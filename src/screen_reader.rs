@@ -14,7 +14,7 @@ use std::{
     time,
 };
 
-const DIFF_DELAY: u16 = 5;
+const DIFF_DELAY: u16 = 50;
 
 #[derive(Copy, Clone)]
 enum Action {
@@ -278,10 +278,18 @@ impl Clipboard {
     }
 }
 
+#[allow(dead_code)]
+enum CursorTrackingMode {
+    On,
+    Off,
+    OffOnce,
+}
+
 pub struct ScreenReader {
     speech: speech::Speech,
     help_mode: bool,
     last_key: Vec<u8>,
+    cursor_tracking_mode: CursorTrackingMode,
     clipboard: Clipboard,
 }
 
@@ -291,6 +299,7 @@ impl ScreenReader {
             speech: speech::new()?,
             help_mode: false,
             last_key: Vec::new(),
+            cursor_tracking_mode: CursorTrackingMode::On,
             clipboard: Default::default(),
         })
     }
@@ -457,17 +466,13 @@ impl ScreenReader {
             }
 
             // Read the screen if it is old enough and was updated.
-            if screen_state.prev_screen_time.elapsed().as_millis() >= DIFF_DELAY as u128 {
+            if screen_state.prev_screen_time.elapsed().as_millis() >= DIFF_DELAY as u128
+                && poll_timeout.is_some()
+            {
                 poll_timeout = None; // No need to wakeup until we get more updates.
-                if !screen_state
-                    .screen
-                    .state_diff(&screen_state.prev_screen)
-                    .is_empty()
-                {
-                    self.autoread(&mut screen_state, &mut text_reporter)?;
-                    screen_state.prev_screen = screen_state.screen.clone();
-                    screen_state.prev_screen_time = time::Instant::now();
-                }
+                self.autoread(&mut screen_state, &mut text_reporter)?;
+                screen_state.prev_screen = screen_state.screen.clone();
+                screen_state.prev_screen_time = time::Instant::now();
             }
         }
     }
@@ -523,8 +528,8 @@ impl ScreenReader {
         // Try to read any incoming text.
         // Fall back to a screen diff if that makes more sense.
         let mut text_read = None;
-        let state_changes = text_reporter.get_state_changes();
         let text = text_reporter.get_text();
+        let new_contents = screen_state.screen.contents();
         let diffing = match text.as_str() {
             "" => true,
             _ => {
@@ -533,24 +538,27 @@ impl ScreenReader {
                     _ => false,
                 };
 
-                // If the current and previous screens contain the same content, but there was text
-                // drawn, it could be because the application is drawing the same characters over
-                // themselves when the cursor was moved, perhaps to change their attributes.
-                // Or, it could be because a bunch of text scrolled by, and this screen just so
-                // happens to be the same.
-                // We don't want to read the former, but we do the latter.
-                if screen_state.screen.contents() == screen_state.prev_screen.contents()
+                // If we got the character we just typed, don't read it or do a diff
+                if echoed_char {
+                    false
+                } else if new_contents == screen_state.prev_screen.contents()
                     && screen_state.screen.cursor_position()
                         != screen_state.prev_screen.cursor_position()
                 {
+                    // If the current and previous screens contain the same content, but there was text
+                    // drawn, it could be because the application is drawing the same characters over
+                    // themselves when the cursor was moved, perhaps to change their attributes.
+                    // Or, it could be because a bunch of text scrolled by, and this screen just so
+                    // happens to be the same.
+                    // We don't want to read the former, but we do the latter.
                     true
-                } else if state_changes > 4 {
+                } else if text.lines().all(|line| new_contents.contains(line)) {
+                    // There is no text that isn't also on the screen. A diff makes more sense
+                    // here.
                     true
                 } else {
-                    if !echoed_char {
-                        self.speech.speak(&text, false)?;
-                        text_read = Some(text);
-                    }
+                    self.speech.speak(&text, false)?;
+                    text_read = Some(text);
                     false
                 }
             }
@@ -648,11 +656,15 @@ impl ScreenReader {
             }
         }
 
-        match cursor_report {
-            Some(s) if !text_read.map_or(false, |v| v.contains(&s)) => {
-                self.speech.speak(&s, false)?
-            }
-            _ => (),
+        match &self.cursor_tracking_mode {
+            CursorTrackingMode::On => match cursor_report {
+                Some(s) if !text_read.map_or(false, |v| v.contains(&s)) => {
+                    self.speech.speak(&s, false)?
+                }
+                _ => (),
+            },
+            CursorTrackingMode::OffOnce => self.cursor_tracking_mode = CursorTrackingMode::On,
+            CursorTrackingMode::Off => (),
         }
 
         Ok(())
@@ -694,7 +706,7 @@ impl ScreenReader {
             Action::SayTime => self.action_say_time(),
             Action::SetMark => self.action_set_mark(&screen_state),
             Action::Copy => self.action_copy(&screen_state),
-            Action::Paste => self.action_paste(pty_stream),
+            Action::Paste => self.action_paste(&screen_state, pty_stream),
             Action::SayClipboard => self.action_clipboard_say(),
             Action::PreviousClipboard => self.action_clipboard_prev(),
             Action::NextClipboard => self.action_clipboard_next(),
@@ -938,6 +950,12 @@ impl ScreenReader {
                 .contents();
             self.speech.speak(&char, false)?;
         }
+        // When backspacing, the cursor will end up moving to the left, but we don't want to hear
+        // that.
+        self.cursor_tracking_mode = match self.cursor_tracking_mode {
+            CursorTrackingMode::Off => CursorTrackingMode::Off,
+            _ => CursorTrackingMode::OffOnce,
+        };
         Ok(true)
     }
 
@@ -1016,10 +1034,18 @@ impl ScreenReader {
         Ok(false)
     }
 
-    fn action_paste(&mut self, stream: &mut ptyprocess::stream::Stream) -> Result<bool> {
+    fn action_paste(
+        &mut self,
+        screen_state: &ScreenState,
+        stream: &mut ptyprocess::stream::Stream,
+    ) -> Result<bool> {
         match self.clipboard.get() {
             Some(contents) => {
-                write!(stream, "\x1B[200~{}\x1B[201~", contents)?;
+                if screen_state.screen.bracketed_paste() {
+                    write!(stream, "\x1B[200~{}\x1B[201~", contents)?;
+                } else {
+                    write!(stream, "{}", contents)?;
+                }
                 self.speech.speak("pasted", false)?;
             }
             None => self.speech.speak("no clipboard", false)?,
