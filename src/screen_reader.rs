@@ -14,7 +14,7 @@ use std::{
     time,
 };
 
-const DIFF_DELAY: u16 = 50;
+const DIFF_DELAY: u16 = 5;
 
 #[derive(Copy, Clone)]
 enum Action {
