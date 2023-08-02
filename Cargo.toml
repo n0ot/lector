@@ -1,0 +1,21 @@
+[package]
+name = "lector"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.72"
+emojis = "0.6.0"
+mio = { version = "0.8.8", features = ["os-ext", "os-poll"] }
+nix = "0.26.2"
+phf = { version = "0.11.2", features = ["macros"] }
+ptyprocess = "0.4.1"
+signal-hook = "0.3.17"
+signal-hook-mio = { version = "0.2.3", features = ["support-v0_8"] }
+similar = { version = "2.2.1", features = ["unicode"] }
+termsize = "0.1.6"
+unicode-segmentation = "1.10.1"
+vt100 = "0.15.2"
+vte = "0.11.1"
