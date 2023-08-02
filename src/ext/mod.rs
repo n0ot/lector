@@ -148,6 +148,6 @@ pub trait CellExt {
 
 impl CellExt for vt100::Cell {
     fn is_in_word(&self) -> bool {
-        self.contents().chars().any(char::is_alphanumeric)
+        !self.contents().chars().any(char::is_whitespace)
     }
 }
