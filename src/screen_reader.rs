@@ -5,7 +5,7 @@ use phf::phf_map;
 use ptyprocess::PtyProcess;
 use signal_hook::consts::signal::*;
 use signal_hook_mio::v0_8::Signals;
-use similar::{Algorithm, ChangeTag, TextDiff, utils::diff_graphemes};
+use similar::{utils::diff_graphemes, Algorithm, ChangeTag, TextDiff};
 use std::{
     cmp::min,
     io::{ErrorKind, Read, Write},
@@ -14,7 +14,7 @@ use std::{
     time,
 };
 
-const DIFF_DELAY: u128 = 5;
+const DIFF_DELAY: u16 = 5;
 
 #[derive(Copy, Clone)]
 enum Action {
@@ -290,16 +290,16 @@ impl ScreenReader {
         let mut stdin = std::io::stdin().lock();
         let mut stdout = std::io::stdout().lock();
         let mut events = mio::Events::with_capacity(1024);
+        let mut poll_timeout = None;
         loop {
-            poll.poll(&mut events, Some(time::Duration::from_millis(10)))
-                .or_else(|e| {
-                    if e.kind() == ErrorKind::Interrupted {
-                        events.clear();
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                })?;
+            poll.poll(&mut events, poll_timeout).or_else(|e| {
+                if e.kind() == ErrorKind::Interrupted {
+                    events.clear();
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            })?;
             for event in events.iter() {
                 match event.token() {
                     STDIN_TOKEN => {
@@ -343,6 +343,9 @@ impl ScreenReader {
                         }
 
                         self.process_screen_changes(&mut screen_state, &mut parser, &buf[0..n]);
+                        // Stop blocking indefinitely until this screen is old enough to be
+                        // autoread.
+                        poll_timeout = Some(time::Duration::from_millis(DIFF_DELAY as u64));
                     }
                     SIGNALS_TOKEN => {
                         for signal in signals.pending() {
@@ -372,15 +375,19 @@ impl ScreenReader {
                     _ => unreachable!("encountered unknown event"),
                 }
             }
-            if screen_state.prev_screen_time.elapsed().as_millis() >= DIFF_DELAY
-                && !screen_state
+
+            // Read the screen if it is old enough and was updated.
+            if screen_state.prev_screen_time.elapsed().as_millis() >= DIFF_DELAY as u128 {
+                poll_timeout = None; // No need to wakeup until we get more updates.
+                if !screen_state
                     .screen
                     .state_diff(&screen_state.prev_screen)
                     .is_empty()
-            {
-                self.autoread(&mut screen_state, &mut text_reporter)?;
-                screen_state.prev_screen = screen_state.screen.clone();
-                screen_state.prev_screen_time = time::Instant::now();
+                {
+                    self.autoread(&mut screen_state, &mut text_reporter)?;
+                    screen_state.prev_screen = screen_state.screen.clone();
+                    screen_state.prev_screen_time = time::Instant::now();
+                }
             }
         }
     }
@@ -432,7 +439,7 @@ impl ScreenReader {
             screen_state.last_indent_level = indent_level;
         }
 
-        // If the cursor wasn't explicitly moved, and this isn't the alternate screen,
+        // If the cursor wasn't explicitly moved,
         // we can just read what was drawn to the screen.
         // Otherwise, we'll use a screen diff.
         // Keep track of what was autoread, and don't repeat it when tracking the cursor.
@@ -443,8 +450,18 @@ impl ScreenReader {
                     Ok(s) if text == s => true,
                     _ => false,
                 };
-                if !echoed_char && screen_state.screen.alternate_screen() {
-                    true // Fall back to diffing
+
+                // If the current and previous screens contain the same content, but there was text
+                // drawn, it could be because the application is drawing the same characters over
+                // themselves when the cursor was moved, perhaps to change their attributes.
+                // Or, it could be because a bunch of text scrolled by, and this screen just so
+                // happens to be the same.
+                // We don't want to read the former, but we do the latter.
+                if screen_state.screen.contents() == screen_state.prev_screen.contents()
+                    && screen_state.screen.cursor_position()
+                        != screen_state.prev_screen.cursor_position()
+                {
+                    true
                 } else {
                     if !echoed_char {
                         self.speech.speak(&text, false)?;
@@ -498,9 +515,12 @@ impl ScreenReader {
                     text.push_str(&format!("{}\n", change));
                 }
             } else {
-                for change in diff_graphemes(Algorithm::Myers, &old, &new).iter().filter(|c| c.0 == ChangeTag::Insert) {
+                for change in diff_graphemes(Algorithm::Myers, &old, &new)
+                    .iter()
+                    .filter(|c| c.0 == ChangeTag::Insert)
+                {
                     text.push_str(&format!("{} ", change.1));
-                                  }
+                }
             }
 
             self.speech.speak(&text, false)?;
