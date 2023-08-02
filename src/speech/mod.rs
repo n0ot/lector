@@ -84,7 +84,7 @@ fn describe_repeated_graphemes(s: &str) -> String {
         // Only yield the last count/grapheme in the run,
         .filter_map(|(count, g)| g.map(|v| (count, v)))
         .map(|(count, g)| {
-            if count >= n && !g.trim().is_empty() {
+            if count >= n && !g.trim().is_empty() && !g.chars().any(char::is_alphanumeric) {
                 // we want to describe this run in terms of how many times it was repeated.
                 // adding spaces around it ensures it's read correctly.
                 format!(" {} {} ", count, g)
