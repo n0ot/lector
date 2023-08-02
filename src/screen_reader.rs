@@ -14,7 +14,7 @@ use std::{
     time,
 };
 
-const DIFF_DELAY: u16 = 5;
+const DIFF_DELAY: u16 = 30;
 
 #[derive(Copy, Clone)]
 enum Action {
@@ -546,7 +546,15 @@ impl ScreenReader {
             prev_tag = Some(tag);
         }
 
-        if diff_mode_lines {
+        // But even if there was only a single line changed, we still want to read the whole line if there's
+        // more than one grapheme change.
+        if diff_mode_lines
+            || diff_graphemes(Algorithm::Myers, &old, &new)
+                .iter()
+                .filter(|c| c.0 != ChangeTag::Equal)
+                .count()
+                > 1
+        {
             for change in line_changes
                 .iter_all_changes()
                 .filter(|c| c.tag() == ChangeTag::Insert)
