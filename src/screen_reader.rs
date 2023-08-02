@@ -1,4 +1,4 @@
-use super::{attributes, ext::ScreenExt, perform, speech};
+use super::{attributes, ext::ScreenExt, speech};
 use anyhow::{anyhow, bail, Context, Result};
 use nix::sys::termios;
 use phf::phf_map;
@@ -346,11 +346,6 @@ impl ScreenReader {
             last_indent_level: 0,
         };
 
-        // We also want to separately keep track of incoming bytes, for autoread.
-        let mut vte_parser = vte::Parser::new();
-        // Store new text to be read.
-        let mut text_reporter = perform::TextReporter::new();
-
         // Set up a mio poll, to select between reading from stdin, and the PTY.
         let mut signals = Signals::new([SIGWINCH])?;
         const STDIN_TOKEN: mio::Token = mio::Token(0);
@@ -427,9 +422,6 @@ impl ScreenReader {
                         };
                         stdout.write_all(&buf[0..n]).context("write PTY output")?;
                         stdout.flush().context("flush output")?;
-                        for b in &buf[0..n] {
-                            vte_parser.advance(&mut text_reporter, *b);
-                        }
 
                         self.process_screen_changes(&mut screen_state, &mut parser, &buf[0..n]);
                         // Stop blocking indefinitely until this screen is old enough to be
@@ -470,7 +462,7 @@ impl ScreenReader {
                 && poll_timeout.is_some()
             {
                 poll_timeout = None; // No need to wakeup until we get more updates.
-                self.autoread(&mut screen_state, &mut text_reporter)?;
+                self.autoread(&mut screen_state)?;
                 screen_state.prev_screen = screen_state.screen.clone();
                 screen_state.prev_screen_time = time::Instant::now();
             }
@@ -498,11 +490,7 @@ impl ScreenReader {
         );
     }
 
-    fn autoread(
-        &mut self,
-        screen_state: &mut ScreenState,
-        text_reporter: &mut perform::TextReporter,
-    ) -> Result<()> {
+    fn autoread(&mut self, screen_state: &mut ScreenState) -> Result<()> {
         let (prev_cursor, cursor) = (
             screen_state.prev_screen.cursor_position(),
             screen_state.screen.cursor_position(),
@@ -525,87 +513,60 @@ impl ScreenReader {
         }
 
         // Keep track of what was autoread, and don't repeat it when tracking the cursor.
-        // Try to read any incoming text.
-        // Fall back to a screen diff if that makes more sense.
-        let mut text_read = None;
-        let text = text_reporter.get_text();
-        let new_contents = screen_state.screen.contents();
-        let diffing = match text.as_str() {
-            "" => true,
-            _ => {
-                let echoed_char = match std::str::from_utf8(&self.last_key) {
-                    Ok(s) if text == s => true,
-                    _ => false,
-                };
+        let mut text = String::new();
+        let old = screen_state
+            .prev_screen
+            .rows(0, screen_state.prev_screen.size().1)
+            .collect::<Vec<String>>()
+            .join("\n");
+        let new = screen_state
+            .screen
+            .rows(0, screen_state.screen.size().1)
+            .collect::<Vec<String>>()
+            .join("\n");
 
-                // If we got the character we just typed, don't read it or do a diff
-                if echoed_char {
-                    false
-                } else if text.lines().all(|line| new_contents.contains(line)) {
-                    // We only want to read the text if it's not on the screen, so we don't miss
-                    // something that scrolled by.
-                    true
-                } else {
-                    self.speech.speak(&text, false)?;
-                    text_read = Some(text);
-                    false
-                }
-            }
-        };
-
-        if diffing {
-            let mut text = String::new();
-            let old = screen_state
-                .prev_screen
-                .rows(0, screen_state.prev_screen.size().1)
-                .collect::<Vec<String>>()
-                .join("\n");
-            let new = screen_state
-                .screen
-                .rows(0, screen_state.screen.size().1)
-                .collect::<Vec<String>>()
-                .join("\n");
-
-            let line_changes = TextDiff::from_lines(&old, &new);
-            // One deletion followed by one insertion, and no other changes,
-            // means only a single line changed. In that case, only report what changed in the
-            // line.
-            // Otherwise, report the entire lines that were added.
-            let mut diff_mode_lines = false;
-            let mut prev_tag = None;
-            let mut insertions = 0;
-            for tag in line_changes.iter_all_changes().map(|c| c.tag()) {
-                if tag != ChangeTag::Insert {
-                    prev_tag = Some(tag);
-                    continue;
-                }
-                if prev_tag != Some(ChangeTag::Delete) || insertions > 0 {
-                    diff_mode_lines = true;
-                    break;
-                }
-                insertions += 1;
+        let line_changes = TextDiff::from_lines(&old, &new);
+        // One deletion followed by one insertion, and no other changes,
+        // means only a single line changed. In that case, only report what changed in the
+        // line.
+        // Otherwise, report the entire lines that were added.
+        let mut diff_mode_lines = false;
+        let mut prev_tag = None;
+        let mut insertions = 0;
+        for tag in line_changes.iter_all_changes().map(|c| c.tag()) {
+            if tag != ChangeTag::Insert {
                 prev_tag = Some(tag);
+                continue;
             }
-
-            if diff_mode_lines {
-                for change in line_changes
-                    .iter_all_changes()
-                    .filter(|c| c.tag() == ChangeTag::Insert)
-                {
-                    text.push_str(&format!("{}\n", change));
-                }
-            } else {
-                for change in diff_graphemes(Algorithm::Myers, &old, &new)
-                    .iter()
-                    .filter(|c| c.0 == ChangeTag::Insert)
-                {
-                    text.push_str(&format!("{} ", change.1));
-                }
+            if prev_tag != Some(ChangeTag::Delete) || insertions > 0 {
+                diff_mode_lines = true;
+                break;
             }
-
-            self.speech.speak(&text, false)?;
-            text_read = Some(text);
+            insertions += 1;
+            prev_tag = Some(tag);
         }
+
+        if diff_mode_lines {
+            for change in line_changes
+                .iter_all_changes()
+                .filter(|c| c.tag() == ChangeTag::Insert)
+            {
+                text.push_str(&format!("{}\n", change));
+            }
+        } else {
+            for change in diff_graphemes(Algorithm::Myers, &old, &new)
+                .iter()
+                .filter(|c| c.0 == ChangeTag::Insert)
+            {
+                text.push_str(&format!("{} ", change.1));
+            }
+        }
+
+        // Don't echo typed characters.
+        match std::str::from_utf8(&self.last_key) {
+            Ok(s) if text.trim() == s => (),
+            _ => self.speech.speak(&text, false)?,
+        };
 
         let mut cursor_report: Option<String> = None;
         if cursor.0 != prev_cursor.0 {
@@ -647,9 +608,7 @@ impl ScreenReader {
 
         match &self.cursor_tracking_mode {
             CursorTrackingMode::On => match cursor_report {
-                Some(s) if !text_read.map_or(false, |v| v.contains(&s)) => {
-                    self.speech.speak(&s, false)?
-                }
+                Some(s) if !text.contains(&s) => self.speech.speak(&s, false)?,
                 _ => (),
             },
             CursorTrackingMode::OffOnce => self.cursor_tracking_mode = CursorTrackingMode::On,
