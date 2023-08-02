@@ -37,6 +37,7 @@ enum Action {
     RevReadAttributes,
     Backspace,
     Delete,
+    SayTime,
 }
 
 impl Action {
@@ -61,6 +62,7 @@ impl Action {
             Action::RevReadAttributes => "read attributes".into(),
             Action::Backspace => "backspace".into(),
             Action::Delete => "delete".into(),
+            Action::SayTime => "say the time".into(),
         }
     }
 }
@@ -86,6 +88,7 @@ static KEYMAP: phf::Map<&'static str, Action> = phf_map! {
     "\x08" => Action::Backspace,
     "\x7F" => Action::Backspace,
     "\x1B[3~" => Action::Delete,
+    "\x1B[24~" => Action::SayTime,
 };
 
 struct ScreenState {
@@ -603,6 +606,7 @@ impl ScreenReader {
             Action::RevReadAttributes => self.action_review_read_attributes(screen_state),
             Action::Backspace => self.action_backspace(screen_state),
             Action::Delete => self.action_delete(screen_state),
+            Action::SayTime => self.action_say_time(),
             _ => {
                 self.speech.speak("not implemented", false)?;
                 Ok(false)
@@ -855,5 +859,11 @@ impl ScreenReader {
             .contents();
         self.speech.speak(&char, false)?;
         Ok(true)
+    }
+
+    fn action_say_time(&mut self) -> Result<bool> {
+        let date = chrono::Local::now();
+        self.speech.speak(&format!("{}", date.format("%H:%M")), false)?;
+        Ok(false)
     }
 }

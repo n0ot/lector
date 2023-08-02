@@ -9,6 +9,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0.72"
+chrono = "0.4.26"
 emojis = "0.6.0"
 mio = { version = "0.8.8", features = ["os-ext", "os-poll"] }
 nix = "0.26.2"
