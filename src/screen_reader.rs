@@ -38,6 +38,12 @@ enum Action {
     Backspace,
     Delete,
     SayTime,
+    SetMark,
+    Copy,
+    Paste,
+    SayClipboard,
+    PreviousClipboard,
+    NextClipboard,
 }
 
 impl Action {
@@ -63,6 +69,12 @@ impl Action {
             Action::Backspace => "backspace".into(),
             Action::Delete => "delete".into(),
             Action::SayTime => "say the time".into(),
+            Action::SetMark => "set mark".into(),
+            Action::Copy => "copy".into(),
+            Action::Paste => "paste".into(),
+            Action::SayClipboard => "say clipboard".into(),
+            Action::PreviousClipboard => "previous clipboard".into(),
+            Action::NextClipboard => "next clipboard".into(),
         }
     }
 }
@@ -89,6 +101,12 @@ static KEYMAP: phf::Map<&'static str, Action> = phf_map! {
     "\x7F" => Action::Backspace,
     "\x1B[3~" => Action::Delete,
     "\x1B[24~" => Action::SayTime,
+    "\x1B[15~" => Action::SetMark,
+    "\x1B[17~" => Action::Copy,
+    "\x1B[18~" => Action::Paste,
+    "\x1Bc" => Action::SayClipboard,
+    "\x1B[" => Action::PreviousClipboard,
+    "\x1B]" => Action::NextClipboard,
 };
 
 struct ScreenState {
@@ -205,10 +223,66 @@ impl ScreenState {
     }
 }
 
+#[derive(Default)]
+struct Clipboard {
+    mark: Option<(u16, u16)>,
+    idx: usize,
+    clipboards: Vec<String>,
+}
+
+impl Clipboard {
+    /// Get the text from the selected clipboard.
+    /// If there are no clipboards, None will be returned.
+    fn get(&self) -> Option<&str> {
+        if self.clipboards.is_empty() {
+            return None;
+        }
+        Some(&self.clipboards[self.idx])
+    }
+
+    /// Add a clipboard with the specified text and select it.
+    /// The oldest clipboards will be removed to make room for newer ones.
+    fn put(&mut self, text: String) {
+        if self.clipboards.len() >= 10 {
+            self.clipboards.remove(0);
+        }
+        self.idx = self.clipboards.len();
+        self.clipboards.push(text);
+    }
+
+    /// Try to select the previous clipboard, and return whether a different clipboard has been selected.
+    /// If there is no previous clipboard, this method will have no effect.
+    fn prev(&mut self) -> bool {
+        if self.idx + 1 >= self.size() {
+            false
+        } else {
+            self.idx += 1;
+            true
+        }
+    }
+
+    /// Try to select the next clipboard, and return whether a different clipboard has been selected.
+    /// If there is no next clipboard, this method will have no effect.
+    fn next(&mut self) -> bool {
+        if self.idx == 0 {
+            false
+        } else {
+            self.idx -= 1;
+            true
+        }
+    }
+
+    /// Returns the number of clipboards.
+    fn size(&self) -> usize {
+        self.clipboards.len()
+    }
+}
+
 pub struct ScreenReader {
     speech: speech::Speech,
     help_mode: bool,
     last_key: Vec<u8>,
+    clipboard: Clipboard,
 }
 
 impl ScreenReader {
@@ -217,6 +291,7 @@ impl ScreenReader {
             speech: speech::new()?,
             help_mode: false,
             last_key: Vec::new(),
+            clipboard: Default::default(),
         })
     }
 
@@ -315,7 +390,9 @@ impl ScreenReader {
                         self.last_key = buf[0..n].to_owned();
                         self.speech.stop()?;
                         let pass_through = match KEYMAP.get(std::str::from_utf8(&buf[0..n])?) {
-                            Some(&v) => self.handle_action(&mut screen_state, v)?,
+                            Some(&v) => {
+                                self.handle_action(&mut screen_state, &mut pty_stream, v)?
+                            }
                             None => {
                                 if self.help_mode {
                                     self.speech.speak("this key is unmapped", false)?;
@@ -581,7 +658,12 @@ impl ScreenReader {
         Ok(())
     }
 
-    fn handle_action(&mut self, screen_state: &mut ScreenState, action: Action) -> Result<bool> {
+    fn handle_action(
+        &mut self,
+        screen_state: &mut ScreenState,
+        pty_stream: &mut ptyprocess::stream::Stream,
+        action: Action,
+    ) -> Result<bool> {
         if let Action::ToggleHelp = action {
             return self.action_toggle_help();
         }
@@ -610,6 +692,12 @@ impl ScreenReader {
             Action::Backspace => self.action_backspace(screen_state),
             Action::Delete => self.action_delete(screen_state),
             Action::SayTime => self.action_say_time(),
+            Action::SetMark => self.action_set_mark(&screen_state),
+            Action::Copy => self.action_copy(&screen_state),
+            Action::Paste => self.action_paste(pty_stream),
+            Action::SayClipboard => self.action_clipboard_say(),
+            Action::PreviousClipboard => self.action_clipboard_prev(),
+            Action::NextClipboard => self.action_clipboard_next(),
             _ => {
                 self.speech.speak("not implemented", false)?;
                 Ok(false)
@@ -866,7 +954,106 @@ impl ScreenReader {
 
     fn action_say_time(&mut self) -> Result<bool> {
         let date = chrono::Local::now();
-        self.speech.speak(&format!("{}", date.format("%H:%M")), false)?;
+        self.speech
+            .speak(&format!("{}", date.format("%H:%M")), false)?;
+        Ok(false)
+    }
+
+    fn action_set_mark(&mut self, screen_state: &ScreenState) -> Result<bool> {
+        self.clipboard.mark = Some(screen_state.review_cursor_position);
+        self.speech.speak("mark set", false)?;
+        Ok(false)
+    }
+
+    fn action_copy(&mut self, screen_state: &ScreenState) -> Result<bool> {
+        match self.clipboard.mark {
+            Some((mark_row, mark_col)) => {
+                let (cur_row, cur_col) = screen_state.review_cursor_position;
+                if mark_row > cur_row || (mark_row == cur_row && mark_col > cur_col) {
+                    self.speech
+                        .speak("mark is after the review cursor", false)?;
+                    return Ok(false);
+                }
+
+                let mut contents = String::new();
+                for row in mark_row..=cur_row {
+                    let start = if row == mark_row { mark_col } else { 0 };
+                    // end is not inclusive, so that a blank row can be achieved with start == end.
+                    let end = if row == cur_row {
+                        cur_col + 1
+                    } else {
+                        screen_state.screen.size().1
+                    };
+                    // Don't add trailing blank/whitespace cells
+                    let end = screen_state
+                        .screen
+                        .rfind_cell(
+                            |c| !c.contents().trim().is_empty(),
+                            row,
+                            start,
+                            row,
+                            end - 1,
+                        )
+                        .map_or(end, |(_, col)| col + 1);
+                    for col in start..end {
+                        contents.push_str(
+                            &screen_state
+                                .screen
+                                .cell(row, col)
+                                .map_or("".into(), vt100::Cell::contents),
+                        );
+                    }
+                    if row != cur_row {
+                        contents.push('\n');
+                    }
+                }
+                self.clipboard.mark = None;
+                self.clipboard.put(contents);
+                self.speech.speak("copied", false)?;
+            }
+            None => self.speech.speak("no mark set", false)?,
+        }
+        Ok(false)
+    }
+
+    fn action_paste(&mut self, stream: &mut ptyprocess::stream::Stream) -> Result<bool> {
+        match self.clipboard.get() {
+            Some(contents) => {
+                write!(stream, "\x1B[200~{}\x1B[201~", contents)?;
+                self.speech.speak("pasted", false)?;
+            }
+            None => self.speech.speak("no clipboard", false)?,
+        }
+        Ok(false)
+    }
+
+    fn action_clipboard_prev(&mut self) -> Result<bool> {
+        if self.clipboard.size() == 0 {
+            self.speech.speak("no clipboard", false)?;
+        } else if self.clipboard.prev() {
+            self.action_clipboard_say()?;
+        } else {
+            self.speech.speak("first clipboard", false)?;
+        }
+        Ok(false)
+    }
+
+    fn action_clipboard_next(&mut self) -> Result<bool> {
+        if self.clipboard.size() == 0 {
+            self.speech.speak("no clipboard", false)?;
+        } else if self.clipboard.next() {
+            self.action_clipboard_say()?;
+        } else {
+            self.speech.speak("last clipboard", false)?;
+        }
+        Ok(false)
+    }
+
+    fn action_clipboard_say(&mut self) -> Result<bool> {
+        match self.clipboard.get() {
+            Some(contents) => self.speech.speak(&contents, false)?,
+            None => self.speech.speak("no clipboard", false)?,
+        }
         Ok(false)
     }
 }
