@@ -541,20 +541,9 @@ impl ScreenReader {
                 // If we got the character we just typed, don't read it or do a diff
                 if echoed_char {
                     false
-                } else if new_contents == screen_state.prev_screen.contents()
-                    && screen_state.screen.cursor_position()
-                        != screen_state.prev_screen.cursor_position()
-                {
-                    // If the current and previous screens contain the same content, but there was text
-                    // drawn, it could be because the application is drawing the same characters over
-                    // themselves when the cursor was moved, perhaps to change their attributes.
-                    // Or, it could be because a bunch of text scrolled by, and this screen just so
-                    // happens to be the same.
-                    // We don't want to read the former, but we do the latter.
-                    true
                 } else if text.lines().all(|line| new_contents.contains(line)) {
-                    // There is no text that isn't also on the screen. A diff makes more sense
-                    // here.
+                    // We only want to read the text if it's not on the screen, so we don't miss
+                    // something that scrolled by.
                     true
                 } else {
                     self.speech.speak(&text, false)?;
