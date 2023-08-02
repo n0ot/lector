@@ -668,7 +668,11 @@ impl ScreenReader {
                 .speak(&format!("indent {}", indent_level), false)?;
             screen_state.review_cursor_last_indent_level = indent_level;
         }
-        self.speech.speak(&line, false)?;
+        if line.is_empty() {
+            self.speech.speak("blank", false)?;
+        } else {
+            self.speech.speak(&line, false)?;
+        }
         Ok(false)
     }
 
@@ -727,7 +731,11 @@ impl ScreenReader {
             .cell(row, col)
             .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
             .contents();
-        self.speech.speak(&char, false)?;
+        if char.is_empty() {
+            self.speech.speak("blank", false)?;
+        } else {
+            self.speech.speak(&char, false)?;
+        }
         Ok(false)
     }
 
