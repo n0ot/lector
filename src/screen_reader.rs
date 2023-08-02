@@ -442,13 +442,15 @@ impl ScreenReader {
             screen_state.last_indent_level = indent_level;
         }
 
-        // If the cursor wasn't explicitly moved,
-        // we can just read what was drawn to the screen.
-        // Otherwise, we'll use a screen diff.
         // Keep track of what was autoread, and don't repeat it when tracking the cursor.
+        // Try to read any incoming text.
+        // Fall back to a screen diff if that makes more sense.
         let mut text_read = None;
-        let diffing = match text_reporter.get_text() {
-            Some(text) => {
+        let state_changes = text_reporter.get_state_changes();
+        let text = text_reporter.get_text();
+        let diffing = match text.as_str() {
+            "" => true,
+            _ => {
                 let echoed_char = match std::str::from_utf8(&self.last_key) {
                     Ok(s) if text == s => true,
                     _ => false,
@@ -465,6 +467,8 @@ impl ScreenReader {
                         != screen_state.prev_screen.cursor_position()
                 {
                     true
+                } else if state_changes > 4 {
+                    true
                 } else {
                     if !echoed_char {
                         self.speech.speak(&text, false)?;
@@ -473,7 +477,6 @@ impl ScreenReader {
                     false
                 }
             }
-            None => true,
         };
 
         if diffing {
