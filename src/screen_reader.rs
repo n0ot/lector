@@ -516,14 +516,16 @@ impl ScreenReader {
         let mut text = String::new();
         let old = screen_state
             .prev_screen
-            .rows(0, screen_state.prev_screen.size().1)
-            .collect::<Vec<String>>()
-            .join("\n");
+            .contents()
+            .lines()
+            .map(|l| format!("{}\n", l.trim()))
+            .collect::<String>();
         let new = screen_state
             .screen
-            .rows(0, screen_state.screen.size().1)
-            .collect::<Vec<String>>()
-            .join("\n");
+            .contents()
+            .lines()
+            .map(|l| format!("{}\n", l.trim()))
+            .collect::<String>();
 
         let line_changes = TextDiff::from_lines(&old, &new);
         // One deletion followed by one insertion, and no other changes,
