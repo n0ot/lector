@@ -1,37 +1,46 @@
 use vte::{Params, Perform};
 
 /// Processes text from VTE, storing new text to be printed.
-/// If Anything other than new text is printed, or attributes are changed, the text will be
-/// cleared, as it might otherwise be meaningless.
 pub struct TextReporter {
+    /// Stores characters printed to the screen
     text: String,
+    /// True if the next call to `[print]` should clear the text.
+    reset: bool,
 }
 
 impl TextReporter {
     pub fn new() -> Self {
         TextReporter {
             text: String::new(),
+            reset: false,
         }
     }
 
-    /// returns a copy of the text seen so far, and clears it.
-    pub fn get_text(&mut self) -> String {
-        let text = self.text.clone();
-        self.text.clear();
-        text
+    /// returns a reference of the text seen so far.
+    /// Future interactions with this TextReporter may overwrite this text.
+    pub fn get_text(&mut self) -> &str {
+        if self.reset {
+            self.text.clear();
+        }
+        self.reset = true;
+        &self.text
     }
 }
 
 impl Perform for TextReporter {
     fn print(&mut self, c: char) {
+        if self.reset {
+            self.text.clear();
+            self.reset = false;
+        }
         self.text.push(c);
     }
 
     fn execute(&mut self, byte: u8) {
         match byte {
-            8 => self.text.push('\n'),
-            _ => self.text.push('\n'), // Not always correct, but fine for auto reading
-        };
+            10 | 13 => self.text.push('\n'),
+            _ => {},
+        }
     }
 
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _c: char) {
@@ -42,14 +51,11 @@ impl Perform for TextReporter {
         // Nothing to do
     }
 
-    fn csi_dispatch(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, c: char) {
-        match c {
-            'h' | 'l' | 'm' => return,
-            _ => self.text.push('\n'),
-        }
+    fn csi_dispatch(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _c: char) {
+        // Nothing to do
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {
-        self.text.push('\n');
+        // Nothing to do
     }
 }

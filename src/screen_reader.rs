@@ -529,8 +529,7 @@ impl ScreenReader {
         // Fall back to a screen diff if that makes more sense.
         let mut text_read = None;
         let text = text_reporter.get_text();
-        let new_contents = screen_state.screen.contents();
-        let diffing = match text.as_str() {
+        let diffing = match text {
             "" => true,
             _ => {
                 let echoed_char = match std::str::from_utf8(&self.last_key) {
@@ -541,30 +540,30 @@ impl ScreenReader {
                 // If we got the character we just typed, don't read it or do a diff
                 if echoed_char {
                     false
-                } else if text.lines().all(|line| new_contents.contains(line)) {
-                    // We only want to read the text if it's not on the screen, so we don't miss
-                    // something that scrolled by.
-                    true
-                } else {
+                } else if text.contains("\n") {
                     self.speech.speak(&text, false)?;
                     text_read = Some(text);
                     false
+                } else {
+                    true // Diff instead
                 }
             }
         };
 
+        let mut text = String::new();
         if diffing {
-            let mut text = String::new();
             let old = screen_state
                 .prev_screen
-                .rows(0, screen_state.prev_screen.size().1)
-                .collect::<Vec<String>>()
-                .join("\n");
+                .contents()
+                .lines()
+                .map(|l| format!("{}\n", l.trim()))
+                .collect::<String>();
             let new = screen_state
                 .screen
-                .rows(0, screen_state.screen.size().1)
-                .collect::<Vec<String>>()
-                .join("\n");
+                .contents()
+                .lines()
+                .map(|l| format!("{}\n", l.trim()))
+                .collect::<String>();
 
             let line_changes = TextDiff::from_lines(&old, &new);
             // One deletion followed by one insertion, and no other changes,
@@ -587,7 +586,15 @@ impl ScreenReader {
                 prev_tag = Some(tag);
             }
 
-            if diff_mode_lines {
+            // But even if there was only a single line changed, we still want to read the whole line if there's
+            // more than one grapheme change.
+            if diff_mode_lines
+                || diff_graphemes(Algorithm::Myers, &old, &new)
+                    .iter()
+                    .filter(|c| c.0 != ChangeTag::Equal)
+                    .count()
+                    > 1
+            {
                 for change in line_changes
                     .iter_all_changes()
                     .filter(|c| c.tag() == ChangeTag::Insert)
@@ -604,7 +611,7 @@ impl ScreenReader {
             }
 
             self.speech.speak(&text, false)?;
-            text_read = Some(text);
+            text_read = Some(&text);
         }
 
         let mut cursor_report: Option<String> = None;
@@ -647,10 +654,8 @@ impl ScreenReader {
 
         match &self.cursor_tracking_mode {
             CursorTrackingMode::On => match cursor_report {
-                Some(s) if !text_read.map_or(false, |v| v.contains(&s)) => {
-                    self.speech.speak(&s, false)?
-                }
-                _ => (),
+                Some(s) if text_read.map_or(true, str::is_empty) => self.speech.speak(&s, false)?,
+                _ => {}
             },
             CursorTrackingMode::OffOnce => self.cursor_tracking_mode = CursorTrackingMode::On,
             CursorTrackingMode::Off => (),
