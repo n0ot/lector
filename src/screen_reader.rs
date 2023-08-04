@@ -741,20 +741,18 @@ impl ScreenReader {
     }
 
     fn action_review_line_prev(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if screen_state.review_cursor_up() {
-            self.action_review_line_read(screen_state)?;
-        } else {
+        if !screen_state.review_cursor_up() {
             self.speech.speak("top", false)?;
         }
+        self.action_review_line_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_line_next(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if screen_state.review_cursor_down() {
-            self.action_review_line_read(screen_state)?;
-        } else {
+        if !screen_state.review_cursor_down() {
             self.speech.speak("bottom", false)?;
         }
+        self.action_review_line_read(screen_state)?;
         Ok(false)
     }
 
@@ -787,20 +785,18 @@ impl ScreenReader {
     }
 
     fn action_review_word_prev(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if screen_state.review_cursor_prev_word() {
-            self.action_review_word_read(screen_state)?;
-        } else {
+        if !screen_state.review_cursor_prev_word() {
             self.speech.speak("left", false)?;
         }
+        self.action_review_word_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_word_next(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if screen_state.review_cursor_next_word() {
-            self.action_review_word_read(screen_state)?;
-        } else {
+        if !screen_state.review_cursor_next_word() {
             self.speech.speak("right", false)?;
         }
+        self.action_review_word_read(screen_state)?;
         Ok(false)
     }
 
@@ -817,20 +813,18 @@ impl ScreenReader {
     }
 
     fn action_review_char_prev(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if screen_state.review_cursor_left() {
-            self.action_review_char_read(screen_state)?;
-        } else {
+        if !screen_state.review_cursor_left() {
             self.speech.speak("left", false)?;
         }
+        self.action_review_char_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_char_next(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if screen_state.review_cursor_right() {
-            self.action_review_char_read(screen_state)?;
-        } else {
+        if !screen_state.review_cursor_right() {
             self.speech.speak("right", false)?;
         }
+        self.action_review_char_read(screen_state)?;
         Ok(false)
     }
 
@@ -892,24 +886,28 @@ impl ScreenReader {
     fn action_review_top(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
         screen_state.review_cursor_position.0 = 0;
         self.speech.speak("top", false)?;
+        self.action_review_line_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_bottom(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
         screen_state.review_cursor_position.0 = screen_state.screen.size().0 - 1;
         self.speech.speak("bottom", false)?;
+        self.action_review_line_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_first(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
         screen_state.review_cursor_position.1 = 0;
         self.speech.speak("left", false)?;
+        self.action_review_char_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_last(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
         screen_state.review_cursor_position.1 = screen_state.screen.size().1 - 1;
         self.speech.speak("right", false)?;
+        self.action_review_char_read(screen_state)?;
         Ok(false)
     }
 
@@ -942,7 +940,6 @@ impl ScreenReader {
         self.speech.speak(&attrs, false)?;
         Ok(false)
     }
-
     fn action_backspace(&mut self, screen_state: &ScreenState) -> Result<bool> {
         let (row, col) = screen_state.screen.cursor_position();
         if col > 0 {
