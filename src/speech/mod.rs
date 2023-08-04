@@ -35,6 +35,7 @@ impl Speech {
         self.driver.stop()
     }
 
+    #[allow(dead_code)]
     pub fn get_rate(&self) -> f32 {
         self.driver.get_rate()
     }

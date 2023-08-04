@@ -8,13 +8,16 @@ use signal_hook_mio::v0_8::Signals;
 use similar::{utils::diff_graphemes, Algorithm, ChangeTag, TextDiff};
 use std::{
     cmp::min,
+    collections::HashSet,
     io::{ErrorKind, Read, Write},
+    iter::FromIterator,
     os::fd::AsRawFd,
     process::Command,
     time,
 };
 
-const DIFF_DELAY: u16 = 5;
+const DIFF_DELAY: u16 = 1;
+const MAX_DIFF_DELAY: u16 = 300;
 
 #[derive(Copy, Clone)]
 enum Action {
@@ -290,6 +293,7 @@ pub struct ScreenReader {
     help_mode: bool,
     last_key: Vec<u8>,
     cursor_tracking_mode: CursorTrackingMode,
+    highlight_tracking: bool,
     clipboard: Clipboard,
 }
 
@@ -300,6 +304,7 @@ impl ScreenReader {
             help_mode: false,
             last_key: Vec::new(),
             cursor_tracking_mode: CursorTrackingMode::On,
+            highlight_tracking: false,
             clipboard: Default::default(),
         })
     }
@@ -378,6 +383,7 @@ impl ScreenReader {
         let mut stdout = std::io::stdout().lock();
         let mut events = mio::Events::with_capacity(1024);
         let mut poll_timeout = None;
+        let mut last_pty_update = None;
         loop {
             poll.poll(&mut events, poll_timeout).or_else(|e| {
                 if e.kind() == ErrorKind::Interrupted {
@@ -387,6 +393,7 @@ impl ScreenReader {
                     Err(e)
                 }
             })?;
+
             for event in events.iter() {
                 match event.token() {
                     STDIN_TOKEN => {
@@ -435,6 +442,7 @@ impl ScreenReader {
                         // Stop blocking indefinitely until this screen is old enough to be
                         // autoread.
                         poll_timeout = Some(time::Duration::from_millis(DIFF_DELAY as u64));
+                        last_pty_update = Some(time::Instant::now());
                     }
                     SIGNALS_TOKEN => {
                         for signal in signals.pending() {
@@ -465,14 +473,22 @@ impl ScreenReader {
                 }
             }
 
-            // Read the screen if it is old enough and was updated.
-            if screen_state.prev_screen_time.elapsed().as_millis() >= DIFF_DELAY as u128
-                && poll_timeout.is_some()
-            {
-                poll_timeout = None; // No need to wakeup until we get more updates.
-                self.autoread(&mut screen_state, &mut text_reporter)?;
-                screen_state.prev_screen = screen_state.screen.clone();
-                screen_state.prev_screen_time = time::Instant::now();
+            // We want to wait till the PTY has stopped sending us data for awhile before reading
+            // updates, to give the screen time to stabilize.
+            // But if we never stop getting updates, we want to read what we have eventually.
+            if let Some(lpu) = last_pty_update {
+                if lpu.elapsed().as_millis() > DIFF_DELAY as u128
+                    || screen_state.prev_screen_time.elapsed().as_millis() > MAX_DIFF_DELAY as u128
+                {
+                    poll_timeout = None; // No need to wakeup until we get more updates.
+                    last_pty_update = None;
+                    if self.highlight_tracking {
+                        self.track_highlighting(&screen_state)?;
+                    }
+                    self.autoread(&mut screen_state, &mut text_reporter)?;
+                    screen_state.prev_screen = screen_state.screen.clone();
+                    screen_state.prev_screen_time = time::Instant::now();
+                }
             }
         }
     }
@@ -496,6 +512,21 @@ impl ScreenReader {
             min(screen_state.review_cursor_position.0, term_size.0),
             min(screen_state.review_cursor_position.1, term_size.1),
         );
+    }
+
+    fn track_highlighting(&mut self, screen_state: &ScreenState) -> Result<()> {
+        let (highlights, prev_highlights) = (
+            screen_state.screen.get_highlights(),
+            screen_state.prev_screen.get_highlights(),
+        );
+        let prev_hl_set: HashSet<String> = HashSet::from_iter(prev_highlights.iter().cloned());
+
+        for hl in highlights {
+            if !prev_hl_set.contains(&hl) {
+                self.speech.speak(&hl, false)?;
+            }
+        }
+        Ok(())
     }
 
     fn autoread(
@@ -542,9 +573,9 @@ impl ScreenReader {
                     false
                 } else if text.contains("\n") && text.len() > screen_state.screen.size().0 as usize
                 {
-                    self.speech.speak(&text, false)?;
+                    //self.speech.speak(&text, false)?;
                     text_read = Some(text);
-                    false
+                    true
                 } else {
                     true // Diff instead
                 }
@@ -596,11 +627,16 @@ impl ScreenReader {
                     .count()
                     > 1
             {
-                for change in line_changes
-                    .iter_all_changes()
-                    .filter(|c| c.tag() == ChangeTag::Insert)
-                {
-                    text.push_str(&format!("{}\n", change));
+                // If a line was deleted and re-added somewhere else, don't read it.
+                let mut deleted_lines = HashSet::new();
+                for change in line_changes.iter_all_changes() {
+                    match change.tag() {
+                        ChangeTag::Delete => drop(deleted_lines.insert(change.to_string())),
+                        ChangeTag::Insert if !deleted_lines.contains(&change.to_string()) => {
+                            text.push_str(&format!("{}\n", change))
+                        }
+                        _ => {}
+                    }
                 }
             } else {
                 for change in diff_graphemes(Algorithm::Myers, &old, &new)

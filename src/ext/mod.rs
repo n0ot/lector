@@ -1,3 +1,5 @@
+use vt100::Color;
+
 pub trait ScreenExt {
     /// Find the first cell between (row_start, col_start) and (row_end, col_end) where matcher(cell) returns true.
     fn find_cell<F>(
@@ -36,6 +38,9 @@ pub trait ScreenExt {
     /// characters.
     /// Only the current row will be considered.
     fn find_word_end(&self, row: u16, col: u16) -> u16;
+
+    /// Get the highlighted text on this screen.
+    fn get_highlights(&self) -> Vec<String>;
 }
 
 impl ScreenExt for vt100::Screen {
@@ -139,15 +144,52 @@ impl ScreenExt for vt100::Screen {
         self.find_cell(CellExt::is_in_word, row, col, row, last)
             .map_or(last, |v| v.1 - 1)
     }
+
+    fn get_highlights(&self) -> Vec<String> {
+        let mut highlights = Vec::new();
+        for row in 0..self.size().0 {
+            let mut highlight_start = None;
+            for col in 0..self.size().1 {
+                if let Some(cell) = self.cell(row, col) {
+                    match highlight_start {
+                        Some(start) => {
+                            if !cell.is_highlighted() || col == self.size().1 - 1 {
+                                highlights.push(self.contents_between(row, start, row, col + 1));
+                                highlight_start = None;
+                            }
+                        }
+                        None => {
+                            if cell.is_highlighted() {
+                                if col == self.size().1 - 1 {
+                                    highlights.push(self.contents_between(row, col, row, col + 1));
+                                } else {
+                                    highlight_start = Some(col);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        highlights
+    }
 }
 
 pub trait CellExt {
     /// Returns true if this cell is in a word.
     fn is_in_word(&self) -> bool;
+
+    /// Returns true if this cell is highlighted (black on yellow).
+    fn is_highlighted(&self) -> bool;
 }
 
 impl CellExt for vt100::Cell {
     fn is_in_word(&self) -> bool {
         !self.contents().chars().any(char::is_whitespace)
+    }
+
+    fn is_highlighted(&self) -> bool {
+        self.bgcolor() == Color::Idx(11) && self.fgcolor() == Color::Idx(0)
     }
 }
