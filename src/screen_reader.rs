@@ -540,7 +540,7 @@ impl ScreenReader {
                 // If we got the character we just typed, don't read it or do a diff
                 if echoed_char {
                     false
-                } else if text.contains("\n") {
+                } else if text.contains("\n") && text.len() > screen_state.screen.size().0 as usize {
                     self.speech.speak(&text, false)?;
                     text_read = Some(text);
                     false
