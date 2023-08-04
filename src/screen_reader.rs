@@ -921,28 +921,24 @@ impl ScreenReader {
 
     fn action_review_top(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
         screen_state.review_cursor_position.0 = 0;
-        self.speech.speak("top", false)?;
         self.action_review_line_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_bottom(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
         screen_state.review_cursor_position.0 = screen_state.screen.size().0 - 1;
-        self.speech.speak("bottom", false)?;
         self.action_review_line_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_first(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
         screen_state.review_cursor_position.1 = 0;
-        self.speech.speak("left", false)?;
         self.action_review_char_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_last(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
         screen_state.review_cursor_position.1 = screen_state.screen.size().1 - 1;
-        self.speech.speak("right", false)?;
         self.action_review_char_read(screen_state)?;
         Ok(false)
     }
