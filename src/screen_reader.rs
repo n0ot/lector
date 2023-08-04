@@ -627,16 +627,11 @@ impl ScreenReader {
                     .count()
                     > 1
             {
-                // If a line was deleted and re-added somewhere else, don't read it.
-                let mut deleted_lines = HashSet::new();
-                for change in line_changes.iter_all_changes() {
-                    match change.tag() {
-                        ChangeTag::Delete => drop(deleted_lines.insert(change.to_string())),
-                        ChangeTag::Insert if !deleted_lines.contains(&change.to_string()) => {
-                            text.push_str(&format!("{}\n", change))
-                        }
-                        _ => {}
-                    }
+                for change in line_changes
+                    .iter_all_changes()
+                    .filter(|c| c.tag() == ChangeTag::Insert)
+                {
+                    text.push_str(&format!("{}\n", change))
                 }
             } else {
                 for change in diff_graphemes(Algorithm::Myers, &old, &new)
