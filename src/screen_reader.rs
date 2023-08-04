@@ -540,7 +540,8 @@ impl ScreenReader {
                 // If we got the character we just typed, don't read it or do a diff
                 if echoed_char {
                     false
-                } else if text.contains("\n") && text.len() > screen_state.screen.size().0 as usize {
+                } else if text.contains("\n") && text.len() > screen_state.screen.size().0 as usize
+                {
                     self.speech.speak(&text, false)?;
                     text_read = Some(text);
                     false
@@ -648,6 +649,14 @@ impl ScreenReader {
                     cursor.0,
                     cursor.1 + 1,
                 );
+                // Avoid randomly saying "space".
+                // Unfortunately this means moving the cursor manually over a space will say
+                // nothing.
+                let ch = if ch.trim().is_empty() {
+                    "".to_string()
+                } else {
+                    ch
+                };
                 cursor_report = Some(ch);
             }
         }
