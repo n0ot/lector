@@ -355,6 +355,8 @@ impl ScreenReader {
         let mut vte_parser = vte::Parser::new();
         // Store new text to be read.
         let mut text_reporter = perform::TextReporter::new();
+        let ansi_csi_re =
+            regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]$").unwrap();
 
         // Set up a mio poll, to select between reading from stdin, and the PTY.
         let mut signals = Signals::new([SIGWINCH])?;
@@ -403,8 +405,12 @@ impl ScreenReader {
                             Ok(n) => n,
                             Err(e) => bail!("error reading from input: {}", e),
                         };
-                        self.last_key = buf[0..n].to_owned();
-                        self.speech.stop()?;
+                        // Don't silence speech or set the last key for key echo,
+                        // when receiving a CSI dispatch.
+                        if !ansi_csi_re.is_match(&buf[0..n]) {
+                            self.last_key = buf[0..n].to_owned();
+                            self.speech.stop()?;
+                        }
                         let pass_through = match KEYMAP.get(std::str::from_utf8(&buf[0..n])?) {
                             Some(&v) => {
                                 self.handle_action(&mut screen_state, &mut pty_stream, v)?
