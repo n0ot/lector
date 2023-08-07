@@ -356,7 +356,7 @@ impl ScreenReader {
         // Store new text to be read.
         let mut text_reporter = perform::TextReporter::new();
         let ansi_csi_re =
-            regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E]$").unwrap();
+            regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$").unwrap();
 
         // Set up a mio poll, to select between reading from stdin, and the PTY.
         let mut signals = Signals::new([SIGWINCH])?;
