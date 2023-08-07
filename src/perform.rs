@@ -6,6 +6,7 @@ pub struct TextReporter {
     text: String,
     /// True if the next call to `[print]` should clear the text.
     reset: bool,
+    pub csi_dispatches: usize,
 }
 
 impl TextReporter {
@@ -13,6 +14,7 @@ impl TextReporter {
         TextReporter {
             text: String::new(),
             reset: false,
+            csi_dispatches: 0,
         }
     }
 
@@ -23,6 +25,7 @@ impl TextReporter {
             self.text.clear();
         }
         self.reset = true;
+        self.csi_dispatches = 0;
         &self.text
     }
 }
@@ -53,6 +56,7 @@ impl Perform for TextReporter {
 
     fn csi_dispatch(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _c: char) {
         // Nothing to do
+        self.csi_dispatches += 1;
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {

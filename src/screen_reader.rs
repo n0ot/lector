@@ -559,6 +559,7 @@ impl ScreenReader {
         // Try to read any incoming text.
         // Fall back to a screen diff if that makes more sense.
         let mut text_read = None;
+        let csi_dispatches = text_reporter.csi_dispatches;
         let text = text_reporter.get_text();
         let diffing = match text {
             "" => true,
@@ -571,11 +572,10 @@ impl ScreenReader {
                 // If we got the character we just typed, don't read it or do a diff
                 if echoed_char {
                     false
-                } else if text.contains("\n") && text.len() > screen_state.screen.size().0 as usize
-                {
-                    //self.speech.speak(&text, false)?;
+                } else if csi_dispatches == 0 || text.len() / csi_dispatches >= 15 {
+                    self.speech.speak(&text, false)?;
                     text_read = Some(text);
-                    true
+                    false
                 } else {
                     true // Diff instead
                 }
