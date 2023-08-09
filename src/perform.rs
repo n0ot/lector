@@ -42,7 +42,7 @@ impl Perform for TextReporter {
     fn execute(&mut self, byte: u8) {
         match byte {
             10 | 13 => self.text.push('\n'),
-            _ => {},
+            _ => {}
         }
     }
 

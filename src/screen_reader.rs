@@ -5,7 +5,7 @@ use phf::phf_map;
 use ptyprocess::PtyProcess;
 use signal_hook::consts::signal::*;
 use signal_hook_mio::v0_8::Signals;
-use similar::{utils::diff_graphemes, Algorithm, ChangeTag, TextDiff};
+use similar::{ChangeTag, TextDiff};
 use std::{
     cmp::min,
     collections::HashSet,
@@ -356,7 +356,8 @@ impl ScreenReader {
         // Store new text to be read.
         let mut text_reporter = perform::TextReporter::new();
         let ansi_csi_re =
-            regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$").unwrap();
+            regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$")
+                .unwrap();
 
         // Set up a mio poll, to select between reading from stdin, and the PTY.
         let mut signals = Signals::new([SIGWINCH])?;
@@ -605,46 +606,89 @@ impl ScreenReader {
 
             let line_changes = TextDiff::from_lines(&old, &new);
             // One deletion followed by one insertion, and no other changes,
-            // means only a single line changed. In that case, only report what changed in the
+            // means only a single line changed. In that case, only report what changed in that
             // line.
             // Otherwise, report the entire lines that were added.
-            let mut diff_mode_lines = false;
-            let mut prev_tag = None;
-            let mut insertions = 0;
-            for tag in line_changes.iter_all_changes().map(|c| c.tag()) {
-                if tag != ChangeTag::Insert {
-                    prev_tag = Some(tag);
-                    continue;
+            #[derive(PartialEq)]
+            enum DiffState {
+                /// Nothing has changed
+                NoChanges,
+                /// A single line was deleted
+                OneDeletion,
+                /// One deletion followed by one insertion
+                Single,
+                /// Anything else (including a single insertion)
+                Multi,
+            }
+            let mut diff_state = DiffState::NoChanges;
+            for change in line_changes.iter_all_changes() {
+                diff_state = match diff_state {
+                    DiffState::NoChanges => match change.tag() {
+                        ChangeTag::Delete => DiffState::OneDeletion,
+                        ChangeTag::Equal => DiffState::NoChanges,
+                        ChangeTag::Insert => DiffState::Multi,
+                    },
+                    DiffState::OneDeletion => match change.tag() {
+                        ChangeTag::Delete => DiffState::Multi,
+                        ChangeTag::Equal => DiffState::OneDeletion,
+                        ChangeTag::Insert => DiffState::Single,
+                    },
+                    DiffState::Single => match change.tag() {
+                        ChangeTag::Equal => DiffState::Single,
+                        _ => DiffState::Multi,
+                    },
+                    DiffState::Multi => DiffState::Multi,
+                };
+                if change.tag() == ChangeTag::Insert {
+                    text.push_str(&format!("{}\n", change));
                 }
-                if prev_tag != Some(ChangeTag::Delete) || insertions > 0 {
-                    diff_mode_lines = true;
-                    break;
-                }
-                insertions += 1;
-                prev_tag = Some(tag);
             }
 
-            // But even if there was only a single line changed, we still want to read the whole line if there's
-            // more than one grapheme change.
-            if diff_mode_lines
-                || diff_graphemes(Algorithm::Myers, &old, &new)
-                    .iter()
-                    .filter(|c| c.0 != ChangeTag::Equal)
-                    .count()
-                    > 1
-            {
-                for change in line_changes
-                    .iter_all_changes()
-                    .filter(|c| c.tag() == ChangeTag::Insert)
-                {
-                    text.push_str(&format!("{}\n", change))
+            if diff_state == DiffState::Single {
+                let mut graphemes = String::new();
+                // If there isn't just a single change, just read the whole line.
+                diff_state = DiffState::NoChanges;
+                let mut prev_tag = None;
+                for change in TextDiff::from_graphemes(&old, &new).iter_all_changes() {
+                    diff_state = match diff_state {
+                        DiffState::NoChanges => match change.tag() {
+                            ChangeTag::Delete => DiffState::OneDeletion,
+                            ChangeTag::Equal => DiffState::NoChanges,
+                            ChangeTag::Insert => DiffState::Single,
+                        },
+                        DiffState::OneDeletion => match change.tag() {
+                            ChangeTag::Delete if prev_tag == Some(ChangeTag::Delete) => {
+                                DiffState::OneDeletion
+                            }
+                            ChangeTag::Equal => DiffState::OneDeletion,
+                            ChangeTag::Insert if prev_tag == Some(ChangeTag::Delete) => {
+                                DiffState::Single
+                            }
+                            _ => DiffState::Multi,
+                        },
+                        DiffState::Single => match change.tag() {
+                            ChangeTag::Equal => DiffState::Single,
+                            ChangeTag::Insert
+                                if prev_tag == Some(ChangeTag::Insert)
+                                    || prev_tag == Some(ChangeTag::Delete) =>
+                            {
+                                DiffState::Single
+                            }
+                            _ => DiffState::Multi,
+                        },
+                        DiffState::Multi => DiffState::Multi,
+                    };
+                    prev_tag = Some(change.tag());
+                    if diff_state == DiffState::Multi {
+                        continue; // Revert to the line diff.
+                    }
+                    if change.tag() == ChangeTag::Insert {
+                        graphemes.push_str(&format!("{}", change).trim());
+                    }
                 }
-            } else {
-                for change in diff_graphemes(Algorithm::Myers, &old, &new)
-                    .iter()
-                    .filter(|c| c.0 == ChangeTag::Insert)
-                {
-                    text.push_str(&format!("{} ", change.1));
+
+                if diff_state != DiffState::Multi {
+                    text = graphemes;
                 }
             }
 
