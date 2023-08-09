@@ -44,6 +44,7 @@ impl Perform for TextReporter {
 
     fn execute(&mut self, byte: u8) {
         match byte {
+            8 => self.cursor_moves += 1,
             10 | 13 => self.text.push('\n'),
             _ => {}
         }
