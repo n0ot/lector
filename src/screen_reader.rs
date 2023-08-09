@@ -22,6 +22,7 @@ const MAX_DIFF_DELAY: u16 = 300;
 #[derive(Copy, Clone)]
 enum Action {
     ToggleHelp,
+    ToggleAutoRead,
     StopSpeaking,
     RevLinePrev,
     RevLineNext,
@@ -53,6 +54,7 @@ impl Action {
     fn help_text(&self) -> String {
         match self {
             Action::ToggleHelp => "toggle help".into(),
+            Action::ToggleAutoRead => "toggle auto read".into(),
             Action::StopSpeaking => "stop speaking".into(),
             Action::RevLinePrev => "previous line".into(),
             Action::RevLineNext => "next line".into(),
@@ -84,6 +86,7 @@ impl Action {
 
 static KEYMAP: phf::Map<&'static str, Action> = phf_map! {
     "\x1BOP" => Action::ToggleHelp,
+    "\x1B'" => Action::ToggleAutoRead,
     "\x1Bx" => Action::StopSpeaking,
     "\x1Bu" => Action::RevLinePrev,
     "\x1Bo" => Action::RevLineNext,
@@ -291,6 +294,7 @@ enum CursorTrackingMode {
 pub struct ScreenReader {
     speech: speech::Speech,
     help_mode: bool,
+    auto_read: bool,
     last_key: Vec<u8>,
     cursor_tracking_mode: CursorTrackingMode,
     highlight_tracking: bool,
@@ -302,6 +306,7 @@ impl ScreenReader {
         Ok(ScreenReader {
             speech: speech::new()?,
             help_mode: false,
+            auto_read: true,
             last_key: Vec::new(),
             cursor_tracking_mode: CursorTrackingMode::On,
             highlight_tracking: false,
@@ -351,7 +356,7 @@ impl ScreenReader {
             last_indent_level: 0,
         };
 
-        // We also want to separately keep track of incoming bytes, for autoread.
+        // We also want to separately keep track of incoming bytes, for auto read.
         let mut vte_parser = vte::Parser::new();
         // Store new text to be read.
         let mut text_reporter = perform::TextReporter::new();
@@ -441,13 +446,15 @@ impl ScreenReader {
                         };
                         stdout.write_all(&buf[0..n]).context("write PTY output")?;
                         stdout.flush().context("flush output")?;
-                        for b in &buf[0..n] {
-                            vte_parser.advance(&mut text_reporter, *b);
+                        if self.auto_read {
+                            for b in &buf[0..n] {
+                                vte_parser.advance(&mut text_reporter, *b);
+                            }
                         }
 
                         self.process_screen_changes(&mut screen_state, &mut parser, &buf[0..n]);
                         // Stop blocking indefinitely until this screen is old enough to be
-                        // autoread.
+                        // auto read.
                         poll_timeout = Some(time::Duration::from_millis(DIFF_DELAY as u64));
                         last_pty_update = Some(time::Instant::now());
                     }
@@ -492,7 +499,17 @@ impl ScreenReader {
                     if self.highlight_tracking {
                         self.track_highlighting(&screen_state)?;
                     }
-                    self.autoread(&mut screen_state, &mut text_reporter)?;
+                    let read_text = if self.auto_read {
+                        self.auto_read(&mut screen_state, &mut text_reporter)?
+                    } else {
+                        // If the text reporter wasn't drained since auto read was last disabled,
+                        // it will be read when auto read is re-enabled, which is not desirable.
+                        let _ = text_reporter.get_text();
+                        false
+                    };
+                    if !read_text {
+                        self.track_cursor(&screen_state)?;
+                    }
                     screen_state.prev_screen = screen_state.screen.clone();
                     screen_state.prev_screen_time = time::Instant::now();
                 }
@@ -536,15 +553,14 @@ impl ScreenReader {
         Ok(())
     }
 
-    fn autoread(
+    /// Read what's changed between the current and previous screen.
+    /// If anything was read, the value in the result will be true.
+    fn auto_read(
         &mut self,
         screen_state: &mut ScreenState,
         text_reporter: &mut perform::TextReporter,
-    ) -> Result<()> {
-        let (prev_cursor, cursor) = (
-            screen_state.prev_screen.cursor_position(),
-            screen_state.screen.cursor_position(),
-        );
+    ) -> Result<bool> {
+        let cursor = screen_state.screen.cursor_position();
 
         let indent_level = screen_state
             .screen
@@ -562,9 +578,12 @@ impl ScreenReader {
             screen_state.last_indent_level = indent_level;
         }
 
-        // Keep track of what was autoread, and don't repeat it when tracking the cursor.
         // Try to read any incoming text.
         // Fall back to a screen diff if that makes more sense.
+        if screen_state.screen.contents() == screen_state.prev_screen.contents() {
+            return Ok(false);
+        }
+
         let mut text_read = None;
         let cursor_moves = text_reporter.cursor_moves;
         let scrolled = text_reporter.scrolled;
@@ -697,6 +716,15 @@ impl ScreenReader {
             text_read = Some(&text);
         }
 
+        Ok(text_read.is_some())
+    }
+
+    fn track_cursor(&mut self, screen_state: &ScreenState) -> Result<()> {
+        let (prev_cursor, cursor) = (
+            screen_state.prev_screen.cursor_position(),
+            screen_state.screen.cursor_position(),
+        );
+
         let mut cursor_report: Option<String> = None;
         if cursor.0 != prev_cursor.0 {
             // It moved to a different line
@@ -744,12 +772,13 @@ impl ScreenReader {
         }
 
         match &self.cursor_tracking_mode {
-            CursorTrackingMode::On => match cursor_report {
-                Some(s) if text_read.map_or(true, str::is_empty) => self.speech.speak(&s, false)?,
-                _ => {}
-            },
+            CursorTrackingMode::On => {
+                if let Some(s) = cursor_report {
+                    self.speech.speak(&s, false)?;
+                }
+            }
             CursorTrackingMode::OffOnce => self.cursor_tracking_mode = CursorTrackingMode::On,
-            CursorTrackingMode::Off => (),
+            CursorTrackingMode::Off => {}
         }
 
         Ok(())
@@ -770,6 +799,7 @@ impl ScreenReader {
         }
 
         match action {
+            Action::ToggleAutoRead => self.action_toggle_auto_read(),
             Action::StopSpeaking => self.action_stop(),
             Action::RevLinePrev => self.action_review_line_prev(screen_state),
             Action::RevLineNext => self.action_review_line_next(screen_state),
@@ -807,6 +837,18 @@ impl ScreenReader {
 impl ScreenReader {
     fn action_stop(&mut self) -> Result<bool> {
         self.speech.stop()?;
+        Ok(false)
+    }
+
+    fn action_toggle_auto_read(&mut self) -> Result<bool> {
+        if self.auto_read {
+            self.auto_read = false;
+            self.speech.speak("auto read disabled", false)?;
+        } else {
+            self.auto_read = true;
+            self.speech.speak("auto read enabled", false)?;
+        }
+
         Ok(false)
     }
 
