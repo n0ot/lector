@@ -6,7 +6,8 @@ pub struct TextReporter {
     text: String,
     /// True if the next call to `[print]` should clear the text.
     reset: bool,
-    pub csi_dispatches: usize,
+    pub cursor_moves: usize,
+    pub scrolled: bool,
 }
 
 impl TextReporter {
@@ -14,7 +15,8 @@ impl TextReporter {
         TextReporter {
             text: String::new(),
             reset: false,
-            csi_dispatches: 0,
+            cursor_moves: 0,
+            scrolled: false,
         }
     }
 
@@ -25,7 +27,8 @@ impl TextReporter {
             self.text.clear();
         }
         self.reset = true;
-        self.csi_dispatches = 0;
+        self.cursor_moves = 0;
+        self.scrolled = false;
         &self.text
     }
 }
@@ -54,9 +57,15 @@ impl Perform for TextReporter {
         // Nothing to do
     }
 
-    fn csi_dispatch(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _c: char) {
-        // Nothing to do
-        self.csi_dispatches += 1;
+    fn csi_dispatch(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, c: char) {
+        if let None = intermediates.first() {
+            match c {
+                'A'..='H' => self.cursor_moves += 1,
+                // We'll set scrolled to true, even if we're just setting the scroll region
+                'S' | 'T' | 'r' => self.scrolled = true,
+                _ => {}
+            }
+        }
     }
 
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {
