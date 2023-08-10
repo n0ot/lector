@@ -62,8 +62,7 @@ impl Perform for TextReporter {
         if let None = intermediates.first() {
             match c {
                 'A'..='H' => self.cursor_moves += 1,
-                // We'll set scrolled to true, even if we're just setting the scroll region
-                'S' | 'T' | 'r' => self.scrolled = true,
+                'S' | 'T' => self.scrolled = true,
                 _ => {}
             }
         }

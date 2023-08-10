@@ -5,7 +5,7 @@ use phf::phf_map;
 use ptyprocess::PtyProcess;
 use signal_hook::consts::signal::*;
 use signal_hook_mio::v0_8::Signals;
-use similar::{ChangeTag, TextDiff};
+use similar::{Algorithm, ChangeTag, TextDiff};
 use std::{
     cmp::min,
     collections::HashSet,
@@ -578,145 +578,146 @@ impl ScreenReader {
             screen_state.last_indent_level = indent_level;
         }
 
-        // Try to read any incoming text.
-        // Fall back to a screen diff if that makes more sense.
         if screen_state.screen.contents() == screen_state.prev_screen.contents() {
             return Ok(false);
         }
 
-        let mut text_read = None;
+        // Try to read any incoming text.
+        // Fall back to a screen diff if that makes more sense.
         let cursor_moves = text_reporter.cursor_moves;
         let scrolled = text_reporter.scrolled;
         let text = text_reporter.get_text();
-        let diffing = match text {
-            "" => true,
-            _ => {
-                let echoed_char = match std::str::from_utf8(&self.last_key) {
-                    Ok(s) if text == s => true,
-                    _ => false,
-                };
-
-                // If we got the character we just typed, don't read it or do a diff
-                if echoed_char {
-                    false
-                } else if cursor_moves == 0 || scrolled {
-                    self.speech.speak(&text, false)?;
-                    text_read = Some(text);
-                    false
-                } else {
-                    true // Diff instead
-                }
+        if !text.is_empty() && (cursor_moves == 0 || scrolled) {
+            // Don't echo typed keys
+            match std::str::from_utf8(&self.last_key) {
+                Ok(s) if text == s => {}
+                _ => self.speech.speak(&text, false)?,
             }
-        };
 
+            // We still want to report that text was read when suppressing echo,
+            // so that cursor tracking doesn't read the character that follows as we type.
+            return Ok(true);
+        }
+
+        // Do a diff instead
         let mut text = String::new();
-        if diffing {
-            let old = screen_state
-                .prev_screen
-                .contents()
-                .lines()
-                .map(|l| format!("{}\n", l.trim()))
-                .collect::<String>();
-            let new = screen_state
-                .screen
-                .contents()
-                .lines()
-                .map(|l| format!("{}\n", l.trim()))
-                .collect::<String>();
+        let old = screen_state
+            .prev_screen
+            .contents()
+            .lines()
+            .map(|l| format!("{}\n", l.trim()))
+            .collect::<String>();
+        let new = screen_state
+            .screen
+            .contents()
+            .lines()
+            .map(|l| format!("{}\n", l.trim()))
+            .collect::<String>();
 
-            let line_changes = TextDiff::from_lines(&old, &new);
-            // One deletion followed by one insertion, and no other changes,
-            // means only a single line changed. In that case, only report what changed in that
-            // line.
-            // Otherwise, report the entire lines that were added.
-            #[derive(PartialEq)]
-            enum DiffState {
-                /// Nothing has changed
-                NoChanges,
-                /// A single line was deleted
-                OneDeletion,
-                /// One deletion followed by one insertion
-                Single,
-                /// Anything else (including a single insertion)
-                Multi,
+        let line_changes = TextDiff::configure()
+            .algorithm(Algorithm::Patience)
+            .diff_lines(&old, &new);
+        // One deletion followed by one insertion, and no other changes,
+        // means only a single line changed. In that case, only report what changed in that
+        // line.
+        // Otherwise, report the entire lines that were added.
+        #[derive(PartialEq)]
+        enum DiffState {
+            /// Nothing has changed
+            NoChanges,
+            /// A single line was deleted
+            OneDeletion,
+            /// One deletion followed by one insertion
+            Single,
+            /// Anything else (including a single insertion)
+            Multi,
+        }
+        let mut diff_state = DiffState::NoChanges;
+        for change in line_changes.iter_all_changes() {
+            diff_state = match diff_state {
+                DiffState::NoChanges => match change.tag() {
+                    ChangeTag::Delete => DiffState::OneDeletion,
+                    ChangeTag::Equal => DiffState::NoChanges,
+                    ChangeTag::Insert => DiffState::Multi,
+                },
+                DiffState::OneDeletion => match change.tag() {
+                    ChangeTag::Delete => DiffState::Multi,
+                    ChangeTag::Equal => DiffState::OneDeletion,
+                    ChangeTag::Insert => DiffState::Single,
+                },
+                DiffState::Single => match change.tag() {
+                    ChangeTag::Equal => DiffState::Single,
+                    _ => DiffState::Multi,
+                },
+                DiffState::Multi => DiffState::Multi,
+            };
+            if change.tag() == ChangeTag::Insert {
+                text.push_str(&format!("{}\n", change));
             }
-            let mut diff_state = DiffState::NoChanges;
-            for change in line_changes.iter_all_changes() {
+        }
+
+        if diff_state == DiffState::Single {
+            let mut graphemes = String::new();
+            // If there isn't just a single change, just read the whole line.
+            diff_state = DiffState::NoChanges;
+            let mut prev_tag = None;
+            for change in TextDiff::configure()
+                .algorithm(Algorithm::Patience)
+                .diff_graphemes(&old, &new)
+                .iter_all_changes()
+            {
                 diff_state = match diff_state {
                     DiffState::NoChanges => match change.tag() {
                         ChangeTag::Delete => DiffState::OneDeletion,
                         ChangeTag::Equal => DiffState::NoChanges,
-                        ChangeTag::Insert => DiffState::Multi,
+                        ChangeTag::Insert => DiffState::Single,
                     },
                     DiffState::OneDeletion => match change.tag() {
-                        ChangeTag::Delete => DiffState::Multi,
+                        ChangeTag::Delete if prev_tag == Some(ChangeTag::Delete) => {
+                            DiffState::OneDeletion
+                        }
                         ChangeTag::Equal => DiffState::OneDeletion,
-                        ChangeTag::Insert => DiffState::Single,
+                        ChangeTag::Insert if prev_tag == Some(ChangeTag::Delete) => {
+                            DiffState::Single
+                        }
+                        _ => DiffState::Multi,
                     },
                     DiffState::Single => match change.tag() {
                         ChangeTag::Equal => DiffState::Single,
+                        ChangeTag::Insert
+                            if prev_tag == Some(ChangeTag::Insert)
+                                || prev_tag == Some(ChangeTag::Delete) =>
+                        {
+                            DiffState::Single
+                        }
                         _ => DiffState::Multi,
                     },
                     DiffState::Multi => DiffState::Multi,
                 };
+                prev_tag = Some(change.tag());
+                if diff_state == DiffState::Multi {
+                    continue; // Revert to the line diff.
+                }
                 if change.tag() == ChangeTag::Insert {
-                    text.push_str(&format!("{}\n", change));
+                    graphemes.push_str(change.as_str().unwrap_or(""));
                 }
             }
 
-            if diff_state == DiffState::Single {
-                let mut graphemes = String::new();
-                // If there isn't just a single change, just read the whole line.
-                diff_state = DiffState::NoChanges;
-                let mut prev_tag = None;
-                for change in TextDiff::from_graphemes(&old, &new).iter_all_changes() {
-                    diff_state = match diff_state {
-                        DiffState::NoChanges => match change.tag() {
-                            ChangeTag::Delete => DiffState::OneDeletion,
-                            ChangeTag::Equal => DiffState::NoChanges,
-                            ChangeTag::Insert => DiffState::Single,
-                        },
-                        DiffState::OneDeletion => match change.tag() {
-                            ChangeTag::Delete if prev_tag == Some(ChangeTag::Delete) => {
-                                DiffState::OneDeletion
-                            }
-                            ChangeTag::Equal => DiffState::OneDeletion,
-                            ChangeTag::Insert if prev_tag == Some(ChangeTag::Delete) => {
-                                DiffState::Single
-                            }
-                            _ => DiffState::Multi,
-                        },
-                        DiffState::Single => match change.tag() {
-                            ChangeTag::Equal => DiffState::Single,
-                            ChangeTag::Insert
-                                if prev_tag == Some(ChangeTag::Insert)
-                                    || prev_tag == Some(ChangeTag::Delete) =>
-                            {
-                                DiffState::Single
-                            }
-                            _ => DiffState::Multi,
-                        },
-                        DiffState::Multi => DiffState::Multi,
-                    };
-                    prev_tag = Some(change.tag());
-                    if diff_state == DiffState::Multi {
-                        continue; // Revert to the line diff.
-                    }
-                    if change.tag() == ChangeTag::Insert {
-                        graphemes.push_str(&format!("{}", change).trim());
-                    }
-                }
-
-                if diff_state != DiffState::Multi {
-                    text = graphemes;
-                }
+            if diff_state != DiffState::Multi {
+                text = graphemes;
             }
-
-            self.speech.speak(&text, false)?;
-            text_read = Some(&text);
         }
 
-        Ok(text_read.is_some())
+        // Don't echo typed keys
+        match std::str::from_utf8(&self.last_key) {
+            // We still want to report that text was read when suppressing echo,
+            // so that cursor tracking doesn't read the character that follows as we type.
+            Ok(s) if text == s => Ok(true),
+            _ => {
+                self.speech.speak(&text, false)?;
+                Ok(!text.is_empty())
+            }
+        }
     }
 
     fn track_cursor(&mut self, screen_state: &ScreenState) -> Result<()> {
