@@ -1,4 +1,8 @@
-use super::{attributes, ext::ScreenExt, perform, speech};
+use super::{
+    attributes,
+    ext::{CellExt, ScreenExt},
+    perform, speech,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use nix::sys::termios;
 use phf::phf_map;
@@ -602,12 +606,8 @@ impl ScreenReader {
 
         // Do a diff instead
         let mut text = String::new();
-        let old = screen_state
-            .prev_screen
-            .contents_full();
-        let new = screen_state
-            .screen
-            .contents_full();
+        let old = screen_state.prev_screen.contents_full();
+        let new = screen_state.screen.contents_full();
 
         let line_changes = TextDiff::configure()
             .algorithm(Algorithm::Patience)
@@ -1016,13 +1016,30 @@ impl ScreenReader {
     }
 
     fn action_review_first(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        screen_state.review_cursor_position.1 = 0;
+        let (row, col) = screen_state.review_cursor_position;
+        let last = screen_state.screen.size().1 - 1;
+        screen_state.review_cursor_position.1 = match col {
+            0 => screen_state
+                .screen
+                .find_cell(CellExt::is_in_word, row, 0, row, last)
+                .map_or(0, |(_, col)| col),
+            _ => 0,
+        };
         self.action_review_char_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_last(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        screen_state.review_cursor_position.1 = screen_state.screen.size().1 - 1;
+        let (row, col) = screen_state.review_cursor_position;
+        let last = screen_state.screen.size().1 - 1;
+        screen_state.review_cursor_position.1 = if col == last {
+            screen_state
+                .screen
+                .rfind_cell(CellExt::is_in_word, row, 0, row, last)
+                .map_or(last, |(_, col)| col)
+        } else {
+            last
+        };
         self.action_review_char_read(screen_state)?;
         Ok(false)
     }
