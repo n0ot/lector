@@ -63,7 +63,7 @@ fn describe_repeated_graphemes(s: &str) -> String {
     // and because we need to iterate one time pass the end of the string to report the count of
     // the last grapheme run.
     UnicodeSegmentation::graphemes(s, true)
-        .map(|s| Some(s))
+        .map(Some)
         .chain(std::iter::once(None))
         .scan((0, None), |(count, prev_g), g| {
             let result = match g {

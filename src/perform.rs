@@ -59,7 +59,7 @@ impl Perform for TextReporter {
     }
 
     fn csi_dispatch(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, c: char) {
-        if let None = intermediates.first() {
+        if intermediates.first().is_none() {
             match c {
                 'A'..='H' => self.cursor_moves += 1,
                 'S' | 'T' => self.scrolled = true,

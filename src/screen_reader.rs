@@ -592,7 +592,7 @@ impl ScreenReader {
             // Don't echo typed keys
             match std::str::from_utf8(&self.last_key) {
                 Ok(s) if text == s => {}
-                _ => self.speech.speak(&text, false)?,
+                _ => self.speech.speak(text, false)?,
             }
 
             // We still want to report that text was read when suppressing echo,
@@ -815,9 +815,9 @@ impl ScreenReader {
             Action::Backspace => self.action_backspace(screen_state),
             Action::Delete => self.action_delete(screen_state),
             Action::SayTime => self.action_say_time(),
-            Action::SetMark => self.action_set_mark(&screen_state),
-            Action::Copy => self.action_copy(&screen_state),
-            Action::Paste => self.action_paste(&screen_state, pty_stream),
+            Action::SetMark => self.action_set_mark(screen_state),
+            Action::Copy => self.action_copy(screen_state),
+            Action::Paste => self.action_paste(screen_state, pty_stream),
             Action::SayClipboard => self.action_clipboard_say(),
             Action::PreviousClipboard => self.action_clipboard_prev(),
             Action::NextClipboard => self.action_clipboard_next(),
@@ -1193,7 +1193,7 @@ impl ScreenReader {
 
     fn action_clipboard_say(&mut self) -> Result<bool> {
         match self.clipboard.get() {
-            Some(contents) => self.speech.speak(&contents, false)?,
+            Some(contents) => self.speech.speak(contents, false)?,
             None => self.speech.speak("no clipboard", false)?,
         }
         Ok(false)

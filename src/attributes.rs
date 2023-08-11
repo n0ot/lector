@@ -519,7 +519,7 @@ pub fn describe_color(color: vt100::Color) -> String {
         },
         Rgb(r, g, b) => {
             let rgb = format!("#{:02X}{:02X}{:02X}", r, g, b);
-            match RGB_INDEX.get(&rgb).and_then(|i| COLORS.get(&i)) {
+            match RGB_INDEX.get(&rgb).and_then(|i| COLORS.get(i)) {
             Some(s) => s.to_string(),
             None => rgb,
         }
