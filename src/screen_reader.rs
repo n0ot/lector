@@ -524,18 +524,19 @@ impl ScreenReader {
         buf: &[u8],
     ) {
         parser.process(buf);
-        let prev_screen = screen_state.screen.clone();
-        screen_state.screen = parser.screen().clone();
-        // If the cursor moved, move the review cursor to its location.
-        if screen_state.screen.cursor_position() != prev_screen.cursor_position() {
-            screen_state.review_cursor_position = screen_state.screen.cursor_position()
+        let prev_screen = &screen_state.screen;
+        // If the screen updated, route the review cursor to the application cursor.
+        if !parser.screen().state_diff(prev_screen).is_empty() {
+            screen_state.review_cursor_position = parser.screen().cursor_position()
         }
         // If the screen's size changed, the cursor may now be out of bounds.
-        let term_size = screen_state.screen.size();
+        let term_size = parser.screen().size();
         screen_state.review_cursor_position = (
             min(screen_state.review_cursor_position.0, term_size.0),
             min(screen_state.review_cursor_position.1, term_size.1),
         );
+
+        screen_state.screen = parser.screen().clone();
     }
 
     fn track_highlighting(&mut self, screen_state: &ScreenState) -> Result<()> {
