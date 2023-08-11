@@ -604,16 +604,10 @@ impl ScreenReader {
         let mut text = String::new();
         let old = screen_state
             .prev_screen
-            .contents()
-            .lines()
-            .map(|l| format!("{}\n", l.trim()))
-            .collect::<String>();
+            .contents_full();
         let new = screen_state
             .screen
-            .contents()
-            .lines()
-            .map(|l| format!("{}\n", l.trim()))
-            .collect::<String>();
+            .contents_full();
 
         let line_changes = TextDiff::configure()
             .algorithm(Algorithm::Patience)

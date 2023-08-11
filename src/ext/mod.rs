@@ -41,6 +41,10 @@ pub trait ScreenExt {
 
     /// Get the highlighted text on this screen.
     fn get_highlights(&self) -> Vec<String>;
+
+    /// Get the contents of the screen, including blank lines.
+    /// Trailing whitespace will be removed from each line.
+    fn contents_full(&self) -> String;
 }
 
 impl ScreenExt for vt100::Screen {
@@ -174,6 +178,12 @@ impl ScreenExt for vt100::Screen {
 
         highlights
     }
+
+    fn contents_full(&self) -> String {
+        self.rows(0, self.size().1)
+            .map(|row| format!("{}\n", row.trim_end()))
+            .collect::<String>()
+    }
 }
 
 pub trait CellExt {
@@ -186,7 +196,7 @@ pub trait CellExt {
 
 impl CellExt for vt100::Cell {
     fn is_in_word(&self) -> bool {
-        !self.contents().chars().any(char::is_whitespace)
+        self.has_contents() && !self.contents().chars().any(char::is_whitespace)
     }
 
     fn is_highlighted(&self) -> bool {
