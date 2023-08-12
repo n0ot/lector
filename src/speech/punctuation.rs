@@ -36,6 +36,7 @@ static SYMBOL_NAMES: phf::Map<&'static str, &'static str> = phf_map! {
     "|" => "bar",
     "}" => "right brace",
     "~" => "tilde",
+    "■" => "black square",
 };
 
 static LEVEL_ALL_SYMBOLS: phf::Set<&'static str> = phf_set! {
@@ -72,6 +73,7 @@ static LEVEL_ALL_SYMBOLS: phf::Set<&'static str> = phf_set! {
     "|",
     "}",
     "~",
+    "■",
 };
 
 static LEVEL_CHARACTER_SYMBOLS: phf::Set<&'static str> = phf_set! {
@@ -109,6 +111,7 @@ static LEVEL_CHARACTER_SYMBOLS: phf::Set<&'static str> = phf_set! {
     "|",
     "}",
     "~",
+    "■",
 };
 
 #[derive(Copy, Clone)]
