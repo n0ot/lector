@@ -27,6 +27,7 @@ const MAX_DIFF_DELAY: u16 = 300;
 enum Action {
     ToggleHelp,
     ToggleAutoRead,
+    MoveReviewToScreenCursor,
     StopSpeaking,
     RevLinePrev,
     RevLineNext,
@@ -59,6 +60,7 @@ impl Action {
         match self {
             Action::ToggleHelp => "toggle help".into(),
             Action::ToggleAutoRead => "toggle auto read".into(),
+            Action::MoveReviewToScreenCursor => "move review to screen cursor".into(),
             Action::StopSpeaking => "stop speaking".into(),
             Action::RevLinePrev => "previous line".into(),
             Action::RevLineNext => "next line".into(),
@@ -91,6 +93,7 @@ impl Action {
 static KEYMAP: phf::Map<&'static str, Action> = phf_map! {
     "\x1BOP" => Action::ToggleHelp,
     "\x1B'" => Action::ToggleAutoRead,
+    "\x1B\"" => Action::MoveReviewToScreenCursor,
     "\x1Bx" => Action::StopSpeaking,
     "\x1Bu" => Action::RevLinePrev,
     "\x1Bo" => Action::RevLineNext,
@@ -514,6 +517,15 @@ impl ScreenReader {
                     if !read_text {
                         self.track_cursor(&screen_state)?;
                     }
+
+                    // Track screen cursor movements here, instead of every time the screen
+                    // updates,
+                    // to give the screen time to stabilize.
+                    if screen_state.review_cursor_position
+                        == screen_state.prev_screen.cursor_position()
+                    {
+                        screen_state.review_cursor_position = screen_state.screen.cursor_position();
+                    }
                     screen_state.prev_screen = screen_state.screen.clone();
                     screen_state.prev_screen_time = time::Instant::now();
                 }
@@ -528,11 +540,6 @@ impl ScreenReader {
         buf: &[u8],
     ) {
         parser.process(buf);
-        let prev_screen = &screen_state.screen;
-        // If the screen updated, route the review cursor to the application cursor.
-        if !parser.screen().state_diff(prev_screen).is_empty() {
-            screen_state.review_cursor_position = parser.screen().cursor_position()
-        }
         // If the screen's size changed, the cursor may now be out of bounds.
         let term_size = parser.screen().size();
         screen_state.review_cursor_position = (
@@ -796,6 +803,9 @@ impl ScreenReader {
 
         match action {
             Action::ToggleAutoRead => self.action_toggle_auto_read(),
+            Action::MoveReviewToScreenCursor => {
+                self.action_move_review_to_screen_cursor(screen_state)
+            }
             Action::StopSpeaking => self.action_stop(),
             Action::RevLinePrev => self.action_review_line_prev(screen_state),
             Action::RevLineNext => self.action_review_line_next(screen_state),
@@ -845,6 +855,15 @@ impl ScreenReader {
             self.speech.speak("auto read enabled", false)?;
         }
 
+        Ok(false)
+    }
+
+    fn action_move_review_to_screen_cursor(
+        &mut self,
+        screen_state: &mut ScreenState,
+    ) -> Result<bool> {
+        screen_state.review_cursor_position = screen_state.screen.cursor_position();
+        self.speech.speak("moved", false)?;
         Ok(false)
     }
 
