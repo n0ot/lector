@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 pub mod tdsr;
+pub mod tts;
 
 pub trait Driver {
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<()>;

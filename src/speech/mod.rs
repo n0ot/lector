@@ -46,7 +46,8 @@ impl Speech {
 }
 
 pub fn new() -> Result<Speech> {
-    let driver = Box::new(drivers::tdsr::Tdsr::new("./mac").context("create tdsr driver")?);
+    //let driver = Box::new(drivers::tdsr::Tdsr::new("./mac").context("create tdsr driver")?);
+    let driver = Box::new(drivers::tts::Tts::new().context("create TTS driver")?);
 
     Ok(Speech { driver })
 }

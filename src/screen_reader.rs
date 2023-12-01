@@ -399,7 +399,7 @@ impl ScreenReader {
         poll.registry()
             .register(&mut signals, SIGNALS_TOKEN, mio::Interest::READABLE)?;
 
-        self.speech.set_rate(720.0)?;
+        self.speech.set_rate(1.0)?;
         self.speech.speak("Welcome to lector", false)?;
 
         // Main event loop
