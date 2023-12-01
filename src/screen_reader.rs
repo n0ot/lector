@@ -27,7 +27,8 @@ const MAX_DIFF_DELAY: u16 = 300;
 enum Action {
     ToggleHelp,
     ToggleAutoRead,
-    MoveReviewToScreenCursor,
+    ToggleReviewCursorFollowsScreenCursor,
+    PassNextKey,
     StopSpeaking,
     RevLinePrev,
     RevLineNext,
@@ -60,7 +61,10 @@ impl Action {
         match self {
             Action::ToggleHelp => "toggle help".into(),
             Action::ToggleAutoRead => "toggle auto read".into(),
-            Action::MoveReviewToScreenCursor => "move review to screen cursor".into(),
+            Action::ToggleReviewCursorFollowsScreenCursor => {
+                "toggle whether review cursor follows screen cursor".into()
+            }
+            Action::PassNextKey => "forward next key press".into(),
             Action::StopSpeaking => "stop speaking".into(),
             Action::RevLinePrev => "previous line".into(),
             Action::RevLineNext => "next line".into(),
@@ -93,7 +97,8 @@ impl Action {
 static KEYMAP: phf::Map<&'static str, Action> = phf_map! {
     "\x1BOP" => Action::ToggleHelp,
     "\x1B'" => Action::ToggleAutoRead,
-    "\x1B\"" => Action::MoveReviewToScreenCursor,
+    "\x1B\"" => Action::ToggleReviewCursorFollowsScreenCursor,
+    "\x1Bn" => Action::PassNextKey,
     "\x1Bx" => Action::StopSpeaking,
     "\x1Bu" => Action::RevLinePrev,
     "\x1Bo" => Action::RevLineNext,
@@ -302,10 +307,12 @@ pub struct ScreenReader {
     speech: speech::Speech,
     help_mode: bool,
     auto_read: bool,
+    review_follows_screen_cursor: bool,
     last_key: Vec<u8>,
     cursor_tracking_mode: CursorTrackingMode,
     highlight_tracking: bool,
     clipboard: Clipboard,
+    pass_through: bool,
 }
 
 impl ScreenReader {
@@ -314,10 +321,12 @@ impl ScreenReader {
             speech: speech::new()?,
             help_mode: false,
             auto_read: true,
+            review_follows_screen_cursor: true,
             last_key: Vec::new(),
             cursor_tracking_mode: CursorTrackingMode::On,
             highlight_tracking: false,
             clipboard: Default::default(),
+            pass_through: false,
         })
     }
 
@@ -424,17 +433,24 @@ impl ScreenReader {
                             self.last_key = buf[0..n].to_owned();
                             self.speech.stop()?;
                         }
-                        let pass_through = match KEYMAP.get(std::str::from_utf8(&buf[0..n])?) {
-                            Some(&v) => {
-                                self.handle_action(&mut screen_state, &mut pty_stream, v)?
-                            }
-                            None => {
-                                if self.help_mode {
-                                    self.speech.speak("this key is unmapped", false)?;
-                                    false
-                                } else {
-                                    true
+                        let pass_through = match self.pass_through {
+                            false => match KEYMAP.get(std::str::from_utf8(&buf[0..n])?) {
+                                Some(&v) => {
+                                    self.handle_action(&mut screen_state, &mut pty_stream, v)?
                                 }
+                                None => {
+                                    if self.help_mode {
+                                        self.speech.speak("this key is unmapped", false)?;
+                                        false
+                                    } else {
+                                        true
+                                    }
+                                }
+                            },
+                            true => {
+                                // Turning pass through on should only apply for one keystroke.
+                                self.pass_through = false;
+                                true
                             }
                         };
                         if pass_through {
@@ -521,8 +537,9 @@ impl ScreenReader {
                     // Track screen cursor movements here, instead of every time the screen
                     // updates,
                     // to give the screen time to stabilize.
-                    if screen_state.review_cursor_position
-                        == screen_state.prev_screen.cursor_position()
+                    if self.review_follows_screen_cursor
+                        && screen_state.screen.cursor_position()
+                            != screen_state.prev_screen.cursor_position()
                     {
                         screen_state.review_cursor_position = screen_state.screen.cursor_position();
                     }
@@ -803,9 +820,10 @@ impl ScreenReader {
 
         match action {
             Action::ToggleAutoRead => self.action_toggle_auto_read(),
-            Action::MoveReviewToScreenCursor => {
-                self.action_move_review_to_screen_cursor(screen_state)
+            Action::ToggleReviewCursorFollowsScreenCursor => {
+                self.action_toggle_review_cursor_follows_screen_cursor(screen_state)
             }
+            Action::PassNextKey => self.action_pass_next_key(),
             Action::StopSpeaking => self.action_stop(),
             Action::RevLinePrev => self.action_review_line_prev(screen_state),
             Action::RevLineNext => self.action_review_line_next(screen_state),
@@ -858,12 +876,27 @@ impl ScreenReader {
         Ok(false)
     }
 
-    fn action_move_review_to_screen_cursor(
+    fn action_toggle_review_cursor_follows_screen_cursor(
         &mut self,
         screen_state: &mut ScreenState,
     ) -> Result<bool> {
-        screen_state.review_cursor_position = screen_state.screen.cursor_position();
-        self.speech.speak("moved", false)?;
+        self.review_follows_screen_cursor = !self.review_follows_screen_cursor;
+        match self.review_follows_screen_cursor {
+            true => {
+                screen_state.review_cursor_position = screen_state.screen.cursor_position();
+                self.speech
+                    .speak("review cursor following screen cursor", false)?;
+            }
+            false => self
+                .speech
+                .speak("review cursor not following screen cursor", false)?,
+        };
+        Ok(false)
+    }
+
+    fn action_pass_next_key(&mut self) -> Result<bool> {
+        self.pass_through = true;
+        self.speech.speak("forward next key press", false)?;
         Ok(false)
     }
 
