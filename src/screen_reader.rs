@@ -1105,6 +1105,8 @@ impl ScreenReader {
 
         let mut attrs = String::new();
         attrs.push_str(&format!(
+            "Row {} col {} ", row + 1, col + 1));
+        attrs.push_str(&format!(
             "{} {}",
             attributes::describe_color(cell.fgcolor()),
             if let vt100::Color::Default = cell.bgcolor() {
