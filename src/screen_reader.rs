@@ -32,6 +32,8 @@ enum Action {
     StopSpeaking,
     RevLinePrev,
     RevLineNext,
+    RevLinePrevNonBlank,
+    RevLineNextNonBlank,
     RevLineRead,
     RevCharPrev,
     RevCharNext,
@@ -68,6 +70,8 @@ impl Action {
             Action::StopSpeaking => "stop speaking".into(),
             Action::RevLinePrev => "previous line".into(),
             Action::RevLineNext => "next line".into(),
+            Action::RevLinePrevNonBlank => "previous non blank line".into(),
+            Action::RevLineNextNonBlank => "next non blank line".into(),
             Action::RevLineRead => "current line".into(),
             Action::RevCharPrev => "previous character".into(),
             Action::RevCharNext => "next character".into(),
@@ -102,6 +106,8 @@ static KEYMAP: phf::Map<&'static str, Action> = phf_map! {
     "\x1Bx" => Action::StopSpeaking,
     "\x1Bu" => Action::RevLinePrev,
     "\x1Bo" => Action::RevLineNext,
+    "\x1BU" => Action::RevLinePrevNonBlank,
+    "\x1BO" => Action::RevLineNextNonBlank,
     "\x1Bi" => Action::RevLineRead,
     "\x1Bm" => Action::RevCharPrev,
     "\x1B." => Action::RevCharNext,
@@ -138,25 +144,52 @@ struct ScreenState {
 
 impl ScreenState {
     /// Moves the review cursor up a line.
+    /// If skip_blank_lines is true,
+    /// the review cursor will move up to the previous non blank line,
+    /// or remain in place if this is the first non blank line.
     /// This method will return true only if the cursor moved.
-    fn review_cursor_up(&mut self) -> bool {
-        if self.review_cursor_position.0 > 0 {
-            self.review_cursor_position.0 -= 1;
-            true
-        } else {
-            false
+    fn review_cursor_up(&mut self, skip_blank_lines: bool) -> bool {
+        if self.review_cursor_position.0 == 0 {
+            return false;
         }
+        if !skip_blank_lines {
+            self.review_cursor_position.0 -= 1;
+            return true;
+        }
+
+        let row = self.review_cursor_position.0;
+        let last_col = self.screen.size().1 - 1;
+        self.review_cursor_position.0 = self
+            .screen
+            .rfind_cell(CellExt::is_in_word, 0, 0, row - 1, last_col)
+            .map_or(row, |(row, _)| row);
+
+        return self.review_cursor_position.0 != row;
     }
 
     /// Moves the review cursor down a line.
+    /// If skip_blank_lines is true,
+    /// the review cursor will move down to the next non blank line,
+    /// or remain in place if this is the last non blank line.
     /// This method will return true only if the cursor moved.
-    fn review_cursor_down(&mut self) -> bool {
-        if self.review_cursor_position.0 < self.screen.size().0 - 1 {
-            self.review_cursor_position.0 += 1;
-            true
-        } else {
-            false
+    fn review_cursor_down(&mut self, skip_blank_lines: bool) -> bool {
+        let last_row = self.screen.size().0 - 1;
+        let last_col = self.screen.size().1 - 1;
+        if self.review_cursor_position.0 == last_row {
+            return false;
         }
+        if !skip_blank_lines {
+            self.review_cursor_position.0 += 1;
+            return true;
+        }
+
+        let row = self.review_cursor_position.0;
+        self.review_cursor_position.0 = self
+            .screen
+            .find_cell(CellExt::is_in_word, row + 1, 0, last_row, last_col)
+            .map_or(row, |(row, _)| row);
+
+        return self.review_cursor_position.0 != row;
     }
 
     /// Moves the cursor to the start of the previous word,
@@ -825,8 +858,10 @@ impl ScreenReader {
             }
             Action::PassNextKey => self.action_pass_next_key(),
             Action::StopSpeaking => self.action_stop(),
-            Action::RevLinePrev => self.action_review_line_prev(screen_state),
-            Action::RevLineNext => self.action_review_line_next(screen_state),
+            Action::RevLinePrev => self.action_review_line_prev(screen_state, false),
+            Action::RevLineNext => self.action_review_line_next(screen_state, false),
+            Action::RevLinePrevNonBlank => self.action_review_line_prev(screen_state, true),
+            Action::RevLineNextNonBlank => self.action_review_line_next(screen_state, true),
             Action::RevLineRead => self.action_review_line_read(screen_state),
             Action::RevWordPrev => self.action_review_word_prev(screen_state),
             Action::RevWordNext => self.action_review_word_next(screen_state),
@@ -912,16 +947,24 @@ impl ScreenReader {
         Ok(false)
     }
 
-    fn action_review_line_prev(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if !screen_state.review_cursor_up() {
+    fn action_review_line_prev(
+        &mut self,
+        screen_state: &mut ScreenState,
+        skip_blank_lines: bool,
+    ) -> Result<bool> {
+        if !screen_state.review_cursor_up(skip_blank_lines) {
             self.speech.speak("top", false)?;
         }
         self.action_review_line_read(screen_state)?;
         Ok(false)
     }
 
-    fn action_review_line_next(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if !screen_state.review_cursor_down() {
+    fn action_review_line_next(
+        &mut self,
+        screen_state: &mut ScreenState,
+        skip_blank_lines: bool,
+    ) -> Result<bool> {
+        if !screen_state.review_cursor_down(skip_blank_lines) {
             self.speech.speak("bottom", false)?;
         }
         self.action_review_line_read(screen_state)?;
@@ -1123,8 +1166,7 @@ impl ScreenReader {
             .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?;
 
         let mut attrs = String::new();
-        attrs.push_str(&format!(
-            "Row {} col {} ", row + 1, col + 1));
+        attrs.push_str(&format!("Row {} col {} ", row + 1, col + 1));
         attrs.push_str(&format!(
             "{} {}",
             attributes::describe_color(cell.fgcolor()),
