@@ -1056,13 +1056,32 @@ impl ScreenReader {
     }
 
     fn action_review_top(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        screen_state.review_cursor_position.0 = 0;
+        let row = screen_state.review_cursor_position.0;
+        let last_row = screen_state.screen.size().0 - 1;
+        let last_col = screen_state.screen.size().1 - 1;
+        screen_state.review_cursor_position.0 = match row {
+            0 => screen_state
+                .screen
+                .find_cell(CellExt::is_in_word, 0, 0, last_row, last_col)
+                .map_or(0, |(row, _)| row),
+            _ => 0,
+        };
         self.action_review_line_read(screen_state)?;
         Ok(false)
     }
 
     fn action_review_bottom(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        screen_state.review_cursor_position.0 = screen_state.screen.size().0 - 1;
+        let row = screen_state.review_cursor_position.0;
+        let last_row = screen_state.screen.size().0 - 1;
+        let last_col = screen_state.screen.size().1 - 1;
+        screen_state.review_cursor_position.0 = if row == last_row {
+            screen_state
+                .screen
+                .rfind_cell(CellExt::is_in_word, 0, 0, last_row, last_col)
+                .map_or(last_row, |(row, _)| row)
+        } else {
+            last_row
+        };
         self.action_review_line_read(screen_state)?;
         Ok(false)
     }
@@ -1127,6 +1146,7 @@ impl ScreenReader {
         self.speech.speak(&attrs, false)?;
         Ok(false)
     }
+
     fn action_backspace(&mut self, screen_state: &ScreenState) -> Result<bool> {
         let (row, col) = screen_state.screen.cursor_position();
         if col > 0 {
