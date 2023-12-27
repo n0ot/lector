@@ -1,8 +1,8 @@
 mod attributes;
 mod clipboard;
-mod commands;
+pub mod commands;
 mod ext;
-mod perform;
+pub mod perform;
 pub mod screen_reader;
-mod speech;
-mod view;
+pub mod speech;
+pub mod view;

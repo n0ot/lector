@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub mod drivers;
@@ -9,6 +9,10 @@ pub struct Speech {
 }
 
 impl Speech {
+pub fn new(driver: Box<dyn drivers::Driver>) -> Speech {
+    Speech { driver }
+}
+
     pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
         let text = describe_repeated_graphemes(text);
 
@@ -43,12 +47,6 @@ impl Speech {
     pub fn set_rate(&mut self, rate: f32) -> Result<()> {
         self.driver.set_rate(rate)
     }
-}
-
-pub fn new() -> Result<Speech> {
-    let driver = Box::new(drivers::tdsr::Tdsr::new("./mac").context("create tdsr driver")?);
-
-    Ok(Speech { driver })
 }
 
 /// If a grapheme g is repeated at least 4 times,
