@@ -1,8 +1,4 @@
-use super::{
-    attributes,
-    ext::{CellExt, ScreenExt},
-    perform, speech,
-};
+use super::{clipboard::Clipboard, commands, ext::ScreenExt, perform, speech, view::View};
 use anyhow::{anyhow, bail, Context, Result};
 use nix::sys::termios;
 use phf::phf_map;
@@ -11,7 +7,6 @@ use signal_hook::consts::signal::*;
 use signal_hook_mio::v0_8::Signals;
 use similar::{Algorithm, ChangeTag, TextDiff};
 use std::{
-    cmp::min,
     collections::HashSet,
     io::{ErrorKind, Read, Write},
     iter::FromIterator,
@@ -23,329 +18,58 @@ use std::{
 const DIFF_DELAY: u16 = 1;
 const MAX_DIFF_DELAY: u16 = 300;
 
-#[derive(Copy, Clone)]
-enum Action {
-    ToggleHelp,
-    ToggleAutoRead,
-    ToggleReviewCursorFollowsScreenCursor,
-    PassNextKey,
-    StopSpeaking,
-    RevLinePrev,
-    RevLineNext,
-    RevLinePrevNonBlank,
-    RevLineNextNonBlank,
-    RevLineRead,
-    RevCharPrev,
-    RevCharNext,
-    RevCharRead,
-    RevCharReadPhonetic,
-    RevWordPrev,
-    RevWordNext,
-    RevWordRead,
-    RevTop,
-    RevBottom,
-    RevFirst,
-    RevLast,
-    RevReadAttributes,
-    Backspace,
-    Delete,
-    SayTime,
-    SetMark,
-    Copy,
-    Paste,
-    SayClipboard,
-    PreviousClipboard,
-    NextClipboard,
-}
-
-impl Action {
-    fn help_text(&self) -> String {
-        match self {
-            Action::ToggleHelp => "toggle help".into(),
-            Action::ToggleAutoRead => "toggle auto read".into(),
-            Action::ToggleReviewCursorFollowsScreenCursor => {
-                "toggle whether review cursor follows screen cursor".into()
-            }
-            Action::PassNextKey => "forward next key press".into(),
-            Action::StopSpeaking => "stop speaking".into(),
-            Action::RevLinePrev => "previous line".into(),
-            Action::RevLineNext => "next line".into(),
-            Action::RevLinePrevNonBlank => "previous non blank line".into(),
-            Action::RevLineNextNonBlank => "next non blank line".into(),
-            Action::RevLineRead => "current line".into(),
-            Action::RevCharPrev => "previous character".into(),
-            Action::RevCharNext => "next character".into(),
-            Action::RevCharRead => "current character".into(),
-            Action::RevCharReadPhonetic => "current character phonetically".into(),
-            Action::RevWordPrev => "previous word".into(),
-            Action::RevWordNext => "next word".into(),
-            Action::RevWordRead => "current word".into(),
-            Action::RevTop => "top".into(),
-            Action::RevBottom => "botom".into(),
-            Action::RevFirst => "beginning of line".into(),
-            Action::RevLast => "end of line".into(),
-            Action::RevReadAttributes => "read attributes".into(),
-            Action::Backspace => "backspace".into(),
-            Action::Delete => "delete".into(),
-            Action::SayTime => "say the time".into(),
-            Action::SetMark => "set mark".into(),
-            Action::Copy => "copy".into(),
-            Action::Paste => "paste".into(),
-            Action::SayClipboard => "say clipboard".into(),
-            Action::PreviousClipboard => "previous clipboard".into(),
-            Action::NextClipboard => "next clipboard".into(),
-        }
-    }
-}
-
-static KEYMAP: phf::Map<&'static str, Action> = phf_map! {
-    "\x1BOP" => Action::ToggleHelp,
-    "\x1B'" => Action::ToggleAutoRead,
-    "\x1B\"" => Action::ToggleReviewCursorFollowsScreenCursor,
-    "\x1Bn" => Action::PassNextKey,
-    "\x1Bx" => Action::StopSpeaking,
-    "\x1Bu" => Action::RevLinePrev,
-    "\x1Bo" => Action::RevLineNext,
-    "\x1BU" => Action::RevLinePrevNonBlank,
-    "\x1BO" => Action::RevLineNextNonBlank,
-    "\x1Bi" => Action::RevLineRead,
-    "\x1Bm" => Action::RevCharPrev,
-    "\x1B." => Action::RevCharNext,
-    "\x1B," => Action::RevCharRead,
-    "\x1B<" => Action::RevCharReadPhonetic,
-    "\x1Bj" => Action::RevWordPrev,
-    "\x1Bl" => Action::RevWordNext,
-    "\x1Bk" => Action::RevWordRead,
-    "\x1By" => Action::RevTop,
-    "\x1Bp" => Action::RevBottom,
-    "\x1Bh" => Action::RevFirst,
-    "\x1B;" => Action::RevLast,
-    "\x1Ba" => Action::RevReadAttributes,
-    "\x08" => Action::Backspace,
-    "\x7F" => Action::Backspace,
-    "\x1B[3~" => Action::Delete,
-    "\x1B[24~" => Action::SayTime,
-    "\x1B[15~" => Action::SetMark,
-    "\x1B[17~" => Action::Copy,
-    "\x1B[18~" => Action::Paste,
-    "\x1Bc" => Action::SayClipboard,
-    "\x1B[" => Action::PreviousClipboard,
-    "\x1B]" => Action::NextClipboard,
+static KEYMAP: phf::Map<&'static str, commands::Action> = phf_map! {
+    "\x1BOP" => commands::Action::ToggleHelp,
+    "\x1B'" => commands::Action::ToggleAutoRead,
+    "\x1B\"" => commands::Action::ToggleReviewCursorFollowsScreenCursor,
+    "\x1Bn" => commands::Action::PassNextKey,
+    "\x1Bx" => commands::Action::StopSpeaking,
+    "\x1Bu" => commands::Action::RevLinePrev,
+    "\x1Bo" => commands::Action::RevLineNext,
+    "\x1BU" => commands::Action::RevLinePrevNonBlank,
+    "\x1BO" => commands::Action::RevLineNextNonBlank,
+    "\x1Bi" => commands::Action::RevLineRead,
+    "\x1Bm" => commands::Action::RevCharPrev,
+    "\x1B." => commands::Action::RevCharNext,
+    "\x1B," => commands::Action::RevCharRead,
+    "\x1B<" => commands::Action::RevCharReadPhonetic,
+    "\x1Bj" => commands::Action::RevWordPrev,
+    "\x1Bl" => commands::Action::RevWordNext,
+    "\x1Bk" => commands::Action::RevWordRead,
+    "\x1By" => commands::Action::RevTop,
+    "\x1Bp" => commands::Action::RevBottom,
+    "\x1Bh" => commands::Action::RevFirst,
+    "\x1B;" => commands::Action::RevLast,
+    "\x1Ba" => commands::Action::RevReadAttributes,
+    "\x08" => commands::Action::Backspace,
+    "\x7F" => commands::Action::Backspace,
+    "\x1B[3~" => commands::Action::Delete,
+    "\x1B[24~" => commands::Action::SayTime,
+    "\x1B[15~" => commands::Action::SetMark,
+    "\x1B[17~" => commands::Action::Copy,
+    "\x1B[18~" => commands::Action::Paste,
+    "\x1Bc" => commands::Action::SayClipboard,
+    "\x1B[" => commands::Action::PreviousClipboard,
+    "\x1B]" => commands::Action::NextClipboard,
 };
 
-struct ScreenState {
-    screen: vt100::Screen,
-    prev_screen: vt100::Screen,
-    prev_screen_time: time::Instant,
-    review_cursor_position: (u16, u16), // (row, col)
-    review_cursor_last_indent_level: u16,
-    last_indent_level: u16,
-}
-
-impl ScreenState {
-    /// Moves the review cursor up a line.
-    /// If skip_blank_lines is true,
-    /// the review cursor will move up to the previous non blank line,
-    /// or remain in place if this is the first non blank line.
-    /// This method will return true only if the cursor moved.
-    fn review_cursor_up(&mut self, skip_blank_lines: bool) -> bool {
-        if self.review_cursor_position.0 == 0 {
-            return false;
-        }
-        if !skip_blank_lines {
-            self.review_cursor_position.0 -= 1;
-            return true;
-        }
-
-        let row = self.review_cursor_position.0;
-        let last_col = self.screen.size().1 - 1;
-        self.review_cursor_position.0 = self
-            .screen
-            .rfind_cell(CellExt::is_in_word, 0, 0, row - 1, last_col)
-            .map_or(row, |(row, _)| row);
-
-        return self.review_cursor_position.0 != row;
-    }
-
-    /// Moves the review cursor down a line.
-    /// If skip_blank_lines is true,
-    /// the review cursor will move down to the next non blank line,
-    /// or remain in place if this is the last non blank line.
-    /// This method will return true only if the cursor moved.
-    fn review_cursor_down(&mut self, skip_blank_lines: bool) -> bool {
-        let last_row = self.screen.size().0 - 1;
-        let last_col = self.screen.size().1 - 1;
-        if self.review_cursor_position.0 == last_row {
-            return false;
-        }
-        if !skip_blank_lines {
-            self.review_cursor_position.0 += 1;
-            return true;
-        }
-
-        let row = self.review_cursor_position.0;
-        self.review_cursor_position.0 = self
-            .screen
-            .find_cell(CellExt::is_in_word, row + 1, 0, last_row, last_col)
-            .map_or(row, |(row, _)| row);
-
-        return self.review_cursor_position.0 != row;
-    }
-
-    /// Moves the cursor to the start of the previous word,
-    /// or the beginning of the line if the cursor is in or before the first word.
-    /// This method will return true only if the cursor moved to a different word.
-    fn review_cursor_prev_word(&mut self) -> bool {
-        let (row, col) = self.review_cursor_position;
-        // First, find the beginning of this word.
-        let col = self.screen.find_word_start(row, col);
-        if col == 0 {
-            // The current word was the first.
-            // Just move to the beginning of the line.
-            self.review_cursor_position.1 = 0;
-            return false;
-        }
-
-        // Now, find the start of the previous word and move to it.
-        let col = self.screen.find_word_start(row, col - 1);
-        self.review_cursor_position.1 = col;
-        true
-    }
-
-    /// Moves the cursor to the start of the next word,
-    /// or the end of the line if the cursor is in or past the last word.
-    /// This method will return true only if the cursor moved to a different word.
-    fn review_cursor_next_word(&mut self) -> bool {
-        let last = self.screen.size().1 - 1;
-        let (row, col) = self.review_cursor_position;
-        // First, find the end of this word.
-        let col = self.screen.find_word_end(row, col);
-        if col >= last {
-            // The current word was the last.
-            return false;
-        }
-
-        self.review_cursor_position.1 = col + 1;
-        true
-    }
-
-    /// Moves the review cursor left a column.
-    /// If the next cell continues a wide character, it will be skipped.
-    /// This method will return true only if the cursor moved.
-    fn review_cursor_left(&mut self) -> bool {
-        if self.review_cursor_position.1 == 0 {
-            return false;
-        }
-        self.review_cursor_position.1 -= 1;
-        if let Some((row, col)) = self.screen.rfind_cell(
-            |c| !c.is_wide_continuation(),
-            self.review_cursor_position.0,
-            0,
-            self.review_cursor_position.0,
-            self.review_cursor_position.1,
-        ) {
-            self.review_cursor_position = (row, col);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Moves the review cursor right a column.
-    /// If the next cell continues a wide character, it will be skipped.
-    /// This method will return true only if the cursor moved.
-    fn review_cursor_right(&mut self) -> bool {
-        if self.review_cursor_position.1 >= self.screen.size().1 - 1 {
-            return false;
-        }
-        self.review_cursor_position.1 += 1;
-        if let Some((row, col)) = self.screen.find_cell(
-            |c| !c.is_wide_continuation(),
-            self.review_cursor_position.0,
-            self.review_cursor_position.1,
-            self.review_cursor_position.0,
-            self.screen.size().1 - 1,
-        ) {
-            self.review_cursor_position = (row, col);
-            true
-        } else {
-            false
-        }
-    }
-}
-
-#[derive(Default)]
-struct Clipboard {
-    mark: Option<(u16, u16)>,
-    idx: usize,
-    clipboards: Vec<String>,
-}
-
-impl Clipboard {
-    /// Get the text from the selected clipboard.
-    /// If there are no clipboards, None will be returned.
-    fn get(&self) -> Option<&str> {
-        if self.clipboards.is_empty() {
-            return None;
-        }
-        Some(&self.clipboards[self.idx])
-    }
-
-    /// Add a clipboard with the specified text and select it.
-    /// The oldest clipboards will be removed to make room for newer ones.
-    fn put(&mut self, text: String) {
-        if self.clipboards.len() >= 10 {
-            self.clipboards.remove(0);
-        }
-        self.idx = self.clipboards.len();
-        self.clipboards.push(text);
-    }
-
-    /// Try to select the previous clipboard, and return whether a different clipboard has been selected.
-    /// If there is no previous clipboard, this method will have no effect.
-    fn prev(&mut self) -> bool {
-        if self.idx + 1 >= self.size() {
-            false
-        } else {
-            self.idx += 1;
-            true
-        }
-    }
-
-    /// Try to select the next clipboard, and return whether a different clipboard has been selected.
-    /// If there is no next clipboard, this method will have no effect.
-    fn next(&mut self) -> bool {
-        if self.idx == 0 {
-            false
-        } else {
-            self.idx -= 1;
-            true
-        }
-    }
-
-    /// Returns the number of clipboards.
-    fn size(&self) -> usize {
-        self.clipboards.len()
-    }
-}
-
 #[allow(dead_code)]
-enum CursorTrackingMode {
+pub enum CursorTrackingMode {
     On,
     Off,
     OffOnce,
 }
 
 pub struct ScreenReader {
-    speech: speech::Speech,
-    help_mode: bool,
-    auto_read: bool,
-    review_follows_screen_cursor: bool,
+    pub speech: speech::Speech,
+    pub help_mode: bool,
+    pub auto_read: bool,
+    pub review_follows_screen_cursor: bool,
     last_key: Vec<u8>,
-    cursor_tracking_mode: CursorTrackingMode,
+    pub cursor_tracking_mode: CursorTrackingMode,
     highlight_tracking: bool,
-    clipboard: Clipboard,
-    pass_through: bool,
+    pub clipboard: Clipboard,
+    pub pass_through: bool,
 }
 
 impl ScreenReader {
@@ -393,17 +117,9 @@ impl ScreenReader {
         // and so that signals like SIGINT aren't send when pressing keys like ^C.
         ptyprocess::set_raw(0).context("set STDIN to raw")?;
 
-        // Create a parser to track the PTY's screen state.
+        // Create a view based on the spawned process's screen
         let (cols, rows) = process.get_window_size()?;
-        let mut parser = vt100::Parser::new(rows, cols, 0);
-        let mut screen_state = ScreenState {
-            screen: parser.screen().clone(),
-            prev_screen: parser.screen().clone(),
-            prev_screen_time: time::Instant::now(),
-            review_cursor_position: parser.screen().cursor_position(),
-            review_cursor_last_indent_level: 0,
-            last_indent_level: 0,
-        };
+        let mut view = View::new(rows, cols);
 
         // We also want to separately keep track of incoming bytes, for auto read.
         let mut vte_parser = vte::Parser::new();
@@ -469,7 +185,7 @@ impl ScreenReader {
                         let pass_through = match self.pass_through {
                             false => match KEYMAP.get(std::str::from_utf8(&buf[0..n])?) {
                                 Some(&v) => {
-                                    self.handle_action(&mut screen_state, &mut pty_stream, v)?
+                                    commands::handle_action(self, &mut view, &mut pty_stream, v)?
                                 }
                                 None => {
                                     if self.help_mode {
@@ -508,7 +224,7 @@ impl ScreenReader {
                             }
                         }
 
-                        self.process_screen_changes(&mut screen_state, &mut parser, &buf[0..n]);
+                        view.process_changes(&buf[0..n]);
                         // Stop blocking indefinitely until this screen is old enough to be
                         // auto read.
                         poll_timeout = Some(time::Duration::from_millis(DIFF_DELAY as u64));
@@ -523,17 +239,7 @@ impl ScreenReader {
                                     process
                                         .set_window_size(term_size.cols, term_size.rows)
                                         .context("resize PTY")?;
-                                    parser.set_size(term_size.rows, term_size.cols);
-                                    screen_state.review_cursor_position = (
-                                        min(
-                                            screen_state.review_cursor_position.0,
-                                            term_size.rows - 1,
-                                        ),
-                                        min(
-                                            screen_state.review_cursor_position.1,
-                                            term_size.cols - 1,
-                                        ),
-                                    );
+                                    view.set_size(term_size.rows, term_size.cols);
                                 }
                                 _ => unreachable!("unknown signal"),
                             }
@@ -548,15 +254,15 @@ impl ScreenReader {
             // But if we never stop getting updates, we want to read what we have eventually.
             if let Some(lpu) = last_pty_update {
                 if lpu.elapsed().as_millis() > DIFF_DELAY as u128
-                    || screen_state.prev_screen_time.elapsed().as_millis() > MAX_DIFF_DELAY as u128
+                    || view.prev_screen_time.elapsed().as_millis() > MAX_DIFF_DELAY as u128
                 {
                     poll_timeout = None; // No need to wakeup until we get more updates.
                     last_pty_update = None;
                     if self.highlight_tracking {
-                        self.track_highlighting(&screen_state)?;
+                        self.track_highlighting(&view)?;
                     }
                     let read_text = if self.auto_read {
-                        self.auto_read(&mut screen_state, &mut text_reporter)?
+                        self.auto_read(&mut view, &mut text_reporter)?
                     } else {
                         // If the text reporter wasn't drained since auto read was last disabled,
                         // it will be read when auto read is re-enabled, which is not desirable.
@@ -564,46 +270,83 @@ impl ScreenReader {
                         false
                     };
                     if !read_text {
-                        self.track_cursor(&screen_state)?;
+                        self.track_cursor(&mut view)?;
                     }
 
                     // Track screen cursor movements here, instead of every time the screen
                     // updates,
                     // to give the screen time to stabilize.
                     if self.review_follows_screen_cursor
-                        && screen_state.screen.cursor_position()
-                            != screen_state.prev_screen.cursor_position()
+                        && view.screen().cursor_position() != view.prev_screen().cursor_position()
                     {
-                        screen_state.review_cursor_position = screen_state.screen.cursor_position();
+                        view.review_cursor_position = view.screen().cursor_position();
                     }
-                    screen_state.prev_screen = screen_state.screen.clone();
-                    screen_state.prev_screen_time = time::Instant::now();
+
+                    view.finalize_changes();
                 }
             }
         }
     }
 
-    fn process_screen_changes(
-        &mut self,
-        screen_state: &mut ScreenState,
-        parser: &mut vt100::Parser,
-        buf: &[u8],
-    ) {
-        parser.process(buf);
-        // If the screen's size changed, the cursor may now be out of bounds.
-        let term_size = parser.screen().size();
-        screen_state.review_cursor_position = (
-            min(screen_state.review_cursor_position.0, term_size.0),
-            min(screen_state.review_cursor_position.1, term_size.1),
+    fn track_cursor(&mut self, view: &mut View) -> Result<()> {
+        let (prev_cursor, cursor) = (
+            view.prev_screen().cursor_position(),
+            view.screen().cursor_position(),
         );
 
-        screen_state.screen = parser.screen().clone();
+        let mut cursor_report: Option<String> = None;
+        if cursor.0 != prev_cursor.0 {
+            // It moved to a different line
+            let line = view
+                .screen()
+                .contents_between(cursor.0, 0, cursor.0, view.size().1);
+            cursor_report = Some(line);
+        } else if cursor.1 != prev_cursor.1 {
+            // The cursor moved left or right
+            let distance_moved = (cursor.1 as i32 - prev_cursor.1 as i32).abs();
+            let prev_word_start = view.screen().find_word_start(prev_cursor.0, prev_cursor.1);
+            let word_start = view.screen().find_word_start(cursor.0, cursor.1);
+            if word_start != prev_word_start && distance_moved > 1 {
+                // The cursor moved to a different word.
+                let word_end = view.screen().find_word_end(cursor.0, cursor.1);
+                let word =
+                    view.screen()
+                        .contents_between(cursor.0, word_start, cursor.0, word_end + 1);
+                cursor_report = Some(word);
+            } else {
+                let ch = view
+                    .screen()
+                    .contents_between(cursor.0, cursor.1, cursor.0, cursor.1 + 1);
+                // Avoid randomly saying "space".
+                // Unfortunately this means moving the cursor manually over a space will say
+                // nothing.
+                let ch = if ch.trim().is_empty() {
+                    "".to_string()
+                } else {
+                    ch
+                };
+                cursor_report = Some(ch);
+            }
+        }
+
+        match &self.cursor_tracking_mode {
+            CursorTrackingMode::On => {
+                self.report_application_cursor_indentation_changes(view)?;
+                if let Some(s) = cursor_report {
+                    self.speech.speak(&s, false)?;
+                }
+            }
+            CursorTrackingMode::OffOnce => self.cursor_tracking_mode = CursorTrackingMode::On,
+            CursorTrackingMode::Off => {}
+        }
+
+        Ok(())
     }
 
-    fn track_highlighting(&mut self, screen_state: &ScreenState) -> Result<()> {
+    fn track_highlighting(&mut self, view: &View) -> Result<()> {
         let (highlights, prev_highlights) = (
-            screen_state.screen.get_highlights(),
-            screen_state.prev_screen.get_highlights(),
+            view.screen().get_highlights(),
+            view.prev_screen().get_highlights(),
         );
         let prev_hl_set: HashSet<String> = HashSet::from_iter(prev_highlights.iter().cloned());
 
@@ -615,32 +358,39 @@ impl ScreenReader {
         Ok(())
     }
 
+    /// Report indentation changes, if any, for the line under the application cursor
+    pub fn report_application_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
+        let (indent_level, changed) = view.application_cursor_indentation_level();
+        if changed {
+            self.speech
+                .speak(&format!("indent {}", indent_level), false)?;
+        }
+
+        Ok(())
+    }
+
+    /// Report indentation changes, if any, for the line under the review cursor
+    pub fn report_review_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
+        let (indent_level, changed) = view.review_cursor_indentation_level();
+        if changed {
+            self.speech
+                .speak(&format!("indent {}", indent_level), false)?;
+        }
+
+        Ok(())
+    }
+
     /// Read what's changed between the current and previous screen.
     /// If anything was read, the value in the result will be true.
     fn auto_read(
         &mut self,
-        screen_state: &mut ScreenState,
+        view: &mut View,
         text_reporter: &mut perform::TextReporter,
     ) -> Result<bool> {
-        let cursor = screen_state.screen.cursor_position();
+        let cursor = view.screen().cursor_position();
 
-        let indent_level = screen_state
-            .screen
-            .find_cell(
-                |c| !c.contents().is_empty() && !c.contents().chars().all(char::is_whitespace),
-                cursor.0,
-                0,
-                cursor.0,
-                screen_state.screen.size().1 - 1,
-            )
-            .map_or(screen_state.last_indent_level, |(_, col)| col);
-        if indent_level != screen_state.last_indent_level {
-            self.speech
-                .speak(&format!("indent {}", indent_level), false)?;
-            screen_state.last_indent_level = indent_level;
-        }
-
-        if screen_state.screen.contents() == screen_state.prev_screen.contents() {
+        self.report_application_cursor_indentation_changes(view)?;
+        if view.screen().contents() == view.prev_screen().contents() {
             return Ok(false);
         }
 
@@ -663,8 +413,8 @@ impl ScreenReader {
 
         // Do a diff instead
         let mut text = String::new();
-        let old = screen_state.prev_screen.contents_full();
-        let new = screen_state.screen.contents_full();
+        let old = view.prev_screen().contents_full();
+        let new = view.screen().contents_full();
 
         let line_changes = TextDiff::configure()
             .algorithm(Algorithm::Patience)
@@ -770,565 +520,5 @@ impl ScreenReader {
                 Ok(!text.is_empty())
             }
         }
-    }
-
-    fn track_cursor(&mut self, screen_state: &ScreenState) -> Result<()> {
-        let (prev_cursor, cursor) = (
-            screen_state.prev_screen.cursor_position(),
-            screen_state.screen.cursor_position(),
-        );
-
-        let mut cursor_report: Option<String> = None;
-        if cursor.0 != prev_cursor.0 {
-            // It moved to a different line
-            let line = screen_state.screen.contents_between(
-                cursor.0,
-                0,
-                cursor.0,
-                screen_state.screen.size().1,
-            );
-            cursor_report = Some(line);
-        } else if cursor.1 != prev_cursor.1 {
-            // The cursor moved left or right
-            let distance_moved = (cursor.1 as i32 - prev_cursor.1 as i32).abs();
-            let prev_word_start = screen_state
-                .screen
-                .find_word_start(prev_cursor.0, prev_cursor.1);
-            let word_start = screen_state.screen.find_word_start(cursor.0, cursor.1);
-            if word_start != prev_word_start && distance_moved > 1 {
-                // The cursor moved to a different word.
-                let word_end = screen_state.screen.find_word_end(cursor.0, cursor.1);
-                let word = screen_state.screen.contents_between(
-                    cursor.0,
-                    word_start,
-                    cursor.0,
-                    word_end + 1,
-                );
-                cursor_report = Some(word);
-            } else {
-                let ch = screen_state.screen.contents_between(
-                    cursor.0,
-                    cursor.1,
-                    cursor.0,
-                    cursor.1 + 1,
-                );
-                // Avoid randomly saying "space".
-                // Unfortunately this means moving the cursor manually over a space will say
-                // nothing.
-                let ch = if ch.trim().is_empty() {
-                    "".to_string()
-                } else {
-                    ch
-                };
-                cursor_report = Some(ch);
-            }
-        }
-
-        match &self.cursor_tracking_mode {
-            CursorTrackingMode::On => {
-                if let Some(s) = cursor_report {
-                    self.speech.speak(&s, false)?;
-                }
-            }
-            CursorTrackingMode::OffOnce => self.cursor_tracking_mode = CursorTrackingMode::On,
-            CursorTrackingMode::Off => {}
-        }
-
-        Ok(())
-    }
-
-    fn handle_action(
-        &mut self,
-        screen_state: &mut ScreenState,
-        pty_stream: &mut ptyprocess::stream::Stream,
-        action: Action,
-    ) -> Result<bool> {
-        if let Action::ToggleHelp = action {
-            return self.action_toggle_help();
-        }
-        if self.help_mode {
-            self.speech.speak(&action.help_text(), false)?;
-            return Ok(false);
-        }
-
-        match action {
-            Action::ToggleAutoRead => self.action_toggle_auto_read(),
-            Action::ToggleReviewCursorFollowsScreenCursor => {
-                self.action_toggle_review_cursor_follows_screen_cursor(screen_state)
-            }
-            Action::PassNextKey => self.action_pass_next_key(),
-            Action::StopSpeaking => self.action_stop(),
-            Action::RevLinePrev => self.action_review_line_prev(screen_state, false),
-            Action::RevLineNext => self.action_review_line_next(screen_state, false),
-            Action::RevLinePrevNonBlank => self.action_review_line_prev(screen_state, true),
-            Action::RevLineNextNonBlank => self.action_review_line_next(screen_state, true),
-            Action::RevLineRead => self.action_review_line_read(screen_state),
-            Action::RevWordPrev => self.action_review_word_prev(screen_state),
-            Action::RevWordNext => self.action_review_word_next(screen_state),
-            Action::RevWordRead => self.action_review_word_read(screen_state),
-            Action::RevCharPrev => self.action_review_char_prev(screen_state),
-            Action::RevCharNext => self.action_review_char_next(screen_state),
-            Action::RevCharRead => self.action_review_char_read(screen_state),
-            Action::RevCharReadPhonetic => self.action_review_char_read_phonetic(screen_state),
-            Action::RevTop => self.action_review_top(screen_state),
-            Action::RevBottom => self.action_review_bottom(screen_state),
-            Action::RevFirst => self.action_review_first(screen_state),
-            Action::RevLast => self.action_review_last(screen_state),
-            Action::RevReadAttributes => self.action_review_read_attributes(screen_state),
-            Action::Backspace => self.action_backspace(screen_state),
-            Action::Delete => self.action_delete(screen_state),
-            Action::SayTime => self.action_say_time(),
-            Action::SetMark => self.action_set_mark(screen_state),
-            Action::Copy => self.action_copy(screen_state),
-            Action::Paste => self.action_paste(screen_state, pty_stream),
-            Action::SayClipboard => self.action_clipboard_say(),
-            Action::PreviousClipboard => self.action_clipboard_prev(),
-            Action::NextClipboard => self.action_clipboard_next(),
-            _ => {
-                self.speech.speak("not implemented", false)?;
-                Ok(false)
-            }
-        }
-    }
-}
-
-// Actions
-impl ScreenReader {
-    fn action_stop(&mut self) -> Result<bool> {
-        self.speech.stop()?;
-        Ok(false)
-    }
-
-    fn action_toggle_auto_read(&mut self) -> Result<bool> {
-        if self.auto_read {
-            self.auto_read = false;
-            self.speech.speak("auto read disabled", false)?;
-        } else {
-            self.auto_read = true;
-            self.speech.speak("auto read enabled", false)?;
-        }
-
-        Ok(false)
-    }
-
-    fn action_toggle_review_cursor_follows_screen_cursor(
-        &mut self,
-        screen_state: &mut ScreenState,
-    ) -> Result<bool> {
-        self.review_follows_screen_cursor = !self.review_follows_screen_cursor;
-        match self.review_follows_screen_cursor {
-            true => {
-                screen_state.review_cursor_position = screen_state.screen.cursor_position();
-                self.speech
-                    .speak("review cursor following screen cursor", false)?;
-            }
-            false => self
-                .speech
-                .speak("review cursor not following screen cursor", false)?,
-        };
-        Ok(false)
-    }
-
-    fn action_pass_next_key(&mut self) -> Result<bool> {
-        self.pass_through = true;
-        self.speech.speak("forward next key press", false)?;
-        Ok(false)
-    }
-
-    fn action_toggle_help(&mut self) -> Result<bool> {
-        if self.help_mode {
-            self.help_mode = false;
-            self.speech.speak("exiting help", false)?;
-        } else {
-            self.help_mode = true;
-            self.speech
-                .speak("entering help. Press this key again to exit", false)?;
-        }
-        Ok(false)
-    }
-
-    fn action_review_line_prev(
-        &mut self,
-        screen_state: &mut ScreenState,
-        skip_blank_lines: bool,
-    ) -> Result<bool> {
-        if !screen_state.review_cursor_up(skip_blank_lines) {
-            self.speech.speak("top", false)?;
-        }
-        self.action_review_line_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_line_next(
-        &mut self,
-        screen_state: &mut ScreenState,
-        skip_blank_lines: bool,
-    ) -> Result<bool> {
-        if !screen_state.review_cursor_down(skip_blank_lines) {
-            self.speech.speak("bottom", false)?;
-        }
-        self.action_review_line_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_line_read(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        let row = screen_state.review_cursor_position.0;
-        let line = screen_state
-            .screen
-            .contents_between(row, 0, row, screen_state.screen.size().1);
-        let indent_level = screen_state
-            .screen
-            .find_cell(
-                |c| !c.contents().is_empty() && !c.contents().chars().all(char::is_whitespace),
-                row,
-                0,
-                row,
-                screen_state.screen.size().1 - 1,
-            )
-            .map_or(screen_state.review_cursor_last_indent_level, |(_, col)| col);
-        if indent_level != screen_state.review_cursor_last_indent_level {
-            self.speech
-                .speak(&format!("indent {}", indent_level), false)?;
-            screen_state.review_cursor_last_indent_level = indent_level;
-        }
-        if line.is_empty() {
-            self.speech.speak("blank", false)?;
-        } else {
-            self.speech.speak(&line, false)?;
-        }
-        Ok(false)
-    }
-
-    fn action_review_word_prev(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if !screen_state.review_cursor_prev_word() {
-            self.speech.speak("left", false)?;
-        }
-        self.action_review_word_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_word_next(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if !screen_state.review_cursor_next_word() {
-            self.speech.speak("right", false)?;
-        }
-        self.action_review_word_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_word_read(&mut self, screen_state: &ScreenState) -> Result<bool> {
-        let (row, col) = screen_state.review_cursor_position;
-        let start = screen_state.screen.find_word_start(row, col);
-        let end = screen_state.screen.find_word_end(row, col);
-
-        let word = screen_state
-            .screen
-            .contents_between(row, start, row, end + 1);
-        self.speech.speak(&word, false)?;
-        Ok(false)
-    }
-
-    fn action_review_char_prev(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if !screen_state.review_cursor_left() {
-            self.speech.speak("left", false)?;
-        }
-        self.action_review_char_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_char_next(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        if !screen_state.review_cursor_right() {
-            self.speech.speak("right", false)?;
-        }
-        self.action_review_char_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_char_read(&mut self, screen_state: &ScreenState) -> Result<bool> {
-        let (row, col) = screen_state.review_cursor_position;
-        let char = screen_state
-            .screen
-            .cell(row, col)
-            .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
-            .contents();
-        if char.is_empty() {
-            self.speech.speak("blank", false)?;
-        } else {
-            self.speech.speak(&char, false)?;
-        }
-        Ok(false)
-    }
-
-    fn action_review_char_read_phonetic(&mut self, screen_state: &ScreenState) -> Result<bool> {
-        let (row, col) = screen_state.review_cursor_position;
-        let char = screen_state
-            .screen
-            .cell(row, col)
-            .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
-            .contents();
-        let char = match char.to_lowercase().as_str() {
-            "a" => "Alpha",
-            "b" => "Bravo",
-            "c" => "Charlie",
-            "d" => "Delta",
-            "e" => "Echo",
-            "f" => "Foxtrot",
-            "g" => "Golf",
-            "h" => "Hotel",
-            "i" => "India",
-            "j" => "Juliett",
-            "k" => "Kilo",
-            "l" => "Lima",
-            "m" => "Mike",
-            "n" => "November",
-            "o" => "Oscar",
-            "p" => "Papa",
-            "q" => "Quebec",
-            "r" => "Romeo",
-            "s" => "Sierra",
-            "t" => "Tango",
-            "u" => "Uniform",
-            "v" => "Victor",
-            "w" => "Whiskey",
-            "x" => "X-ray",
-            "y" => "Yankee",
-            "z" => "Zulu",
-            _ => &char,
-        };
-        self.speech.speak(char, false)?;
-        Ok(false)
-    }
-
-    fn action_review_top(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        let row = screen_state.review_cursor_position.0;
-        let last_row = screen_state.screen.size().0 - 1;
-        let last_col = screen_state.screen.size().1 - 1;
-        screen_state.review_cursor_position.0 = match row {
-            0 => screen_state
-                .screen
-                .find_cell(CellExt::is_in_word, 0, 0, last_row, last_col)
-                .map_or(0, |(row, _)| row),
-            _ => 0,
-        };
-        self.action_review_line_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_bottom(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        let row = screen_state.review_cursor_position.0;
-        let last_row = screen_state.screen.size().0 - 1;
-        let last_col = screen_state.screen.size().1 - 1;
-        screen_state.review_cursor_position.0 = if row == last_row {
-            screen_state
-                .screen
-                .rfind_cell(CellExt::is_in_word, 0, 0, last_row, last_col)
-                .map_or(last_row, |(row, _)| row)
-        } else {
-            last_row
-        };
-        self.action_review_line_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_first(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        let (row, col) = screen_state.review_cursor_position;
-        let last = screen_state.screen.size().1 - 1;
-        screen_state.review_cursor_position.1 = match col {
-            0 => screen_state
-                .screen
-                .find_cell(CellExt::is_in_word, row, 0, row, last)
-                .map_or(0, |(_, col)| col),
-            _ => 0,
-        };
-        self.action_review_char_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_last(&mut self, screen_state: &mut ScreenState) -> Result<bool> {
-        let (row, col) = screen_state.review_cursor_position;
-        let last = screen_state.screen.size().1 - 1;
-        screen_state.review_cursor_position.1 = if col == last {
-            screen_state
-                .screen
-                .rfind_cell(CellExt::is_in_word, row, 0, row, last)
-                .map_or(last, |(_, col)| col)
-        } else {
-            last
-        };
-        self.action_review_char_read(screen_state)?;
-        Ok(false)
-    }
-
-    fn action_review_read_attributes(&mut self, screen_state: &ScreenState) -> Result<bool> {
-        let (row, col) = screen_state.review_cursor_position;
-        let cell = screen_state
-            .screen
-            .cell(row, col)
-            .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?;
-
-        let mut attrs = String::new();
-        attrs.push_str(&format!("Row {} col {} ", row + 1, col + 1));
-        attrs.push_str(&format!(
-            "{} {}",
-            attributes::describe_color(cell.fgcolor()),
-            if let vt100::Color::Default = cell.bgcolor() {
-                "".into()
-            } else {
-                format!("on {}", attributes::describe_color(cell.bgcolor()))
-            }
-        ));
-        attrs.push_str(&format!(
-            "{}{}{}{}{}",
-            if cell.bold() { "bold " } else { "" },
-            if cell.italic() { "italic " } else { "" },
-            if cell.underline() { "underline " } else { "" },
-            if cell.inverse() { "inverse " } else { "" },
-            if cell.is_wide() { "wide " } else { "" },
-        ));
-
-        self.speech.speak(&attrs, false)?;
-        Ok(false)
-    }
-
-    fn action_backspace(&mut self, screen_state: &ScreenState) -> Result<bool> {
-        let (row, col) = screen_state.screen.cursor_position();
-        if col > 0 {
-            let char = screen_state
-                .screen
-                .cell(row, col - 1)
-                .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
-                .contents();
-            self.speech.speak(&char, false)?;
-        }
-        // When backspacing, the cursor will end up moving to the left, but we don't want to hear
-        // that.
-        self.cursor_tracking_mode = match self.cursor_tracking_mode {
-            CursorTrackingMode::Off => CursorTrackingMode::Off,
-            _ => CursorTrackingMode::OffOnce,
-        };
-        Ok(true)
-    }
-
-    fn action_delete(&mut self, screen_state: &ScreenState) -> Result<bool> {
-        let (row, col) = screen_state.screen.cursor_position();
-        let char = screen_state
-            .screen
-            .cell(row, col)
-            .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
-            .contents();
-        self.speech.speak(&char, false)?;
-        Ok(true)
-    }
-
-    fn action_say_time(&mut self) -> Result<bool> {
-        let date = chrono::Local::now();
-        self.speech
-            .speak(&format!("{}", date.format("%H:%M")), false)?;
-        Ok(false)
-    }
-
-    fn action_set_mark(&mut self, screen_state: &ScreenState) -> Result<bool> {
-        self.clipboard.mark = Some(screen_state.review_cursor_position);
-        self.speech.speak("mark set", false)?;
-        Ok(false)
-    }
-
-    fn action_copy(&mut self, screen_state: &ScreenState) -> Result<bool> {
-        match self.clipboard.mark {
-            Some((mark_row, mark_col)) => {
-                let (cur_row, cur_col) = screen_state.review_cursor_position;
-                if mark_row > cur_row || (mark_row == cur_row && mark_col > cur_col) {
-                    self.speech
-                        .speak("mark is after the review cursor", false)?;
-                    return Ok(false);
-                }
-
-                let mut contents = String::new();
-                for row in mark_row..=cur_row {
-                    let start = if row == mark_row { mark_col } else { 0 };
-                    // end is not inclusive, so that a blank row can be achieved with start == end.
-                    let end = if row == cur_row {
-                        cur_col + 1
-                    } else {
-                        screen_state.screen.size().1
-                    };
-                    // Don't add trailing blank/whitespace cells
-                    let end = screen_state
-                        .screen
-                        .rfind_cell(
-                            |c| !c.contents().trim().is_empty(),
-                            row,
-                            start,
-                            row,
-                            end - 1,
-                        )
-                        .map_or(end, |(_, col)| col + 1);
-                    for col in start..end {
-                        contents.push_str(
-                            &screen_state
-                                .screen
-                                .cell(row, col)
-                                .map_or("".into(), vt100::Cell::contents),
-                        );
-                    }
-                    if row != cur_row {
-                        contents.push('\n');
-                    }
-                }
-                self.clipboard.mark = None;
-                self.clipboard.put(contents);
-                self.speech.speak("copied", false)?;
-            }
-            None => self.speech.speak("no mark set", false)?,
-        }
-        Ok(false)
-    }
-
-    fn action_paste(
-        &mut self,
-        screen_state: &ScreenState,
-        stream: &mut ptyprocess::stream::Stream,
-    ) -> Result<bool> {
-        match self.clipboard.get() {
-            Some(contents) => {
-                if screen_state.screen.bracketed_paste() {
-                    write!(stream, "\x1B[200~{}\x1B[201~", contents)?;
-                } else {
-                    write!(stream, "{}", contents)?;
-                }
-                self.speech.speak("pasted", false)?;
-            }
-            None => self.speech.speak("no clipboard", false)?,
-        }
-        Ok(false)
-    }
-
-    fn action_clipboard_prev(&mut self) -> Result<bool> {
-        if self.clipboard.size() == 0 {
-            self.speech.speak("no clipboard", false)?;
-        } else if self.clipboard.prev() {
-            self.action_clipboard_say()?;
-        } else {
-            self.speech.speak("first clipboard", false)?;
-        }
-        Ok(false)
-    }
-
-    fn action_clipboard_next(&mut self) -> Result<bool> {
-        if self.clipboard.size() == 0 {
-            self.speech.speak("no clipboard", false)?;
-        } else if self.clipboard.next() {
-            self.action_clipboard_say()?;
-        } else {
-            self.speech.speak("last clipboard", false)?;
-        }
-        Ok(false)
-    }
-
-    fn action_clipboard_say(&mut self) -> Result<bool> {
-        match self.clipboard.get() {
-            Some(contents) => self.speech.speak(contents, false)?,
-            None => self.speech.speak("no clipboard", false)?,
-        }
-        Ok(false)
     }
 }

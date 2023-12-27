@@ -123,7 +123,9 @@ pub enum Level {
 pub fn get(symbol: &str, level: Level) -> Option<&'static str> {
     match level {
         Level::All if LEVEL_ALL_SYMBOLS.contains(symbol) => SYMBOL_NAMES.get(symbol).copied(),
-        Level::Character if LEVEL_CHARACTER_SYMBOLS.contains(symbol) => SYMBOL_NAMES.get(symbol).copied(),
+        Level::Character if LEVEL_CHARACTER_SYMBOLS.contains(symbol) => {
+            SYMBOL_NAMES.get(symbol).copied()
+        }
         _ => None,
     }
 }
