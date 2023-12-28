@@ -39,6 +39,14 @@ static SYMBOL_NAMES: phf::Map<&'static str, &'static str> = phf_map! {
     "■" => "black square",
 };
 
+static LEVEL_NONE_SYMBOLS: phf::Set<&'static str> = phf_set! {
+    "{",
+    "}",
+    "<",
+    "=",
+    ">",
+};
+
 static LEVEL_ALL_SYMBOLS: phf::Set<&'static str> = phf_set! {
     "!",
     "\"",
@@ -123,6 +131,7 @@ pub enum Level {
 
 pub fn get(symbol: &str, level: Level) -> Option<&'static str> {
     match level {
+        Level::None if LEVEL_NONE_SYMBOLS.contains(symbol) => SYMBOL_NAMES.get(symbol).copied(),
         Level::All if LEVEL_ALL_SYMBOLS.contains(symbol) => SYMBOL_NAMES.get(symbol).copied(),
         Level::Character if LEVEL_CHARACTER_SYMBOLS.contains(symbol) => {
             SYMBOL_NAMES.get(symbol).copied()
