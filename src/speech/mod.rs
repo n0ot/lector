@@ -1,17 +1,24 @@
 use anyhow::Result;
 use unicode_segmentation::UnicodeSegmentation;
 
-pub mod drivers;
 mod punctuation;
+pub mod tdsr;
+
+pub trait Driver {
+    fn speak(&mut self, text: &str, interrupt: bool) -> Result<()>;
+    fn stop(&mut self) -> Result<()>;
+    fn get_rate(&self) -> f32;
+    fn set_rate(&mut self, rate: f32) -> Result<()>;
+}
 
 pub struct Speech {
-    driver: Box<dyn drivers::Driver>,
+    driver: Box<dyn Driver>,
 }
 
 impl Speech {
-pub fn new(driver: Box<dyn drivers::Driver>) -> Speech {
-    Speech { driver }
-}
+    pub fn new(driver: Box<dyn Driver>) -> Speech {
+        Speech { driver }
+    }
 
     pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
         let text = describe_repeated_graphemes(text);
@@ -25,8 +32,11 @@ pub fn new(driver: Box<dyn drivers::Driver>) -> Speech {
 
         let text = UnicodeSegmentation::graphemes(text.as_str(), true)
             .map(|s| {
-                let result =
-                    emojis::get(s).map_or_else(|| String::from(s), |v| format!(" {} ", v.name()));
+                let result = if s.chars().all(char::is_alphabetic) {
+                    String::from(s)
+                } else {
+                    emojis::get(s).map_or_else(|| String::from(s), |v| format!(" {} ", v.name()))
+                };
                 let result =
                     punctuation::get(s, punct_level).map_or(result, |v| format!(" {} ", v));
                 result

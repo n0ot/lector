@@ -65,7 +65,7 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let speech_driver = Box::new(
-        speech::drivers::tdsr::Tdsr::new(cli.speech_program).context("create tdsr driver")?,
+        speech::tdsr::Tdsr::new(cli.speech_program).context("create tdsr driver")?,
     );
     let speech = speech::Speech::new(speech_driver);
     let mut screen_reader =
