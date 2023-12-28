@@ -12,6 +12,7 @@ pub enum Action {
     ToggleHelp,
     ToggleAutoRead,
     ToggleReviewCursorFollowsScreenCursor,
+    ToggleSymbolLevel,
     PassNextKey,
     StopSpeaking,
     RevLinePrev,
@@ -50,6 +51,7 @@ impl Action {
             Action::ToggleReviewCursorFollowsScreenCursor => {
                 "toggle whether review cursor follows screen cursor".into()
             }
+            Action::ToggleSymbolLevel => "toggle symbol level".into(),
             Action::PassNextKey => "forward next key press".into(),
             Action::StopSpeaking => "stop speaking".into(),
             Action::RevLinePrev => "previous line".into(),
@@ -101,6 +103,7 @@ pub fn handle_action(
         Action::ToggleReviewCursorFollowsScreenCursor => {
             action_toggle_review_cursor_follows_screen_cursor(screen_reader, view)
         }
+        Action::ToggleSymbolLevel => action_toggle_symbol_level(screen_reader),
         Action::PassNextKey => action_pass_next_key(screen_reader),
         Action::StopSpeaking => action_stop(screen_reader),
         Action::RevLinePrev => action_review_line_prev(screen_reader, view, false),
@@ -557,5 +560,30 @@ fn action_clipboard_say(screen_reader: &mut ScreenReader) -> Result<bool> {
         Some(contents) => screen_reader.speech.speak(contents, false)?,
         None => screen_reader.speech.speak("no clipboard", false)?,
     }
+    Ok(false)
+}
+
+fn action_toggle_symbol_level(screen_reader: &mut ScreenReader) -> Result<bool> {
+    use super::speech::symbols::Level;
+
+    screen_reader.speech.symbol_level = match screen_reader.speech.symbol_level {
+        Level::None => {
+            screen_reader.speech.speak("some", false)?;
+            Level::Some
+        }
+        Level::Some => {
+            screen_reader.speech.speak("most", false)?;
+            Level::Most
+        }
+        Level::Most => {
+            screen_reader.speech.speak("all", false)?;
+            Level::All
+        }
+        Level::All | Level::Character => {
+            screen_reader.speech.speak("none", false)?;
+            Level::None
+        }
+    };
+
     Ok(false)
 }

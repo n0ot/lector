@@ -21,6 +21,7 @@ static KEYMAP: phf::Map<&'static str, commands::Action> = phf_map! {
     "\x1BOP" => commands::Action::ToggleHelp,
     "\x1B'" => commands::Action::ToggleAutoRead,
     "\x1B\"" => commands::Action::ToggleReviewCursorFollowsScreenCursor,
+    "\x1Bs" => commands::Action::ToggleSymbolLevel,
     "\x1Bn" => commands::Action::PassNextKey,
     "\x1Bx" => commands::Action::StopSpeaking,
     "\x1Bu" => commands::Action::RevLinePrev,

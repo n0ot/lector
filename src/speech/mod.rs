@@ -16,7 +16,7 @@ pub trait Driver {
 
 pub struct Speech {
     driver: Box<dyn Driver>,
-    symbol_level: symbols::Level,
+    pub symbol_level: symbols::Level,
     symbols_map: symbols::SymbolMap,
 }
 
