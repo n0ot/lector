@@ -1,8 +1,11 @@
 use anyhow::Result;
+use std::fmt::Write;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub mod symbols;
 pub mod tdsr;
+
+const MIN_REPEAT_COUNT: usize = 4;
 
 pub trait Driver {
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<()>;
@@ -27,7 +30,11 @@ impl Speech {
     }
 
     pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
-        let text = describe_repeated_graphemes(text);
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        let mut processed = String::with_capacity(text.len());
 
         // If the text is a single character, increase the symbol level to Level::Character to
         // read the symbol no matter what.
@@ -36,19 +43,62 @@ impl Speech {
             _ => self.symbol_level,
         };
 
-        let text = UnicodeSegmentation::graphemes(text.as_str(), true)
-            .map(|s| {
-                let result = if s.chars().all(char::is_alphabetic) {
-                    String::from(s)
+        let mut prev_g: Option<&str> = None;
+        let mut run_string = String::new();
+        let mut run_count = 0;
+        for g in UnicodeSegmentation::graphemes(text, true)
+            .map(Some)
+            .chain(std::iter::once(None))
+        {
+            if prev_g == None || prev_g == g {
+                run_count += 1;
+                prev_g = g;
+                continue;
+            }
+
+            // the previous run has ended
+            let mut collapse_repeated = run_count >= MIN_REPEAT_COUNT;
+            run_string.clear();
+
+            if let Some(symbol) = self.symbols_map.get(prev_g.unwrap()) {
+                if level >= symbol.level {
+                    write!(&mut run_string, " {} ", symbol.replacement)?;
                 } else {
-                    emojis::get(s).map_or_else(|| String::from(s), |v| format!(" {} ", v.name()))
-                };
-                let result =
-                    self.symbols_map.get_level(s, level).map_or(result, |v| format!(" {} ", v.replacement));
-                result
-            })
-            .collect::<String>();
-        self.driver.speak(&text, interrupt)
+                    // It doesn't make sense to collapse repeated symbols that aren't expanded
+                    collapse_repeated = false;
+                }
+                if !symbol.repeat {
+                    collapse_repeated = false;
+                }
+            }
+
+            if run_string.is_empty() {
+                if let Some(v) = emojis::get(prev_g.unwrap()) {
+                    write!(&mut run_string, " {} ", v.name())?;
+                }
+            }
+
+            if run_string.is_empty() {
+                run_string.push_str(prev_g.unwrap());
+            }
+
+            if run_string.chars().all(char::is_whitespace) {
+                collapse_repeated = false;
+            }
+
+            if collapse_repeated {
+                write!(&mut processed, " {} {} ", run_count, run_string)?;
+            } else {
+                for _ in 0..run_count {
+                    processed.push_str(run_string.as_str());
+                }
+            }
+
+            run_count = 1;
+            prev_g = g;
+        }
+
+        self.driver.speak(&processed, interrupt)
     }
 
     pub fn stop(&mut self) -> Result<()> {
@@ -63,50 +113,4 @@ impl Speech {
     pub fn set_rate(&mut self, rate: f32) -> Result<()> {
         self.driver.set_rate(rate)
     }
-}
-
-/// If a grapheme g is repeated at least 4 times,
-/// the entire run will be replaced with " n g ".
-/// For example, "hello....world" will become "hello 4 . world".
-fn describe_repeated_graphemes(s: &str) -> String {
-    let n = 4;
-    // We are comparing each grapheme to the one before it.
-    // If they're not equal, we will reset the count to 1,
-    // otherwise, we will increase it.
-    // We are using Option here because there is no previous grapheme before the first one,
-    // and because we need to iterate one time pass the end of the string to report the count of
-    // the last grapheme run.
-    UnicodeSegmentation::graphemes(s, true)
-        .map(Some)
-        .chain(std::iter::once(None))
-        .scan((0, None), |(count, prev_g), g| {
-            let result = match g {
-                Some(c) if Some(c) == *prev_g => {
-                    *count += 1;
-                    Some((0, None))
-                }
-                Some(_) => {
-                    // This is a new grapheme
-                    let result = (*count, *prev_g);
-                    *count = 1;
-                    Some(result)
-                }
-                None => Some((*count, *prev_g)), // This is the end of the string
-            };
-            *prev_g = g;
-            result
-        })
-        // Only yield the last count/grapheme in the run,
-        .filter_map(|(count, g)| g.map(|v| (count, v)))
-        .map(|(count, g)| {
-            if count >= n && !g.trim().is_empty() && !g.chars().any(char::is_alphanumeric) {
-                // we want to describe this run in terms of how many times it was repeated.
-                // adding spaces around it ensures it's read correctly.
-                format!(" {} {} ", count, g)
-            } else {
-                // just reproduce the grapheme run as it was in the original string.
-                String::from(g).repeat(count)
-            }
-        })
-        .collect()
 }

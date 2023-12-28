@@ -95,11 +95,8 @@ impl SymbolMap {
         );
     }
 
-    pub fn get_level(&self, symbol: &str, level: Level) -> Option<&SymbolDesc> {
-        match self.map.get(symbol) {
-            Some(s) if level >= s.level => Some(s),
-            _ => None,
-        }
+    pub fn get(&self, symbol: &str) -> Option<&SymbolDesc> {
+        self.map.get(symbol)
     }
 }
 
@@ -108,10 +105,10 @@ pub struct SymbolDesc {
     /// mapped symbols will be replaced with this string
     pub replacement: String,
     /// Replacement will take place at this symbol level or above
-    level: Level,
+    pub level: Level,
     /// If true, repeated runs of symbols mapped to this SymbolDesc will be transformed to
     /// `<count> <replacement>`
-    repeat: bool,
+    pub repeat: bool,
 }
 
 impl SymbolDesc {
