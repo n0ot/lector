@@ -1,7 +1,7 @@
 use anyhow::Result;
 use unicode_segmentation::UnicodeSegmentation;
 
-pub mod punctuation;
+pub mod symbols;
 pub mod tdsr;
 
 pub trait Driver {
@@ -13,22 +13,27 @@ pub trait Driver {
 
 pub struct Speech {
     driver: Box<dyn Driver>,
-    punctuation_level: punctuation::Level,
+    symbol_level: symbols::Level,
+    symbols_map: symbols::SymbolMap,
 }
 
 impl Speech {
-    pub fn new(driver: Box<dyn Driver>, punctuation_level: punctuation::Level) -> Speech {
-        Speech { driver, punctuation_level }
+    pub fn new(driver: Box<dyn Driver>, symbol_level: symbols::Level) -> Speech {
+        Speech {
+            driver,
+            symbol_level,
+            symbols_map: symbols::SymbolMap::default_map(),
+        }
     }
 
     pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
         let text = describe_repeated_graphemes(text);
 
-        // If the text is a single character, increase the punctuation level to Level::Character to
+        // If the text is a single character, increase the symbol level to Level::Character to
         // read the symbol no matter what.
-        let punct_level = match text.chars().count() {
-            1 => punctuation::Level::Character,
-            _ => self.punctuation_level,
+        let level = match text.chars().count() {
+            1 => symbols::Level::Character,
+            _ => self.symbol_level,
         };
 
         let text = UnicodeSegmentation::graphemes(text.as_str(), true)
@@ -39,7 +44,7 @@ impl Speech {
                     emojis::get(s).map_or_else(|| String::from(s), |v| format!(" {} ", v.name()))
                 };
                 let result =
-                    punctuation::get(s, punct_level).map_or(result, |v| format!(" {} ", v));
+                    self.symbols_map.get_level(s, level).map_or(result, |v| format!(" {} ", v.replacement));
                 result
             })
             .collect::<String>();

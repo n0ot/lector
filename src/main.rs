@@ -61,29 +61,35 @@ struct Cli {
     /// Path to the speech program
     #[clap(long, short = 'p')]
     speech_program: String,
-    /// Punctuation level
-    #[clap(long, short = 'P', value_enum, default_value_t)]
-    punctuation_level: PunctuationLevel,
+    /// Symbol level
+    #[clap(long, short = 'l', value_enum, default_value_t)]
+    symbol_level: SymbolLevel,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "kebab-case")]
-enum PunctuationLevel {
-    /// No punctuation symbols will be expanded
+enum SymbolLevel {
+    /// No symbols will be expanded
     None,
-    /// All punctuation symbols will be expanded
+    /// Some symbols will be expanded
+    Some,
+    /// Most symbols will be expanded
+    Most,
+    /// All symbols will be expanded
     #[default]
     All,
-    /// All punctuation symbols, including spaces, will be expanded
+    /// All symbols, including spaces, will be expanded
     Character,
 }
 
-impl From<PunctuationLevel> for speech::punctuation::Level {
-    fn from(other: PunctuationLevel) -> speech::punctuation::Level {
+impl From<SymbolLevel> for speech::symbols::Level {
+    fn from(other: SymbolLevel) -> speech::symbols::Level {
         match other {
-            PunctuationLevel::None => speech::punctuation::Level::None,
-            PunctuationLevel::All => speech::punctuation::Level::All,
-            PunctuationLevel::Character => speech::punctuation::Level::Character,
+            SymbolLevel::None => speech::symbols::Level::None,
+            SymbolLevel::Some => speech::symbols::Level::Some,
+            SymbolLevel::Most => speech::symbols::Level::Most,
+            SymbolLevel::All => speech::symbols::Level::All,
+            SymbolLevel::Character => speech::symbols::Level::Character,
         }
     }
 }
@@ -92,7 +98,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let speech_driver =
         Box::new(speech::tdsr::Tdsr::new(cli.speech_program).context("create tdsr driver")?);
-    let speech = speech::Speech::new(speech_driver, cli.punctuation_level.into());
+    let speech = speech::Speech::new(speech_driver, cli.symbol_level.into());
     let mut screen_reader =
         ScreenReader::new(speech).context("create new screen reader instance")?;
 
