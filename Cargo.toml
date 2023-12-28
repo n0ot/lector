@@ -16,7 +16,11 @@ mio = { version = "0.8.8", features = ["os-ext", "os-poll"] }
 nix = "0.26.2"
 phf = { version = "0.11.2", features = ["macros"] }
 ptyprocess = "0.4.1"
-regex = { version = "1.9.3", default-features = false, features = ["std", "perf"] }
+regex = { version = "1.9.3", default-features = false, features = [
+    "std",
+    "perf",
+] }
+serde = { version = "1.0.193", features = ["derive"] }
 signal-hook = "0.3.17"
 signal-hook-mio = { version = "0.2.3", features = ["support-v0_8"] }
 similar = { version = "2.2.1", features = ["unicode"] }

@@ -4,6 +4,7 @@ use lector::{commands, perform, screen_reader::ScreenReader, speech, view::View}
 use nix::sys::termios;
 use phf::phf_map;
 use ptyprocess::PtyProcess;
+use serde::Serialize;
 use signal_hook::consts::signal::*;
 use signal_hook_mio::v0_8::Signals;
 use std::{
@@ -60,14 +61,38 @@ struct Cli {
     /// Path to the speech program
     #[clap(long, short = 'p')]
     speech_program: String,
+    /// Punctuation level
+    #[clap(long, short = 'P', value_enum, default_value_t)]
+    punctuation_level: PunctuationLevel,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PunctuationLevel {
+    /// No punctuation symbols will be expanded
+    None,
+    /// All punctuation symbols will be expanded
+    #[default]
+    All,
+    /// All punctuation symbols, including spaces, will be expanded
+    Character,
+}
+
+impl From<PunctuationLevel> for speech::punctuation::Level {
+    fn from(other: PunctuationLevel) -> speech::punctuation::Level {
+        match other {
+            PunctuationLevel::None => speech::punctuation::Level::None,
+            PunctuationLevel::All => speech::punctuation::Level::All,
+            PunctuationLevel::Character => speech::punctuation::Level::Character,
+        }
+    }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let speech_driver = Box::new(
-        speech::tdsr::Tdsr::new(cli.speech_program).context("create tdsr driver")?,
-    );
-    let speech = speech::Speech::new(speech_driver);
+    let speech_driver =
+        Box::new(speech::tdsr::Tdsr::new(cli.speech_program).context("create tdsr driver")?);
+    let speech = speech::Speech::new(speech_driver, cli.punctuation_level.into());
     let mut screen_reader =
         ScreenReader::new(speech).context("create new screen reader instance")?;
 

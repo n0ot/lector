@@ -116,6 +116,7 @@ static LEVEL_CHARACTER_SYMBOLS: phf::Set<&'static str> = phf_set! {
 
 #[derive(Copy, Clone)]
 pub enum Level {
+    None,
     All,
     Character,
 }

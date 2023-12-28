@@ -1,7 +1,7 @@
 use anyhow::Result;
 use unicode_segmentation::UnicodeSegmentation;
 
-mod punctuation;
+pub mod punctuation;
 pub mod tdsr;
 
 pub trait Driver {
@@ -13,11 +13,12 @@ pub trait Driver {
 
 pub struct Speech {
     driver: Box<dyn Driver>,
+    punctuation_level: punctuation::Level,
 }
 
 impl Speech {
-    pub fn new(driver: Box<dyn Driver>) -> Speech {
-        Speech { driver }
+    pub fn new(driver: Box<dyn Driver>, punctuation_level: punctuation::Level) -> Speech {
+        Speech { driver, punctuation_level }
     }
 
     pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
@@ -27,7 +28,7 @@ impl Speech {
         // read the symbol no matter what.
         let punct_level = match text.chars().count() {
             1 => punctuation::Level::Character,
-            _ => punctuation::Level::All,
+            _ => self.punctuation_level,
         };
 
         let text = UnicodeSegmentation::graphemes(text.as_str(), true)
