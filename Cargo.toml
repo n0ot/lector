@@ -1,30 +1,4 @@
-[package]
-name = "lector"
-version = "0.1.0"
-edition = "2021"
-description = "A terminal screen reader"
-license = "MIT"
+[workspace]
+resolver = "2"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
-anyhow = "1.0.72"
-chrono = "0.4.26"
-clap = { version = "4.4.11", features = ["derive", "env"] }
-emojis = "0.6.0"
-mio = { version = "0.8.8", features = ["os-ext", "os-poll"] }
-nix = "0.26.2"
-phf = { version = "0.11.2", features = ["macros"] }
-ptyprocess = "0.4.1"
-regex = { version = "1.9.3", default-features = false, features = [
-    "std",
-    "perf",
-] }
-serde = { version = "1.0.193", features = ["derive"] }
-signal-hook = "0.3.17"
-signal-hook-mio = { version = "0.2.3", features = ["support-v0_8"] }
-similar = { version = "2.2.1", features = ["unicode"] }
-termsize = "0.1.6"
-unicode-segmentation = "1.10.1"
-vt100 = "0.15.2"
-vte = "0.11.1"
+members = ["lector", "lector-tts"]
