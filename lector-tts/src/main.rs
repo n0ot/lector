@@ -59,8 +59,6 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                         eprintln!("Error handling input: {}", e);
                         std::process::exit(1);
                     }
-
-                    Ok(())
                 }
 
                 let fh: *mut Object = msg_send![notification, object];
@@ -90,6 +88,8 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
     for line in std::io::stdin().lock().lines() {
         handle_input(tts, line)?;
     }
+
+    Ok(())
 }
 
 fn handle_input(tts: &mut Tts, input: &str) -> Result<()> {
