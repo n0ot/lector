@@ -162,7 +162,7 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
     poll.registry()
         .register(&mut signals, SIGNALS_TOKEN, mio::Interest::READABLE)?;
 
-    screen_reader.speech.set_rate(720.0)?;
+    screen_reader.speech.set_rate(1.0)?;
     screen_reader.speech.speak("Welcome to lector", false)?;
 
     // Main event loop
