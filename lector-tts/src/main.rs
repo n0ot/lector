@@ -14,6 +14,7 @@ use objc::{
     runtime::{Object, Sel},
     sel, sel_impl,
 };
+use std::io::BufRead;
 use tts::Tts;
 
 #[cfg(target_os = "macos")]
@@ -86,7 +87,7 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn observe_stdin(tts: &mut Tts) -> Result<()> {
     for line in std::io::stdin().lock().lines() {
-        handle_input(tts, line)?;
+        handle_input(tts, &line?)?;
     }
 
     Ok(())
