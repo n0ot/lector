@@ -62,7 +62,25 @@ impl Speech {
 
             if let Some(symbol) = self.symbols_map.get(prev_g.unwrap()) {
                 if level >= symbol.level {
-                    write!(&mut run_string, " {} ", symbol.replacement)?;
+                    match symbol.include_original {
+                        symbols::IncludeOriginal::Before if level != symbols::Level::Character => {
+                            write!(
+                                &mut run_string,
+                                " {}{} ",
+                                prev_g.unwrap(),
+                                symbol.replacement
+                            )?
+                        }
+                        symbols::IncludeOriginal::After if level != symbols::Level::Character => {
+                            write!(
+                                &mut run_string,
+                                " {}{} ",
+                                symbol.replacement,
+                                prev_g.unwrap()
+                            )?
+                        }
+                        _ => write!(&mut run_string, " {} ", symbol.replacement)?,
+                    }
                 } else {
                     // It doesn't make sense to collapse repeated symbols that aren't expanded
                     collapse_repeated = false;
