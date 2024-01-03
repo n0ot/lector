@@ -100,7 +100,10 @@ impl Speech {
                 run_string.push_str(prev_g.unwrap());
             }
 
-            if run_string.chars().all(char::is_whitespace) {
+            if run_string
+                .chars()
+                .all(|c| c.is_whitespace() ||  c.is_numeric())
+            {
                 collapse_repeated = false;
             }
 
