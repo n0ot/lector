@@ -170,6 +170,7 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
     let mut stdout = std::io::stdout().lock();
     let mut events = mio::Events::with_capacity(1024);
     let mut poll_timeout = None;
+    let mut last_stdin_update = None;
     let mut last_pty_update = None;
     loop {
         poll.poll(&mut events, poll_timeout).or_else(|e| {
@@ -220,6 +221,7 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
                         }
                     };
                     if pass_through {
+                        last_stdin_update = Some(time::Instant::now());
                         pty_stream
                             .write_all(&buf[0..n])
                             .context("copy STDIN to PTY")?;
@@ -286,8 +288,13 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
                     let _ = text_reporter.get_text();
                     false
                 };
-                if !read_text {
-                    screen_reader.track_cursor(&mut view)?;
+                // Don't announce cursor changes if there are other textual changes being read,
+                // or the cursor is moving without user interaction.
+                // The latter makes disabling auto read truly be silent.
+                if let Some(lsu) = last_stdin_update {
+                    if lsu.elapsed().as_millis() <= MAX_DIFF_DELAY as u128 && !read_text {
+                        screen_reader.track_cursor(&mut view)?;
+                    }
                 }
 
                 // Track screen cursor movements here, instead of every time the screen
