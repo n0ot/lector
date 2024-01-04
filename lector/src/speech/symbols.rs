@@ -13,12 +13,30 @@ impl SymbolMap {
 
     pub fn default_map() -> Self {
         let mut m = Self::new();
-        m.put(" ", "space", Level::Character, IncludeOriginal::Never, false);
+        m.put(
+            " ",
+            "space",
+            Level::Character,
+            IncludeOriginal::Never,
+            false,
+        );
         m.put("!", "bang", Level::All, IncludeOriginal::After, true);
-        m.put("¡", "inverted bang", Level::Some, IncludeOriginal::After, true);
+        m.put(
+            "¡",
+            "inverted bang",
+            Level::Some,
+            IncludeOriginal::After,
+            true,
+        );
         m.put("\"", "quote", Level::Most, IncludeOriginal::Never, true);
         m.put("“", "left quote", Level::Most, IncludeOriginal::Never, true);
-        m.put("”", "right quote", Level::Most, IncludeOriginal::Never, true);
+        m.put(
+            "”",
+            "right quote",
+            Level::Most,
+            IncludeOriginal::Never,
+            true,
+        );
         m.put("#", "number", Level::Some, IncludeOriginal::Never, true);
         m.put("$", "dollar", Level::All, IncludeOriginal::Never, false);
         m.put("¢", "cents", Level::All, IncludeOriginal::Never, false);
@@ -32,14 +50,26 @@ impl SymbolMap {
         m.put("‘", "left tick", Level::Most, IncludeOriginal::Never, true);
         m.put("’", "right tick", Level::Most, IncludeOriginal::Never, true);
         m.put("(", "left paren", Level::Most, IncludeOriginal::After, true);
-        m.put(")", "right paren", Level::Most, IncludeOriginal::Before, true);
+        m.put(
+            ")",
+            "right paren",
+            Level::Most,
+            IncludeOriginal::Before,
+            true,
+        );
         m.put("*", "star", Level::Some, IncludeOriginal::Never, true);
         m.put("+", "plus", Level::Some, IncludeOriginal::Never, true);
         m.put(",", "comma", Level::All, IncludeOriginal::After, true);
         m.put("-", "dash", Level::Most, IncludeOriginal::After, true);
         m.put("–", "en dash", Level::Most, IncludeOriginal::After, true);
         m.put("—", "em dash", Level::Most, IncludeOriginal::After, true);
-        m.put("­", "soft hyphen", Level::Most, IncludeOriginal::Never, true);
+        m.put(
+            "­",
+            "soft hyphen",
+            Level::Most,
+            IncludeOriginal::Never,
+            true,
+        );
         m.put("⁃", "hyphen", Level::None, IncludeOriginal::Never, true);
         m.put(".", "dot", Level::All, IncludeOriginal::After, true);
         m.put("…", "dot dot dot", Level::All, IncludeOriginal::After, true);
@@ -51,31 +81,115 @@ impl SymbolMap {
         m.put("=", "equals", Level::Some, IncludeOriginal::Never, true);
         m.put(">", "greater", Level::Some, IncludeOriginal::Never, true);
         m.put("?", "question", Level::All, IncludeOriginal::After, true);
-        m.put("¿", "inverted question", Level::Some, IncludeOriginal::After, true);
+        m.put(
+            "¿",
+            "inverted question",
+            Level::Some,
+            IncludeOriginal::After,
+            true,
+        );
         m.put("@", "at", Level::Some, IncludeOriginal::Never, true);
-        m.put("[", "left bracket", Level::Some, IncludeOriginal::Never, true);
+        m.put(
+            "[",
+            "left bracket",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
         m.put("\\", "backslash", Level::Most, IncludeOriginal::Never, true);
-        m.put("]", "right bracket", Level::Some, IncludeOriginal::Never, true);
+        m.put(
+            "]",
+            "right bracket",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
         m.put("^", "carrat", Level::Most, IncludeOriginal::Never, true);
         m.put("_", "line", Level::Most, IncludeOriginal::Never, true);
         m.put("`", "graav", Level::Most, IncludeOriginal::Never, true);
         m.put("{", "left brace", Level::Some, IncludeOriginal::Never, true);
         m.put("|", "bar", Level::Most, IncludeOriginal::Never, true);
         m.put("¦", "broken bar", Level::Most, IncludeOriginal::Never, true);
-        m.put("}", "right brace", Level::Some, IncludeOriginal::Never, true);
+        m.put(
+            "}",
+            "right brace",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
         m.put("~", "tilde", Level::Most, IncludeOriginal::Never, true);
-        m.put("■", "black square", Level::Some, IncludeOriginal::Never, true);
-        m.put("▪", "black small square", Level::Some, IncludeOriginal::Never, true);
-        m.put("◾", "black medium small square", Level::Some, IncludeOriginal::Never, true);
-        m.put("□", "white square", Level::Some, IncludeOriginal::Never, true);
-        m.put("◦", "white bullet", Level::Some, IncludeOriginal::Never, true);
-        m.put("➔", "right arrow", Level::Some, IncludeOriginal::Never, true);
-        m.put("⇨", "right white arrow", Level::Some, IncludeOriginal::Never, true);
+        m.put(
+            "■",
+            "black square",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
+        m.put(
+            "▪",
+            "black small square",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
+        m.put(
+            "◾",
+            "black medium small square",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
+        m.put(
+            "□",
+            "white square",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
+        m.put(
+            "◦",
+            "white bullet",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
+        m.put(
+            "➔",
+            "right arrow",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
+        m.put(
+            "⇨",
+            "right white arrow",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
         m.put("●", "circle", Level::Most, IncludeOriginal::Never, true);
-        m.put("○", "white circle", Level::Most, IncludeOriginal::Never, true);
+        m.put(
+            "○",
+            "white circle",
+            Level::Most,
+            IncludeOriginal::Never,
+            true,
+        );
         m.put("′", "prime", Level::None, IncludeOriginal::Never, true);
-        m.put("″", "double prime", Level::None, IncludeOriginal::Never, true);
-        m.put("‴", "tripple prime", Level::None, IncludeOriginal::Never, true);
+        m.put(
+            "″",
+            "double prime",
+            Level::None,
+            IncludeOriginal::Never,
+            true,
+        );
+        m.put(
+            "‴",
+            "tripple prime",
+            Level::None,
+            IncludeOriginal::Never,
+            true,
+        );
         m.put("•", "bullet", Level::Some, IncludeOriginal::Never, true);
         m.put("§", "section", Level::Some, IncludeOriginal::Never, true);
         m.put("°", "degrees", Level::Some, IncludeOriginal::Never, true);
@@ -83,12 +197,25 @@ impl SymbolMap {
         m.put("®", "registered", Level::Some, IncludeOriginal::Never, true);
         m.put("™", "trademark", Level::Some, IncludeOriginal::Never, true);
         m.put("©", "copyright", Level::Some, IncludeOriginal::Never, true);
-        m.put("℠", "service mark", Level::Some, IncludeOriginal::Never, true);
+        m.put(
+            "℠",
+            "service mark",
+            Level::Some,
+            IncludeOriginal::Never,
+            true,
+        );
 
         m
     }
 
-    pub fn put(&mut self, symbol: &str, replacement: &str, level: Level, include_original: IncludeOriginal, repeat: bool) {
+    pub fn put(
+        &mut self,
+        symbol: &str,
+        replacement: &str,
+        level: Level,
+        include_original: IncludeOriginal,
+        repeat: bool,
+    ) {
         self.map.insert(
             symbol.into(),
             SymbolDesc::new(replacement.into(), level, include_original, repeat),
@@ -115,7 +242,12 @@ pub struct SymbolDesc {
 }
 
 impl SymbolDesc {
-    pub fn new(replacement: String, level: Level, include_original: IncludeOriginal, repeat: bool) -> SymbolDesc {
+    pub fn new(
+        replacement: String,
+        level: Level,
+        include_original: IncludeOriginal,
+        repeat: bool,
+    ) -> SymbolDesc {
         SymbolDesc {
             replacement,
             level,

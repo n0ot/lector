@@ -14,6 +14,7 @@ use objc::{
     runtime::{Object, Sel},
     sel, sel_impl,
 };
+#[cfg(not(target_os = "macos"))]
 use std::io::BufRead;
 use tts::Tts;
 

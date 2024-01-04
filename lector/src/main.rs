@@ -9,7 +9,7 @@ use signal_hook::consts::signal::*;
 use signal_hook_mio::v0_8::Signals;
 use std::{
     io::{ErrorKind, Read, Write},
-    os::fd::AsRawFd,
+    os::fd::{AsFd, AsRawFd},
     process::Command,
     time,
 };
@@ -103,7 +103,7 @@ fn main() -> Result<()> {
     let mut screen_reader =
         ScreenReader::new(speech).context("create new screen reader instance")?;
 
-    let init_term_attrs = termios::tcgetattr(0)?;
+    let init_term_attrs = termios::tcgetattr(std::io::stdin().as_fd())?;
     // Spawn the child process, connect it to a PTY,
     // and set the PTY to match the current terminal attributes.
     let mut process = PtyProcess::spawn(Command::new(cli.shell)).context("spawn child process")?;
@@ -111,16 +111,20 @@ fn main() -> Result<()> {
     process
         .set_window_size(term_size.cols, term_size.rows)
         .context("resize PTY")?;
-    let pty_stream = process.get_pty_stream().context("get PTY stream")?;
     termios::tcsetattr(
-        pty_stream.as_raw_fd(),
+        process.get_raw_handle()?,
         termios::SetArg::TCSADRAIN,
         &init_term_attrs,
     )?;
 
     let result = do_events(&mut screen_reader, &mut process);
     // Clean up before returning the above result.
-    termios::tcsetattr(0, termios::SetArg::TCSADRAIN, &init_term_attrs).unwrap();
+    termios::tcsetattr(
+        std::io::stdin().as_fd(),
+        termios::SetArg::TCSADRAIN,
+        &init_term_attrs,
+    )
+    .unwrap();
     let _ = process.kill(ptyprocess::Signal::SIGKILL);
     let _ = process.wait();
     result

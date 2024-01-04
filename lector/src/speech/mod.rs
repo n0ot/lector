@@ -38,7 +38,11 @@ impl Speech {
 
         // If the text is a single character, increase the symbol level to Level::Character to
         // read the symbol no matter what.
-        let text = if text.chars().all(char::is_whitespace) { text } else { text.trim() };
+        let text = if text.chars().all(char::is_whitespace) {
+            text
+        } else {
+            text.trim()
+        };
         let level = match text.chars().count() {
             1 => symbols::Level::Character,
             _ => self.symbol_level,
