@@ -47,6 +47,8 @@ impl Speech {
         let mut prev_g: Option<&str> = None;
         let mut run_string = String::new();
         let mut run_count = 0;
+        // Loop N+1 times, where N is the number of graphemes,
+        // to compute the final run at the end.
         for g in UnicodeSegmentation::graphemes(text, true)
             .map(Some)
             .chain(std::iter::once(None))
@@ -98,6 +100,7 @@ impl Speech {
             }
 
             if run_string.is_empty() {
+                collapse_repeated = false; // Only collapse for symbols and emojis
                 run_string.push_str(prev_g.unwrap());
             }
 
