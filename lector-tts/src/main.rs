@@ -1,4 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+#[cfg(target_os = "macos")]
+use anyhow::anyhow;
+use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
 use cocoa::base::selector;
 #[cfg(target_os = "macos")]
