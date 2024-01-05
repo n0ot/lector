@@ -12,196 +12,814 @@ impl SymbolMap {
     }
 
     pub fn default_map() -> Self {
+        use IncludeOriginal::*;
+        use Level::*;
         let mut m = Self::new();
+
+        // Whitespace
+        m.put(" ", "space", Character, Never, false);
+        m.put("	", "tab", Character, Never, false);
+
+        // Basic punctuation
+        m.put("!", "bang", All, After, true);
+        m.put("¡", "inverted bang", Some, After, true);
+        m.put("\"", "quote", Most, Never, true);
+        m.put("“", "left quote", Most, Never, true);
+        m.put("”", "right quote", Most, Never, true);
+        m.put("#", "number", Some, Never, true);
+        m.put("%", "percent", Some, Never, true);
+        m.put("&", "and", Some, Never, true);
+        m.put("'", "tick", Most, Never, true);
+        m.put("‘", "left tick", Most, Never, true);
+        m.put("’", "right tick", Most, Never, true);
+        m.put("(", "left paren", Most, After, true);
+        m.put(")", "right paren", Most, Before, true);
+        m.put("*", "star", Some, Never, true);
+        m.put("+", "plus", Some, Never, true);
+        m.put(",", "comma", All, After, true);
+        m.put("-", "dash", Most, After, true);
+        m.put("–", "en dash", Most, After, true);
+        m.put("—", "em dash", Most, After, true);
+        m.put("­", "soft hyphen", Most, Never, true);
+        m.put("⁃", "hyphen", None, Never, true);
+        m.put(".", "dot", All, After, true);
+        m.put("…", "dot dot dot", All, After, true);
+        m.put("·", "middle dot", Most, Never, true);
+        m.put("/", "slash", Some, Never, true);
+        m.put(":", "colon", Most, After, true);
+        m.put(";", "semi", Most, After, true);
+        m.put("<", "less", Some, Never, true);
+        m.put("=", "equals", Some, Never, true);
+        m.put(">", "greater", Some, Never, true);
+        m.put("?", "question", All, After, true);
+        m.put("¿", "inverted question", Some, After, true);
+        m.put("@", "at", Some, Never, true);
+        m.put("[", "left bracket", Some, Never, true);
+        m.put("\\", "backslash", Most, Never, true);
+        m.put("]", "right bracket", Some, Never, true);
+        m.put("^", "carrat", Most, Never, true);
+        m.put("_", "line", Most, Never, true);
+        m.put("`", "graav", Most, Never, true);
+        m.put("{", "left brace", Some, Never, true);
+        m.put("|", "bar", Most, Never, true);
+        m.put("¦", "broken bar", Most, Never, true);
+        m.put("}", "right brace", Some, Never, true);
+        m.put("~", "tilde", Most, Never, true);
+
+        // Currency
+        m.put("¤", "currency", All, Never, false);
+        m.put("₿", "bitcoin", All, Never, false);
+        m.put("$", "dollar", All, Never, false);
+        m.put("¢", "cents", All, Never, false);
+        m.put("£", "pound", All, Never, false);
+        m.put("€", "euro", All, Never, false);
+        m.put("¥", "yen", All, Never, false);
+
+        // Shapes
+        m.put("■", "black square", Some, Never, true);
+        m.put("▪", "black small square", Some, Never, true);
+        m.put("◾", "black medium small square", Some, Never, true);
+        m.put("□", "white square", Some, Never, true);
+        m.put("◦", "white bullet", Some, Never, true);
+        m.put("➔", "right arrow", Some, Never, true);
+        m.put("⇨", "right white arrow", Some, Never, true);
+        m.put("●", "circle", Most, Never, true);
+        m.put("○", "white circle", Most, Never, true);
+
+        // Misc
+        m.put("′", "prime", None, Never, true);
+        m.put("″", "double prime", None, Never, true);
+        m.put("‴", "tripple prime", None, Never, true);
+        m.put("•", "bullet", Some, Never, true);
+        m.put("§", "section", Some, Never, true);
+        m.put("°", "degrees", Some, Never, true);
+        m.put("µ", "micro", Some, Never, true);
+        m.put("®", "registered", Some, Never, true);
+        m.put("™", "trademark", Some, Never, true);
+        m.put("©", "copyright", Some, Never, true);
+        m.put("℠", "service mark", Some, Never, true);
+
+        // Box drawings
+        m.put("─", "box drawing Light Horizontal", None, Never, true);
+        m.put("━", "box drawing Heavy Horizontal", None, Never, true);
+        m.put("│", "box drawing Light Vertical", None, Never, true);
+        m.put("┃", "box drawing Heavy Vertical", None, Never, true);
         m.put(
-            " ",
-            "space",
-            Level::Character,
-            IncludeOriginal::Never,
-            false,
-        );
-        m.put("!", "bang", Level::All, IncludeOriginal::After, true);
-        m.put(
-            "¡",
-            "inverted bang",
-            Level::Some,
-            IncludeOriginal::After,
-            true,
-        );
-        m.put("\"", "quote", Level::Most, IncludeOriginal::Never, true);
-        m.put("“", "left quote", Level::Most, IncludeOriginal::Never, true);
-        m.put(
-            "”",
-            "right quote",
-            Level::Most,
-            IncludeOriginal::Never,
-            true,
-        );
-        m.put("#", "number", Level::Some, IncludeOriginal::Never, true);
-        m.put("$", "dollar", Level::All, IncludeOriginal::Never, false);
-        m.put("¢", "cents", Level::All, IncludeOriginal::Never, false);
-        m.put("¤", "currency", Level::All, IncludeOriginal::Never, false);
-        m.put("£", "pound", Level::All, IncludeOriginal::Never, false);
-        m.put("€", "euro", Level::All, IncludeOriginal::Never, false);
-        m.put("¥", "yen", Level::All, IncludeOriginal::Never, false);
-        m.put("%", "percent", Level::Some, IncludeOriginal::Never, true);
-        m.put("&", "and", Level::Some, IncludeOriginal::Never, true);
-        m.put("'", "tick", Level::Most, IncludeOriginal::Never, true);
-        m.put("‘", "left tick", Level::Most, IncludeOriginal::Never, true);
-        m.put("’", "right tick", Level::Most, IncludeOriginal::Never, true);
-        m.put("(", "left paren", Level::Most, IncludeOriginal::After, true);
-        m.put(
-            ")",
-            "right paren",
-            Level::Most,
-            IncludeOriginal::Before,
-            true,
-        );
-        m.put("*", "star", Level::Some, IncludeOriginal::Never, true);
-        m.put("+", "plus", Level::Some, IncludeOriginal::Never, true);
-        m.put(",", "comma", Level::All, IncludeOriginal::After, true);
-        m.put("-", "dash", Level::Most, IncludeOriginal::After, true);
-        m.put("–", "en dash", Level::Most, IncludeOriginal::After, true);
-        m.put("—", "em dash", Level::Most, IncludeOriginal::After, true);
-        m.put(
-            "­",
-            "soft hyphen",
-            Level::Most,
-            IncludeOriginal::Never,
-            true,
-        );
-        m.put("⁃", "hyphen", Level::None, IncludeOriginal::Never, true);
-        m.put(".", "dot", Level::All, IncludeOriginal::After, true);
-        m.put("…", "dot dot dot", Level::All, IncludeOriginal::After, true);
-        m.put("·", "middle dot", Level::Most, IncludeOriginal::Never, true);
-        m.put("/", "slash", Level::Some, IncludeOriginal::Never, true);
-        m.put(":", "colon", Level::Most, IncludeOriginal::After, true);
-        m.put(";", "semi", Level::Most, IncludeOriginal::After, true);
-        m.put("<", "less", Level::Some, IncludeOriginal::Never, true);
-        m.put("=", "equals", Level::Some, IncludeOriginal::Never, true);
-        m.put(">", "greater", Level::Some, IncludeOriginal::Never, true);
-        m.put("?", "question", Level::All, IncludeOriginal::After, true);
-        m.put(
-            "¿",
-            "inverted question",
-            Level::Some,
-            IncludeOriginal::After,
-            true,
-        );
-        m.put("@", "at", Level::Some, IncludeOriginal::Never, true);
-        m.put(
-            "[",
-            "left bracket",
-            Level::Some,
-            IncludeOriginal::Never,
-            true,
-        );
-        m.put("\\", "backslash", Level::Most, IncludeOriginal::Never, true);
-        m.put(
-            "]",
-            "right bracket",
-            Level::Some,
-            IncludeOriginal::Never,
-            true,
-        );
-        m.put("^", "carrat", Level::Most, IncludeOriginal::Never, true);
-        m.put("_", "line", Level::Most, IncludeOriginal::Never, true);
-        m.put("`", "graav", Level::Most, IncludeOriginal::Never, true);
-        m.put("{", "left brace", Level::Some, IncludeOriginal::Never, true);
-        m.put("|", "bar", Level::Most, IncludeOriginal::Never, true);
-        m.put("¦", "broken bar", Level::Most, IncludeOriginal::Never, true);
-        m.put(
-            "}",
-            "right brace",
-            Level::Some,
-            IncludeOriginal::Never,
-            true,
-        );
-        m.put("~", "tilde", Level::Most, IncludeOriginal::Never, true);
-        m.put(
-            "■",
-            "black square",
-            Level::Some,
-            IncludeOriginal::Never,
+            "┄",
+            "box drawing Light Triple Dash Horizontal",
+            None,
+            Never,
             true,
         );
         m.put(
-            "▪",
-            "black small square",
-            Level::Some,
-            IncludeOriginal::Never,
+            "┅",
+            "box drawing Heavy Triple Dash Horizontal",
+            None,
+            Never,
             true,
         );
         m.put(
-            "◾",
-            "black medium small square",
-            Level::Some,
-            IncludeOriginal::Never,
+            "┆",
+            "box drawing Light Triple Dash Vertical",
+            None,
+            Never,
             true,
         );
         m.put(
-            "□",
-            "white square",
-            Level::Some,
-            IncludeOriginal::Never,
+            "┇",
+            "box drawing Heavy Triple Dash Vertical",
+            None,
+            Never,
             true,
         );
         m.put(
-            "◦",
-            "white bullet",
-            Level::Some,
-            IncludeOriginal::Never,
+            "┈",
+            "box drawing Light Quadruple Dash Horizontal",
+            None,
+            Never,
             true,
         );
         m.put(
-            "➔",
-            "right arrow",
-            Level::Some,
-            IncludeOriginal::Never,
+            "┉",
+            "box drawing Heavy Quadruple Dash Horizontal",
+            None,
+            Never,
             true,
         );
         m.put(
-            "⇨",
-            "right white arrow",
-            Level::Some,
-            IncludeOriginal::Never,
-            true,
-        );
-        m.put("●", "circle", Level::Most, IncludeOriginal::Never, true);
-        m.put(
-            "○",
-            "white circle",
-            Level::Most,
-            IncludeOriginal::Never,
-            true,
-        );
-        m.put("′", "prime", Level::None, IncludeOriginal::Never, true);
-        m.put(
-            "″",
-            "double prime",
-            Level::None,
-            IncludeOriginal::Never,
+            "┊",
+            "box drawing Light Quadruple Dash Vertical",
+            None,
+            Never,
             true,
         );
         m.put(
-            "‴",
-            "tripple prime",
-            Level::None,
-            IncludeOriginal::Never,
+            "┋",
+            "box drawing Heavy Quadruple Dash Vertical",
+            None,
+            Never,
             true,
         );
-        m.put("•", "bullet", Level::Some, IncludeOriginal::Never, true);
-        m.put("§", "section", Level::Some, IncludeOriginal::Never, true);
-        m.put("°", "degrees", Level::Some, IncludeOriginal::Never, true);
-        m.put("µ", "micro", Level::Some, IncludeOriginal::Never, true);
-        m.put("®", "registered", Level::Some, IncludeOriginal::Never, true);
-        m.put("™", "trademark", Level::Some, IncludeOriginal::Never, true);
-        m.put("©", "copyright", Level::Some, IncludeOriginal::Never, true);
+        m.put("┌", "box drawing Light Down and Right", None, Never, true);
         m.put(
-            "℠",
-            "service mark",
-            Level::Some,
-            IncludeOriginal::Never,
+            "┍",
+            "box drawing Down Light and Right Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┎",
+            "box drawing Down Heavy and Right Light",
+            None,
+            Never,
+            true,
+        );
+        m.put("┏", "box drawing Heavy Down and Right", None, Never, true);
+        m.put("┐", "box drawing Light Down and Left", None, Never, true);
+        m.put(
+            "┑",
+            "box drawing Down Light and Left Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┒",
+            "box drawing Down Heavy and Left Light",
+            None,
+            Never,
+            true,
+        );
+        m.put("┓", "box drawing Heavy Down and Left", None, Never, true);
+        m.put("└", "box drawing Light Up and Right", None, Never, true);
+        m.put(
+            "┕",
+            "box drawing Up Light and Right Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┖",
+            "box drawing Up Heavy and Right Light",
+            None,
+            Never,
+            true,
+        );
+        m.put("┗", "box drawing Heavy Up and Right", None, Never, true);
+        m.put("┘", "box drawing Light Up and Left", None, Never, true);
+        m.put(
+            "┙",
+            "box drawing Up Light and Left Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┚",
+            "box drawing Up Heavy and Left Light",
+            None,
+            Never,
+            true,
+        );
+        m.put("┛", "box drawing Heavy Up and Left", None, Never, true);
+        m.put(
+            "├",
+            "box drawing Light Vertical and Right",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┝",
+            "box drawing Vertical Light and Right Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┞",
+            "box drawing Up Heavy and Right Down Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┟",
+            "box drawing Down Heavy and Right Up Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┠",
+            "box drawing Vertical Heavy and Right Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┡",
+            "box drawing Down Light and Right Up Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┢",
+            "box drawing Up Light and Right Down Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┣",
+            "box drawing Heavy Vertical and Right",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┤",
+            "box drawing Light Vertical and Left",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┥",
+            "box drawing Vertical Light and Left Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┦",
+            "box drawing Up Heavy and Left Down Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┧",
+            "box drawing Down Heavy and Left Up Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┨",
+            "box drawing Vertical Heavy and Left Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┩",
+            "box drawing Down Light and Left Up Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┪",
+            "box drawing Up Light and Left Down Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┫",
+            "box drawing Heavy Vertical and Left",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┬",
+            "box drawing Light Down and Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┭",
+            "box drawing Left Heavy and Right Down Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┮",
+            "box drawing Right Heavy and Left Down Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┯",
+            "box drawing Down Light and Horizontal Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┰",
+            "box drawing Down Heavy and Horizontal Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┱",
+            "box drawing Right Light and Left Down Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┲",
+            "box drawing Left Light and Right Down Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┳",
+            "box drawing Heavy Down and Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┴",
+            "box drawing Light Up and Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┵",
+            "box drawing Left Heavy and Right Up Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┶",
+            "box drawing Right Heavy and Left Up Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┷",
+            "box drawing Up Light and Horizontal Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┸",
+            "box drawing Up Heavy and Horizontal Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┹",
+            "box drawing Right Light and Left Up Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┺",
+            "box drawing Left Light and Right Up Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┻",
+            "box drawing Heavy Up and Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┼",
+            "box drawing Light Vertical and Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┽",
+            "box drawing Left Heavy and Right Vertical Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┾",
+            "box drawing Right Heavy and Left Vertical Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "┿",
+            "box drawing Vertical Light and Horizontal Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╀",
+            "box drawing Up Heavy and Down Horizontal Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╁",
+            "box drawing Down Heavy and Up Horizontal Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╂",
+            "box drawing Vertical Heavy and Horizontal Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╃",
+            "box drawing Left Up Heavy and Right Down Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╄",
+            "box drawing Right Up Heavy and Left Down Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╅",
+            "box drawing Left Down Heavy and Right Up Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╆",
+            "box drawing Right Down Heavy and Left Up Light",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╇",
+            "box drawing Down Light and Up Horizontal Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╈",
+            "box drawing Up Light and Down Horizontal Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╉",
+            "box drawing Right Light and Left Vertical Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╊",
+            "box drawing Left Light and Right Vertical Heavy",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╋",
+            "box drawing Heavy Vertical and Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╌",
+            "box drawing Light Double Dash Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╍",
+            "box drawing Heavy Double Dash Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╎",
+            "box drawing Light Double Dash Vertical",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╏",
+            "box drawing Heavy Double Dash Vertical",
+            None,
+            Never,
+            true,
+        );
+        m.put("═", "box drawing Double Horizontal", None, Never, true);
+        m.put("║", "box drawing Double Vertical", None, Never, true);
+        m.put(
+            "╒",
+            "box drawing Down Single and Right Double",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╓",
+            "box drawing Down Double and Right Single",
+            None,
+            Never,
+            true,
+        );
+        m.put("╔", "box drawing Double Down and Right", None, Never, true);
+        m.put(
+            "╕",
+            "box drawing Down Single and Left Double",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╖",
+            "box drawing Down Double and Left Single",
+            None,
+            Never,
+            true,
+        );
+        m.put("╗", "box drawing Double Down and Left", None, Never, true);
+        m.put(
+            "╘",
+            "box drawing Up Single and Right Double",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╙",
+            "box drawing Up Double and Right Single",
+            None,
+            Never,
+            true,
+        );
+        m.put("╚", "box drawing Double Up and Right", None, Never, true);
+        m.put(
+            "╛",
+            "box drawing Up Single and Left Double",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╜",
+            "box drawing Up Double and Left Single",
+            None,
+            Never,
+            true,
+        );
+        m.put("╝", "box drawing Double Up and Left", None, Never, true);
+        m.put(
+            "╞",
+            "box drawing Vertical Single and Right Double",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╟",
+            "box drawing Vertical Double and Right Single",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╠",
+            "box drawing Double Vertical and Right",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╡",
+            "box drawing Vertical Single and Left Double",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╢",
+            "box drawing Vertical Double and Left Single",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╣",
+            "box drawing Double Vertical and Left",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╤",
+            "box drawing Down Single and Horizontal Double",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╥",
+            "box drawing Down Double and Horizontal Single",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╦",
+            "box drawing Double Down and Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╧",
+            "box drawing Up Single and Horizontal Double",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╨",
+            "box drawing Up Double and Horizontal Single",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╩",
+            "box drawing Double Up and Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╪",
+            "box drawing Vertical Single and Horizontal Double",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╫",
+            "box drawing Vertical Double and Horizontal Single",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╬",
+            "box drawing Double Vertical and Horizontal",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╭",
+            "box drawing Light Arc Down and Right",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╮",
+            "box drawing Light Arc Down and Left",
+            None,
+            Never,
+            true,
+        );
+        m.put("╯", "box drawing Light Arc Up and Left", None, Never, true);
+        m.put("╰", "box drawing Light Arc Up and Right", None, Never, true);
+        m.put(
+            "╱",
+            "box drawing Light Diagonal Upper Right to Lower Left",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╲",
+            "box drawing Light Diagonal Upper Left to Lower Right",
+            None,
+            Never,
+            true,
+        );
+        m.put("╳", "box drawing Light Diagonal Cross", None, Never, true);
+        m.put("╴", "box drawing Light Left", None, Never, true);
+        m.put("╵", "box drawing Light Up", None, Never, true);
+        m.put("╶", "box drawing Light Right", None, Never, true);
+        m.put("╷", "box drawing Light Down", None, Never, true);
+        m.put("╸", "box drawing Heavy Left", None, Never, true);
+        m.put("╹", "box drawing Heavy Up", None, Never, true);
+        m.put("╺", "box drawing Heavy Right", None, Never, true);
+        m.put("╻", "box drawing Heavy Down", None, Never, true);
+        m.put(
+            "╼",
+            "box drawing Light Left and Heavy Right",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╽",
+            "box drawing Light Up and Heavy Down",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╾",
+            "box drawing Heavy Left and Light Right",
+            None,
+            Never,
+            true,
+        );
+        m.put(
+            "╿",
+            "box drawing Heavy Up and Light Down",
+            None,
+            Never,
             true,
         );
 
