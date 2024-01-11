@@ -70,7 +70,9 @@ impl Speech {
             if let Some(symbol) = self.symbols_map.get(prev_g.unwrap()) {
                 if level >= symbol.level {
                     match symbol.include_original {
-                        symbols::IncludeOriginal::Before if level != symbols::Level::Character => {
+                        symbols::IncludeOriginal::Before
+                            if !processed.is_empty() && level != symbols::Level::Character =>
+                        {
                             write!(
                                 &mut run_string,
                                 " {}{} ",
