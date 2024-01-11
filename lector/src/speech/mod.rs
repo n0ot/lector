@@ -77,7 +77,7 @@ impl Speech {
                         {
                             write!(
                                 &mut run_string,
-                                " {}{} ",
+                                "{} {} ",
                                 prev_g.unwrap(),
                                 symbol.replacement
                             )?
