@@ -12,6 +12,7 @@ anyhow = "1.0.72"
 chrono = "0.4.26"
 clap = { version = "4.4.11", features = ["derive", "env"] }
 emojis = "0.6.0"
+lazy_static = "1.4.0"
 mio = { version = "0.8.8", features = ["os-ext", "os-poll"] }
 nix = { version = "0.27.1", features = ["term"] }
 phf = { version = "0.11.2", features = ["macros"] }
@@ -19,6 +20,7 @@ ptyprocess = "0.4.1"
 regex = { version = "1.9.3", default-features = false, features = [
     "std",
     "perf",
+    "unicode-bool",
 ] }
 serde = { version = "1.0.193", features = ["derive"] }
 signal-hook = "0.3.17"

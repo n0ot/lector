@@ -1,4 +1,6 @@
 use anyhow::Result;
+use lazy_static::lazy_static;
+use regex::Regex;
 use std::fmt::Write;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -128,6 +130,17 @@ impl Speech {
             run_count = 1;
             prev_g = g;
         }
+
+        // Break up mixed-case words
+        lazy_static! {
+            static ref RE_EXPAND_START_CAPS: Regex =
+                Regex::new(r"(\p{Lowercase})(\p{Uppercase})").unwrap();
+            static ref RE_EXPAND_END_CAPS: Regex =
+                Regex::new(r"(\p{Uppercase})(\p{Uppercase}\p{Lowercase})").unwrap();
+        }
+
+        let processed = RE_EXPAND_START_CAPS.replace_all(&processed, "$1 $2");
+        let processed = RE_EXPAND_END_CAPS.replace_all(&processed, "$1 $2");
 
         self.driver.speak(&processed, interrupt)
     }

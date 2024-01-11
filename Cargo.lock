@@ -616,6 +616,7 @@ dependencies = [
  "chrono",
  "clap",
  "emojis",
+ "lazy_static",
  "mio",
  "nix 0.27.1",
  "phf",
