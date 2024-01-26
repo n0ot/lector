@@ -18,15 +18,15 @@ pub trait Driver {
 
 pub struct Speech {
     driver: Box<dyn Driver>,
-    pub symbol_level: symbols::Level,
-    symbols_map: symbols::SymbolMap,
+    pub(crate) symbol_level: symbols::Level,
+    pub(crate) symbols_map: symbols::SymbolMap,
 }
 
 impl Speech {
-    pub fn new(driver: Box<dyn Driver>, symbol_level: symbols::Level) -> Speech {
+    pub fn new(driver: Box<dyn Driver>) -> Speech {
         Speech {
             driver,
-            symbol_level,
+            symbol_level: symbols::Level::Some,
             symbols_map: symbols::SymbolMap::default_map(),
         }
     }

@@ -1,10 +1,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use lector::{commands, perform, screen_reader::ScreenReader, speech, view::View};
+use lector::{commands, lua, perform, screen_reader::ScreenReader, speech, view::View};
 use nix::sys::termios;
 use phf::phf_map;
 use ptyprocess::PtyProcess;
-use serde::Serialize;
 use signal_hook::consts::signal::*;
 use signal_hook_mio::v0_8::Signals;
 use std::{
@@ -62,44 +61,13 @@ struct Cli {
     /// Path to the speech program
     #[clap(long, short = 'p')]
     speech_program: String,
-    /// Symbol level
-    #[clap(long, short = 'l', value_enum, default_value_t)]
-    symbol_level: SymbolLevel,
-}
-
-#[derive(clap::ValueEnum, Clone, Debug, Default, Serialize)]
-#[serde(rename_all = "kebab-case")]
-enum SymbolLevel {
-    /// No symbols will be expanded
-    None,
-    /// Some symbols will be expanded
-    Some,
-    /// Most symbols will be expanded
-    Most,
-    /// All symbols will be expanded
-    #[default]
-    All,
-    /// All symbols, including spaces, will be expanded
-    Character,
-}
-
-impl From<SymbolLevel> for speech::symbols::Level {
-    fn from(other: SymbolLevel) -> speech::symbols::Level {
-        match other {
-            SymbolLevel::None => speech::symbols::Level::None,
-            SymbolLevel::Some => speech::symbols::Level::Some,
-            SymbolLevel::Most => speech::symbols::Level::Most,
-            SymbolLevel::All => speech::symbols::Level::All,
-            SymbolLevel::Character => speech::symbols::Level::Character,
-        }
-    }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let speech_driver =
         Box::new(speech::tdsr::Tdsr::new(cli.speech_program).context("create tdsr driver")?);
-    let speech = speech::Speech::new(speech_driver, cli.symbol_level.into());
+    let speech = speech::Speech::new(speech_driver);
     let mut screen_reader =
         ScreenReader::new(speech).context("create new screen reader instance")?;
 
@@ -117,7 +85,14 @@ fn main() -> Result<()> {
         &init_term_attrs,
     )?;
 
-    let result = do_events(&mut screen_reader, &mut process);
+    let mut conf_dir = dirs::config_dir().ok_or_else(|| anyhow!("cannot get config directory"))?;
+    conf_dir.push("lector");
+    let mut conf_file = conf_dir.clone();
+    conf_file.push("init.lua");
+
+    let result = lua::setup(conf_file, &mut screen_reader, |screen_reader| {
+        do_events(screen_reader, &mut process)
+    });
     // Clean up before returning the above result.
     termios::tcsetattr(
         std::io::stdin().as_fd(),
@@ -127,7 +102,7 @@ fn main() -> Result<()> {
     .unwrap();
     let _ = process.kill(ptyprocess::Signal::SIGKILL);
     let _ = process.wait();
-    result
+    Ok(result?)
 }
 
 fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Result<()> {
@@ -165,9 +140,6 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
     )?;
     poll.registry()
         .register(&mut signals, SIGNALS_TOKEN, mio::Interest::READABLE)?;
-
-    screen_reader.speech.set_rate(1.0)?;
-    screen_reader.speech.speak("Welcome to lector", false)?;
 
     // Main event loop
     let mut stdin = std::io::stdin().lock();

@@ -1,14 +1,11 @@
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 
-pub struct SymbolMap {
-    map: HashMap<String, SymbolDesc>,
-}
+pub struct SymbolMap(HashMap<String, SymbolDesc>);
 
 impl SymbolMap {
     pub fn new() -> Self {
-        SymbolMap {
-            map: HashMap::new(),
-        }
+        SymbolMap(HashMap::new())
     }
 
     pub fn default_map() -> Self {
@@ -834,14 +831,14 @@ impl SymbolMap {
         include_original: IncludeOriginal,
         repeat: bool,
     ) {
-        self.map.insert(
+        self.0.insert(
             symbol.into(),
             SymbolDesc::new(replacement.into(), level, include_original, repeat),
         );
     }
 
     pub fn get(&self, symbol: &str) -> Option<&SymbolDesc> {
-        self.map.get(symbol)
+        self.0.get(symbol)
     }
 }
 
@@ -884,8 +881,67 @@ pub enum Level {
     Character,
 }
 
+impl std::fmt::Display for Level {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Level::None => "none",
+                Level::Some => "some",
+                Level::Most => "most",
+                Level::All => "all",
+                Level::Character => "character",
+            }
+        )
+    }
+}
+
+impl std::str::FromStr for Level {
+    type Err = anyhow::Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "none" => Ok(Level::None),
+            "some" => Ok(Level::Some),
+            "most" => Ok(Level::Most),
+            "all" => Ok(Level::All),
+            "character" => Ok(Level::Character),
+            _ => Err(anyhow!("unknown symbol level")),
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
 pub enum IncludeOriginal {
     Never,
     Before,
     After,
+}
+
+impl std::fmt::Display for IncludeOriginal {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+        IncludeOriginal::Never => "never",
+        IncludeOriginal::Before => "before",
+        IncludeOriginal::After => "after",
+            }
+        )
+    }
+}
+
+impl std::str::FromStr for IncludeOriginal {
+    type Err = anyhow::Error;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input {
+            "never" => Ok(IncludeOriginal::Never),
+            "before" => Ok(IncludeOriginal::Before),
+            "after" => Ok(IncludeOriginal::After),
+            _ => Err(anyhow!("unknown variant")),
+        }
+    }
 }
