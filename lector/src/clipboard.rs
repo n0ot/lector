@@ -1,6 +1,5 @@
 #[derive(Default)]
 pub struct Clipboard {
-    pub mark: Option<(u16, u16)>,
     idx: usize,
     clipboards: Vec<String>,
 }

@@ -6,6 +6,7 @@ pub struct View {
     prev_screen: vt100::Screen,
     pub prev_screen_time: time::Instant,
     pub review_cursor_position: (u16, u16), // (row, col)
+    pub(crate) review_mark_position: Option<(u16, u16)>, // (row, col)
     review_cursor_indent_level: u16,
     application_cursor_indent_level: u16,
 }
@@ -20,6 +21,7 @@ impl View {
             prev_screen,
             prev_screen_time: time::Instant::now(),
             review_cursor_position: cursor_position,
+            review_mark_position: None,
             review_cursor_indent_level: 0,
             application_cursor_indent_level: 0,
         }
@@ -29,10 +31,18 @@ impl View {
     pub fn process_changes(&mut self, buf: &[u8]) {
         self.parser.process(buf);
         // If the screen's size changed, the cursor may now be out of bounds.
+        let review_cursor_position = self.review_cursor_position;
         self.review_cursor_position = (
-            min(self.review_cursor_position.0, self.size().0),
-            min(self.review_cursor_position.1, self.size().1),
+            min(review_cursor_position.0, self.size().0),
+            min(review_cursor_position.1, self.size().1),
         );
+
+        // If the review cursor moved,
+        // it's because the screen was resized.
+        // Clear the mark, because it's probably not where you'd expect it.
+        if review_cursor_position != self.review_cursor_position {
+            self.review_mark_position = None;
+        }
     }
 
     /// Advances the previous screen to match the current one,

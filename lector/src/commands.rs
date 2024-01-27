@@ -456,14 +456,15 @@ fn action_say_time(screen_reader: &mut ScreenReader) -> Result<bool> {
         .speak(&format!("{}", date.format("%H:%M")), false)?;
     Ok(false)
 }
-fn action_set_mark(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
-    screen_reader.clipboard.mark = Some(view.review_cursor_position);
+
+fn action_set_mark(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
+    view.review_mark_position = Some(view.review_cursor_position);
     screen_reader.speech.speak("mark set", false)?;
     Ok(false)
 }
 
 fn action_copy(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
-    match screen_reader.clipboard.mark {
+    match view.review_mark_position {
         Some((mark_row, mark_col)) => {
             let (cur_row, cur_col) = view.review_cursor_position;
             if mark_row > cur_row || (mark_row == cur_row && mark_col > cur_col) {
@@ -505,7 +506,6 @@ fn action_copy(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
                     contents.push('\n');
                 }
             }
-            screen_reader.clipboard.mark = None;
             screen_reader.clipboard.put(contents);
             screen_reader.speech.speak("copied", false)?;
         }
