@@ -12,6 +12,7 @@ pub enum CursorTrackingMode {
 
 pub struct ScreenReader {
     pub speech: Speech,
+    pub view: View,
     pub help_mode: bool,
     pub auto_read: bool,
     pub review_follows_screen_cursor: bool,
@@ -23,9 +24,10 @@ pub struct ScreenReader {
 }
 
 impl ScreenReader {
-    pub fn new(speech: Speech) -> Result<Self> {
-        Ok(ScreenReader {
+    pub fn new(speech: Speech, view: View) -> Self {
+        ScreenReader {
             speech,
+            view,
             help_mode: false,
             auto_read: true,
             review_follows_screen_cursor: true,
@@ -34,38 +36,46 @@ impl ScreenReader {
             highlight_tracking: false,
             clipboard: Default::default(),
             pass_through: false,
-        })
+        }
     }
 
-    pub fn track_cursor(&mut self, view: &mut View) -> Result<()> {
+    pub fn track_cursor(&mut self) -> Result<()> {
         let (prev_cursor, cursor) = (
-            view.prev_screen().cursor_position(),
-            view.screen().cursor_position(),
+            self.view.prev_screen().cursor_position(),
+            self.view.screen().cursor_position(),
         );
 
         let mut cursor_report: Option<String> = None;
         if cursor.0 != prev_cursor.0 {
             // It moved to a different line
-            let line = view
-                .screen()
-                .contents_between(cursor.0, 0, cursor.0, view.size().1);
+            let line =
+                self.view
+                    .screen()
+                    .contents_between(cursor.0, 0, cursor.0, self.view.size().1);
             cursor_report = Some(line);
         } else if cursor.1 != prev_cursor.1 {
             // The cursor moved left or right
             let distance_moved = (cursor.1 as i32 - prev_cursor.1 as i32).abs();
-            let prev_word_start = view.screen().find_word_start(prev_cursor.0, prev_cursor.1);
-            let word_start = view.screen().find_word_start(cursor.0, cursor.1);
+            let prev_word_start = self
+                .view
+                .screen()
+                .find_word_start(prev_cursor.0, prev_cursor.1);
+            let word_start = self.view.screen().find_word_start(cursor.0, cursor.1);
             if word_start != prev_word_start && distance_moved > 1 {
                 // The cursor moved to a different word.
-                let word_end = view.screen().find_word_end(cursor.0, cursor.1);
-                let word =
-                    view.screen()
-                        .contents_between(cursor.0, word_start, cursor.0, word_end + 1);
+                let word_end = self.view.screen().find_word_end(cursor.0, cursor.1);
+                let word = self.view.screen().contents_between(
+                    cursor.0,
+                    word_start,
+                    cursor.0,
+                    word_end + 1,
+                );
                 cursor_report = Some(word);
             } else {
-                let ch = view
-                    .screen()
-                    .contents_between(cursor.0, cursor.1, cursor.0, cursor.1 + 1);
+                let ch =
+                    self.view
+                        .screen()
+                        .contents_between(cursor.0, cursor.1, cursor.0, cursor.1 + 1);
                 // Avoid randomly saying "space".
                 // Unfortunately this means moving the cursor manually over a space will say
                 // nothing.
@@ -80,7 +90,7 @@ impl ScreenReader {
 
         match &self.cursor_tracking_mode {
             CursorTrackingMode::On => {
-                self.report_application_cursor_indentation_changes(view)?;
+                self.report_application_cursor_indentation_changes()?;
                 if let Some(s) = cursor_report {
                     self.speech.speak(&s, false)?;
                 }
@@ -92,10 +102,10 @@ impl ScreenReader {
         Ok(())
     }
 
-    pub fn track_highlighting(&mut self, view: &View) -> Result<()> {
+    pub fn track_highlighting(&mut self) -> Result<()> {
         let (highlights, prev_highlights) = (
-            view.screen().get_highlights(),
-            view.prev_screen().get_highlights(),
+            self.view.screen().get_highlights(),
+            self.view.prev_screen().get_highlights(),
         );
         let prev_hl_set: HashSet<String> = HashSet::from_iter(prev_highlights.iter().cloned());
 
@@ -108,8 +118,8 @@ impl ScreenReader {
     }
 
     /// Report indentation changes, if any, for the line under the application cursor
-    pub fn report_application_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
-        let (indent_level, changed) = view.application_cursor_indentation_level();
+    pub fn report_application_cursor_indentation_changes(&mut self) -> Result<()> {
+        let (indent_level, changed) = self.view.application_cursor_indentation_level();
         if changed {
             self.speech
                 .speak(&format!("indent {}", indent_level), false)?;
@@ -119,8 +129,8 @@ impl ScreenReader {
     }
 
     /// Report indentation changes, if any, for the line under the review cursor
-    pub fn report_review_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
-        let (indent_level, changed) = view.review_cursor_indentation_level();
+    pub fn report_review_cursor_indentation_changes(&mut self) -> Result<()> {
+        let (indent_level, changed) = self.view.review_cursor_indentation_level();
         if changed {
             self.speech
                 .speak(&format!("indent {}", indent_level), false)?;
@@ -131,13 +141,9 @@ impl ScreenReader {
 
     /// Read what's changed between the current and previous screen.
     /// If anything was read, the value in the result will be true.
-    pub fn auto_read(
-        &mut self,
-        view: &mut View,
-        text_reporter: &mut perform::TextReporter,
-    ) -> Result<bool> {
-        self.report_application_cursor_indentation_changes(view)?;
-        if view.screen().contents() == view.prev_screen().contents() {
+    pub fn auto_read(&mut self, text_reporter: &mut perform::TextReporter) -> Result<bool> {
+        self.report_application_cursor_indentation_changes()?;
+        if self.view.screen().contents() == self.view.prev_screen().contents() {
             return Ok(false);
         }
 
@@ -160,8 +166,8 @@ impl ScreenReader {
 
         // Do a diff instead
         let mut text = String::new();
-        let old = view.prev_screen().contents_full();
-        let new = view.screen().contents_full();
+        let old = self.view.prev_screen().contents_full();
+        let new = self.view.screen().contents_full();
 
         let line_changes = TextDiff::configure()
             .algorithm(Algorithm::Patience)

@@ -65,17 +65,17 @@ struct Cli {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let term_size = termsize::get().ok_or_else(|| anyhow!("cannot get terminal size"))?;
     let speech_driver =
         Box::new(speech::tdsr::Tdsr::new(cli.speech_program).context("create tdsr driver")?);
     let speech = speech::Speech::new(speech_driver);
-    let mut screen_reader =
-        ScreenReader::new(speech).context("create new screen reader instance")?;
+    let view = View::new(term_size.rows, term_size.cols);
+    let mut screen_reader = ScreenReader::new(speech, view);
 
     let init_term_attrs = termios::tcgetattr(std::io::stdin().as_fd())?;
     // Spawn the child process, connect it to a PTY,
     // and set the PTY to match the current terminal attributes.
     let mut process = PtyProcess::spawn(Command::new(cli.shell)).context("spawn child process")?;
-    let term_size = termsize::get().ok_or_else(|| anyhow!("cannot get terminal size"))?;
     process
         .set_window_size(term_size.cols, term_size.rows)
         .context("resize PTY")?;
@@ -105,15 +105,11 @@ fn main() -> Result<()> {
     Ok(result?)
 }
 
-fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Result<()> {
+fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Result<()> {
     let mut pty_stream = process.get_pty_stream().context("get PTY stream")?;
     // Set stdin to raw, so that input is read character by character,
     // and so that signals like SIGINT aren't send when pressing keys like ^C.
     ptyprocess::set_raw(0).context("set STDIN to raw")?;
-
-    // Create a view based on the spawned process's screen
-    let (cols, rows) = process.get_window_size()?;
-    let mut view = View::new(rows, cols);
 
     // We also want to separately keep track of incoming bytes, for auto read.
     let mut vte_parser = vte::Parser::new();
@@ -170,20 +166,15 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
                     // Don't silence speech or set the last key for key echo,
                     // when receiving a CSI dispatch.
                     if !ansi_csi_re.is_match(&buf[0..n]) {
-                        screen_reader.last_key = buf[0..n].to_owned();
-                        screen_reader.speech.stop()?;
+                        sr.last_key = buf[0..n].to_owned();
+                        sr.speech.stop()?;
                     }
-                    let pass_through = match screen_reader.pass_through {
+                    let pass_through = match sr.pass_through {
                         false => match KEYMAP.get(std::str::from_utf8(&buf[0..n])?) {
-                            Some(&v) => commands::handle_action(
-                                screen_reader,
-                                &mut view,
-                                &mut pty_stream,
-                                v,
-                            )?,
+                            Some(&v) => commands::handle(sr, &mut pty_stream, v)?,
                             None => {
-                                if screen_reader.help_mode {
-                                    screen_reader.speech.speak("this key is unmapped", false)?;
+                                if sr.help_mode {
+                                    sr.speech.speak("this key is unmapped", false)?;
                                     false
                                 } else {
                                     true
@@ -192,7 +183,7 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
                         },
                         true => {
                             // Turning pass through on should only apply for one keystroke.
-                            screen_reader.pass_through = false;
+                            sr.pass_through = false;
                             true
                         }
                     };
@@ -213,13 +204,13 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
                     };
                     stdout.write_all(&buf[0..n]).context("write PTY output")?;
                     stdout.flush().context("flush output")?;
-                    if screen_reader.auto_read {
+                    if sr.auto_read {
                         for b in &buf[0..n] {
                             vte_parser.advance(&mut text_reporter, *b);
                         }
                     }
 
-                    view.process_changes(&buf[0..n]);
+                    sr.view.process_changes(&buf[0..n]);
                     // Stop blocking indefinitely until this screen is old enough to be
                     // auto read.
                     poll_timeout = Some(time::Duration::from_millis(DIFF_DELAY as u64));
@@ -234,7 +225,7 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
                                 process
                                     .set_window_size(term_size.cols, term_size.rows)
                                     .context("resize PTY")?;
-                                view.set_size(term_size.rows, term_size.cols);
+                                sr.view.set_size(term_size.rows, term_size.cols);
                             }
                             _ => unreachable!("unknown signal"),
                         }
@@ -249,15 +240,15 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
         // But if we never stop getting updates, we want to read what we have eventually.
         if let Some(lpu) = last_pty_update {
             if lpu.elapsed().as_millis() > DIFF_DELAY as u128
-                || view.prev_screen_time.elapsed().as_millis() > MAX_DIFF_DELAY as u128
+                || sr.view.prev_screen_time.elapsed().as_millis() > MAX_DIFF_DELAY as u128
             {
                 poll_timeout = None; // No need to wakeup until we get more updates.
                 last_pty_update = None;
-                if screen_reader.highlight_tracking {
-                    screen_reader.track_highlighting(&view)?;
+                if sr.highlight_tracking {
+                    sr.track_highlighting()?;
                 }
-                let read_text = if screen_reader.auto_read {
-                    screen_reader.auto_read(&mut view, &mut text_reporter)?
+                let read_text = if sr.auto_read {
+                    sr.auto_read(&mut text_reporter)?
                 } else {
                     // If the text reporter wasn't drained since auto read was last disabled,
                     // it will be read when auto read is re-enabled, which is not desirable.
@@ -269,20 +260,20 @@ fn do_events(screen_reader: &mut ScreenReader, process: &mut ptyprocess::PtyProc
                 // The latter makes disabling auto read truly be silent.
                 if let Some(lsu) = last_stdin_update {
                     if lsu.elapsed().as_millis() <= MAX_DIFF_DELAY as u128 && !read_text {
-                        screen_reader.track_cursor(&mut view)?;
+                        sr.track_cursor()?;
                     }
                 }
 
                 // Track screen cursor movements here, instead of every time the screen
                 // updates,
                 // to give the screen time to stabilize.
-                if screen_reader.review_follows_screen_cursor
-                    && view.screen().cursor_position() != view.prev_screen().cursor_position()
+                if sr.review_follows_screen_cursor
+                    && sr.view.screen().cursor_position() != sr.view.prev_screen().cursor_position()
                 {
-                    view.review_cursor_position = view.screen().cursor_position();
+                    sr.view.review_cursor_position = sr.view.screen().cursor_position();
                 }
 
-                view.finalize_changes();
+                sr.view.finalize_changes();
             }
         }
     }

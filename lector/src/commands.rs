@@ -2,7 +2,6 @@ use super::{
     attributes,
     ext::{CellExt, ScreenExt},
     screen_reader::{CursorTrackingMode, ScreenReader},
-    view::View,
 };
 use anyhow::{anyhow, Result};
 use std::io::Write;
@@ -84,215 +83,204 @@ impl Action {
     }
 }
 
-pub fn handle_action(
-    screen_reader: &mut ScreenReader,
-    view: &mut View,
+pub fn handle(
+    sr: &mut ScreenReader,
     pty_stream: &mut ptyprocess::stream::Stream,
     action: Action,
 ) -> Result<bool> {
     if let Action::ToggleHelp = action {
-        return action_toggle_help(screen_reader);
+        return action_toggle_help(sr);
     }
-    if screen_reader.help_mode {
-        screen_reader.speech.speak(&action.help_text(), false)?;
+    if sr.help_mode {
+        sr.speech.speak(&action.help_text(), false)?;
         return Ok(false);
     }
 
     match action {
-        Action::ToggleAutoRead => action_toggle_auto_read(screen_reader),
+        Action::ToggleAutoRead => action_toggle_auto_read(sr),
         Action::ToggleReviewCursorFollowsScreenCursor => {
-            action_toggle_review_cursor_follows_screen_cursor(screen_reader, view)
+            action_toggle_review_cursor_follows_screen_cursor(sr)
         }
-        Action::ToggleSymbolLevel => action_toggle_symbol_level(screen_reader),
-        Action::PassNextKey => action_pass_next_key(screen_reader),
-        Action::StopSpeaking => action_stop(screen_reader),
-        Action::RevLinePrev => action_review_line_prev(screen_reader, view, false),
-        Action::RevLineNext => action_review_line_next(screen_reader, view, false),
-        Action::RevLinePrevNonBlank => action_review_line_prev(screen_reader, view, true),
-        Action::RevLineNextNonBlank => action_review_line_next(screen_reader, view, true),
-        Action::RevLineRead => action_review_line_read(screen_reader, view),
-        Action::RevWordPrev => action_review_word_prev(screen_reader, view),
-        Action::RevWordNext => action_review_word_next(screen_reader, view),
-        Action::RevWordRead => action_review_word_read(screen_reader, view),
-        Action::RevCharPrev => action_review_char_prev(screen_reader, view),
-        Action::RevCharNext => action_review_char_next(screen_reader, view),
-        Action::RevCharRead => action_review_char_read(screen_reader, view),
-        Action::RevCharReadPhonetic => action_review_char_read_phonetic(screen_reader, view),
-        Action::RevTop => action_review_top(screen_reader, view),
-        Action::RevBottom => action_review_bottom(screen_reader, view),
-        Action::RevFirst => action_review_first(screen_reader, view),
-        Action::RevLast => action_review_last(screen_reader, view),
-        Action::RevReadAttributes => action_review_read_attributes(screen_reader, view),
-        Action::Backspace => action_backspace(screen_reader, view),
-        Action::Delete => action_delete(screen_reader, view),
-        Action::SayTime => action_say_time(screen_reader),
-        Action::SetMark => action_set_mark(screen_reader, view),
-        Action::Copy => action_copy(screen_reader, view),
-        Action::Paste => action_paste(screen_reader, view, pty_stream),
-        Action::SayClipboard => action_clipboard_say(screen_reader),
-        Action::PreviousClipboard => action_clipboard_prev(screen_reader),
-        Action::NextClipboard => action_clipboard_next(screen_reader),
+        Action::ToggleSymbolLevel => action_toggle_symbol_level(sr),
+        Action::PassNextKey => action_pass_next_key(sr),
+        Action::StopSpeaking => action_stop(sr),
+        Action::RevLinePrev => action_review_line_prev(sr, false),
+        Action::RevLineNext => action_review_line_next(sr, false),
+        Action::RevLinePrevNonBlank => action_review_line_prev(sr, true),
+        Action::RevLineNextNonBlank => action_review_line_next(sr, true),
+        Action::RevLineRead => action_review_line_read(sr),
+        Action::RevWordPrev => action_review_word_prev(sr),
+        Action::RevWordNext => action_review_word_next(sr),
+        Action::RevWordRead => action_review_word_read(sr),
+        Action::RevCharPrev => action_review_char_prev(sr),
+        Action::RevCharNext => action_review_char_next(sr),
+        Action::RevCharRead => action_review_char_read(sr),
+        Action::RevCharReadPhonetic => action_review_char_read_phonetic(sr),
+        Action::RevTop => action_review_top(sr),
+        Action::RevBottom => action_review_bottom(sr),
+        Action::RevFirst => action_review_first(sr),
+        Action::RevLast => action_review_last(sr),
+        Action::RevReadAttributes => action_review_read_attributes(sr),
+        Action::Backspace => action_backspace(sr),
+        Action::Delete => action_delete(sr),
+        Action::SayTime => action_say_time(sr),
+        Action::SetMark => action_set_mark(sr),
+        Action::Copy => action_copy(sr),
+        Action::Paste => action_paste(sr, pty_stream),
+        Action::SayClipboard => action_clipboard_say(sr),
+        Action::PreviousClipboard => action_clipboard_prev(sr),
+        Action::NextClipboard => action_clipboard_next(sr),
         _ => {
-            screen_reader.speech.speak("not implemented", false)?;
+            sr.speech.speak("not implemented", false)?;
             Ok(false)
         }
     }
 }
 
 // Actions
-fn action_stop(screen_reader: &mut ScreenReader) -> Result<bool> {
-    screen_reader.speech.stop()?;
+fn action_stop(sr: &mut ScreenReader) -> Result<bool> {
+    sr.speech.stop()?;
     Ok(false)
 }
 
-fn action_toggle_auto_read(screen_reader: &mut ScreenReader) -> Result<bool> {
-    if screen_reader.auto_read {
-        screen_reader.auto_read = false;
-        screen_reader.speech.speak("auto read disabled", false)?;
+fn action_toggle_auto_read(sr: &mut ScreenReader) -> Result<bool> {
+    if sr.auto_read {
+        sr.auto_read = false;
+        sr.speech.speak("auto read disabled", false)?;
     } else {
-        screen_reader.auto_read = true;
-        screen_reader.speech.speak("auto read enabled", false)?;
+        sr.auto_read = true;
+        sr.speech.speak("auto read enabled", false)?;
     }
 
     Ok(false)
 }
 
-fn action_toggle_review_cursor_follows_screen_cursor(
-    screen_reader: &mut ScreenReader,
-    view: &mut View,
-) -> Result<bool> {
-    screen_reader.review_follows_screen_cursor = !screen_reader.review_follows_screen_cursor;
-    match screen_reader.review_follows_screen_cursor {
+fn action_toggle_review_cursor_follows_screen_cursor(sr: &mut ScreenReader) -> Result<bool> {
+    sr.review_follows_screen_cursor = !sr.review_follows_screen_cursor;
+    match sr.review_follows_screen_cursor {
         true => {
-            view.review_cursor_position = view.screen().cursor_position();
-            screen_reader
-                .speech
+            sr.view.review_cursor_position = sr.view.screen().cursor_position();
+            sr.speech
                 .speak("review cursor following screen cursor", false)?;
         }
-        false => screen_reader
+        false => sr
             .speech
             .speak("review cursor not following screen cursor", false)?,
     };
     Ok(false)
 }
 
-fn action_pass_next_key(screen_reader: &mut ScreenReader) -> Result<bool> {
-    screen_reader.pass_through = true;
-    screen_reader
-        .speech
-        .speak("forward next key press", false)?;
+fn action_pass_next_key(sr: &mut ScreenReader) -> Result<bool> {
+    sr.pass_through = true;
+    sr.speech.speak("forward next key press", false)?;
     Ok(false)
 }
 
-fn action_toggle_help(screen_reader: &mut ScreenReader) -> Result<bool> {
-    if screen_reader.help_mode {
-        screen_reader.help_mode = false;
-        screen_reader.speech.speak("exiting help", false)?;
+fn action_toggle_help(sr: &mut ScreenReader) -> Result<bool> {
+    if sr.help_mode {
+        sr.help_mode = false;
+        sr.speech.speak("exiting help", false)?;
     } else {
-        screen_reader.help_mode = true;
-        screen_reader
-            .speech
+        sr.help_mode = true;
+        sr.speech
             .speak("entering help. Press this key again to exit", false)?;
     }
     Ok(false)
 }
 
-fn action_review_line_prev(
-    screen_reader: &mut ScreenReader,
-    view: &mut View,
-    skip_blank_lines: bool,
-) -> Result<bool> {
-    if !view.review_cursor_up(skip_blank_lines) {
-        screen_reader.speech.speak("top", false)?;
+fn action_review_line_prev(sr: &mut ScreenReader, skip_blank_lines: bool) -> Result<bool> {
+    if !sr.view.review_cursor_up(skip_blank_lines) {
+        sr.speech.speak("top", false)?;
     }
-    action_review_line_read(screen_reader, view)?;
+    action_review_line_read(sr)?;
     Ok(false)
 }
 
-fn action_review_line_next(
-    screen_reader: &mut ScreenReader,
-    view: &mut View,
-    skip_blank_lines: bool,
-) -> Result<bool> {
-    if !view.review_cursor_down(skip_blank_lines) {
-        screen_reader.speech.speak("bottom", false)?;
+fn action_review_line_next(sr: &mut ScreenReader, skip_blank_lines: bool) -> Result<bool> {
+    if !sr.view.review_cursor_down(skip_blank_lines) {
+        sr.speech.speak("bottom", false)?;
     }
-    action_review_line_read(screen_reader, view)?;
+    action_review_line_read(sr)?;
     Ok(false)
 }
 
-fn action_review_line_read(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    let row = view.review_cursor_position.0;
-    screen_reader.report_review_cursor_indentation_changes(view)?;
-    let line = view.screen().contents_between(row, 0, row, view.size().1);
+fn action_review_line_read(sr: &mut ScreenReader) -> Result<bool> {
+    let row = sr.view.review_cursor_position.0;
+    sr.report_review_cursor_indentation_changes()?;
+    let line = sr
+        .view
+        .screen()
+        .contents_between(row, 0, row, sr.view.size().1);
     if line.is_empty() {
-        screen_reader.speech.speak("blank", false)?;
+        sr.speech.speak("blank", false)?;
     } else {
-        screen_reader.speech.speak(&line, false)?;
+        sr.speech.speak(&line, false)?;
     }
     Ok(false)
 }
 
-fn action_review_word_prev(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    if !view.review_cursor_prev_word() {
-        screen_reader.speech.speak("left", false)?;
+fn action_review_word_prev(sr: &mut ScreenReader) -> Result<bool> {
+    if !sr.view.review_cursor_prev_word() {
+        sr.speech.speak("left", false)?;
     }
-    action_review_word_read(screen_reader, view)?;
+    action_review_word_read(sr)?;
     Ok(false)
 }
 
-fn action_review_word_next(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    if !view.review_cursor_next_word() {
-        screen_reader.speech.speak("right", false)?;
+fn action_review_word_next(sr: &mut ScreenReader) -> Result<bool> {
+    if !sr.view.review_cursor_next_word() {
+        sr.speech.speak("right", false)?;
     }
-    action_review_word_read(screen_reader, view)?;
+    action_review_word_read(sr)?;
     Ok(false)
 }
 
-fn action_review_word_read(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
-    let (row, col) = view.review_cursor_position;
-    let start = view.screen().find_word_start(row, col);
-    let end = view.screen().find_word_end(row, col);
+fn action_review_word_read(sr: &mut ScreenReader) -> Result<bool> {
+    let (row, col) = sr.view.review_cursor_position;
+    let start = sr.view.screen().find_word_start(row, col);
+    let end = sr.view.screen().find_word_end(row, col);
 
-    let word = view.screen().contents_between(row, start, row, end + 1);
-    screen_reader.speech.speak(&word, false)?;
+    let word = sr.view.screen().contents_between(row, start, row, end + 1);
+    sr.speech.speak(&word, false)?;
     Ok(false)
 }
 
-fn action_review_char_prev(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    if !view.review_cursor_left() {
-        screen_reader.speech.speak("left", false)?;
+fn action_review_char_prev(sr: &mut ScreenReader) -> Result<bool> {
+    if !sr.view.review_cursor_left() {
+        sr.speech.speak("left", false)?;
     }
-    action_review_char_read(screen_reader, view)?;
+    action_review_char_read(sr)?;
     Ok(false)
 }
 
-fn action_review_char_next(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    if !view.review_cursor_right() {
-        screen_reader.speech.speak("right", false)?;
+fn action_review_char_next(sr: &mut ScreenReader) -> Result<bool> {
+    if !sr.view.review_cursor_right() {
+        sr.speech.speak("right", false)?;
     }
-    action_review_char_read(screen_reader, view)?;
+    action_review_char_read(sr)?;
     Ok(false)
 }
 
-fn action_review_char_read(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
-    let (row, col) = view.review_cursor_position;
-    let char = view
+fn action_review_char_read(sr: &mut ScreenReader) -> Result<bool> {
+    let (row, col) = sr.view.review_cursor_position;
+    let char = sr
+        .view
         .screen()
         .cell(row, col)
         .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
         .contents();
     if char.is_empty() {
-        screen_reader.speech.speak("blank", false)?;
+        sr.speech.speak("blank", false)?;
     } else {
-        screen_reader.speech.speak(&char, false)?;
+        sr.speech.speak(&char, false)?;
     }
     Ok(false)
 }
 
-fn action_review_char_read_phonetic(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
-    let (row, col) = view.review_cursor_position;
-    let char = view
+fn action_review_char_read_phonetic(sr: &mut ScreenReader) -> Result<bool> {
+    let (row, col) = sr.view.review_cursor_position;
+    let char = sr
+        .view
         .screen()
         .cell(row, col)
         .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
@@ -326,71 +314,76 @@ fn action_review_char_read_phonetic(screen_reader: &mut ScreenReader, view: &Vie
         "z" => "Zulu",
         _ => &char,
     };
-    screen_reader.speech.speak(char, false)?;
+    sr.speech.speak(char, false)?;
     Ok(false)
 }
 
-fn action_review_top(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    let row = view.review_cursor_position.0;
-    let last_row = view.size().0 - 1;
-    let last_col = view.size().1 - 1;
-    view.review_cursor_position.0 = match row {
-        0 => view
+fn action_review_top(sr: &mut ScreenReader) -> Result<bool> {
+    let row = sr.view.review_cursor_position.0;
+    let last_row = sr.view.size().0 - 1;
+    let last_col = sr.view.size().1 - 1;
+    sr.view.review_cursor_position.0 = match row {
+        0 => sr
+            .view
             .screen()
             .find_cell(CellExt::is_in_word, 0, 0, last_row, last_col)
             .map_or(0, |(row, _)| row),
         _ => 0,
     };
-    action_review_line_read(screen_reader, view)?;
+    action_review_line_read(sr)?;
     Ok(false)
 }
 
-fn action_review_bottom(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    let row = view.review_cursor_position.0;
-    let last_row = view.size().0 - 1;
-    let last_col = view.size().1 - 1;
-    view.review_cursor_position.0 = if row == last_row {
-        view.screen()
+fn action_review_bottom(sr: &mut ScreenReader) -> Result<bool> {
+    let row = sr.view.review_cursor_position.0;
+    let last_row = sr.view.size().0 - 1;
+    let last_col = sr.view.size().1 - 1;
+    sr.view.review_cursor_position.0 = if row == last_row {
+        sr.view
+            .screen()
             .rfind_cell(CellExt::is_in_word, 0, 0, last_row, last_col)
             .map_or(last_row, |(row, _)| row)
     } else {
         last_row
     };
-    action_review_line_read(screen_reader, view)?;
+    action_review_line_read(sr)?;
     Ok(false)
 }
 
-fn action_review_first(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    let (row, col) = view.review_cursor_position;
-    let last = view.size().1 - 1;
-    view.review_cursor_position.1 = match col {
-        0 => view
+fn action_review_first(sr: &mut ScreenReader) -> Result<bool> {
+    let (row, col) = sr.view.review_cursor_position;
+    let last = sr.view.size().1 - 1;
+    sr.view.review_cursor_position.1 = match col {
+        0 => sr
+            .view
             .screen()
             .find_cell(CellExt::is_in_word, row, 0, row, last)
             .map_or(0, |(_, col)| col),
         _ => 0,
     };
-    action_review_char_read(screen_reader, view)?;
+    action_review_char_read(sr)?;
     Ok(false)
 }
 
-fn action_review_last(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    let (row, col) = view.review_cursor_position;
-    let last = view.size().1 - 1;
-    view.review_cursor_position.1 = if col == last {
-        view.screen()
+fn action_review_last(sr: &mut ScreenReader) -> Result<bool> {
+    let (row, col) = sr.view.review_cursor_position;
+    let last = sr.view.size().1 - 1;
+    sr.view.review_cursor_position.1 = if col == last {
+        sr.view
+            .screen()
             .rfind_cell(CellExt::is_in_word, row, 0, row, last)
             .map_or(last, |(_, col)| col)
     } else {
         last
     };
-    action_review_char_read(screen_reader, view)?;
+    action_review_char_read(sr)?;
     Ok(false)
 }
 
-fn action_review_read_attributes(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
-    let (row, col) = view.review_cursor_position;
-    let cell = view
+fn action_review_read_attributes(sr: &mut ScreenReader) -> Result<bool> {
+    let (row, col) = sr.view.review_cursor_position;
+    let cell = sr
+        .view
         .screen()
         .cell(row, col)
         .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?;
@@ -415,62 +408,61 @@ fn action_review_read_attributes(screen_reader: &mut ScreenReader, view: &View) 
         if cell.is_wide() { "wide " } else { "" },
     ));
 
-    screen_reader.speech.speak(&attrs, false)?;
+    sr.speech.speak(&attrs, false)?;
     Ok(false)
 }
 
-fn action_backspace(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
-    let (row, col) = view.screen().cursor_position();
+fn action_backspace(sr: &mut ScreenReader) -> Result<bool> {
+    let (row, col) = sr.view.screen().cursor_position();
     if col > 0 {
-        let char = view
+        let char = sr
+            .view
             .screen()
             .cell(row, col - 1)
             .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
             .contents();
-        screen_reader.speech.speak(&char, false)?;
+        sr.speech.speak(&char, false)?;
     }
     // When backspacing, the cursor will end up moving to the left, but we don't want to hear
     // that.
-    screen_reader.cursor_tracking_mode = match screen_reader.cursor_tracking_mode {
+    sr.cursor_tracking_mode = match sr.cursor_tracking_mode {
         CursorTrackingMode::Off => CursorTrackingMode::Off,
         _ => CursorTrackingMode::OffOnce,
     };
     Ok(true)
 }
 
-fn action_delete(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
-    let (row, col) = view.screen().cursor_position();
-    let char = view
+fn action_delete(sr: &mut ScreenReader) -> Result<bool> {
+    let (row, col) = sr.view.screen().cursor_position();
+    let char = sr
+        .view
         .screen()
         .cell(row, col)
         .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
         .contents();
-    screen_reader.speech.speak(&char, false)?;
+    sr.speech.speak(&char, false)?;
     Ok(true)
 }
 
-fn action_say_time(screen_reader: &mut ScreenReader) -> Result<bool> {
+fn action_say_time(sr: &mut ScreenReader) -> Result<bool> {
     let date = chrono::Local::now();
-    screen_reader
-        .speech
+    sr.speech
         .speak(&format!("{}", date.format("%H:%M")), false)?;
     Ok(false)
 }
 
-fn action_set_mark(screen_reader: &mut ScreenReader, view: &mut View) -> Result<bool> {
-    view.review_mark_position = Some(view.review_cursor_position);
-    screen_reader.speech.speak("mark set", false)?;
+fn action_set_mark(sr: &mut ScreenReader) -> Result<bool> {
+    sr.view.review_mark_position = Some(sr.view.review_cursor_position);
+    sr.speech.speak("mark set", false)?;
     Ok(false)
 }
 
-fn action_copy(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
-    match view.review_mark_position {
+fn action_copy(sr: &mut ScreenReader) -> Result<bool> {
+    match sr.view.review_mark_position {
         Some((mark_row, mark_col)) => {
-            let (cur_row, cur_col) = view.review_cursor_position;
+            let (cur_row, cur_col) = sr.view.review_cursor_position;
             if mark_row > cur_row || (mark_row == cur_row && mark_col > cur_col) {
-                screen_reader
-                    .speech
-                    .speak("mark is after the review cursor", false)?;
+                sr.speech.speak("mark is after the review cursor", false)?;
                 return Ok(false);
             }
 
@@ -481,10 +473,11 @@ fn action_copy(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
                 let end = if row == cur_row {
                     cur_col + 1
                 } else {
-                    view.size().1
+                    sr.view.size().1
                 };
                 // Don't add trailing blank/whitespace cells
-                let end = view
+                let end = sr
+                    .view
                     .screen()
                     .rfind_cell(
                         |c| !c.contents().trim().is_empty(),
@@ -496,7 +489,7 @@ fn action_copy(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
                     .map_or(end, |(_, col)| col + 1);
                 for col in start..end {
                     contents.push_str(
-                        &view
+                        &sr.view
                             .screen()
                             .cell(row, col)
                             .map_or("".into(), vt100::Cell::contents),
@@ -506,81 +499,77 @@ fn action_copy(screen_reader: &mut ScreenReader, view: &View) -> Result<bool> {
                     contents.push('\n');
                 }
             }
-            screen_reader.clipboard.put(contents);
-            screen_reader.speech.speak("copied", false)?;
+            sr.clipboard.put(contents);
+            sr.speech.speak("copied", false)?;
         }
-        None => screen_reader.speech.speak("no mark set", false)?,
+        None => sr.speech.speak("no mark set", false)?,
     }
     Ok(false)
 }
 
-fn action_paste(
-    screen_reader: &mut ScreenReader,
-    view: &View,
-    stream: &mut ptyprocess::stream::Stream,
-) -> Result<bool> {
-    match screen_reader.clipboard.get() {
+fn action_paste(sr: &mut ScreenReader, stream: &mut ptyprocess::stream::Stream) -> Result<bool> {
+    match sr.clipboard.get() {
         Some(contents) => {
-            if view.screen().bracketed_paste() {
+            if sr.view.screen().bracketed_paste() {
                 write!(stream, "\x1B[200~{}\x1B[201~", contents)?;
             } else {
                 write!(stream, "{}", contents)?;
             }
-            screen_reader.speech.speak("pasted", false)?;
+            sr.speech.speak("pasted", false)?;
         }
-        None => screen_reader.speech.speak("no clipboard", false)?,
+        None => sr.speech.speak("no clipboard", false)?,
     }
     Ok(false)
 }
 
-fn action_clipboard_prev(screen_reader: &mut ScreenReader) -> Result<bool> {
-    if screen_reader.clipboard.size() == 0 {
-        screen_reader.speech.speak("no clipboard", false)?;
-    } else if screen_reader.clipboard.prev() {
-        action_clipboard_say(screen_reader)?;
+fn action_clipboard_prev(sr: &mut ScreenReader) -> Result<bool> {
+    if sr.clipboard.size() == 0 {
+        sr.speech.speak("no clipboard", false)?;
+    } else if sr.clipboard.prev() {
+        action_clipboard_say(sr)?;
     } else {
-        screen_reader.speech.speak("first clipboard", false)?;
+        sr.speech.speak("first clipboard", false)?;
     }
     Ok(false)
 }
 
-fn action_clipboard_next(screen_reader: &mut ScreenReader) -> Result<bool> {
-    if screen_reader.clipboard.size() == 0 {
-        screen_reader.speech.speak("no clipboard", false)?;
-    } else if screen_reader.clipboard.next() {
-        action_clipboard_say(screen_reader)?;
+fn action_clipboard_next(sr: &mut ScreenReader) -> Result<bool> {
+    if sr.clipboard.size() == 0 {
+        sr.speech.speak("no clipboard", false)?;
+    } else if sr.clipboard.next() {
+        action_clipboard_say(sr)?;
     } else {
-        screen_reader.speech.speak("last clipboard", false)?;
+        sr.speech.speak("last clipboard", false)?;
     }
     Ok(false)
 }
 
-fn action_clipboard_say(screen_reader: &mut ScreenReader) -> Result<bool> {
-    match screen_reader.clipboard.get() {
-        Some(contents) => screen_reader.speech.speak(contents, false)?,
-        None => screen_reader.speech.speak("no clipboard", false)?,
+fn action_clipboard_say(sr: &mut ScreenReader) -> Result<bool> {
+    match sr.clipboard.get() {
+        Some(contents) => sr.speech.speak(contents, false)?,
+        None => sr.speech.speak("no clipboard", false)?,
     }
     Ok(false)
 }
 
-fn action_toggle_symbol_level(screen_reader: &mut ScreenReader) -> Result<bool> {
+fn action_toggle_symbol_level(sr: &mut ScreenReader) -> Result<bool> {
     use super::speech::symbols::Level;
 
-    screen_reader.speech.symbol_level = match screen_reader.speech.symbol_level {
+    sr.speech.symbol_level = match sr.speech.symbol_level {
         Level::None => {
-            screen_reader.speech.speak("some", false)?;
+            sr.speech.speak("some", false)?;
             Level::Some
         }
         Level::Some => {
-            screen_reader.speech.speak("most", false)?;
+            sr.speech.speak("most", false)?;
             Level::Most
         }
         Level::Most => {
-            screen_reader.speech.speak("all", false)?;
+            sr.speech.speak("all", false)?;
             Level::All
         }
         Level::All | Level::Character => {
-            screen_reader.speech.speak("none", false)?;
+            sr.speech.speak("none", false)?;
             Level::None
         }
     };
