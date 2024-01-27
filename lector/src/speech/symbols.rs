@@ -925,9 +925,9 @@ impl std::fmt::Display for IncludeOriginal {
             f,
             "{}",
             match self {
-        IncludeOriginal::Never => "never",
-        IncludeOriginal::Before => "before",
-        IncludeOriginal::After => "after",
+                IncludeOriginal::Never => "never",
+                IncludeOriginal::Before => "before",
+                IncludeOriginal::After => "after",
             }
         )
     }
