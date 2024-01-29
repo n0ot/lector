@@ -242,4 +242,21 @@ impl View {
             false
         }
     }
+
+    /// Returns the entire line at the specified row.
+    pub fn line(&self, row: u16) -> String {
+        self.screen().contents_between(row, 0, row, self.size().1)
+    }
+
+    /// Returns the word at the specified coordinates.
+    pub fn word(&self, row: u16, col: u16) -> String {
+        let start = self.screen().find_word_start(row, col);
+        let end = self.screen().find_word_end(row, col);
+        self.screen().contents_between(row, start, row, end + 1)
+    }
+
+    /// Returns the character at the specified coordinates.
+    pub fn character(&self, row: u16, col: u16) -> String {
+        self.screen().contents_between(row, col, row, col + 1)
+    }
 }

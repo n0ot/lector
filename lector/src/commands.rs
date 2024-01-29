@@ -207,10 +207,7 @@ fn action_review_line_next(sr: &mut ScreenReader, skip_blank_lines: bool) -> Res
 fn action_review_line_read(sr: &mut ScreenReader) -> Result<bool> {
     let row = sr.view.review_cursor_position.0;
     sr.report_review_cursor_indentation_changes()?;
-    let line = sr
-        .view
-        .screen()
-        .contents_between(row, 0, row, sr.view.size().1);
+    let line = sr.view.line(row);
     if line.is_empty() {
         sr.speech.speak("blank", false)?;
     } else {
@@ -237,10 +234,7 @@ fn action_review_word_next(sr: &mut ScreenReader) -> Result<bool> {
 
 fn action_review_word_read(sr: &mut ScreenReader) -> Result<bool> {
     let (row, col) = sr.view.review_cursor_position;
-    let start = sr.view.screen().find_word_start(row, col);
-    let end = sr.view.screen().find_word_end(row, col);
-
-    let word = sr.view.screen().contents_between(row, start, row, end + 1);
+    let word = sr.view.word(row, col);
     sr.speech.speak(&word, false)?;
     Ok(false)
 }
@@ -263,12 +257,7 @@ fn action_review_char_next(sr: &mut ScreenReader) -> Result<bool> {
 
 fn action_review_char_read(sr: &mut ScreenReader) -> Result<bool> {
     let (row, col) = sr.view.review_cursor_position;
-    let char = sr
-        .view
-        .screen()
-        .cell(row, col)
-        .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
-        .contents();
+    let char = sr.view.character(row, col);
     if char.is_empty() {
         sr.speech.speak("blank", false)?;
     } else {
@@ -279,12 +268,7 @@ fn action_review_char_read(sr: &mut ScreenReader) -> Result<bool> {
 
 fn action_review_char_read_phonetic(sr: &mut ScreenReader) -> Result<bool> {
     let (row, col) = sr.view.review_cursor_position;
-    let char = sr
-        .view
-        .screen()
-        .cell(row, col)
-        .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
-        .contents();
+    let char = sr.view.character(row, col);
     let char = match char.to_lowercase().as_str() {
         "a" => "Alpha",
         "b" => "Bravo",

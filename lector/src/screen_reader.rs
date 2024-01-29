@@ -48,11 +48,7 @@ impl ScreenReader {
         let mut cursor_report: Option<String> = None;
         if cursor.0 != prev_cursor.0 {
             // It moved to a different line
-            let line =
-                self.view
-                    .screen()
-                    .contents_between(cursor.0, 0, cursor.0, self.view.size().1);
-            cursor_report = Some(line);
+            cursor_report = Some(self.view.line(cursor.0));
         } else if cursor.1 != prev_cursor.1 {
             // The cursor moved left or right
             let distance_moved = (cursor.1 as i32 - prev_cursor.1 as i32).abs();
@@ -63,19 +59,9 @@ impl ScreenReader {
             let word_start = self.view.screen().find_word_start(cursor.0, cursor.1);
             if word_start != prev_word_start && distance_moved > 1 {
                 // The cursor moved to a different word.
-                let word_end = self.view.screen().find_word_end(cursor.0, cursor.1);
-                let word = self.view.screen().contents_between(
-                    cursor.0,
-                    word_start,
-                    cursor.0,
-                    word_end + 1,
-                );
-                cursor_report = Some(word);
+                cursor_report = Some(self.view.word(cursor.0, cursor.1));
             } else {
-                let ch =
-                    self.view
-                        .screen()
-                        .contents_between(cursor.0, cursor.1, cursor.0, cursor.1 + 1);
+                let ch = self.view.character(cursor.0, cursor.1);
                 // Avoid randomly saying "space".
                 // Unfortunately this means moving the cursor manually over a space will say
                 // nothing.
