@@ -19,18 +19,18 @@ pub fn setup<'lua, 'scope>(
 }
 
 fn add_callbacks<'lua, 'scope>(
-    tbl_api: &Table<'lua>,
+    tbl_callbacks: &Table<'lua>,
     scope: &Scope<'lua, 'scope>,
     screen_reader: &'scope RefCell<&mut ScreenReader>,
 ) -> Result<()> {
-    tbl_api.set(
+    tbl_callbacks.set(
         "set_option",
         scope.create_function_mut(|_, (key, value): (String, rlua::Value)| {
             let mut sr = screen_reader.borrow_mut();
             set_option(&mut sr, &key, value).to_lua_result()
         })?,
     )?;
-    tbl_api.set(
+    tbl_callbacks.set(
         "get_option",
         scope.create_function(|ctx, key: String| {
             let sr = screen_reader.borrow();
@@ -38,7 +38,7 @@ fn add_callbacks<'lua, 'scope>(
         })?,
     )?;
 
-    tbl_api.set(
+    tbl_callbacks.set(
         "set_symbol",
         scope.create_function_mut(|_, (key, value): (String, Table)| {
             let mut sr = screen_reader.borrow_mut();
@@ -60,7 +60,7 @@ fn add_callbacks<'lua, 'scope>(
             Ok(())
         })?,
     )?;
-    tbl_api.set(
+    tbl_callbacks.set(
         "get_symbol",
         scope.create_function(|ctx, key: String| {
             let sr = screen_reader.borrow();
