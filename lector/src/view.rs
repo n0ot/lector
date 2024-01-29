@@ -61,7 +61,6 @@ impl View {
     pub fn prev_screen(&self) -> &vt100::Screen {
         &self.prev_screen
     }
-
     /// Gets the size of this view
     pub fn size(&self) -> (u16, u16) {
         self.screen().size()
@@ -208,13 +207,12 @@ impl View {
         if self.review_cursor_position.1 == 0 {
             return false;
         }
-        self.review_cursor_position.1 -= 1;
         if let Some((row, col)) = self.screen().rfind_cell(
             |c| !c.is_wide_continuation(),
             self.review_cursor_position.0,
             0,
             self.review_cursor_position.0,
-            self.review_cursor_position.1,
+            self.review_cursor_position.1 - 1,
         ) {
             self.review_cursor_position = (row, col);
             true
@@ -230,11 +228,11 @@ impl View {
         if self.review_cursor_position.1 >= self.size().1 - 1 {
             return false;
         }
-        self.review_cursor_position.1 += 1;
+
         if let Some((row, col)) = self.screen().find_cell(
             |c| !c.is_wide_continuation(),
             self.review_cursor_position.0,
-            self.review_cursor_position.1,
+            self.review_cursor_position.1 + 1,
             self.review_cursor_position.0,
             self.size().1 - 1,
         ) {
