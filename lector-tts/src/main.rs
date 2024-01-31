@@ -28,6 +28,9 @@ extern "C" {
 }
 
 #[cfg(target_os = "macos")]
+static mut IN_BUFFER: String = String::new();
+
+#[cfg(target_os = "macos")]
 fn observe_stdin(tts: &mut Tts) -> Result<()> {
     unsafe {
         let nc: *mut Object = msg_send![class!(NSNotificationCenter), defaultCenter];
@@ -46,21 +49,23 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                     // EOF
                     std::process::exit(0);
                 }
-                let s = match std::str::from_utf8(std::slice::from_raw_parts(
+
+                match std::str::from_utf8(std::slice::from_raw_parts(
                     ptr as *const u8,
                     len.try_into().unwrap(),
                 )) {
-                    Ok(s) => s,
+                    Ok(s) => IN_BUFFER.push_str(s),
                     Err(e) => {
                         eprintln!("Error decoding input: {}", e);
                         std::process::exit(1);
                     }
-                };
+                }
 
                 let tts: usize = *this.get_ivar("_tts_ptr");
-                for line in s.lines() {
-                    if let Err(e) = handle_input(&mut *(tts as *mut Tts), line) {
-                        eprintln!("Error handling input: {}", e);
+                while let Some(pos) = IN_BUFFER.find('\n') {
+                    let line = IN_BUFFER.drain(..=pos).collect::<String>();
+                    if let Err(e) = handle_input(&mut *(tts as *mut Tts), line.trim()) {
+                        eprintln!("Error handling input: {}\nline: {}", e, line);
                         std::process::exit(1);
                     }
                 }
@@ -90,7 +95,7 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
 #[cfg(not(target_os = "macos"))]
 fn observe_stdin(tts: &mut Tts) -> Result<()> {
     for line in std::io::stdin().lock().lines() {
-        handle_input(tts, &line?)?;
+        handle_input(tts, line?.trim())?;
     }
 
     Ok(())
