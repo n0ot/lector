@@ -127,7 +127,7 @@ impl ScreenReader {
 
     /// Read what's changed between the current and previous screen.
     /// If anything was read, the value in the result will be true.
-    pub fn auto_read(&mut self, text_reporter: &mut perform::TextReporter) -> Result<bool> {
+    pub fn auto_read(&mut self, reporter: &mut perform::Reporter) -> Result<bool> {
         self.report_application_cursor_indentation_changes()?;
         if self.view.screen().contents() == self.view.prev_screen().contents() {
             return Ok(false);
@@ -135,14 +135,25 @@ impl ScreenReader {
 
         // Try to read any incoming text.
         // Fall back to a screen diff if that makes more sense.
-        let cursor_moves = text_reporter.cursor_moves;
-        let scrolled = text_reporter.scrolled;
-        let text = text_reporter.get_text();
+        let cursor_moves = reporter.cursor_moves;
+        let scrolled = reporter.scrolled;
+        reporter.reset();
+        // Play the new bytes onto a blank screen,
+        // so screen.contents() only returns the new text.
+        // Using a much taller screen so that we capture text, even if it scrolled off of the real
+        // screen.
+        let (rows, cols) = self.view.size();
+        let mut parser = vt100::Parser::new(rows * 10, cols, 0);
+        parser.process(format!("\x1B[{}B", rows * 10).as_bytes());
+        parser.process(&self.view.next_bytes);
+        let text = parser.screen().contents();
+        let text = text.trim();
+
         if !text.is_empty() && (cursor_moves == 0 || scrolled) {
             // Don't echo typed keys
             match std::str::from_utf8(&self.last_key) {
                 Ok(s) if text == s => {}
-                _ => self.speech.speak(text, false)?,
+                _ => self.speech.speak(&text, false)?,
             }
 
             // We still want to report that text was read when suppressing echo,

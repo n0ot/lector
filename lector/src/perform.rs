@@ -1,51 +1,33 @@
 use vte::{Params, Perform};
 
 /// Processes text from VTE, storing new text to be printed.
-pub struct TextReporter {
-    /// Stores characters printed to the screen
-    text: String,
-    /// True if the next call to `[print]` should clear the text.
-    reset: bool,
+pub struct Reporter {
     pub cursor_moves: usize,
     pub scrolled: bool,
 }
 
-impl TextReporter {
+impl Reporter {
     pub fn new() -> Self {
-        TextReporter {
-            text: String::new(),
-            reset: false,
+        Reporter {
             cursor_moves: 0,
             scrolled: false,
         }
     }
 
-    /// returns a reference of the text seen so far.
-    /// Future interactions with this TextReporter may overwrite this text.
-    pub fn get_text(&mut self) -> &str {
-        if self.reset {
-            self.text.clear();
-        }
-        self.reset = true;
+    pub fn reset(&mut self) {
         self.cursor_moves = 0;
         self.scrolled = false;
-        &self.text
     }
 }
 
-impl Perform for TextReporter {
-    fn print(&mut self, c: char) {
-        if self.reset {
-            self.text.clear();
-            self.reset = false;
-        }
-        self.text.push(c);
+impl Perform for Reporter {
+    fn print(&mut self, _c: char) {
+        // Nothing to do
     }
 
     fn execute(&mut self, byte: u8) {
         match byte {
             8 => self.cursor_moves += 1,
-            10 | 13 => self.text.push('\n'),
             _ => {}
         }
     }

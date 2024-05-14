@@ -3,6 +3,7 @@ use std::{cmp::min, time};
 
 pub struct View {
     parser: vt100::Parser,
+    pub next_bytes: Vec<u8>,
     prev_screen: vt100::Screen,
     pub prev_screen_time: time::Instant,
     pub review_cursor_position: (u16, u16), // (row, col)
@@ -18,6 +19,7 @@ impl View {
         let prev_screen = parser.screen().clone();
         View {
             parser,
+            next_bytes: Vec::new(),
             prev_screen,
             prev_screen_time: time::Instant::now(),
             review_cursor_position: cursor_position,
@@ -30,6 +32,7 @@ impl View {
     /// Processes new changes, updating the internal screen representation
     pub fn process_changes(&mut self, buf: &[u8]) {
         self.parser.process(buf);
+        self.next_bytes.extend_from_slice(buf);
         // If the screen's size changed, the cursor may now be out of bounds.
         let review_cursor_position = self.review_cursor_position;
         self.review_cursor_position = (
@@ -50,6 +53,7 @@ impl View {
     pub fn finalize_changes(&mut self) {
         self.prev_screen = self.screen().clone();
         self.prev_screen_time = time::Instant::now();
+        self.next_bytes.clear();
     }
 
     /// Gets the current screen backing this view

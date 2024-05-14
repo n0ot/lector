@@ -114,7 +114,7 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
     // We also want to separately keep track of incoming bytes, for auto read.
     let mut vte_parser = vte::Parser::new();
     // Store new text to be read.
-    let mut text_reporter = perform::TextReporter::new();
+    let mut reporter = perform::Reporter::new();
     let ansi_csi_re =
         regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$").unwrap();
 
@@ -206,7 +206,7 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
                     stdout.flush().context("flush output")?;
                     if sr.auto_read {
                         for b in &buf[0..n] {
-                            vte_parser.advance(&mut text_reporter, *b);
+                            vte_parser.advance(&mut reporter, *b);
                         }
                     }
 
@@ -248,11 +248,8 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
                     sr.track_highlighting()?;
                 }
                 let read_text = if sr.auto_read {
-                    sr.auto_read(&mut text_reporter)?
+                    sr.auto_read(&mut reporter)?
                 } else {
-                    // If the text reporter wasn't drained since auto read was last disabled,
-                    // it will be read when auto read is re-enabled, which is not desirable.
-                    let _ = text_reporter.get_text();
                     false
                 };
                 // Don't announce cursor changes if there are other textual changes being read,
