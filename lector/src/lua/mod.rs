@@ -25,7 +25,7 @@ where
             meta::setup(&ctx, &scope, &sr)?;
 
             if init_lua_file.is_file() {
-                load_file(&ctx, &init_lua_file)?.call(())?;
+                load_file(&ctx, &init_lua_file)?.call::<_, ()>(())?;
             }
 
             let mut screen_reader = sr.borrow_mut();

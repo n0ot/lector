@@ -1,7 +1,7 @@
 [package]
 name = "lector"
 version = "0.2.1"
-edition = "2021"
+edition = "2024"
 description = "A terminal screen reader"
 license = "MIT"
 repository = "https://github.com/n0ot/lector"
@@ -9,17 +9,17 @@ repository = "https://github.com/n0ot/lector"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.72"
-chrono = "0.4.26"
-clap = { version = "4.4.11", features = ["derive", "env"] }
+anyhow = "1.0.86"
+chrono = "0.4.38"
+clap = { version = "4.5.11", features = ["derive", "env"] }
 dirs = "5.0.1"
-emojis = "0.6.0"
-lazy_static = "1.4.0"
-mio = { version = "0.8.8", features = ["os-ext", "os-poll"] }
-nix = { version = "0.27.1", features = ["term"] }
+emojis = "0.6.4"
+lazy_static = "1.5.0"
+mio = { version = "0.8.11", features = ["os-ext", "os-poll"] }
+nix = { version = "0.29.0", features = ["term"] }
 phf = { version = "0.11.2", features = ["macros"] }
 ptyprocess = "0.4.1"
-regex = { version = "1.9.3", default-features = false, features = [
+regex = { version = "1.10.5", default-features = false, features = [
     "std",
     "perf",
     "unicode-bool",
@@ -27,8 +27,8 @@ regex = { version = "1.9.3", default-features = false, features = [
 rlua = "0.19.8"
 signal-hook = "0.3.17"
 signal-hook-mio = { version = "0.2.3", features = ["support-v0_8"] }
-similar = { version = "2.2.1", features = ["unicode"] }
-termsize = "0.1.6"
-unicode-segmentation = "1.10.1"
+similar = { version = "2.5.0", features = ["unicode"] }
+termsize = "0.1.7"
+unicode-segmentation = "1.11.0"
 vt100 = "0.15.2"
-vte = "0.13.0"
+vte = "0.11.0" # Downgraded to align with vte version in vt100 v0.15.2

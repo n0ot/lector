@@ -13,7 +13,7 @@ pub fn setup<'lua, 'scope>(
     add_callbacks(&tbl_callbacks, &scope, &sr)?;
     ctx.load(include_str!("meta.lua"))
         .set_name("meta.lua")?
-        .call(tbl_callbacks)?;
+        .call::<_, ()>(tbl_callbacks)?;
 
     Ok(())
 }
@@ -40,24 +40,35 @@ fn add_callbacks<'lua, 'scope>(
 
     tbl_callbacks.set(
         "set_symbol",
-        scope.create_function_mut(|_, (key, value): (String, Table)| {
+        scope.create_function_mut(|_, (key, value): (String, rlua::Value)| {
             let mut sr = screen_reader.borrow_mut();
-            let replacement: String = value.get(1)?;
-            let level: symbols::Level = value
-                .get::<usize, String>(2)?
-                .parse()
-                .context("parse level")
-                .to_lua_result()?;
-            let include_original: symbols::IncludeOriginal = value
-                .get::<usize, String>(3)?
-                .parse()
-                .context("parse include_original")
-                .to_lua_result()?;
-            let repeat: bool = value.get(4)?;
-            sr.speech
-                .symbols_map
-                .put(&key, &replacement, level, include_original, repeat);
-            Ok(())
+            match value {
+                rlua::Value::Nil => {
+                    sr.speech.symbols_map.remove(&key);
+                    Ok(())
+                }
+                rlua::Value::Table(table_value) => {
+                    let replacement: String = table_value.get(1)?;
+                    let level: symbols::Level = table_value
+                        .get::<usize, String>(2)?
+                        .parse()
+                        .context("parse level")
+                        .to_lua_result()?;
+                    let include_original: symbols::IncludeOriginal = table_value
+                        .get::<usize, String>(3)?
+                        .parse()
+                        .context("parse include_original")
+                        .to_lua_result()?;
+                    let repeat: bool = table_value.get(4)?;
+                    sr.speech
+                        .symbols_map
+                        .put(&key, &replacement, level, include_original, repeat);
+                    Ok(())
+                }
+                _ => Err(Error::external(anyhow!(
+                    "symbol value must be a table or nil"
+                ))),
+            }
         })?,
     )?;
     tbl_callbacks.set(
@@ -75,6 +86,14 @@ fn add_callbacks<'lua, 'scope>(
                 }
                 None => Ok(Value::Nil),
             }
+        })?,
+    )?;
+    tbl_callbacks.set(
+        "clear_symbols",
+        scope.create_function_mut(|_, ()| {
+            let mut sr = screen_reader.borrow_mut();
+            sr.speech.symbols_map.clear();
+            Ok(())
         })?,
     )?;
 

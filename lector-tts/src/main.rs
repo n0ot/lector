@@ -16,19 +16,21 @@ use objc::{
     runtime::{Object, Sel},
     sel, sel_impl,
 };
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 #[cfg(not(target_os = "macos"))]
 use std::io::BufRead;
 use tts::Tts;
 
 #[cfg(target_os = "macos")]
-#[cfg_attr(feature = "link", link(name = "AppKit", kind = "framework"))]
-extern "C" {
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
     pub static NSFileHandleReadCompletionNotification: id;
     pub static NSFileHandleNotificationDataItem: id;
 }
 
 #[cfg(target_os = "macos")]
-static mut IN_BUFFER: String = String::new();
+static IN_BUFFER: Mutex<String> = Mutex::new(String::new());
 
 #[cfg(target_os = "macos")]
 fn observe_stdin(tts: &mut Tts) -> Result<()> {
@@ -54,18 +56,28 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                     ptr as *const u8,
                     len.try_into().unwrap(),
                 )) {
-                    Ok(s) => IN_BUFFER.push_str(s),
+                    Ok(s_slice) => {
+                        let mut in_buffer_guard = IN_BUFFER.lock().unwrap();
+                        in_buffer_guard.push_str(s_slice);
+
+                        let tts_ptr_val: usize = *this.get_ivar("_tts_ptr");
+                        let tts_callback = &mut *(tts_ptr_val as *mut Tts);
+
+                        while let Some(pos) = in_buffer_guard.find('\n') {
+                            let line = in_buffer_guard.drain(..=pos).collect::<String>();
+                            // Drop the lock before calling handle_input if it could be re-entrant
+                            // or very long-running. For this specific case, it's likely fine
+                            // to hold it, but if handle_input could call back into something
+                            // that tries to lock IN_BUFFER, this would need to be more careful.
+                            if let Err(e) = handle_input(tts_callback, line.trim()) {
+                                eprintln!("Error handling input: {}\nline: {}", e, line);
+                                std::process::exit(1);
+                            }
+                        }
+                        // Mutex guard is dropped here, releasing the lock.
+                    }
                     Err(e) => {
                         eprintln!("Error decoding input: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-
-                let tts: usize = *this.get_ivar("_tts_ptr");
-                while let Some(pos) = IN_BUFFER.find('\n') {
-                    let line = IN_BUFFER.drain(..=pos).collect::<String>();
-                    if let Err(e) = handle_input(&mut *(tts as *mut Tts), line.trim()) {
-                        eprintln!("Error handling input: {}\nline: {}", e, line);
                         std::process::exit(1);
                     }
                 }
