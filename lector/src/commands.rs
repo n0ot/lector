@@ -3,7 +3,7 @@ use super::{
     ext::{CellExt, ScreenExt},
     screen_reader::{CursorTrackingMode, ScreenReader},
 };
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::io::Write;
 
 #[derive(Copy, Clone)]
@@ -540,23 +540,14 @@ fn action_toggle_symbol_level(sr: &mut ScreenReader) -> Result<bool> {
     use super::speech::symbols::Level;
 
     sr.speech.symbol_level = match sr.speech.symbol_level {
-        Level::None => {
-            sr.speech.speak("some", false)?;
-            Level::Some
-        }
-        Level::Some => {
-            sr.speech.speak("most", false)?;
-            Level::Most
-        }
-        Level::Most => {
-            sr.speech.speak("all", false)?;
-            Level::All
-        }
-        Level::All | Level::Character => {
-            sr.speech.speak("none", false)?;
-            Level::None
-        }
+        Level::None => Level::Some,
+        Level::Some => Level::Most,
+        Level::Most => Level::All,
+        Level::All | Level::Character => Level::None,
     };
+
+    sr.speech
+        .speak(&format!("{}", sr.speech.symbol_level), false)?;
 
     Ok(false)
 }
