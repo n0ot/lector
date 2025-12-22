@@ -102,7 +102,7 @@ fn main() -> Result<()> {
     .unwrap();
     let _ = process.kill(ptyprocess::Signal::SIGKILL);
     let _ = process.wait();
-    Ok(result?)
+    result.map_err(|e| anyhow!("{}", e))
 }
 
 fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Result<()> {

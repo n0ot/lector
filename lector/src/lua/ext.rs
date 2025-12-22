@@ -1,4 +1,4 @@
-use rlua::{Error, Result};
+use mlua::{Error, Result};
 
 pub trait LuaResultExt<T> {
     fn to_lua_result(self) -> Result<T>;

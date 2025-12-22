@@ -1,64 +1,64 @@
 use super::ext::LuaResultExt;
 use crate::{screen_reader::ScreenReader, speech::symbols};
-use anyhow::{anyhow, Context as AnyhowContext};
-use rlua::{Context, Error, Result, Scope, Table, ToLua, Value};
+use anyhow::{Context as AnyhowContext, anyhow};
+use mlua::{Error, IntoLua, Lua, Result, Scope, Table, Value};
 use std::cell::RefCell;
 
 pub fn setup<'lua, 'scope>(
-    ctx: &Context<'lua>,
-    scope: &Scope<'lua, 'scope>,
+    lua: &Lua,
+    scope: &'lua Scope<'lua, 'scope>,
     sr: &'scope RefCell<&mut ScreenReader>,
 ) -> Result<()> {
-    let tbl_callbacks = ctx.create_table()?;
+    let tbl_callbacks = lua.create_table()?;
     add_callbacks(&tbl_callbacks, &scope, &sr)?;
-    ctx.load(include_str!("meta.lua"))
-        .set_name("meta.lua")?
-        .call::<_, ()>(tbl_callbacks)?;
+    lua.load(include_str!("meta.lua"))
+        .set_name("meta.lua")
+        .call::<()>( (tbl_callbacks,) )?;
 
     Ok(())
 }
 
 fn add_callbacks<'lua, 'scope>(
-    tbl_callbacks: &Table<'lua>,
-    scope: &Scope<'lua, 'scope>,
+    tbl_callbacks: &Table,
+    scope: &'lua Scope<'lua, 'scope>,
     screen_reader: &'scope RefCell<&mut ScreenReader>,
 ) -> Result<()> {
     tbl_callbacks.set(
         "set_option",
-        scope.create_function_mut(|_, (key, value): (String, rlua::Value)| {
+        scope.create_function_mut(|_, (key, value): (String, mlua::Value)| {
             let mut sr = screen_reader.borrow_mut();
             set_option(&mut sr, &key, value).to_lua_result()
         })?,
     )?;
     tbl_callbacks.set(
         "get_option",
-        scope.create_function(|ctx, key: String| {
+        scope.create_function(|lua, key: String| {
             let sr = screen_reader.borrow();
-            get_option(ctx, &sr, &key).to_lua_result()
+            get_option(lua, &sr, &key).to_lua_result()
         })?,
     )?;
 
     tbl_callbacks.set(
         "set_symbol",
-        scope.create_function_mut(|_, (key, value): (String, rlua::Value)| {
+        scope.create_function_mut(|_, (key, value): (String, mlua::Value)| {
             let mut sr = screen_reader.borrow_mut();
             match value {
-                rlua::Value::Nil => {
+                mlua::Value::Nil => {
                     sr.speech.symbols_map.remove(&key);
                     Ok(())
                 }
-                rlua::Value::Table(table_value) => {
+                mlua::Value::Table(table_value) => {
                     let replacement: String = table_value.get(1)?;
-                    let level: symbols::Level = table_value
-                        .get::<usize, String>(2)?
-                        .parse()
-                        .context("parse level")
-                        .to_lua_result()?;
-                    let include_original: symbols::IncludeOriginal = table_value
-                        .get::<usize, String>(3)?
-                        .parse()
-                        .context("parse include_original")
-                        .to_lua_result()?;
+                    let level: symbols::Level = AnyhowContext::context(
+                        table_value.get::<String>(2)?.parse(),
+                        "parse level",
+                    )
+                    .to_lua_result()?;
+                    let include_original: symbols::IncludeOriginal = AnyhowContext::context(
+                        table_value.get::<String>(3)?.parse(),
+                        "parse include_original",
+                    )
+                    .to_lua_result()?;
                     let repeat: bool = table_value.get(4)?;
                     sr.speech
                         .symbols_map
@@ -101,33 +101,39 @@ fn add_callbacks<'lua, 'scope>(
 }
 
 fn get_option<'lua>(
-    ctx: Context<'lua>,
+    lua: &'lua Lua,
     sr: &ScreenReader,
     option: &str,
-) -> anyhow::Result<rlua::Value<'lua>> {
+) -> anyhow::Result<mlua::Value> {
     match option {
-        "speech_rate" => sr.speech.get_rate().to_lua(ctx),
-        "symbol_level" => sr.speech.symbol_level.to_string().to_lua(ctx),
-        "help_mode" => sr.help_mode.to_lua(ctx),
-        "auto_read" => sr.auto_read.to_lua(ctx),
+        "speech_rate" => sr.speech.get_rate().into_lua(lua),
+        "symbol_level" => sr.speech.symbol_level.to_string().into_lua(lua),
+        "help_mode" => sr.help_mode.into_lua(lua),
+        "auto_read" => sr.auto_read.into_lua(lua),
         "review_follows_screen_cursor" | "rev_follows" => {
-            sr.review_follows_screen_cursor.to_lua(ctx)
+            sr.review_follows_screen_cursor.into_lua(lua)
         }
+        "highlight_tracking" => sr.highlight_tracking.into_lua(lua),
         _ => Err(Error::external(anyhow!("unknown option"))),
     }
+    .map_err(|e| anyhow!("{}", e))
     .context(format!("get option: {}", option))
 }
 
-fn set_option(sr: &mut ScreenReader, option: &str, value: rlua::Value) -> anyhow::Result<()> {
-    use rlua::Value::*;
-    match option {
+fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow::Result<()> {
+    use mlua::Value::*;
+    (match option {
         "speech_rate" => match value {
             Number(v) => sr.speech.set_rate(v as f32),
+            Integer(v) => sr.speech.set_rate(v as f32),
             _ => Err(anyhow!("value must be a number")),
         },
         "symbol_level" => match value {
             String(v) => {
-                sr.speech.symbol_level = v.to_str()?.parse::<symbols::Level>()?;
+                sr.speech.symbol_level = v
+                    .to_str()
+                    .map_err(|e| anyhow!("{}", e))?
+                    .parse::<symbols::Level>()?;
                 Ok(())
             }
             _ => Err(anyhow!("value must be a string")),
@@ -153,7 +159,14 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: rlua::Value) -> anyhow
             }
             _ => Err(anyhow!("value must be a boolean")),
         },
+        "highlight_tracking" => match value {
+            Boolean(v) => {
+                sr.highlight_tracking = v;
+                Ok(())
+            }
+            _ => Err(anyhow!("value must be a boolean")),
+        },
         _ => Err(anyhow!("unknown option")),
-    }
-    .context(format!("set option: {}", option))
+    })
+    .map_err(|e| anyhow!("set option: {}: {:?}", option, e))
 }

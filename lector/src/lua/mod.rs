@@ -1,7 +1,7 @@
 use self::ext::LuaResultExt;
 use crate::screen_reader::ScreenReader;
-use anyhow::{anyhow, Context as AnyhowContext};
-use rlua::{Context, Error, Function, Lua, Result, Scope, Table};
+use anyhow::{Context as AnyhowContext, anyhow};
+use mlua::{Error, Function, LuaOptions, Result, Scope, StdLib, Table, prelude::*};
 use std::{cell::RefCell, fs::File, io::Read, path::PathBuf};
 
 mod ext;
@@ -12,33 +12,30 @@ where
     F: FnOnce(&mut ScreenReader) -> anyhow::Result<()>,
 {
     let sr = RefCell::new(screen_reader);
-    let lua = Lua::new();
-    lua.context(|ctx| {
-        let globals = ctx.globals();
-        ctx.scope(|scope| {
-            let tbl_lector = ctx.create_table()?;
-            let tbl_api = ctx.create_table()?;
-            add_callbacks(&tbl_api, &scope, &sr)?;
-            tbl_lector.set("api", tbl_api)?;
-            globals.set("lector", tbl_lector)?;
+    let lua = Lua::new_with(StdLib::ALL_SAFE | StdLib::JIT, LuaOptions::default())?;
+    lua.scope(|scope| {
+        let tbl_lector = lua.create_table()?;
+        let tbl_api = lua.create_table()?;
+        add_callbacks(&tbl_api, &scope, &sr)?;
+        tbl_lector.set("api", tbl_api)?;
+        lua.globals().set("lector", tbl_lector)?;
 
-            meta::setup(&ctx, &scope, &sr)?;
+        meta::setup(&lua, &scope, &sr)?;
 
-            if init_lua_file.is_file() {
-                load_file(&ctx, &init_lua_file)?.call::<_, ()>(())?;
-            }
+        if init_lua_file.is_file() {
+            load_file(&lua, &init_lua_file)?.call::<()>(())?;
+        }
 
-            let mut screen_reader = sr.borrow_mut();
-            if let Err(e) = after(&mut screen_reader) {
-                return Err(Error::external(e));
-            }
+        let mut screen_reader = sr.borrow_mut();
+        if let Err(e) = after(&mut screen_reader) {
+            return Err(Error::external(e));
+        }
 
-            Ok(())
-        })
+        Ok(())
     })
 }
 
-fn load_file<'lua>(ctx: &Context<'lua>, path: &PathBuf) -> Result<Function<'lua>> {
+fn load_file(lua: &Lua, path: &PathBuf) -> Result<Function> {
     let path_string = path
         .to_str()
         .ok_or_else(|| anyhow!("convert path to string"))
@@ -54,12 +51,12 @@ fn load_file<'lua>(ctx: &Context<'lua>, path: &PathBuf) -> Result<Function<'lua>
         .context(format!("read {}", path_string))
         .to_lua_result()?;
 
-    ctx.load(&s).set_name(&path_string)?.into_function()
+    lua.load(&s).set_name(&path_string).into_function()
 }
 
 fn add_callbacks<'lua, 'scope>(
-    tbl_api: &Table<'lua>,
-    scope: &Scope<'lua, 'scope>,
+    tbl_api: &Table,
+    scope: &'lua Scope<'lua, 'scope>,
     screen_reader: &'scope RefCell<&mut ScreenReader>,
 ) -> Result<()> {
     tbl_api.set(
