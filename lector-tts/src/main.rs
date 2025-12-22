@@ -21,23 +21,38 @@ use tts::Tts;
 
 #[cfg(target_os = "macos")]
 static IN_BUFFER: Mutex<String> = Mutex::new(String::new());
+#[cfg(target_os = "macos")]
+struct StdinObserver {
+    _observer: Retained<AnyObject>,
+    _file_handle: Retained<NSFileHandle>,
+}
 
 #[cfg(target_os = "macos")]
-fn observe_stdin(tts: &mut Tts) -> Result<()> {
+fn observe_stdin(tts: &mut Tts) -> Result<StdinObserver> {
     unsafe {
         let nc = NSNotificationCenter::defaultCenter();
         let fh = NSFileHandle::fileHandleWithStandardInput();
         let superclass = NSObject::class();
         let mut file_observer_class = ClassBuilder::new("FileObserver", superclass)
             .ok_or_else(|| anyhow!("declare Observer class"))?;
-        extern "C" fn read_completed(this: &AnyObject, _: Sel, notification: &NSNotification) {
+        extern "C" fn read_completed(
+            this: *mut AnyObject,
+            _: Sel,
+            notification: *mut NSNotification,
+        ) {
             unsafe {
+                let this = this.as_ref().expect("observer should be non-null");
+                let notification = notification
+                    .as_ref()
+                    .expect("notification should be non-null");
                 let user_info = notification
                     .userInfo()
                     .expect("notification should have user info");
-                let data_obj: Retained<AnyObject> = msg_send_id![&user_info, objectForKey: NSFileHandleNotificationDataItem]
-                    .expect("user info should contain notification data");
-                let data: Retained<NSData> = Retained::cast(data_obj).unwrap();
+                let data_obj: Option<Retained<AnyObject>> =
+                    msg_send_id![&user_info, objectForKey: NSFileHandleNotificationDataItem];
+                let data_obj =
+                    data_obj.expect("user info should contain notification data");
+                let data: Retained<NSData> = Retained::cast::<NSData>(data_obj);
                 let len = data.length();
                 if len == 0 {
                     // EOF
@@ -49,7 +64,11 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                         let mut in_buffer_guard = IN_BUFFER.lock().unwrap();
                         in_buffer_guard.push_str(s_slice);
 
-                        let tts_ptr_val: usize = *this.get_ivar::<usize>("_tts_ptr");
+                        let ivar = this
+                            .class()
+                            .instance_variable("_tts_ptr")
+                            .expect("FileObserver should have _tts_ptr ivar");
+                        let tts_ptr_val: usize = *ivar.load::<usize>(this);
                         let tts_callback = &mut *(tts_ptr_val as *mut Tts);
 
                         while let Some(pos) = in_buffer_guard.find('\n') {
@@ -71,20 +90,23 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                     }
                 }
 
-                let fh = notification.object().unwrap();
-                let fh: Retained<NSFileHandle> = Retained::cast(fh).unwrap();
+                let fh_obj = notification.object().unwrap();
+                let fh: Retained<NSFileHandle> = Retained::cast::<NSFileHandle>(fh_obj);
                 fh.readInBackgroundAndNotify();
             }
         }
         file_observer_class.add_method(
             sel!(fileHandleReadCompleted:),
-            read_completed as extern "C" fn(&AnyObject, Sel, &NSNotification),
+            read_completed as extern "C" fn(*mut AnyObject, Sel, *mut NSNotification),
         );
         file_observer_class.add_ivar::<usize>("_tts_ptr");
         let file_observer_class = file_observer_class.register();
         let file_observer: Retained<AnyObject> = msg_send_id![file_observer_class, new];
         let observer_ptr = Retained::as_ptr(&file_observer) as *mut AnyObject;
-        (&mut *observer_ptr).set_ivar("_tts_ptr", tts as *mut Tts as usize);
+        let ivar = file_observer_class
+            .instance_variable("_tts_ptr")
+            .expect("FileObserver should have _tts_ptr ivar");
+        *ivar.load_mut::<usize>(&mut *observer_ptr) = tts as *mut Tts as usize;
         nc.addObserver_selector_name_object(
             &file_observer,
             sel!(fileHandleReadCompleted:),
@@ -93,7 +115,10 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
         );
         fh.readInBackgroundAndNotify();
 
-        Ok(())
+        Ok(StdinObserver {
+            _observer: file_observer,
+            _file_handle: fh,
+        })
     }
 }
 
@@ -126,6 +151,9 @@ fn handle_input(tts: &mut Tts, input: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     let mut tts = Tts::default()?;
+    #[cfg(target_os = "macos")]
+    let _stdin_observer = observe_stdin(&mut tts).context("handle input")?;
+    #[cfg(not(target_os = "macos"))]
     observe_stdin(&mut tts).context("handle input")?;
     #[cfg(target_os = "macos")]
     {
