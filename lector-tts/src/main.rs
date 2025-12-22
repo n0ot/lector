@@ -2,19 +2,15 @@
 use anyhow::anyhow;
 use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
-use cocoa::base::selector;
-#[cfg(target_os = "macos")]
-use cocoa_foundation::{
-    base::id,
-    foundation::{NSData, NSRunLoop},
+use objc2::{
+    class, declare::ClassDecl, msg_send_id, sel,
+    runtime::{AnyObject, Object, Sel},
 };
 #[cfg(target_os = "macos")]
-use objc::{
-    class,
-    declare::ClassDecl,
-    msg_send,
-    runtime::{Object, Sel},
-    sel, sel_impl,
+use objc2_appkit::{NSFileHandleNotificationDataItem, NSFileHandleReadCompletionNotification};
+#[cfg(target_os = "macos")]
+use objc2_foundation::{
+    NSData, NSDictionary, NSFileHandle, NSNotification, NSNotificationCenter, NSObject, NSRunLoop,
 };
 #[cfg(target_os = "macos")]
 use std::sync::Mutex;
@@ -22,12 +18,6 @@ use std::sync::Mutex;
 use std::io::BufRead;
 use tts::Tts;
 
-#[cfg(target_os = "macos")]
-#[link(name = "AppKit", kind = "framework")]
-unsafe extern "C" {
-    pub static NSFileHandleReadCompletionNotification: id;
-    pub static NSFileHandleNotificationDataItem: id;
-}
 
 #[cfg(target_os = "macos")]
 static IN_BUFFER: Mutex<String> = Mutex::new(String::new());
@@ -35,27 +25,27 @@ static IN_BUFFER: Mutex<String> = Mutex::new(String::new());
 #[cfg(target_os = "macos")]
 fn observe_stdin(tts: &mut Tts) -> Result<()> {
     unsafe {
-        let nc: *mut Object = msg_send![class!(NSNotificationCenter), defaultCenter];
-        let alloc_fh: *mut Object = msg_send![class!(NSFileHandle), alloc];
-        let fh: *mut Object = msg_send![alloc_fh, initWithFileDescriptor: 0];
-        let superclass = class!(NSObject);
+        let nc = NSNotificationCenter::defaultCenter();
+        let fh = NSFileHandle::fileHandleWithStandardInput();
+        let superclass = NSObject::class();
         let mut file_observer_class = ClassDecl::new("FileObserver", superclass)
             .ok_or_else(|| anyhow!("declare Observer class"))?;
-        extern "C" fn read_completed(this: &Object, _: Sel, notification: id) {
+        extern "C" fn read_completed(this: &Object, _: Sel, notification: &NSNotification) {
             unsafe {
-                let user_info: *mut Object = msg_send![notification, userInfo];
-                let data: id = msg_send![user_info, objectForKey: NSFileHandleNotificationDataItem];
-                let ptr = data.bytes();
+                let user_info = notification
+                    .userInfo()
+                    .expect("notification should have user info");
+                let data = user_info
+                    .get(NSFileHandleNotificationDataItem)
+                    .expect("user info should contain notification data")
+                    .cast::<NSData>();
                 let len = data.length();
-                if ptr == std::ptr::null() {
+                if len == 0 {
                     // EOF
                     std::process::exit(0);
                 }
 
-                match std::str::from_utf8(std::slice::from_raw_parts(
-                    ptr as *const u8,
-                    len.try_into().unwrap(),
-                )) {
+                match std::str::from_utf8(data.bytes()) {
                     Ok(s_slice) => {
                         let mut in_buffer_guard = IN_BUFFER.lock().unwrap();
                         in_buffer_guard.push_str(s_slice);
@@ -82,23 +72,26 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                     }
                 }
 
-                let fh: *mut Object = msg_send![notification, object];
-                let _: () = msg_send![fh, readInBackgroundAndNotify];
+                let fh: &AnyObject = notification.object().unwrap();
+                let fh = fh.cast::<NSFileHandle>();
+                fh.readInBackgroundAndNotify();
             }
         }
         file_observer_class.add_method(
-            selector("fileHandleReadCompleted:"),
-            read_completed as extern "C" fn(&Object, Sel, id),
+            sel!(fileHandleReadCompleted:),
+            read_completed as extern "C" fn(&Object, Sel, &NSNotification),
         );
         file_observer_class.add_ivar::<usize>("_tts_ptr");
         let file_observer_class = file_observer_class.register();
-        let file_observer: *mut Object = msg_send![file_observer_class, new];
-        file_observer
-            .as_mut()
-            .unwrap()
-            .set_ivar("_tts_ptr", tts as *mut Tts as usize);
-        let _: *mut Object = msg_send![nc, addObserver: file_observer  selector: selector("fileHandleReadCompleted:") name: NSFileHandleReadCompletionNotification object: fh];
-        let _: () = msg_send![fh, readInBackgroundAndNotify];
+        let mut file_observer = msg_send_id![file_observer_class, new];
+        file_observer.set_ivar("_tts_ptr", tts as *mut Tts as usize);
+        nc.addObserver_selector_name_object(
+            &file_observer,
+            sel!(fileHandleReadCompleted:),
+            Some(NSFileHandleReadCompletionNotification),
+            Some(&fh),
+        );
+        fh.readInBackgroundAndNotify();
 
         Ok(())
     }
@@ -135,10 +128,10 @@ fn main() -> Result<()> {
     let mut tts = Tts::default()?;
     observe_stdin(&mut tts).context("handle input")?;
     #[cfg(target_os = "macos")]
-    unsafe {
+    {
         // Start the event loop
-        let run_loop: id = NSRunLoop::currentRunLoop();
-        let _: () = msg_send![run_loop, run];
+        let run_loop = NSRunLoop::currentRunLoop();
+        run_loop.run();
     }
 
     Ok(())

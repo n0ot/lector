@@ -18,6 +18,15 @@ anyhow = "1.0.86"
 cargo-clippy = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc = { version = "0.2.7", features = ["exception"] }
-cocoa-foundation = "0.2.1"
-cocoa = "0.26.1"
+objc2 = "0.5.2"
+objc2-appkit = { version = "0.2.2", features = ["NSFileHandle"] }
+objc2-foundation = { version = "0.2.2", features = [
+    "Foundation_NSData",
+    "Foundation_NSDictionary",
+    "Foundation_NSFileHandle",
+    "Foundation_NSNotification",
+    "Foundation_NSNotificationCenter",
+    "Foundation_NSRunLoop",
+    "Foundation_NSString",
+    "NSObject",
+] }
