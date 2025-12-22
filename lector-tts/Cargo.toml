@@ -19,5 +19,5 @@ cargo-clippy = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = { version = "0.2.7", features = ["exception"] }
-cocoa-foundation = "0.1.2"
-cocoa = "0.25.0"
+cocoa-foundation = "0.2.1"
+cocoa = "0.26.1"

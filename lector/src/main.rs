@@ -1,9 +1,9 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use lector::{commands, lua, perform, screen_reader::ScreenReader, speech, view::View};
 use nix::sys::termios;
 use phf::phf_map;
-use ptyprocess::PtyProcess;
+use ptyprocess::{PtyProcess, Signal};
 use signal_hook::consts::signal::*;
 use signal_hook_mio::v0_8::Signals;
 use std::{
@@ -205,9 +205,7 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
                     stdout.write_all(&buf[0..n]).context("write PTY output")?;
                     stdout.flush().context("flush output")?;
                     if sr.auto_read {
-                        for b in &buf[0..n] {
-                            vte_parser.advance(&mut reporter, *b);
-                        }
+                            vte_parser.advance(&mut reporter, &buf[0..n]);
                     }
 
                     sr.view.process_changes(&buf[0..n]);
@@ -225,6 +223,7 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
                                 process
                                     .set_window_size(term_size.cols, term_size.rows)
                                     .context("resize PTY")?;
+                                process.signal(Signal::SIGWINCH)?;
                                 sr.view.set_size(term_size.rows, term_size.cols);
                             }
                             _ => unreachable!("unknown signal"),

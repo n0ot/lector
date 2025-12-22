@@ -72,7 +72,7 @@ impl View {
 
     /// Resizes this view
     pub fn set_size(&mut self, rows: u16, cols: u16) {
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
         // If the screen's size changed, the cursor may now be out of bounds.
         self.review_cursor_position = (
             min(self.review_cursor_position.0, self.size().0),
