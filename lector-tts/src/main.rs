@@ -3,8 +3,9 @@ use anyhow::anyhow;
 use anyhow::{Context, Result};
 #[cfg(target_os = "macos")]
 use objc2::{
+    rc::Retained,
     runtime::{AnyObject, ClassBuilder, Sel},
-    msg_send_id, sel, ClassType, Retained,
+    msg_send_id, sel, ClassType,
 };
 #[cfg(target_os = "macos")]
 use objc2_foundation::{
@@ -34,9 +35,9 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                 let user_info = notification
                     .userInfo()
                     .expect("notification should have user info");
-                let data = msg_send_id![user_info, objectForKey: NSFileHandleNotificationDataItem]
+                let data: Retained<NSData> = msg_send_id![&user_info, objectForKey: NSFileHandleNotificationDataItem]
                     .expect("user info should contain notification data")
-                    .cast::<NSData>();
+                    .cast();
                 let len = data.length();
                 if len == 0 {
                     // EOF
@@ -48,7 +49,7 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                         let mut in_buffer_guard = IN_BUFFER.lock().unwrap();
                         in_buffer_guard.push_str(s_slice);
 
-                        let tts_ptr_val: usize = *this.get_mut_ivar::<usize>("_tts_ptr");
+                        let tts_ptr_val: usize = *this.get_ivar::<usize>("_tts_ptr");
                         let tts_callback = &mut *(tts_ptr_val as *mut Tts);
 
                         while let Some(pos) = in_buffer_guard.find('\n') {
@@ -71,7 +72,7 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                 }
 
                 let fh = notification.object().unwrap();
-                let fh = fh.cast::<NSFileHandle>();
+                let fh: Retained<NSFileHandle> = fh.cast();
                 fh.readInBackgroundAndNotify();
             }
         }
