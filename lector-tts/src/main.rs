@@ -7,7 +7,7 @@ use objc2::{
     runtime::{AnyObject, Object, Sel},
 };
 #[cfg(target_os = "macos")]
-use objc2_appkit::{NSFileHandleNotificationDataItem, NSFileHandleReadCompletionNotification};
+use objc2_app_kit::{NSFileHandleNotificationDataItem, NSFileHandleReadCompletionNotification};
 #[cfg(target_os = "macos")]
 use objc2_foundation::{
     NSData, NSDictionary, NSFileHandle, NSNotification, NSNotificationCenter, NSObject, NSRunLoop,
