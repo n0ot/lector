@@ -15,7 +15,7 @@ clap = { version = "4.5.11", features = ["derive", "env"] }
 dirs = "6.0.0"
 emojis = "0.8.0"
 lazy_static = "1.5.0"
-mio = { version = "0.8.11", features = ["os-ext", "os-poll"] }
+mio = { version = "1.1.1", features = ["os-ext", "os-poll"] }
 nix = { version = "0.30.1", features = ["term"] }
 phf = { version = "0.13.1", features = ["macros"] }
 ptyprocess = "0.5.0"
@@ -25,7 +25,7 @@ regex = { version = "1.10.5", default-features = false, features = [
     "unicode-bool",
 ] }
 signal-hook = "0.3.17"
-signal-hook-mio = { version = "0.2.3", features = ["support-v0_8"] }
+signal-hook-mio = { version = "0.2.3", features = ["support-v1_0"] }
 similar = { version = "2.5.0", features = ["unicode"] }
 termsize = "0.1.7"
 unicode-segmentation = "1.11.0"

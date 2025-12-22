@@ -5,7 +5,7 @@ use nix::sys::termios;
 use phf::phf_map;
 use ptyprocess::{PtyProcess, Signal};
 use signal_hook::consts::signal::*;
-use signal_hook_mio::v0_8::Signals;
+use signal_hook_mio::v1_0::Signals;
 use std::{
     io::{ErrorKind, Read, Write},
     os::fd::{AsFd, AsRawFd},
