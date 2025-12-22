@@ -21,12 +21,12 @@ cargo-clippy = []
 objc2 = "0.5.2"
 objc2-app-kit = { version = "0.2.2" }
 objc2-foundation = { version = "0.2.2", features = [
-    "Foundation_NSData",
-    "Foundation_NSDictionary",
-    "Foundation_NSFileHandle",
-    "Foundation_NSNotification",
-    "Foundation_NSNotificationCenter",
-    "Foundation_NSRunLoop",
-    "Foundation_NSString",
+    "NSData",
+    "NSDictionary",
+    "NSFileHandle",
+    "NSNotification",
+    "NSNotificationCenter",
+    "NSRunLoop",
+    "NSString",
     "NSObject",
 ] }
