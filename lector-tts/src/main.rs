@@ -35,9 +35,9 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                 let user_info = notification
                     .userInfo()
                     .expect("notification should have user info");
-                let data: Retained<NSData> = msg_send_id![&user_info, objectForKey: NSFileHandleNotificationDataItem]
-                    .expect("user info should contain notification data")
-                    .cast();
+                let data_obj: Retained<AnyObject> = msg_send_id![&user_info, objectForKey: NSFileHandleNotificationDataItem]
+                    .expect("user info should contain notification data");
+                let data: Retained<NSData> = Retained::cast(data_obj).unwrap();
                 let len = data.length();
                 if len == 0 {
                     // EOF
@@ -72,7 +72,7 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
                 }
 
                 let fh = notification.object().unwrap();
-                let fh: Retained<NSFileHandle> = fh.cast();
+                let fh: Retained<NSFileHandle> = Retained::cast(fh).unwrap();
                 fh.readInBackgroundAndNotify();
             }
         }
@@ -82,8 +82,9 @@ fn observe_stdin(tts: &mut Tts) -> Result<()> {
         );
         file_observer_class.add_ivar::<usize>("_tts_ptr");
         let file_observer_class = file_observer_class.register();
-        let mut file_observer: Retained<AnyObject> = msg_send_id![file_observer_class, new];
-        file_observer.set_ivar("_tts_ptr", tts as *mut Tts as usize);
+        let file_observer: Retained<AnyObject> = msg_send_id![file_observer_class, new];
+        let observer_ptr = Retained::as_ptr(&file_observer) as *mut AnyObject;
+        (&mut *observer_ptr).set_ivar("_tts_ptr", tts as *mut Tts as usize);
         nc.addObserver_selector_name_object(
             &file_observer,
             sel!(fileHandleReadCompleted:),
