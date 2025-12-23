@@ -1,5 +1,10 @@
 use super::{ViewAction, ViewController, ViewKind};
-use crate::{lua, screen_reader::ScreenReader, view::View};
+use crate::{
+    line_editor::{EditorAction, LineEditor},
+    lua,
+    screen_reader::ScreenReader,
+    view::View,
+};
 use anyhow::{anyhow, Result};
 use mlua::{
     Error, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Thread, ThreadStatus, Value,
@@ -10,281 +15,6 @@ use std::{
     io::Write,
     rc::Rc,
 };
-
-struct LineEditor {
-    input: String,
-    cursor: usize,
-    state: InputState,
-    csi_buf: Vec<u8>,
-    history: Vec<String>,
-    history_index: Option<usize>,
-    history_draft: String,
-}
-
-#[derive(Copy, Clone)]
-enum InputState {
-    Normal,
-    Esc,
-    Csi,
-    Ss3,
-}
-
-impl LineEditor {
-    fn new() -> Self {
-        Self {
-            input: String::new(),
-            cursor: 0,
-            state: InputState::Normal,
-            csi_buf: Vec::new(),
-            history: Vec::new(),
-            history_index: None,
-            history_draft: String::new(),
-        }
-    }
-
-    fn clear(&mut self) {
-        self.input.clear();
-        self.cursor = 0;
-        self.history_index = None;
-    }
-
-    fn commit_history(&mut self) {
-        if !self.input.trim().is_empty() {
-            self.history.push(self.input.clone());
-        }
-        self.history_index = None;
-        self.history_draft.clear();
-    }
-
-    fn history_up(&mut self) -> bool {
-        if self.history.is_empty() {
-            return false;
-        }
-        let next_index = match self.history_index {
-            Some(0) => 0,
-            Some(idx) => idx.saturating_sub(1),
-            None => {
-                self.history_draft = self.input.clone();
-                self.history.len() - 1
-            }
-        };
-        self.history_index = Some(next_index);
-        self.input = self.history[next_index].clone();
-        self.cursor = self.len_chars();
-        true
-    }
-
-    fn history_down(&mut self) -> bool {
-        let Some(idx) = self.history_index else {
-            return false;
-        };
-        if idx + 1 >= self.history.len() {
-            self.history_index = None;
-            self.input = self.history_draft.clone();
-            self.cursor = self.len_chars();
-            return true;
-        }
-        let next_index = idx + 1;
-        self.history_index = Some(next_index);
-        self.input = self.history[next_index].clone();
-        self.cursor = self.len_chars();
-        true
-    }
-
-    fn handle_bytes(&mut self, bytes: &[u8]) -> EditorAction {
-        let mut action = EditorAction::None;
-        for &b in bytes {
-            action = match self.state {
-                InputState::Normal => self.handle_byte(b),
-                InputState::Esc => self.handle_esc(b),
-                InputState::Csi => self.handle_csi(b),
-                InputState::Ss3 => self.handle_ss3(b),
-            };
-            if matches!(action, EditorAction::Submit) {
-                return action;
-            }
-        }
-        action
-    }
-
-    fn handle_byte(&mut self, byte: u8) -> EditorAction {
-        match byte {
-            b'\x1B' => {
-                self.state = InputState::Esc;
-                EditorAction::None
-            }
-            b'\x01' => {
-                self.cursor = 0;
-                EditorAction::Changed
-            }
-            b'\x05' => {
-                self.cursor = self.len_chars();
-                EditorAction::Changed
-            }
-            b'\x10' => {
-                if self.history_up() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
-            b'\x0E' => {
-                if self.history_down() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
-            b'\r' | b'\n' => EditorAction::Submit,
-            b'\x7F' | b'\x08' => {
-                if self.cursor == 0 && self.input.is_empty() {
-                    EditorAction::Bell
-                } else if self.cursor == 0 {
-                    EditorAction::None
-                } else {
-                    self.backspace();
-                    EditorAction::Changed
-                }
-            }
-            _ => {
-                if byte.is_ascii() && !byte.is_ascii_control() {
-                    let ch = byte as char;
-                    self.insert_str(&ch.to_string());
-                    EditorAction::Changed
-                } else {
-                    EditorAction::None
-                }
-            }
-        }
-    }
-
-    fn handle_esc(&mut self, byte: u8) -> EditorAction {
-        match byte {
-            b'[' => {
-                self.state = InputState::Csi;
-                self.csi_buf.clear();
-            }
-            b'O' => self.state = InputState::Ss3,
-            _ => self.state = InputState::Normal,
-        }
-        EditorAction::None
-    }
-
-    fn handle_csi(&mut self, byte: u8) -> EditorAction {
-        self.csi_buf.push(byte);
-        if !(byte >= 0x40 && byte <= 0x7E) {
-            return EditorAction::None;
-        }
-        self.state = InputState::Normal;
-        let action = match byte {
-            b'D' => {
-                self.move_left();
-                EditorAction::Changed
-            }
-            b'C' => {
-                self.move_right();
-                EditorAction::Changed
-            }
-            b'A' => {
-                if self.history_up() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
-            b'B' => {
-                if self.history_down() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
-            _ => EditorAction::None,
-        };
-        self.csi_buf.clear();
-        action
-    }
-
-    fn handle_ss3(&mut self, byte: u8) -> EditorAction {
-        self.state = InputState::Normal;
-        match byte {
-            b'D' => {
-                self.move_left();
-                EditorAction::Changed
-            }
-            b'C' => {
-                self.move_right();
-                EditorAction::Changed
-            }
-            b'A' => {
-                if self.history_up() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
-            b'B' => {
-                if self.history_down() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
-            _ => EditorAction::None,
-        }
-    }
-
-    fn move_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-        }
-    }
-
-    fn move_right(&mut self) {
-        if self.cursor < self.len_chars() {
-            self.cursor += 1;
-        }
-    }
-
-    fn insert_str(&mut self, s: &str) {
-        let idx = self.byte_index(self.cursor);
-        self.input.insert_str(idx, s);
-        self.cursor += s.chars().count();
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let start = self.byte_index(self.cursor - 1);
-        let end = self.byte_index(self.cursor);
-        self.input.replace_range(start..end, "");
-        self.cursor -= 1;
-    }
-
-    fn len_chars(&self) -> usize {
-        self.input.chars().count()
-    }
-
-    fn byte_index(&self, char_index: usize) -> usize {
-        if char_index == 0 {
-            return 0;
-        }
-        self.input
-            .char_indices()
-            .nth(char_index)
-            .map(|(idx, _)| idx)
-            .unwrap_or_else(|| self.input.len())
-    }
-}
-
-#[derive(Copy, Clone)]
-enum EditorAction {
-    None,
-    Changed,
-    Submit,
-    Bell,
-}
 
 struct ReplOutput {
     lines: Vec<String>,
@@ -409,8 +139,8 @@ impl LuaReplView {
     }
 
     fn try_append_input(&mut self) -> bool {
-        let input = self.editor.input.clone();
-        let cursor = self.editor.cursor;
+        let input = self.editor.input().to_string();
+        let cursor = self.editor.cursor();
         let input_len = input.chars().count();
         let prev_input = self.rendered_input.as_str();
         let prev_len = prev_input.chars().count();
@@ -429,8 +159,8 @@ impl LuaReplView {
     }
 
     fn redraw_input_line(&mut self) {
-        let input = self.editor.input.clone();
-        let cursor = self.editor.cursor;
+        let input = self.editor.input().to_string();
+        let cursor = self.editor.cursor();
         let input_len = input.chars().count();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"\r\x1B[K");
@@ -445,8 +175,8 @@ impl LuaReplView {
     }
 
     fn apply_editor_update(&mut self) {
-        let new_input = self.editor.input.clone();
-        let new_cursor = self.editor.cursor;
+        let new_input = self.editor.input().to_string();
+        let new_cursor = self.editor.cursor();
         let prev_input = self.rendered_input.clone();
         let prev_cursor = self.rendered_cursor;
 
@@ -505,7 +235,7 @@ impl LuaReplView {
         let prompt = "> ";
         let available = cols.saturating_sub(prompt.len());
         let total_chars = self.editor.len_chars();
-        let cursor = self.editor.cursor.min(total_chars);
+        let cursor = self.editor.cursor().min(total_chars);
         let start = if cursor > available {
             cursor.saturating_sub(available)
         } else {
@@ -513,7 +243,7 @@ impl LuaReplView {
         };
         let visible_input: String = self
             .editor
-            .input
+            .input()
             .chars()
             .skip(start)
             .take(available)
@@ -543,8 +273,8 @@ impl LuaReplView {
         self.view.next_bytes.clear();
         self.view.process_changes(&bytes);
         self.view.next_bytes.clear();
-        self.rendered_input = self.editor.input.clone();
-        self.rendered_cursor = self.editor.cursor;
+        self.rendered_input = self.editor.input().to_string();
+        self.rendered_cursor = self.editor.cursor();
     }
 
     fn start_eval(&mut self, input: &str) -> Result<()> {
@@ -649,7 +379,7 @@ impl ViewController for LuaReplView {
         }
         match self.editor.handle_bytes(input) {
             EditorAction::Submit => {
-                let line = self.editor.input.clone();
+                let line = self.editor.input().to_string();
                 if line.trim().is_empty() {
                     return Ok(ViewAction::Bell);
                 }

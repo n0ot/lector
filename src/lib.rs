@@ -5,6 +5,7 @@ mod clipboard;
 pub mod commands;
 mod ext;
 pub mod lua;
+pub mod line_editor;
 pub mod platform;
 pub mod perform;
 pub mod screen_reader;
