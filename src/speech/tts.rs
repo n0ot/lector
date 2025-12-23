@@ -2,11 +2,6 @@ use super::Driver;
 use anyhow::{Result, anyhow};
 use tts::Tts;
 
-#[cfg(target_os = "macos")]
-use core_foundation::runloop;
-#[cfg(target_os = "macos")]
-use std::time::Duration;
-
 pub struct TtsDriver {
     tts: Tts,
     rate: f32,
@@ -53,15 +48,4 @@ impl Driver for TtsDriver {
         Ok(())
     }
 
-    #[cfg(target_os = "macos")]
-    fn tick(&mut self) -> Result<()> {
-        unsafe {
-            let _ = runloop::CFRunLoopRunInMode(runloop::kCFRunLoopDefaultMode, 0.01, 0);
-        }
-        Ok(())
-    }
-
-    fn max_poll_interval(&self) -> Option<Duration> {
-        Some(Duration::from_millis(10))
-    }
 }

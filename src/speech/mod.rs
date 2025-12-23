@@ -2,7 +2,6 @@ use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::fmt::Write;
-use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub mod symbols;
@@ -15,12 +14,6 @@ pub trait Driver {
     fn stop(&mut self) -> Result<()>;
     fn get_rate(&self) -> f32;
     fn set_rate(&mut self, rate: f32) -> Result<()>;
-    fn tick(&mut self) -> Result<()> {
-        Ok(())
-    }
-    fn max_poll_interval(&self) -> Option<Duration> {
-        None
-    }
 }
 
 pub struct Speech {
@@ -165,17 +158,4 @@ impl Speech {
         self.driver.set_rate(rate)
     }
 
-    pub fn tick(&mut self) -> Result<()> {
-        self.driver.tick()
-    }
-
-    pub fn adjust_poll_timeout(
-        &self,
-        current: Option<Duration>,
-    ) -> Option<Duration> {
-        match self.driver.max_poll_interval() {
-            Some(max) => Some(current.map_or(max, |c| c.min(max))),
-            None => current,
-        }
-    }
 }

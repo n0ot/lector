@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use lector::{commands, lua, perform, screen_reader::ScreenReader, speech, view::View};
+use lector::{commands, lua, perform, platform, screen_reader::ScreenReader, speech, view::View};
 use nix::sys::termios;
 use phf::phf_map;
 use ptyprocess::{PtyProcess, Signal};
@@ -141,7 +141,7 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
     let mut last_stdin_update = None;
     let mut last_pty_update = None;
     loop {
-        poll_timeout = sr.speech.adjust_poll_timeout(poll_timeout);
+        poll_timeout = platform::adjust_poll_timeout(poll_timeout);
         poll.poll(&mut events, poll_timeout).or_else(|e| {
             if e.kind() == ErrorKind::Interrupted {
                 events.clear();
@@ -270,6 +270,6 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
             }
         }
 
-        sr.speech.tick()?;
+        platform::tick_runloop()?;
     }
 }
