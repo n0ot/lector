@@ -2,7 +2,7 @@ use super::ext::LuaResultExt;
 use crate::{screen_reader::ScreenReader, speech::symbols};
 use anyhow::{Context as AnyhowContext, anyhow};
 use mlua::{Error, IntoLua, Lua, Result, Scope, Table, Value};
-use std::cell::RefCell;
+use std::{cell::RefCell, rc::Rc};
 
 pub fn setup<'lua, 'scope>(
     lua: &Lua,
@@ -15,6 +15,15 @@ pub fn setup<'lua, 'scope>(
         .set_name("meta.lua")
         .call::<()>( (tbl_callbacks,) )?;
 
+    Ok(())
+}
+
+pub fn setup_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
+    let tbl_callbacks = lua.create_table()?;
+    add_callbacks_static(lua, &tbl_callbacks, sr_ptr)?;
+    lua.load(include_str!("meta.lua"))
+        .set_name("meta.lua")
+        .call::<()>( (tbl_callbacks,) )?;
     Ok(())
 }
 
@@ -100,6 +109,108 @@ fn add_callbacks<'lua, 'scope>(
     Ok(())
 }
 
+fn add_callbacks_static(
+    lua: &Lua,
+    tbl_callbacks: &Table,
+    sr_ptr: Rc<RefCell<*mut ScreenReader>>,
+) -> Result<()> {
+    tbl_callbacks.set(
+        "set_option",
+        lua.create_function_mut({
+            let sr_ptr = Rc::clone(&sr_ptr);
+            move |_, (key, value): (String, mlua::Value)| {
+                with_screen_reader_mut(&sr_ptr, |sr| {
+                    set_option(sr, &key, value).map_err(Error::external)
+                })
+            }
+        })?,
+    )?;
+    tbl_callbacks.set(
+        "get_option",
+        lua.create_function({
+            let sr_ptr = Rc::clone(&sr_ptr);
+            move |lua, key: String| {
+                with_screen_reader(&sr_ptr, |sr| {
+                    get_option(lua, sr, &key).map_err(Error::external)
+                })
+            }
+        })?,
+    )?;
+    tbl_callbacks.set(
+        "set_symbol",
+        lua.create_function_mut({
+            let sr_ptr = Rc::clone(&sr_ptr);
+            move |_, (key, value): (String, mlua::Value)| {
+                with_screen_reader_mut(&sr_ptr, |sr| {
+                    match value {
+                        mlua::Value::Nil => {
+                            sr.speech.symbols_map.remove(&key);
+                            Ok(())
+                        }
+                        mlua::Value::Table(table_value) => {
+                            let replacement: String = table_value.get(1)?;
+                            let level: symbols::Level = AnyhowContext::context(
+                                table_value.get::<String>(2)?.parse(),
+                                "parse level",
+                            )
+                            .to_lua_result()?;
+                            let include_original: symbols::IncludeOriginal = AnyhowContext::context(
+                                table_value.get::<String>(3)?.parse(),
+                                "parse include_original",
+                            )
+                            .to_lua_result()?;
+                            let repeat: bool = table_value.get(4)?;
+                            sr.speech
+                                .symbols_map
+                                .put(&key, &replacement, level, include_original, repeat);
+                            Ok(())
+                        }
+                        _ => Err(Error::external(anyhow!(
+                            "symbol value must be a table or nil"
+                        ))),
+                    }
+                })
+            }
+        })?,
+    )?;
+    tbl_callbacks.set(
+        "get_symbol",
+        lua.create_function({
+            let sr_ptr = Rc::clone(&sr_ptr);
+            move |lua, key: String| {
+                with_screen_reader(&sr_ptr, |sr| {
+                    let value = match sr.speech.symbols_map.get(&key) {
+                        Some(v) => {
+                            let tbl = lua.create_table()?;
+                            tbl.set(1, v.replacement.clone())?;
+                            tbl.set(2, v.level.to_string())?;
+                            tbl.set(3, v.include_original.to_string())?;
+                            tbl.set(4, v.repeat)?;
+                            Value::Table(tbl)
+                        }
+                        None => Value::Nil,
+                    };
+                    Ok(value)
+                })
+            }
+        })?,
+    )?;
+    tbl_callbacks.set(
+        "clear_symbols",
+        lua.create_function_mut({
+            let sr_ptr = Rc::clone(&sr_ptr);
+            move |_, ()| {
+                with_screen_reader_mut(&sr_ptr, |sr| {
+                    sr.speech.symbols_map.clear();
+                    Ok(())
+                })
+            }
+        })?,
+    )?;
+
+    Ok(())
+}
+
 fn get_option<'lua>(
     lua: &'lua Lua,
     sr: &ScreenReader,
@@ -169,4 +280,28 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
         _ => Err(anyhow!("unknown option")),
     })
     .map_err(|e| anyhow!("set option: {}: {:?}", option, e))
+}
+
+fn with_screen_reader_mut<T>(
+    sr_ptr: &Rc<RefCell<*mut ScreenReader>>,
+    f: impl FnOnce(&mut ScreenReader) -> Result<T>,
+) -> Result<T> {
+    let ptr = *sr_ptr.borrow();
+    if ptr.is_null() {
+        return Err(Error::external(anyhow!("screen reader unavailable")));
+    }
+    // Safety: the pointer is set by the main thread before any Lua call.
+    unsafe { f(&mut *ptr) }
+}
+
+fn with_screen_reader<T>(
+    sr_ptr: &Rc<RefCell<*mut ScreenReader>>,
+    f: impl FnOnce(&ScreenReader) -> Result<T>,
+) -> Result<T> {
+    let ptr = *sr_ptr.borrow();
+    if ptr.is_null() {
+        return Err(Error::external(anyhow!("screen reader unavailable")));
+    }
+    // Safety: the pointer is set by the main thread before any Lua call.
+    unsafe { f(&*ptr) }
 }

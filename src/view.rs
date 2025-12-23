@@ -263,4 +263,9 @@ impl View {
     pub fn character(&self, row: u16, col: u16) -> String {
         self.screen().contents_between(row, col, row, col + 1)
     }
+
+    /// Returns the contents of the full screen, including blank lines.
+    pub fn contents_full(&self) -> String {
+        self.screen().contents_full()
+    }
 }

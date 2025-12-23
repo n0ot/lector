@@ -12,6 +12,7 @@ pub enum Action {
     ToggleAutoRead,
     ToggleReviewCursorFollowsScreenCursor,
     ToggleSymbolLevel,
+    OpenLuaRepl,
     PassNextKey,
     StopSpeaking,
     RevLinePrev,
@@ -57,6 +58,7 @@ impl Action {
                 "toggle whether review cursor follows screen cursor".into()
             }
             Action::ToggleSymbolLevel => "toggle symbol level".into(),
+            Action::OpenLuaRepl => "open Lua REPL".into(),
             Action::PassNextKey => "forward next key press".into(),
             Action::StopSpeaking => "stop speaking".into(),
             Action::RevLinePrev => "previous line".into(),

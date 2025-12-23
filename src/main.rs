@@ -44,6 +44,7 @@ static KEYMAP: phf::Map<&'static str, commands::Action> = phf_map! {
     "\x7F" => commands::Action::Backspace,
     "\x1B[3~" => commands::Action::Delete,
     "\x1B[24~" => commands::Action::SayTime,
+    "\x1BL" => commands::Action::OpenLuaRepl,
     "\x1B[15~" => commands::Action::SetMark,
     "\x1B[17~" => commands::Action::Copy,
     "\x1B[18~" => commands::Action::Paste,
@@ -88,9 +89,21 @@ fn main() -> Result<()> {
     let mut conf_file = conf_dir.clone();
     conf_file.push("init.lua");
 
-    let result = lua::setup(conf_file, &mut screen_reader, |screen_reader| {
-        do_events(screen_reader, &mut view_stack, &mut process)
-    });
+    let result = match lua::setup(conf_file.clone(), &mut screen_reader, |screen_reader| {
+        do_events(screen_reader, &mut view_stack, &mut process, None)
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) => do_events(
+            &mut screen_reader,
+            &mut view_stack,
+            &mut process,
+            Some(format!(
+                "Error loading config file: {}\n\n{}",
+                conf_file.display(),
+                err
+            )),
+        ),
+    };
     // Clean up before returning the above result.
     termios::tcsetattr(
         std::io::stdin().as_fd(),
@@ -107,6 +120,7 @@ fn do_events(
     sr: &mut ScreenReader,
     view_stack: &mut views::ViewStack,
     process: &mut ptyprocess::PtyProcess,
+    initial_message: Option<String>,
 ) -> Result<()> {
     let mut pty_stream = process.get_pty_stream().context("get PTY stream")?;
     // Set stdin to raw, so that input is read character by character,
@@ -147,8 +161,23 @@ fn do_events(
     let mut poll_timeout = None;
     let mut last_stdin_update = None;
     let mut last_pty_update = None;
+
+    if let Some(message) = initial_message {
+        let (rows, cols) = view_stack.root_mut().model().size();
+        view_stack.push(Box::new(views::MessageView::new(
+            rows,
+            cols,
+            "Lector Error",
+            message,
+        )));
+        render_active_view(&mut stdout, view_stack)?;
+        announce_view_change(sr, view_stack)?;
+    }
     loop {
         poll_timeout = platform::adjust_poll_timeout(poll_timeout);
+        if view_stack.active_mut().wants_tick() {
+            poll_timeout = Some(time::Duration::from_millis(0));
+        }
         poll.poll(&mut events, poll_timeout).or_else(|e| {
             if e.kind() == ErrorKind::Interrupted {
                 events.clear();
@@ -188,6 +217,22 @@ fn do_events(
                         .ok()
                         .and_then(|key| KEYMAP.get(key).copied());
                     if let Some(action) = action {
+                        if matches!(action, commands::Action::OpenLuaRepl) {
+                            if view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
+                                sr.speech.speak("Lua REPL already open", false)?;
+                                continue;
+                            }
+                            let (rows, cols) = view_stack.active_mut().model().size();
+                            let repl = views::LuaReplView::new(rows, cols)?;
+                            handle_view_action(
+                                sr,
+                                views::ViewAction::Push(Box::new(repl)),
+                                view_stack,
+                                &mut stdout,
+                                &mut last_stdin_update,
+                            )?;
+                            continue;
+                        }
                         match commands::handle(sr, view_stack.active_mut().model(), action)? {
                             commands::CommandResult::Handled => {}
                             commands::CommandResult::ForwardInput => {
@@ -205,6 +250,7 @@ fn do_events(
                                     .active_mut()
                                     .handle_paste(sr, &contents, &mut pty_stream)?;
                                 handle_view_action(
+                                    sr,
                                     view_action,
                                     view_stack,
                                     &mut stdout,
@@ -270,6 +316,17 @@ fn do_events(
                 _ => unreachable!("encountered unknown event"),
             }
         }
+
+        let tick_action = view_stack
+            .active_mut()
+            .tick(sr, &mut pty_stream)?;
+        handle_view_action(
+            sr,
+            tick_action,
+            view_stack,
+            &mut stdout,
+            &mut last_stdin_update,
+        )?;
 
         // We want to wait till the PTY has stopped sending us data for awhile before reading
         // updates, to give the screen time to stabilize.
@@ -348,13 +405,15 @@ fn dispatch_to_view(
     stdout: &mut impl Write,
     last_stdin_update: &mut Option<time::Instant>,
 ) -> Result<()> {
+    *last_stdin_update = Some(time::Instant::now());
     let action = view_stack
         .active_mut()
         .handle_input(sr, input, pty_stream)?;
-    handle_view_action(action, view_stack, stdout, last_stdin_update)
+    handle_view_action(sr, action, view_stack, stdout, last_stdin_update)
 }
 
 fn handle_view_action(
+    sr: &mut ScreenReader,
     action: views::ViewAction,
     view_stack: &mut views::ViewStack,
     stdout: &mut impl Write,
@@ -364,19 +423,66 @@ fn handle_view_action(
         views::ViewAction::PtyInput => {
             *last_stdin_update = Some(time::Instant::now());
         }
+        views::ViewAction::Bell => {
+            stdout.write_all(b"\x07").context("write bell")?;
+            stdout.flush().context("flush bell")?;
+        }
         views::ViewAction::Push(view) => {
             view_stack.push(view);
             render_active_view(stdout, view_stack)?;
+            announce_view_change(sr, view_stack)?;
         }
         views::ViewAction::Pop => {
             if view_stack.pop() {
                 render_active_view(stdout, view_stack)?;
+                announce_view_change(sr, view_stack)?;
             }
         }
         views::ViewAction::Redraw => {
             render_active_view(stdout, view_stack)?;
+            read_active_view_changes(sr, view_stack, last_stdin_update)?;
         }
         views::ViewAction::None => {}
     }
+    Ok(())
+}
+
+fn announce_view_change(sr: &mut ScreenReader, view_stack: &mut views::ViewStack) -> Result<()> {
+    let title = view_stack.active_mut().title().to_string();
+    let view = view_stack.active_mut().model();
+    sr.speech.speak(&title, false)?;
+    let contents = view.contents_full();
+    if contents.trim().is_empty() {
+        sr.speech.speak("blank screen", false)?;
+    } else {
+        sr.speech.speak(&contents, false)?;
+    }
+    view.finalize_changes();
+    Ok(())
+}
+
+fn read_active_view_changes(
+    sr: &mut ScreenReader,
+    view_stack: &mut views::ViewStack,
+    last_stdin_update: &mut Option<time::Instant>,
+) -> Result<()> {
+    let view = view_stack.active_mut().model();
+    let read_text = if sr.auto_read {
+        let mut reporter = perform::Reporter::new();
+        sr.auto_read(view, &mut reporter)?
+    } else {
+        false
+    };
+    if let Some(lsu) = last_stdin_update {
+        if lsu.elapsed().as_millis() <= MAX_DIFF_DELAY as u128 && !read_text {
+            sr.track_cursor(view)?;
+        }
+    }
+    if sr.review_follows_screen_cursor
+        && view.screen().cursor_position() != view.prev_screen().cursor_position()
+    {
+        view.review_cursor_position = view.screen().cursor_position();
+    }
+    view.finalize_changes();
     Ok(())
 }
