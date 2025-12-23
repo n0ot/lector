@@ -2,7 +2,8 @@ use super::{ViewAction, ViewController, ViewKind};
 use crate::{lua, screen_reader::ScreenReader, view::View};
 use anyhow::{anyhow, Result};
 use mlua::{
-    HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Thread, ThreadStatus, Value, VmState,
+    Error, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Thread, ThreadStatus, Value,
+    VmState,
 };
 use std::{
     cell::RefCell,
@@ -294,6 +295,7 @@ pub struct LuaReplView {
     output: Vec<String>,
     editor: LineEditor,
     lua: Lua,
+    env: Table,
     thread: Option<Thread>,
     print_buffer: Rc<RefCell<ReplOutput>>,
     screen_reader_ptr: Rc<RefCell<*mut ScreenReader>>,
@@ -323,6 +325,19 @@ impl LuaReplView {
             .set("print", print_fn)
             .map_err(|e| anyhow!(e.to_string()))?;
 
+        let env = lua
+            .create_table()
+            .map_err(|e| anyhow!(e.to_string()))?;
+        let env_meta = lua
+            .create_table()
+            .map_err(|e| anyhow!(e.to_string()))?;
+        env_meta
+            .set("__index", lua.globals())
+            .map_err(|e| anyhow!(e.to_string()))?;
+        env.set_metatable(Some(env_meta));
+        env.set("_G", env.clone())
+            .map_err(|e| anyhow!(e.to_string()))?;
+
         let view = View::new(rows, cols);
         let mut repl = Self {
             view,
@@ -330,6 +345,7 @@ impl LuaReplView {
             output: Vec::new(),
             editor: LineEditor::new(),
             lua,
+            env,
             thread: None,
             print_buffer,
             screen_reader_ptr,
@@ -408,17 +424,33 @@ impl LuaReplView {
     }
 
     fn start_eval(&mut self, input: &str) -> Result<()> {
-        let code = if let Some(rest) = input.strip_prefix('=') {
-            format!("return {}", rest)
+        let func = if let Some(rest) = input.strip_prefix('=') {
+            self.lua
+                .load(&format!("return {}", rest))
+                .set_name("repl")
+                .set_environment(self.env.clone())
+                .into_function()
+                .map_err(|e| anyhow!(e.to_string()))?
         } else {
-            input.to_string()
+            let expr_code = format!("return {}", input);
+            match self
+                .lua
+                .load(&expr_code)
+                .set_name("repl")
+                .set_environment(self.env.clone())
+                .into_function()
+            {
+                Ok(func) => func,
+                Err(Error::SyntaxError { .. }) => self
+                    .lua
+                    .load(input)
+                    .set_name("repl")
+                    .set_environment(self.env.clone())
+                    .into_function()
+                    .map_err(|e| anyhow!(e.to_string()))?,
+                Err(err) => return Err(anyhow!(err.to_string())),
+            }
         };
-        let func = self
-            .lua
-            .load(&code)
-            .set_name("repl")
-            .into_function()
-            .map_err(|e| anyhow!(e.to_string()))?;
         let thread = self
             .lua
             .create_thread(func)
