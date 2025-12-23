@@ -4,6 +4,7 @@ pub mod harness;
 mod clipboard;
 pub mod commands;
 mod ext;
+mod keymap;
 pub mod lua;
 pub mod line_editor;
 pub mod platform;

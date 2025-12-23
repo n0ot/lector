@@ -11,6 +11,29 @@ local function set_symbol(symbol, replacement_def)
     callbacks.set_symbol(symbol, replacement_def)
 end
 
+local function set_binding(key, binding_def)
+    if type(key) ~= "string" then
+        error("binding key must be a string", 2)
+    end
+    if binding_def ~= nil then
+        local t = type(binding_def)
+        if t ~= "table" and t ~= "string" then
+            error("binding value must be a string, table, or nil", 2)
+        end
+        if t == "table" then
+            local help = binding_def.help or binding_def[1]
+            local fn = binding_def.fn or binding_def[2]
+            if type(help) ~= "string" or type(fn) ~= "function" then
+                error("binding table must be {help, fn} or {help=..., fn=...}", 2)
+            end
+        end
+    end
+    if callbacks.set_binding == nil then
+        error("bindings are not available in this context", 2)
+    end
+    callbacks.set_binding(key, binding_def)
+end
+
 local tbl_lector_symbols_mt = {
     __index = function(_, k)
         if type(k) ~= "string" then
@@ -23,6 +46,22 @@ local tbl_lector_symbols_mt = {
     end,
 }
 local tbl_lector_symbols = setmetatable({}, tbl_lector_symbols_mt)
+
+local tbl_lector_bindings_mt = {
+    __index = function(_, k)
+        if type(k) ~= "string" then
+            error("binding key must be a string for indexing", 2)
+        end
+        if callbacks.get_binding == nil then
+            error("bindings are not available in this context", 2)
+        end
+        return callbacks.get_binding(k)
+    end,
+    __newindex = function(_, k, v)
+        return set_binding(k, v)
+    end,
+}
+local tbl_lector_bindings = setmetatable({}, tbl_lector_bindings_mt)
 
 local tbl_lector_o_mt = {
     __index = function(_, k)
@@ -46,6 +85,8 @@ local tbl_lector_mt = {
             return tbl_lector_o
         elseif k == 'symbols' then
             return tbl_lector_symbols
+        elseif k == 'bindings' then
+            return tbl_lector_bindings
         else
             return rawget(t, k)
         end
@@ -74,6 +115,8 @@ local tbl_lector_mt = {
             end
 
             tbl_lector_symbols = setmetatable(v, tbl_lector_symbols_mt)
+        elseif k == "bindings" then
+            error("assign individual bindings via lector.bindings[key] = value", 2)
         else
             error("cannot assign to arbitrary keys on the lector table", 2)
         end

@@ -1,49 +1,17 @@
-use crate::{commands, perform, screen_reader::ScreenReader, views};
+use crate::{
+    commands,
+    keymap::Binding,
+    perform,
+    screen_reader::ScreenReader,
+    views,
+};
 use anyhow::{Context, Result};
-use phf::phf_map;
 use std::{io::Write, time};
 use terminput::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 pub const DIFF_DELAY: u16 = 1;
 pub const MAX_DIFF_DELAY: u16 = 300;
 const ESC_TIMEOUT_MS: u128 = 50;
-
-static KEYMAP: phf::Map<&'static str, commands::Action> = phf_map! {
-    "F1" => commands::Action::ToggleHelp,
-    "M-'" => commands::Action::ToggleAutoRead,
-    "M-\"" => commands::Action::ToggleReviewCursorFollowsScreenCursor,
-    "M-s" => commands::Action::ToggleSymbolLevel,
-    "M-n" => commands::Action::PassNextKey,
-    "M-x" => commands::Action::StopSpeaking,
-    "M-u" => commands::Action::RevLinePrev,
-    "M-o" => commands::Action::RevLineNext,
-    "M-U" => commands::Action::RevLinePrevNonBlank,
-    "M-O" => commands::Action::RevLineNextNonBlank,
-    "M-i" => commands::Action::RevLineRead,
-    "M-m" => commands::Action::RevCharPrev,
-    "M-." => commands::Action::RevCharNext,
-    "M-," => commands::Action::RevCharRead,
-    "M-<" => commands::Action::RevCharReadPhonetic,
-    "M-j" => commands::Action::RevWordPrev,
-    "M-l" => commands::Action::RevWordNext,
-    "M-k" => commands::Action::RevWordRead,
-    "M-y" => commands::Action::RevTop,
-    "M-p" => commands::Action::RevBottom,
-    "M-h" => commands::Action::RevFirst,
-    "M-;" => commands::Action::RevLast,
-    "M-a" => commands::Action::RevReadAttributes,
-    "Backspace" => commands::Action::Backspace,
-    "C-h" => commands::Action::Backspace,
-    "Delete" => commands::Action::Delete,
-    "F12" => commands::Action::SayTime,
-    "M-L" => commands::Action::OpenLuaRepl,
-    "F5" => commands::Action::SetMark,
-    "F6" => commands::Action::Copy,
-    "F7" => commands::Action::Paste,
-    "M-c" => commands::Action::SayClipboard,
-    "M-[" => commands::Action::PreviousClipboard,
-    "M-]" => commands::Action::NextClipboard,
-};
 
 pub trait Clock {
     fn now_ms(&self) -> u128;
@@ -273,33 +241,49 @@ impl App {
             return self.dispatch_to_view(sr, raw, pty_out, term_out);
         }
 
-        let action = self.action_for_key_event(key_event);
-        if let Some(action) = action {
-            if matches!(action, commands::Action::OpenLuaRepl) {
-                if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
-                    sr.speech.speak("Lua REPL already open", false)?;
+        let binding = self.binding_for_key_event(sr, key_event);
+        if let Some(binding) = binding {
+            if sr.help_mode {
+                if matches!(binding, Binding::Builtin(commands::Action::ToggleHelp)) {
+                    // Allow exiting help mode.
+                } else {
+                    let help = binding.help_text();
+                    sr.speech.speak(&help, false)?;
                     return Ok(());
                 }
-                let (rows, cols) = self.view_stack.active_mut().model().size();
-                let repl = views::LuaReplView::new(rows, cols)?;
-                self.handle_view_action(
-                    sr,
-                    views::ViewAction::Push(Box::new(repl)),
-                    term_out,
-                )?;
-                return Ok(());
             }
-            match commands::handle(sr, self.view_stack.active_mut().model(), action)? {
-                commands::CommandResult::Handled => {}
-                commands::CommandResult::ForwardInput => {
-                    self.dispatch_to_view(sr, raw, pty_out, term_out)?;
+            match binding {
+                Binding::Builtin(action) => {
+                    if matches!(action, commands::Action::OpenLuaRepl) {
+                        if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
+                            sr.speech.speak("Lua REPL already open", false)?;
+                            return Ok(());
+                        }
+                        let (rows, cols) = self.view_stack.active_mut().model().size();
+                        let repl = views::LuaReplView::new(rows, cols)?;
+                        self.handle_view_action(
+                            sr,
+                            views::ViewAction::Push(Box::new(repl)),
+                            term_out,
+                        )?;
+                        return Ok(());
+                    }
+                    match commands::handle(sr, self.view_stack.active_mut().model(), *action)? {
+                        commands::CommandResult::Handled => {}
+                        commands::CommandResult::ForwardInput => {
+                            self.dispatch_to_view(sr, raw, pty_out, term_out)?;
+                        }
+                        commands::CommandResult::Paste(contents) => {
+                            let view_action = self
+                                .view_stack
+                                .active_mut()
+                                .handle_paste(sr, &contents, pty_out)?;
+                            self.handle_view_action(sr, view_action, term_out)?;
+                        }
+                    }
                 }
-                commands::CommandResult::Paste(contents) => {
-                    let view_action = self
-                        .view_stack
-                        .active_mut()
-                        .handle_paste(sr, &contents, pty_out)?;
-                    self.handle_view_action(sr, view_action, term_out)?;
+                Binding::Lua(lua_binding) => {
+                    lua_binding.call()?;
                 }
             }
         } else if sr.help_mode {
@@ -333,9 +317,13 @@ impl App {
         Ok(())
     }
 
-    fn action_for_key_event(&self, key_event: KeyEvent) -> Option<commands::Action> {
+    fn binding_for_key_event<'a>(
+        &self,
+        sr: &'a ScreenReader,
+        key_event: KeyEvent,
+    ) -> Option<&'a Binding> {
         let binding = self.key_event_binding_name(key_event)?;
-        KEYMAP.get(binding.as_str()).copied()
+        sr.key_bindings.binding_for(binding.as_str())
     }
 
     fn key_event_binding_name(&self, key_event: KeyEvent) -> Option<String> {

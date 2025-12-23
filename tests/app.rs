@@ -159,3 +159,16 @@ fn alt_bracket_maps_after_timeout() {
     let speaks = &recorder.inner.borrow().speaks;
     assert!(speaks.iter().any(|(text, _)| text == "no clipboard"));
 }
+
+#[test]
+fn help_mode_can_toggle_off() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    sr.help_mode = true;
+    app.handle_stdin(&mut sr, b"\x1BOP", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+
+    assert!(!sr.help_mode);
+}

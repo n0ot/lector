@@ -1,7 +1,9 @@
-use super::{clipboard::Clipboard, ext::ScreenExt, perform, speech::Speech, view::View};
+use super::{clipboard::Clipboard, ext::ScreenExt, keymap::KeyBindings, perform, speech::Speech, view::View};
 use anyhow::Result;
+use mlua::{Lua, WeakLua};
 use similar::{Algorithm, ChangeTag, TextDiff};
 use std::collections::HashSet;
+use std::rc::Rc;
 
 #[allow(dead_code)]
 pub enum CursorTrackingMode {
@@ -20,6 +22,9 @@ pub struct ScreenReader {
     pub highlight_tracking: bool,
     pub clipboard: Clipboard,
     pub pass_through: bool,
+    pub key_bindings: KeyBindings,
+    pub lua_ctx: Option<Rc<Lua>>,
+    pub lua_ctx_weak: Option<WeakLua>,
 }
 
 impl ScreenReader {
@@ -34,7 +39,15 @@ impl ScreenReader {
             highlight_tracking: false,
             clipboard: Default::default(),
             pass_through: false,
+            key_bindings: KeyBindings::new(),
+            lua_ctx: None,
+            lua_ctx_weak: None,
         }
+    }
+
+    pub fn set_lua_context(&mut self, lua: Rc<Lua>) {
+        self.lua_ctx_weak = Some(lua.weak());
+        self.lua_ctx = Some(lua);
     }
 
     pub fn track_cursor(&mut self, view: &mut View) -> Result<()> {

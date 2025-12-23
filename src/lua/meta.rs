@@ -1,9 +1,10 @@
 use super::ext::LuaResultExt;
-use crate::{screen_reader::ScreenReader, speech::symbols};
+use crate::{keymap::KeyBindings, screen_reader::ScreenReader, speech::symbols};
 use anyhow::{Context as AnyhowContext, anyhow};
-use mlua::{Error, IntoLua, Lua, Result, Scope, Table, Value};
+use mlua::{Error, Function, IntoLua, Lua, Result, Scope, Table, Value};
 use std::{cell::RefCell, rc::Rc};
 
+#[allow(dead_code)]
 pub fn setup<'lua, 'scope>(
     lua: &Lua,
     scope: &'lua Scope<'lua, 'scope>,
@@ -27,6 +28,7 @@ pub fn setup_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result
     Ok(())
 }
 
+#[allow(dead_code)]
 fn add_callbacks<'lua, 'scope>(
     tbl_callbacks: &Table,
     scope: &'lua Scope<'lua, 'scope>,
@@ -78,6 +80,20 @@ fn add_callbacks<'lua, 'scope>(
                     "symbol value must be a table or nil"
                 ))),
             }
+        })?,
+    )?;
+    tbl_callbacks.set(
+        "set_binding",
+        scope.create_function_mut(|lua, (key, value): (String, mlua::Value)| {
+            let mut sr = screen_reader.borrow_mut();
+            set_binding(lua, &mut sr, &key, value).to_lua_result()
+        })?,
+    )?;
+    tbl_callbacks.set(
+        "get_binding",
+        scope.create_function(|lua, key: String| {
+            let sr = screen_reader.borrow();
+            get_binding(lua, &sr, &key).to_lua_result()
         })?,
     )?;
     tbl_callbacks.set(
@@ -174,6 +190,28 @@ fn add_callbacks_static(
         })?,
     )?;
     tbl_callbacks.set(
+        "set_binding",
+        lua.create_function_mut({
+            let sr_ptr = Rc::clone(&sr_ptr);
+            move |lua, (key, value): (String, mlua::Value)| {
+                with_screen_reader_mut(&sr_ptr, |sr| {
+                    set_binding(lua, sr, &key, value).map_err(Error::external)
+                })
+            }
+        })?,
+    )?;
+    tbl_callbacks.set(
+        "get_binding",
+        lua.create_function({
+            let sr_ptr = Rc::clone(&sr_ptr);
+            move |lua, key: String| {
+                with_screen_reader(&sr_ptr, |sr| {
+                    get_binding(lua, sr, &key).map_err(Error::external)
+                })
+            }
+        })?,
+    )?;
+    tbl_callbacks.set(
         "get_symbol",
         lua.create_function({
             let sr_ptr = Rc::clone(&sr_ptr);
@@ -229,6 +267,66 @@ fn get_option<'lua>(
     }
     .map_err(|e| anyhow!("{}", e))
     .context(format!("get option: {}", option))
+}
+
+fn set_binding(
+    lua: &Lua,
+    sr: &mut ScreenReader,
+    key: &str,
+    value: Value,
+) -> anyhow::Result<()> {
+    match value {
+        Value::Nil => {
+            sr.key_bindings.clear_binding(key);
+            Ok(())
+        }
+        Value::String(name) => {
+            let name = name.to_str().map_err(|err| anyhow!(err.to_string()))?;
+            let action = KeyBindings::builtin_action_from_value(name.as_ref())?;
+            sr.key_bindings
+                .set_builtin_binding(key.to_string(), action);
+            Ok(())
+        }
+        Value::Table(table) => {
+            let (help, func) = parse_binding_table(table)?;
+            let Some(ctx) = sr.lua_ctx.as_ref() else {
+                return Err(anyhow!("lua bindings are only available in init.lua"));
+            };
+            let Some(weak_ctx) = sr.lua_ctx_weak.as_ref() else {
+                return Err(anyhow!("lua bindings are only available in init.lua"));
+            };
+            if *weak_ctx != lua.weak() {
+                return Err(anyhow!("lua bindings are only available in init.lua"));
+            }
+            sr.key_bindings
+                .set_lua_binding(key.to_string(), help, Rc::clone(ctx), func)?;
+            Ok(())
+        }
+        _ => Err(anyhow!("binding value must be a string, table, or nil")),
+    }
+}
+
+fn parse_binding_table(table: Table) -> anyhow::Result<(String, Function)> {
+    let help = match table.get::<String>("help") {
+        Ok(help) => help,
+        Err(_) => table.get(1).map_err(|err| anyhow!(err.to_string()))?,
+    };
+    let func = match table.get::<Function>("fn") {
+        Ok(func) => func,
+        Err(_) => table.get(2).map_err(|err| anyhow!(err.to_string()))?,
+    };
+    Ok((help, func))
+}
+
+fn get_binding(lua: &Lua, sr: &ScreenReader, key: &str) -> anyhow::Result<Value> {
+    let allow_function = sr
+        .lua_ctx_weak
+        .as_ref()
+        .map(|ctx| *ctx == lua.weak())
+        .unwrap_or(false);
+    sr.key_bindings
+        .binding_value_for_lua(key, lua, allow_function)
+        .map_err(|err| anyhow!(err.to_string()))
 }
 
 fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow::Result<()> {

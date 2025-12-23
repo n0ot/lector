@@ -6,7 +6,7 @@ use super::{
 };
 use anyhow::{Result, anyhow};
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub enum Action {
     ToggleHelp,
     ToggleAutoRead,
@@ -50,7 +50,7 @@ pub enum CommandResult {
 }
 
 impl Action {
-    fn help_text(&self) -> String {
+    pub fn help_text(&self) -> String {
         match self {
             Action::ToggleHelp => "toggle help".into(),
             Action::ToggleAutoRead => "toggle auto read".into(),
@@ -88,6 +88,85 @@ impl Action {
             Action::PreviousClipboard => "previous clipboard".into(),
             Action::NextClipboard => "next clipboard".into(),
         }
+    }
+}
+
+pub fn builtin_action_name(action: Action) -> &'static str {
+    match action {
+        Action::ToggleHelp => "toggle_help",
+        Action::ToggleAutoRead => "toggle_auto_read",
+        Action::ToggleReviewCursorFollowsScreenCursor => "toggle_review_cursor_follows_screen_cursor",
+        Action::ToggleSymbolLevel => "toggle_symbol_level",
+        Action::OpenLuaRepl => "open_lua_repl",
+        Action::PassNextKey => "pass_next_key",
+        Action::StopSpeaking => "stop_speaking",
+        Action::RevLinePrev => "review_line_prev",
+        Action::RevLineNext => "review_line_next",
+        Action::RevLinePrevNonBlank => "review_line_prev_non_blank",
+        Action::RevLineNextNonBlank => "review_line_next_non_blank",
+        Action::RevLineRead => "review_line_read",
+        Action::RevCharPrev => "review_char_prev",
+        Action::RevCharNext => "review_char_next",
+        Action::RevCharRead => "review_char_read",
+        Action::RevCharReadPhonetic => "review_char_read_phonetic",
+        Action::RevWordPrev => "review_word_prev",
+        Action::RevWordNext => "review_word_next",
+        Action::RevWordRead => "review_word_read",
+        Action::RevTop => "review_top",
+        Action::RevBottom => "review_bottom",
+        Action::RevFirst => "review_first",
+        Action::RevLast => "review_last",
+        Action::RevReadAttributes => "review_read_attributes",
+        Action::Backspace => "backspace",
+        Action::Delete => "delete",
+        Action::SayTime => "say_time",
+        Action::SetMark => "set_mark",
+        Action::Copy => "copy",
+        Action::Paste => "paste",
+        Action::SayClipboard => "say_clipboard",
+        Action::PreviousClipboard => "previous_clipboard",
+        Action::NextClipboard => "next_clipboard",
+    }
+}
+
+pub fn builtin_action_from_name(name: &str) -> Option<Action> {
+    match name {
+        "toggle_help" => Some(Action::ToggleHelp),
+        "toggle_auto_read" => Some(Action::ToggleAutoRead),
+        "toggle_review_cursor_follows_screen_cursor" => {
+            Some(Action::ToggleReviewCursorFollowsScreenCursor)
+        }
+        "toggle_symbol_level" => Some(Action::ToggleSymbolLevel),
+        "open_lua_repl" => Some(Action::OpenLuaRepl),
+        "pass_next_key" => Some(Action::PassNextKey),
+        "stop_speaking" => Some(Action::StopSpeaking),
+        "review_line_prev" => Some(Action::RevLinePrev),
+        "review_line_next" => Some(Action::RevLineNext),
+        "review_line_prev_non_blank" => Some(Action::RevLinePrevNonBlank),
+        "review_line_next_non_blank" => Some(Action::RevLineNextNonBlank),
+        "review_line_read" => Some(Action::RevLineRead),
+        "review_char_prev" => Some(Action::RevCharPrev),
+        "review_char_next" => Some(Action::RevCharNext),
+        "review_char_read" => Some(Action::RevCharRead),
+        "review_char_read_phonetic" => Some(Action::RevCharReadPhonetic),
+        "review_word_prev" => Some(Action::RevWordPrev),
+        "review_word_next" => Some(Action::RevWordNext),
+        "review_word_read" => Some(Action::RevWordRead),
+        "review_top" => Some(Action::RevTop),
+        "review_bottom" => Some(Action::RevBottom),
+        "review_first" => Some(Action::RevFirst),
+        "review_last" => Some(Action::RevLast),
+        "review_read_attributes" => Some(Action::RevReadAttributes),
+        "backspace" => Some(Action::Backspace),
+        "delete" => Some(Action::Delete),
+        "say_time" => Some(Action::SayTime),
+        "set_mark" => Some(Action::SetMark),
+        "copy" => Some(Action::Copy),
+        "paste" => Some(Action::Paste),
+        "say_clipboard" => Some(Action::SayClipboard),
+        "previous_clipboard" => Some(Action::PreviousClipboard),
+        "next_clipboard" => Some(Action::NextClipboard),
+        _ => None,
     }
 }
 
