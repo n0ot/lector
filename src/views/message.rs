@@ -1,6 +1,7 @@
 use super::{ViewAction, ViewController, ViewKind};
 use crate::{screen_reader::ScreenReader, view::View};
 use anyhow::Result;
+use std::io::Write;
 
 pub struct MessageView {
     view: View,
@@ -39,7 +40,7 @@ impl ViewController for MessageView {
         &mut self,
         _sr: &mut ScreenReader,
         input: &[u8],
-        _pty_stream: &mut ptyprocess::stream::Stream,
+        _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         if input == b"\x1B" || input == b"\r" || input == b"\n" {
             Ok(ViewAction::Pop)

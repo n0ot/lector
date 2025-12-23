@@ -10,6 +10,7 @@ pub use stack::ViewStack;
 
 use crate::{screen_reader::ScreenReader, view::View};
 use anyhow::Result;
+use std::io::Write;
 
 pub enum ViewAction {
     None,
@@ -41,12 +42,12 @@ pub trait ViewController {
         &mut self,
         sr: &mut ScreenReader,
         input: &[u8],
-        pty_stream: &mut ptyprocess::stream::Stream,
+        pty_stream: &mut dyn Write,
     ) -> Result<ViewAction>;
     fn tick(
         &mut self,
         _sr: &mut ScreenReader,
-        _pty_stream: &mut ptyprocess::stream::Stream,
+        _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         Ok(ViewAction::None)
     }
@@ -54,7 +55,7 @@ pub trait ViewController {
         &mut self,
         _sr: &mut ScreenReader,
         _contents: &str,
-        _pty_stream: &mut ptyprocess::stream::Stream,
+        _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         Ok(ViewAction::None)
     }

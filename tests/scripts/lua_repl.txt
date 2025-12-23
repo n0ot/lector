@@ -1,0 +1,4 @@
+# Lua REPL opens via normal shortcut and renders to stdout
+Scenario: lua repl opens
+When stdin: \x1BL
+Then expect-stdout-contains: Lua REPL ready.

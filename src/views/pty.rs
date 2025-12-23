@@ -32,7 +32,7 @@ impl ViewController for PtyView {
         &mut self,
         _sr: &mut ScreenReader,
         input: &[u8],
-        pty_stream: &mut ptyprocess::stream::Stream,
+        pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         pty_stream.write_all(input)?;
         pty_stream.flush()?;
@@ -43,7 +43,7 @@ impl ViewController for PtyView {
         &mut self,
         sr: &mut ScreenReader,
         contents: &str,
-        pty_stream: &mut ptyprocess::stream::Stream,
+        pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         if self.view.screen().bracketed_paste() {
             write!(pty_stream, "\x1B[200~{}\x1B[201~", contents)?;

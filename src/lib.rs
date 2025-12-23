@@ -1,4 +1,6 @@
 mod attributes;
+pub mod app;
+pub mod harness;
 mod clipboard;
 pub mod commands;
 mod ext;

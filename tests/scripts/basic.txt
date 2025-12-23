@@ -1,0 +1,8 @@
+# Simple end-to-end harness check
+Scenario: basic PTY and speech
+When stdin: a
+And pty-stdout: hello\r\n
+And settled:
+Then expect-pty-stdin: a
+And expect-stdout: hello\r\n
+And expect-speak-contains: hello

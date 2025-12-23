@@ -7,6 +7,7 @@ use mlua::{
 };
 use std::{
     cell::RefCell,
+    io::Write,
     rc::Rc,
 };
 
@@ -299,6 +300,8 @@ pub struct LuaReplView {
     thread: Option<Thread>,
     print_buffer: Rc<RefCell<ReplOutput>>,
     screen_reader_ptr: Rc<RefCell<*mut ScreenReader>>,
+    rendered_input: String,
+    rendered_cursor: usize,
 }
 
 impl LuaReplView {
@@ -334,7 +337,8 @@ impl LuaReplView {
         env_meta
             .set("__index", lua.globals())
             .map_err(|e| anyhow!(e.to_string()))?;
-        env.set_metatable(Some(env_meta));
+        env.set_metatable(Some(env_meta))
+            .map_err(|e| anyhow!(e.to_string()))?;
         env.set("_G", env.clone())
             .map_err(|e| anyhow!(e.to_string()))?;
 
@@ -349,9 +353,12 @@ impl LuaReplView {
             thread: None,
             print_buffer,
             screen_reader_ptr,
+            rendered_input: String::new(),
+            rendered_cursor: 0,
         };
-        repl.append_output("Lua REPL ready.");
-        repl.render();
+        let added = repl.append_output("Lua REPL ready.");
+        repl.write_output_lines(&added);
+        repl.write_prompt();
         Ok(repl)
     }
 
@@ -359,25 +366,140 @@ impl LuaReplView {
         *self.screen_reader_ptr.borrow_mut() = sr as *mut ScreenReader;
     }
 
-    fn append_output(&mut self, text: &str) {
+    fn append_output(&mut self, text: &str) -> Vec<String> {
+        let mut added = Vec::new();
         for line in text.split('\n') {
-            self.output.push(line.to_string());
+            let line = line.to_string();
+            self.output.push(line.clone());
+            added.push(line);
         }
         const MAX_LINES: usize = 1000;
         if self.output.len() > MAX_LINES {
             let excess = self.output.len() - MAX_LINES;
             self.output.drain(0..excess);
         }
+        added
     }
 
-    fn drain_print_buffer(&mut self) {
+    fn drain_print_buffer(&mut self) -> Vec<String> {
         let mut buffer = self.print_buffer.borrow_mut();
+        let mut added = Vec::new();
         for line in buffer.lines.drain(..) {
-            self.output.push(line);
+            self.output.push(line.clone());
+            added.push(line);
+        }
+        added
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        self.view.process_changes(bytes);
+    }
+
+    fn write_output_lines(&mut self, lines: &[String]) {
+        for line in lines {
+            self.write_bytes(line.as_bytes());
+            self.write_bytes(b"\r\n");
         }
     }
 
-    fn render(&mut self) {
+    fn write_prompt(&mut self) {
+        self.write_bytes(b"> ");
+        self.rendered_input.clear();
+        self.rendered_cursor = 0;
+    }
+
+    fn try_append_input(&mut self) -> bool {
+        let input = self.editor.input.clone();
+        let cursor = self.editor.cursor;
+        let input_len = input.chars().count();
+        let prev_input = self.rendered_input.as_str();
+        let prev_len = prev_input.chars().count();
+        if cursor == input_len
+            && self.rendered_cursor == prev_len
+            && input_len > prev_len
+            && input.starts_with(prev_input)
+        {
+            let added = &input[prev_input.len()..];
+            self.write_bytes(added.as_bytes());
+            self.rendered_input = input;
+            self.rendered_cursor = cursor;
+            return true;
+        }
+        false
+    }
+
+    fn redraw_input_line(&mut self) {
+        let input = self.editor.input.clone();
+        let cursor = self.editor.cursor;
+        let input_len = input.chars().count();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\r\x1B[K");
+        bytes.extend_from_slice(b"> ");
+        bytes.extend_from_slice(input.as_bytes());
+        if input_len > cursor {
+            bytes.extend_from_slice(format!("\x1B[{}D", input_len - cursor).as_bytes());
+        }
+        self.write_bytes(&bytes);
+        self.rendered_input = input;
+        self.rendered_cursor = cursor;
+    }
+
+    fn apply_editor_update(&mut self) {
+        let new_input = self.editor.input.clone();
+        let new_cursor = self.editor.cursor;
+        let prev_input = self.rendered_input.clone();
+        let prev_cursor = self.rendered_cursor;
+
+        if new_input == prev_input {
+            if new_cursor + 1 == prev_cursor {
+                self.write_bytes(b"\x08");
+                self.rendered_cursor = new_cursor;
+                return;
+            }
+            if new_cursor == prev_cursor + 1 {
+                self.write_bytes(b"\x1B[C");
+                self.rendered_cursor = new_cursor;
+                return;
+            }
+        }
+
+        let new_chars: Vec<char> = new_input.chars().collect();
+        let prev_chars: Vec<char> = prev_input.chars().collect();
+
+        if new_chars.len() == prev_chars.len() + 1 && new_cursor == prev_cursor + 1 {
+            if new_chars[..prev_cursor] == prev_chars[..prev_cursor]
+                && new_chars[prev_cursor + 1..] == prev_chars[prev_cursor..]
+            {
+                let inserted = new_chars[prev_cursor];
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(b"\x1B[1@");
+                bytes.extend_from_slice(inserted.to_string().as_bytes());
+                self.write_bytes(&bytes);
+                self.rendered_input = new_input;
+                self.rendered_cursor = new_cursor;
+                return;
+            }
+        }
+
+        if new_chars.len() + 1 == prev_chars.len() && new_cursor + 1 == prev_cursor {
+            if new_chars[..new_cursor] == prev_chars[..new_cursor]
+                && new_chars[new_cursor..] == prev_chars[new_cursor + 1..]
+            {
+                if new_cursor == new_chars.len() {
+                    self.write_bytes(b"\x08 \x08");
+                } else {
+                    self.write_bytes(b"\x08\x1B[1P");
+                }
+                self.rendered_input = new_input;
+                self.rendered_cursor = new_cursor;
+                return;
+            }
+        }
+
+        self.redraw_input_line();
+    }
+
+    fn render_full(&mut self) {
         let (rows, cols) = self.view.size();
         let cols = cols as usize;
         let prompt = "> ";
@@ -421,6 +543,8 @@ impl LuaReplView {
         self.view.next_bytes.clear();
         self.view.process_changes(&bytes);
         self.view.next_bytes.clear();
+        self.rendered_input = self.editor.input.clone();
+        self.rendered_cursor = self.editor.cursor;
     }
 
     fn start_eval(&mut self, input: &str) -> Result<()> {
@@ -464,28 +588,29 @@ impl LuaReplView {
         Ok(())
     }
 
-    fn resume_eval(&mut self) -> Result<bool> {
+    fn resume_eval(&mut self) -> Result<(bool, Vec<String>)> {
         let Some(thread) = &self.thread else {
-            return Ok(false);
+            return Ok((false, Vec::new()));
         };
         match thread.resume::<MultiValue>(()) {
             Ok(values) => {
+                let mut added = Vec::new();
                 if thread.status() == ThreadStatus::Finished {
                     if !values.is_empty() {
                         let mut pieces = Vec::new();
                         for value in values {
                             pieces.push(format_value(value));
                         }
-                        self.append_output(&pieces.join("\t"));
+                        added = self.append_output(&pieces.join("\t"));
                     }
                     self.thread = None;
                 }
-                Ok(true)
+                Ok((true, added))
             }
             Err(err) => {
-                self.append_output(&format!("Error: {}", err));
+                let added = self.append_output(&format!("Error: {}", err));
                 self.thread = None;
-                Ok(true)
+                Ok((true, added))
             }
         }
     }
@@ -512,7 +637,7 @@ impl ViewController for LuaReplView {
         &mut self,
         sr: &mut ScreenReader,
         input: &[u8],
-        _pty_stream: &mut ptyprocess::stream::Stream,
+        _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         self.set_screen_reader(sr);
         if input == b"\x04" {
@@ -528,19 +653,23 @@ impl ViewController for LuaReplView {
                 if line.trim().is_empty() {
                     return Ok(ViewAction::Bell);
                 }
-                self.append_output(&format!("> {}", line));
+                self.write_bytes(b"\r\n");
                 self.editor.commit_history();
                 self.editor.clear();
+                self.rendered_input.clear();
+                self.rendered_cursor = 0;
                 if let Err(err) = self.start_eval(&line) {
-                    self.append_output(&format!("Error: {}", err));
-                    self.render();
+                    let added = self.append_output(&format!("Error: {}", err));
+                    self.write_output_lines(&added);
+                    self.write_prompt();
                     return Ok(ViewAction::Redraw);
                 }
-                self.render();
                 Ok(ViewAction::Redraw)
             }
             EditorAction::Changed => {
-                self.render();
+                if !self.try_append_input() {
+                    self.apply_editor_update();
+                }
                 Ok(ViewAction::Redraw)
             }
             EditorAction::Bell => Ok(ViewAction::Bell),
@@ -551,16 +680,24 @@ impl ViewController for LuaReplView {
     fn tick(
         &mut self,
         sr: &mut ScreenReader,
-        _pty_stream: &mut ptyprocess::stream::Stream,
+        _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         self.set_screen_reader(sr);
         if self.thread.is_none() {
             return Ok(ViewAction::None);
         }
-        let progressed = self.resume_eval()?;
-        self.drain_print_buffer();
+        let (progressed, added) = self.resume_eval()?;
+        let printed = self.drain_print_buffer();
+        if !added.is_empty() {
+            self.write_output_lines(&added);
+        }
+        if !printed.is_empty() {
+            self.write_output_lines(&printed);
+        }
         if progressed {
-            self.render();
+            if self.thread.is_none() {
+                self.write_prompt();
+            }
             return Ok(ViewAction::Redraw);
         }
         Ok(ViewAction::None)
@@ -568,7 +705,7 @@ impl ViewController for LuaReplView {
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
         self.view.set_size(rows, cols);
-        self.render();
+        self.render_full();
     }
 }
 

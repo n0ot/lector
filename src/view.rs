@@ -1,11 +1,11 @@
 use super::ext::{CellExt, ScreenExt};
-use std::{cmp::min, time};
+use std::cmp::min;
 
 pub struct View {
     parser: vt100::Parser,
     pub next_bytes: Vec<u8>,
     prev_screen: vt100::Screen,
-    pub prev_screen_time: time::Instant,
+    pub prev_screen_time: u128,
     pub review_cursor_position: (u16, u16), // (row, col)
     pub(crate) review_mark_position: Option<(u16, u16)>, // (row, col)
     review_cursor_indent_level: u16,
@@ -21,7 +21,7 @@ impl View {
             parser,
             next_bytes: Vec::new(),
             prev_screen,
-            prev_screen_time: time::Instant::now(),
+            prev_screen_time: 0,
             review_cursor_position: cursor_position,
             review_mark_position: None,
             review_cursor_indent_level: 0,
@@ -50,9 +50,9 @@ impl View {
 
     /// Advances the previous screen to match the current one,
     /// and sets its update time to now
-    pub fn finalize_changes(&mut self) {
+    pub fn finalize_changes(&mut self, now_ms: u128) {
         self.prev_screen = self.screen().clone();
-        self.prev_screen_time = time::Instant::now();
+        self.prev_screen_time = now_ms;
         self.next_bytes.clear();
     }
 
