@@ -76,7 +76,7 @@ impl LineEditor {
     }
 
     pub fn len_chars(&self) -> usize {
-        self.input.chars().count()
+        self.input.len()
     }
 
     fn history_up(&mut self) -> bool {
@@ -93,7 +93,7 @@ impl LineEditor {
         };
         self.history_index = Some(next_index);
         self.input = self.history[next_index].clone();
-        self.cursor = self.len_chars();
+        self.cursor = self.input.len();
         true
     }
 
@@ -104,13 +104,13 @@ impl LineEditor {
         if idx + 1 >= self.history.len() {
             self.history_index = None;
             self.input = self.history_draft.clone();
-            self.cursor = self.len_chars();
+            self.cursor = self.input.len();
             return true;
         }
         let next_index = idx + 1;
         self.history_index = Some(next_index);
         self.input = self.history[next_index].clone();
-        self.cursor = self.len_chars();
+        self.cursor = self.input.len();
         true
     }
 
@@ -125,7 +125,7 @@ impl LineEditor {
                 EditorAction::Changed
             }
             b'\x05' => {
-                self.cursor = self.len_chars();
+                self.cursor = self.input.len();
                 EditorAction::Changed
             }
             b'\x10' => {
@@ -233,7 +233,7 @@ impl LineEditor {
                 EditorAction::Changed
             }
             b'F' => {
-                self.cursor = self.len_chars();
+                self.cursor = self.input.len();
                 EditorAction::Changed
             }
             b'~' => {
@@ -279,7 +279,7 @@ impl LineEditor {
                 EditorAction::Changed
             }
             b'F' => {
-                self.cursor = self.len_chars();
+                self.cursor = self.input.len();
                 EditorAction::Changed
             }
             _ => EditorAction::None,
@@ -293,24 +293,22 @@ impl LineEditor {
     }
 
     fn move_right(&mut self) {
-        if self.cursor < self.len_chars() {
+        if self.cursor < self.input.len() {
             self.cursor += 1;
         }
     }
 
     fn insert_str(&mut self, s: &str) {
-        let idx = self.byte_index(self.cursor);
-        self.input.insert_str(idx, s);
-        self.cursor += s.chars().count();
+        self.input.insert_str(self.cursor, s);
+        self.cursor += s.len();
     }
 
     fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        let start = self.byte_index(self.cursor - 1);
-        let end = self.byte_index(self.cursor);
-        self.input.replace_range(start..end, "");
+        let start = self.cursor - 1;
+        self.input.replace_range(start..self.cursor, "");
         self.cursor -= 1;
     }
 
@@ -319,25 +317,25 @@ impl LineEditor {
             return;
         }
         let mut idx = self.cursor;
-        while idx > 0 && !is_word_char(self.char_at(idx - 1)) {
+        while idx > 0 && !is_word_byte(self.input.as_bytes()[idx - 1]) {
             idx -= 1;
         }
-        while idx > 0 && is_word_char(self.char_at(idx - 1)) {
+        while idx > 0 && is_word_byte(self.input.as_bytes()[idx - 1]) {
             idx -= 1;
         }
         self.cursor = idx;
     }
 
     fn move_word_right(&mut self) {
-        let len = self.len_chars();
+        let len = self.input.len();
         if self.cursor >= len {
             return;
         }
         let mut idx = self.cursor;
-        while idx < len && !is_word_char(self.char_at(idx)) {
+        while idx < len && !is_word_byte(self.input.as_bytes()[idx]) {
             idx += 1;
         }
-        while idx < len && is_word_char(self.char_at(idx)) {
+        while idx < len && is_word_byte(self.input.as_bytes()[idx]) {
             idx += 1;
         }
         self.cursor = idx;
@@ -349,8 +347,8 @@ impl LineEditor {
         }
         let original = self.cursor;
         self.move_word_left();
-        let start = self.byte_index(self.cursor);
-        let end = self.byte_index(original);
+        let start = self.cursor;
+        let end = original;
         if start == end {
             return false;
         }
@@ -366,7 +364,7 @@ impl LineEditor {
                 true
             }
             Some(4) | Some(8) => {
-                self.cursor = self.len_chars();
+                self.cursor = self.input.len();
                 true
             }
             _ => false,
@@ -387,27 +385,10 @@ impl LineEditor {
         if saw_digit { Some(value) } else { None }
     }
 
-    fn byte_index(&self, char_index: usize) -> usize {
-        if char_index == 0 {
-            return 0;
-        }
-        self.input
-            .char_indices()
-            .nth(char_index)
-            .map(|(idx, _)| idx)
-            .unwrap_or_else(|| self.input.len())
-    }
-
-    fn char_at(&self, char_index: usize) -> char {
-        self.input
-            .chars()
-            .nth(char_index)
-            .unwrap_or('\0')
-    }
 }
 
-fn is_word_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 #[cfg(test)]

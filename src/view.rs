@@ -35,9 +35,12 @@ impl View {
         self.next_bytes.extend_from_slice(buf);
         // If the screen's size changed, the cursor may now be out of bounds.
         let review_cursor_position = self.review_cursor_position;
+        let (rows, cols) = self.size();
+        let max_row = rows.saturating_sub(1);
+        let max_col = cols.saturating_sub(1);
         self.review_cursor_position = (
-            min(review_cursor_position.0, self.size().0),
-            min(review_cursor_position.1, self.size().1),
+            min(review_cursor_position.0, max_row),
+            min(review_cursor_position.1, max_col),
         );
 
         // If the review cursor moved,
@@ -74,10 +77,16 @@ impl View {
     pub fn set_size(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
         // If the screen's size changed, the cursor may now be out of bounds.
+        let review_cursor_position = self.review_cursor_position;
+        let max_row = rows.saturating_sub(1);
+        let max_col = cols.saturating_sub(1);
         self.review_cursor_position = (
-            min(self.review_cursor_position.0, self.size().0),
-            min(self.review_cursor_position.1, self.size().1),
+            min(self.review_cursor_position.0, max_row),
+            min(self.review_cursor_position.1, max_col),
         );
+        if review_cursor_position != self.review_cursor_position {
+            self.review_mark_position = None;
+        }
     }
 
     /// Gets the indentation level of the line under the review cursor,

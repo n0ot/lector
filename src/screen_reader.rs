@@ -159,11 +159,14 @@ impl ScreenReader {
         // so screen.contents() only returns the new text.
         // Using a much taller screen so that we capture text, even if it scrolled off of the real
         // screen.
-        let (rows, cols) = view.size();
-        let mut parser = vt100::Parser::new(rows * 10, cols, 0);
-        parser.process(format!("\x1B[{}B", rows * 10).as_bytes());
-        parser.process(&view.next_bytes);
-        let text = parser.screen().contents();
+        let mut text = String::new();
+        if !view.next_bytes.is_empty() {
+            let (rows, cols) = view.size();
+            let mut parser = vt100::Parser::new(rows * 10, cols, 0);
+            parser.process(format!("\x1B[{}B", rows * 10).as_bytes());
+            parser.process(&view.next_bytes);
+            text = parser.screen().contents();
+        }
         let text = text.trim();
 
         if !text.is_empty() && (cursor_moves == 0 || scrolled) {
@@ -287,5 +290,86 @@ impl ScreenReader {
                 Ok(!text.is_empty())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ScreenReader;
+    use crate::{perform, speech, view::View};
+    use std::{cell::RefCell, rc::Rc};
+
+    struct TestDriver {
+        speaks: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl speech::Driver for TestDriver {
+        fn speak(&mut self, text: &str, _interrupt: bool) -> anyhow::Result<()> {
+            self.speaks.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rate(&self) -> f32 {
+            1.0
+        }
+
+        fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_sr() -> (ScreenReader, Rc<RefCell<Vec<String>>>) {
+        let speaks = Rc::new(RefCell::new(Vec::new()));
+        let driver = TestDriver {
+            speaks: Rc::clone(&speaks),
+        };
+        let speech = speech::Speech::new(Box::new(driver));
+        let sr = ScreenReader::new(speech);
+        (sr, speaks)
+    }
+
+    #[test]
+    fn auto_read_returns_false_when_unchanged() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 10);
+        let mut reporter = perform::Reporter::new();
+
+        view.process_changes(b"hello");
+        view.finalize_changes(0);
+
+        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        assert!(!read);
+        assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn auto_read_speaks_new_text() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 10);
+        let mut reporter = perform::Reporter::new();
+
+        view.process_changes(b"hi");
+        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        assert!(read);
+        let speaks = speaks.borrow();
+        assert_eq!(speaks.len(), 1);
+        assert_eq!(speaks[0], "hi");
+    }
+
+    #[test]
+    fn auto_read_suppresses_echo_of_last_key() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 10);
+        let mut reporter = perform::Reporter::new();
+
+        sr.last_key = b"hi".to_vec();
+        view.process_changes(b"hi");
+        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        assert!(read);
+        assert!(speaks.borrow().is_empty());
     }
 }

@@ -4,6 +4,27 @@ use anyhow::{Context as AnyhowContext, anyhow};
 use mlua::{Error, Function, IntoLua, Lua, Result, Scope, Table, Value};
 use std::{cell::RefCell, rc::Rc};
 
+macro_rules! add_callbacks_common {
+    ($tbl:expr,
+        set_option = $set_option:expr,
+        get_option = $get_option:expr,
+        set_symbol = $set_symbol:expr,
+        set_binding = $set_binding:expr,
+        get_binding = $get_binding:expr,
+        get_symbol = $get_symbol:expr,
+        clear_symbols = $clear_symbols:expr $(,)?
+    ) => {{
+        $tbl.set("set_option", $set_option)?;
+        $tbl.set("get_option", $get_option)?;
+        $tbl.set("set_symbol", $set_symbol)?;
+        $tbl.set("set_binding", $set_binding)?;
+        $tbl.set("get_binding", $get_binding)?;
+        $tbl.set("get_symbol", $get_symbol)?;
+        $tbl.set("clear_symbols", $clear_symbols)?;
+        Ok(())
+    }};
+}
+
 #[allow(dead_code)]
 pub fn setup<'lua, 'scope>(
     lua: &Lua,
@@ -34,95 +55,82 @@ fn add_callbacks<'lua, 'scope>(
     scope: &'lua Scope<'lua, 'scope>,
     screen_reader: &'scope RefCell<&mut ScreenReader>,
 ) -> Result<()> {
-    tbl_callbacks.set(
-        "set_option",
-        scope.create_function_mut(|_, (key, value): (String, mlua::Value)| {
-            let mut sr = screen_reader.borrow_mut();
-            set_option(&mut sr, &key, value).to_lua_result()
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "get_option",
-        scope.create_function(|lua, key: String| {
-            let sr = screen_reader.borrow();
-            get_option(lua, &sr, &key).to_lua_result()
-        })?,
-    )?;
-
-    tbl_callbacks.set(
-        "set_symbol",
-        scope.create_function_mut(|_, (key, value): (String, mlua::Value)| {
-            let mut sr = screen_reader.borrow_mut();
-            match value {
-                mlua::Value::Nil => {
-                    sr.speech.symbols_map.remove(&key);
-                    Ok(())
-                }
-                mlua::Value::Table(table_value) => {
-                    let replacement: String = table_value.get(1)?;
-                    let level: symbols::Level = AnyhowContext::context(
-                        table_value.get::<String>(2)?.parse(),
-                        "parse level",
-                    )
-                    .to_lua_result()?;
-                    let include_original: symbols::IncludeOriginal = AnyhowContext::context(
-                        table_value.get::<String>(3)?.parse(),
-                        "parse include_original",
-                    )
-                    .to_lua_result()?;
-                    let repeat: bool = table_value.get(4)?;
-                    sr.speech
-                        .symbols_map
-                        .put(&key, &replacement, level, include_original, repeat);
-                    Ok(())
-                }
-                _ => Err(Error::external(anyhow!(
-                    "symbol value must be a table or nil"
-                ))),
+    let set_option = scope.create_function_mut(|_, (key, value): (String, mlua::Value)| {
+        let mut sr = screen_reader.borrow_mut();
+        set_option(&mut sr, &key, value).to_lua_result()
+    })?;
+    let get_option = scope.create_function(|lua, key: String| {
+        let sr = screen_reader.borrow();
+        get_option(lua, &sr, &key).to_lua_result()
+    })?;
+    let set_symbol = scope.create_function_mut(|_, (key, value): (String, mlua::Value)| {
+        let mut sr = screen_reader.borrow_mut();
+        match value {
+            mlua::Value::Nil => {
+                sr.speech.symbols_map.remove(&key);
+                Ok(())
             }
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "set_binding",
-        scope.create_function_mut(|lua, (key, value): (String, mlua::Value)| {
-            let mut sr = screen_reader.borrow_mut();
-            set_binding(lua, &mut sr, &key, value).to_lua_result()
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "get_binding",
-        scope.create_function(|lua, key: String| {
-            let sr = screen_reader.borrow();
-            get_binding(lua, &sr, &key).to_lua_result()
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "get_symbol",
-        scope.create_function(|ctx, key: String| {
-            let sr = screen_reader.borrow();
-            match sr.speech.symbols_map.get(&key) {
-                Some(v) => {
-                    let tbl = ctx.create_table()?;
-                    tbl.set(1, v.replacement.clone())?;
-                    tbl.set(2, v.level.to_string())?;
-                    tbl.set(3, v.include_original.to_string())?;
-                    tbl.set(4, v.repeat)?;
-                    Ok(Value::Table(tbl))
-                }
-                None => Ok(Value::Nil),
+            mlua::Value::Table(table_value) => {
+                let replacement: String = table_value.get(1)?;
+                let level: symbols::Level = AnyhowContext::context(
+                    table_value.get::<String>(2)?.parse(),
+                    "parse level",
+                )
+                .to_lua_result()?;
+                let include_original: symbols::IncludeOriginal = AnyhowContext::context(
+                    table_value.get::<String>(3)?.parse(),
+                    "parse include_original",
+                )
+                .to_lua_result()?;
+                let repeat: bool = table_value.get(4)?;
+                sr.speech
+                    .symbols_map
+                    .put(&key, &replacement, level, include_original, repeat);
+                Ok(())
             }
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "clear_symbols",
-        scope.create_function_mut(|_, ()| {
-            let mut sr = screen_reader.borrow_mut();
-            sr.speech.symbols_map.clear();
-            Ok(())
-        })?,
-    )?;
+            _ => Err(Error::external(anyhow!(
+                "symbol value must be a table or nil"
+            ))),
+        }
+    })?;
+    let set_binding = scope.create_function_mut(|lua, (key, value): (String, mlua::Value)| {
+        let mut sr = screen_reader.borrow_mut();
+        set_binding(lua, &mut sr, &key, value).to_lua_result()
+    })?;
+    let get_binding = scope.create_function(|lua, key: String| {
+        let sr = screen_reader.borrow();
+        get_binding(lua, &sr, &key).to_lua_result()
+    })?;
+    let get_symbol = scope.create_function(|ctx, key: String| {
+        let sr = screen_reader.borrow();
+        match sr.speech.symbols_map.get(&key) {
+            Some(v) => {
+                let tbl = ctx.create_table()?;
+                tbl.set(1, v.replacement.clone())?;
+                tbl.set(2, v.level.to_string())?;
+                tbl.set(3, v.include_original.to_string())?;
+                tbl.set(4, v.repeat)?;
+                Ok(Value::Table(tbl))
+            }
+            None => Ok(Value::Nil),
+        }
+    })?;
+    let clear_symbols = scope.create_function_mut(|_, ()| {
+        let mut sr = screen_reader.borrow_mut();
+        sr.speech.symbols_map.clear();
+        Ok(())
+    })?;
 
-    Ok(())
+    add_callbacks_common!(
+        tbl_callbacks,
+        set_option = set_option,
+        get_option = get_option,
+        set_symbol = set_symbol,
+        set_binding = set_binding,
+        get_binding = get_binding,
+        get_symbol = get_symbol,
+        clear_symbols = clear_symbols,
+    )
 }
 
 fn add_callbacks_static(
@@ -130,123 +138,111 @@ fn add_callbacks_static(
     tbl_callbacks: &Table,
     sr_ptr: Rc<RefCell<*mut ScreenReader>>,
 ) -> Result<()> {
-    tbl_callbacks.set(
-        "set_option",
-        lua.create_function_mut({
-            let sr_ptr = Rc::clone(&sr_ptr);
-            move |_, (key, value): (String, mlua::Value)| {
-                with_screen_reader_mut(&sr_ptr, |sr| {
-                    set_option(sr, &key, value).map_err(Error::external)
-                })
-            }
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "get_option",
-        lua.create_function({
-            let sr_ptr = Rc::clone(&sr_ptr);
-            move |lua, key: String| {
-                with_screen_reader(&sr_ptr, |sr| {
-                    get_option(lua, sr, &key).map_err(Error::external)
-                })
-            }
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "set_symbol",
-        lua.create_function_mut({
-            let sr_ptr = Rc::clone(&sr_ptr);
-            move |_, (key, value): (String, mlua::Value)| {
-                with_screen_reader_mut(&sr_ptr, |sr| {
-                    match value {
-                        mlua::Value::Nil => {
-                            sr.speech.symbols_map.remove(&key);
-                            Ok(())
-                        }
-                        mlua::Value::Table(table_value) => {
-                            let replacement: String = table_value.get(1)?;
-                            let level: symbols::Level = AnyhowContext::context(
-                                table_value.get::<String>(2)?.parse(),
-                                "parse level",
-                            )
-                            .to_lua_result()?;
-                            let include_original: symbols::IncludeOriginal = AnyhowContext::context(
-                                table_value.get::<String>(3)?.parse(),
-                                "parse include_original",
-                            )
-                            .to_lua_result()?;
-                            let repeat: bool = table_value.get(4)?;
-                            sr.speech
-                                .symbols_map
-                                .put(&key, &replacement, level, include_original, repeat);
-                            Ok(())
-                        }
-                        _ => Err(Error::external(anyhow!(
-                            "symbol value must be a table or nil"
-                        ))),
+    let set_option = lua.create_function_mut({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |_, (key, value): (String, mlua::Value)| {
+            with_screen_reader_mut(&sr_ptr, |sr| {
+                set_option(sr, &key, value).map_err(Error::external)
+            })
+        }
+    })?;
+    let get_option = lua.create_function({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, key: String| {
+            with_screen_reader(&sr_ptr, |sr| {
+                get_option(lua, sr, &key).map_err(Error::external)
+            })
+        }
+    })?;
+    let set_symbol = lua.create_function_mut({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |_, (key, value): (String, mlua::Value)| {
+            with_screen_reader_mut(&sr_ptr, |sr| {
+                match value {
+                    mlua::Value::Nil => {
+                        sr.speech.symbols_map.remove(&key);
+                        Ok(())
                     }
-                })
-            }
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "set_binding",
-        lua.create_function_mut({
-            let sr_ptr = Rc::clone(&sr_ptr);
-            move |lua, (key, value): (String, mlua::Value)| {
-                with_screen_reader_mut(&sr_ptr, |sr| {
-                    set_binding(lua, sr, &key, value).map_err(Error::external)
-                })
-            }
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "get_binding",
-        lua.create_function({
-            let sr_ptr = Rc::clone(&sr_ptr);
-            move |lua, key: String| {
-                with_screen_reader(&sr_ptr, |sr| {
-                    get_binding(lua, sr, &key).map_err(Error::external)
-                })
-            }
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "get_symbol",
-        lua.create_function({
-            let sr_ptr = Rc::clone(&sr_ptr);
-            move |lua, key: String| {
-                with_screen_reader(&sr_ptr, |sr| {
-                    let value = match sr.speech.symbols_map.get(&key) {
-                        Some(v) => {
-                            let tbl = lua.create_table()?;
-                            tbl.set(1, v.replacement.clone())?;
-                            tbl.set(2, v.level.to_string())?;
-                            tbl.set(3, v.include_original.to_string())?;
-                            tbl.set(4, v.repeat)?;
-                            Value::Table(tbl)
-                        }
-                        None => Value::Nil,
-                    };
-                    Ok(value)
-                })
-            }
-        })?,
-    )?;
-    tbl_callbacks.set(
-        "clear_symbols",
-        lua.create_function_mut({
-            let sr_ptr = Rc::clone(&sr_ptr);
-            move |_, ()| {
-                with_screen_reader_mut(&sr_ptr, |sr| {
-                    sr.speech.symbols_map.clear();
-                    Ok(())
-                })
-            }
-        })?,
-    )?;
+                    mlua::Value::Table(table_value) => {
+                        let replacement: String = table_value.get(1)?;
+                        let level: symbols::Level = AnyhowContext::context(
+                            table_value.get::<String>(2)?.parse(),
+                            "parse level",
+                        )
+                        .to_lua_result()?;
+                        let include_original: symbols::IncludeOriginal = AnyhowContext::context(
+                            table_value.get::<String>(3)?.parse(),
+                            "parse include_original",
+                        )
+                        .to_lua_result()?;
+                        let repeat: bool = table_value.get(4)?;
+                        sr.speech
+                            .symbols_map
+                            .put(&key, &replacement, level, include_original, repeat);
+                        Ok(())
+                    }
+                    _ => Err(Error::external(anyhow!(
+                        "symbol value must be a table or nil"
+                    ))),
+                }
+            })
+        }
+    })?;
+    let set_binding = lua.create_function_mut({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, (key, value): (String, mlua::Value)| {
+            with_screen_reader_mut(&sr_ptr, |sr| {
+                set_binding(lua, sr, &key, value).map_err(Error::external)
+            })
+        }
+    })?;
+    let get_binding = lua.create_function({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, key: String| {
+            with_screen_reader(&sr_ptr, |sr| {
+                get_binding(lua, sr, &key).map_err(Error::external)
+            })
+        }
+    })?;
+    let get_symbol = lua.create_function({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, key: String| {
+            with_screen_reader(&sr_ptr, |sr| {
+                let value = match sr.speech.symbols_map.get(&key) {
+                    Some(v) => {
+                        let tbl = lua.create_table()?;
+                        tbl.set(1, v.replacement.clone())?;
+                        tbl.set(2, v.level.to_string())?;
+                        tbl.set(3, v.include_original.to_string())?;
+                        tbl.set(4, v.repeat)?;
+                        Value::Table(tbl)
+                    }
+                    None => Value::Nil,
+                };
+                Ok(value)
+            })
+        }
+    })?;
+    let clear_symbols = lua.create_function_mut({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |_, ()| {
+            with_screen_reader_mut(&sr_ptr, |sr| {
+                sr.speech.symbols_map.clear();
+                Ok(())
+            })
+        }
+    })?;
 
-    Ok(())
+    add_callbacks_common!(
+        tbl_callbacks,
+        set_option = set_option,
+        get_option = get_option,
+        set_symbol = set_symbol,
+        set_binding = set_binding,
+        get_binding = get_binding,
+        get_symbol = get_symbol,
+        clear_symbols = clear_symbols,
+    )
 }
 
 fn get_option<'lua>(

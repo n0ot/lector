@@ -6,7 +6,7 @@ use crate::{
     views,
 };
 use anyhow::{Context, Result};
-use std::{io::Write, time};
+use std::{collections::VecDeque, io::Write, time};
 use terminput::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 pub const DIFF_DELAY: u16 = 1;
@@ -40,7 +40,7 @@ pub struct App {
     vte_parser: vte::Parser,
     reporter: perform::Reporter,
     ansi_csi_re: regex::bytes::Regex,
-    pending_input: Vec<u8>,
+    pending_input: VecDeque<u8>,
     pending_input_last_at: Option<u128>,
     last_stdin_update: Option<u128>,
     last_pty_update: Option<u128>,
@@ -63,7 +63,7 @@ impl App {
             vte_parser: vte::Parser::new(),
             reporter: perform::Reporter::new(),
             ansi_csi_re,
-            pending_input: Vec::new(),
+            pending_input: VecDeque::new(),
             pending_input_last_at: None,
             last_stdin_update: None,
             last_pty_update: None,
@@ -123,9 +123,9 @@ impl App {
     ) -> Result<()> {
         for &byte in input {
             self.pending_input_last_at = Some(self.clock.now_ms());
-            self.pending_input.push(byte);
+            self.pending_input.push_back(byte);
 
-            if self.pending_input == [b'\x1B'] {
+            if self.pending_input.len() == 1 && self.pending_input[0] == b'\x1B' {
                 continue;
             }
 
@@ -145,9 +145,10 @@ impl App {
                 return Ok(());
             }
 
-            match Event::parse_from(&self.pending_input) {
+            let buf = self.pending_input.make_contiguous();
+            match Event::parse_from(buf) {
                 Ok(Some(event)) => {
-                    let raw = self.pending_input.clone();
+                    let raw = buf.to_vec();
                     self.pending_input.clear();
                     self.pending_input_last_at = None;
                     self.handle_event(sr, event, &raw, pty_out, term_out)?;
@@ -156,7 +157,10 @@ impl App {
                     return Ok(());
                 }
                 Err(_) => {
-                    let raw_byte = self.pending_input.remove(0);
+                    let raw_byte = self
+                        .pending_input
+                        .pop_front()
+                        .expect("pending input should not be empty");
                     if self.pending_input.is_empty() {
                         self.pending_input_last_at = None;
                     }
@@ -183,7 +187,7 @@ impl App {
             return Ok(());
         }
 
-        let raw = std::mem::take(&mut self.pending_input);
+        let raw: Vec<u8> = self.pending_input.drain(..).collect();
         self.pending_input_last_at = None;
 
         let forced_event = match raw.as_slice() {

@@ -6,7 +6,7 @@ use super::{
 };
 use anyhow::{Result, anyhow};
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     ToggleHelp,
     ToggleAutoRead,
@@ -49,125 +49,109 @@ pub enum CommandResult {
     Paste(String),
 }
 
+const ACTION_TABLE: &[(Action, &str, &str)] = &[
+    (Action::ToggleHelp, "toggle help", "toggle_help"),
+    (
+        Action::ToggleAutoRead,
+        "toggle auto read",
+        "toggle_auto_read",
+    ),
+    (
+        Action::ToggleReviewCursorFollowsScreenCursor,
+        "toggle whether review cursor follows screen cursor",
+        "toggle_review_cursor_follows_screen_cursor",
+    ),
+    (
+        Action::ToggleSymbolLevel,
+        "toggle symbol level",
+        "toggle_symbol_level",
+    ),
+    (Action::OpenLuaRepl, "open Lua REPL", "open_lua_repl"),
+    (
+        Action::PassNextKey,
+        "forward next key press",
+        "pass_next_key",
+    ),
+    (
+        Action::StopSpeaking,
+        "stop speaking",
+        "stop_speaking",
+    ),
+    (Action::RevLinePrev, "previous line", "review_line_prev"),
+    (Action::RevLineNext, "next line", "review_line_next"),
+    (
+        Action::RevLinePrevNonBlank,
+        "previous non blank line",
+        "review_line_prev_non_blank",
+    ),
+    (
+        Action::RevLineNextNonBlank,
+        "next non blank line",
+        "review_line_next_non_blank",
+    ),
+    (Action::RevLineRead, "current line", "review_line_read"),
+    (
+        Action::RevCharPrev,
+        "previous character",
+        "review_char_prev",
+    ),
+    (Action::RevCharNext, "next character", "review_char_next"),
+    (Action::RevCharRead, "current character", "review_char_read"),
+    (
+        Action::RevCharReadPhonetic,
+        "current character phonetically",
+        "review_char_read_phonetic",
+    ),
+    (Action::RevWordPrev, "previous word", "review_word_prev"),
+    (Action::RevWordNext, "next word", "review_word_next"),
+    (Action::RevWordRead, "current word", "review_word_read"),
+    (Action::RevTop, "top", "review_top"),
+    (Action::RevBottom, "bottom", "review_bottom"),
+    (Action::RevFirst, "beginning of line", "review_first"),
+    (Action::RevLast, "end of line", "review_last"),
+    (
+        Action::RevReadAttributes,
+        "read attributes",
+        "review_read_attributes",
+    ),
+    (Action::Backspace, "backspace", "backspace"),
+    (Action::Delete, "delete", "delete"),
+    (Action::SayTime, "say the time", "say_time"),
+    (Action::SetMark, "set mark", "set_mark"),
+    (Action::Copy, "copy", "copy"),
+    (Action::Paste, "paste", "paste"),
+    (Action::SayClipboard, "say clipboard", "say_clipboard"),
+    (
+        Action::PreviousClipboard,
+        "previous clipboard",
+        "previous_clipboard",
+    ),
+    (Action::NextClipboard, "next clipboard", "next_clipboard"),
+];
+
 impl Action {
     pub fn help_text(&self) -> String {
-        match self {
-            Action::ToggleHelp => "toggle help".into(),
-            Action::ToggleAutoRead => "toggle auto read".into(),
-            Action::ToggleReviewCursorFollowsScreenCursor => {
-                "toggle whether review cursor follows screen cursor".into()
-            }
-            Action::ToggleSymbolLevel => "toggle symbol level".into(),
-            Action::OpenLuaRepl => "open Lua REPL".into(),
-            Action::PassNextKey => "forward next key press".into(),
-            Action::StopSpeaking => "stop speaking".into(),
-            Action::RevLinePrev => "previous line".into(),
-            Action::RevLineNext => "next line".into(),
-            Action::RevLinePrevNonBlank => "previous non blank line".into(),
-            Action::RevLineNextNonBlank => "next non blank line".into(),
-            Action::RevLineRead => "current line".into(),
-            Action::RevCharPrev => "previous character".into(),
-            Action::RevCharNext => "next character".into(),
-            Action::RevCharRead => "current character".into(),
-            Action::RevCharReadPhonetic => "current character phonetically".into(),
-            Action::RevWordPrev => "previous word".into(),
-            Action::RevWordNext => "next word".into(),
-            Action::RevWordRead => "current word".into(),
-            Action::RevTop => "top".into(),
-            Action::RevBottom => "botom".into(),
-            Action::RevFirst => "beginning of line".into(),
-            Action::RevLast => "end of line".into(),
-            Action::RevReadAttributes => "read attributes".into(),
-            Action::Backspace => "backspace".into(),
-            Action::Delete => "delete".into(),
-            Action::SayTime => "say the time".into(),
-            Action::SetMark => "set mark".into(),
-            Action::Copy => "copy".into(),
-            Action::Paste => "paste".into(),
-            Action::SayClipboard => "say clipboard".into(),
-            Action::PreviousClipboard => "previous clipboard".into(),
-            Action::NextClipboard => "next clipboard".into(),
-        }
+        ACTION_TABLE
+            .iter()
+            .find(|(action, _, _)| action == self)
+            .map(|(_, help, _)| (*help).to_string())
+            .unwrap_or_default()
     }
 }
 
 pub fn builtin_action_name(action: Action) -> &'static str {
-    match action {
-        Action::ToggleHelp => "toggle_help",
-        Action::ToggleAutoRead => "toggle_auto_read",
-        Action::ToggleReviewCursorFollowsScreenCursor => "toggle_review_cursor_follows_screen_cursor",
-        Action::ToggleSymbolLevel => "toggle_symbol_level",
-        Action::OpenLuaRepl => "open_lua_repl",
-        Action::PassNextKey => "pass_next_key",
-        Action::StopSpeaking => "stop_speaking",
-        Action::RevLinePrev => "review_line_prev",
-        Action::RevLineNext => "review_line_next",
-        Action::RevLinePrevNonBlank => "review_line_prev_non_blank",
-        Action::RevLineNextNonBlank => "review_line_next_non_blank",
-        Action::RevLineRead => "review_line_read",
-        Action::RevCharPrev => "review_char_prev",
-        Action::RevCharNext => "review_char_next",
-        Action::RevCharRead => "review_char_read",
-        Action::RevCharReadPhonetic => "review_char_read_phonetic",
-        Action::RevWordPrev => "review_word_prev",
-        Action::RevWordNext => "review_word_next",
-        Action::RevWordRead => "review_word_read",
-        Action::RevTop => "review_top",
-        Action::RevBottom => "review_bottom",
-        Action::RevFirst => "review_first",
-        Action::RevLast => "review_last",
-        Action::RevReadAttributes => "review_read_attributes",
-        Action::Backspace => "backspace",
-        Action::Delete => "delete",
-        Action::SayTime => "say_time",
-        Action::SetMark => "set_mark",
-        Action::Copy => "copy",
-        Action::Paste => "paste",
-        Action::SayClipboard => "say_clipboard",
-        Action::PreviousClipboard => "previous_clipboard",
-        Action::NextClipboard => "next_clipboard",
-    }
+    ACTION_TABLE
+        .iter()
+        .find(|(entry, _, _)| *entry == action)
+        .map(|(_, _, builtin)| *builtin)
+        .unwrap_or("")
 }
 
 pub fn builtin_action_from_name(name: &str) -> Option<Action> {
-    match name {
-        "toggle_help" => Some(Action::ToggleHelp),
-        "toggle_auto_read" => Some(Action::ToggleAutoRead),
-        "toggle_review_cursor_follows_screen_cursor" => {
-            Some(Action::ToggleReviewCursorFollowsScreenCursor)
-        }
-        "toggle_symbol_level" => Some(Action::ToggleSymbolLevel),
-        "open_lua_repl" => Some(Action::OpenLuaRepl),
-        "pass_next_key" => Some(Action::PassNextKey),
-        "stop_speaking" => Some(Action::StopSpeaking),
-        "review_line_prev" => Some(Action::RevLinePrev),
-        "review_line_next" => Some(Action::RevLineNext),
-        "review_line_prev_non_blank" => Some(Action::RevLinePrevNonBlank),
-        "review_line_next_non_blank" => Some(Action::RevLineNextNonBlank),
-        "review_line_read" => Some(Action::RevLineRead),
-        "review_char_prev" => Some(Action::RevCharPrev),
-        "review_char_next" => Some(Action::RevCharNext),
-        "review_char_read" => Some(Action::RevCharRead),
-        "review_char_read_phonetic" => Some(Action::RevCharReadPhonetic),
-        "review_word_prev" => Some(Action::RevWordPrev),
-        "review_word_next" => Some(Action::RevWordNext),
-        "review_word_read" => Some(Action::RevWordRead),
-        "review_top" => Some(Action::RevTop),
-        "review_bottom" => Some(Action::RevBottom),
-        "review_first" => Some(Action::RevFirst),
-        "review_last" => Some(Action::RevLast),
-        "review_read_attributes" => Some(Action::RevReadAttributes),
-        "backspace" => Some(Action::Backspace),
-        "delete" => Some(Action::Delete),
-        "say_time" => Some(Action::SayTime),
-        "set_mark" => Some(Action::SetMark),
-        "copy" => Some(Action::Copy),
-        "paste" => Some(Action::Paste),
-        "say_clipboard" => Some(Action::SayClipboard),
-        "previous_clipboard" => Some(Action::PreviousClipboard),
-        "next_clipboard" => Some(Action::NextClipboard),
-        _ => None,
-    }
+    ACTION_TABLE
+        .iter()
+        .find(|(_, _, builtin)| *builtin == name)
+        .map(|(action, _, _)| *action)
 }
 
 pub fn handle(
