@@ -33,6 +33,7 @@ vt100 = "0.16.2"
 vte = "0.15.0"
 mlua = { version = "0.11", features = ["luajit", "vendored"] }
 tts = "0.26.3"
+terminput = "0.5.12"
 
 [features]
 cargo-clippy = []

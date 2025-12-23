@@ -2,45 +2,47 @@ use crate::{commands, perform, screen_reader::ScreenReader, views};
 use anyhow::{Context, Result};
 use phf::phf_map;
 use std::{io::Write, time};
+use terminput::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 pub const DIFF_DELAY: u16 = 1;
 pub const MAX_DIFF_DELAY: u16 = 300;
+const ESC_TIMEOUT_MS: u128 = 50;
 
 static KEYMAP: phf::Map<&'static str, commands::Action> = phf_map! {
-    "\x1BOP" => commands::Action::ToggleHelp,
-    "\x1B'" => commands::Action::ToggleAutoRead,
-    "\x1B\"" => commands::Action::ToggleReviewCursorFollowsScreenCursor,
-    "\x1Bs" => commands::Action::ToggleSymbolLevel,
-    "\x1Bn" => commands::Action::PassNextKey,
-    "\x1Bx" => commands::Action::StopSpeaking,
-    "\x1Bu" => commands::Action::RevLinePrev,
-    "\x1Bo" => commands::Action::RevLineNext,
-    "\x1BU" => commands::Action::RevLinePrevNonBlank,
-    "\x1BO" => commands::Action::RevLineNextNonBlank,
-    "\x1Bi" => commands::Action::RevLineRead,
-    "\x1Bm" => commands::Action::RevCharPrev,
-    "\x1B." => commands::Action::RevCharNext,
-    "\x1B," => commands::Action::RevCharRead,
-    "\x1B<" => commands::Action::RevCharReadPhonetic,
-    "\x1Bj" => commands::Action::RevWordPrev,
-    "\x1Bl" => commands::Action::RevWordNext,
-    "\x1Bk" => commands::Action::RevWordRead,
-    "\x1By" => commands::Action::RevTop,
-    "\x1Bp" => commands::Action::RevBottom,
-    "\x1Bh" => commands::Action::RevFirst,
-    "\x1B;" => commands::Action::RevLast,
-    "\x1Ba" => commands::Action::RevReadAttributes,
-    "\x08" => commands::Action::Backspace,
-    "\x7F" => commands::Action::Backspace,
-    "\x1B[3~" => commands::Action::Delete,
-    "\x1B[24~" => commands::Action::SayTime,
-    "\x1BL" => commands::Action::OpenLuaRepl,
-    "\x1B[15~" => commands::Action::SetMark,
-    "\x1B[17~" => commands::Action::Copy,
-    "\x1B[18~" => commands::Action::Paste,
-    "\x1Bc" => commands::Action::SayClipboard,
-    "\x1B[" => commands::Action::PreviousClipboard,
-    "\x1B]" => commands::Action::NextClipboard,
+    "F1" => commands::Action::ToggleHelp,
+    "M-'" => commands::Action::ToggleAutoRead,
+    "M-\"" => commands::Action::ToggleReviewCursorFollowsScreenCursor,
+    "M-s" => commands::Action::ToggleSymbolLevel,
+    "M-n" => commands::Action::PassNextKey,
+    "M-x" => commands::Action::StopSpeaking,
+    "M-u" => commands::Action::RevLinePrev,
+    "M-o" => commands::Action::RevLineNext,
+    "M-U" => commands::Action::RevLinePrevNonBlank,
+    "M-O" => commands::Action::RevLineNextNonBlank,
+    "M-i" => commands::Action::RevLineRead,
+    "M-m" => commands::Action::RevCharPrev,
+    "M-." => commands::Action::RevCharNext,
+    "M-," => commands::Action::RevCharRead,
+    "M-<" => commands::Action::RevCharReadPhonetic,
+    "M-j" => commands::Action::RevWordPrev,
+    "M-l" => commands::Action::RevWordNext,
+    "M-k" => commands::Action::RevWordRead,
+    "M-y" => commands::Action::RevTop,
+    "M-p" => commands::Action::RevBottom,
+    "M-h" => commands::Action::RevFirst,
+    "M-;" => commands::Action::RevLast,
+    "M-a" => commands::Action::RevReadAttributes,
+    "Backspace" => commands::Action::Backspace,
+    "C-h" => commands::Action::Backspace,
+    "Delete" => commands::Action::Delete,
+    "F12" => commands::Action::SayTime,
+    "M-L" => commands::Action::OpenLuaRepl,
+    "F5" => commands::Action::SetMark,
+    "F6" => commands::Action::Copy,
+    "F7" => commands::Action::Paste,
+    "M-c" => commands::Action::SayClipboard,
+    "M-[" => commands::Action::PreviousClipboard,
+    "M-]" => commands::Action::NextClipboard,
 };
 
 pub trait Clock {
@@ -70,6 +72,8 @@ pub struct App {
     vte_parser: vte::Parser,
     reporter: perform::Reporter,
     ansi_csi_re: regex::bytes::Regex,
+    pending_input: Vec<u8>,
+    pending_input_last_at: Option<u128>,
     last_stdin_update: Option<u128>,
     last_pty_update: Option<u128>,
     clock: Box<dyn Clock>,
@@ -91,6 +95,8 @@ impl App {
             vte_parser: vte::Parser::new(),
             reporter: perform::Reporter::new(),
             ansi_csi_re,
+            pending_input: Vec::new(),
+            pending_input_last_at: None,
             last_stdin_update: None,
             last_pty_update: None,
             clock,
@@ -147,20 +153,127 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
-        if !self.ansi_csi_re.is_match(input) {
-            sr.last_key.clear();
-            sr.last_key.extend_from_slice(input);
-            sr.speech.stop()?;
+        for &byte in input {
+            self.pending_input_last_at = Some(self.clock.now_ms());
+            self.pending_input.push(byte);
+
+            if self.pending_input == [b'\x1B'] {
+                continue;
+            }
+
+            self.parse_pending_input(sr, pty_out, term_out)?;
         }
-        if sr.pass_through {
-            sr.pass_through = false;
-            self.dispatch_to_view(sr, input, pty_out, term_out)?;
+        Ok(())
+    }
+
+    fn parse_pending_input(
+        &mut self,
+        sr: &mut ScreenReader,
+        pty_out: &mut dyn Write,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        loop {
+            if self.pending_input.is_empty() {
+                return Ok(());
+            }
+
+            match Event::parse_from(&self.pending_input) {
+                Ok(Some(event)) => {
+                    let raw = self.pending_input.clone();
+                    self.pending_input.clear();
+                    self.pending_input_last_at = None;
+                    self.handle_event(sr, event, &raw, pty_out, term_out)?;
+                }
+                Ok(None) => {
+                    return Ok(());
+                }
+                Err(_) => {
+                    let raw_byte = self.pending_input.remove(0);
+                    if self.pending_input.is_empty() {
+                        self.pending_input_last_at = None;
+                    }
+                    self.handle_raw_bytes(sr, &[raw_byte], pty_out, term_out)?;
+                }
+            }
+        }
+    }
+
+    fn flush_pending_input(
+        &mut self,
+        sr: &mut ScreenReader,
+        pty_out: &mut dyn Write,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        let Some(last_at) = self.pending_input_last_at else {
+            return Ok(());
+        };
+        if self.pending_input.is_empty() {
+            self.pending_input_last_at = None;
+            return Ok(());
+        }
+        if self.clock.now_ms().saturating_sub(last_at) < ESC_TIMEOUT_MS {
             return Ok(());
         }
 
-        let action = std::str::from_utf8(input)
-            .ok()
-            .and_then(|key| KEYMAP.get(key).copied());
+        let raw = std::mem::take(&mut self.pending_input);
+        self.pending_input_last_at = None;
+
+        let forced_event = match raw.as_slice() {
+            b"\x1B" => Some(Event::Key(KeyCode::Esc.into())),
+            b"\x1B[" => Some(Event::Key(
+                KeyEvent::new(KeyCode::Char('[')).modifiers(KeyModifiers::ALT),
+            )),
+            b"\x1BO" => Some(Event::Key(
+                KeyEvent::new(KeyCode::Char('O')).modifiers(KeyModifiers::ALT),
+            )),
+            _ => None,
+        };
+
+        if let Some(event) = forced_event {
+            self.handle_event(sr, event, &raw, pty_out, term_out)
+        } else {
+            self.handle_raw_bytes(sr, &raw, pty_out, term_out)
+        }
+    }
+
+    fn handle_event(
+        &mut self,
+        sr: &mut ScreenReader,
+        event: Event,
+        raw: &[u8],
+        pty_out: &mut dyn Write,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        match event {
+            Event::Key(key_event) => {
+                self.handle_key_event(sr, key_event, raw, pty_out, term_out)
+            }
+            Event::Paste(contents) => {
+                let view_action = self
+                    .view_stack
+                    .active_mut()
+                    .handle_paste(sr, &contents, pty_out)?;
+                self.handle_view_action(sr, view_action, term_out)
+            }
+            _ => self.handle_raw_bytes(sr, raw, pty_out, term_out),
+        }
+    }
+
+    fn handle_key_event(
+        &mut self,
+        sr: &mut ScreenReader,
+        key_event: KeyEvent,
+        raw: &[u8],
+        pty_out: &mut dyn Write,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        self.update_last_key(sr, raw)?;
+        if sr.pass_through {
+            sr.pass_through = false;
+            return self.dispatch_to_view(sr, raw, pty_out, term_out);
+        }
+
+        let action = self.action_for_key_event(key_event);
         if let Some(action) = action {
             if matches!(action, commands::Action::OpenLuaRepl) {
                 if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
@@ -179,7 +292,7 @@ impl App {
             match commands::handle(sr, self.view_stack.active_mut().model(), action)? {
                 commands::CommandResult::Handled => {}
                 commands::CommandResult::ForwardInput => {
-                    self.dispatch_to_view(sr, input, pty_out, term_out)?;
+                    self.dispatch_to_view(sr, raw, pty_out, term_out)?;
                 }
                 commands::CommandResult::Paste(contents) => {
                     let view_action = self
@@ -192,9 +305,78 @@ impl App {
         } else if sr.help_mode {
             sr.speech.speak("this key is unmapped", false)?;
         } else {
-            self.dispatch_to_view(sr, input, pty_out, term_out)?;
+            self.dispatch_to_view(sr, raw, pty_out, term_out)?;
         }
         Ok(())
+    }
+
+    fn handle_raw_bytes(
+        &mut self,
+        sr: &mut ScreenReader,
+        raw: &[u8],
+        pty_out: &mut dyn Write,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        self.update_last_key(sr, raw)?;
+        if sr.pass_through {
+            sr.pass_through = false;
+        }
+        self.dispatch_to_view(sr, raw, pty_out, term_out)
+    }
+
+    fn update_last_key(&mut self, sr: &mut ScreenReader, raw: &[u8]) -> Result<()> {
+        if !self.ansi_csi_re.is_match(raw) {
+            sr.last_key.clear();
+            sr.last_key.extend_from_slice(raw);
+            sr.speech.stop()?;
+        }
+        Ok(())
+    }
+
+    fn action_for_key_event(&self, key_event: KeyEvent) -> Option<commands::Action> {
+        let binding = self.key_event_binding_name(key_event)?;
+        KEYMAP.get(binding.as_str()).copied()
+    }
+
+    fn key_event_binding_name(&self, key_event: KeyEvent) -> Option<String> {
+        let key_event = key_event.normalize_case();
+        let mut binding = String::new();
+        let is_char = matches!(key_event.code, KeyCode::Char(_));
+
+        if key_event.modifiers.contains(KeyModifiers::CTRL) {
+            binding.push_str("C-");
+        }
+        if key_event.modifiers.contains(KeyModifiers::ALT)
+            || key_event.modifiers.contains(KeyModifiers::META)
+        {
+            binding.push_str("M-");
+        }
+        if key_event.modifiers.contains(KeyModifiers::SUPER) {
+            binding.push_str("Super-");
+        }
+        if key_event.modifiers.contains(KeyModifiers::HYPER) {
+            binding.push_str("Hyper-");
+        }
+        if !is_char && key_event.modifiers.contains(KeyModifiers::SHIFT) {
+            binding.push_str("S-");
+        }
+
+        match key_event.code {
+            KeyCode::Char(ch) => {
+                binding.push(ch);
+            }
+            KeyCode::Backspace => binding.push_str("Backspace"),
+            KeyCode::Delete => binding.push_str("Delete"),
+            KeyCode::Esc => binding.push_str("Esc"),
+            KeyCode::Enter => binding.push_str("Enter"),
+            KeyCode::Tab => binding.push_str("Tab"),
+            KeyCode::F(num) => {
+                binding.push_str(&format!("F{num}"));
+            }
+            _ => return None,
+        }
+
+        Some(binding)
     }
 
     pub fn handle_pty(
@@ -222,6 +404,7 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        self.flush_pending_input(sr, pty_out, term_out)?;
         let tick_action = self.view_stack.active_mut().tick(sr, pty_out)?;
         self.handle_view_action(sr, tick_action, term_out)
     }

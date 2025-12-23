@@ -560,6 +560,7 @@ dependencies = [
  "signal-hook",
  "signal-hook-mio",
  "similar",
+ "terminput",
  "termsize",
  "tts",
  "unicode-segmentation",
@@ -1126,6 +1127,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "terminput"
+version = "0.5.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb2e8e835e040588586eb480bd465b41e1164d507190cce0c7153bb56b27614d"
+dependencies = [
+ "bitflags 2.10.0",
 ]
 
 [[package]]

@@ -121,3 +121,41 @@ fn pty_output_writes_terminal_and_autoreads() {
     let speaks = &recorder.inner.borrow().speaks;
     assert!(speaks.iter().any(|(text, _)| text.contains("hello")));
 }
+
+#[test]
+fn split_alt_sequence_maps_to_action() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1B", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+    assert!(pty_out.is_empty());
+
+    app.handle_stdin(&mut sr, b"l", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+
+    assert!(pty_out.is_empty());
+    assert_eq!(sr.last_key, b"\x1Bl");
+    assert!(!recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
+fn alt_bracket_maps_after_timeout() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1B[", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+    assert!(pty_out.is_empty());
+
+    clock.advance_ms(100);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("handle tick");
+
+    assert!(pty_out.is_empty());
+    assert_eq!(sr.last_key, b"\x1B[");
+    let speaks = &recorder.inner.borrow().speaks;
+    assert!(speaks.iter().any(|(text, _)| text == "no clipboard"));
+}
