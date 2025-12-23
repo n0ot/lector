@@ -38,6 +38,6 @@ tts = "0.26.3"
 cargo-clippy = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cocoa-foundation = "0.1"
-core-foundation = "0.9"
+cocoa-foundation = "0.2"
+core-foundation = "0.10"
 objc = { version = "0.2", features = ["exception"] }
