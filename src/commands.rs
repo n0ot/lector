@@ -1,7 +1,10 @@
 use super::{
     attributes,
     ext::{CellExt, ScreenExt},
+    keymap::InputMode,
     screen_reader::{CursorTrackingMode, ScreenReader},
+    speech::Speech,
+    table::{self, TableState},
     view::View,
 };
 use anyhow::{Result, anyhow};
@@ -41,6 +44,15 @@ pub enum Action {
     SayClipboard,
     PreviousClipboard,
     NextClipboard,
+    ToggleTableMode,
+    ExitTableMode,
+    TableRowPrev,
+    TableRowNext,
+    TableColPrev,
+    TableColNext,
+    TableCellRead,
+    TableHeaderRead,
+    ToggleTableHeaderRead,
 }
 
 pub enum CommandResult {
@@ -127,6 +139,19 @@ const ACTION_TABLE: &[(Action, &str, &str)] = &[
         "previous_clipboard",
     ),
     (Action::NextClipboard, "next clipboard", "next_clipboard"),
+    (Action::ToggleTableMode, "toggle table mode", "toggle_table_mode"),
+    (Action::ExitTableMode, "exit table mode", "exit_table_mode"),
+    (Action::TableRowPrev, "previous table row", "table_row_prev"),
+    (Action::TableRowNext, "next table row", "table_row_next"),
+    (Action::TableColPrev, "previous table column", "table_col_prev"),
+    (Action::TableColNext, "next table column", "table_col_next"),
+    (Action::TableCellRead, "current table cell", "table_cell_read"),
+    (Action::TableHeaderRead, "current table header", "table_header_read"),
+    (
+        Action::ToggleTableHeaderRead,
+        "toggle table header reading",
+        "toggle_table_header_read",
+    ),
 ];
 
 impl Action {
@@ -201,6 +226,15 @@ pub fn handle(
         Action::SayClipboard => action_clipboard_say(sr),
         Action::PreviousClipboard => action_clipboard_prev(sr),
         Action::NextClipboard => action_clipboard_next(sr),
+        Action::ToggleTableMode => action_toggle_table_mode(sr, view),
+        Action::ExitTableMode => action_exit_table_mode(sr),
+        Action::TableRowPrev => action_table_row_prev(sr, view),
+        Action::TableRowNext => action_table_row_next(sr, view),
+        Action::TableColPrev => action_table_col_prev(sr, view),
+        Action::TableColNext => action_table_col_next(sr, view),
+        Action::TableCellRead => action_table_cell_read(sr, view),
+        Action::TableHeaderRead => action_table_header_read(sr, view),
+        Action::ToggleTableHeaderRead => action_toggle_table_header_read(sr),
         _ => {
             sr.speech.speak("not implemented", false)?;
             Ok(CommandResult::Handled)
@@ -606,6 +640,211 @@ fn action_clipboard_say(sr: &mut ScreenReader) -> Result<CommandResult> {
         None => sr.speech.speak("no clipboard", false)?,
     }
     Ok(CommandResult::Handled)
+}
+
+fn action_toggle_table_mode(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if matches!(sr.input_mode, InputMode::Table) {
+        return action_exit_table_mode(sr);
+    }
+
+    let row = view.review_cursor_position.0;
+    let Some(model) = table::detect(view, row) else {
+        sr.speech.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let col_idx = model.column_for_col(view.review_cursor_position.1);
+    sr.table_state = Some(TableState {
+        model,
+        current_col: col_idx,
+    });
+    if let Some(state) = sr.table_state.as_ref() {
+        let column = &state.model.columns[state.current_col];
+        view.review_cursor_position.1 = column.start;
+    }
+    sr.input_mode = InputMode::Table;
+    sr.speech.speak("table mode on", false)?;
+    action_table_cell_read(sr, view)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_exit_table_mode(sr: &mut ScreenReader) -> Result<CommandResult> {
+    sr.input_mode = InputMode::Normal;
+    sr.table_state = None;
+    sr.speech.speak("table mode off", false)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_row_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speech.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let state_snapshot = sr.table_state.as_ref().unwrap().clone();
+    if view.review_cursor_position.0 <= state_snapshot.model.top {
+        sr.speech.speak("top", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let new_row = view.review_cursor_position.0 - 1;
+    move_review_to_table_cell(view, &state_snapshot, new_row);
+    speak_table_cell(&mut sr.speech, view, &state_snapshot, false)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_row_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speech.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let state_snapshot = sr.table_state.as_ref().unwrap().clone();
+    if view.review_cursor_position.0 >= state_snapshot.model.bottom {
+        sr.speech.speak("bottom", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let new_row = view.review_cursor_position.0 + 1;
+    move_review_to_table_cell(view, &state_snapshot, new_row);
+    speak_table_cell(&mut sr.speech, view, &state_snapshot, false)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_col_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speech.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let state_snapshot = {
+        let state = sr.table_state.as_mut().unwrap();
+        if state.current_col == 0 {
+            sr.speech.speak("left", false)?;
+            return Ok(CommandResult::Handled);
+        }
+        state.current_col -= 1;
+        move_review_to_table_cell(view, state, view.review_cursor_position.0);
+        state.clone()
+    };
+    speak_table_cell(
+        &mut sr.speech,
+        view,
+        &state_snapshot,
+        sr.table_header_auto,
+    )?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_col_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speech.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let state_snapshot = {
+        let state = sr.table_state.as_mut().unwrap();
+        if state.current_col + 1 >= state.model.columns.len() {
+            sr.speech.speak("right", false)?;
+            return Ok(CommandResult::Handled);
+        }
+        state.current_col += 1;
+        move_review_to_table_cell(view, state, view.review_cursor_position.0);
+        state.clone()
+    };
+    speak_table_cell(
+        &mut sr.speech,
+        view,
+        &state_snapshot,
+        sr.table_header_auto,
+    )?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_cell_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speech.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let state = sr.table_state.as_ref().unwrap().clone();
+    speak_table_cell(&mut sr.speech, view, &state, false)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_header_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speech.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let state = sr.table_state.as_ref().unwrap().clone();
+    if let Some(text) = state.model.header_text(view, state.current_col) {
+        sr.speech.speak(&text, false)?;
+    } else {
+        sr.speech.speak("no header", false)?;
+    }
+    Ok(CommandResult::Handled)
+}
+
+fn action_toggle_table_header_read(sr: &mut ScreenReader) -> Result<CommandResult> {
+    sr.table_header_auto = !sr.table_header_auto;
+    let status = if sr.table_header_auto { "on" } else { "off" };
+    sr.speech
+        .speak(&format!("table headers {}", status), false)?;
+    Ok(CommandResult::Handled)
+}
+
+fn ensure_table_state(sr: &mut ScreenReader, view: &mut View) -> bool {
+    let row = view.review_cursor_position.0;
+    let needs_refresh = match &sr.table_state {
+        Some(state) => row < state.model.top || row > state.model.bottom,
+        None => true,
+    };
+    if needs_refresh {
+        if let Some(model) = table::detect(view, row) {
+            let col_idx = model.column_for_col(view.review_cursor_position.1);
+            sr.table_state = Some(TableState {
+                model,
+                current_col: col_idx,
+            });
+        } else {
+            sr.table_state = None;
+            return false;
+        }
+    }
+    if let Some(state) = sr.table_state.as_mut() {
+        state.current_col = state
+            .model
+            .column_for_col(view.review_cursor_position.1);
+        if state.current_col >= state.model.columns.len() {
+            state.current_col = 0;
+        }
+    }
+    true
+}
+
+fn move_review_to_table_cell(view: &mut View, state: &TableState, row: u16) {
+    let row = state.model.clamp_row(row);
+    if let Some(column) = state.model.columns.get(state.current_col) {
+        view.review_cursor_position = (row, column.start);
+    }
+}
+
+fn speak_table_cell(
+    speech: &mut Speech,
+    view: &View,
+    state: &TableState,
+    include_header: bool,
+) -> Result<()> {
+    let row = view.review_cursor_position.0;
+    if include_header {
+        if let Some(header_row) = state.model.header_row {
+            if header_row != row {
+                if let Some(text) = state.model.header_text(view, state.current_col) {
+                    speech.speak(&text, false)?;
+                }
+            }
+        }
+    }
+    let text = state.model.cell_text(view, row, state.current_col);
+    if text.is_empty() {
+        speech.speak("blank", false)?;
+    } else {
+        speech.speak(&text, false)?;
+    }
+    Ok(())
 }
 
 fn action_toggle_symbol_level(sr: &mut ScreenReader) -> Result<CommandResult> {

@@ -1,0 +1,14 @@
+Scenario: table header toggle
+Given pty-stdout: Name | Age\r\n-----|-----\r\nAlice|30\r\nBob  |40
+And settled:
+When stdin: \x1Bt
+And stdin: h
+And stdin: \x1Bh
+And stdin: l
+Then expect-speak-contains: Name | Age
+And expect-speak: table mode on
+And expect-speak: 40
+And expect-speak: Name
+And expect-speak: Bob
+And expect-speak: table headers off
+And expect-speak: 40

@@ -327,7 +327,8 @@ impl App {
         key_event: KeyEvent,
     ) -> Option<&'a Binding> {
         let binding = self.key_event_binding_name(key_event)?;
-        sr.key_bindings.binding_for(binding.as_str())
+        sr.key_bindings
+            .binding_for_mode(sr.input_mode, binding.as_str())
     }
 
     fn key_event_binding_name(&self, key_event: KeyEvent) -> Option<String> {

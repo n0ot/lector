@@ -5,6 +5,7 @@ mod clipboard;
 pub mod commands;
 mod ext;
 mod keymap;
+mod table;
 pub mod lua;
 pub mod line_editor;
 pub mod platform;

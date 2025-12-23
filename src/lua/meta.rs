@@ -271,16 +271,17 @@ fn set_binding(
     key: &str,
     value: Value,
 ) -> anyhow::Result<()> {
+    let (mode, key) = sr.key_bindings.split_mode_key(key);
     match value {
         Value::Nil => {
-            sr.key_bindings.clear_binding(key);
+            sr.key_bindings.clear_binding_for_mode(mode, key);
             Ok(())
         }
         Value::String(name) => {
             let name = name.to_str().map_err(|err| anyhow!(err.to_string()))?;
             let action = KeyBindings::builtin_action_from_value(name.as_ref())?;
             sr.key_bindings
-                .set_builtin_binding(key.to_string(), action);
+                .set_builtin_binding_for_mode(mode, key.to_string(), action);
             Ok(())
         }
         Value::Table(table) => {
@@ -294,8 +295,13 @@ fn set_binding(
             if *weak_ctx != lua.weak() {
                 return Err(anyhow!("lua bindings are only available in init.lua"));
             }
-            sr.key_bindings
-                .set_lua_binding(key.to_string(), help, Rc::clone(ctx), func)?;
+            sr.key_bindings.set_lua_binding_for_mode(
+                mode,
+                key.to_string(),
+                help,
+                Rc::clone(ctx),
+                func,
+            )?;
             Ok(())
         }
         _ => Err(anyhow!("binding value must be a string, table, or nil")),
@@ -320,8 +326,9 @@ fn get_binding(lua: &Lua, sr: &ScreenReader, key: &str) -> anyhow::Result<Value>
         .as_ref()
         .map(|ctx| *ctx == lua.weak())
         .unwrap_or(false);
+    let (mode, key) = sr.key_bindings.split_mode_key(key);
     sr.key_bindings
-        .binding_value_for_lua(key, lua, allow_function)
+        .binding_value_for_lua_mode(mode, key, lua, allow_function)
         .map_err(|err| anyhow!(err.to_string()))
 }
 

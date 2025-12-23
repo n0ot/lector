@@ -5,6 +5,22 @@ use std::{collections::HashMap, rc::Rc};
 
 pub const BUILTIN_PREFIX: &str = "lector.";
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum InputMode {
+    Normal,
+    Table,
+}
+
+impl InputMode {
+    pub fn from_prefix(prefix: &str) -> Option<Self> {
+        match prefix {
+            "normal" => Some(InputMode::Normal),
+            "table" => Some(InputMode::Table),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Binding {
     Builtin(Action),
@@ -45,82 +61,137 @@ impl LuaBinding {
 }
 
 pub struct KeyBindings {
-    bindings: HashMap<String, Binding>,
+    bindings: HashMap<InputMode, HashMap<String, Binding>>,
 }
 
 impl KeyBindings {
     pub fn new() -> Self {
         let mut bindings = HashMap::new();
-        bindings.insert("F1".to_string(), Binding::Builtin(Action::ToggleHelp));
-        bindings.insert(
+        bindings.insert(InputMode::Normal, HashMap::new());
+        bindings.insert(InputMode::Table, HashMap::new());
+
+        let normal = bindings.get_mut(&InputMode::Normal).unwrap();
+        normal.insert("F1".to_string(), Binding::Builtin(Action::ToggleHelp));
+        normal.insert(
             "M-'".to_string(),
             Binding::Builtin(Action::ToggleAutoRead),
         );
-        bindings.insert(
+        normal.insert(
             "M-\"".to_string(),
             Binding::Builtin(Action::ToggleReviewCursorFollowsScreenCursor),
         );
-        bindings.insert(
+        normal.insert(
             "M-s".to_string(),
             Binding::Builtin(Action::ToggleSymbolLevel),
         );
-        bindings.insert("M-n".to_string(), Binding::Builtin(Action::PassNextKey));
-        bindings.insert("M-x".to_string(), Binding::Builtin(Action::StopSpeaking));
-        bindings.insert("M-u".to_string(), Binding::Builtin(Action::RevLinePrev));
-        bindings.insert("M-o".to_string(), Binding::Builtin(Action::RevLineNext));
-        bindings.insert(
+        normal.insert("M-n".to_string(), Binding::Builtin(Action::PassNextKey));
+        normal.insert("M-x".to_string(), Binding::Builtin(Action::StopSpeaking));
+        normal.insert("M-u".to_string(), Binding::Builtin(Action::RevLinePrev));
+        normal.insert("M-o".to_string(), Binding::Builtin(Action::RevLineNext));
+        normal.insert(
             "M-U".to_string(),
             Binding::Builtin(Action::RevLinePrevNonBlank),
         );
-        bindings.insert(
+        normal.insert(
             "M-O".to_string(),
             Binding::Builtin(Action::RevLineNextNonBlank),
         );
-        bindings.insert("M-i".to_string(), Binding::Builtin(Action::RevLineRead));
-        bindings.insert("M-m".to_string(), Binding::Builtin(Action::RevCharPrev));
-        bindings.insert("M-.".to_string(), Binding::Builtin(Action::RevCharNext));
-        bindings.insert("M-,".to_string(), Binding::Builtin(Action::RevCharRead));
-        bindings.insert(
+        normal.insert("M-i".to_string(), Binding::Builtin(Action::RevLineRead));
+        normal.insert("M-m".to_string(), Binding::Builtin(Action::RevCharPrev));
+        normal.insert("M-.".to_string(), Binding::Builtin(Action::RevCharNext));
+        normal.insert("M-,".to_string(), Binding::Builtin(Action::RevCharRead));
+        normal.insert(
             "M-<".to_string(),
             Binding::Builtin(Action::RevCharReadPhonetic),
         );
-        bindings.insert("M-j".to_string(), Binding::Builtin(Action::RevWordPrev));
-        bindings.insert("M-l".to_string(), Binding::Builtin(Action::RevWordNext));
-        bindings.insert("M-k".to_string(), Binding::Builtin(Action::RevWordRead));
-        bindings.insert("M-y".to_string(), Binding::Builtin(Action::RevTop));
-        bindings.insert("M-p".to_string(), Binding::Builtin(Action::RevBottom));
-        bindings.insert("M-h".to_string(), Binding::Builtin(Action::RevFirst));
-        bindings.insert("M-;".to_string(), Binding::Builtin(Action::RevLast));
-        bindings.insert(
+        normal.insert("M-j".to_string(), Binding::Builtin(Action::RevWordPrev));
+        normal.insert("M-l".to_string(), Binding::Builtin(Action::RevWordNext));
+        normal.insert("M-k".to_string(), Binding::Builtin(Action::RevWordRead));
+        normal.insert("M-y".to_string(), Binding::Builtin(Action::RevTop));
+        normal.insert("M-p".to_string(), Binding::Builtin(Action::RevBottom));
+        normal.insert("M-h".to_string(), Binding::Builtin(Action::RevFirst));
+        normal.insert("M-;".to_string(), Binding::Builtin(Action::RevLast));
+        normal.insert(
             "M-a".to_string(),
             Binding::Builtin(Action::RevReadAttributes),
         );
-        bindings.insert("Backspace".to_string(), Binding::Builtin(Action::Backspace));
-        bindings.insert("C-h".to_string(), Binding::Builtin(Action::Backspace));
-        bindings.insert("Delete".to_string(), Binding::Builtin(Action::Delete));
-        bindings.insert("F12".to_string(), Binding::Builtin(Action::SayTime));
-        bindings.insert("M-L".to_string(), Binding::Builtin(Action::OpenLuaRepl));
-        bindings.insert("F5".to_string(), Binding::Builtin(Action::SetMark));
-        bindings.insert("F6".to_string(), Binding::Builtin(Action::Copy));
-        bindings.insert("F7".to_string(), Binding::Builtin(Action::Paste));
-        bindings.insert("M-c".to_string(), Binding::Builtin(Action::SayClipboard));
-        bindings.insert(
+        normal.insert("Backspace".to_string(), Binding::Builtin(Action::Backspace));
+        normal.insert("C-h".to_string(), Binding::Builtin(Action::Backspace));
+        normal.insert("Delete".to_string(), Binding::Builtin(Action::Delete));
+        normal.insert("F12".to_string(), Binding::Builtin(Action::SayTime));
+        normal.insert("M-L".to_string(), Binding::Builtin(Action::OpenLuaRepl));
+        normal.insert("F5".to_string(), Binding::Builtin(Action::SetMark));
+        normal.insert("F6".to_string(), Binding::Builtin(Action::Copy));
+        normal.insert("F7".to_string(), Binding::Builtin(Action::Paste));
+        normal.insert("M-c".to_string(), Binding::Builtin(Action::SayClipboard));
+        normal.insert(
             "M-[".to_string(),
             Binding::Builtin(Action::PreviousClipboard),
         );
-        bindings.insert(
+        normal.insert(
             "M-]".to_string(),
             Binding::Builtin(Action::NextClipboard),
         );
+        normal.insert(
+            "M-t".to_string(),
+            Binding::Builtin(Action::ToggleTableMode),
+        );
+
+        let table = bindings.get_mut(&InputMode::Table).unwrap();
+        table.insert("Esc".to_string(), Binding::Builtin(Action::ExitTableMode));
+        table.insert("M-u".to_string(), Binding::Builtin(Action::TableRowPrev));
+        table.insert("M-o".to_string(), Binding::Builtin(Action::TableRowNext));
+        table.insert("M-U".to_string(), Binding::Builtin(Action::TableRowPrev));
+        table.insert("M-O".to_string(), Binding::Builtin(Action::TableRowNext));
+        table.insert("M-i".to_string(), Binding::Builtin(Action::TableCellRead));
+        table.insert("j".to_string(), Binding::Builtin(Action::TableRowNext));
+        table.insert("k".to_string(), Binding::Builtin(Action::TableRowPrev));
+        table.insert("h".to_string(), Binding::Builtin(Action::TableColPrev));
+        table.insert("l".to_string(), Binding::Builtin(Action::TableColNext));
+        table.insert("i".to_string(), Binding::Builtin(Action::TableCellRead));
+        table.insert("H".to_string(), Binding::Builtin(Action::TableHeaderRead));
+        table.insert(
+            "M-h".to_string(),
+            Binding::Builtin(Action::ToggleTableHeaderRead),
+        );
+        table.insert(
+            "M-H".to_string(),
+            Binding::Builtin(Action::ToggleTableHeaderRead),
+        );
+
         Self { bindings }
     }
 
     pub fn binding_for(&self, key: &str) -> Option<&Binding> {
-        self.bindings.get(key)
+        self.binding_for_mode(InputMode::Normal, key)
+    }
+
+    pub fn binding_for_mode(&self, mode: InputMode, key: &str) -> Option<&Binding> {
+        if let Some(bindings) = self.bindings.get(&mode) {
+            if let Some(binding) = bindings.get(key) {
+                return Some(binding);
+            }
+        }
+        if mode != InputMode::Normal {
+            return self
+                .bindings
+                .get(&InputMode::Normal)
+                .and_then(|bindings| bindings.get(key));
+        }
+        None
     }
 
     pub fn set_builtin_binding(&mut self, key: String, action: Action) {
-        self.replace_binding(key, Binding::Builtin(action));
+        self.set_builtin_binding_for_mode(InputMode::Normal, key, action);
+    }
+
+    pub fn set_builtin_binding_for_mode(
+        &mut self,
+        mode: InputMode,
+        key: String,
+        action: Action,
+    ) {
+        self.replace_binding(mode, key, Binding::Builtin(action));
     }
 
     pub fn set_lua_binding(
@@ -130,10 +201,22 @@ impl KeyBindings {
         lua: Rc<Lua>,
         func: Function,
     ) -> Result<()> {
+        self.set_lua_binding_for_mode(InputMode::Normal, key, help, lua, func)
+    }
+
+    pub fn set_lua_binding_for_mode(
+        &mut self,
+        mode: InputMode,
+        key: String,
+        help: String,
+        lua: Rc<Lua>,
+        func: Function,
+    ) -> Result<()> {
         let func_key = lua
             .create_registry_value(func)
             .map_err(|err| anyhow!(err.to_string()))?;
         self.replace_binding(
+            mode,
             key,
             Binding::Lua(LuaBinding {
                 help,
@@ -145,8 +228,14 @@ impl KeyBindings {
     }
 
     pub fn clear_binding(&mut self, key: &str) {
-        if let Some(binding) = self.bindings.remove(key) {
-            binding.cleanup();
+        self.clear_binding_for_mode(InputMode::Normal, key);
+    }
+
+    pub fn clear_binding_for_mode(&mut self, mode: InputMode, key: &str) {
+        if let Some(bindings) = self.bindings.get_mut(&mode) {
+            if let Some(binding) = bindings.remove(key) {
+                binding.cleanup();
+            }
         }
     }
 
@@ -156,7 +245,17 @@ impl KeyBindings {
         lua: &Lua,
         allow_function: bool,
     ) -> mlua::Result<Value> {
-        let Some(binding) = self.bindings.get(key) else {
+        self.binding_value_for_lua_mode(InputMode::Normal, key, lua, allow_function)
+    }
+
+    pub fn binding_value_for_lua_mode(
+        &self,
+        mode: InputMode,
+        key: &str,
+        lua: &Lua,
+        allow_function: bool,
+    ) -> mlua::Result<Value> {
+        let Some(binding) = self.binding_for_mode(mode, key) else {
             return Ok(Value::Nil);
         };
 
@@ -190,8 +289,26 @@ impl KeyBindings {
         commands::builtin_action_from_name(name).ok_or_else(|| anyhow!("unknown action {}", value))
     }
 
-    fn replace_binding(&mut self, key: String, binding: Binding) {
-        if let Some(prev) = self.bindings.insert(key, binding) {
+    pub fn split_mode_key<'a>(&self, key: &'a str) -> (InputMode, &'a str) {
+        let mut parts = key.splitn(2, ':');
+        let prefix = parts.next().unwrap_or("");
+        let rest = parts.next();
+        if let Some(mode) = InputMode::from_prefix(prefix) {
+            if let Some(rest) = rest {
+                if !rest.is_empty() {
+                    return (mode, rest);
+                }
+            }
+        }
+        (InputMode::Normal, key)
+    }
+
+    fn replace_binding(&mut self, mode: InputMode, key: String, binding: Binding) {
+        let bindings = self
+            .bindings
+            .get_mut(&mode)
+            .expect("missing bindings map");
+        if let Some(prev) = bindings.insert(key, binding) {
             prev.cleanup();
         }
     }

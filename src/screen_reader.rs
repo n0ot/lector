@@ -1,4 +1,12 @@
-use super::{clipboard::Clipboard, ext::ScreenExt, keymap::KeyBindings, perform, speech::Speech, view::View};
+use super::{
+    clipboard::Clipboard,
+    ext::ScreenExt,
+    keymap::{InputMode, KeyBindings},
+    perform,
+    speech::Speech,
+    table::TableState,
+    view::View,
+};
 use anyhow::Result;
 use mlua::{Lua, WeakLua};
 use similar::{Algorithm, ChangeTag, TextDiff};
@@ -23,6 +31,9 @@ pub struct ScreenReader {
     pub clipboard: Clipboard,
     pub pass_through: bool,
     pub key_bindings: KeyBindings,
+    pub input_mode: InputMode,
+    pub table_state: Option<TableState>,
+    pub table_header_auto: bool,
     pub lua_ctx: Option<Rc<Lua>>,
     pub lua_ctx_weak: Option<WeakLua>,
 }
@@ -40,6 +51,9 @@ impl ScreenReader {
             clipboard: Default::default(),
             pass_through: false,
             key_bindings: KeyBindings::new(),
+            input_mode: InputMode::Normal,
+            table_state: None,
+            table_header_auto: true,
             lua_ctx: None,
             lua_ctx_weak: None,
         }
