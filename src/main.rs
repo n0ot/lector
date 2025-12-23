@@ -58,16 +58,12 @@ struct Cli {
     /// Lector will spawn this shell when it starts
     #[clap(long, short = 's', env)]
     shell: std::path::PathBuf,
-    /// Path to the speech program
-    #[clap(long, short = 'p')]
-    speech_program: String,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let term_size = termsize::get().ok_or_else(|| anyhow!("cannot get terminal size"))?;
-    let speech_driver =
-        Box::new(speech::tdsr::Tdsr::new(cli.speech_program).context("create tdsr driver")?);
+    let speech_driver = Box::new(speech::tts::TtsDriver::new().context("create tts driver")?);
     let speech = speech::Speech::new(speech_driver);
     let view = View::new(term_size.rows, term_size.cols);
     let mut screen_reader = ScreenReader::new(speech, view);
@@ -145,6 +141,7 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
     let mut last_stdin_update = None;
     let mut last_pty_update = None;
     loop {
+        poll_timeout = sr.speech.adjust_poll_timeout(poll_timeout);
         poll.poll(&mut events, poll_timeout).or_else(|e| {
             if e.kind() == ErrorKind::Interrupted {
                 events.clear();
@@ -272,5 +269,7 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
                 sr.view.finalize_changes();
             }
         }
+
+        sr.speech.tick()?;
     }
 }
