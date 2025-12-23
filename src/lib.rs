@@ -8,3 +8,4 @@ pub mod perform;
 pub mod screen_reader;
 pub mod speech;
 pub mod view;
+pub mod views;

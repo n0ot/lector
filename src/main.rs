@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use lector::{commands, lua, perform, platform, screen_reader::ScreenReader, speech, view::View};
+use lector::{commands, lua, perform, platform, screen_reader::ScreenReader, speech, views};
 use nix::sys::termios;
 use phf::phf_map;
 use ptyprocess::{PtyProcess, Signal};
@@ -51,7 +51,6 @@ static KEYMAP: phf::Map<&'static str, commands::Action> = phf_map! {
     "\x1B[" => commands::Action::PreviousClipboard,
     "\x1B]" => commands::Action::NextClipboard,
 };
-
 #[derive(Parser)]
 #[clap(author, version, about)]
 struct Cli {
@@ -65,8 +64,11 @@ fn main() -> Result<()> {
     let term_size = termsize::get().ok_or_else(|| anyhow!("cannot get terminal size"))?;
     let speech_driver = Box::new(speech::tts::TtsDriver::new().context("create tts driver")?);
     let speech = speech::Speech::new(speech_driver);
-    let view = View::new(term_size.rows, term_size.cols);
-    let mut screen_reader = ScreenReader::new(speech, view);
+    let mut screen_reader = ScreenReader::new(speech);
+    let mut view_stack = views::ViewStack::new(Box::new(views::PtyView::new(
+        term_size.rows,
+        term_size.cols,
+    )));
 
     let init_term_attrs = termios::tcgetattr(std::io::stdin().as_fd())?;
     // Spawn the child process, connect it to a PTY,
@@ -87,7 +89,7 @@ fn main() -> Result<()> {
     conf_file.push("init.lua");
 
     let result = lua::setup(conf_file, &mut screen_reader, |screen_reader| {
-        do_events(screen_reader, &mut process)
+        do_events(screen_reader, &mut view_stack, &mut process)
     });
     // Clean up before returning the above result.
     termios::tcsetattr(
@@ -101,7 +103,11 @@ fn main() -> Result<()> {
     result.map_err(|e| anyhow!("{}", e))
 }
 
-fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Result<()> {
+fn do_events(
+    sr: &mut ScreenReader,
+    view_stack: &mut views::ViewStack,
+    process: &mut ptyprocess::PtyProcess,
+) -> Result<()> {
     let mut pty_stream = process.get_pty_stream().context("get PTY stream")?;
     // Set stdin to raw, so that input is read character by character,
     // and so that signals like SIGINT aren't send when pressing keys like ^C.
@@ -112,7 +118,8 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
     // Store new text to be read.
     let mut reporter = perform::Reporter::new();
     let ansi_csi_re =
-        regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$").unwrap();
+        regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$")
+            .context("compile ansi csi regex")?;
 
     // Set up a mio poll, to select between reading from stdin, and the PTY.
     let mut signals = Signals::new([SIGWINCH])?;
@@ -160,36 +167,62 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
                         Ok(n) => n,
                         Err(e) => bail!("error reading from input: {}", e),
                     };
-                    // Don't silence speech or set the last key for key echo,
-                    // when receiving a CSI dispatch.
                     if !ansi_csi_re.is_match(&buf[0..n]) {
                         sr.last_key = buf[0..n].to_owned();
                         sr.speech.stop()?;
                     }
-                    let pass_through = match sr.pass_through {
-                        false => match KEYMAP.get(std::str::from_utf8(&buf[0..n])?) {
-                            Some(&v) => commands::handle(sr, &mut pty_stream, v)?,
-                            None => {
-                                if sr.help_mode {
-                                    sr.speech.speak("this key is unmapped", false)?;
-                                    false
-                                } else {
-                                    true
-                                }
+                    if sr.pass_through {
+                        sr.pass_through = false;
+                        dispatch_to_view(
+                            &buf[0..n],
+                            sr,
+                            view_stack,
+                            &mut pty_stream,
+                            &mut stdout,
+                            &mut last_stdin_update,
+                        )?;
+                        continue;
+                    }
+
+                    let action = std::str::from_utf8(&buf[0..n])
+                        .ok()
+                        .and_then(|key| KEYMAP.get(key).copied());
+                    if let Some(action) = action {
+                        match commands::handle(sr, view_stack.active_mut().model(), action)? {
+                            commands::CommandResult::Handled => {}
+                            commands::CommandResult::ForwardInput => {
+                                dispatch_to_view(
+                                    &buf[0..n],
+                                    sr,
+                                    view_stack,
+                                    &mut pty_stream,
+                                    &mut stdout,
+                                    &mut last_stdin_update,
+                                )?;
                             }
-                        },
-                        true => {
-                            // Turning pass through on should only apply for one keystroke.
-                            sr.pass_through = false;
-                            true
+                            commands::CommandResult::Paste(contents) => {
+                                let view_action = view_stack
+                                    .active_mut()
+                                    .handle_paste(sr, &contents, &mut pty_stream)?;
+                                handle_view_action(
+                                    view_action,
+                                    view_stack,
+                                    &mut stdout,
+                                    &mut last_stdin_update,
+                                )?;
+                            }
                         }
-                    };
-                    if pass_through {
-                        last_stdin_update = Some(time::Instant::now());
-                        pty_stream
-                            .write_all(&buf[0..n])
-                            .context("copy STDIN to PTY")?;
-                        pty_stream.flush().context("flush write to PTY")?;
+                    } else if sr.help_mode {
+                        sr.speech.speak("this key is unmapped", false)?;
+                    } else {
+                        dispatch_to_view(
+                            &buf[0..n],
+                            sr,
+                            view_stack,
+                            &mut pty_stream,
+                            &mut stdout,
+                            &mut last_stdin_update,
+                        )?;
                     }
                 }
                 PTY_TOKEN => {
@@ -199,13 +232,17 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
                         Ok(n) => n,
                         Err(e) => bail!("error reading from PTY: {}", e),
                     };
-                    stdout.write_all(&buf[0..n]).context("write PTY output")?;
-                    stdout.flush().context("flush output")?;
-                    if sr.auto_read {
+                    let overlay_active = view_stack.has_overlay();
+                    view_stack
+                        .root_mut()
+                        .handle_pty_output(&buf[0..n])?;
+                    if !overlay_active {
+                        stdout.write_all(&buf[0..n]).context("write PTY output")?;
+                        stdout.flush().context("flush output")?;
+                        if sr.auto_read {
                             vte_parser.advance(&mut reporter, &buf[0..n]);
+                        }
                     }
-
-                    sr.view.process_changes(&buf[0..n]);
                     // Stop blocking indefinitely until this screen is old enough to be
                     // auto read.
                     poll_timeout = Some(time::Duration::from_millis(DIFF_DELAY as u64));
@@ -221,7 +258,10 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
                                     .set_window_size(term_size.cols, term_size.rows)
                                     .context("resize PTY")?;
                                 process.signal(Signal::SIGWINCH)?;
-                                sr.view.set_size(term_size.rows, term_size.cols);
+                                view_stack.on_resize(term_size.rows, term_size.cols);
+                                if view_stack.has_overlay() {
+                                    render_active_view(&mut stdout, view_stack)?;
+                                }
                             }
                             _ => unreachable!("unknown signal"),
                         }
@@ -235,25 +275,30 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
         // updates, to give the screen time to stabilize.
         // But if we never stop getting updates, we want to read what we have eventually.
         if let Some(lpu) = last_pty_update {
+            let overlay_active = view_stack.has_overlay();
+            let root_view = view_stack.root_mut();
+            let view = root_view.model();
             if lpu.elapsed().as_millis() > DIFF_DELAY as u128
-                || sr.view.prev_screen_time.elapsed().as_millis() > MAX_DIFF_DELAY as u128
+                || view.prev_screen_time.elapsed().as_millis() > MAX_DIFF_DELAY as u128
             {
                 poll_timeout = None; // No need to wakeup until we get more updates.
                 last_pty_update = None;
-                if sr.highlight_tracking {
-                    sr.track_highlighting()?;
-                }
-                let read_text = if sr.auto_read {
-                    sr.auto_read(&mut reporter)?
-                } else {
-                    false
-                };
-                // Don't announce cursor changes if there are other textual changes being read,
-                // or the cursor is moving without user interaction.
-                // The latter makes disabling auto read truly be silent.
-                if let Some(lsu) = last_stdin_update {
-                    if lsu.elapsed().as_millis() <= MAX_DIFF_DELAY as u128 && !read_text {
-                        sr.track_cursor()?;
+                if !overlay_active {
+                    if sr.highlight_tracking {
+                        sr.track_highlighting(view)?;
+                    }
+                    let read_text = if sr.auto_read {
+                        sr.auto_read(view, &mut reporter)?
+                    } else {
+                        false
+                    };
+                    // Don't announce cursor changes if there are other textual changes being read,
+                    // or the cursor is moving without user interaction.
+                    // The latter makes disabling auto read truly be silent.
+                    if let Some(lsu) = last_stdin_update {
+                        if lsu.elapsed().as_millis() <= MAX_DIFF_DELAY as u128 && !read_text {
+                            sr.track_cursor(view)?;
+                        }
                     }
                 }
 
@@ -261,15 +306,77 @@ fn do_events(sr: &mut ScreenReader, process: &mut ptyprocess::PtyProcess) -> Res
                 // updates,
                 // to give the screen time to stabilize.
                 if sr.review_follows_screen_cursor
-                    && sr.view.screen().cursor_position() != sr.view.prev_screen().cursor_position()
+                    && view.screen().cursor_position() != view.prev_screen().cursor_position()
                 {
-                    sr.view.review_cursor_position = sr.view.screen().cursor_position();
+                    view.review_cursor_position = view.screen().cursor_position();
                 }
 
-                sr.view.finalize_changes();
+                view.finalize_changes();
             }
         }
 
         platform::tick_runloop()?;
     }
+}
+
+fn render_active_view(
+    stdout: &mut impl Write,
+    view_stack: &mut views::ViewStack,
+) -> Result<()> {
+    let view = view_stack.active_mut().model();
+    stdout
+        .write_all(b"\x1B[2J\x1B[H")
+        .context("clear screen")?;
+    stdout
+        .write_all(&view.screen().contents_formatted())
+        .context("render view contents")?;
+    stdout
+        .write_all(&view.screen().cursor_state_formatted())
+        .context("render cursor state")?;
+    stdout
+        .write_all(&view.screen().input_mode_formatted())
+        .context("render input modes")?;
+    stdout.flush().context("flush view render")?;
+    Ok(())
+}
+
+fn dispatch_to_view(
+    input: &[u8],
+    sr: &mut ScreenReader,
+    view_stack: &mut views::ViewStack,
+    pty_stream: &mut ptyprocess::stream::Stream,
+    stdout: &mut impl Write,
+    last_stdin_update: &mut Option<time::Instant>,
+) -> Result<()> {
+    let action = view_stack
+        .active_mut()
+        .handle_input(sr, input, pty_stream)?;
+    handle_view_action(action, view_stack, stdout, last_stdin_update)
+}
+
+fn handle_view_action(
+    action: views::ViewAction,
+    view_stack: &mut views::ViewStack,
+    stdout: &mut impl Write,
+    last_stdin_update: &mut Option<time::Instant>,
+) -> Result<()> {
+    match action {
+        views::ViewAction::PtyInput => {
+            *last_stdin_update = Some(time::Instant::now());
+        }
+        views::ViewAction::Push(view) => {
+            view_stack.push(view);
+            render_active_view(stdout, view_stack)?;
+        }
+        views::ViewAction::Pop => {
+            if view_stack.pop() {
+                render_active_view(stdout, view_stack)?;
+            }
+        }
+        views::ViewAction::Redraw => {
+            render_active_view(stdout, view_stack)?;
+        }
+        views::ViewAction::None => {}
+    }
+    Ok(())
 }
