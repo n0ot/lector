@@ -6,7 +6,7 @@ use ptyprocess::{PtyProcess, Signal};
 use signal_hook::consts::signal::*;
 use signal_hook_mio::v1_0::Signals;
 use std::{
-    io::{ErrorKind, Read},
+    io::{ErrorKind, Read, Write},
     os::fd::{AsFd, AsRawFd},
     process::Command,
     time,
@@ -24,6 +24,9 @@ struct Cli {
     /// Path to the proc driver server (required when --speech-driver=proc)
     #[clap(long, env)]
     speech_server: Option<std::path::PathBuf>,
+    /// Write raw IO bytes to a log file for debugging
+    #[clap(long, env)]
+    io_log: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -76,19 +79,36 @@ fn main() -> Result<()> {
     conf_file.push("init.lua");
 
     let result = match lua::setup(conf_file.clone(), &mut screen_reader, |screen_reader| {
-        do_events(screen_reader, &mut app, &mut process, None)
-    }) {
-        Ok(()) => Ok(()),
-        Err(err) => do_events(
-            &mut screen_reader,
+        let io_logger = match cli.io_log.clone() {
+            Some(path) => Some(IoLogger::new(path)?),
+            None => None,
+        };
+        do_events(
+            screen_reader,
             &mut app,
             &mut process,
-            Some(format!(
-                "Error loading config file: {}\n\n{}",
-                conf_file.display(),
-                err
-            )),
-        ),
+            None,
+            io_logger,
+        )
+    }) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let io_logger = match cli.io_log.clone() {
+                Some(path) => Some(IoLogger::new(path)?),
+                None => None,
+            };
+            do_events(
+                &mut screen_reader,
+                &mut app,
+                &mut process,
+                Some(format!(
+                    "Error loading config file: {}\n\n{}",
+                    conf_file.display(),
+                    err
+                )),
+                io_logger,
+            )
+        }
     };
     // Clean up before returning the above result.
     if let Err(err) = termios::tcsetattr(
@@ -108,8 +128,16 @@ fn do_events(
     app: &mut app::App,
     process: &mut ptyprocess::PtyProcess,
     initial_message: Option<String>,
+    mut io_logger: Option<IoLogger>,
 ) -> Result<()> {
-    let mut pty_stream = process.get_pty_stream().context("get PTY stream")?;
+    let pty_stream = process.get_pty_stream().context("get PTY stream")?;
+    let io_logger = io_logger
+        .take()
+        .map(|logger| std::rc::Rc::new(std::cell::RefCell::new(logger)));
+    let mut pty_stream: Box<dyn PtyStream> = match io_logger.clone() {
+        Some(logger) => Box::new(LoggedPtyStream::new(pty_stream, logger)),
+        None => Box::new(pty_stream),
+    };
     // Set stdin to raw, so that input is read character by character,
     // and so that signals like SIGINT aren't send when pressing keys like ^C.
     ptyprocess::set_raw(0).context("set STDIN to raw")?;
@@ -164,6 +192,11 @@ fn do_events(
                         Ok(n) => n,
                         Err(e) => bail!("error reading from input: {}", e),
                     };
+                    if let Some(logger) = io_logger.as_ref() {
+                        logger
+                            .borrow_mut()
+                            .log("stdin->app", &buf[..n]);
+                    }
                     app.handle_stdin(sr, &buf[0..n], &mut pty_stream, &mut stdout)?;
                 }
                 PTY_TOKEN => {
@@ -208,5 +241,97 @@ fn do_events(
         }
 
         platform::tick_runloop()?;
+    }
+}
+
+trait PtyStream: Read + std::io::Write + AsRawFd {}
+
+impl<T> PtyStream for T where T: Read + std::io::Write + AsRawFd {}
+
+struct IoLogger {
+    file: std::fs::File,
+    start: time::Instant,
+}
+
+impl IoLogger {
+    fn new(path: std::path::PathBuf) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open io log {}", path.display()))?;
+        Ok(Self {
+            file,
+            start: time::Instant::now(),
+        })
+    }
+
+    fn log(&mut self, direction: &str, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut hex = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{:02X}", b));
+        }
+        let _ = writeln!(
+            self.file,
+            "{}\t{}\t{}\t{}",
+            self.start.elapsed().as_millis(),
+            direction,
+            bytes.len(),
+            hex
+        );
+        let _ = self.file.flush();
+    }
+}
+
+struct LoggedPtyStream<T> {
+    inner: T,
+    logger: std::rc::Rc<std::cell::RefCell<IoLogger>>,
+}
+
+impl<T> LoggedPtyStream<T> {
+    fn new(inner: T, logger: std::rc::Rc<std::cell::RefCell<IoLogger>>) -> Self {
+        Self { inner, logger }
+    }
+}
+
+impl<T> Read for LoggedPtyStream<T>
+where
+    T: Read,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.logger.borrow_mut().log("pty->app", &buf[..n]);
+        }
+        Ok(n)
+    }
+}
+
+impl<T> std::io::Write for LoggedPtyStream<T>
+where
+    T: std::io::Write,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            self.logger.borrow_mut().log("app->pty", &buf[..n]);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<T> AsRawFd for LoggedPtyStream<T>
+where
+    T: AsRawFd,
+{
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.as_raw_fd()
     }
 }

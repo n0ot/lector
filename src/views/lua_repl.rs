@@ -370,7 +370,7 @@ impl ViewController for LuaReplView {
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         self.set_screen_reader(sr);
-        if input == b"\x04" {
+        if input.iter().any(|&b| b == 0x04) {
             self.thread = None;
             return Ok(ViewAction::Pop);
         }

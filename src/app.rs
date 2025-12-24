@@ -12,6 +12,9 @@ use terminput::{Event, KeyCode, KeyEvent, KeyModifiers};
 pub const DIFF_DELAY: u16 = 1;
 pub const MAX_DIFF_DELAY: u16 = 300;
 const ESC_TIMEOUT_MS: u128 = 50;
+const CTRL_D_CSI: &[u8] = b"\x1B[27;5;100~";
+const OSC_START: u8 = b']';
+const ST_ESCAPE: u8 = b'\\';
 
 pub trait Clock {
     fn now_ms(&self) -> u128;
@@ -145,6 +148,33 @@ impl App {
                 return Ok(());
             }
 
+            match self.pending_osc_status() {
+                PendingStatus::Complete(osc_len) => {
+                    let raw: Vec<u8> = self.pending_input.drain(..osc_len).collect();
+                    self.pending_input_last_at = None;
+                    self.handle_raw_bytes(sr, &raw, pty_out, term_out)?;
+                    continue;
+                }
+                PendingStatus::Incomplete => return Ok(()),
+                PendingStatus::None => {}
+            }
+
+            if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
+                match self.pending_ctrl_d_status() {
+                    PendingStatus::Complete(len) => {
+                        self.pending_input.drain(..len);
+                        if self.pending_input.is_empty() {
+                            self.pending_input_last_at = None;
+                        }
+                        let raw = [0x04u8];
+                        self.update_last_key(sr, &raw)?;
+                        return self.dispatch_to_view(sr, &raw, pty_out, term_out);
+                    }
+                    PendingStatus::Incomplete => return Ok(()),
+                    PendingStatus::None => {}
+                }
+            }
+
             let buf = self.pending_input.make_contiguous();
             match Event::parse_from(buf) {
                 Ok(Some(event)) => {
@@ -168,6 +198,41 @@ impl App {
                 }
             }
         }
+    }
+
+    fn pending_osc_status(&mut self) -> PendingStatus {
+        if self.pending_input.len() < 2 {
+            return PendingStatus::None;
+        }
+        if self.pending_input[0] != b'\x1B' || self.pending_input[1] != OSC_START {
+            return PendingStatus::None;
+        }
+        let buf = self.pending_input.make_contiguous();
+        let mut i = 2usize;
+        while i < buf.len() {
+            match buf[i] {
+                0x07 => return PendingStatus::Complete(i + 1),
+                0x1B => {
+                    if i + 1 < buf.len() && buf[i + 1] == ST_ESCAPE {
+                        return PendingStatus::Complete(i + 2);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        PendingStatus::Incomplete
+    }
+
+    fn pending_ctrl_d_status(&mut self) -> PendingStatus {
+        let buf = self.pending_input.make_contiguous();
+        if buf.starts_with(CTRL_D_CSI) {
+            return PendingStatus::Complete(CTRL_D_CSI.len());
+        }
+        if CTRL_D_CSI.starts_with(buf) && !buf.is_empty() {
+            return PendingStatus::Incomplete;
+        }
+        PendingStatus::None
     }
 
     fn flush_pending_input(
@@ -239,6 +304,14 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl
+            && key_event.modifiers.contains(KeyModifiers::CTRL)
+            && matches!(key_event.code, KeyCode::Char('d' | 'D'))
+        {
+            let raw = [0x04u8];
+            self.update_last_key(sr, &raw)?;
+            return self.dispatch_to_view(sr, &raw, pty_out, term_out);
+        }
         self.update_last_key(sr, raw)?;
         if sr.pass_through {
             sr.pass_through = false;
@@ -548,4 +621,10 @@ impl App {
         view.finalize_changes(now_ms);
         Ok(())
     }
+}
+
+enum PendingStatus {
+    None,
+    Incomplete,
+    Complete(usize),
 }
