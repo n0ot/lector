@@ -12,7 +12,9 @@ macro_rules! add_callbacks_common {
         set_binding = $set_binding:expr,
         get_binding = $get_binding:expr,
         get_symbol = $get_symbol:expr,
-        clear_symbols = $clear_symbols:expr $(,)?
+        clear_symbols = $clear_symbols:expr,
+        set_hook = $set_hook:expr,
+        get_hook = $get_hook:expr $(,)?
     ) => {{
         $tbl.set("set_option", $set_option)?;
         $tbl.set("get_option", $get_option)?;
@@ -21,6 +23,8 @@ macro_rules! add_callbacks_common {
         $tbl.set("get_binding", $get_binding)?;
         $tbl.set("get_symbol", $get_symbol)?;
         $tbl.set("clear_symbols", $clear_symbols)?;
+        $tbl.set("set_hook", $set_hook)?;
+        $tbl.set("get_hook", $get_hook)?;
         Ok(())
     }};
 }
@@ -120,6 +124,14 @@ fn add_callbacks<'lua, 'scope>(
         sr.speech.symbols_map.clear();
         Ok(())
     })?;
+    let set_hook = scope.create_function_mut(|lua, (key, value): (String, Value)| {
+        let mut sr = screen_reader.borrow_mut();
+        sr.set_hook(lua, &key, value).to_lua_result()
+    })?;
+    let get_hook = scope.create_function(|lua, key: String| {
+        let sr = screen_reader.borrow();
+        sr.get_hook(lua, &key).to_lua_result()
+    })?;
 
     add_callbacks_common!(
         tbl_callbacks,
@@ -130,6 +142,8 @@ fn add_callbacks<'lua, 'scope>(
         get_binding = get_binding,
         get_symbol = get_symbol,
         clear_symbols = clear_symbols,
+        set_hook = set_hook,
+        get_hook = get_hook,
     )
 }
 
@@ -232,6 +246,22 @@ fn add_callbacks_static(
             })
         }
     })?;
+    let set_hook = lua.create_function_mut({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, (key, value): (String, Value)| {
+            with_screen_reader_mut(&sr_ptr, |sr| {
+                sr.set_hook(lua, &key, value).map_err(Error::external)
+            })
+        }
+    })?;
+    let get_hook = lua.create_function({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, key: String| {
+            with_screen_reader(&sr_ptr, |sr| {
+                sr.get_hook(lua, &key).map_err(Error::external)
+            })
+        }
+    })?;
 
     add_callbacks_common!(
         tbl_callbacks,
@@ -242,6 +272,8 @@ fn add_callbacks_static(
         get_binding = get_binding,
         get_symbol = get_symbol,
         clear_symbols = clear_symbols,
+        set_hook = set_hook,
+        get_hook = get_hook,
     )
 }
 

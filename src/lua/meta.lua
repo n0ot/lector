@@ -79,6 +79,29 @@ local tbl_lector_o_mt = {
 }
 local tbl_lector_o = setmetatable({}, tbl_lector_o_mt)
 
+local function set_hook(name, fn)
+    if type(name) ~= "string" then
+        error("hook name must be a string", 2)
+    end
+    if fn ~= nil and type(fn) ~= "function" then
+        error("hook value must be a function or nil", 2)
+    end
+    callbacks.set_hook(name, fn)
+end
+
+local tbl_lector_hooks_mt = {
+    __index = function(_, k)
+        if type(k) ~= "string" then
+            error("hook name must be a string for indexing", 2)
+        end
+        return callbacks.get_hook(k)
+    end,
+    __newindex = function(_, k, v)
+        return set_hook(k, v)
+    end,
+}
+local tbl_lector_hooks = setmetatable({}, tbl_lector_hooks_mt)
+
 local tbl_lector_mt = {
     __index = function(t, k)
         if k == 'o' then
@@ -87,6 +110,8 @@ local tbl_lector_mt = {
             return tbl_lector_symbols
         elseif k == 'bindings' then
             return tbl_lector_bindings
+        elseif k == 'hooks' then
+            return tbl_lector_hooks
         else
             return rawget(t, k)
         end
@@ -117,6 +142,8 @@ local tbl_lector_mt = {
             tbl_lector_symbols = setmetatable(v, tbl_lector_symbols_mt)
         elseif k == "bindings" then
             error("assign individual bindings via lector.bindings[key] = value", 2)
+        elseif k == "hooks" then
+            error("assign individual hooks via lector.hooks[name] = value", 2)
         else
             error("cannot assign to arbitrary keys on the lector table", 2)
         end

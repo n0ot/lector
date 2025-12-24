@@ -3,7 +3,6 @@ use super::{
     ext::{CellExt, ScreenExt},
     keymap::InputMode,
     screen_reader::{CursorTrackingMode, ScreenReader},
-    speech::Speech,
     table::{self, TableState},
     view::View,
 };
@@ -188,7 +187,7 @@ pub fn handle(
         return action_toggle_help(sr);
     }
     if sr.help_mode {
-        sr.speech.speak(&action.help_text(), false)?;
+        sr.speak(&action.help_text(), false)?;
         return Ok(CommandResult::Handled);
     }
 
@@ -236,7 +235,7 @@ pub fn handle(
         Action::TableHeaderRead => action_table_header_read(sr, view),
         Action::ToggleTableHeaderRead => action_toggle_table_header_read(sr),
         _ => {
-            sr.speech.speak("not implemented", false)?;
+            sr.speak("not implemented", false)?;
             Ok(CommandResult::Handled)
         }
     }
@@ -251,10 +250,10 @@ fn action_stop(sr: &mut ScreenReader) -> Result<CommandResult> {
 fn action_toggle_auto_read(sr: &mut ScreenReader) -> Result<CommandResult> {
     if sr.auto_read {
         sr.auto_read = false;
-        sr.speech.speak("auto read disabled", false)?;
+        sr.speak("auto read disabled", false)?;
     } else {
         sr.auto_read = true;
-        sr.speech.speak("auto read enabled", false)?;
+        sr.speak("auto read enabled", false)?;
     }
 
     Ok(CommandResult::Handled)
@@ -267,33 +266,39 @@ fn action_toggle_review_cursor_follows_screen_cursor(
     sr.review_follows_screen_cursor = !sr.review_follows_screen_cursor;
     match sr.review_follows_screen_cursor {
         true => {
+            let old = view.review_cursor_position;
             view.review_cursor_position = view.screen().cursor_position();
-            sr.speech
-                .speak("review cursor following screen cursor", false)?;
+            sr.hook_on_review_cursor_move(old, view.review_cursor_position)?;
+            sr.speak("review cursor following screen cursor", false)?;
         }
-        false => sr
-            .speech
-            .speak("review cursor not following screen cursor", false)?,
+        false => sr.speak("review cursor not following screen cursor", false)?,
     };
     Ok(CommandResult::Handled)
 }
 
 fn action_pass_next_key(sr: &mut ScreenReader) -> Result<CommandResult> {
     sr.pass_through = true;
-    sr.speech.speak("forward next key press", false)?;
+    sr.speak("forward next key press", false)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_toggle_help(sr: &mut ScreenReader) -> Result<CommandResult> {
     if sr.help_mode {
         sr.help_mode = false;
-        sr.speech.speak("exiting help", false)?;
+        sr.speak("exiting help", false)?;
     } else {
         sr.help_mode = true;
-        sr.speech
-            .speak("entering help. Press this key again to exit", false)?;
+        sr.speak("entering help. Press this key again to exit", false)?;
     }
     Ok(CommandResult::Handled)
+}
+
+fn report_review_cursor_move(
+    sr: &mut ScreenReader,
+    view: &View,
+    old_pos: (u16, u16),
+) -> Result<()> {
+    sr.hook_on_review_cursor_move(old_pos, view.review_cursor_position)
 }
 
 fn action_review_line_prev(
@@ -301,9 +306,11 @@ fn action_review_line_prev(
     view: &mut View,
     skip_blank_lines: bool,
 ) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     if !view.review_cursor_up(skip_blank_lines) {
-        sr.speech.speak("top", false)?;
+        sr.speak("top", false)?;
     }
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_line_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
@@ -313,9 +320,11 @@ fn action_review_line_next(
     view: &mut View,
     skip_blank_lines: bool,
 ) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     if !view.review_cursor_down(skip_blank_lines) {
-        sr.speech.speak("bottom", false)?;
+        sr.speak("bottom", false)?;
     }
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_line_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
@@ -325,25 +334,29 @@ fn action_review_line_read(sr: &mut ScreenReader, view: &mut View) -> Result<Com
     sr.report_review_cursor_indentation_changes(view)?;
     let line = view.line(row);
     if line.is_empty() {
-        sr.speech.speak("blank", false)?;
+        sr.speak("blank", false)?;
     } else {
-        sr.speech.speak(&line, false)?;
+        sr.speak(&line, false)?;
     }
     Ok(CommandResult::Handled)
 }
 
 fn action_review_word_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     if !view.review_cursor_prev_word() {
-        sr.speech.speak("left", false)?;
+        sr.speak("left", false)?;
     }
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_word_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_review_word_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     if !view.review_cursor_next_word() {
-        sr.speech.speak("right", false)?;
+        sr.speak("right", false)?;
     }
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_word_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
@@ -351,22 +364,26 @@ fn action_review_word_next(sr: &mut ScreenReader, view: &mut View) -> Result<Com
 fn action_review_word_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     let (row, col) = view.review_cursor_position;
     let word = view.word(row, col);
-    sr.speech.speak(&word, false)?;
+    sr.speak(&word, false)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_review_char_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     if !view.review_cursor_left() {
-        sr.speech.speak("left", false)?;
+        sr.speak("left", false)?;
     }
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_char_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_review_char_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     if !view.review_cursor_right() {
-        sr.speech.speak("right", false)?;
+        sr.speak("right", false)?;
     }
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_char_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
@@ -375,9 +392,9 @@ fn action_review_char_read(sr: &mut ScreenReader, view: &mut View) -> Result<Com
     let (row, col) = view.review_cursor_position;
     let char = view.character(row, col);
     if char.is_empty() {
-        sr.speech.speak("blank", false)?;
+        sr.speak("blank", false)?;
     } else {
-        sr.speech.speak(&char, false)?;
+        sr.speak(&char, false)?;
     }
     Ok(CommandResult::Handled)
 }
@@ -417,11 +434,12 @@ fn action_review_char_read_phonetic(
         "z" => "Zulu",
         _ => &char,
     };
-    sr.speech.speak(char, false)?;
+    sr.speak(char, false)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_review_top(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     let row = view.review_cursor_position.0;
     let last_row = view.size().0 - 1;
     let last_col = view.size().1 - 1;
@@ -432,11 +450,13 @@ fn action_review_top(sr: &mut ScreenReader, view: &mut View) -> Result<CommandRe
             .map_or(0, |(row, _)| row),
         _ => 0,
     };
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_line_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_review_bottom(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     let row = view.review_cursor_position.0;
     let last_row = view.size().0 - 1;
     let last_col = view.size().1 - 1;
@@ -447,11 +467,13 @@ fn action_review_bottom(sr: &mut ScreenReader, view: &mut View) -> Result<Comman
     } else {
         last_row
     };
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_line_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_review_first(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     let (row, col) = view.review_cursor_position;
     let last = view.size().1 - 1;
     view.review_cursor_position.1 = match col {
@@ -461,11 +483,13 @@ fn action_review_first(sr: &mut ScreenReader, view: &mut View) -> Result<Command
             .map_or(0, |(_, col)| col),
         _ => 0,
     };
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_char_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_review_last(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    let old_pos = view.review_cursor_position;
     let (row, col) = view.review_cursor_position;
     let last = view.size().1 - 1;
     view.review_cursor_position.1 = if col == last {
@@ -475,6 +499,7 @@ fn action_review_last(sr: &mut ScreenReader, view: &mut View) -> Result<CommandR
     } else {
         last
     };
+    report_review_cursor_move(sr, view, old_pos)?;
     action_review_char_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
@@ -506,7 +531,7 @@ fn action_review_read_attributes(sr: &mut ScreenReader, view: &mut View) -> Resu
         if cell.is_wide() { "wide " } else { "" },
     ));
 
-    sr.speech.speak(&attrs, false)?;
+    sr.speak(&attrs, false)?;
     Ok(CommandResult::Handled)
 }
 
@@ -518,7 +543,7 @@ fn action_backspace(sr: &mut ScreenReader, view: &mut View) -> Result<CommandRes
             .cell(row, col - 1)
             .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
             .contents();
-        sr.speech.speak(&char, false)?;
+        sr.speak(&char, false)?;
     }
     // When backspacing, the cursor will end up moving to the left, but we don't want to hear
     // that.
@@ -536,20 +561,19 @@ fn action_delete(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult
         .cell(row, col)
         .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
         .contents();
-    sr.speech.speak(&char, false)?;
+    sr.speak(&char, false)?;
     Ok(CommandResult::ForwardInput)
 }
 
 fn action_say_time(sr: &mut ScreenReader) -> Result<CommandResult> {
     let date = chrono::Local::now();
-    sr.speech
-        .speak(&format!("{}", date.format("%H:%M")), false)?;
+    sr.speak(&format!("{}", date.format("%H:%M")), false)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_set_mark(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     view.review_mark_position = Some(view.review_cursor_position);
-    sr.speech.speak("mark set", false)?;
+    sr.speak("mark set", false)?;
     Ok(CommandResult::Handled)
 }
 
@@ -558,7 +582,7 @@ fn action_copy(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> 
         Some((mark_row, mark_col)) => {
             let (cur_row, cur_col) = view.review_cursor_position;
             if mark_row > cur_row || (mark_row == cur_row && mark_col > cur_col) {
-                sr.speech.speak("mark is after the review cursor", false)?;
+                sr.speak("mark is after the review cursor", false)?;
                 return Ok(CommandResult::Handled);
             }
 
@@ -595,9 +619,11 @@ fn action_copy(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> 
                 }
             }
             sr.clipboard.put(contents);
-            sr.speech.speak("copied", false)?;
+            let entry = sr.clipboard.get().map(|value| value.to_string());
+            sr.hook_on_clipboard_change("push", entry.as_deref())?;
+            sr.speak("copied", false)?;
         }
-        None => sr.speech.speak("no mark set", false)?,
+        None => sr.speak("no mark set", false)?,
     }
     Ok(CommandResult::Handled)
 }
@@ -607,37 +633,42 @@ fn action_paste(sr: &mut ScreenReader) -> Result<CommandResult> {
         Some(contents) => {
             return Ok(CommandResult::Paste(contents.to_string()));
         }
-        None => sr.speech.speak("no clipboard", false)?,
+        None => sr.speak("no clipboard", false)?,
     }
     Ok(CommandResult::Handled)
 }
 
 fn action_clipboard_prev(sr: &mut ScreenReader) -> Result<CommandResult> {
     if sr.clipboard.size() == 0 {
-        sr.speech.speak("no clipboard", false)?;
+        sr.speak("no clipboard", false)?;
     } else if sr.clipboard.prev() {
+        let entry = sr.clipboard.get().map(|value| value.to_string());
+        sr.hook_on_clipboard_change("prev", entry.as_deref())?;
         action_clipboard_say(sr)?;
     } else {
-        sr.speech.speak("first clipboard", false)?;
+        sr.speak("first clipboard", false)?;
     }
     Ok(CommandResult::Handled)
 }
 
 fn action_clipboard_next(sr: &mut ScreenReader) -> Result<CommandResult> {
     if sr.clipboard.size() == 0 {
-        sr.speech.speak("no clipboard", false)?;
+        sr.speak("no clipboard", false)?;
     } else if sr.clipboard.next() {
+        let entry = sr.clipboard.get().map(|value| value.to_string());
+        sr.hook_on_clipboard_change("next", entry.as_deref())?;
         action_clipboard_say(sr)?;
     } else {
-        sr.speech.speak("last clipboard", false)?;
+        sr.speak("last clipboard", false)?;
     }
     Ok(CommandResult::Handled)
 }
 
 fn action_clipboard_say(sr: &mut ScreenReader) -> Result<CommandResult> {
-    match sr.clipboard.get() {
-        Some(contents) => sr.speech.speak(contents, false)?,
-        None => sr.speech.speak("no clipboard", false)?,
+    let contents = sr.clipboard.get().map(|value| value.to_string());
+    match contents {
+        Some(contents) => sr.speak(&contents, false)?,
+        None => sr.speak("no clipboard", false)?,
     }
     Ok(CommandResult::Handled)
 }
@@ -649,9 +680,10 @@ fn action_toggle_table_mode(sr: &mut ScreenReader, view: &mut View) -> Result<Co
 
     let row = view.review_cursor_position.0;
     let Some(model) = table::detect(view, row) else {
-        sr.speech.speak("no table found", false)?;
+        sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     };
+    let old_pos = view.review_cursor_position;
     let col_idx = model.column_for_col(view.review_cursor_position.1);
     sr.table_state = Some(TableState {
         model,
@@ -661,119 +693,126 @@ fn action_toggle_table_mode(sr: &mut ScreenReader, view: &mut View) -> Result<Co
         let column = &state.model.columns[state.current_col];
         view.review_cursor_position.1 = column.start;
     }
+    let old_mode = sr.input_mode;
     sr.input_mode = InputMode::Table;
-    sr.speech.speak("table mode on", false)?;
+    sr.hook_on_mode_change(old_mode, sr.input_mode)?;
+    if let Some(state) = sr.table_state.clone() {
+        sr.hook_on_table_mode_enter(&state)?;
+    }
+    report_review_cursor_move(sr, view, old_pos)?;
+    sr.speak("table mode on", false)?;
     action_table_cell_read(sr, view)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_exit_table_mode(sr: &mut ScreenReader) -> Result<CommandResult> {
+    let old_mode = sr.input_mode;
     sr.input_mode = InputMode::Normal;
     sr.table_state = None;
-    sr.speech.speak("table mode off", false)?;
+    sr.hook_on_mode_change(old_mode, sr.input_mode)?;
+    sr.hook_on_table_mode_exit()?;
+    sr.speak("table mode off", false)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_table_row_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     if !ensure_table_state(sr, view) {
-        sr.speech.speak("no table found", false)?;
+        sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     }
     let state_snapshot = sr.table_state.as_ref().unwrap().clone();
     if view.review_cursor_position.0 <= state_snapshot.model.top {
-        sr.speech.speak("top", false)?;
+        sr.speak("top", false)?;
         return Ok(CommandResult::Handled);
     }
+    let old_pos = view.review_cursor_position;
     let new_row = view.review_cursor_position.0 - 1;
     move_review_to_table_cell(view, &state_snapshot, new_row);
-    speak_table_cell(&mut sr.speech, view, &state_snapshot, false)?;
+    report_review_cursor_move(sr, view, old_pos)?;
+    speak_table_cell(sr, view, &state_snapshot, false)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_table_row_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     if !ensure_table_state(sr, view) {
-        sr.speech.speak("no table found", false)?;
+        sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     }
     let state_snapshot = sr.table_state.as_ref().unwrap().clone();
     if view.review_cursor_position.0 >= state_snapshot.model.bottom {
-        sr.speech.speak("bottom", false)?;
+        sr.speak("bottom", false)?;
         return Ok(CommandResult::Handled);
     }
+    let old_pos = view.review_cursor_position;
     let new_row = view.review_cursor_position.0 + 1;
     move_review_to_table_cell(view, &state_snapshot, new_row);
-    speak_table_cell(&mut sr.speech, view, &state_snapshot, false)?;
+    report_review_cursor_move(sr, view, old_pos)?;
+    speak_table_cell(sr, view, &state_snapshot, false)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_table_col_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     if !ensure_table_state(sr, view) {
-        sr.speech.speak("no table found", false)?;
+        sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     }
+    let old_pos = view.review_cursor_position;
     let state_snapshot = {
         let state = sr.table_state.as_mut().unwrap();
         if state.current_col == 0 {
-            sr.speech.speak("left", false)?;
+            sr.speak("left", false)?;
             return Ok(CommandResult::Handled);
         }
         state.current_col -= 1;
         move_review_to_table_cell(view, state, view.review_cursor_position.0);
         state.clone()
     };
-    speak_table_cell(
-        &mut sr.speech,
-        view,
-        &state_snapshot,
-        sr.table_header_auto,
-    )?;
+    report_review_cursor_move(sr, view, old_pos)?;
+    speak_table_cell(sr, view, &state_snapshot, sr.table_header_auto)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_table_col_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     if !ensure_table_state(sr, view) {
-        sr.speech.speak("no table found", false)?;
+        sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     }
+    let old_pos = view.review_cursor_position;
     let state_snapshot = {
         let state = sr.table_state.as_mut().unwrap();
         if state.current_col + 1 >= state.model.columns.len() {
-            sr.speech.speak("right", false)?;
+            sr.speak("right", false)?;
             return Ok(CommandResult::Handled);
         }
         state.current_col += 1;
         move_review_to_table_cell(view, state, view.review_cursor_position.0);
         state.clone()
     };
-    speak_table_cell(
-        &mut sr.speech,
-        view,
-        &state_snapshot,
-        sr.table_header_auto,
-    )?;
+    report_review_cursor_move(sr, view, old_pos)?;
+    speak_table_cell(sr, view, &state_snapshot, sr.table_header_auto)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_table_cell_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     if !ensure_table_state(sr, view) {
-        sr.speech.speak("no table found", false)?;
+        sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     }
     let state = sr.table_state.as_ref().unwrap().clone();
-    speak_table_cell(&mut sr.speech, view, &state, false)?;
+    speak_table_cell(sr, view, &state, false)?;
     Ok(CommandResult::Handled)
 }
 
 fn action_table_header_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     if !ensure_table_state(sr, view) {
-        sr.speech.speak("no table found", false)?;
+        sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     }
     let state = sr.table_state.as_ref().unwrap().clone();
     if let Some(text) = state.model.header_text(view, state.current_col) {
-        sr.speech.speak(&text, false)?;
+        sr.speak(&text, false)?;
     } else {
-        sr.speech.speak("no header", false)?;
+        sr.speak("no header", false)?;
     }
     Ok(CommandResult::Handled)
 }
@@ -781,8 +820,7 @@ fn action_table_header_read(sr: &mut ScreenReader, view: &mut View) -> Result<Co
 fn action_toggle_table_header_read(sr: &mut ScreenReader) -> Result<CommandResult> {
     sr.table_header_auto = !sr.table_header_auto;
     let status = if sr.table_header_auto { "on" } else { "off" };
-    sr.speech
-        .speak(&format!("table headers {}", status), false)?;
+    sr.speak(&format!("table headers {}", status), false)?;
     Ok(CommandResult::Handled)
 }
 
@@ -823,7 +861,7 @@ fn move_review_to_table_cell(view: &mut View, state: &TableState, row: u16) {
 }
 
 fn speak_table_cell(
-    speech: &mut Speech,
+    sr: &mut ScreenReader,
     view: &View,
     state: &TableState,
     include_header: bool,
@@ -833,16 +871,16 @@ fn speak_table_cell(
         if let Some(header_row) = state.model.header_row {
             if header_row != row {
                 if let Some(text) = state.model.header_text(view, state.current_col) {
-                    speech.speak(&text, false)?;
+                    sr.speak(&text, false)?;
                 }
             }
         }
     }
     let text = state.model.cell_text(view, row, state.current_col);
     if text.is_empty() {
-        speech.speak("blank", false)?;
+        sr.speak("blank", false)?;
     } else {
-        speech.speak(&text, false)?;
+        sr.speak(&text, false)?;
     }
     Ok(())
 }
@@ -857,8 +895,7 @@ fn action_toggle_symbol_level(sr: &mut ScreenReader) -> Result<CommandResult> {
         Level::All | Level::Character => Level::None,
     };
 
-    sr.speech
-        .speak(&format!("{}", sr.speech.symbol_level), false)?;
+    sr.speak(&format!("{}", sr.speech.symbol_level), false)?;
 
     Ok(CommandResult::Handled)
 }

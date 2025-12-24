@@ -7,8 +7,8 @@ use super::{
     table::TableState,
     view::View,
 };
-use anyhow::Result;
-use mlua::{Lua, WeakLua};
+use anyhow::{Result, anyhow};
+use mlua::{Function, Lua, RegistryKey, Value, WeakLua};
 use similar::{Algorithm, ChangeTag, TextDiff};
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -36,6 +36,7 @@ pub struct ScreenReader {
     pub table_header_auto: bool,
     pub lua_ctx: Option<Rc<Lua>>,
     pub lua_ctx_weak: Option<WeakLua>,
+    lua_hooks: LuaHooks,
 }
 
 impl ScreenReader {
@@ -56,12 +57,401 @@ impl ScreenReader {
             table_header_auto: true,
             lua_ctx: None,
             lua_ctx_weak: None,
+            lua_hooks: LuaHooks::default(),
         }
     }
 
     pub fn set_lua_context(&mut self, lua: Rc<Lua>) {
         self.lua_ctx_weak = Some(lua.weak());
         self.lua_ctx = Some(lua);
+    }
+
+    pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.call_hook_on_speech_start(text, interrupt)?;
+        let result = self.speech.speak(text, interrupt);
+        let ok = result.is_ok();
+        self.call_hook_on_speech_end(text, interrupt, ok)?;
+        result
+    }
+
+    pub fn set_hook(&mut self, lua: &Lua, name: &str, value: Value) -> anyhow::Result<()> {
+        match value {
+            Value::Nil => {
+                let Some(slot) = self.lua_hooks.slot_mut(name) else {
+                    return Err(anyhow!("unknown hook: {}", name));
+                };
+                if let Some(key) = slot.take() {
+                    lua.remove_registry_value(key)
+                        .map_err(|err| anyhow!(err.to_string()))?;
+                }
+                Ok(())
+            }
+            Value::Function(func) => {
+                self.ensure_lua_context(lua)?;
+                let Some(slot) = self.lua_hooks.slot_mut(name) else {
+                    return Err(anyhow!("unknown hook: {}", name));
+                };
+                if let Some(key) = slot.take() {
+                    lua.remove_registry_value(key)
+                        .map_err(|err| anyhow!(err.to_string()))?;
+                }
+                let key = lua
+                    .create_registry_value(func)
+                    .map_err(|err| anyhow!(err.to_string()))?;
+                *slot = Some(key);
+                Ok(())
+            }
+            _ => Err(anyhow!("hook value must be a function or nil")),
+        }
+    }
+
+    pub fn get_hook(&self, lua: &Lua, name: &str) -> anyhow::Result<Value> {
+        let Some(slot) = self.lua_hooks.slot(name) else {
+            return Err(anyhow!("unknown hook: {}", name));
+        };
+        let Some(key) = slot else {
+            return Ok(Value::Nil);
+        };
+        self.ensure_lua_context(lua)?;
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        Ok(Value::Function(func))
+    }
+
+    pub fn hook_on_startup(&mut self, config_path: &str) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_startup else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let tbl = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("config_path", config_path)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("version", env!("CARGO_PKG_VERSION"))
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("pid", std::process::id())
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>(tbl)
+            .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    pub fn hook_on_shutdown(&mut self, reason: &str) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_shutdown else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>(reason.to_string())
+            .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    pub fn hook_on_error(&mut self, message: &str, context: &str) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_error else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>((
+            message.to_string(),
+            context.to_string(),
+        ))
+        .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    pub fn hook_on_screen_update(
+        &mut self,
+        view: &View,
+        overlay_active: bool,
+    ) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_screen_update else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let (rows, cols) = view.size();
+        let (cursor_row, cursor_col) = view.screen().cursor_position();
+        let (prev_cursor_row, prev_cursor_col) = view.prev_screen().cursor_position();
+        let changed = view.screen().contents() != view.prev_screen().contents();
+        let tbl = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("rows", rows)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("cols", cols)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("cursor_row", cursor_row)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("cursor_col", cursor_col)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("prev_cursor_row", prev_cursor_row)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("prev_cursor_col", prev_cursor_col)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("changed", changed)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("overlay", overlay_active)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("screen", view.contents_full())
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("prev_screen", view.prev_screen().contents_full())
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>(tbl)
+            .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    pub fn hook_on_review_cursor_move(
+        &mut self,
+        old_pos: (u16, u16),
+        new_pos: (u16, u16),
+    ) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_review_cursor_move else {
+            return Ok(());
+        };
+        if old_pos == new_pos {
+            return Ok(());
+        }
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let tbl = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("row", new_pos.0)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("col", new_pos.1)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("prev_row", old_pos.0)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("prev_col", old_pos.1)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>(tbl)
+            .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    pub fn hook_on_mode_change(&mut self, old: InputMode, new: InputMode) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_mode_change else {
+            return Ok(());
+        };
+        if old == new {
+            return Ok(());
+        }
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>((
+            old.as_str().to_string(),
+            new.as_str().to_string(),
+        ))
+        .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    pub fn hook_on_table_mode_enter(
+        &mut self,
+        table_state: &TableState,
+    ) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_table_mode_enter else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let model = &table_state.model;
+        let tbl = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("top", model.top)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("bottom", model.bottom)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        tbl.set("columns", model.columns.len())
+            .map_err(|err| anyhow!(err.to_string()))?;
+        if let Some(row) = model.header_row {
+            tbl.set("header_row", row)
+                .map_err(|err| anyhow!(err.to_string()))?;
+        } else {
+            tbl.set("header_row", Value::Nil)
+                .map_err(|err| anyhow!(err.to_string()))?;
+        }
+        tbl.set("current_col", table_state.current_col)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>(tbl)
+            .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    pub fn hook_on_table_mode_exit(&mut self) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_table_mode_exit else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>(())
+            .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    pub fn hook_on_clipboard_change(
+        &mut self,
+        op: &str,
+        entry: Option<&str>,
+    ) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_clipboard_change else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let meta = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("op", op)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("index", self.clipboard.index())
+            .map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("size", self.clipboard.size())
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let entry = match entry {
+            Some(value) => Value::String(lua.create_string(value).map_err(|err| anyhow!(err.to_string()))?),
+            None => Value::Nil,
+        };
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>( (entry, meta) )
+            .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    pub fn hook_on_key_unhandled(
+        &mut self,
+        key: Option<&str>,
+        mode: InputMode,
+    ) -> Result<bool> {
+        let Some(key_ref) = &self.lua_hooks.on_key_unhandled else {
+            return Ok(false);
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(false);
+        };
+        let func: Function = lua
+            .registry_value(key_ref)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let key_value = match key {
+            Some(value) => Value::String(lua.create_string(value).map_err(|err| anyhow!(err.to_string()))?),
+            None => Value::Nil,
+        };
+        let res: Value = func
+            .call((key_value, mode.as_str().to_string()))
+            .map_err(|err| anyhow!(err.to_string()))?;
+        Ok(matches!(res, Value::Boolean(true)))
+    }
+
+    pub fn hook_on_live_read(
+        &mut self,
+        text: &str,
+        cursor_moves: usize,
+        scrolled: bool,
+    ) -> Result<Option<String>> {
+        let Some(key) = &self.lua_hooks.on_live_read else {
+            return Ok(Some(text.to_string()));
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(Some(text.to_string()));
+        };
+        let meta = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("cursor_moves", cursor_moves)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("scrolled", scrolled)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let res: Value = func
+            .call((text.to_string(), meta))
+            .map_err(|err| anyhow!(err.to_string()))?;
+        match res {
+            Value::Nil => Ok(None),
+            Value::Boolean(false) => Ok(None),
+            Value::String(s) => Ok(Some(
+                s.to_str()
+                    .map_err(|err| anyhow!(err.to_string()))?
+                    .to_string(),
+            )),
+            _ => Err(anyhow!("on_live_read must return a string or nil")),
+        }
+    }
+
+    fn call_hook_on_speech_start(&mut self, text: &str, interrupt: bool) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_speech_start else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let meta = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("interrupt", interrupt)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>( (text.to_string(), meta) )
+            .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    fn call_hook_on_speech_end(
+        &mut self,
+        text: &str,
+        interrupt: bool,
+        ok: bool,
+    ) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_speech_end else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let meta = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("interrupt", interrupt)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("ok", ok)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let func: Function = lua
+            .registry_value(key)
+            .map_err(|err| anyhow!(err.to_string()))?;
+        func.call::<()>( (text.to_string(), meta) )
+            .map_err(|err| anyhow!(err.to_string()))
+    }
+
+    fn ensure_lua_context(&self, lua: &Lua) -> anyhow::Result<()> {
+        let Some(weak_ctx) = self.lua_ctx_weak.as_ref() else {
+            return Err(anyhow!("lua hooks are only available in init.lua"));
+        };
+        if *weak_ctx != lua.weak() {
+            return Err(anyhow!("lua hooks are only available in init.lua"));
+        }
+        Ok(())
     }
 
     pub fn track_cursor(&mut self, view: &mut View) -> Result<()> {
@@ -101,7 +491,7 @@ impl ScreenReader {
             CursorTrackingMode::On => {
                 self.report_application_cursor_indentation_changes(view)?;
                 if let Some(s) = cursor_report {
-                    self.speech.speak(&s, false)?;
+                    self.speak(&s, false)?;
                 }
             }
             CursorTrackingMode::OffOnce => self.cursor_tracking_mode = CursorTrackingMode::On,
@@ -118,7 +508,7 @@ impl ScreenReader {
 
         for hl in highlights {
             if !prev_hl_set.contains(&hl) {
-                self.speech.speak(&hl, false)?;
+                self.speak(&hl, false)?;
             }
         }
         Ok(())
@@ -131,8 +521,7 @@ impl ScreenReader {
     ) -> Result<()> {
         let (indent_level, changed) = view.application_cursor_indentation_level();
         if changed {
-            self.speech
-                .speak(&format!("indent {}", indent_level), false)?;
+            self.speak(&format!("indent {}", indent_level), false)?;
         }
 
         Ok(())
@@ -145,8 +534,7 @@ impl ScreenReader {
     ) -> Result<()> {
         let (indent_level, changed) = view.review_cursor_indentation_level();
         if changed {
-            self.speech
-                .speak(&format!("indent {}", indent_level), false)?;
+            self.speak(&format!("indent {}", indent_level), false)?;
         }
 
         Ok(())
@@ -185,14 +573,23 @@ impl ScreenReader {
 
         if !text.is_empty() && (cursor_moves == 0 || scrolled) {
             // Don't echo typed keys
+            let mut spoken = false;
             match std::str::from_utf8(&self.last_key) {
                 Ok(s) if text == s => {}
-                _ => self.speech.speak(&text, false)?,
+                _ => {
+                    let text = self.hook_on_live_read(text, cursor_moves, scrolled)?;
+                    if let Some(text) = text {
+                        if !text.is_empty() {
+                            self.speak(&text, false)?;
+                            spoken = true;
+                        }
+                    }
+                }
             }
 
-            // We still want to report that text was read when suppressing echo,
+            // We still want to report that text was read when suppressing echo or hook output,
             // so that cursor tracking doesn't read the character that follows as we type.
-            return Ok(true);
+            return Ok(spoken || !text.is_empty());
         }
 
         // Do a diff instead
@@ -300,9 +697,72 @@ impl ScreenReader {
             // so that cursor tracking doesn't read the character that follows as we type.
             Ok(s) if text == s => Ok(true),
             _ => {
-                self.speech.speak(&text, false)?;
-                Ok(!text.is_empty())
+                let original_nonempty = !text.is_empty();
+                let text = self.hook_on_live_read(&text, cursor_moves, scrolled)?;
+                if let Some(text) = text {
+                    if !text.is_empty() {
+                        self.speak(&text, false)?;
+                    }
+                }
+                Ok(original_nonempty)
             }
+        }
+    }
+}
+
+#[derive(Default)]
+struct LuaHooks {
+    on_startup: Option<RegistryKey>,
+    on_shutdown: Option<RegistryKey>,
+    on_screen_update: Option<RegistryKey>,
+    on_live_read: Option<RegistryKey>,
+    on_review_cursor_move: Option<RegistryKey>,
+    on_mode_change: Option<RegistryKey>,
+    on_table_mode_enter: Option<RegistryKey>,
+    on_table_mode_exit: Option<RegistryKey>,
+    on_clipboard_change: Option<RegistryKey>,
+    on_speech_start: Option<RegistryKey>,
+    on_speech_end: Option<RegistryKey>,
+    on_key_unhandled: Option<RegistryKey>,
+    on_error: Option<RegistryKey>,
+}
+
+impl LuaHooks {
+    fn slot_mut(&mut self, name: &str) -> Option<&mut Option<RegistryKey>> {
+        match name {
+            "on_startup" => Some(&mut self.on_startup),
+            "on_shutdown" => Some(&mut self.on_shutdown),
+            "on_screen_update" => Some(&mut self.on_screen_update),
+            "on_live_read" => Some(&mut self.on_live_read),
+            "on_review_cursor_move" => Some(&mut self.on_review_cursor_move),
+            "on_mode_change" => Some(&mut self.on_mode_change),
+            "on_table_mode_enter" => Some(&mut self.on_table_mode_enter),
+            "on_table_mode_exit" => Some(&mut self.on_table_mode_exit),
+            "on_clipboard_change" => Some(&mut self.on_clipboard_change),
+            "on_speech_start" => Some(&mut self.on_speech_start),
+            "on_speech_end" => Some(&mut self.on_speech_end),
+            "on_key_unhandled" => Some(&mut self.on_key_unhandled),
+            "on_error" => Some(&mut self.on_error),
+            _ => None,
+        }
+    }
+
+    fn slot(&self, name: &str) -> Option<&Option<RegistryKey>> {
+        match name {
+            "on_startup" => Some(&self.on_startup),
+            "on_shutdown" => Some(&self.on_shutdown),
+            "on_screen_update" => Some(&self.on_screen_update),
+            "on_live_read" => Some(&self.on_live_read),
+            "on_review_cursor_move" => Some(&self.on_review_cursor_move),
+            "on_mode_change" => Some(&self.on_mode_change),
+            "on_table_mode_enter" => Some(&self.on_table_mode_enter),
+            "on_table_mode_exit" => Some(&self.on_table_mode_exit),
+            "on_clipboard_change" => Some(&self.on_clipboard_change),
+            "on_speech_start" => Some(&self.on_speech_start),
+            "on_speech_end" => Some(&self.on_speech_end),
+            "on_key_unhandled" => Some(&self.on_key_unhandled),
+            "on_error" => Some(&self.on_error),
+            _ => None,
         }
     }
 }

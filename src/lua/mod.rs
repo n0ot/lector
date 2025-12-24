@@ -21,11 +21,26 @@ where
         load_file(&lua, &init_lua_file)?.call::<()>(())?;
     }
 
-    if let Err(e) = after(screen_reader) {
-        return Err(Error::external(e));
+    if let Some(path) = init_lua_file.to_str() {
+        screen_reader
+            .hook_on_startup(path)
+            .map_err(Error::external)?;
     }
 
-    Ok(())
+    let result = after(screen_reader);
+    match result {
+        Ok(()) => {
+            screen_reader
+                .hook_on_shutdown("exit")
+                .map_err(Error::external)?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = screen_reader.hook_on_error(&err.to_string(), "runtime");
+            let _ = screen_reader.hook_on_shutdown("error");
+            Err(Error::external(err))
+        }
+    }
 }
 
 pub fn setup_repl(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
@@ -64,7 +79,7 @@ fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Resu
             }
             // Safety: pointer is set by the main thread before any Lua call.
             let sr = unsafe { &mut *ptr };
-            sr.speech.speak(&text, interrupt).to_lua_result()
+            sr.speak(&text, interrupt).to_lua_result()
         })?;
     tbl_api.set("speak", speak_fn)?;
     tbl_lector.set("api", tbl_api)?;

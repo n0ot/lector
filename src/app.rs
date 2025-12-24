@@ -245,14 +245,17 @@ impl App {
             return self.dispatch_to_view(sr, raw, pty_out, term_out);
         }
 
-        let binding = self.binding_for_key_event(sr, key_event);
+        let binding_name = self.key_event_binding_name(key_event);
+        let binding = binding_name
+            .as_ref()
+            .and_then(|name| sr.key_bindings.binding_for_mode(sr.input_mode, name.as_str()));
         if let Some(binding) = binding {
             if sr.help_mode {
                 if matches!(binding, Binding::Builtin(commands::Action::ToggleHelp)) {
                     // Allow exiting help mode.
                 } else {
                     let help = binding.help_text();
-                    sr.speech.speak(&help, false)?;
+                    sr.speak(&help, false)?;
                     return Ok(());
                 }
             }
@@ -260,7 +263,7 @@ impl App {
                 Binding::Builtin(action) => {
                     if matches!(action, commands::Action::OpenLuaRepl) {
                         if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
-                            sr.speech.speak("Lua REPL already open", false)?;
+                            sr.speak("Lua REPL already open", false)?;
                             return Ok(());
                         }
                         let (rows, cols) = self.view_stack.active_mut().model().size();
@@ -291,8 +294,11 @@ impl App {
                 }
             }
         } else if sr.help_mode {
-            sr.speech.speak("this key is unmapped", false)?;
+            sr.speak("this key is unmapped", false)?;
         } else {
+            if sr.hook_on_key_unhandled(binding_name.as_deref(), sr.input_mode)? {
+                return Ok(());
+            }
             self.dispatch_to_view(sr, raw, pty_out, term_out)?;
         }
         Ok(())
@@ -319,16 +325,6 @@ impl App {
             sr.speech.stop()?;
         }
         Ok(())
-    }
-
-    fn binding_for_key_event<'a>(
-        &self,
-        sr: &'a ScreenReader,
-        key_event: KeyEvent,
-    ) -> Option<&'a Binding> {
-        let binding = self.key_event_binding_name(key_event)?;
-        sr.key_bindings
-            .binding_for_mode(sr.input_mode, binding.as_str())
     }
 
     fn key_event_binding_name(&self, key_event: KeyEvent) -> Option<String> {
@@ -433,9 +429,12 @@ impl App {
             if sr.review_follows_screen_cursor
                 && view.screen().cursor_position() != view.prev_screen().cursor_position()
             {
+                let old = view.review_cursor_position;
                 view.review_cursor_position = view.screen().cursor_position();
+                sr.hook_on_review_cursor_move(old, view.review_cursor_position)?;
             }
 
+            sr.hook_on_screen_update(view, overlay_active)?;
             view.finalize_changes(now_ms);
             return Ok(true);
         }
@@ -512,12 +511,12 @@ impl App {
     fn announce_view_change(&mut self, sr: &mut ScreenReader) -> Result<()> {
         let title = self.view_stack.active_mut().title().to_string();
         let view = self.view_stack.active_mut().model();
-        sr.speech.speak(&title, false)?;
+        sr.speak(&title, false)?;
         let contents = view.contents_full();
         if contents.trim().is_empty() {
-            sr.speech.speak("blank screen", false)?;
+            sr.speak("blank screen", false)?;
         } else {
-            sr.speech.speak(&contents, false)?;
+            sr.speak(&contents, false)?;
         }
         view.finalize_changes(self.clock.now_ms());
         Ok(())
@@ -525,6 +524,7 @@ impl App {
 
     fn read_active_view_changes(&mut self, sr: &mut ScreenReader) -> Result<()> {
         let now_ms = self.clock.now_ms();
+        let overlay_active = self.view_stack.has_overlay();
         let view = self.view_stack.active_mut().model();
         let read_text = if sr.auto_read {
             let mut reporter = perform::Reporter::new();
@@ -540,8 +540,11 @@ impl App {
         if sr.review_follows_screen_cursor
             && view.screen().cursor_position() != view.prev_screen().cursor_position()
         {
+            let old = view.review_cursor_position;
             view.review_cursor_position = view.screen().cursor_position();
+            sr.hook_on_review_cursor_move(old, view.review_cursor_position)?;
         }
+        sr.hook_on_screen_update(view, overlay_active)?;
         view.finalize_changes(now_ms);
         Ok(())
     }

@@ -51,7 +51,7 @@ impl ViewController for PtyView {
             write!(pty_stream, "{}", contents)?;
         }
         pty_stream.flush()?;
-        sr.speech.speak("pasted", false)?;
+        sr.speak("pasted", false)?;
         Ok(ViewAction::PtyInput)
     }
 

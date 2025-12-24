@@ -50,4 +50,8 @@ impl Clipboard {
     pub fn size(&self) -> usize {
         self.clipboards.len()
     }
+
+    pub fn index(&self) -> usize {
+        self.idx
+    }
 }

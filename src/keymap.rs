@@ -19,6 +19,13 @@ impl InputMode {
             _ => None,
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InputMode::Normal => "normal",
+            InputMode::Table => "table",
+        }
+    }
 }
 
 #[derive(Debug)]

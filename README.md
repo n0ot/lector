@@ -123,6 +123,51 @@ lector.bindings["M-r"] = {
 }
 ```
 
+### Lua hooks
+
+Hooks let you respond to Lector events.
+
+```lua
+-- set a hook
+lector.hooks.on_screen_update = function(ev)
+  -- ev.screen / ev.prev_screen are full screen strings
+end
+
+-- unset a hook
+lector.hooks.on_screen_update = nil
+```
+
+Available hooks:
+
+```lua
+-- lifecycle
+lector.hooks.on_startup = function(ctx) end         -- ctx: { config_path, version, pid }
+lector.hooks.on_shutdown = function(reason) end     -- reason: "exit" | "error"
+lector.hooks.on_error = function(message, context) end
+
+-- screen + live reading
+lector.hooks.on_screen_update = function(ev) end    -- ev: { rows, cols, cursor_row, cursor_col, prev_cursor_row, prev_cursor_col, changed, overlay, screen, prev_screen }
+lector.hooks.on_live_read = function(text, meta)    -- meta: { cursor_moves, scrolled }, return string or nil to suppress
+  return text
+end
+
+-- speech
+lector.hooks.on_speech_start = function(text, meta) end  -- meta: { interrupt }
+lector.hooks.on_speech_end = function(text, meta) end    -- meta: { interrupt, ok }
+
+-- navigation + mode
+lector.hooks.on_review_cursor_move = function(pos) end   -- pos: { row, col, prev_row, prev_col }
+lector.hooks.on_mode_change = function(old, new) end     -- "normal" | "table"
+lector.hooks.on_table_mode_enter = function(meta) end    -- meta: { top, bottom, columns, header_row, current_col }
+lector.hooks.on_table_mode_exit = function() end
+
+-- clipboard + input
+lector.hooks.on_clipboard_change = function(entry, meta) end -- meta: { op, index, size }, op: "push" | "prev" | "next"
+lector.hooks.on_key_unhandled = function(key, mode)          -- return true to consume
+  return false
+end
+```
+
 ## Lua REPL
 
 Lector has a built‑in Lua REPL so you can try commands while it’s running. Open it with `M-L`, experiment, then close it when you’re done.
