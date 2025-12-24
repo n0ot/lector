@@ -16,6 +16,13 @@ const CTRL_D_CSI: &[u8] = b"\x1B[27;5;100~";
 const OSC_START: u8 = b']';
 const ST_ESCAPE: u8 = b'\\';
 
+fn is_ss3_final(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'D' | b'C' | b'A' | b'B' | b'H' | b'F' | b'P'..=b'S'
+    )
+}
+
 pub trait Clock {
     fn now_ms(&self) -> u128;
 }
@@ -147,6 +154,9 @@ impl App {
             if self.pending_input.is_empty() {
                 return Ok(());
             }
+            if self.pending_input.len() == 1 && self.pending_input[0] == b'\x1B' {
+                return Ok(());
+            }
 
             match self.pending_osc_status() {
                 PendingStatus::Complete(osc_len) => {
@@ -173,6 +183,22 @@ impl App {
                     PendingStatus::Incomplete => return Ok(()),
                     PendingStatus::None => {}
                 }
+            }
+
+            if self.pending_input.len() >= 3
+                && self.pending_input[0] == b'\x1B'
+                && self.pending_input[1] == b'O'
+                && !is_ss3_final(self.pending_input[2])
+            {
+                let raw: Vec<u8> = self.pending_input.drain(..2).collect();
+                if self.pending_input.is_empty() {
+                    self.pending_input_last_at = None;
+                }
+                let event = Event::Key(
+                    KeyEvent::new(KeyCode::Char('O')).modifiers(KeyModifiers::ALT),
+                );
+                self.handle_event(sr, event, &raw, pty_out, term_out)?;
+                continue;
             }
 
             let buf = self.pending_input.make_contiguous();
