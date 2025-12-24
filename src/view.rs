@@ -10,6 +10,12 @@ pub struct View {
     pub(crate) review_mark_position: Option<(u16, u16)>, // (row, col)
     review_cursor_indent_level: u16,
     application_cursor_indent_level: u16,
+    cached_full: String,
+    cached_prev_full: String,
+    cached_full_valid: bool,
+    cached_prev_full_valid: bool,
+    cached_full_row_hashes: Vec<u64>,
+    cached_prev_full_row_hashes: Vec<u64>,
 }
 
 impl View {
@@ -26,6 +32,12 @@ impl View {
             review_mark_position: None,
             review_cursor_indent_level: 0,
             application_cursor_indent_level: 0,
+            cached_full: String::new(),
+            cached_prev_full: String::new(),
+            cached_full_valid: false,
+            cached_prev_full_valid: false,
+            cached_full_row_hashes: Vec::new(),
+            cached_prev_full_row_hashes: Vec::new(),
         }
     }
 
@@ -33,6 +45,8 @@ impl View {
     pub fn process_changes(&mut self, buf: &[u8]) {
         self.parser.process(buf);
         self.next_bytes.extend_from_slice(buf);
+        self.cached_full_valid = false;
+        self.cached_full_row_hashes.clear();
         // If the screen's size changed, the cursor may now be out of bounds.
         let review_cursor_position = self.review_cursor_position;
         let (rows, cols) = self.size();
@@ -57,6 +71,15 @@ impl View {
         self.prev_screen = self.screen().clone();
         self.prev_screen_time = now_ms;
         self.next_bytes.clear();
+        if self.cached_full_valid {
+            self.cached_prev_full.clone_from(&self.cached_full);
+            self.cached_prev_full_valid = true;
+            self.cached_prev_full_row_hashes
+                .clone_from(&self.cached_full_row_hashes);
+        } else {
+            self.cached_prev_full_valid = false;
+            self.cached_prev_full_row_hashes.clear();
+        }
     }
 
     /// Gets the current screen backing this view
@@ -76,6 +99,8 @@ impl View {
     /// Resizes this view
     pub fn set_size(&mut self, rows: u16, cols: u16) {
         self.parser.screen_mut().set_size(rows, cols);
+        self.cached_full_valid = false;
+        self.cached_full_row_hashes.clear();
         // If the screen's size changed, the cursor may now be out of bounds.
         let review_cursor_position = self.review_cursor_position;
         let max_row = rows.saturating_sub(1);
@@ -277,4 +302,58 @@ impl View {
     pub fn contents_full(&self) -> String {
         self.screen().contents_full()
     }
+
+    /// Writes the contents of the full screen, including blank lines, into `out`.
+    pub fn contents_full_into(&self, out: &mut String) {
+        self.screen().contents_full_into(out);
+    }
+
+    pub fn full_contents_cached(&mut self) -> (&str, &str, &[u64], &[u64]) {
+        self.ensure_cached_full();
+        self.ensure_cached_prev_full();
+        (
+            &self.cached_prev_full,
+            &self.cached_full,
+            &self.cached_prev_full_row_hashes,
+            &self.cached_full_row_hashes,
+        )
+    }
+
+    fn ensure_cached_full(&mut self) {
+        if self.cached_full_valid {
+            return;
+        }
+        let mut cached_full = std::mem::take(&mut self.cached_full);
+        self.screen().contents_full_into(&mut cached_full);
+        compute_row_hashes(&cached_full, &mut self.cached_full_row_hashes);
+        self.cached_full = cached_full;
+        self.cached_full_valid = true;
+    }
+
+    fn ensure_cached_prev_full(&mut self) {
+        if self.cached_prev_full_valid {
+            return;
+        }
+        let mut cached_prev_full = std::mem::take(&mut self.cached_prev_full);
+        self.prev_screen.contents_full_into(&mut cached_prev_full);
+        compute_row_hashes(&cached_prev_full, &mut self.cached_prev_full_row_hashes);
+        self.cached_prev_full = cached_prev_full;
+        self.cached_prev_full_valid = true;
+    }
+}
+
+fn compute_row_hashes(source: &str, out: &mut Vec<u64>) {
+    out.clear();
+    for line in source.split_terminator('\n') {
+        out.push(fnv1a_64(line.as_bytes()));
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }

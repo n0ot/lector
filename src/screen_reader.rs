@@ -37,6 +37,9 @@ pub struct ScreenReader {
     pub lua_ctx: Option<Rc<Lua>>,
     pub lua_ctx_weak: Option<WeakLua>,
     lua_hooks: LuaHooks,
+    diff_text: String,
+    diff_graphemes: String,
+    live_text: String,
 }
 
 impl ScreenReader {
@@ -58,6 +61,9 @@ impl ScreenReader {
             lua_ctx: None,
             lua_ctx_weak: None,
             lua_hooks: LuaHooks::default(),
+            diff_text: String::new(),
+            diff_graphemes: String::new(),
+            live_text: String::new(),
         }
     }
 
@@ -561,45 +567,63 @@ impl ScreenReader {
         // so screen.contents() only returns the new text.
         // Using a much taller screen so that we capture text, even if it scrolled off of the real
         // screen.
-        let mut text = String::new();
+        let mut live_text = std::mem::take(&mut self.live_text);
+        live_text.clear();
         if !view.next_bytes.is_empty() {
             let (rows, cols) = view.size();
             let mut parser = vt100::Parser::new(rows * 10, cols, 0);
             parser.process(format!("\x1B[{}B", rows * 10).as_bytes());
             parser.process(&view.next_bytes);
-            text = parser.screen().contents();
+            live_text = parser.screen().contents();
         }
-        let text = text.trim();
-
-        if !text.is_empty() && (cursor_moves == 0 || scrolled) {
-            // Don't echo typed keys
-            let mut spoken = false;
-            match std::str::from_utf8(&self.last_key) {
-                Ok(s) if text == s => {}
-                _ => {
-                    let text = self.hook_on_live_read(text, cursor_moves, scrolled)?;
-                    if let Some(text) = text {
-                        if !text.is_empty() {
-                            self.speak(&text, false)?;
-                            spoken = true;
+        let mut live_read_result = None;
+        {
+            let text = live_text.trim();
+            if !text.is_empty() && (cursor_moves == 0 || scrolled) {
+                // Don't echo typed keys
+                let mut spoken = false;
+                match std::str::from_utf8(&self.last_key) {
+                    Ok(s) if text == s => {}
+                    _ => {
+                        let text = self.hook_on_live_read(text, cursor_moves, scrolled)?;
+                        if let Some(text) = text {
+                            if !text.is_empty() {
+                                self.speak(&text, false)?;
+                                spoken = true;
+                            }
                         }
                     }
                 }
-            }
 
-            // We still want to report that text was read when suppressing echo or hook output,
-            // so that cursor tracking doesn't read the character that follows as we type.
-            return Ok(spoken || !text.is_empty());
+                // We still want to report that text was read when suppressing echo or hook output,
+                // so that cursor tracking doesn't read the character that follows as we type.
+                live_read_result = Some(spoken || !text.is_empty());
+            }
         }
 
+        if let Some(result) = live_read_result {
+            self.live_text = live_text;
+            return Ok(result);
+        }
+
+        self.live_text = live_text;
+
         // Do a diff instead
-        let mut text = String::new();
-        let old = view.prev_screen().contents_full();
-        let new = view.screen().contents_full();
+        let mut diff_text = std::mem::take(&mut self.diff_text);
+        diff_text.clear();
+        let (old_text, new_text, prev_hashes, curr_hashes) = view.full_contents_cached();
+
+        if prev_hashes.len() == curr_hashes.len()
+            && prev_hashes == curr_hashes
+            && old_text == new_text
+        {
+            self.diff_text = diff_text;
+            return Ok(false);
+        }
 
         let line_changes = TextDiff::configure()
             .algorithm(Algorithm::Patience)
-            .diff_lines(&old, &new);
+            .diff_lines(old_text, new_text);
         // One deletion followed by one insertion, and no other changes,
         // means only a single line changed. In that case, only report what changed in that
         // line.
@@ -635,18 +659,22 @@ impl ScreenReader {
                 DiffState::Multi => DiffState::Multi,
             };
             if change.tag() == ChangeTag::Insert {
-                text.push_str(&format!("{}\n", change));
+                if let Some(change_str) = change.as_str() {
+                    diff_text.push_str(change_str);
+                    diff_text.push('\n');
+                }
             }
         }
 
         if diff_state == DiffState::Single {
-            let mut graphemes = String::new();
+            let mut grapheme_buf = std::mem::take(&mut self.diff_graphemes);
+            grapheme_buf.clear();
             // If there isn't just a single change, just read the whole line.
             diff_state = DiffState::NoChanges;
             let mut prev_tag = None;
             for change in TextDiff::configure()
                 .algorithm(Algorithm::Patience)
-                .diff_graphemes(&old, &new)
+                .diff_graphemes(old_text, new_text)
                 .iter_all_changes()
             {
                 diff_state = match diff_state {
@@ -682,28 +710,35 @@ impl ScreenReader {
                     continue; // Revert to the line diff.
                 }
                 if change.tag() == ChangeTag::Insert {
-                    graphemes.push_str(change.as_str().unwrap_or(""));
+                    if let Some(change_str) = change.as_str() {
+                        grapheme_buf.push_str(change_str);
+                    }
                 }
             }
 
             if diff_state != DiffState::Multi {
-                text = graphemes;
+                std::mem::swap(&mut diff_text, &mut grapheme_buf);
             }
+            self.diff_graphemes = grapheme_buf;
         }
 
         // Don't echo typed keys
         match std::str::from_utf8(&self.last_key) {
             // We still want to report that text was read when suppressing echo,
             // so that cursor tracking doesn't read the character that follows as we type.
-            Ok(s) if text == s => Ok(true),
+            Ok(s) if diff_text == s => {
+                self.diff_text = diff_text;
+                Ok(true)
+            }
             _ => {
-                let original_nonempty = !text.is_empty();
-                let text = self.hook_on_live_read(&text, cursor_moves, scrolled)?;
+                let original_nonempty = !diff_text.is_empty();
+                let text = self.hook_on_live_read(&diff_text, cursor_moves, scrolled)?;
                 if let Some(text) = text {
                     if !text.is_empty() {
                         self.speak(&text, false)?;
                     }
                 }
+                self.diff_text = diff_text;
                 Ok(original_nonempty)
             }
         }

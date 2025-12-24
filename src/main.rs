@@ -91,12 +91,13 @@ fn main() -> Result<()> {
         ),
     };
     // Clean up before returning the above result.
-    termios::tcsetattr(
+    if let Err(err) = termios::tcsetattr(
         std::io::stdin().as_fd(),
         termios::SetArg::TCSADRAIN,
         &init_term_attrs,
-    )
-    .unwrap();
+    ) {
+        eprintln!("failed to restore terminal settings: {err}");
+    }
     let _ = process.kill(ptyprocess::Signal::SIGKILL);
     let _ = process.wait();
     result.map_err(|e| anyhow!("{}", e))

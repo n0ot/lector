@@ -45,6 +45,10 @@ pub trait ScreenExt {
     /// Get the contents of the screen, including blank lines.
     /// Trailing whitespace will be removed from each line.
     fn contents_full(&self) -> String;
+
+    /// Write the contents of the screen into an existing buffer.
+    /// Trailing whitespace will be removed from each line.
+    fn contents_full_into(&self, out: &mut String);
 }
 
 impl ScreenExt for vt100::Screen {
@@ -183,6 +187,16 @@ impl ScreenExt for vt100::Screen {
         self.rows(0, self.size().1)
             .map(|row| format!("{}\n", row.trim_end()))
             .collect::<String>()
+    }
+
+    fn contents_full_into(&self, out: &mut String) {
+        out.clear();
+        let (rows, cols) = self.size();
+        out.reserve((rows as usize) * (cols as usize + 1));
+        for row in self.rows(0, cols) {
+            out.push_str(row.trim_end());
+            out.push('\n');
+        }
     }
 }
 
