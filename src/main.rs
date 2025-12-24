@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use lector::{app, lua, platform, screen_reader::ScreenReader, speech, views};
 use nix::sys::termios;
 use ptyprocess::{PtyProcess, Signal};
@@ -18,12 +18,37 @@ struct Cli {
     /// Lector will spawn this shell when it starts
     #[clap(long, short = 's', env)]
     shell: std::path::PathBuf,
+    /// Speech driver backend
+    #[clap(long, value_enum, default_value = "tts", env)]
+    speech_driver: SpeechDriverKind,
+    /// Path to the proc driver server (required when --speech-driver=proc)
+    #[clap(long, env)]
+    speech_server: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SpeechDriverKind {
+    Tts,
+    Proc,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let term_size = termsize::get().ok_or_else(|| anyhow!("cannot get terminal size"))?;
-    let speech_driver = Box::new(speech::tts::TtsDriver::new().context("create tts driver")?);
+    let speech_driver: Box<dyn speech::Driver> = match cli.speech_driver {
+        SpeechDriverKind::Tts => Box::new(
+            speech::tts::TtsDriver::new().context("create tts driver")?,
+        ),
+        SpeechDriverKind::Proc => {
+            let path = cli.speech_server.ok_or_else(|| {
+                anyhow!("--speech-server is required when --speech-driver=proc")
+            })?;
+            Box::new(
+                speech::proc_driver::ProcDriver::new(&path)
+                    .context("create proc driver")?,
+            )
+        }
+    };
     let speech = speech::Speech::new(speech_driver);
     let mut screen_reader = ScreenReader::new(speech);
     let view_stack = views::ViewStack::new(Box::new(views::PtyView::new(

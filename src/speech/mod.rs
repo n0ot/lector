@@ -5,6 +5,7 @@ use std::fmt::Write;
 use unicode_segmentation::UnicodeSegmentation;
 
 pub mod symbols;
+pub mod proc_driver;
 pub mod tts;
 
 const MIN_REPEAT_COUNT: usize = 4;

@@ -10,6 +10,7 @@ pub mod lua;
 pub mod line_editor;
 pub mod platform;
 pub mod perform;
+pub mod proc_server_common;
 pub mod screen_reader;
 pub mod speech;
 pub mod view;

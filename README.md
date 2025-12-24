@@ -30,6 +30,52 @@ Or use the `SHELL` environment variable:
 SHELL=/bin/zsh cargo run
 ```
 
+## Speech drivers
+
+Lector defaults to the built‑in TTS driver. You can also run a proc‑based driver that speaks JSON‑RPC over stdin/stdout.
+
+Select a driver:
+
+```bash
+cargo run -- --shell /bin/zsh --speech-driver tts
+cargo run -- --shell /bin/zsh --speech-driver proc --speech-server /path/to/driver
+```
+
+### Proc driver protocol
+
+The proc driver speaks line‑delimited JSON‑RPC 2.0. Each request is one JSON object per line, and each response is one JSON object per line.
+
+Supported methods:
+
+- `speak` params `{ "text": "...", "interrupt": true|false }`
+- `stop` params `{}` or omitted
+- `set_rate` params `{ "rate": 1.0 }`
+
+Example response:
+
+```json
+{"jsonrpc":"2.0","id":1,"result":null}
+```
+
+### Proc stub server (tests)
+
+There is a tiny proc server binary used by tests to validate the JSON‑RPC driver path without invoking system TTS. It’s called `proc_stub_server`.
+
+### Example proc server (TTS)
+
+Build the bundled TTS proc server and point Lector at it:
+
+```bash
+cargo build --release
+target/release/lector-tts
+```
+
+Then run Lector:
+
+```bash
+target/release/lector --shell /bin/zsh --speech-driver proc --speech-server target/release/lector-tts
+```
+
 ## How to use Lector
 
 Think of Lector as having two ways to listen:
