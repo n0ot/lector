@@ -286,6 +286,9 @@ impl App {
             b"\x1B[" => Some(Event::Key(
                 KeyEvent::new(KeyCode::Char('[')).modifiers(KeyModifiers::ALT),
             )),
+            b"\x1B]" => Some(Event::Key(
+                KeyEvent::new(KeyCode::Char(']')).modifiers(KeyModifiers::ALT),
+            )),
             b"\x1BO" => Some(Event::Key(
                 KeyEvent::new(KeyCode::Char('O')).modifiers(KeyModifiers::ALT),
             )),

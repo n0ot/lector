@@ -161,6 +161,58 @@ fn alt_bracket_maps_after_timeout() {
 }
 
 #[test]
+fn alt_close_bracket_maps_after_timeout() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1B]", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+    assert!(pty_out.is_empty());
+
+    clock.advance_ms(100);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("handle tick");
+
+    assert!(pty_out.is_empty());
+    assert_eq!(sr.last_key, b"\x1B]");
+    let speaks = &recorder.inner.borrow().speaks;
+    assert!(speaks.iter().any(|(text, _)| text == "no clipboard"));
+}
+
+#[test]
+fn osc_sequence_forwards_to_pty() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    let osc = b"\x1B]0;lector test\x07";
+    app.handle_stdin(&mut sr, osc, &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+
+    assert_eq!(pty_out, osc);
+    assert!(term_out.is_empty());
+    assert_eq!(sr.last_key, osc);
+    assert_eq!(recorder.inner.borrow().stops, 1);
+}
+
+#[test]
+fn osc_sequence_with_st_terminator_forwards_to_pty() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    let osc = b"\x1B]0;lector test\x1B\\";
+    app.handle_stdin(&mut sr, osc, &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+
+    assert_eq!(pty_out, osc);
+    assert!(term_out.is_empty());
+    assert_eq!(sr.last_key, osc);
+    assert_eq!(recorder.inner.borrow().stops, 1);
+}
+
+#[test]
 fn help_mode_can_toggle_off() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
