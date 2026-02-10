@@ -143,6 +143,10 @@ impl KeyBindings {
             "M-t".to_string(),
             Binding::Builtin(Action::ToggleTableMode),
         );
+        normal.insert(
+            "M-g".to_string(),
+            Binding::Builtin(Action::ToggleStopSpeechOnFocusLoss),
+        );
 
         let table = bindings.get_mut(&InputMode::Table).unwrap();
         table.insert("Esc".to_string(), Binding::Builtin(Action::ExitTableMode));

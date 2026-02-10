@@ -44,6 +44,7 @@ pub enum Action {
     PreviousClipboard,
     NextClipboard,
     ToggleTableMode,
+    ToggleStopSpeechOnFocusLoss,
     ExitTableMode,
     TableRowPrev,
     TableRowNext,
@@ -139,6 +140,11 @@ const ACTION_TABLE: &[(Action, &str, &str)] = &[
     ),
     (Action::NextClipboard, "next clipboard", "next_clipboard"),
     (Action::ToggleTableMode, "toggle table mode", "toggle_table_mode"),
+    (
+        Action::ToggleStopSpeechOnFocusLoss,
+        "toggle stop speech on focus loss",
+        "toggle_stop_speech_on_focus_loss",
+    ),
     (Action::ExitTableMode, "exit table mode", "exit_table_mode"),
     (Action::TableRowPrev, "previous table row", "table_row_prev"),
     (Action::TableRowNext, "next table row", "table_row_next"),
@@ -226,6 +232,7 @@ pub fn handle(
         Action::PreviousClipboard => action_clipboard_prev(sr),
         Action::NextClipboard => action_clipboard_next(sr),
         Action::ToggleTableMode => action_toggle_table_mode(sr, view),
+        Action::ToggleStopSpeechOnFocusLoss => action_toggle_stop_speech_on_focus_loss(sr),
         Action::ExitTableMode => action_exit_table_mode(sr),
         Action::TableRowPrev => action_table_row_prev(sr, view),
         Action::TableRowNext => action_table_row_next(sr, view),
@@ -256,6 +263,19 @@ fn action_toggle_auto_read(sr: &mut ScreenReader) -> Result<CommandResult> {
         sr.speak("auto read enabled", false)?;
     }
 
+    Ok(CommandResult::Handled)
+}
+
+fn action_toggle_stop_speech_on_focus_loss(
+    sr: &mut ScreenReader,
+) -> Result<CommandResult> {
+    sr.stop_speech_on_focus_loss = !sr.stop_speech_on_focus_loss;
+    let status = if sr.stop_speech_on_focus_loss {
+        "enabled"
+    } else {
+        "disabled"
+    };
+    sr.speak(&format!("stop on focus loss {}", status), false)?;
     Ok(CommandResult::Handled)
 }
 

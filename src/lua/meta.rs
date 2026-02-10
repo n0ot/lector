@@ -291,6 +291,7 @@ fn get_option<'lua>(
             sr.review_follows_screen_cursor.into_lua(lua)
         }
         "highlight_tracking" => sr.highlight_tracking.into_lua(lua),
+        "stop_speech_on_focus_loss" => sr.stop_speech_on_focus_loss.into_lua(lua),
         _ => Err(Error::external(anyhow!("unknown option"))),
     }
     .map_err(|e| anyhow!("{}", e))
@@ -406,6 +407,13 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
         "highlight_tracking" => match value {
             Boolean(v) => {
                 sr.highlight_tracking = v;
+                Ok(())
+            }
+            _ => Err(anyhow!("value must be a boolean")),
+        },
+        "stop_speech_on_focus_loss" => match value {
+            Boolean(v) => {
+                sr.stop_speech_on_focus_loss = v;
                 Ok(())
             }
             _ => Err(anyhow!("value must be a boolean")),

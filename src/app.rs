@@ -320,7 +320,7 @@ impl App {
             );
         }
         sr.terminal_focused = focused;
-        if !focused {
+        if !focused && sr.stop_speech_on_focus_loss {
             sr.speech.stop()?;
         }
         if self.app_focus_events_enabled {

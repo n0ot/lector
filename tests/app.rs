@@ -299,3 +299,35 @@ fn auto_read_does_not_speak_when_terminal_unfocused() {
 
     assert!(recorder.inner.borrow().speaks.is_empty());
 }
+
+#[test]
+fn focus_out_does_not_stop_when_option_disabled() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    sr.stop_speech_on_focus_loss = false;
+    app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+
+    assert!(!sr.terminal_focused);
+    assert_eq!(recorder.inner.borrow().stops, 0);
+}
+
+#[test]
+fn toggle_stop_on_focus_loss_hotkey_disables_stopping() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1Bg", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+    assert!(!sr.stop_speech_on_focus_loss);
+
+    app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+
+    let state = recorder.inner.borrow();
+    assert!(state.speaks.iter().any(|(text, _)| text == "stop on focus loss disabled"));
+    assert_eq!(state.stops, 1);
+}

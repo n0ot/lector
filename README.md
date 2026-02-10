@@ -89,6 +89,7 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 
 - **Stop speech** when it’s too noisy. Default: `M-x`.
 - **Toggle auto‑read** if you want to hear only on demand. Default: `M-'`.
+- **Toggle stop on focus loss** (interrupt speech when terminal focus leaves). Default: `M-g`.
 - **Move and read** by line/word/character using the review cursor.
 - **Set a mark and copy** text between the mark and the review cursor.
 - **Toggle table mode** to navigate tables by row/column.
@@ -150,6 +151,9 @@ lector.o.symbol_level = "most"  -- "none", "some", "most", "all", "character"
 
 -- live reading on/off
 lector.o.auto_read = true
+
+-- interrupt speech immediately when terminal focus is lost
+lector.o.stop_speech_on_focus_loss = true
 ```
 
 ### Simple key customization
@@ -159,6 +163,9 @@ You can remap keys or add your own Lua functions:
 ```lua
 -- map a key to a built-in action
 lector.bindings["M-x"] = "lector.stop_speaking"
+
+-- toggle stop-on-focus-loss behavior
+lector.bindings["M-g"] = "lector.toggle_stop_speech_on_focus_loss"
 
 -- add a custom command
 lector.bindings["M-r"] = {
