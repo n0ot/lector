@@ -224,3 +224,78 @@ fn help_mode_can_toggle_off() {
 
     assert!(!sr.help_mode);
 }
+
+#[test]
+fn focus_events_not_forwarded_without_app_request() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+
+    assert!(pty_out.is_empty());
+    assert!(!sr.terminal_focused);
+    assert_eq!(recorder.inner.borrow().stops, 1);
+}
+
+#[test]
+fn focus_events_forwarded_after_app_enables_them() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1B[?1004h", &mut term_out)
+        .expect("handle pty");
+    assert!(term_out.is_empty());
+
+    app.handle_stdin(&mut sr, b"\x1B[I", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+
+    assert_eq!(pty_out, b"\x1B[I");
+    assert!(sr.terminal_focused);
+}
+
+#[test]
+fn focus_mode_sequences_are_filtered_from_terminal_output() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut term_out = Vec::new();
+    let mut pty_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"x\x1B[?10", &mut term_out)
+        .expect("handle pty");
+    assert_eq!(term_out, b"x");
+
+    app.handle_pty(&mut sr, b"04hy", &mut term_out)
+        .expect("handle pty");
+    assert_eq!(term_out, b"xy");
+
+    app.handle_stdin(&mut sr, b"\x1B[I", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+    assert_eq!(pty_out, b"\x1B[I");
+
+    app.handle_pty(&mut sr, b"\x1B[?1004l", &mut term_out)
+        .expect("handle pty");
+    assert_eq!(term_out, b"xy");
+
+    app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+    assert_eq!(pty_out, b"\x1B[I");
+}
+
+#[test]
+fn auto_read_does_not_speak_when_terminal_unfocused() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+    app.handle_pty(&mut sr, b"hello\r\n", &mut term_out)
+        .expect("handle pty");
+
+    clock.advance_ms(2);
+    let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
+
+    assert!(recorder.inner.borrow().speaks.is_empty());
+}

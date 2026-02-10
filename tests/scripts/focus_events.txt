@@ -1,0 +1,33 @@
+Scenario: focus events not forwarded by default
+When stdin: a
+And stdin: \x1B[I
+And stdin: b
+Then expect-pty-stdin: ab
+
+Scenario: focus events forwarded when app enables ?1004
+When pty-stdout: pre\x1B[?1004hpost
+And stdin: \x1B[I
+Then expect-stdout: prepost
+And expect-pty-stdin: \x1B[I
+
+Scenario: focus events not forwarded after app disables ?1004
+Given pty-stdout: \x1B[?1004h
+And pty-stdout: \x1B[?1004l
+When stdin: z
+And stdin: \x1B[O
+And stdin: y
+Then expect-pty-stdin: zy
+And expect-stops: 3
+
+Scenario: split focus-mode sequence is filtered and still enables forwarding
+When pty-stdout: x\x1B[?10
+And pty-stdout: 04hy
+And stdin: \x1B[O
+Then expect-stdout: xy
+And expect-pty-stdin: \x1B[O
+
+Scenario: auto-read speech suppressed while unfocused
+When stdin: \x1B[O
+And pty-stdout: hidden\r\n
+And settled:
+Then expect-stops: 1

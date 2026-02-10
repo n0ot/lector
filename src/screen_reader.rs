@@ -34,6 +34,7 @@ pub struct ScreenReader {
     pub input_mode: InputMode,
     pub table_state: Option<TableState>,
     pub table_header_auto: bool,
+    pub terminal_focused: bool,
     pub lua_ctx: Option<Rc<Lua>>,
     pub lua_ctx_weak: Option<WeakLua>,
     lua_hooks: LuaHooks,
@@ -58,6 +59,7 @@ impl ScreenReader {
             input_mode: InputMode::Normal,
             table_state: None,
             table_header_auto: true,
+            terminal_focused: true,
             lua_ctx: None,
             lua_ctx_weak: None,
             lua_hooks: LuaHooks::default(),
@@ -73,7 +75,7 @@ impl ScreenReader {
     }
 
     pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
-        if text.is_empty() {
+        if text.is_empty() || !self.terminal_focused {
             return Ok(());
         }
         self.call_hook_on_speech_start(text, interrupt)?;

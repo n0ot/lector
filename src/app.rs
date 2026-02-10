@@ -13,6 +13,10 @@ pub const DIFF_DELAY: u16 = 1;
 pub const MAX_DIFF_DELAY: u16 = 300;
 const ESC_TIMEOUT_MS: u128 = 50;
 const CTRL_D_CSI: &[u8] = b"\x1B[27;5;100~";
+const FOCUS_IN_EVENT: &[u8] = b"\x1B[I";
+const FOCUS_OUT_EVENT: &[u8] = b"\x1B[O";
+const FOCUS_EVENTS_ENABLE: &[u8] = b"\x1B[?1004h";
+const FOCUS_EVENTS_DISABLE: &[u8] = b"\x1B[?1004l";
 const OSC_START: u8 = b']';
 const ST_ESCAPE: u8 = b'\\';
 
@@ -52,6 +56,9 @@ pub struct App {
     ansi_csi_re: regex::bytes::Regex,
     pending_input: VecDeque<u8>,
     pending_input_last_at: Option<u128>,
+    pending_pty_output: Vec<u8>,
+    app_focus_events_enabled: bool,
+    log_enabled: bool,
     last_stdin_update: Option<u128>,
     last_pty_update: Option<u128>,
     clock: Box<dyn Clock>,
@@ -75,6 +82,9 @@ impl App {
             ansi_csi_re,
             pending_input: VecDeque::new(),
             pending_input_last_at: None,
+            pending_pty_output: Vec::new(),
+            app_focus_events_enabled: false,
+            log_enabled: false,
             last_stdin_update: None,
             last_pty_update: None,
             clock,
@@ -82,6 +92,10 @@ impl App {
         let now_ms = app.clock.now_ms();
         app.view_stack.active_mut().model().prev_screen_time = now_ms;
         Ok(app)
+    }
+
+    pub fn set_logging(&mut self, enabled: bool) {
+        self.log_enabled = enabled;
     }
 
     pub fn wants_tick(&mut self) -> bool {
@@ -167,6 +181,19 @@ impl App {
                 }
                 PendingStatus::Incomplete => return Ok(()),
                 PendingStatus::None => {}
+            }
+
+            match self.pending_focus_event_status() {
+                FocusPendingStatus::Complete(focused) => {
+                    self.pending_input.drain(..FOCUS_IN_EVENT.len());
+                    if self.pending_input.is_empty() {
+                        self.pending_input_last_at = None;
+                    }
+                    self.handle_focus_event(sr, focused, pty_out, term_out)?;
+                    continue;
+                }
+                FocusPendingStatus::Incomplete => return Ok(()),
+                FocusPendingStatus::None => {}
             }
 
             if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
@@ -259,6 +286,88 @@ impl App {
             return PendingStatus::Incomplete;
         }
         PendingStatus::None
+    }
+
+    fn pending_focus_event_status(&mut self) -> FocusPendingStatus {
+        let buf = self.pending_input.make_contiguous();
+        if buf.starts_with(FOCUS_IN_EVENT) {
+            return FocusPendingStatus::Complete(true);
+        }
+        if FOCUS_IN_EVENT.starts_with(buf) && !buf.is_empty() {
+            return FocusPendingStatus::Incomplete;
+        }
+        if buf.starts_with(FOCUS_OUT_EVENT) {
+            return FocusPendingStatus::Complete(false);
+        }
+        if FOCUS_OUT_EVENT.starts_with(buf) && !buf.is_empty() {
+            return FocusPendingStatus::Incomplete;
+        }
+        FocusPendingStatus::None
+    }
+
+    fn handle_focus_event(
+        &mut self,
+        sr: &mut ScreenReader,
+        focused: bool,
+        pty_out: &mut dyn Write,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        if self.log_enabled {
+            eprintln!(
+                "focus event: {} (forward_to_app={})",
+                if focused { "in" } else { "out" },
+                self.app_focus_events_enabled,
+            );
+        }
+        sr.terminal_focused = focused;
+        if !focused {
+            sr.speech.stop()?;
+        }
+        if self.app_focus_events_enabled {
+            let raw = if focused {
+                FOCUS_IN_EVENT
+            } else {
+                FOCUS_OUT_EVENT
+            };
+            self.dispatch_to_view(sr, raw, pty_out, term_out)?;
+        }
+        Ok(())
+    }
+
+    fn filter_focus_mode_sequences(&mut self, buf: &[u8]) -> Vec<u8> {
+        self.pending_pty_output.extend_from_slice(buf);
+        let mut out = Vec::with_capacity(self.pending_pty_output.len());
+        let mut i = 0usize;
+
+        while i < self.pending_pty_output.len() {
+            let rem = &self.pending_pty_output[i..];
+            if rem.starts_with(FOCUS_EVENTS_ENABLE) {
+                self.app_focus_events_enabled = true;
+                if self.log_enabled {
+                    eprintln!("focus mode: app enabled ?1004 passthrough");
+                }
+                i += FOCUS_EVENTS_ENABLE.len();
+                continue;
+            }
+            if rem.starts_with(FOCUS_EVENTS_DISABLE) {
+                self.app_focus_events_enabled = false;
+                if self.log_enabled {
+                    eprintln!("focus mode: app disabled ?1004 passthrough");
+                }
+                i += FOCUS_EVENTS_DISABLE.len();
+                continue;
+            }
+            if FOCUS_EVENTS_ENABLE.starts_with(rem) || FOCUS_EVENTS_DISABLE.starts_with(rem) {
+                break;
+            }
+            out.push(self.pending_pty_output[i]);
+            i += 1;
+        }
+
+        if i > 0 {
+            self.pending_pty_output.drain(..i);
+        }
+        out
     }
 
     fn flush_pending_input(
@@ -476,10 +585,11 @@ impl App {
         buf: &[u8],
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        let terminal_buf = self.filter_focus_mode_sequences(buf);
         let overlay_active = self.view_stack.has_overlay();
         self.view_stack.root_mut().handle_pty_output(buf)?;
         if !overlay_active {
-            term_out.write_all(buf).context("write PTY output")?;
+            term_out.write_all(&terminal_buf).context("write PTY output")?;
             term_out.flush().context("flush output")?;
             if sr.auto_read {
                 self.vte_parser.advance(&mut self.reporter, buf);
@@ -656,4 +766,10 @@ enum PendingStatus {
     None,
     Incomplete,
     Complete(usize),
+}
+
+enum FocusPendingStatus {
+    None,
+    Incomplete,
+    Complete(bool),
 }
