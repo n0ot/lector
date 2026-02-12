@@ -36,7 +36,7 @@ pub fn setup<'lua, 'scope>(
     sr: &'scope RefCell<&mut ScreenReader>,
 ) -> Result<()> {
     let tbl_callbacks = lua.create_table()?;
-    add_callbacks(&tbl_callbacks, &scope, &sr)?;
+    add_callbacks(&tbl_callbacks, scope, sr)?;
     lua.load(include_str!("meta.lua"))
         .set_name("meta.lua")
         .call::<()>((tbl_callbacks,))?;
@@ -273,11 +273,7 @@ fn add_callbacks_static(
     )
 }
 
-fn get_option<'lua>(
-    lua: &'lua Lua,
-    sr: &ScreenReader,
-    option: &str,
-) -> anyhow::Result<mlua::Value> {
+fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua::Value> {
     match option {
         "speech_rate" => sr.speech.get_rate().into_lua(lua),
         "symbol_level" => sr.speech.symbol_level.to_string().into_lua(lua),

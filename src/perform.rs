@@ -6,6 +6,12 @@ pub struct Reporter {
     pub scrolled: bool,
 }
 
+impl Default for Reporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Reporter {
     pub fn new() -> Self {
         Reporter {
@@ -26,9 +32,8 @@ impl Perform for Reporter {
     }
 
     fn execute(&mut self, byte: u8) {
-        match byte {
-            8 => self.cursor_moves += 1,
-            _ => {}
+        if byte == 8 {
+            self.cursor_moves += 1
         }
     }
 
@@ -41,7 +46,7 @@ impl Perform for Reporter {
     }
 
     fn csi_dispatch(&mut self, _params: &Params, intermediates: &[u8], _ignore: bool, c: char) {
-        if intermediates.first().is_none() {
+        if intermediates.is_empty() {
             match c {
                 'A'..='H' => self.cursor_moves += 1,
                 'S' | 'T' => self.scrolled = true,

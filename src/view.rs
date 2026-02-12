@@ -173,7 +173,7 @@ impl View {
             .rfind_cell(CellExt::is_in_word, 0, 0, row - 1, last_col)
             .map_or(row, |(row, _)| row);
 
-        return self.review_cursor_position.0 != row;
+        self.review_cursor_position.0 != row
     }
 
     /// Moves the review cursor down a line.
@@ -198,7 +198,7 @@ impl View {
             .find_cell(CellExt::is_in_word, row + 1, 0, last_row, last_col)
             .map_or(row, |(row, _)| row);
 
-        return self.review_cursor_position.0 != row;
+        self.review_cursor_position.0 != row
     }
 
     /// Moves the cursor to the start of the previous word,

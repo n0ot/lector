@@ -556,11 +556,11 @@ impl ScreenReader {
                     Ok(s) if text == s => {}
                     _ => {
                         let text = self.hook_on_live_read(text, cursor_moves, scrolled)?;
-                        if let Some(text) = text {
-                            if !text.is_empty() {
-                                self.speak(&text, false)?;
-                                spoken = true;
-                            }
+                        if let Some(text) = text
+                            && !text.is_empty()
+                        {
+                            self.speak(&text, false)?;
+                            spoken = true;
                         }
                     }
                 }
@@ -628,11 +628,11 @@ impl ScreenReader {
                 },
                 DiffState::Multi => DiffState::Multi,
             };
-            if change.tag() == ChangeTag::Insert {
-                if let Some(change_str) = change.as_str() {
-                    diff_text.push_str(change_str);
-                    diff_text.push('\n');
-                }
+            if change.tag() == ChangeTag::Insert
+                && let Some(change_str) = change.as_str()
+            {
+                diff_text.push_str(change_str);
+                diff_text.push('\n');
             }
         }
 
@@ -679,10 +679,10 @@ impl ScreenReader {
                 if diff_state == DiffState::Multi {
                     continue; // Revert to the line diff.
                 }
-                if change.tag() == ChangeTag::Insert {
-                    if let Some(change_str) = change.as_str() {
-                        grapheme_buf.push_str(change_str);
-                    }
+                if change.tag() == ChangeTag::Insert
+                    && let Some(change_str) = change.as_str()
+                {
+                    grapheme_buf.push_str(change_str);
                 }
             }
 
@@ -703,10 +703,10 @@ impl ScreenReader {
             _ => {
                 let original_nonempty = !diff_text.is_empty();
                 let text = self.hook_on_live_read(&diff_text, cursor_moves, scrolled)?;
-                if let Some(text) = text {
-                    if !text.is_empty() {
-                        self.speak(&text, false)?;
-                    }
+                if let Some(text) = text
+                    && !text.is_empty()
+                {
+                    self.speak(&text, false)?;
                 }
                 self.diff_text = diff_text;
                 Ok(original_nonempty)

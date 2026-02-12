@@ -189,10 +189,10 @@ impl KeyBindings {
     }
 
     pub fn binding_for_mode(&self, mode: InputMode, key: &str) -> Option<&Binding> {
-        if let Some(bindings) = self.bindings.get(&mode) {
-            if let Some(binding) = bindings.get(key) {
-                return Some(binding);
-            }
+        if let Some(bindings) = self.bindings.get(&mode)
+            && let Some(binding) = bindings.get(key)
+        {
+            return Some(binding);
         }
         if mode != InputMode::Normal {
             return self
@@ -249,10 +249,10 @@ impl KeyBindings {
     }
 
     pub fn clear_binding_for_mode(&mut self, mode: InputMode, key: &str) {
-        if let Some(bindings) = self.bindings.get_mut(&mode) {
-            if let Some(binding) = bindings.remove(key) {
-                binding.cleanup();
-            }
+        if let Some(bindings) = self.bindings.get_mut(&mode)
+            && let Some(binding) = bindings.remove(key)
+        {
+            binding.cleanup();
         }
     }
 
@@ -277,7 +277,7 @@ impl KeyBindings {
         };
 
         match binding {
-            Binding::Builtin(action) => Ok(Value::String(lua.create_string(&format!(
+            Binding::Builtin(action) => Ok(Value::String(lua.create_string(format!(
                 "{}{}",
                 BUILTIN_PREFIX,
                 commands::builtin_action_name(*action)
@@ -310,12 +310,11 @@ impl KeyBindings {
         let mut parts = key.splitn(2, ':');
         let prefix = parts.next().unwrap_or("");
         let rest = parts.next();
-        if let Some(mode) = InputMode::from_prefix(prefix) {
-            if let Some(rest) = rest {
-                if !rest.is_empty() {
-                    return (mode, rest);
-                }
-            }
+        if let Some(mode) = InputMode::from_prefix(prefix)
+            && let Some(rest) = rest
+            && !rest.is_empty()
+        {
+            return (mode, rest);
         }
         (InputMode::Normal, key)
     }

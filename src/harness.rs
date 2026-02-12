@@ -349,9 +349,9 @@ impl Harness {
         let speaks = self.speak_log.inner.borrow();
         let mut remaining_speech = String::new();
         for (idx, (text, interrupt)) in speaks.speaks.iter().enumerate().skip(self.speak_cursor) {
-            let _ = write!(
+            let _ = writeln!(
                 &mut remaining_speech,
-                "{}: {:?} (interrupt={})\n",
+                "{}: {:?} (interrupt={})",
                 idx, text, interrupt
             );
         }

@@ -42,10 +42,10 @@ impl TableModel {
     }
 
     pub fn cell_text(&self, view: &View, row: u16, col_idx: usize) -> String {
-        if self.delimiter == Some('|') {
-            if let Some(text) = pipe_delimited_cell_text(&view.line(row), col_idx) {
-                return text;
-            }
+        if self.delimiter == Some('|')
+            && let Some(text) = pipe_delimited_cell_text(&view.line(row), col_idx)
+        {
+            return text;
         }
 
         let Some(column) = self.columns.get(col_idx) else {
@@ -320,12 +320,7 @@ fn nearest_pipe_row(view: &View, row: u16) -> Option<u16> {
 }
 
 fn find_pipe_header_row_in_bounds(view: &View, top: u16, bottom: u16) -> Option<u16> {
-    for row in top..=bottom {
-        if row_looks_like_pipe_header(view, row) {
-            return Some(row);
-        }
-    }
-    None
+    (top..=bottom).find(|&row| row_looks_like_pipe_header(view, row))
 }
 
 fn row_looks_like_pipe_header(view: &View, row: u16) -> bool {
@@ -585,10 +580,10 @@ fn detect_fixed_width_columns_from_blanks(
 fn row_is_blank(view: &View, row: u16) -> bool {
     let (_, cols) = view.size();
     for col in 0..cols {
-        if let Some(cell) = view.screen().cell(row, col) {
-            if cell.is_wide_continuation() || !cell.contents().trim().is_empty() {
-                return false;
-            }
+        if let Some(cell) = view.screen().cell(row, col)
+            && (cell.is_wide_continuation() || !cell.contents().trim().is_empty())
+        {
+            return false;
         }
     }
     true
@@ -672,13 +667,7 @@ fn detect_header_row(
         }
     }
 
-    for row in top..=bottom {
-        if !model.is_skippable_row(view, row) && row_has_letters(view, row) {
-            return Some(row);
-        }
-    }
-
-    None
+    (top..=bottom).find(|&row| !model.is_skippable_row(view, row) && row_has_letters(view, row))
 }
 
 fn delimiter_positions(view: &View, row: u16, delim: char) -> Vec<u16> {
@@ -687,10 +676,10 @@ fn delimiter_positions(view: &View, row: u16, delim: char) -> Vec<u16> {
     let mut positions = Vec::new();
 
     for col in 0..cols {
-        if let Some(cell) = view.screen().cell(row, col) {
-            if cell.contents() == needle {
-                positions.push(col);
-            }
+        if let Some(cell) = view.screen().cell(row, col)
+            && cell.contents() == needle
+        {
+            positions.push(col);
         }
     }
 
@@ -703,10 +692,10 @@ fn column_has_content(view: &View, top: u16, bottom: u16, start: u16, end: u16) 
             continue;
         }
         for col in start..=end {
-            if let Some(cell) = view.screen().cell(row, col) {
-                if cell.is_wide_continuation() || !cell.contents().trim().is_empty() {
-                    return true;
-                }
+            if let Some(cell) = view.screen().cell(row, col)
+                && (cell.is_wide_continuation() || !cell.contents().trim().is_empty())
+            {
+                return true;
             }
         }
     }

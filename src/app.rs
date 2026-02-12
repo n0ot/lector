@@ -26,6 +26,12 @@ pub struct StdClock {
     start: time::Instant,
 }
 
+impl Default for StdClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StdClock {
     pub fn new() -> Self {
         Self {
@@ -612,10 +618,11 @@ impl App {
                 } else {
                     false
                 };
-                if let Some(lsu) = self.last_stdin_update {
-                    if now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128 && !read_text {
-                        sr.track_cursor(view)?;
-                    }
+                if let Some(lsu) = self.last_stdin_update
+                    && now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128
+                    && !read_text
+                {
+                    sr.track_cursor(view)?;
                 }
             }
 
@@ -725,10 +732,11 @@ impl App {
         } else {
             false
         };
-        if let Some(lsu) = self.last_stdin_update {
-            if now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128 && !read_text {
-                sr.track_cursor(view)?;
-            }
+        if let Some(lsu) = self.last_stdin_update
+            && now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128
+            && !read_text
+        {
+            sr.track_cursor(view)?;
         }
         if sr.review_follows_screen_cursor
             && view.screen().cursor_position() != view.prev_screen().cursor_position()

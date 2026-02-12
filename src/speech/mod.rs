@@ -60,7 +60,7 @@ impl Speech {
             .map(Some)
             .chain(std::iter::once(None))
         {
-            if prev_g == None || prev_g == g {
+            if prev_g.is_none() || prev_g == g {
                 run_count += 1;
                 prev_g = g;
                 continue;
@@ -102,10 +102,10 @@ impl Speech {
                 }
             }
 
-            if run_string.is_empty() {
-                if let Some(v) = emojis::get(prev_g.unwrap()) {
-                    write!(&mut run_string, " {} ", v.name())?;
-                }
+            if run_string.is_empty()
+                && let Some(v) = emojis::get(prev_g.unwrap())
+            {
+                write!(&mut run_string, " {} ", v.name())?;
             }
 
             if run_string.is_empty() {

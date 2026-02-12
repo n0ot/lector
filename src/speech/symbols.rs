@@ -3,6 +3,12 @@ use std::collections::HashMap;
 
 pub struct SymbolMap(HashMap<String, SymbolDesc>);
 
+impl Default for SymbolMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SymbolMap {
     pub fn new() -> Self {
         SymbolMap(HashMap::new())

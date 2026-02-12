@@ -597,7 +597,7 @@ fn action_backspace(sr: &mut ScreenReader, view: &mut View) -> Result<CommandRes
             .cell(row, col - 1)
             .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
             .contents();
-        sr.speak(&char, false)?;
+        sr.speak(char, false)?;
     }
     // When backspacing, the cursor will end up moving to the left, but we don't want to hear
     // that.
@@ -615,7 +615,7 @@ fn action_delete(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult
         .cell(row, col)
         .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
         .contents();
-    sr.speak(&char, false)?;
+    sr.speak(char, false)?;
     Ok(CommandResult::ForwardInput)
 }
 
@@ -662,10 +662,9 @@ fn action_copy(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> 
                     .map_or(end, |(_, col)| col + 1);
                 for col in start..end {
                     contents.push_str(
-                        &view
-                            .screen()
+                        view.screen()
                             .cell(row, col)
-                            .map_or("".into(), vt100::Cell::contents),
+                            .map_or("", vt100::Cell::contents),
                     );
                 }
                 if row != cur_row {
@@ -1008,10 +1007,10 @@ fn ensure_table_state(sr: &mut ScreenReader, view: &mut View) -> bool {
         }
     }
     if let Some(state) = sr.table_state.as_mut() {
-        if state.model.is_skippable_row(view, row) {
-            if let Some(target_row) = state.model.nearest_data_row(view, row) {
-                move_review_to_table_cell(view, state, target_row);
-            }
+        if state.model.is_skippable_row(view, row)
+            && let Some(target_row) = state.model.nearest_data_row(view, row)
+        {
+            move_review_to_table_cell(view, state, target_row);
         }
         state.current_col = state.model.column_for_col(view.review_cursor_position.1);
         if state.current_col >= state.model.columns.len() {
@@ -1035,14 +1034,12 @@ fn speak_table_cell(
     include_header: bool,
 ) -> Result<()> {
     let row = view.review_cursor_position.0;
-    if include_header {
-        if let Some(header_row) = state.model.header_row {
-            if header_row != row {
-                if let Some(text) = state.model.header_text(view, state.current_col) {
-                    sr.speak(&text, false)?;
-                }
-            }
-        }
+    if include_header
+        && let Some(header_row) = state.model.header_row
+        && header_row != row
+        && let Some(text) = state.model.header_text(view, state.current_col)
+    {
+        sr.speak(&text, false)?;
     }
     let text = state.model.cell_text(view, row, state.current_col);
     if text.is_empty() {

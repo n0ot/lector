@@ -167,7 +167,7 @@ fn do_events(
                 STDIN_TOKEN => {
                     let mut buf = [0; 8192];
                     let n = match stdin.read(&mut buf) {
-                        Ok(n) if n == 0 => return Ok(()),
+                        Ok(0) => return Ok(()),
                         Ok(n) => n,
                         Err(e) => bail!("error reading from input: {}", e),
                     };
@@ -176,7 +176,7 @@ fn do_events(
                 PTY_TOKEN => {
                     let mut buf = [0; 8192];
                     let n = match pty_stream.read(&mut buf) {
-                        Ok(n) if n == 0 => return Ok(()), // The child process exited
+                        Ok(0) => return Ok(()), // The child process exited
                         Ok(n) => n,
                         Err(e) => bail!("error reading from PTY: {}", e),
                     };

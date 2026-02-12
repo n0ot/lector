@@ -24,6 +24,12 @@ pub enum EditorAction {
     Bell,
 }
 
+impl Default for LineEditor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LineEditor {
     pub fn new() -> Self {
         Self {
@@ -205,7 +211,7 @@ impl LineEditor {
 
     fn handle_csi(&mut self, byte: u8) -> EditorAction {
         self.csi_buf.push(byte);
-        if !(byte >= 0x40 && byte <= 0x7E) {
+        if !(0x40..=0x7E).contains(&byte) {
             return EditorAction::None;
         }
         self.state = InputState::Normal;

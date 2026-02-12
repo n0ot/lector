@@ -187,34 +187,34 @@ impl LuaReplView {
         let new_chars: Vec<char> = new_input.chars().collect();
         let prev_chars: Vec<char> = prev_input.chars().collect();
 
-        if new_chars.len() == prev_chars.len() + 1 && new_cursor == prev_cursor + 1 {
-            if new_chars[..prev_cursor] == prev_chars[..prev_cursor]
-                && new_chars[prev_cursor + 1..] == prev_chars[prev_cursor..]
-            {
-                let inserted = new_chars[prev_cursor];
-                let mut bytes = Vec::new();
-                bytes.extend_from_slice(b"\x1B[1@");
-                bytes.extend_from_slice(inserted.to_string().as_bytes());
-                self.write_bytes(&bytes);
-                self.rendered_input = new_input;
-                self.rendered_cursor = new_cursor;
-                return;
-            }
+        if new_chars.len() == prev_chars.len() + 1
+            && new_cursor == prev_cursor + 1
+            && new_chars[..prev_cursor] == prev_chars[..prev_cursor]
+            && new_chars[prev_cursor + 1..] == prev_chars[prev_cursor..]
+        {
+            let inserted = new_chars[prev_cursor];
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"\x1B[1@");
+            bytes.extend_from_slice(inserted.to_string().as_bytes());
+            self.write_bytes(&bytes);
+            self.rendered_input = new_input;
+            self.rendered_cursor = new_cursor;
+            return;
         }
 
-        if new_chars.len() + 1 == prev_chars.len() && new_cursor + 1 == prev_cursor {
-            if new_chars[..new_cursor] == prev_chars[..new_cursor]
-                && new_chars[new_cursor..] == prev_chars[new_cursor + 1..]
-            {
-                if new_cursor == new_chars.len() {
-                    self.write_bytes(b"\x08 \x08");
-                } else {
-                    self.write_bytes(b"\x08\x1B[1P");
-                }
-                self.rendered_input = new_input;
-                self.rendered_cursor = new_cursor;
-                return;
+        if new_chars.len() + 1 == prev_chars.len()
+            && new_cursor + 1 == prev_cursor
+            && new_chars[..new_cursor] == prev_chars[..new_cursor]
+            && new_chars[new_cursor..] == prev_chars[new_cursor + 1..]
+        {
+            if new_cursor == new_chars.len() {
+                self.write_bytes(b"\x08 \x08");
+            } else {
+                self.write_bytes(b"\x08\x1B[1P");
             }
+            self.rendered_input = new_input;
+            self.rendered_cursor = new_cursor;
+            return;
         }
 
         self.redraw_input_line();
@@ -271,7 +271,7 @@ impl LuaReplView {
     fn start_eval(&mut self, input: &str) -> Result<()> {
         let func = if let Some(rest) = input.strip_prefix('=') {
             self.lua
-                .load(&format!("return {}", rest))
+                .load(format!("return {}", rest))
                 .set_name("repl")
                 .set_environment(self.env.clone())
                 .into_function()
@@ -362,7 +362,7 @@ impl ViewController for LuaReplView {
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         self.set_screen_reader(sr);
-        if input.iter().any(|&b| b == 0x04) {
+        if input.contains(&0x04) {
             self.thread = None;
             return Ok(ViewAction::Pop);
         }
