@@ -47,5 +47,4 @@ impl Driver for TtsDriver {
         self.rate = clamped;
         Ok(())
     }
-
 }

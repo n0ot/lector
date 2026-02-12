@@ -1,12 +1,16 @@
-use crate::{app::{self, App, Clock}, screen_reader::ScreenReader, speech, views};
+use crate::{
+    app::{self, App, Clock},
+    screen_reader::ScreenReader,
+    speech, views,
+};
 use anyhow::{Result, anyhow, bail};
+use std::fmt::Write as FmtWrite;
 use std::{
     cell::{Cell, RefCell},
     fs,
     io::{self, Read},
     rc::Rc,
 };
-use std::fmt::Write as FmtWrite;
 
 #[derive(Clone, Default)]
 pub struct FakeClock {
@@ -122,15 +126,15 @@ impl Harness {
                 continue;
             }
             if !scenario_seen {
-                return Err(anyhow!(
-                    "line {}: missing Scenario header",
-                    line_no + 1
-                ));
+                return Err(anyhow!("line {}: missing Scenario header", line_no + 1));
             }
             let (prefix, line) = parse_bdd_prefix(line, line_no + 1)?;
             let prefix = match prefix {
                 BddPrefix::And => last_prefix.ok_or_else(|| {
-                    anyhow!("line {}: And without a previous Given/When/Then", line_no + 1)
+                    anyhow!(
+                        "line {}: And without a previous Given/When/Then",
+                        line_no + 1
+                    )
                 })?,
                 _ => prefix,
             };
@@ -175,13 +179,18 @@ impl Harness {
             let result = match cmd {
                 "stdin" => {
                     let bytes = parse_bytes(payload)?;
-                    self.app
-                        .handle_stdin(&mut self.sr, &bytes, &mut self.pty_out, &mut self.term_out)?;
+                    self.app.handle_stdin(
+                        &mut self.sr,
+                        &bytes,
+                        &mut self.pty_out,
+                        &mut self.term_out,
+                    )?;
                     Ok(())
                 }
                 "pty-stdout" => {
                     let bytes = parse_bytes(payload)?;
-                    self.app.handle_pty(&mut self.sr, &bytes, &mut self.term_out)?;
+                    self.app
+                        .handle_pty(&mut self.sr, &bytes, &mut self.term_out)?;
                     Ok(())
                 }
                 "settled" => {
@@ -193,9 +202,9 @@ impl Harness {
                     let delta = if payload.is_empty() {
                         0
                     } else {
-                        payload.parse::<u128>().map_err(|_| {
-                            anyhow!("line {}: invalid tick value", line_no + 1)
-                        })?
+                        payload
+                            .parse::<u128>()
+                            .map_err(|_| anyhow!("line {}: invalid tick value", line_no + 1))?
                     };
                     self.clock.advance_ms(delta);
                     self.app
@@ -204,9 +213,9 @@ impl Harness {
                     Ok(())
                 }
                 "advance" => {
-                    let delta = payload.parse::<u128>().map_err(|_| {
-                        anyhow!("line {}: invalid advance value", line_no + 1)
-                    })?;
+                    let delta = payload
+                        .parse::<u128>()
+                        .map_err(|_| anyhow!("line {}: invalid advance value", line_no + 1))?;
                     self.clock.advance_ms(delta);
                     Ok(())
                 }
@@ -226,8 +235,7 @@ impl Harness {
                         .ok_or_else(|| anyhow!("line {}: missing cols", line_no + 1))?
                         .parse::<u16>()
                         .map_err(|_| anyhow!("line {}: invalid cols", line_no + 1))?;
-                    self.app
-                        .on_resize(rows, cols, &mut self.term_out)?;
+                    self.app.on_resize(rows, cols, &mut self.term_out)?;
                     Ok(())
                 }
                 "expect-pty-stdin" => {
@@ -295,9 +303,9 @@ impl Harness {
                     Ok(())
                 }
                 "expect-stops" => {
-                    let expected = payload.parse::<usize>().map_err(|_| {
-                        anyhow!("line {}: invalid stop count", line_no + 1)
-                    })?;
+                    let expected = payload
+                        .parse::<usize>()
+                        .map_err(|_| anyhow!("line {}: invalid stop count", line_no + 1))?;
                     let actual = self.speak_log.inner.borrow().stops;
                     if actual != expected {
                         bail!(
@@ -344,9 +352,7 @@ impl Harness {
             let _ = write!(
                 &mut remaining_speech,
                 "{}: {:?} (interrupt={})\n",
-                idx,
-                text,
-                interrupt
+                idx, text, interrupt
             );
         }
         if remaining_speech.is_empty() {
@@ -354,10 +360,7 @@ impl Harness {
         }
         format!(
             "State:\npty-stdin-remaining: {}\nstdout-remaining: {}\nspeech-remaining:\n{}stops: {}\n",
-            pty_remaining,
-            term_remaining,
-            remaining_speech,
-            speaks.stops
+            pty_remaining, term_remaining, remaining_speech, speaks.stops
         )
     }
 }
@@ -428,8 +431,8 @@ fn parse_bytes(input: &str) -> Result<Vec<u8>> {
                 let hi = chars.next().ok_or_else(|| anyhow!("invalid \\x escape"))?;
                 let lo = chars.next().ok_or_else(|| anyhow!("invalid \\x escape"))?;
                 let hex = [hi, lo].iter().collect::<String>();
-                let byte = u8::from_str_radix(&hex, 16)
-                    .map_err(|_| anyhow!("invalid \\x escape"))?;
+                let byte =
+                    u8::from_str_radix(&hex, 16).map_err(|_| anyhow!("invalid \\x escape"))?;
                 out.push(byte);
             }
             _ => return Err(anyhow!("unknown escape \\{}", esc)),
@@ -517,11 +520,7 @@ fn format_bytes_remaining(buffer: &[u8], cursor: usize) -> String {
         }
     }
     if remaining.len() > LIMIT {
-        let _ = write!(
-            &mut out,
-            "... ({} bytes more)",
-            remaining.len() - LIMIT
-        );
+        let _ = write!(&mut out, "... ({} bytes more)", remaining.len() - LIMIT);
     }
     if out.is_empty() {
         out.push_str("<none>");

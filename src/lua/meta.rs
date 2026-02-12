@@ -39,7 +39,7 @@ pub fn setup<'lua, 'scope>(
     add_callbacks(&tbl_callbacks, &scope, &sr)?;
     lua.load(include_str!("meta.lua"))
         .set_name("meta.lua")
-        .call::<()>( (tbl_callbacks,) )?;
+        .call::<()>((tbl_callbacks,))?;
 
     Ok(())
 }
@@ -49,7 +49,7 @@ pub fn setup_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result
     add_callbacks_static(lua, &tbl_callbacks, sr_ptr)?;
     lua.load(include_str!("meta.lua"))
         .set_name("meta.lua")
-        .call::<()>( (tbl_callbacks,) )?;
+        .call::<()>((tbl_callbacks,))?;
     Ok(())
 }
 
@@ -76,11 +76,9 @@ fn add_callbacks<'lua, 'scope>(
             }
             mlua::Value::Table(table_value) => {
                 let replacement: String = table_value.get(1)?;
-                let level: symbols::Level = AnyhowContext::context(
-                    table_value.get::<String>(2)?.parse(),
-                    "parse level",
-                )
-                .to_lua_result()?;
+                let level: symbols::Level =
+                    AnyhowContext::context(table_value.get::<String>(2)?.parse(), "parse level")
+                        .to_lua_result()?;
                 let include_original: symbols::IncludeOriginal = AnyhowContext::context(
                     table_value.get::<String>(3)?.parse(),
                     "parse include_original",
@@ -171,34 +169,32 @@ fn add_callbacks_static(
     let set_symbol = lua.create_function_mut({
         let sr_ptr = Rc::clone(&sr_ptr);
         move |_, (key, value): (String, mlua::Value)| {
-            with_screen_reader_mut(&sr_ptr, |sr| {
-                match value {
-                    mlua::Value::Nil => {
-                        sr.speech.symbols_map.remove(&key);
-                        Ok(())
-                    }
-                    mlua::Value::Table(table_value) => {
-                        let replacement: String = table_value.get(1)?;
-                        let level: symbols::Level = AnyhowContext::context(
-                            table_value.get::<String>(2)?.parse(),
-                            "parse level",
-                        )
-                        .to_lua_result()?;
-                        let include_original: symbols::IncludeOriginal = AnyhowContext::context(
-                            table_value.get::<String>(3)?.parse(),
-                            "parse include_original",
-                        )
-                        .to_lua_result()?;
-                        let repeat: bool = table_value.get(4)?;
-                        sr.speech
-                            .symbols_map
-                            .put(&key, &replacement, level, include_original, repeat);
-                        Ok(())
-                    }
-                    _ => Err(Error::external(anyhow!(
-                        "symbol value must be a table or nil"
-                    ))),
+            with_screen_reader_mut(&sr_ptr, |sr| match value {
+                mlua::Value::Nil => {
+                    sr.speech.symbols_map.remove(&key);
+                    Ok(())
                 }
+                mlua::Value::Table(table_value) => {
+                    let replacement: String = table_value.get(1)?;
+                    let level: symbols::Level = AnyhowContext::context(
+                        table_value.get::<String>(2)?.parse(),
+                        "parse level",
+                    )
+                    .to_lua_result()?;
+                    let include_original: symbols::IncludeOriginal = AnyhowContext::context(
+                        table_value.get::<String>(3)?.parse(),
+                        "parse include_original",
+                    )
+                    .to_lua_result()?;
+                    let repeat: bool = table_value.get(4)?;
+                    sr.speech
+                        .symbols_map
+                        .put(&key, &replacement, level, include_original, repeat);
+                    Ok(())
+                }
+                _ => Err(Error::external(anyhow!(
+                    "symbol value must be a table or nil"
+                ))),
             })
         }
     })?;
@@ -298,12 +294,7 @@ fn get_option<'lua>(
     .context(format!("get option: {}", option))
 }
 
-fn set_binding(
-    lua: &Lua,
-    sr: &mut ScreenReader,
-    key: &str,
-    value: Value,
-) -> anyhow::Result<()> {
+fn set_binding(lua: &Lua, sr: &mut ScreenReader, key: &str, value: Value) -> anyhow::Result<()> {
     let (mode, key) = sr.key_bindings.split_mode_key(key);
     match value {
         Value::Nil => {

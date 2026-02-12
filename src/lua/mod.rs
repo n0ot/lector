@@ -11,7 +11,10 @@ pub fn setup<F>(init_lua_file: PathBuf, screen_reader: &mut ScreenReader, after:
 where
     F: FnOnce(&mut ScreenReader) -> anyhow::Result<()>,
 {
-    let lua = Rc::new(Lua::new_with(StdLib::ALL_SAFE | StdLib::JIT, LuaOptions::default())?);
+    let lua = Rc::new(Lua::new_with(
+        StdLib::ALL_SAFE | StdLib::JIT,
+        LuaOptions::default(),
+    )?);
     screen_reader.set_lua_context(Rc::clone(&lua));
     let sr_ptr = Rc::new(RefCell::new(screen_reader as *mut ScreenReader));
     install_api_static(&lua, Rc::clone(&sr_ptr))?;
@@ -71,16 +74,15 @@ fn load_file(lua: &Lua, path: &PathBuf) -> Result<Function> {
 fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
     let tbl_lector = lua.create_table()?;
     let tbl_api = lua.create_table()?;
-    let speak_fn = lua
-        .create_function(move |_, (text, interrupt): (String, bool)| {
-            let ptr = *sr_ptr.borrow();
-            if ptr.is_null() {
-                return Err(Error::external(anyhow!("screen reader unavailable")));
-            }
-            // Safety: pointer is set by the main thread before any Lua call.
-            let sr = unsafe { &mut *ptr };
-            sr.speak(&text, interrupt).to_lua_result()
-        })?;
+    let speak_fn = lua.create_function(move |_, (text, interrupt): (String, bool)| {
+        let ptr = *sr_ptr.borrow();
+        if ptr.is_null() {
+            return Err(Error::external(anyhow!("screen reader unavailable")));
+        }
+        // Safety: pointer is set by the main thread before any Lua call.
+        let sr = unsafe { &mut *ptr };
+        sr.speak(&text, interrupt).to_lua_result()
+    })?;
     tbl_api.set("speak", speak_fn)?;
     tbl_lector.set("api", tbl_api)?;
     lua.globals().set("lector", tbl_lector)?;

@@ -2,7 +2,7 @@ use super::{
     attributes,
     ext::{CellExt, ScreenExt},
     keymap::InputMode,
-    screen_reader::{CursorTrackingMode, ScreenReader},
+    screen_reader::{CursorTrackingMode, ScreenReader, TableSetupState},
     table::{self, TableState},
     view::View,
 };
@@ -45,6 +45,10 @@ pub enum Action {
     NextClipboard,
     ToggleTableMode,
     ToggleStopSpeechOnFocusLoss,
+    StartTableSetupMode,
+    CancelTableSetupMode,
+    CommitTableSetupMode,
+    ToggleTableSetupTabstop,
     ExitTableMode,
     TableRowPrev,
     TableRowNext,
@@ -84,11 +88,7 @@ const ACTION_TABLE: &[(Action, &str, &str)] = &[
         "forward next key press",
         "pass_next_key",
     ),
-    (
-        Action::StopSpeaking,
-        "stop speaking",
-        "stop_speaking",
-    ),
+    (Action::StopSpeaking, "stop speaking", "stop_speaking"),
     (Action::RevLinePrev, "previous line", "review_line_prev"),
     (Action::RevLineNext, "next line", "review_line_next"),
     (
@@ -139,19 +139,55 @@ const ACTION_TABLE: &[(Action, &str, &str)] = &[
         "previous_clipboard",
     ),
     (Action::NextClipboard, "next clipboard", "next_clipboard"),
-    (Action::ToggleTableMode, "toggle table mode", "toggle_table_mode"),
+    (
+        Action::ToggleTableMode,
+        "toggle table mode",
+        "toggle_table_mode",
+    ),
     (
         Action::ToggleStopSpeechOnFocusLoss,
         "toggle stop speech on focus loss",
         "toggle_stop_speech_on_focus_loss",
     ),
+    (
+        Action::StartTableSetupMode,
+        "start table setup mode",
+        "start_table_setup_mode",
+    ),
+    (
+        Action::CancelTableSetupMode,
+        "cancel table setup mode",
+        "cancel_table_setup_mode",
+    ),
+    (
+        Action::CommitTableSetupMode,
+        "commit table setup mode",
+        "commit_table_setup_mode",
+    ),
+    (
+        Action::ToggleTableSetupTabstop,
+        "toggle tabstop at review cursor",
+        "toggle_table_setup_tabstop",
+    ),
     (Action::ExitTableMode, "exit table mode", "exit_table_mode"),
     (Action::TableRowPrev, "previous table row", "table_row_prev"),
     (Action::TableRowNext, "next table row", "table_row_next"),
-    (Action::TableColPrev, "previous table column", "table_col_prev"),
+    (
+        Action::TableColPrev,
+        "previous table column",
+        "table_col_prev",
+    ),
     (Action::TableColNext, "next table column", "table_col_next"),
-    (Action::TableCellRead, "current table cell", "table_cell_read"),
-    (Action::TableHeaderRead, "current table header", "table_header_read"),
+    (
+        Action::TableCellRead,
+        "current table cell",
+        "table_cell_read",
+    ),
+    (
+        Action::TableHeaderRead,
+        "current table header",
+        "table_header_read",
+    ),
     (
         Action::ToggleTableHeaderRead,
         "toggle table header reading",
@@ -184,11 +220,7 @@ pub fn builtin_action_from_name(name: &str) -> Option<Action> {
         .map(|(action, _, _)| *action)
 }
 
-pub fn handle(
-    sr: &mut ScreenReader,
-    view: &mut View,
-    action: Action,
-) -> Result<CommandResult> {
+pub fn handle(sr: &mut ScreenReader, view: &mut View, action: Action) -> Result<CommandResult> {
     if let Action::ToggleHelp = action {
         return action_toggle_help(sr);
     }
@@ -233,6 +265,10 @@ pub fn handle(
         Action::NextClipboard => action_clipboard_next(sr),
         Action::ToggleTableMode => action_toggle_table_mode(sr, view),
         Action::ToggleStopSpeechOnFocusLoss => action_toggle_stop_speech_on_focus_loss(sr),
+        Action::StartTableSetupMode => action_start_table_setup_mode(sr, view),
+        Action::CancelTableSetupMode => action_cancel_table_setup_mode(sr),
+        Action::CommitTableSetupMode => action_commit_table_setup_mode(sr, view),
+        Action::ToggleTableSetupTabstop => action_toggle_table_setup_tabstop(sr, view),
         Action::ExitTableMode => action_exit_table_mode(sr),
         Action::TableRowPrev => action_table_row_prev(sr, view),
         Action::TableRowNext => action_table_row_next(sr, view),
@@ -266,9 +302,7 @@ fn action_toggle_auto_read(sr: &mut ScreenReader) -> Result<CommandResult> {
     Ok(CommandResult::Handled)
 }
 
-fn action_toggle_stop_speech_on_focus_loss(
-    sr: &mut ScreenReader,
-) -> Result<CommandResult> {
+fn action_toggle_stop_speech_on_focus_loss(sr: &mut ScreenReader) -> Result<CommandResult> {
     sr.stop_speech_on_focus_loss = !sr.stop_speech_on_focus_loss;
     let status = if sr.stop_speech_on_focus_loss {
         "enabled"
@@ -703,15 +737,121 @@ fn action_toggle_table_mode(sr: &mut ScreenReader, view: &mut View) -> Result<Co
         sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     };
+    enter_table_mode_with_model(sr, view, model)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_start_table_setup_mode(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if matches!(sr.input_mode, InputMode::TableSetup) {
+        sr.speak("table setup already on", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    if matches!(sr.input_mode, InputMode::Table) {
+        sr.speak("exit table mode first", false)?;
+        return Ok(CommandResult::Handled);
+    }
+
+    let row = view.review_cursor_position.0;
+    if view.line(row).trim().is_empty() {
+        sr.speak("header row is blank", false)?;
+        return Ok(CommandResult::Handled);
+    }
+
+    sr.table_setup_state = Some(TableSetupState {
+        header_row: row,
+        tabstops: Vec::new(),
+    });
+    sr.table_state = None;
+    let old_mode = sr.input_mode;
+    sr.input_mode = InputMode::TableSetup;
+    sr.hook_on_mode_change(old_mode, sr.input_mode)?;
+    sr.speak("table setup on", false)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_cancel_table_setup_mode(sr: &mut ScreenReader) -> Result<CommandResult> {
+    if !matches!(sr.input_mode, InputMode::TableSetup) {
+        return Ok(CommandResult::Handled);
+    }
+
+    sr.table_setup_state = None;
+    let old_mode = sr.input_mode;
+    sr.input_mode = InputMode::Normal;
+    sr.hook_on_mode_change(old_mode, sr.input_mode)?;
+    sr.speak("table setup off", false)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_toggle_table_setup_tabstop(
+    sr: &mut ScreenReader,
+    view: &mut View,
+) -> Result<CommandResult> {
+    if !matches!(sr.input_mode, InputMode::TableSetup) {
+        return Ok(CommandResult::Handled);
+    }
+    let Some(setup) = sr.table_setup_state.as_mut() else {
+        sr.speak("table setup not active", false)?;
+        return Ok(CommandResult::Handled);
+    };
+
+    let col = view.review_cursor_position.1;
+    if col == 0 {
+        sr.speak("cannot set tabstop at first column", false)?;
+        return Ok(CommandResult::Handled);
+    }
+
+    if let Some(idx) = setup.tabstops.iter().position(|stop| *stop == col) {
+        setup.tabstops.remove(idx);
+        sr.speak("tabstop removed", false)?;
+    } else {
+        setup.tabstops.push(col);
+        setup.tabstops.sort_unstable();
+        setup.tabstops.dedup();
+        sr.speak("tabstop added", false)?;
+    }
+    Ok(CommandResult::Handled)
+}
+
+fn action_commit_table_setup_mode(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !matches!(sr.input_mode, InputMode::TableSetup) {
+        return Ok(CommandResult::Handled);
+    }
+
+    let Some(setup) = sr.table_setup_state.clone() else {
+        sr.speak("table setup not active", false)?;
+        return Ok(CommandResult::Handled);
+    };
+
+    let Some(model) = table::detect_manual_from_header(view, setup.header_row, &setup.tabstops)
+    else {
+        sr.speak("manual table setup invalid", false)?;
+        return Ok(CommandResult::Handled);
+    };
+
+    sr.table_setup_state = None;
+    enter_table_mode_with_model(sr, view, model)?;
+    Ok(CommandResult::Handled)
+}
+
+fn enter_table_mode_with_model(
+    sr: &mut ScreenReader,
+    view: &mut View,
+    model: table::TableModel,
+) -> Result<()> {
     let old_pos = view.review_cursor_position;
-    let col_idx = model.column_for_col(view.review_cursor_position.1);
+    let anchor_row = old_pos.0;
+    let entry_row = model
+        .nearest_data_row(view, anchor_row)
+        .unwrap_or(anchor_row);
+    let mut col_idx = model.column_for_col(view.review_cursor_position.1);
+    col_idx = model.nearest_non_empty_col(view, entry_row, col_idx);
     sr.table_state = Some(TableState {
         model,
         current_col: col_idx,
     });
     if let Some(state) = sr.table_state.as_ref() {
         let column = &state.model.columns[state.current_col];
-        view.review_cursor_position.1 = column.start;
+        view.review_cursor_position = (entry_row, column.start);
     }
     let old_mode = sr.input_mode;
     sr.input_mode = InputMode::Table;
@@ -722,13 +862,14 @@ fn action_toggle_table_mode(sr: &mut ScreenReader, view: &mut View) -> Result<Co
     report_review_cursor_move(sr, view, old_pos)?;
     sr.speak("table mode on", false)?;
     action_table_cell_read(sr, view)?;
-    Ok(CommandResult::Handled)
+    Ok(())
 }
 
 fn action_exit_table_mode(sr: &mut ScreenReader) -> Result<CommandResult> {
     let old_mode = sr.input_mode;
     sr.input_mode = InputMode::Normal;
     sr.table_state = None;
+    sr.table_setup_state = None;
     sr.hook_on_mode_change(old_mode, sr.input_mode)?;
     sr.hook_on_table_mode_exit()?;
     sr.speak("table mode off", false)?;
@@ -741,12 +882,14 @@ fn action_table_row_prev(sr: &mut ScreenReader, view: &mut View) -> Result<Comma
         return Ok(CommandResult::Handled);
     }
     let state_snapshot = sr.table_state.as_ref().unwrap().clone();
-    if view.review_cursor_position.0 <= state_snapshot.model.top {
+    let Some(new_row) = state_snapshot
+        .model
+        .prev_data_row(view, view.review_cursor_position.0)
+    else {
         sr.speak("top", false)?;
         return Ok(CommandResult::Handled);
-    }
+    };
     let old_pos = view.review_cursor_position;
-    let new_row = view.review_cursor_position.0 - 1;
     move_review_to_table_cell(view, &state_snapshot, new_row);
     report_review_cursor_move(sr, view, old_pos)?;
     speak_table_cell(sr, view, &state_snapshot, false)?;
@@ -759,12 +902,14 @@ fn action_table_row_next(sr: &mut ScreenReader, view: &mut View) -> Result<Comma
         return Ok(CommandResult::Handled);
     }
     let state_snapshot = sr.table_state.as_ref().unwrap().clone();
-    if view.review_cursor_position.0 >= state_snapshot.model.bottom {
+    let Some(new_row) = state_snapshot
+        .model
+        .next_data_row(view, view.review_cursor_position.0)
+    else {
         sr.speak("bottom", false)?;
         return Ok(CommandResult::Handled);
-    }
+    };
     let old_pos = view.review_cursor_position;
-    let new_row = view.review_cursor_position.0 + 1;
     move_review_to_table_cell(view, &state_snapshot, new_row);
     report_review_cursor_move(sr, view, old_pos)?;
     speak_table_cell(sr, view, &state_snapshot, false)?;
@@ -863,9 +1008,12 @@ fn ensure_table_state(sr: &mut ScreenReader, view: &mut View) -> bool {
         }
     }
     if let Some(state) = sr.table_state.as_mut() {
-        state.current_col = state
-            .model
-            .column_for_col(view.review_cursor_position.1);
+        if state.model.is_skippable_row(view, row) {
+            if let Some(target_row) = state.model.nearest_data_row(view, row) {
+                move_review_to_table_cell(view, state, target_row);
+            }
+        }
+        state.current_col = state.model.column_for_col(view.review_cursor_position.1);
         if state.current_col >= state.model.columns.len() {
             state.current_col = 0;
         }

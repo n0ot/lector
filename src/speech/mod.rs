@@ -4,8 +4,8 @@ use regex::Regex;
 use std::fmt::Write;
 use unicode_segmentation::UnicodeSegmentation;
 
-pub mod symbols;
 pub mod proc_driver;
+pub mod symbols;
 pub mod tts;
 
 const MIN_REPEAT_COUNT: usize = 4;
@@ -158,5 +158,4 @@ impl Speech {
     pub fn set_rate(&mut self, rate: f32) -> Result<()> {
         self.driver.set_rate(rate)
     }
-
 }

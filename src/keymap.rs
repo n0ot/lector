@@ -9,6 +9,7 @@ pub const BUILTIN_PREFIX: &str = "lector.";
 pub enum InputMode {
     Normal,
     Table,
+    TableSetup,
 }
 
 impl InputMode {
@@ -16,6 +17,7 @@ impl InputMode {
         match prefix {
             "normal" => Some(InputMode::Normal),
             "table" => Some(InputMode::Table),
+            "table_setup" => Some(InputMode::TableSetup),
             _ => None,
         }
     }
@@ -24,6 +26,7 @@ impl InputMode {
         match self {
             InputMode::Normal => "normal",
             InputMode::Table => "table",
+            InputMode::TableSetup => "table_setup",
         }
     }
 }
@@ -62,8 +65,7 @@ impl LuaBinding {
             .lua
             .registry_value(&self.func)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>(())
-            .map_err(|err| anyhow!(err.to_string()))
+        func.call::<()>(()).map_err(|err| anyhow!(err.to_string()))
     }
 }
 
@@ -76,13 +78,11 @@ impl KeyBindings {
         let mut bindings = HashMap::new();
         bindings.insert(InputMode::Normal, HashMap::new());
         bindings.insert(InputMode::Table, HashMap::new());
+        bindings.insert(InputMode::TableSetup, HashMap::new());
 
         let normal = bindings.get_mut(&InputMode::Normal).unwrap();
         normal.insert("F1".to_string(), Binding::Builtin(Action::ToggleHelp));
-        normal.insert(
-            "M-'".to_string(),
-            Binding::Builtin(Action::ToggleAutoRead),
-        );
+        normal.insert("M-'".to_string(), Binding::Builtin(Action::ToggleAutoRead));
         normal.insert(
             "M-\"".to_string(),
             Binding::Builtin(Action::ToggleReviewCursorFollowsScreenCursor),
@@ -135,13 +135,11 @@ impl KeyBindings {
             "M-[".to_string(),
             Binding::Builtin(Action::PreviousClipboard),
         );
+        normal.insert("M-]".to_string(), Binding::Builtin(Action::NextClipboard));
+        normal.insert("M-t".to_string(), Binding::Builtin(Action::ToggleTableMode));
         normal.insert(
-            "M-]".to_string(),
-            Binding::Builtin(Action::NextClipboard),
-        );
-        normal.insert(
-            "M-t".to_string(),
-            Binding::Builtin(Action::ToggleTableMode),
+            "M-T".to_string(),
+            Binding::Builtin(Action::StartTableSetupMode),
         );
         normal.insert(
             "M-g".to_string(),
@@ -150,10 +148,6 @@ impl KeyBindings {
 
         let table = bindings.get_mut(&InputMode::Table).unwrap();
         table.insert("Esc".to_string(), Binding::Builtin(Action::ExitTableMode));
-        table.insert("M-u".to_string(), Binding::Builtin(Action::TableRowPrev));
-        table.insert("M-o".to_string(), Binding::Builtin(Action::TableRowNext));
-        table.insert("M-U".to_string(), Binding::Builtin(Action::TableRowPrev));
-        table.insert("M-O".to_string(), Binding::Builtin(Action::TableRowNext));
         table.insert("M-i".to_string(), Binding::Builtin(Action::TableCellRead));
         table.insert("j".to_string(), Binding::Builtin(Action::TableRowNext));
         table.insert("k".to_string(), Binding::Builtin(Action::TableRowPrev));
@@ -169,6 +163,23 @@ impl KeyBindings {
             "M-H".to_string(),
             Binding::Builtin(Action::ToggleTableHeaderRead),
         );
+
+        let table_setup = bindings.get_mut(&InputMode::TableSetup).unwrap();
+        table_setup.insert(
+            "Esc".to_string(),
+            Binding::Builtin(Action::CancelTableSetupMode),
+        );
+        table_setup.insert(
+            "Enter".to_string(),
+            Binding::Builtin(Action::CommitTableSetupMode),
+        );
+        table_setup.insert(
+            "t".to_string(),
+            Binding::Builtin(Action::ToggleTableSetupTabstop),
+        );
+        table_setup.insert("h".to_string(), Binding::Builtin(Action::RevCharPrev));
+        table_setup.insert("l".to_string(), Binding::Builtin(Action::RevCharNext));
+        table_setup.insert("i".to_string(), Binding::Builtin(Action::RevCharRead));
 
         Self { bindings }
     }
@@ -196,12 +207,7 @@ impl KeyBindings {
         self.set_builtin_binding_for_mode(InputMode::Normal, key, action);
     }
 
-    pub fn set_builtin_binding_for_mode(
-        &mut self,
-        mode: InputMode,
-        key: String,
-        action: Action,
-    ) {
+    pub fn set_builtin_binding_for_mode(&mut self, mode: InputMode, key: String, action: Action) {
         self.replace_binding(mode, key, Binding::Builtin(action));
     }
 
@@ -315,10 +321,7 @@ impl KeyBindings {
     }
 
     fn replace_binding(&mut self, mode: InputMode, key: String, binding: Binding) {
-        let bindings = self
-            .bindings
-            .get_mut(&mode)
-            .expect("missing bindings map");
+        let bindings = self.bindings.get_mut(&mode).expect("missing bindings map");
         if let Some(prev) = bindings.insert(key, binding) {
             prev.cleanup();
         }

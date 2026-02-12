@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
 pub struct SymbolMap(HashMap<String, SymbolDesc>);
@@ -37,7 +37,7 @@ impl SymbolMap {
         m.put("-", "dash", Most, After, true);
         m.put("–", "en dash", Most, After, true);
         m.put("—", "em dash", Most, After, true);
-        m.put("­", "soft hyphen", Most, Never, true);
+        m.put("\u{AD}", "soft hyphen", Most, Never, true);
         m.put("⁃", "hyphen", None, Never, true);
         m.put(".", "dot", All, After, true);
         m.put("…", "dot dot dot", All, After, true);
@@ -157,7 +157,13 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("┌", "box drawing Light Down and Right", Character, Never, true);
+        m.put(
+            "┌",
+            "box drawing Light Down and Right",
+            Character,
+            Never,
+            true,
+        );
         m.put(
             "┍",
             "box drawing Down Light and Right Heavy",
@@ -172,8 +178,20 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("┏", "box drawing Heavy Down and Right", Character, Never, true);
-        m.put("┐", "box drawing Light Down and Left", Character, Never, true);
+        m.put(
+            "┏",
+            "box drawing Heavy Down and Right",
+            Character,
+            Never,
+            true,
+        );
+        m.put(
+            "┐",
+            "box drawing Light Down and Left",
+            Character,
+            Never,
+            true,
+        );
         m.put(
             "┑",
             "box drawing Down Light and Left Heavy",
@@ -188,8 +206,20 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("┓", "box drawing Heavy Down and Left", Character, Never, true);
-        m.put("└", "box drawing Light Up and Right", Character, Never, true);
+        m.put(
+            "┓",
+            "box drawing Heavy Down and Left",
+            Character,
+            Never,
+            true,
+        );
+        m.put(
+            "└",
+            "box drawing Light Up and Right",
+            Character,
+            Never,
+            true,
+        );
         m.put(
             "┕",
             "box drawing Up Light and Right Heavy",
@@ -204,7 +234,13 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("┗", "box drawing Heavy Up and Right", Character, Never, true);
+        m.put(
+            "┗",
+            "box drawing Heavy Up and Right",
+            Character,
+            Never,
+            true,
+        );
         m.put("┘", "box drawing Light Up and Left", Character, Never, true);
         m.put(
             "┙",
@@ -601,7 +637,13 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("╔", "box drawing Double Down and Right", Character, Never, true);
+        m.put(
+            "╔",
+            "box drawing Double Down and Right",
+            Character,
+            Never,
+            true,
+        );
         m.put(
             "╕",
             "box drawing Down Single and Left Double",
@@ -616,7 +658,13 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("╗", "box drawing Double Down and Left", Character, Never, true);
+        m.put(
+            "╗",
+            "box drawing Double Down and Left",
+            Character,
+            Never,
+            true,
+        );
         m.put(
             "╘",
             "box drawing Up Single and Right Double",
@@ -631,7 +679,13 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("╚", "box drawing Double Up and Right", Character, Never, true);
+        m.put(
+            "╚",
+            "box drawing Double Up and Right",
+            Character,
+            Never,
+            true,
+        );
         m.put(
             "╛",
             "box drawing Up Single and Left Double",
@@ -646,7 +700,13 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("╝", "box drawing Double Up and Left", Character, Never, true);
+        m.put(
+            "╝",
+            "box drawing Double Up and Left",
+            Character,
+            Never,
+            true,
+        );
         m.put(
             "╞",
             "box drawing Vertical Single and Right Double",
@@ -766,8 +826,20 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("╯", "box drawing Light Arc Up and Left", Character, Never, true);
-        m.put("╰", "box drawing Light Arc Up and Right", Character, Never, true);
+        m.put(
+            "╯",
+            "box drawing Light Arc Up and Left",
+            Character,
+            Never,
+            true,
+        );
+        m.put(
+            "╰",
+            "box drawing Light Arc Up and Right",
+            Character,
+            Never,
+            true,
+        );
         m.put(
             "╱",
             "box drawing Light Diagonal Upper Right to Lower Left",
@@ -782,7 +854,13 @@ impl SymbolMap {
             Never,
             true,
         );
-        m.put("╳", "box drawing Light Diagonal Cross", Character, Never, true);
+        m.put(
+            "╳",
+            "box drawing Light Diagonal Cross",
+            Character,
+            Never,
+            true,
+        );
         m.put("╴", "box drawing Light Left", Character, Never, true);
         m.put("╵", "box drawing Light Up", Character, Never, true);
         m.put("╶", "box drawing Light Right", Character, Never, true);

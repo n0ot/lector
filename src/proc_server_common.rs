@@ -126,7 +126,11 @@ where
                 while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
                     let line = buffer.drain(..=pos).collect::<Vec<u8>>();
                     let line = String::from_utf8_lossy(&line);
-                    handle_line(line.trim_end_matches(&['\r', '\n'][..]), handler, &mut stdout)?;
+                    handle_line(
+                        line.trim_end_matches(&['\r', '\n'][..]),
+                        handler,
+                        &mut stdout,
+                    )?;
                 }
             }
         }

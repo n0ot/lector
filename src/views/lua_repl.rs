@@ -5,16 +5,12 @@ use crate::{
     screen_reader::ScreenReader,
     view::View,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use mlua::{
     Error, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Thread, ThreadStatus, Value,
     VmState,
 };
-use std::{
-    cell::RefCell,
-    io::Write,
-    rc::Rc,
-};
+use std::{cell::RefCell, io::Write, rc::Rc};
 
 struct ReplOutput {
     lines: Vec<String>,
@@ -41,8 +37,7 @@ impl LuaReplView {
         let print_buffer = Rc::new(RefCell::new(ReplOutput { lines: Vec::new() }));
         let print_buffer_clone = Rc::clone(&print_buffer);
         let screen_reader_ptr = Rc::new(RefCell::new(std::ptr::null_mut()));
-        lua::setup_repl(&lua, Rc::clone(&screen_reader_ptr))
-            .map_err(|e| anyhow!(e.to_string()))?;
+        lua::setup_repl(&lua, Rc::clone(&screen_reader_ptr)).map_err(|e| anyhow!(e.to_string()))?;
         let print_fn = lua
             .create_function(move |_lua, args: MultiValue| {
                 let mut pieces = Vec::new();
@@ -58,12 +53,8 @@ impl LuaReplView {
             .set("print", print_fn)
             .map_err(|e| anyhow!(e.to_string()))?;
 
-        let env = lua
-            .create_table()
-            .map_err(|e| anyhow!(e.to_string()))?;
-        let env_meta = lua
-            .create_table()
-            .map_err(|e| anyhow!(e.to_string()))?;
+        let env = lua.create_table().map_err(|e| anyhow!(e.to_string()))?;
+        let env_meta = lua.create_table().map_err(|e| anyhow!(e.to_string()))?;
         env_meta
             .set("__index", lua.globals())
             .map_err(|e| anyhow!(e.to_string()))?;
@@ -309,11 +300,12 @@ impl LuaReplView {
             .lua
             .create_thread(func)
             .map_err(|e| anyhow!(e.to_string()))?;
-        thread.set_hook(
-            HookTriggers::new().every_nth_instruction(1000),
-            |_lua, _debug| Ok(VmState::Yield),
-        )
-        .map_err(|e| anyhow!(e.to_string()))?;
+        thread
+            .set_hook(
+                HookTriggers::new().every_nth_instruction(1000),
+                |_lua, _debug| Ok(VmState::Yield),
+            )
+            .map_err(|e| anyhow!(e.to_string()))?;
         self.thread = Some(thread);
         Ok(())
     }
@@ -407,11 +399,7 @@ impl ViewController for LuaReplView {
         }
     }
 
-    fn tick(
-        &mut self,
-        sr: &mut ScreenReader,
-        _pty_stream: &mut dyn Write,
-    ) -> Result<ViewAction> {
+    fn tick(&mut self, sr: &mut ScreenReader, _pty_stream: &mut dyn Write) -> Result<ViewAction> {
         self.set_screen_reader(sr);
         if self.thread.is_none() {
             return Ok(ViewAction::None);

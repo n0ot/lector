@@ -22,6 +22,13 @@ fn harness_script_table_headers() {
 }
 
 #[test]
+fn harness_script_table_real_world() {
+    let script = include_str!("scripts/table_real_world.txt");
+    let mut harness = Harness::new(24, 80).expect("create harness");
+    harness.run_script(script).expect("run script");
+}
+
+#[test]
 fn harness_script_focus_events() {
     let script = include_str!("scripts/focus_events.txt");
     let mut harness = Harness::new(24, 80).expect("create harness");

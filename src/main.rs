@@ -41,17 +41,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let term_size = termsize::get().ok_or_else(|| anyhow!("cannot get terminal size"))?;
     let speech_driver: Box<dyn speech::Driver> = match cli.speech_driver {
-        SpeechDriverKind::Tts => Box::new(
-            speech::tts::TtsDriver::new().context("create tts driver")?,
-        ),
+        SpeechDriverKind::Tts => {
+            Box::new(speech::tts::TtsDriver::new().context("create tts driver")?)
+        }
         SpeechDriverKind::Proc => {
-            let path = cli.speech_server.ok_or_else(|| {
-                anyhow!("--speech-server is required when --speech-driver=proc")
-            })?;
-            Box::new(
-                speech::proc_driver::ProcDriver::new(&path)
-                    .context("create proc driver")?,
-            )
+            let path = cli
+                .speech_server
+                .ok_or_else(|| anyhow!("--speech-server is required when --speech-driver=proc"))?;
+            Box::new(speech::proc_driver::ProcDriver::new(&path).context("create proc driver")?)
         }
     };
     let speech = speech::Speech::new(speech_driver);
@@ -85,18 +82,16 @@ fn main() -> Result<()> {
         do_events(screen_reader, &mut app, &mut process, None)
     }) {
         Ok(()) => Ok(()),
-        Err(err) => {
-            do_events(
-                &mut screen_reader,
-                &mut app,
-                &mut process,
-                Some(format!(
-                    "Error loading config file: {}\n\n{}",
-                    conf_file.display(),
-                    err
-                )),
-            )
-        }
+        Err(err) => do_events(
+            &mut screen_reader,
+            &mut app,
+            &mut process,
+            Some(format!(
+                "Error loading config file: {}\n\n{}",
+                conf_file.display(),
+                err
+            )),
+        ),
     };
     // Clean up before returning the above result.
     if let Err(err) = termios::tcsetattr(
@@ -144,7 +139,9 @@ fn do_events(
     // Main event loop
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
-    stdout.write_all(FOCUS_EVENTS_ENABLE).context("enable focus events")?;
+    stdout
+        .write_all(FOCUS_EVENTS_ENABLE)
+        .context("enable focus events")?;
     stdout.flush().context("flush focus events enable")?;
     let mut events = mio::Events::with_capacity(1024);
     let mut poll_timeout = None;

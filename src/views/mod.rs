@@ -44,11 +44,7 @@ pub trait ViewController {
         input: &[u8],
         pty_stream: &mut dyn Write,
     ) -> Result<ViewAction>;
-    fn tick(
-        &mut self,
-        _sr: &mut ScreenReader,
-        _pty_stream: &mut dyn Write,
-    ) -> Result<ViewAction> {
+    fn tick(&mut self, _sr: &mut ScreenReader, _pty_stream: &mut dyn Write) -> Result<ViewAction> {
         Ok(ViewAction::None)
     }
     fn handle_paste(

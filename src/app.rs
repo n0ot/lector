@@ -1,10 +1,4 @@
-use crate::{
-    commands,
-    keymap::Binding,
-    perform,
-    screen_reader::ScreenReader,
-    views,
-};
+use crate::{commands, keymap::Binding, perform, screen_reader::ScreenReader, views};
 use anyhow::{Context, Result};
 use std::{collections::VecDeque, io::Write, time};
 use terminput::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -21,10 +15,7 @@ const OSC_START: u8 = b']';
 const ST_ESCAPE: u8 = b'\\';
 
 fn is_ss3_final(byte: u8) -> bool {
-    matches!(
-        byte,
-        b'D' | b'C' | b'A' | b'B' | b'H' | b'F' | b'P'..=b'S'
-    )
+    matches!(byte, b'D' | b'C' | b'A' | b'B' | b'H' | b'F' | b'P'..=b'S')
 }
 
 pub trait Clock {
@@ -71,10 +62,8 @@ impl App {
 
     pub fn new_with_clock(view_stack: views::ViewStack, clock: Box<dyn Clock>) -> Result<Self> {
         let ansi_csi_re =
-            regex::bytes::Regex::new(
-                r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$",
-            )
-            .context("compile ansi csi regex")?;
+            regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$")
+                .context("compile ansi csi regex")?;
         let mut app = Self {
             view_stack,
             vte_parser: vte::Parser::new(),
@@ -106,12 +95,7 @@ impl App {
         self.view_stack.has_overlay()
     }
 
-    pub fn on_resize(
-        &mut self,
-        rows: u16,
-        cols: u16,
-        term_out: &mut dyn Write,
-    ) -> Result<()> {
+    pub fn on_resize(&mut self, rows: u16, cols: u16, term_out: &mut dyn Write) -> Result<()> {
         self.view_stack.on_resize(rows, cols);
         if self.view_stack.has_overlay() {
             self.render_active_view(term_out)?;
@@ -128,10 +112,7 @@ impl App {
     ) -> Result<()> {
         let (rows, cols) = self.view_stack.root_mut().model().size();
         self.view_stack.push(Box::new(views::MessageView::new(
-            rows,
-            cols,
-            title,
-            message,
+            rows, cols, title, message,
         )));
         self.render_active_view(term_out)?;
         self.announce_view_change(sr)?;
@@ -221,9 +202,8 @@ impl App {
                 if self.pending_input.is_empty() {
                     self.pending_input_last_at = None;
                 }
-                let event = Event::Key(
-                    KeyEvent::new(KeyCode::Char('O')).modifiers(KeyModifiers::ALT),
-                );
+                let event =
+                    Event::Key(KeyEvent::new(KeyCode::Char('O')).modifiers(KeyModifiers::ALT));
                 self.handle_event(sr, event, &raw, pty_out, term_out)?;
                 continue;
             }
@@ -420,9 +400,7 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         match event {
-            Event::Key(key_event) => {
-                self.handle_key_event(sr, key_event, raw, pty_out, term_out)
-            }
+            Event::Key(key_event) => self.handle_key_event(sr, key_event, raw, pty_out, term_out),
             Event::Paste(contents) => {
                 let view_action = self
                     .view_stack
@@ -457,9 +435,10 @@ impl App {
         }
 
         let binding_name = self.key_event_binding_name(key_event);
-        let binding = binding_name
-            .as_ref()
-            .and_then(|name| sr.key_bindings.binding_for_mode(sr.input_mode, name.as_str()));
+        let binding = binding_name.as_ref().and_then(|name| {
+            sr.key_bindings
+                .binding_for_mode(sr.input_mode, name.as_str())
+        });
         if let Some(binding) = binding {
             if sr.help_mode {
                 if matches!(binding, Binding::Builtin(commands::Action::ToggleHelp)) {
@@ -589,7 +568,9 @@ impl App {
         let overlay_active = self.view_stack.has_overlay();
         self.view_stack.root_mut().handle_pty_output(buf)?;
         if !overlay_active {
-            term_out.write_all(&terminal_buf).context("write PTY output")?;
+            term_out
+                .write_all(&terminal_buf)
+                .context("write PTY output")?;
             term_out.flush().context("flush output")?;
             if sr.auto_read {
                 self.vte_parser.advance(&mut self.reporter, buf);

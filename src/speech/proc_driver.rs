@@ -47,14 +47,8 @@ impl ProcDriver {
             .stdout(Stdio::piped())
             .spawn()
             .with_context(|| format!("spawn proc driver {}", path.display()))?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("capture proc driver stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("capture proc driver stdout")?;
+        let stdin = child.stdin.take().context("capture proc driver stdin")?;
+        let stdout = child.stdout.take().context("capture proc driver stdout")?;
         Ok(ProcDriver {
             child,
             stdin,
@@ -89,8 +83,8 @@ impl ProcDriver {
             if read == 0 {
                 bail!("proc driver closed stdout while waiting for response");
             }
-            let response: JsonRpcResponse = serde_json::from_str(line.trim())
-                .context("parse rpc response")?;
+            let response: JsonRpcResponse =
+                serde_json::from_str(line.trim()).context("parse rpc response")?;
             if response.id != Some(id) {
                 continue;
             }
@@ -99,9 +93,7 @@ impl ProcDriver {
                     "proc driver rpc error {}: {}{}",
                     err.code,
                     err.message,
-                    err.data
-                        .map(|v| format!(" ({})", v))
-                        .unwrap_or_default()
+                    err.data.map(|v| format!(" ({})", v)).unwrap_or_default()
                 );
             }
             return Ok(());
@@ -111,7 +103,10 @@ impl ProcDriver {
 
 impl Driver for ProcDriver {
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
-        self.call("speak", Some(json!({ "text": text, "interrupt": interrupt })))
+        self.call(
+            "speak",
+            Some(json!({ "text": text, "interrupt": interrupt })),
+        )
     }
 
     fn stop(&mut self) -> Result<()> {

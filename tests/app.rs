@@ -1,9 +1,9 @@
-use lector::{app::{App, Clock}, screen_reader::ScreenReader, speech, views};
-use std::{
-    cell::Cell,
-    cell::RefCell,
-    rc::Rc,
+use lector::{
+    app::{App, Clock},
+    screen_reader::ScreenReader,
+    speech, views,
 };
+use std::{cell::Cell, cell::RefCell, rc::Rc};
 
 #[derive(Default)]
 struct RecorderState {
@@ -328,6 +328,11 @@ fn toggle_stop_on_focus_loss_hotkey_disables_stopping() {
         .expect("handle stdin");
 
     let state = recorder.inner.borrow();
-    assert!(state.speaks.iter().any(|(text, _)| text == "stop on focus loss disabled"));
+    assert!(
+        state
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "stop on focus loss disabled")
+    );
     assert_eq!(state.stops, 1);
 }

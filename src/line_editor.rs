@@ -192,7 +192,11 @@ impl LineEditor {
             b'\x7F' | b'\x08' => {
                 let changed = self.erase_word_left();
                 self.state = InputState::Normal;
-                return if changed { EditorAction::Changed } else { EditorAction::Bell };
+                return if changed {
+                    EditorAction::Changed
+                } else {
+                    EditorAction::Bell
+                };
             }
             _ => self.state = InputState::Normal,
         }
@@ -384,7 +388,6 @@ impl LineEditor {
         }
         if saw_digit { Some(value) } else { None }
     }
-
 }
 
 fn is_word_byte(byte: u8) -> bool {

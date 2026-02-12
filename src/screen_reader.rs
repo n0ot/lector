@@ -33,6 +33,7 @@ pub struct ScreenReader {
     pub key_bindings: KeyBindings,
     pub input_mode: InputMode,
     pub table_state: Option<TableState>,
+    pub table_setup_state: Option<TableSetupState>,
     pub table_header_auto: bool,
     pub stop_speech_on_focus_loss: bool,
     pub terminal_focused: bool,
@@ -59,6 +60,7 @@ impl ScreenReader {
             key_bindings: KeyBindings::new(),
             input_mode: InputMode::Normal,
             table_state: None,
+            table_setup_state: None,
             table_header_auto: true,
             stop_speech_on_focus_loss: true,
             terminal_focused: true,
@@ -149,8 +151,7 @@ impl ScreenReader {
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>(tbl)
-            .map_err(|err| anyhow!(err.to_string()))
+        func.call::<()>(tbl).map_err(|err| anyhow!(err.to_string()))
     }
 
     pub fn hook_on_shutdown(&mut self, reason: &str) -> Result<()> {
@@ -177,18 +178,11 @@ impl ScreenReader {
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>((
-            message.to_string(),
-            context.to_string(),
-        ))
-        .map_err(|err| anyhow!(err.to_string()))
+        func.call::<()>((message.to_string(), context.to_string()))
+            .map_err(|err| anyhow!(err.to_string()))
     }
 
-    pub fn hook_on_screen_update(
-        &mut self,
-        view: &View,
-        overlay_active: bool,
-    ) -> Result<()> {
+    pub fn hook_on_screen_update(&mut self, view: &View, overlay_active: bool) -> Result<()> {
         let Some(key) = &self.lua_hooks.on_screen_update else {
             return Ok(());
         };
@@ -223,8 +217,7 @@ impl ScreenReader {
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>(tbl)
-            .map_err(|err| anyhow!(err.to_string()))
+        func.call::<()>(tbl).map_err(|err| anyhow!(err.to_string()))
     }
 
     pub fn hook_on_review_cursor_move(
@@ -253,8 +246,7 @@ impl ScreenReader {
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>(tbl)
-            .map_err(|err| anyhow!(err.to_string()))
+        func.call::<()>(tbl).map_err(|err| anyhow!(err.to_string()))
     }
 
     pub fn hook_on_mode_change(&mut self, old: InputMode, new: InputMode) -> Result<()> {
@@ -270,17 +262,11 @@ impl ScreenReader {
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>((
-            old.as_str().to_string(),
-            new.as_str().to_string(),
-        ))
-        .map_err(|err| anyhow!(err.to_string()))
+        func.call::<()>((old.as_str().to_string(), new.as_str().to_string()))
+            .map_err(|err| anyhow!(err.to_string()))
     }
 
-    pub fn hook_on_table_mode_enter(
-        &mut self,
-        table_state: &TableState,
-    ) -> Result<()> {
+    pub fn hook_on_table_mode_enter(&mut self, table_state: &TableState) -> Result<()> {
         let Some(key) = &self.lua_hooks.on_table_mode_enter else {
             return Ok(());
         };
@@ -307,8 +293,7 @@ impl ScreenReader {
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>(tbl)
-            .map_err(|err| anyhow!(err.to_string()))
+        func.call::<()>(tbl).map_err(|err| anyhow!(err.to_string()))
     }
 
     pub fn hook_on_table_mode_exit(&mut self) -> Result<()> {
@@ -321,15 +306,10 @@ impl ScreenReader {
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>(())
-            .map_err(|err| anyhow!(err.to_string()))
+        func.call::<()>(()).map_err(|err| anyhow!(err.to_string()))
     }
 
-    pub fn hook_on_clipboard_change(
-        &mut self,
-        op: &str,
-        entry: Option<&str>,
-    ) -> Result<()> {
+    pub fn hook_on_clipboard_change(&mut self, op: &str, entry: Option<&str>) -> Result<()> {
         let Some(key) = &self.lua_hooks.on_clipboard_change else {
             return Ok(());
         };
@@ -337,28 +317,26 @@ impl ScreenReader {
             return Ok(());
         };
         let meta = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
-        meta.set("op", op)
-            .map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("op", op).map_err(|err| anyhow!(err.to_string()))?;
         meta.set("index", self.clipboard.index())
             .map_err(|err| anyhow!(err.to_string()))?;
         meta.set("size", self.clipboard.size())
             .map_err(|err| anyhow!(err.to_string()))?;
         let entry = match entry {
-            Some(value) => Value::String(lua.create_string(value).map_err(|err| anyhow!(err.to_string()))?),
+            Some(value) => Value::String(
+                lua.create_string(value)
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            ),
             None => Value::Nil,
         };
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>( (entry, meta) )
+        func.call::<()>((entry, meta))
             .map_err(|err| anyhow!(err.to_string()))
     }
 
-    pub fn hook_on_key_unhandled(
-        &mut self,
-        key: Option<&str>,
-        mode: InputMode,
-    ) -> Result<bool> {
+    pub fn hook_on_key_unhandled(&mut self, key: Option<&str>, mode: InputMode) -> Result<bool> {
         let Some(key_ref) = &self.lua_hooks.on_key_unhandled else {
             return Ok(false);
         };
@@ -369,7 +347,10 @@ impl ScreenReader {
             .registry_value(key_ref)
             .map_err(|err| anyhow!(err.to_string()))?;
         let key_value = match key {
-            Some(value) => Value::String(lua.create_string(value).map_err(|err| anyhow!(err.to_string()))?),
+            Some(value) => Value::String(
+                lua.create_string(value)
+                    .map_err(|err| anyhow!(err.to_string()))?,
+            ),
             None => Value::Nil,
         };
         let res: Value = func
@@ -426,16 +407,11 @@ impl ScreenReader {
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>( (text.to_string(), meta) )
+        func.call::<()>((text.to_string(), meta))
             .map_err(|err| anyhow!(err.to_string()))
     }
 
-    fn call_hook_on_speech_end(
-        &mut self,
-        text: &str,
-        interrupt: bool,
-        ok: bool,
-    ) -> Result<()> {
+    fn call_hook_on_speech_end(&mut self, text: &str, interrupt: bool, ok: bool) -> Result<()> {
         let Some(key) = &self.lua_hooks.on_speech_end else {
             return Ok(());
         };
@@ -445,12 +421,11 @@ impl ScreenReader {
         let meta = lua.create_table().map_err(|err| anyhow!(err.to_string()))?;
         meta.set("interrupt", interrupt)
             .map_err(|err| anyhow!(err.to_string()))?;
-        meta.set("ok", ok)
-            .map_err(|err| anyhow!(err.to_string()))?;
+        meta.set("ok", ok).map_err(|err| anyhow!(err.to_string()))?;
         let func: Function = lua
             .registry_value(key)
             .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>( (text.to_string(), meta) )
+        func.call::<()>((text.to_string(), meta))
             .map_err(|err| anyhow!(err.to_string()))
     }
 
@@ -477,8 +452,7 @@ impl ScreenReader {
         } else if cursor.1 != prev_cursor.1 {
             // The cursor moved left or right
             let distance_moved = (cursor.1 as i32 - prev_cursor.1 as i32).abs();
-            let prev_word_start =
-                view.screen().find_word_start(prev_cursor.0, prev_cursor.1);
+            let prev_word_start = view.screen().find_word_start(prev_cursor.0, prev_cursor.1);
             let word_start = view.screen().find_word_start(cursor.0, cursor.1);
             if word_start != prev_word_start && distance_moved > 1 {
                 // The cursor moved to a different word.
@@ -512,8 +486,10 @@ impl ScreenReader {
     }
 
     pub fn track_highlighting(&mut self, view: &mut View) -> Result<()> {
-        let (highlights, prev_highlights) =
-            (view.screen().get_highlights(), view.prev_screen().get_highlights());
+        let (highlights, prev_highlights) = (
+            view.screen().get_highlights(),
+            view.prev_screen().get_highlights(),
+        );
         let prev_hl_set: HashSet<String> = HashSet::from_iter(prev_highlights.iter().cloned());
 
         for hl in highlights {
@@ -525,10 +501,7 @@ impl ScreenReader {
     }
 
     /// Report indentation changes, if any, for the line under the application cursor
-    pub fn report_application_cursor_indentation_changes(
-        &mut self,
-        view: &mut View,
-    ) -> Result<()> {
+    pub fn report_application_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
         let (indent_level, changed) = view.application_cursor_indentation_level();
         if changed {
             self.speak(&format!("indent {}", indent_level), false)?;
@@ -538,10 +511,7 @@ impl ScreenReader {
     }
 
     /// Report indentation changes, if any, for the line under the review cursor
-    pub fn report_review_cursor_indentation_changes(
-        &mut self,
-        view: &mut View,
-    ) -> Result<()> {
+    pub fn report_review_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
         let (indent_level, changed) = view.review_cursor_indentation_level();
         if changed {
             self.speak(&format!("indent {}", indent_level), false)?;
@@ -552,11 +522,7 @@ impl ScreenReader {
 
     /// Read what's changed between the current and previous screen.
     /// If anything was read, the value in the result will be true.
-    pub fn auto_read(
-        &mut self,
-        view: &mut View,
-        reporter: &mut perform::Reporter,
-    ) -> Result<bool> {
+    pub fn auto_read(&mut self, view: &mut View, reporter: &mut perform::Reporter) -> Result<bool> {
         self.report_application_cursor_indentation_changes(view)?;
         if view.screen().contents() == view.prev_screen().contents() {
             return Ok(false);
@@ -747,6 +713,12 @@ impl ScreenReader {
             }
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct TableSetupState {
+    pub header_row: u16,
+    pub tabstops: Vec<u16>,
 }
 
 #[derive(Default)]

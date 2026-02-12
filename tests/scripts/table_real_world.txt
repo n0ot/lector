@@ -1,0 +1,119 @@
+Scenario: kubectl get pods style fixed-width table
+Given pty-stdout: NAME                     READY   STATUS    RESTARTS   AGE\r\nnginx-77b4fdf86c-pxn7m   1/1     Running   0          84s\r\nredis-f9d87f5d6-pt6bl    1/1     Running   0          84s
+When stdin: \x1Bt
+And stdin: H
+And stdin: i
+Then expect-speak: table mode on
+And expect-speak: NAME
+And expect-speak: NAME
+And expect-speak: NAME
+
+Scenario: docker ps style fixed-width table
+Given pty-stdout: CONTAINER ID   IMAGE          COMMAND                  CREATED         STATUS         PORTS     NAMES\r\nd64d3505b0d2   nginx:latest   "nginx -g 'daemon off;'"   4 minutes ago   Up 4 minutes   80/tcp    focused_turing\r\n7f8e9a0b1c2d   redis:7        "docker-entrypoint.s…"   5 minutes ago   Up 5 minutes   6379/tcp  boring_hawking
+When stdin: \x1Bt
+And stdin: H
+Then expect-speak: table mode on
+And expect-speak: CONTAINER ID
+And expect-speak: CONTAINER ID
+
+Scenario: aws cli table with separator rows skips separators on row movement
+Given pty-stdout: -----------------------------------------------------\r\n|              DescribeInstances                |\r\n+------------------+----------------------------+\r\n|  AvailabilityZone|  InstanceType              |\r\n+------------------+----------------------------+\r\n|  us-west-2a      |  t2.micro                  |\r\n|  us-west-2b      |  t2.nano                   |\r\n+------------------+----------------------------+
+When stdin: \x1Bt
+And stdin: j
+And stdin: k
+Then expect-speak: table mode on
+And expect-speak-contains: Availability
+And expect-speak: us-west-2a
+And expect-speak-contains: Availability
+
+Scenario: single noisy comma line does not trigger table mode
+Given pty-stdout: INFO startup complete\r\nerror, code, failed to process\r\nstack trace line
+When stdin: \x1Bt
+Then expect-speak: no table found
+
+Scenario: markdown pipe table reads full first cell value
+Given pty-stdout: | ID | Name |\r\n|:---|:---|\r\n| `1015` | Auto |
+When stdin: \x1By
+And stdin: \x1Bo
+And stdin: \x1Bo
+And stdin: \x1Bt
+Then expect-speak-contains: | ID | Name |
+And expect-speak-contains: |:---|:---|
+And expect-speak-contains: | `1015` | Auto |
+And expect-speak: table mode on
+And expect-speak-contains: 1015
+
+Scenario: full markdown project table reads full last-row id
+Given resize: 17 240
+And pty-stdout: | ID | Client / Company | Project Name | Status | Priority | Budget | Progress | Due Date | Lead |\r\n|:---|:---|:---|:---:|:---:|---:|:---|:---:|:---|\r\n| `1001` | **Acme Corp** | Q4 Marketing Audit | 🟢 Active | High | $12,500 | ▓▓▓▓▓▓░░░░ 60% | 2023-11-15 | *Sarah J.* |\r\n| `1002` | **Wayne Ent.** | Security Protocol v2 | 🟡 Pending | Critical | $85,000 | ▓▓░░░░░░░░ 20% | 2023-12-01 | *Bruce W.* |\r\n| `1003` | **Cyberdyne** | Neural Net Training | 🔴 Error | Medium | $150,000 | ▓▓▓▓▓░░░░░ 50% | 2024-01-20 | *Miles D.* |\r\n| `1004` | **Stark Ind.** | Arc Reactor Mini | 🟢 Active | Low | $5,000 | ▓▓▓▓▓▓▓▓▓░ 90% | 2023-10-30 | *Tony S.* |\r\n| `1005` | **Umbrella Corp** | Bio-Dome HVAC | 🔵 Done | High | $32,000 | ▓▓▓▓▓▓▓▓▓▓ 100%| 2023-09-15 | *Albert W.* |\r\n| `1006` | **Massive Dynamic** | Cortexiphan Trial | 🟡 Pending | Low | $10,000 | ░░░░░░░░░░ 0% | 2024-02-14 | *Walter B.* |\r\n| `1007` | **InGen** | Park Automation | 🔴 Error | Critical | $2,400,000 | ▓▓▓▓░░░░░░ 40% | 2023-11-05 | *John H.* |\r\n| `1008` | **Aperture Sci.** | Portal Gun Physic | 🟢 Active | Medium | $0 | ▓▓▓▓▓▓▓░░░ 75% | TBD | *G.L.A.D.* |\r\n| `1009` | **Tyrell Corp** | Nexus-6 Skin Job | 🔵 Done | High | $550,000 | ▓▓▓▓▓▓▓▓▓▓ 100%| 2019-11-20 | *Eldon T.* |\r\n| `1010` | **OCP** | Delta City Plan | 🟢 Active | High | $95,000 | ▓▓▓░░░░░░░ 30% | 2024-03-10 | *Dick J.* |\r\n| `1011` | **Soylent Corp** | Nutritional Paste | 🟡 Pending | Low | $500 | ▓░░░░░░░░░ 10% | 2023-12-12 | *Sol R.* |\r\n| `1012` | **Globex** | Doomsday Device | 🟢 Active | Critical | $1,000,000 | ▓▓▓▓▓▓▓▓░░ 80% | 2023-11-01 | *Hank S.* |\r\n| `1013` | **Hooli** | Nucleus Compression | 🔴 Error | High | $24,500 | ▓▓▓▓▓▓░░░░ 55% | 2023-10-28 | *Gavin B.* |\r\n| `1014` | **Veidt Ent.** | Squid Teleport | 🔵 Done | Critical | $7,000,000 | ▓▓▓▓▓▓▓▓▓▓ 100%| 1985-11-02 | *Adrian V.* |\r\n| `1015` | **BNL** | Trash Compactors | 🟢 Active | Low | $12,000 | ▓▓▓▓░░░░░░ 45% | 2105-06-15 | *Auto* |
+When stdin: \x1Bp
+And stdin: \x1Bh
+And stdin: \x1Bt
+Then expect-speak-contains: | `1015` |
+And expect-speak-contains: bar
+And expect-speak: table mode on
+And expect-speak-contains: 1015
+
+Scenario: full markdown project table supports row navigation
+Given resize: 17 240
+And pty-stdout: | ID | Client / Company | Project Name | Status | Priority | Budget | Progress | Due Date | Lead |\r\n|:---|:---|:---|:---:|:---:|---:|:---|:---:|:---|\r\n| `1001` | **Acme Corp** | Q4 Marketing Audit | 🟢 Active | High | $12,500 | ▓▓▓▓▓▓░░░░ 60% | 2023-11-15 | *Sarah J.* |\r\n| `1002` | **Wayne Ent.** | Security Protocol v2 | 🟡 Pending | Critical | $85,000 | ▓▓░░░░░░░░ 20% | 2023-12-01 | *Bruce W.* |\r\n| `1003` | **Cyberdyne** | Neural Net Training | 🔴 Error | Medium | $150,000 | ▓▓▓▓▓░░░░░ 50% | 2024-01-20 | *Miles D.* |\r\n| `1004` | **Stark Ind.** | Arc Reactor Mini | 🟢 Active | Low | $5,000 | ▓▓▓▓▓▓▓▓▓░ 90% | 2023-10-30 | *Tony S.* |\r\n| `1005` | **Umbrella Corp** | Bio-Dome HVAC | 🔵 Done | High | $32,000 | ▓▓▓▓▓▓▓▓▓▓ 100%| 2023-09-15 | *Albert W.* |\r\n| `1006` | **Massive Dynamic** | Cortexiphan Trial | 🟡 Pending | Low | $10,000 | ░░░░░░░░░░ 0% | 2024-02-14 | *Walter B.* |\r\n| `1007` | **InGen** | Park Automation | 🔴 Error | Critical | $2,400,000 | ▓▓▓▓░░░░░░ 40% | 2023-11-05 | *John H.* |\r\n| `1008` | **Aperture Sci.** | Portal Gun Physic | 🟢 Active | Medium | $0 | ▓▓▓▓▓▓▓░░░ 75% | TBD | *G.L.A.D.* |\r\n| `1009` | **Tyrell Corp** | Nexus-6 Skin Job | 🔵 Done | High | $550,000 | ▓▓▓▓▓▓▓▓▓▓ 100%| 2019-11-20 | *Eldon T.* |\r\n| `1010` | **OCP** | Delta City Plan | 🟢 Active | High | $95,000 | ▓▓▓░░░░░░░ 30% | 2024-03-10 | *Dick J.* |\r\n| `1011` | **Soylent Corp** | Nutritional Paste | 🟡 Pending | Low | $500 | ▓░░░░░░░░░ 10% | 2023-12-12 | *Sol R.* |\r\n| `1012` | **Globex** | Doomsday Device | 🟢 Active | Critical | $1,000,000 | ▓▓▓▓▓▓▓▓░░ 80% | 2023-11-01 | *Hank S.* |\r\n| `1013` | **Hooli** | Nucleus Compression | 🔴 Error | High | $24,500 | ▓▓▓▓▓▓░░░░ 55% | 2023-10-28 | *Gavin B.* |\r\n| `1014` | **Veidt Ent.** | Squid Teleport | 🔵 Done | Critical | $7,000,000 | ▓▓▓▓▓▓▓▓▓▓ 100%| 1985-11-02 | *Adrian V.* |\r\n| `1015` | **BNL** | Trash Compactors | 🟢 Active | Low | $12,000 | ▓▓▓▓░░░░░░ 45% | 2105-06-15 | *Auto* |
+When stdin: \x1Bt
+And stdin: j
+And stdin: j
+And stdin: k
+Then expect-speak: table mode on
+And expect-speak-contains: ID
+And expect-speak-contains: 1001
+And expect-speak-contains: 1002
+And expect-speak-contains: 1001
+
+Scenario: df style fixed-width table skips wrapped continuation rows
+Given resize: 24 80
+And pty-stdout: Filesystem     1024-blocks      Used Available Capacity Mounted on\r\n/dev/diskA      1000000000 500000000 500000000 50% /System/Volumes/Very/Long/Mount/Path/That/WrapsAcrossRows\r\ndevfs                 409       409         0 100% /dev
+When stdin: \x1By
+And stdin: \x1Bt
+And stdin: j
+And stdin: j
+And stdin: k
+Then expect-speak-contains: Filesystem
+And expect-speak: table mode on
+And expect-speak-contains: Filesystem
+And expect-speak-contains: disk A
+And expect-speak-contains: devfs
+And expect-speak-contains: disk A
+
+Scenario: fixed-width hyphenated header remains one column
+Given resize: 24 120
+And pty-stdout: Filesystem     512-blocks       Used Available Capacity Mounted on\r\ndiskA          1000             10   990      1% /a\r\nverylongdiskname  2000          20   1980     1% /b\r\ndiskC          3000             30   2970     1% /c\r\nverylongdiskx     4000          40   3960     1% /d\r\ndiskE          5000             50   4950     1% /e\r\nverylongdiskz     6000          60   5940     1% /f
+When stdin: \x1By
+And stdin: \x1Bh
+And stdin: \x1Bt
+And stdin: l
+Then expect-speak-contains: Filesystem
+And expect-speak: F
+And expect-speak: table mode on
+And expect-speak-contains: Filesystem
+And expect-speak: Used
+
+Scenario: manual table setup mode uses tabstops from header row
+Given resize: 24 80
+And pty-stdout: FS            BLOCKS  USED\r\na             1000    10\r\nb             9999999910
+When stdin: \x1By
+And stdin: \x1BT
+And stdin: \x1Bl
+And stdin: t
+And stdin: \x1Bl
+And stdin: t
+And stdin: \r
+And stdin: j
+And stdin: j
+Then expect-speak-contains: FS
+And expect-speak: table setup on
+And expect-speak: BLOCKS
+And expect-speak: tabstop added
+And expect-speak: USED
+And expect-speak: tabstop added
+And expect-speak: table mode on
+And expect-speak: USED
+And expect-speak: 10
+And expect-speak: 10
