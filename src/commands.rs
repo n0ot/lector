@@ -52,8 +52,12 @@ pub enum Action {
     ExitTableMode,
     TableRowPrev,
     TableRowNext,
+    TableRowTop,
+    TableRowBottom,
     TableColPrev,
     TableColNext,
+    TableColFirst,
+    TableColLast,
     TableCellRead,
     TableHeaderRead,
     ToggleTableHeaderRead,
@@ -172,12 +176,24 @@ const ACTION_TABLE: &[(Action, &str, &str)] = &[
     (Action::ExitTableMode, "exit table mode", "exit_table_mode"),
     (Action::TableRowPrev, "previous table row", "table_row_prev"),
     (Action::TableRowNext, "next table row", "table_row_next"),
+    (Action::TableRowTop, "top table row", "table_row_top"),
+    (
+        Action::TableRowBottom,
+        "bottom table row",
+        "table_row_bottom",
+    ),
     (
         Action::TableColPrev,
         "previous table column",
         "table_col_prev",
     ),
     (Action::TableColNext, "next table column", "table_col_next"),
+    (
+        Action::TableColFirst,
+        "first table column",
+        "table_col_first",
+    ),
+    (Action::TableColLast, "last table column", "table_col_last"),
     (
         Action::TableCellRead,
         "current table cell",
@@ -272,8 +288,12 @@ pub fn handle(sr: &mut ScreenReader, view: &mut View, action: Action) -> Result<
         Action::ExitTableMode => action_exit_table_mode(sr),
         Action::TableRowPrev => action_table_row_prev(sr, view),
         Action::TableRowNext => action_table_row_next(sr, view),
+        Action::TableRowTop => action_table_row_top(sr, view),
+        Action::TableRowBottom => action_table_row_bottom(sr, view),
         Action::TableColPrev => action_table_col_prev(sr, view),
         Action::TableColNext => action_table_col_next(sr, view),
+        Action::TableColFirst => action_table_col_first(sr, view),
+        Action::TableColLast => action_table_col_last(sr, view),
         Action::TableCellRead => action_table_cell_read(sr, view),
         Action::TableHeaderRead => action_table_header_read(sr, view),
         Action::ToggleTableHeaderRead => action_toggle_table_header_read(sr),
@@ -915,6 +935,46 @@ fn action_table_row_next(sr: &mut ScreenReader, view: &mut View) -> Result<Comma
     Ok(CommandResult::Handled)
 }
 
+fn action_table_row_top(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let state_snapshot = sr.table_state.as_ref().unwrap().clone();
+    let Some(new_row) = state_snapshot
+        .model
+        .nearest_data_row(view, state_snapshot.model.top)
+    else {
+        sr.speak("top", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let old_pos = view.review_cursor_position;
+    move_review_to_table_cell(view, &state_snapshot, new_row);
+    report_review_cursor_move(sr, view, old_pos)?;
+    speak_table_cell(sr, view, &state_snapshot, false)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_row_bottom(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let state_snapshot = sr.table_state.as_ref().unwrap().clone();
+    let Some(new_row) = state_snapshot
+        .model
+        .nearest_data_row(view, state_snapshot.model.bottom)
+    else {
+        sr.speak("bottom", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let old_pos = view.review_cursor_position;
+    move_review_to_table_cell(view, &state_snapshot, new_row);
+    report_review_cursor_move(sr, view, old_pos)?;
+    speak_table_cell(sr, view, &state_snapshot, false)?;
+    Ok(CommandResult::Handled)
+}
+
 fn action_table_col_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     if !ensure_table_state(sr, view) {
         sr.speak("no table found", false)?;
@@ -949,6 +1009,49 @@ fn action_table_col_next(sr: &mut ScreenReader, view: &mut View) -> Result<Comma
             return Ok(CommandResult::Handled);
         }
         state.current_col += 1;
+        move_review_to_table_cell(view, state, view.review_cursor_position.0);
+        state.clone()
+    };
+    report_review_cursor_move(sr, view, old_pos)?;
+    speak_table_cell(sr, view, &state_snapshot, sr.table_header_auto)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_col_first(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let old_pos = view.review_cursor_position;
+    let state_snapshot = {
+        let state = sr.table_state.as_mut().unwrap();
+        if state.current_col == 0 {
+            sr.speak("left", false)?;
+            return Ok(CommandResult::Handled);
+        }
+        state.current_col = 0;
+        move_review_to_table_cell(view, state, view.review_cursor_position.0);
+        state.clone()
+    };
+    report_review_cursor_move(sr, view, old_pos)?;
+    speak_table_cell(sr, view, &state_snapshot, sr.table_header_auto)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_col_last(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let old_pos = view.review_cursor_position;
+    let state_snapshot = {
+        let state = sr.table_state.as_mut().unwrap();
+        let last_idx = state.model.columns.len().saturating_sub(1);
+        if state.current_col == last_idx {
+            sr.speak("right", false)?;
+            return Ok(CommandResult::Handled);
+        }
+        state.current_col = last_idx;
         move_review_to_table_cell(view, state, view.review_cursor_position.0);
         state.clone()
     };

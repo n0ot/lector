@@ -54,6 +54,7 @@ pub struct App {
     pending_input: VecDeque<u8>,
     pending_input_last_at: Option<u128>,
     pending_pty_output: Vec<u8>,
+    deferred_pty_output: Vec<u8>,
     app_focus_events_enabled: bool,
     log_enabled: bool,
     last_stdin_update: Option<u128>,
@@ -78,6 +79,7 @@ impl App {
             pending_input: VecDeque::new(),
             pending_input_last_at: None,
             pending_pty_output: Vec::new(),
+            deferred_pty_output: Vec::new(),
             app_focus_events_enabled: false,
             log_enabled: false,
             last_stdin_update: None,
@@ -471,6 +473,7 @@ impl App {
                         )?;
                         return Ok(());
                     }
+                    let mode_before = sr.input_mode;
                     match commands::handle(sr, self.view_stack.active_mut().model(), *action)? {
                         commands::CommandResult::Handled => {}
                         commands::CommandResult::ForwardInput => {
@@ -484,14 +487,34 @@ impl App {
                             self.handle_view_action(sr, view_action, term_out)?;
                         }
                     }
+                    if mode_before == crate::keymap::InputMode::TableSetup
+                        && sr.input_mode != crate::keymap::InputMode::TableSetup
+                    {
+                        self.flush_deferred_pty_output(sr, term_out)?;
+                    }
                 }
                 Binding::Lua(lua_binding) => {
+                    let mode_before = sr.input_mode;
                     lua_binding.call()?;
+                    if mode_before == crate::keymap::InputMode::TableSetup
+                        && sr.input_mode != crate::keymap::InputMode::TableSetup
+                    {
+                        self.flush_deferred_pty_output(sr, term_out)?;
+                    }
                 }
             }
         } else if sr.help_mode {
             sr.speak("this key is unmapped", false)?;
         } else {
+            if matches!(
+                sr.input_mode,
+                crate::keymap::InputMode::Table | crate::keymap::InputMode::TableSetup
+            ) {
+                if sr.hook_on_key_unhandled(binding_name.as_deref(), sr.input_mode)? {
+                    return Ok(());
+                }
+                return Ok(());
+            }
             if sr.hook_on_key_unhandled(binding_name.as_deref(), sr.input_mode)? {
                 return Ok(());
             }
@@ -570,6 +593,29 @@ impl App {
         buf: &[u8],
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        if matches!(sr.input_mode, crate::keymap::InputMode::TableSetup) {
+            self.deferred_pty_output.extend_from_slice(buf);
+            return Ok(());
+        }
+
+        if self.deferred_pty_output.is_empty() {
+            self.process_pty_output(sr, buf, term_out)?;
+        } else {
+            let mut merged = Vec::with_capacity(self.deferred_pty_output.len() + buf.len());
+            merged.extend_from_slice(&self.deferred_pty_output);
+            merged.extend_from_slice(buf);
+            self.deferred_pty_output.clear();
+            self.process_pty_output(sr, &merged, term_out)?;
+        }
+        Ok(())
+    }
+
+    fn process_pty_output(
+        &mut self,
+        sr: &mut ScreenReader,
+        buf: &[u8],
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
         let terminal_buf = self.filter_focus_mode_sequences(buf);
         let overlay_active = self.view_stack.has_overlay();
         self.view_stack.root_mut().handle_pty_output(buf)?;
@@ -584,6 +630,21 @@ impl App {
         }
         self.last_pty_update = Some(self.clock.now_ms());
         Ok(())
+    }
+
+    fn flush_deferred_pty_output(
+        &mut self,
+        sr: &mut ScreenReader,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        if self.deferred_pty_output.is_empty() {
+            return Ok(());
+        }
+        if matches!(sr.input_mode, crate::keymap::InputMode::TableSetup) {
+            return Ok(());
+        }
+        let deferred = std::mem::take(&mut self.deferred_pty_output);
+        self.process_pty_output(sr, &deferred, term_out)
     }
 
     pub fn handle_tick(

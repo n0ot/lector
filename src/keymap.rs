@@ -151,9 +151,16 @@ impl KeyBindings {
         table.insert("M-i".to_string(), Binding::Builtin(Action::TableCellRead));
         table.insert("j".to_string(), Binding::Builtin(Action::TableRowNext));
         table.insert("k".to_string(), Binding::Builtin(Action::TableRowPrev));
+        table.insert("g".to_string(), Binding::Builtin(Action::TableRowTop));
+        table.insert("G".to_string(), Binding::Builtin(Action::TableRowBottom));
         table.insert("h".to_string(), Binding::Builtin(Action::TableColPrev));
         table.insert("l".to_string(), Binding::Builtin(Action::TableColNext));
+        table.insert("^".to_string(), Binding::Builtin(Action::TableColFirst));
+        table.insert("$".to_string(), Binding::Builtin(Action::TableColLast));
         table.insert("i".to_string(), Binding::Builtin(Action::TableCellRead));
+        table.insert("M-j".to_string(), Binding::Builtin(Action::RevWordPrev));
+        table.insert("M-l".to_string(), Binding::Builtin(Action::RevWordNext));
+        table.insert("M-k".to_string(), Binding::Builtin(Action::RevWordRead));
         table.insert("H".to_string(), Binding::Builtin(Action::TableHeaderRead));
         table.insert(
             "M-h".to_string(),
@@ -180,6 +187,10 @@ impl KeyBindings {
         table_setup.insert("h".to_string(), Binding::Builtin(Action::RevCharPrev));
         table_setup.insert("l".to_string(), Binding::Builtin(Action::RevCharNext));
         table_setup.insert("i".to_string(), Binding::Builtin(Action::RevCharRead));
+        table_setup.insert("^".to_string(), Binding::Builtin(Action::RevFirst));
+        table_setup.insert("$".to_string(), Binding::Builtin(Action::RevLast));
+        table_setup.insert("w".to_string(), Binding::Builtin(Action::RevWordNext));
+        table_setup.insert("b".to_string(), Binding::Builtin(Action::RevWordPrev));
 
         Self { bindings }
     }

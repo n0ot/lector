@@ -114,20 +114,46 @@ Use the review cursor to move around without changing the application’s cursor
 
 ## Table navigation
 
-When table mode is on, Lector will detect tables like:
+### Supported table types
 
-- Pipe‑delimited (`|`), comma‑delimited, or tab‑delimited rows.
-- Fixed‑width columns separated by consistent spacing.
+Lector table mode currently supports:
 
-Turn table mode on/off with `M-t`. Then:
+- Pipe tables with `|` separators (with or without leading/trailing `|`), including separator/banner rows.
+- Fixed-width terminal tables where columns are separated by vertical blank gutters.
+- Manually-marked fixed-width tables using tabstops from a chosen header row.
 
-- Move rows with `j`/`k` (or `M-o`/`M-u`).
+### How to use table mode
+
+1. Move the review cursor onto a row inside a table.
+2. Press `M-t` to enter table mode.
+3. Navigate and read:
+
+- Move rows with `j`/`k`.
+- Jump to top/bottom table row with `g` / `G`.
 - Move columns with `h`/`l`.
+- Jump to first/last column with `^` / `$`.
 - Read the current cell with `i`.
 - Read the current column header with `H`.
-- Exit table mode with `Esc`.
+- Move by word inside the current cell with `M-j` / `M-l`.
+- Read current word inside the current cell with `M-k`.
 
-You can also toggle automatic header speaking with `M-h`.
+4. Toggle automatic header speaking with `M-h` if needed.
+5. Press `Esc` to exit table mode.
+
+### Manual table setup (tabstops)
+
+Use this when auto fixed-width detection is wrong for a screen layout.
+
+1. Move the review cursor to the line you want to use as the header.
+2. Press `M-T` to start tabstop setup mode.
+3. On that header line:
+- Move with `h` / `l`.
+- Move by word with `w` / `b`.
+- Jump to beginning/end with `^` / `$`.
+- Toggle a tabstop with `t` (press again to remove).
+4. Press `Enter` to commit tabstops and enter table mode, or `Esc` to cancel.
+
+Manual tabstops are temporary and cleared when table mode exits.
 
 ## Clipboard history
 
@@ -210,7 +236,7 @@ lector.hooks.on_speech_end = function(text, meta) end    -- meta: { interrupt, o
 
 -- navigation + mode
 lector.hooks.on_review_cursor_move = function(pos) end   -- pos: { row, col, prev_row, prev_col }
-lector.hooks.on_mode_change = function(old, new) end     -- "normal" | "table"
+lector.hooks.on_mode_change = function(old, new) end     -- "normal" | "table" | "table_setup"
 lector.hooks.on_table_mode_enter = function(meta) end    -- meta: { top, bottom, columns, header_row, current_col }
 lector.hooks.on_table_mode_exit = function() end
 
