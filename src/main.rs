@@ -13,6 +13,156 @@ use std::{
 };
 
 const FOCUS_EVENTS_ENABLE: &[u8] = b"\x1B[?1004h";
+const FOCUS_EVENTS_DISABLE: &[u8] = b"\x1B[?1004l";
+const FOCUS_EVENTS_QUERY: &[u8] = b"\x1B[?1004$p";
+
+struct FocusEventsGuard {
+    was_enabled_before: Option<bool>,
+}
+
+impl FocusEventsGuard {
+    fn enable<R: Read + AsRawFd>(stdin: &mut R, stdout: &mut dyn Write) -> Result<Self> {
+        let was_enabled_before = query_focus_mode(stdin, stdout);
+        stdout
+            .write_all(FOCUS_EVENTS_ENABLE)
+            .context("enable focus events")?;
+        stdout.flush().context("flush focus events enable")?;
+        Ok(Self { was_enabled_before })
+    }
+}
+
+impl Drop for FocusEventsGuard {
+    fn drop(&mut self) {
+        if !self.should_disable_on_drop() {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(FOCUS_EVENTS_DISABLE);
+        let _ = stdout.flush();
+    }
+}
+
+fn query_focus_mode<R: Read + AsRawFd>(stdin: &mut R, stdout: &mut dyn Write) -> Option<bool> {
+    if stdout.write_all(FOCUS_EVENTS_QUERY).is_err() || stdout.flush().is_err() {
+        return None;
+    }
+
+    let mut poll = mio::Poll::new().ok()?;
+    let stdin_fd = stdin.as_raw_fd();
+    let mut source = mio::unix::SourceFd(&stdin_fd);
+    poll.registry()
+        .register(&mut source, mio::Token(0), mio::Interest::READABLE)
+        .ok()?;
+
+    let mut events = mio::Events::with_capacity(8);
+    let mut response = Vec::new();
+    for timeout_ms in [20, 10, 10] {
+        poll.poll(
+            &mut events,
+            Some(time::Duration::from_millis(timeout_ms)),
+        )
+        .ok()?;
+        if events.is_empty() {
+            continue;
+        }
+        let mut buf = [0u8; 256];
+        match stdin.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                response.extend_from_slice(&buf[..n]);
+                if let Some(enabled) = parse_focus_mode_report(&response) {
+                    return Some(enabled);
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
+            Err(_) => return None,
+        }
+    }
+    parse_focus_mode_report(&response)
+}
+
+fn parse_focus_mode_report(buf: &[u8]) -> Option<bool> {
+    let prefix = b"\x1B[?1004;";
+    let mut i = 0usize;
+    while i < buf.len() {
+        if !buf[i..].starts_with(prefix) {
+            i += 1;
+            continue;
+        }
+        let start = i + prefix.len();
+        let mut end = start;
+        while end < buf.len() && buf[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end <= start || end + 1 >= buf.len() || buf[end] != b'$' || buf[end + 1] != b'y' {
+            i += 1;
+            continue;
+        }
+        let code = std::str::from_utf8(&buf[start..end]).ok()?.parse::<u8>().ok()?;
+        return match code {
+            1 | 3 => Some(true),
+            2 | 4 => Some(false),
+            _ => None,
+        };
+    }
+    None
+}
+
+impl FocusEventsGuard {
+    fn should_disable_on_drop(&self) -> bool {
+        !matches!(self.was_enabled_before, Some(true))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FocusEventsGuard, parse_focus_mode_report};
+
+    #[test]
+    fn parse_focus_mode_report_enabled_code_1() {
+        assert_eq!(parse_focus_mode_report(b"\x1B[?1004;1$y"), Some(true));
+    }
+
+    #[test]
+    fn parse_focus_mode_report_enabled_code_3() {
+        assert_eq!(parse_focus_mode_report(b"xx\x1B[?1004;3$yyy"), Some(true));
+    }
+
+    #[test]
+    fn parse_focus_mode_report_disabled_code_2() {
+        assert_eq!(parse_focus_mode_report(b"\x1B[?1004;2$y"), Some(false));
+    }
+
+    #[test]
+    fn parse_focus_mode_report_disabled_code_4() {
+        assert_eq!(parse_focus_mode_report(b"\x1B[?1004;4$y"), Some(false));
+    }
+
+    #[test]
+    fn parse_focus_mode_report_none_for_invalid_or_missing() {
+        assert_eq!(parse_focus_mode_report(b""), None);
+        assert_eq!(parse_focus_mode_report(b"\x1B[?1004$p"), None);
+        assert_eq!(parse_focus_mode_report(b"\x1B[?1004;9$y"), None);
+    }
+
+    #[test]
+    fn focus_events_guard_drop_decision_respects_prior_state() {
+        let enabled_before = FocusEventsGuard {
+            was_enabled_before: Some(true),
+        };
+        assert!(!enabled_before.should_disable_on_drop());
+
+        let disabled_before = FocusEventsGuard {
+            was_enabled_before: Some(false),
+        };
+        assert!(disabled_before.should_disable_on_drop());
+
+        let unknown_before = FocusEventsGuard {
+            was_enabled_before: None,
+        };
+        assert!(unknown_before.should_disable_on_drop());
+    }
+}
 
 #[derive(Parser)]
 #[clap(author, version, about)]
@@ -139,10 +289,7 @@ fn do_events(
     // Main event loop
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
-    stdout
-        .write_all(FOCUS_EVENTS_ENABLE)
-        .context("enable focus events")?;
-    stdout.flush().context("flush focus events enable")?;
+    let _focus_guard = FocusEventsGuard::enable(&mut stdin, &mut stdout)?;
     let mut events = mio::Events::with_capacity(1024);
     let mut poll_timeout = None;
     if let Some(message) = initial_message {
