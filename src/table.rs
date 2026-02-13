@@ -604,8 +604,8 @@ fn supported_header_cuts(
         match (gap_start, has_text) {
             (Some(start), true) => {
                 let end = col.saturating_sub(1);
-                if gap_has_blank_support(view, structural_rows, start, end) {
-                    cuts.push(col);
+                if let Some(cut) = supported_cut_in_gap(view, structural_rows, start, end) {
+                    cuts.push(cut);
                 }
                 gap_start = None;
                 seen_text = true;
@@ -710,20 +710,32 @@ fn detect_fixed_width_columns_from_blanks(
     Some(columns)
 }
 
-fn has_blank_support_at_cut(view: &View, structural_rows: &[u16], cut: u16) -> bool {
-    if structural_rows.is_empty() {
-        return false;
+fn supported_cut_in_gap(view: &View, structural_rows: &[u16], start: u16, end: u16) -> Option<u16> {
+    let mut best: Option<(usize, u16)> = None;
+    for cut in start..=end {
+        let blank_rows = blank_count_at_cut(view, structural_rows, cut);
+        if blank_rows * 3 < structural_rows.len() * 2 {
+            continue;
+        }
+        match best {
+            None => best = Some((blank_rows, cut)),
+            Some((best_blank_rows, best_cut)) => {
+                if blank_rows > best_blank_rows || (blank_rows == best_blank_rows && cut > best_cut)
+                {
+                    best = Some((blank_rows, cut));
+                }
+            }
+        }
     }
-    let blank_rows = structural_rows
+    best.map(|(_, cut)| cut)
+}
+
+fn blank_count_at_cut(view: &View, structural_rows: &[u16], cut: u16) -> usize {
+    structural_rows
         .iter()
         .copied()
         .filter(|row| !cell_has_text(view, *row, cut))
-        .count();
-    blank_rows * 3 >= structural_rows.len() * 2
-}
-
-fn gap_has_blank_support(view: &View, structural_rows: &[u16], start: u16, end: u16) -> bool {
-    (start..=end).any(|cut| has_blank_support_at_cut(view, structural_rows, cut))
+        .count()
 }
 
 fn cell_has_text(view: &View, row: u16, col: u16) -> bool {
@@ -886,4 +898,80 @@ fn is_separator_row(view: &View, row: u16) -> bool {
         _ if ch.is_whitespace() => true,
         _ => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view_with_lines(rows: u16, cols: u16, lines: &[&str]) -> View {
+        let mut view = View::new(rows, cols);
+        let mut data = String::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if idx > 0 {
+                data.push_str("\r\n");
+            }
+            data.push_str(line);
+        }
+        view.process_changes(data.as_bytes());
+        view
+    }
+
+    #[test]
+    fn df_capacity_column_does_not_absorb_next_column_digits() {
+        let view = view_with_lines(
+            24,
+            220,
+            &[
+                "Filesystem     1024-blocks      Used Available Capacity iused      ifree %iused  Mounted on",
+                "/dev/disk3s1s1 1942700360   31903848 853122808     4%  453019 4265614040    0%   /",
+                "devfs                 411        411         0   100%     712          0  100%   /dev",
+            ],
+        );
+
+        let model = detect(&view, 1).expect("detect table");
+        assert_eq!(model.header_row, Some(0));
+        assert!(model.columns.len() >= 9);
+
+        let capacity = model.cell_text(&view, 1, 4);
+        let iused = model.cell_text(&view, 1, 5);
+        assert_eq!(capacity, "4%");
+        assert_eq!(iused, "453019");
+    }
+
+    #[test]
+    fn docker_created_column_keeps_ago_out_of_status_column() {
+        let view = view_with_lines(
+            24,
+            220,
+            &[
+                "CONTAINER ID   IMAGE                                COMMAND                  CREATED         STATUS                             PORTS                       NAMES",
+                "ce14b2a58e31   ghcr.io/open-webui/open-webui:main   \"bash start.sh\"          12 months ago   Up 17 seconds (health: starting)   0.0.0.0:3000->8080/tcp      open-webui",
+                "9f68d2b92c9c   kindest/node:v1.30.0                 \"/usr/local/bin/entr...\"   12 months ago   Up 17 seconds                                                  kind-worker2",
+            ],
+        );
+
+        let model = detect(&view, 1).expect("detect table");
+        let header_row = model.header_row.expect("header row");
+
+        let mut created_col = None;
+        let mut status_col = None;
+        for idx in 0..model.columns.len() {
+            let header = model.cell_text(&view, header_row, idx);
+            if header == "CREATED" {
+                created_col = Some(idx);
+            } else if header == "STATUS" {
+                status_col = Some(idx);
+            }
+        }
+
+        let created_col = created_col.expect("CREATED column");
+        let status_col = status_col.expect("STATUS column");
+
+        let created = model.cell_text(&view, 1, created_col);
+        let status = model.cell_text(&view, 1, status_col);
+        assert_eq!(created, "12 months ago");
+        assert!(status.starts_with("Up 17 seconds"));
+        assert!(!status.starts_with("ago"));
+    }
 }
