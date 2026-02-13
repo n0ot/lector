@@ -61,6 +61,12 @@ pub enum Action {
     TableCellRead,
     TableHeaderRead,
     ToggleTableHeaderRead,
+    TableWordPrev,
+    TableWordNext,
+    TableWordRead,
+    TableCharPrev,
+    TableCharNext,
+    TableCharRead,
 }
 
 pub enum CommandResult {
@@ -209,6 +215,36 @@ const ACTION_TABLE: &[(Action, &str, &str)] = &[
         "toggle table header reading",
         "toggle_table_header_read",
     ),
+    (
+        Action::TableWordPrev,
+        "previous word in cell",
+        "table_word_prev",
+    ),
+    (
+        Action::TableWordNext,
+        "next word in cell",
+        "table_word_next",
+    ),
+    (
+        Action::TableWordRead,
+        "current word in cell",
+        "table_word_read",
+    ),
+    (
+        Action::TableCharPrev,
+        "previous character in cell",
+        "table_char_prev",
+    ),
+    (
+        Action::TableCharNext,
+        "next character in cell",
+        "table_char_next",
+    ),
+    (
+        Action::TableCharRead,
+        "current character in cell",
+        "table_char_read",
+    ),
 ];
 
 impl Action {
@@ -297,6 +333,12 @@ pub fn handle(sr: &mut ScreenReader, view: &mut View, action: Action) -> Result<
         Action::TableCellRead => action_table_cell_read(sr, view),
         Action::TableHeaderRead => action_table_header_read(sr, view),
         Action::ToggleTableHeaderRead => action_toggle_table_header_read(sr),
+        Action::TableWordPrev => action_table_word_prev(sr, view),
+        Action::TableWordNext => action_table_word_next(sr, view),
+        Action::TableWordRead => action_table_word_read(sr, view),
+        Action::TableCharPrev => action_table_char_prev(sr, view),
+        Action::TableCharNext => action_table_char_next(sr, view),
+        Action::TableCharRead => action_table_char_read(sr, view),
         _ => {
             sr.speak("not implemented", false)?;
             Ok(CommandResult::Handled)
@@ -1091,6 +1133,216 @@ fn action_toggle_table_header_read(sr: &mut ScreenReader) -> Result<CommandResul
     Ok(CommandResult::Handled)
 }
 
+fn action_table_word_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let Some((start, _end)) = current_cell_text_bounds(sr, view) else {
+        sr.speak("blank", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let old_pos = view.review_cursor_position;
+    let (row, col) = old_pos;
+    if col <= start {
+        sr.speak("left", false)?;
+        action_table_word_read(sr, view)?;
+        return Ok(CommandResult::Handled);
+    }
+
+    let mut idx = col.saturating_sub(1);
+    while idx > start && is_cell_whitespace(view, row, idx) {
+        idx = idx.saturating_sub(1);
+    }
+    while idx > start && !is_cell_whitespace(view, row, idx.saturating_sub(1)) {
+        idx = idx.saturating_sub(1);
+    }
+    view.review_cursor_position.1 = idx;
+    report_review_cursor_move(sr, view, old_pos)?;
+    action_table_word_read(sr, view)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_word_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let Some((start, end)) = current_cell_text_bounds(sr, view) else {
+        sr.speak("blank", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let old_pos = view.review_cursor_position;
+    let (row, mut idx) = old_pos;
+    let old_word_end = table_word_end_from_or_left(view, row, old_pos.1, start, end);
+    if idx < start {
+        idx = start;
+    }
+    while idx < end && !is_cell_whitespace(view, row, idx) {
+        idx += 1;
+    }
+    while idx <= end && is_cell_whitespace(view, row, idx) {
+        idx += 1;
+    }
+    if idx > end || old_word_end.is_some_and(|word_end| idx <= word_end) {
+        sr.speak("right", false)?;
+        action_table_word_read(sr, view)?;
+        return Ok(CommandResult::Handled);
+    }
+    view.review_cursor_position.1 = idx;
+    report_review_cursor_move(sr, view, old_pos)?;
+    action_table_word_read(sr, view)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_word_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let Some((start, end)) = current_cell_text_bounds(sr, view) else {
+        sr.speak("blank", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let (row, col) = view.review_cursor_position;
+    let Some((word_start, word_end)) = table_word_bounds_at(view, row, col, start, end) else {
+        sr.speak("blank", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let text = view
+        .screen()
+        .contents_between(row, word_start, row, word_end + 1);
+    let spoken = text.trim();
+    if spoken.is_empty() {
+        sr.speak("blank", false)?;
+    } else {
+        sr.speak(spoken, false)?;
+    }
+    Ok(CommandResult::Handled)
+}
+
+fn table_word_bounds_at(
+    view: &View,
+    row: u16,
+    col: u16,
+    start: u16,
+    end: u16,
+) -> Option<(u16, u16)> {
+    let mut idx = col.clamp(start, end);
+    if is_cell_whitespace(view, row, idx) {
+        let mut right = idx;
+        while right <= end && is_cell_whitespace(view, row, right) {
+            right += 1;
+        }
+        idx = if right <= end {
+            right
+        } else {
+            let mut left = idx;
+            while left > start && is_cell_whitespace(view, row, left) {
+                left -= 1;
+            }
+            if is_cell_whitespace(view, row, left) {
+                return None;
+            }
+            left
+        };
+    }
+
+    let mut word_start = idx;
+    while word_start > start && !is_cell_whitespace(view, row, word_start - 1) {
+        word_start -= 1;
+    }
+
+    let mut word_end = idx;
+    while word_end < end && !is_cell_whitespace(view, row, word_end + 1) {
+        word_end += 1;
+    }
+
+    Some((word_start, word_end))
+}
+
+fn table_word_end_from_or_left(
+    view: &View,
+    row: u16,
+    col: u16,
+    start: u16,
+    end: u16,
+) -> Option<u16> {
+    let mut idx = col.clamp(start, end);
+    while idx > start && is_cell_whitespace(view, row, idx) {
+        idx -= 1;
+    }
+    if is_cell_whitespace(view, row, idx) {
+        return None;
+    }
+    while idx < end && !is_cell_whitespace(view, row, idx + 1) {
+        idx += 1;
+    }
+    Some(idx)
+}
+
+fn action_table_char_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let Some((start, _end)) = current_cell_text_bounds(sr, view) else {
+        sr.speak("blank", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let old_pos = view.review_cursor_position;
+    if old_pos.1 <= start {
+        sr.speak("left", false)?;
+        action_table_char_read(sr, view)?;
+        return Ok(CommandResult::Handled);
+    }
+    view.review_cursor_position.1 = old_pos.1.saturating_sub(1);
+    report_review_cursor_move(sr, view, old_pos)?;
+    action_table_char_read(sr, view)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_char_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let Some((_start, end)) = current_cell_text_bounds(sr, view) else {
+        sr.speak("blank", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let old_pos = view.review_cursor_position;
+    if old_pos.1 >= end {
+        sr.speak("right", false)?;
+        action_table_char_read(sr, view)?;
+        return Ok(CommandResult::Handled);
+    }
+    view.review_cursor_position.1 = old_pos.1 + 1;
+    report_review_cursor_move(sr, view, old_pos)?;
+    action_table_char_read(sr, view)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_table_char_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    if !ensure_table_state(sr, view) {
+        sr.speak("no table found", false)?;
+        return Ok(CommandResult::Handled);
+    }
+    let Some((start, end)) = current_cell_text_bounds(sr, view) else {
+        sr.speak("blank", false)?;
+        return Ok(CommandResult::Handled);
+    };
+    let (row, col) = view.review_cursor_position;
+    let col = col.clamp(start, end);
+    let ch = view.screen().contents_between(row, col, row, col + 1);
+    if ch.trim().is_empty() {
+        sr.speak("space", false)?;
+    } else {
+        sr.speak(&ch, false)?;
+    }
+    Ok(CommandResult::Handled)
+}
+
 fn ensure_table_state(sr: &mut ScreenReader, view: &mut View) -> bool {
     let row = view.review_cursor_position.0;
     let needs_refresh = match &sr.table_state {
@@ -1126,8 +1378,44 @@ fn ensure_table_state(sr: &mut ScreenReader, view: &mut View) -> bool {
 fn move_review_to_table_cell(view: &mut View, state: &TableState, row: u16) {
     let row = state.model.clamp_row(row);
     if let Some(column) = state.model.columns.get(state.current_col) {
-        view.review_cursor_position = (row, column.start);
+        let target_col =
+            first_text_col_in_range(view, row, column.start, column.end).unwrap_or(column.start);
+        view.review_cursor_position = (row, target_col);
     }
+}
+
+fn current_cell_text_bounds(sr: &ScreenReader, view: &View) -> Option<(u16, u16)> {
+    let state = sr.table_state.as_ref()?;
+    let row = view.review_cursor_position.0;
+    let col = state.model.columns.get(state.current_col)?;
+    let start = first_text_col_in_range(view, row, col.start, col.end)?;
+    let end = last_text_col_in_range(view, row, col.start, col.end)?;
+    Some((start, end))
+}
+
+fn first_text_col_in_range(view: &View, row: u16, start: u16, end: u16) -> Option<u16> {
+    (start..=end).find(|&col| !is_cell_whitespace(view, row, col))
+}
+
+fn last_text_col_in_range(view: &View, row: u16, start: u16, end: u16) -> Option<u16> {
+    let mut col = end;
+    loop {
+        if !is_cell_whitespace(view, row, col) {
+            return Some(col);
+        }
+        if col == start {
+            break;
+        }
+        col -= 1;
+    }
+    None
+}
+
+fn is_cell_whitespace(view: &View, row: u16, col: u16) -> bool {
+    view.screen()
+        .cell(row, col)
+        .map(|cell| !cell.is_wide_continuation() && cell.contents().trim().is_empty())
+        .unwrap_or(true)
 }
 
 fn speak_table_cell(

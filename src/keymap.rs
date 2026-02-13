@@ -148,6 +148,8 @@ impl KeyBindings {
 
         let table = bindings.get_mut(&InputMode::Table).unwrap();
         table.insert("Esc".to_string(), Binding::Builtin(Action::ExitTableMode));
+        table.insert("M-u".to_string(), Binding::Builtin(Action::TableRowPrev));
+        table.insert("M-o".to_string(), Binding::Builtin(Action::TableRowNext));
         table.insert("M-i".to_string(), Binding::Builtin(Action::TableCellRead));
         table.insert("j".to_string(), Binding::Builtin(Action::TableRowNext));
         table.insert("k".to_string(), Binding::Builtin(Action::TableRowPrev));
@@ -158,9 +160,12 @@ impl KeyBindings {
         table.insert("^".to_string(), Binding::Builtin(Action::TableColFirst));
         table.insert("$".to_string(), Binding::Builtin(Action::TableColLast));
         table.insert("i".to_string(), Binding::Builtin(Action::TableCellRead));
-        table.insert("M-j".to_string(), Binding::Builtin(Action::RevWordPrev));
-        table.insert("M-l".to_string(), Binding::Builtin(Action::RevWordNext));
-        table.insert("M-k".to_string(), Binding::Builtin(Action::RevWordRead));
+        table.insert("M-j".to_string(), Binding::Builtin(Action::TableWordPrev));
+        table.insert("M-l".to_string(), Binding::Builtin(Action::TableWordNext));
+        table.insert("M-k".to_string(), Binding::Builtin(Action::TableWordRead));
+        table.insert("M-m".to_string(), Binding::Builtin(Action::TableCharPrev));
+        table.insert("M-.".to_string(), Binding::Builtin(Action::TableCharNext));
+        table.insert("M-,".to_string(), Binding::Builtin(Action::TableCharRead));
         table.insert("H".to_string(), Binding::Builtin(Action::TableHeaderRead));
         table.insert(
             "M-h".to_string(),

@@ -93,7 +93,7 @@ Then expect-speak-contains: Filesystem
 And expect-speak: F
 And expect-speak: table mode on
 And expect-speak-contains: Filesystem
-And expect-speak: Used
+And expect-speak-contains: 512-blocks
 
 Scenario: manual table setup mode uses tabstops from header row
 Given resize: 24 80
@@ -117,3 +117,66 @@ And expect-speak: table mode on
 And expect-speak: USED
 And expect-speak: 10
 And expect-speak: 10
+
+Scenario: docker ps wide output splits expected headers
+Given resize: 57 214
+And pty-stdout: CONTAINER ID   IMAGE                                COMMAND                  CREATED         STATUS                             PORTS                       NAMES\r\nce14b2a58e31   ghcr.io/open-webui/open-webui:main   "bash start.sh"          12 months ago   Up 17 seconds (health: starting)   0.0.0.0:3000->8080/tcp      open-webui\r\n9f68d2b92c9c   kindest/node:v1.30.0                 "/usr/local/bin/entr…"   12 months ago   Up 17 seconds                                                  kind-worker2\r\ne719e19bfae9   kindest/node:v1.30.0                 "/usr/local/bin/entr…"   12 months ago   Up 17 seconds                                                  kind-worker\r\n45c54681d7bc   kindest/node:v1.30.0                 "/usr/local/bin/entr…"   12 months ago   Up 17 seconds                      127.0.0.1:49799->6443/tcp   kind-control-plane
+When stdin: \x1By
+And stdin: \x1Bt
+And stdin: \x1Bh
+And stdin: H
+And stdin: l
+And stdin: H
+And stdin: l
+And stdin: H
+And stdin: l
+And stdin: H
+And stdin: l
+And stdin: H
+And stdin: l
+And stdin: H
+And stdin: l
+And stdin: H
+Then expect-speak-contains: CONTAINER ID
+And expect-speak: table mode on
+And expect-speak-contains: CONTAINER ID
+And expect-speak: table headers off
+And expect-speak: CONTAINER ID
+And expect-speak-contains: IMAGE
+And expect-speak: IMAGE
+And expect-speak-contains: COMMAND
+And expect-speak: COMMAND
+And expect-speak-contains: CREATED
+And expect-speak: CREATED
+And expect-speak-contains: STATUS
+And expect-speak: STATUS
+And expect-speak-contains: PORTS
+And expect-speak: PORTS
+And expect-speak-contains: NAMES
+And expect-speak: NAMES
+
+Scenario: tmux prompt context docker table still splits first headers
+Given resize: 57 214
+And pty-stdout: ncarpenter:lector (master *=)$ docker ps\r\nCONTAINER ID   IMAGE                                COMMAND                  CREATED         STATUS                    PORTS                       NAMES\r\nce14b2a58e31   ghcr.io/open-webui/open-webui:main   "bash start.sh"          12 months ago   Up 54 minutes (healthy)   0.0.0.0:3000->8080/tcp      open-webui\r\n9f68d2b92c9c   kindest/node:v1.30.0                 "/usr/local/bin/entr…"   12 months ago   Up 54 minutes                                         kind-worker2\r\ne719e19bfae9   kindest/node:v1.30.0                 "/usr/local/bin/entr…"   12 months ago   Up 54 minutes                                         kind-worker\r\n45c54681d7bc   kindest/node:v1.30.0                 "/usr/local/bin/entr…"   12 months ago   Up 54 minutes             127.0.0.1:49799->6443/tcp   kind-control-plane\r\nncarpenter:lector (master *=)$
+When stdin: \x1Bt
+And stdin: H
+And stdin: l
+And stdin: H
+Then expect-speak: table mode on
+And expect-speak-contains: CONTAINER ID
+And expect-speak: CONTAINER ID
+And expect-speak: IMAGE
+And expect-speak: IMAGE
+
+Scenario: table word next repeats full last word at right boundary
+Given pty-stdout: A   FOO BAR\r\nx   data
+When stdin: \x1Bt
+And stdin: l
+And stdin: \x1Bl
+And stdin: \x1Bl
+Then expect-speak: table mode on
+And expect-speak: A
+And expect-speak: FOO BAR
+And expect-speak: BAR
+And expect-speak: right
+And expect-speak: BAR

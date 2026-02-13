@@ -129,13 +129,17 @@ Lector table mode currently supports:
 3. Navigate and read:
 
 - Move rows with `j`/`k`.
+- Move rows with review-style keys `M-u` / `M-o`.
 - Jump to top/bottom table row with `g` / `G`.
 - Move columns with `h`/`l`.
 - Jump to first/last column with `^` / `$`.
 - Read the current cell with `i`.
+- Read the current cell with review-style key `M-i`.
 - Read the current column header with `H`.
 - Move by word inside the current cell with `M-j` / `M-l`.
 - Read current word inside the current cell with `M-k`.
+- Move by character inside the current cell with `M-m` / `M-.`.
+- Read current character inside the current cell with `M-,`.
 
 4. Toggle automatic header speaking with `M-h` if needed.
 5. Press `Esc` to exit table mode.
