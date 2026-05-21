@@ -14,6 +14,7 @@ pub enum Action {
     ToggleAutoRead,
     ToggleReviewCursorFollowsScreenCursor,
     ToggleSymbolLevel,
+    SayOverlay,
     OpenLuaRepl,
     PassNextKey,
     StopSpeaking,
@@ -92,6 +93,7 @@ const ACTION_TABLE: &[(Action, &str, &str)] = &[
         "toggle symbol level",
         "toggle_symbol_level",
     ),
+    (Action::SayOverlay, "repeat current overlay", "say_overlay"),
     (Action::OpenLuaRepl, "open Lua REPL", "open_lua_repl"),
     (
         Action::PassNextKey,
@@ -272,7 +274,12 @@ pub fn builtin_action_from_name(name: &str) -> Option<Action> {
         .map(|(action, _, _)| *action)
 }
 
-pub fn handle(sr: &mut ScreenReader, view: &mut View, action: Action) -> Result<CommandResult> {
+pub fn handle(
+    sr: &mut ScreenReader,
+    title: &str,
+    view: &mut View,
+    action: Action,
+) -> Result<CommandResult> {
     if let Action::ToggleHelp = action {
         return action_toggle_help(sr);
     }
@@ -287,6 +294,7 @@ pub fn handle(sr: &mut ScreenReader, view: &mut View, action: Action) -> Result<
             action_toggle_review_cursor_follows_screen_cursor(sr, view)
         }
         Action::ToggleSymbolLevel => action_toggle_symbol_level(sr),
+        Action::SayOverlay => action_say_overlay(sr, title),
         Action::PassNextKey => action_pass_next_key(sr),
         Action::StopSpeaking => action_stop(sr),
         Action::RevLinePrev => action_review_line_prev(sr, view, false),
@@ -372,6 +380,11 @@ fn action_toggle_stop_speech_on_focus_loss(sr: &mut ScreenReader) -> Result<Comm
         "disabled"
     };
     sr.speak(&format!("stop on focus loss {}", status), false)?;
+    Ok(CommandResult::Handled)
+}
+
+fn action_say_overlay(sr: &mut ScreenReader, title: &str) -> Result<CommandResult> {
+    sr.speak(title, false)?;
     Ok(CommandResult::Handled)
 }
 

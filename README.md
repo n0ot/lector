@@ -88,6 +88,7 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 ### Core actions (with defaults)
 
 - **Stop speech** when it’s too noisy. Default: `M-x`.
+- **Repeat the current overlay name**. Default: `M-r`.
 - **Toggle auto‑read** if you want to hear only on demand. Default: `M-'`.
 - **Toggle stop on focus loss** (interrupt speech when terminal focus leaves). Default: `M-g`.
 - **Move and read** by line/word/character using the review cursor.
@@ -198,7 +199,7 @@ lector.bindings["M-x"] = "lector.stop_speaking"
 lector.bindings["M-g"] = "lector.toggle_stop_speech_on_focus_loss"
 
 -- add a custom command
-lector.bindings["M-r"] = {
+lector.bindings["M-v"] = {
   "speak current time",
   function()
     lector.api.speak(os.date("%H:%M"), true)
@@ -254,6 +255,10 @@ end
 ## Lua REPL
 
 Lector has a built‑in Lua REPL so you can try commands while it’s running. Open it with `M-L`, experiment, then close it when you’re done.
+
+- Press `C-l` to clear the REPL screen while keeping the `Esc to close` banner visible.
+- REPL history is preserved after closing and reopening the overlay.
+- Commands that start with a space and consecutive duplicate commands are not added to REPL history.
 
 ## Tips
 

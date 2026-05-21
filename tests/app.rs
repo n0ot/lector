@@ -336,3 +336,47 @@ fn toggle_stop_on_focus_loss_hotkey_disables_stopping() {
     );
     assert_eq!(state.stops, 1);
 }
+
+#[test]
+fn say_overlay_hotkey_speaks_terminal_title() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+
+    let speaks = &recorder.inner.borrow().speaks;
+    assert!(speaks.iter().any(|(text, _)| text == "Terminal"));
+}
+
+#[test]
+fn lua_repl_history_persists_after_close() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open repl");
+    app.handle_stdin(&mut sr, b"print(1)\r", &mut pty_out, &mut term_out)
+        .expect("submit command");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish eval");
+
+    app.handle_stdin(&mut sr, b"\x1B", &mut pty_out, &mut term_out)
+        .expect("queue escape");
+    clock.advance_ms(100);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("close repl");
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("reopen repl");
+    app.handle_stdin(&mut sr, b"\x10", &mut pty_out, &mut term_out)
+        .expect("history up");
+
+    assert!(pty_out.is_empty());
+    let rendered = String::from_utf8_lossy(&term_out);
+    assert!(rendered.contains("> print(1)"));
+    let speaks = &recorder.inner.borrow().speaks;
+    assert!(speaks.iter().any(|(text, _)| text == "Lua REPL"));
+}

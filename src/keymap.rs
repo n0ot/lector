@@ -91,6 +91,7 @@ impl KeyBindings {
             "M-s".to_string(),
             Binding::Builtin(Action::ToggleSymbolLevel),
         );
+        normal.insert("M-r".to_string(), Binding::Builtin(Action::SayOverlay));
         normal.insert("M-n".to_string(), Binding::Builtin(Action::PassNextKey));
         normal.insert("M-x".to_string(), Binding::Builtin(Action::StopSpeaking));
         normal.insert("M-u".to_string(), Binding::Builtin(Action::RevLinePrev));

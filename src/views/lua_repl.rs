@@ -10,7 +10,7 @@ use mlua::{
     Error, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Thread, ThreadStatus, Value,
     VmState,
 };
-use std::{cell::RefCell, io::Write, rc::Rc};
+use std::{any::Any, cell::RefCell, io::Write, rc::Rc};
 
 const CLOSE_HINT: &str = "Esc to close";
 
@@ -33,7 +33,7 @@ pub struct LuaReplView {
 }
 
 impl LuaReplView {
-    pub fn new(rows: u16, cols: u16) -> Result<Self> {
+    pub fn new(rows: u16, cols: u16, history: Vec<String>) -> Result<Self> {
         let lua = Lua::new_with(StdLib::ALL_SAFE | StdLib::JIT, LuaOptions::default())
             .map_err(|e| anyhow!(e.to_string()))?;
         let print_buffer = Rc::new(RefCell::new(ReplOutput { lines: Vec::new() }));
@@ -66,11 +66,13 @@ impl LuaReplView {
             .map_err(|e| anyhow!(e.to_string()))?;
 
         let view = View::new(rows, cols);
+        let mut editor = LineEditor::new();
+        editor.set_history(history);
         let mut repl = Self {
             view,
             title: "Lua REPL".to_string(),
             output: Vec::new(),
-            editor: LineEditor::new(),
+            editor,
             lua,
             env,
             thread: None,
@@ -84,6 +86,10 @@ impl LuaReplView {
         repl.write_prompt();
         repl.render_full();
         Ok(repl)
+    }
+
+    pub fn history(&self) -> &[String] {
+        self.editor.history()
     }
 
     fn set_screen_reader(&mut self, sr: &mut ScreenReader) {
@@ -344,9 +350,18 @@ impl LuaReplView {
             }
         }
     }
+
+    fn clear_screen(&mut self) {
+        self.output.clear();
+        self.render_full();
+    }
 }
 
 impl ViewController for LuaReplView {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn model(&mut self) -> &mut View {
         &mut self.view
     }
@@ -373,6 +388,10 @@ impl ViewController for LuaReplView {
         if input == b"\x1B" {
             self.thread = None;
             return Ok(ViewAction::Pop);
+        }
+        if input == b"\x0C" {
+            self.clear_screen();
+            return Ok(ViewAction::Redraw);
         }
         if self.thread.is_some() {
             return Ok(ViewAction::Bell);
@@ -499,14 +518,14 @@ mod tests {
 
     #[test]
     fn lua_repl_renders_close_hint_in_top_row() {
-        let mut repl = LuaReplView::new(6, 20).expect("create lua repl");
+        let mut repl = LuaReplView::new(6, 20, Vec::new()).expect("create lua repl");
         let top_row = repl.model().screen().contents_between(0, 0, 0, 20);
         assert!(top_row.starts_with(CLOSE_HINT));
     }
 
     #[test]
     fn lua_repl_esc_closes_view() {
-        let mut repl = LuaReplView::new(6, 20).expect("create lua repl");
+        let mut repl = LuaReplView::new(6, 20, Vec::new()).expect("create lua repl");
         let (mut sr, _speaks) = make_screen_reader();
         let action = repl
             .handle_input(&mut sr, b"\x1B", &mut Vec::new())
@@ -516,7 +535,7 @@ mod tests {
 
     #[test]
     fn lua_repl_ctrl_d_does_not_close_view() {
-        let mut repl = LuaReplView::new(6, 20).expect("create lua repl");
+        let mut repl = LuaReplView::new(6, 20, Vec::new()).expect("create lua repl");
         let (mut sr, _speaks) = make_screen_reader();
         let action = repl
             .handle_input(&mut sr, b"\x04", &mut Vec::new())
@@ -526,7 +545,7 @@ mod tests {
 
     #[test]
     fn lua_repl_close_hint_stays_pinned_after_output_overflows() {
-        let mut repl = LuaReplView::new(4, 20).expect("create lua repl");
+        let mut repl = LuaReplView::new(4, 20, Vec::new()).expect("create lua repl");
         repl.append_output("line 1\nline 2\nline 3\nline 4\nline 5");
         repl.render_full();
         let screen = repl.model().screen();
@@ -538,7 +557,7 @@ mod tests {
 
     #[test]
     fn lua_repl_auto_read_speaks_incoming_output_without_banner() {
-        let mut repl = LuaReplView::new(6, 30).expect("create lua repl");
+        let mut repl = LuaReplView::new(6, 30, Vec::new()).expect("create lua repl");
         let (mut sr, speaks) = make_screen_reader();
         let mut reporter = perform::Reporter::new();
 
@@ -556,5 +575,30 @@ mod tests {
         assert!(speaks.iter().any(|text| text.contains("alpha")));
         assert!(speaks.iter().any(|text| text.contains("delta")));
         assert!(!speaks.iter().any(|text| text.contains(CLOSE_HINT)));
+    }
+
+    #[test]
+    fn lua_repl_ctrl_l_clears_output_and_keeps_close_hint() {
+        let mut repl = LuaReplView::new(6, 30, Vec::new()).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+        repl.append_output("alpha\nbeta");
+        repl.render_full();
+
+        let action = repl
+            .handle_input(&mut sr, b"\x0C", &mut Vec::new())
+            .expect("handle ctrl-l");
+
+        assert!(matches!(action, crate::views::ViewAction::Redraw));
+        let screen = repl.model().screen();
+        assert!(screen.contents_between(0, 0, 0, 30).starts_with(CLOSE_HINT));
+        assert!(!screen.contents_between(1, 0, 1, 30).contains("alpha"));
+        assert!(screen.contents().contains("> "));
+    }
+
+    #[test]
+    fn lua_repl_accepts_existing_history() {
+        let repl = LuaReplView::new(6, 30, vec!["print(1)".to_string(), "print(2)".to_string()])
+            .expect("create lua repl");
+        assert_eq!(repl.history(), ["print(1)", "print(2)"]);
     }
 }

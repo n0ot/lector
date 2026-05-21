@@ -10,6 +10,7 @@ pub use stack::ViewStack;
 
 use crate::{screen_reader::ScreenReader, view::View};
 use anyhow::Result;
+use std::any::Any;
 use std::io::Write;
 
 pub enum ViewAction {
@@ -30,6 +31,7 @@ pub enum ViewKind {
 }
 
 pub trait ViewController {
+    fn as_any(&self) -> &dyn Any;
     fn model(&mut self) -> &mut View;
     fn title(&self) -> &str;
     fn kind(&self) -> ViewKind {

@@ -57,6 +57,7 @@ pub struct App {
     deferred_pty_output: Vec<u8>,
     app_focus_events_enabled: bool,
     log_enabled: bool,
+    lua_repl_history: Vec<String>,
     last_stdin_update: Option<u128>,
     last_pty_update: Option<u128>,
     clock: Box<dyn Clock>,
@@ -82,6 +83,7 @@ impl App {
             deferred_pty_output: Vec::new(),
             app_focus_events_enabled: false,
             log_enabled: false,
+            lua_repl_history: Vec::new(),
             last_stdin_update: None,
             last_pty_update: None,
             clock,
@@ -503,7 +505,8 @@ impl App {
                             return Ok(());
                         }
                         let (rows, cols) = self.view_stack.active_mut().model().size();
-                        let repl = views::LuaReplView::new(rows, cols)?;
+                        let repl =
+                            views::LuaReplView::new(rows, cols, self.lua_repl_history.clone())?;
                         self.handle_view_action(
                             sr,
                             views::ViewAction::Push(Box::new(repl)),
@@ -512,7 +515,13 @@ impl App {
                         return Ok(());
                     }
                     let mode_before = sr.input_mode;
-                    match commands::handle(sr, self.view_stack.active_mut().model(), *action)? {
+                    let title = self.view_stack.active_mut().title().to_string();
+                    match commands::handle(
+                        sr,
+                        &title,
+                        self.view_stack.active_mut().model(),
+                        *action,
+                    )? {
                         commands::CommandResult::Handled => {}
                         commands::CommandResult::ForwardInput => {
                             self.dispatch_to_view(sr, raw, pty_out, term_out)?;
@@ -781,6 +790,7 @@ impl App {
                 self.announce_view_change(sr)?;
             }
             views::ViewAction::Pop => {
+                self.capture_lua_repl_history();
                 if self.view_stack.pop() {
                     self.render_active_view(term_out)?;
                     self.announce_view_change(sr)?;
@@ -793,6 +803,21 @@ impl App {
             views::ViewAction::None => {}
         }
         Ok(())
+    }
+
+    fn capture_lua_repl_history(&mut self) {
+        if self.view_stack.active_mut().kind() != views::ViewKind::LuaRepl {
+            return;
+        }
+        let history = self
+            .view_stack
+            .active_mut()
+            .as_any()
+            .downcast_ref::<views::LuaReplView>()
+            .map(|repl| repl.history().to_vec());
+        if let Some(history) = history {
+            self.lua_repl_history = history;
+        }
     }
 
     fn render_active_view(&mut self, term_out: &mut dyn Write) -> Result<()> {

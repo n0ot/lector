@@ -55,12 +55,27 @@ impl LineEditor {
         self.input.clear();
         self.cursor = 0;
         self.history_index = None;
+        self.history_draft.clear();
     }
 
     pub fn commit_history(&mut self) {
-        if !self.input.trim().is_empty() {
-            self.history.push(self.input.clone());
+        let line = self.input.as_str();
+        let ignored = line.trim().is_empty()
+            || line.starts_with(' ')
+            || self.history.last().is_some_and(|entry| entry == line);
+        if !ignored {
+            self.history.push(line.to_string());
         }
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
+    pub fn set_history(&mut self, history: Vec<String>) {
+        self.history = history;
         self.history_index = None;
         self.history_draft.clear();
     }
@@ -480,6 +495,29 @@ mod tests {
         let action = feed(&mut editor, b"\x0E");
         assert!(matches!(action, EditorAction::Changed));
         assert_eq!(editor.input(), "draft");
+    }
+
+    #[test]
+    fn history_ignores_leading_space_and_consecutive_duplicates() {
+        let mut editor = LineEditor::new();
+        feed(&mut editor, b" first");
+        editor.commit_history();
+        assert!(editor.history().is_empty());
+
+        editor.clear();
+        feed(&mut editor, b"first");
+        editor.commit_history();
+        assert_eq!(editor.history(), ["first"]);
+
+        editor.clear();
+        feed(&mut editor, b"first");
+        editor.commit_history();
+        assert_eq!(editor.history(), ["first"]);
+
+        editor.clear();
+        feed(&mut editor, b"second");
+        editor.commit_history();
+        assert_eq!(editor.history(), ["first", "second"]);
     }
 
     #[test]

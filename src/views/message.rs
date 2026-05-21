@@ -1,6 +1,7 @@
 use super::{ViewAction, ViewController, ViewKind};
 use crate::{screen_reader::ScreenReader, view::View};
 use anyhow::Result;
+use std::any::Any;
 use std::io::Write;
 
 pub struct MessageView {
@@ -24,6 +25,10 @@ impl MessageView {
 }
 
 impl ViewController for MessageView {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn model(&mut self) -> &mut View {
         &mut self.view
     }
