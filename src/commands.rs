@@ -665,15 +665,7 @@ fn action_review_read_attributes(sr: &mut ScreenReader, view: &mut View) -> Resu
 }
 
 fn action_backspace(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let (row, col) = view.screen().cursor_position();
-    if col > 0 {
-        let char = view
-            .screen()
-            .cell(row, col - 1)
-            .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
-            .contents();
-        sr.speak(char, false)?;
-    }
+    sr.defer_backspace(view);
     // When backspacing, the cursor will end up moving to the left, but we don't want to hear
     // that.
     sr.cursor_tracking_mode = match sr.cursor_tracking_mode {
@@ -684,13 +676,7 @@ fn action_backspace(sr: &mut ScreenReader, view: &mut View) -> Result<CommandRes
 }
 
 fn action_delete(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let (row, col) = view.screen().cursor_position();
-    let char = view
-        .screen()
-        .cell(row, col)
-        .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?
-        .contents();
-    sr.speak(char, false)?;
+    sr.defer_delete(view);
     Ok(CommandResult::ForwardInput)
 }
 

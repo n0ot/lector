@@ -43,6 +43,12 @@ pub struct ScreenReader {
     diff_text: String,
     diff_graphemes: String,
     live_text: String,
+    pending_delete: Option<PendingDelete>,
+}
+
+enum PendingDelete {
+    Backspace { cursor: (u16, u16), text: String },
+    Delete { text: String },
 }
 
 impl ScreenReader {
@@ -70,6 +76,7 @@ impl ScreenReader {
             diff_text: String::new(),
             diff_graphemes: String::new(),
             live_text: String::new(),
+            pending_delete: None,
         }
     }
 
@@ -485,6 +492,67 @@ impl ScreenReader {
         Ok(())
     }
 
+    pub fn clear_pending_delete(&mut self) {
+        self.pending_delete = None;
+    }
+
+    pub fn defer_backspace(&mut self, view: &View) {
+        let (row, col) = view.screen().cursor_position();
+        let text = if col > 0 {
+            view.screen()
+                .cell(row, col - 1)
+                .map(|cell| cell.contents().to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        self.pending_delete = Some(PendingDelete::Backspace {
+            cursor: (row, col),
+            text,
+        });
+    }
+
+    pub fn defer_delete(&mut self, view: &View) {
+        let (row, col) = view.screen().cursor_position();
+        let text = view
+            .screen()
+            .cell(row, col)
+            .map(|cell| cell.contents().to_string())
+            .unwrap_or_default();
+        self.pending_delete = Some(PendingDelete::Delete { text });
+    }
+
+    pub fn resolve_pending_delete(&mut self, view: &View) -> Result<bool> {
+        let Some(pending) = self.pending_delete.take() else {
+            return Ok(false);
+        };
+
+        let prev_cursor = view.prev_screen().cursor_position();
+        let cursor = view.screen().cursor_position();
+        let screen_changed =
+            view.screen().contents() != view.prev_screen().contents() || cursor != prev_cursor;
+
+        match pending {
+            PendingDelete::Backspace {
+                cursor: old_cursor,
+                text,
+            } => {
+                if !text.is_empty() && cursor.0 == old_cursor.0 && cursor.1 < old_cursor.1 {
+                    self.speak(&text, false)?;
+                    return Ok(true);
+                }
+            }
+            PendingDelete::Delete { text } => {
+                if !text.is_empty() && screen_changed {
+                    self.speak(&text, false)?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
     pub fn track_highlighting(&mut self, view: &mut View) -> Result<()> {
         let (highlights, prev_highlights) = (
             view.screen().get_highlights(),
@@ -856,5 +924,49 @@ mod tests {
         let read = sr.auto_read(&mut view, &mut reporter).unwrap();
         assert!(read);
         assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn deferred_backspace_only_speaks_when_cursor_moves_left() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 10);
+
+        view.process_changes(b"$ x");
+        view.finalize_changes(0);
+        sr.defer_backspace(&view);
+
+        view.process_changes(b"\x08\x1B[P");
+        let read = sr.resolve_pending_delete(&view).unwrap();
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["x"]);
+    }
+
+    #[test]
+    fn deferred_backspace_stays_silent_when_cursor_does_not_move() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 10);
+
+        view.process_changes(b"$ ");
+        view.finalize_changes(0);
+        sr.defer_backspace(&view);
+
+        let read = sr.resolve_pending_delete(&view).unwrap();
+        assert!(!read);
+        assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn deferred_delete_speaks_when_screen_changes() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 10);
+
+        view.process_changes(b"abc\x1B[D\x1B[D");
+        view.finalize_changes(0);
+        sr.defer_delete(&view);
+
+        view.process_changes(b"\x1B[P");
+        let read = sr.resolve_pending_delete(&view).unwrap();
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["b"]);
     }
 }

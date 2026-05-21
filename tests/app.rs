@@ -426,3 +426,53 @@ fn lua_repl_ctrl_l_from_modify_other_keys_clears_output() {
     assert!(after_clear.contains("Esc to close"));
     assert!(!after_clear.contains("alpha"));
 }
+
+#[test]
+fn backspace_waits_for_cursor_movement_before_speaking() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"$ ", &mut term_out)
+        .expect("handle pty");
+    clock.advance_ms(2);
+    let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x7F", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    app.handle_pty(&mut sr, b"", &mut term_out)
+        .expect("handle pty");
+    clock.advance_ms(2);
+    let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
+
+    assert!(recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
+fn delete_speaks_after_screen_change_with_auto_read_off() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    sr.auto_read = false;
+    app.handle_pty(&mut sr, b"abc\x1B[D\x1B[D", &mut term_out)
+        .expect("handle pty");
+    clock.advance_ms(2);
+    let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B[3~", &mut pty_out, &mut term_out)
+        .expect("handle stdin");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    app.handle_pty(&mut sr, b"\x1B[P", &mut term_out)
+        .expect("handle pty");
+    clock.advance_ms(2);
+    let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
+
+    let speaks = &recorder.inner.borrow().speaks;
+    assert!(speaks.iter().any(|(text, _)| text == "b"));
+}

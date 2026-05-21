@@ -591,6 +591,7 @@ impl App {
     }
 
     fn update_last_key(&mut self, sr: &mut ScreenReader, raw: &[u8]) -> Result<()> {
+        sr.clear_pending_delete();
         if !self.ansi_csi_re.is_match(raw) {
             sr.last_key.clear();
             sr.last_key.extend_from_slice(raw);
@@ -749,14 +750,16 @@ impl App {
         {
             self.last_pty_update = None;
             if !overlay_active {
+                let mut read_text = sr.resolve_pending_delete(view)?;
                 if sr.highlight_tracking {
                     sr.track_highlighting(view)?;
                 }
-                let read_text = if sr.auto_read {
+                let auto_read_text = if sr.auto_read {
                     sr.auto_read(view, &mut self.reporter)?
                 } else {
                     false
                 };
+                read_text |= auto_read_text;
                 if let Some(lsu) = self.last_stdin_update
                     && now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128
                     && !read_text
@@ -882,12 +885,14 @@ impl App {
         let now_ms = self.clock.now_ms();
         let overlay_active = self.view_stack.has_overlay();
         let view = self.view_stack.active_mut().model();
-        let read_text = if sr.auto_read {
+        let mut read_text = sr.resolve_pending_delete(view)?;
+        let auto_read_text = if sr.auto_read {
             let mut reporter = perform::Reporter::new();
             sr.auto_read(view, &mut reporter)?
         } else {
             false
         };
+        read_text |= auto_read_text;
         if let Some(lsu) = self.last_stdin_update
             && now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128
             && !read_text
