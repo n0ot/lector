@@ -380,3 +380,49 @@ fn lua_repl_history_persists_after_close() {
     let speaks = &recorder.inner.borrow().speaks;
     assert!(speaks.iter().any(|(text, _)| text == "Lua REPL"));
 }
+
+#[test]
+fn lua_repl_ctrl_l_clears_through_app_input_path() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open repl");
+    app.handle_stdin(&mut sr, b"alpha\r", &mut pty_out, &mut term_out)
+        .expect("submit alpha");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish eval");
+
+    let before_clear = String::from_utf8_lossy(&term_out).into_owned();
+    assert!(before_clear.contains("alpha"));
+
+    app.handle_stdin(&mut sr, b"\x0C", &mut pty_out, &mut term_out)
+        .expect("ctrl-l");
+
+    let after_clear = app.debug_active_view_contents();
+    assert!(after_clear.contains("Esc to close"));
+    assert!(!after_clear.contains("alpha"));
+}
+
+#[test]
+fn lua_repl_ctrl_l_from_modify_other_keys_clears_output() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open repl");
+    app.handle_stdin(&mut sr, b"alpha\r", &mut pty_out, &mut term_out)
+        .expect("submit alpha");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish eval");
+
+    term_out.clear();
+    app.handle_stdin(&mut sr, b"\x1B[27;5;108~", &mut pty_out, &mut term_out)
+        .expect("ctrl-l modifyOtherKeys");
+
+    let after_clear = app.debug_active_view_contents();
+    assert!(after_clear.contains("Esc to close"));
+    assert!(!after_clear.contains("alpha"));
+}

@@ -565,6 +565,11 @@ impl App {
             if sr.hook_on_key_unhandled(binding_name.as_deref(), sr.input_mode)? {
                 return Ok(());
             }
+            if self.view_stack.has_overlay()
+                && let Some(translated) = Self::overlay_input_bytes_for_key_event(key_event)
+            {
+                return self.dispatch_to_view(sr, &translated, pty_out, term_out);
+            }
             self.dispatch_to_view(sr, raw, pty_out, term_out)?;
         }
         Ok(())
@@ -633,6 +638,27 @@ impl App {
         }
 
         Some(binding)
+    }
+
+    fn overlay_input_bytes_for_key_event(key_event: KeyEvent) -> Option<Vec<u8>> {
+        let key_event = key_event.normalize_case();
+        if key_event.modifiers != KeyModifiers::CTRL {
+            return None;
+        }
+        let KeyCode::Char(ch) = key_event.code else {
+            return None;
+        };
+        let byte = match ch {
+            '@' | ' ' => 0x00,
+            'a'..='z' => (ch as u8) - b'a' + 1,
+            '[' => 0x1B,
+            '\\' => 0x1C,
+            ']' => 0x1D,
+            '^' => 0x1E,
+            '_' => 0x1F,
+            _ => return None,
+        };
+        Some(vec![byte])
     }
 
     pub fn handle_pty(
@@ -878,6 +904,10 @@ impl App {
         sr.hook_on_screen_update(view, overlay_active)?;
         view.finalize_changes(now_ms);
         Ok(())
+    }
+
+    pub fn debug_active_view_contents(&mut self) -> String {
+        self.view_stack.active_mut().model().contents_full()
     }
 }
 
