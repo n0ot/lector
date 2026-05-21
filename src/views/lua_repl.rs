@@ -12,6 +12,8 @@ use mlua::{
 };
 use std::{cell::RefCell, io::Write, rc::Rc};
 
+const CLOSE_HINT: &str = "Esc to close";
+
 struct ReplOutput {
     lines: Vec<String>,
 }
@@ -80,6 +82,7 @@ impl LuaReplView {
         let added = repl.append_output("Lua REPL ready.");
         repl.write_output_lines(&added);
         repl.write_prompt();
+        repl.render_full();
         Ok(repl)
     }
 
@@ -222,6 +225,7 @@ impl LuaReplView {
 
     fn render_full(&mut self) {
         let (rows, cols) = self.view.size();
+        let rows = rows as usize;
         let cols = cols as usize;
         let prompt = "> ";
         let available = cols.saturating_sub(prompt.len());
@@ -241,23 +245,27 @@ impl LuaReplView {
             .collect();
         let cursor_col = prompt.len() + (cursor - start);
 
-        let mut lines: Vec<String> = Vec::new();
-        lines.extend(self.output.iter().cloned());
-        lines.push(format!("{}{}", prompt, visible_input));
-        let rows = rows as usize;
-        let lines = if lines.len() > rows {
-            lines[lines.len() - rows..].to_vec()
+        let body_rows = rows.saturating_sub(1);
+        let mut body_lines: Vec<String> = self.output.to_vec();
+        body_lines.push(format!("{}{}", prompt, visible_input));
+        let body_lines = if body_lines.len() > body_rows {
+            body_lines[body_lines.len() - body_rows..].to_vec()
         } else {
-            lines
+            body_lines
         };
-        let cursor_row = if lines.is_empty() { 1 } else { lines.len() };
+        let body_len = body_lines.len();
+        let mut lines: Vec<String> = vec![truncate_to_width(CLOSE_HINT, cols)];
+        lines.extend(body_lines);
+        let cursor_row = if body_rows == 0 { 1 } else { body_len + 1 };
         let cursor_col = cursor_col + 1;
 
         let mut bytes = Vec::new();
         bytes.extend_from_slice(b"\x1B[2J\x1B[H");
-        for line in lines {
+        for (idx, line) in lines.iter().enumerate() {
             bytes.extend_from_slice(line.as_bytes());
-            bytes.extend_from_slice(b"\r\n");
+            if idx + 1 < lines.len() {
+                bytes.extend_from_slice(b"\r\n");
+            }
         }
         bytes.extend_from_slice(format!("\x1B[{};{}H", cursor_row, cursor_col).as_bytes());
 
@@ -362,7 +370,7 @@ impl ViewController for LuaReplView {
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         self.set_screen_reader(sr);
-        if input.contains(&0x04) {
+        if input == b"\x1B" {
             self.thread = None;
             return Ok(ViewAction::Pop);
         }
@@ -444,5 +452,109 @@ fn format_value(value: Value) -> String {
         Value::LightUserData(_) => "lightuserdata".to_string(),
         Value::Error(err) => err.to_string(),
         _ => "value".to_string(),
+    }
+}
+
+fn truncate_to_width(text: &str, width: usize) -> String {
+    text.chars().take(width).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CLOSE_HINT, LuaReplView};
+    use crate::{perform, screen_reader::ScreenReader, speech, views::ViewController};
+    use std::{cell::RefCell, rc::Rc};
+
+    struct TestDriver {
+        speaks: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl speech::Driver for TestDriver {
+        fn speak(&mut self, text: &str, _interrupt: bool) -> anyhow::Result<()> {
+            self.speaks.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rate(&self) -> f32 {
+            1.0
+        }
+
+        fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_screen_reader() -> (ScreenReader, Rc<RefCell<Vec<String>>>) {
+        let speaks = Rc::new(RefCell::new(Vec::new()));
+        let driver = TestDriver {
+            speaks: Rc::clone(&speaks),
+        };
+        let sr = ScreenReader::new(speech::Speech::new(Box::new(driver)));
+        (sr, speaks)
+    }
+
+    #[test]
+    fn lua_repl_renders_close_hint_in_top_row() {
+        let mut repl = LuaReplView::new(6, 20).expect("create lua repl");
+        let top_row = repl.model().screen().contents_between(0, 0, 0, 20);
+        assert!(top_row.starts_with(CLOSE_HINT));
+    }
+
+    #[test]
+    fn lua_repl_esc_closes_view() {
+        let mut repl = LuaReplView::new(6, 20).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+        let action = repl
+            .handle_input(&mut sr, b"\x1B", &mut Vec::new())
+            .expect("handle esc");
+        assert!(matches!(action, crate::views::ViewAction::Pop));
+    }
+
+    #[test]
+    fn lua_repl_ctrl_d_does_not_close_view() {
+        let mut repl = LuaReplView::new(6, 20).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+        let action = repl
+            .handle_input(&mut sr, b"\x04", &mut Vec::new())
+            .expect("handle ctrl-d");
+        assert!(matches!(action, crate::views::ViewAction::None));
+    }
+
+    #[test]
+    fn lua_repl_close_hint_stays_pinned_after_output_overflows() {
+        let mut repl = LuaReplView::new(4, 20).expect("create lua repl");
+        repl.append_output("line 1\nline 2\nline 3\nline 4\nline 5");
+        repl.render_full();
+        let screen = repl.model().screen();
+        assert!(screen.contents_between(0, 0, 0, 20).starts_with(CLOSE_HINT));
+        assert!(screen.contents_between(1, 0, 1, 20).contains("line 4"));
+        assert!(screen.contents_between(2, 0, 2, 20).contains("line 5"));
+        assert!(screen.contents_between(3, 0, 3, 20).contains(">"));
+    }
+
+    #[test]
+    fn lua_repl_auto_read_speaks_incoming_output_without_banner() {
+        let mut repl = LuaReplView::new(6, 30).expect("create lua repl");
+        let (mut sr, speaks) = make_screen_reader();
+        let mut reporter = perform::Reporter::new();
+
+        repl.model().finalize_changes(0);
+        let added = repl.append_output("alpha\nbeta\ngamma\ndelta");
+        repl.write_output_lines(&added);
+        repl.write_prompt();
+
+        let read = sr
+            .auto_read(repl.model(), &mut reporter)
+            .expect("auto read");
+        assert!(read);
+
+        let speaks = speaks.borrow();
+        assert!(speaks.iter().any(|text| text.contains("alpha")));
+        assert!(speaks.iter().any(|text| text.contains("delta")));
+        assert!(!speaks.iter().any(|text| text.contains(CLOSE_HINT)));
     }
 }

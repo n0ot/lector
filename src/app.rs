@@ -6,13 +6,13 @@ use terminput::{Event, KeyCode, KeyEvent, KeyModifiers};
 pub const DIFF_DELAY: u16 = 1;
 pub const MAX_DIFF_DELAY: u16 = 300;
 const ESC_TIMEOUT_MS: u128 = 50;
-const CTRL_D_CSI: &[u8] = b"\x1B[27;5;100~";
 const FOCUS_IN_EVENT: &[u8] = b"\x1B[I";
 const FOCUS_OUT_EVENT: &[u8] = b"\x1B[O";
 const FOCUS_EVENTS_ENABLE: &[u8] = b"\x1B[?1004h";
 const FOCUS_EVENTS_DISABLE: &[u8] = b"\x1B[?1004l";
 const OSC_START: u8 = b']';
 const ST_ESCAPE: u8 = b'\\';
+const MODIFY_OTHER_KEYS_PREFIX: &[u8] = b"\x1B[27;";
 
 fn is_ss3_final(byte: u8) -> bool {
     matches!(byte, b'D' | b'C' | b'A' | b'B' | b'H' | b'F' | b'P'..=b'S')
@@ -95,6 +95,37 @@ impl App {
         self.log_enabled = enabled;
     }
 
+    fn format_bytes(bytes: &[u8]) -> String {
+        let mut out = String::new();
+        for &byte in bytes {
+            match byte {
+                b'\x1B' => out.push_str("\\e"),
+                b'\r' => out.push_str("\\r"),
+                b'\n' => out.push_str("\\n"),
+                b'\t' => out.push_str("\\t"),
+                0x20..=0x7E => out.push(byte as char),
+                _ => out.push_str(&format!("\\x{byte:02X}")),
+            }
+        }
+        out
+    }
+
+    fn log_bytes(&self, label: &str, bytes: &[u8]) {
+        if self.log_enabled {
+            eprintln!(
+                "{label}: [{} bytes] {}",
+                bytes.len(),
+                Self::format_bytes(bytes)
+            );
+        }
+    }
+
+    fn log_event(&self, message: &str) {
+        if self.log_enabled {
+            eprintln!("{message}");
+        }
+    }
+
     pub fn wants_tick(&mut self) -> bool {
         self.view_stack.active_mut().wants_tick()
     }
@@ -134,6 +165,7 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        self.log_bytes("stdin from terminal", input);
         for &byte in input {
             self.pending_input_last_at = Some(self.clock.now_ms());
             self.pending_input.push_back(byte);
@@ -165,6 +197,7 @@ impl App {
                 PendingStatus::Complete(osc_len) => {
                     let raw: Vec<u8> = self.pending_input.drain(..osc_len).collect();
                     self.pending_input_last_at = None;
+                    self.log_bytes("recognized OSC sequence", &raw);
                     self.handle_raw_bytes(sr, &raw, pty_out, term_out)?;
                     continue;
                 }
@@ -178,6 +211,11 @@ impl App {
                     if self.pending_input.is_empty() {
                         self.pending_input_last_at = None;
                     }
+                    self.log_event(if focused {
+                        "recognized focus-in sequence"
+                    } else {
+                        "recognized focus-out sequence"
+                    });
                     self.handle_focus_event(sr, focused, pty_out, term_out)?;
                     continue;
                 }
@@ -185,20 +223,27 @@ impl App {
                 FocusPendingStatus::None => {}
             }
 
-            if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
-                match self.pending_ctrl_d_status() {
-                    PendingStatus::Complete(len) => {
-                        self.pending_input.drain(..len);
-                        if self.pending_input.is_empty() {
-                            self.pending_input_last_at = None;
-                        }
-                        let raw = [0x04u8];
-                        self.update_last_key(sr, &raw)?;
-                        return self.dispatch_to_view(sr, &raw, pty_out, term_out);
+            match self.pending_modify_other_keys_status() {
+                ModifyOtherKeysPendingStatus::Complete(len, event) => {
+                    let raw: Vec<u8> = self.pending_input.drain(..len).collect();
+                    if self.pending_input.is_empty() {
+                        self.pending_input_last_at = None;
                     }
-                    PendingStatus::Incomplete => return Ok(()),
-                    PendingStatus::None => {}
+                    self.log_bytes("parsed terminal event bytes", &raw);
+                    self.handle_event(sr, event, &raw, pty_out, term_out)?;
+                    continue;
                 }
+                ModifyOtherKeysPendingStatus::CompleteRaw(len) => {
+                    let raw: Vec<u8> = self.pending_input.drain(..len).collect();
+                    if self.pending_input.is_empty() {
+                        self.pending_input_last_at = None;
+                    }
+                    self.log_bytes("recognized modifyOtherKeys sequence", &raw);
+                    self.handle_raw_bytes(sr, &raw, pty_out, term_out)?;
+                    continue;
+                }
+                ModifyOtherKeysPendingStatus::Incomplete => return Ok(()),
+                ModifyOtherKeysPendingStatus::None => {}
             }
 
             if self.pending_input.len() >= 3
@@ -210,6 +255,7 @@ impl App {
                 if self.pending_input.is_empty() {
                     self.pending_input_last_at = None;
                 }
+                self.log_bytes("reclassified partial SS3 as Alt-O", &raw);
                 let event =
                     Event::Key(KeyEvent::new(KeyCode::Char('O')).modifiers(KeyModifiers::ALT));
                 self.handle_event(sr, event, &raw, pty_out, term_out)?;
@@ -222,6 +268,7 @@ impl App {
                     let raw = buf.to_vec();
                     self.pending_input.clear();
                     self.pending_input_last_at = None;
+                    self.log_bytes("parsed terminal event bytes", &raw);
                     self.handle_event(sr, event, &raw, pty_out, term_out)?;
                 }
                 Ok(None) => {
@@ -235,6 +282,7 @@ impl App {
                     if self.pending_input.is_empty() {
                         self.pending_input_last_at = None;
                     }
+                    self.log_bytes("forwarding undecodable byte", &[raw_byte]);
                     self.handle_raw_bytes(sr, &[raw_byte], pty_out, term_out)?;
                 }
             }
@@ -265,15 +313,8 @@ impl App {
         PendingStatus::Incomplete
     }
 
-    fn pending_ctrl_d_status(&mut self) -> PendingStatus {
-        let buf = self.pending_input.make_contiguous();
-        if buf.starts_with(CTRL_D_CSI) {
-            return PendingStatus::Complete(CTRL_D_CSI.len());
-        }
-        if CTRL_D_CSI.starts_with(buf) && !buf.is_empty() {
-            return PendingStatus::Incomplete;
-        }
-        PendingStatus::None
+    fn pending_modify_other_keys_status(&mut self) -> ModifyOtherKeysPendingStatus {
+        parse_modify_other_keys(self.pending_input.make_contiguous())
     }
 
     fn pending_focus_event_status(&mut self) -> FocusPendingStatus {
@@ -331,17 +372,13 @@ impl App {
             let rem = &self.pending_pty_output[i..];
             if rem.starts_with(FOCUS_EVENTS_ENABLE) {
                 self.app_focus_events_enabled = true;
-                if self.log_enabled {
-                    eprintln!("focus mode: app enabled ?1004 passthrough");
-                }
+                self.log_event("focus mode: app enabled ?1004 passthrough");
                 i += FOCUS_EVENTS_ENABLE.len();
                 continue;
             }
             if rem.starts_with(FOCUS_EVENTS_DISABLE) {
                 self.app_focus_events_enabled = false;
-                if self.log_enabled {
-                    eprintln!("focus mode: app disabled ?1004 passthrough");
-                }
+                self.log_event("focus mode: app disabled ?1004 passthrough");
                 i += FOCUS_EVENTS_DISABLE.len();
                 continue;
             }
@@ -377,6 +414,7 @@ impl App {
 
         let raw: Vec<u8> = self.pending_input.drain(..).collect();
         self.pending_input_last_at = None;
+        self.log_bytes("flushing pending input after timeout", &raw);
 
         let forced_event = match raw.as_slice() {
             b"\x1B" => Some(Event::Key(KeyCode::Esc.into())),
@@ -410,6 +448,7 @@ impl App {
         match event {
             Event::Key(key_event) => self.handle_key_event(sr, key_event, raw, pty_out, term_out),
             Event::Paste(contents) => {
+                self.log_event(&format!("parsed paste event: [{} chars]", contents.len()));
                 let view_action = self
                     .view_stack
                     .active_mut()
@@ -428,14 +467,6 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
-        if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl
-            && key_event.modifiers.contains(KeyModifiers::CTRL)
-            && matches!(key_event.code, KeyCode::Char('d' | 'D'))
-        {
-            let raw = [0x04u8];
-            self.update_last_key(sr, &raw)?;
-            return self.dispatch_to_view(sr, &raw, pty_out, term_out);
-        }
         self.update_last_key(sr, raw)?;
         if sr.pass_through {
             sr.pass_through = false;
@@ -443,6 +474,13 @@ impl App {
         }
 
         let binding_name = self.key_event_binding_name(key_event);
+        if self.log_enabled {
+            eprintln!(
+                "parsed key event: binding={} raw={}",
+                binding_name.as_deref().unwrap_or("<none>"),
+                Self::format_bytes(raw)
+            );
+        }
         let binding = binding_name.as_ref().and_then(|name| {
             sr.key_bindings
                 .binding_for_mode(sr.input_mode, name.as_str())
@@ -530,6 +568,7 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        self.log_bytes("forwarding raw bytes to active view", raw);
         self.update_last_key(sr, raw)?;
         if sr.pass_through {
             sr.pass_through = false;
@@ -616,7 +655,11 @@ impl App {
         buf: &[u8],
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        self.log_bytes("pty output from app", buf);
         let terminal_buf = self.filter_focus_mode_sequences(buf);
+        if terminal_buf != buf {
+            self.log_bytes("pty output after focus filtering", &terminal_buf);
+        }
         let overlay_active = self.view_stack.has_overlay();
         self.view_stack.root_mut().handle_pty_output(buf)?;
         if !overlay_active {
@@ -709,6 +752,7 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        self.log_bytes("dispatching bytes to active view", input);
         self.last_stdin_update = Some(self.clock.now_ms());
         let action = self
             .view_stack
@@ -822,4 +866,92 @@ enum FocusPendingStatus {
     None,
     Incomplete,
     Complete(bool),
+}
+
+#[derive(Debug, PartialEq)]
+enum ModifyOtherKeysPendingStatus {
+    None,
+    Incomplete,
+    Complete(usize, Event),
+    CompleteRaw(usize),
+}
+
+fn parse_modify_other_keys(buf: &[u8]) -> ModifyOtherKeysPendingStatus {
+    if buf.is_empty() {
+        return ModifyOtherKeysPendingStatus::None;
+    }
+    if MODIFY_OTHER_KEYS_PREFIX.starts_with(buf) && buf.len() < MODIFY_OTHER_KEYS_PREFIX.len() {
+        return ModifyOtherKeysPendingStatus::Incomplete;
+    }
+    if !buf.starts_with(MODIFY_OTHER_KEYS_PREFIX) {
+        return ModifyOtherKeysPendingStatus::None;
+    }
+
+    let mut end = MODIFY_OTHER_KEYS_PREFIX.len();
+    while end < buf.len() {
+        match buf[end] {
+            b'0'..=b'9' | b';' => {
+                end += 1;
+            }
+            b'~' => {
+                let raw = &buf[..=end];
+                return parse_modify_other_keys_event(raw)
+                    .map(|event| ModifyOtherKeysPendingStatus::Complete(raw.len(), event))
+                    .unwrap_or(ModifyOtherKeysPendingStatus::CompleteRaw(raw.len()));
+            }
+            _ => return ModifyOtherKeysPendingStatus::None,
+        }
+    }
+
+    ModifyOtherKeysPendingStatus::Incomplete
+}
+
+fn parse_modify_other_keys_event(raw: &[u8]) -> Option<Event> {
+    let body = std::str::from_utf8(&raw[2..raw.len().checked_sub(1)?]).ok()?;
+    let mut parts = body.split(';');
+    let prefix = parts.next()?;
+    let modifiers = parts.next()?;
+    let keycode = parts.next()?;
+    if prefix != "27" || parts.next().is_some() {
+        return None;
+    }
+
+    let translated = format!("\x1B[{keycode};{modifiers}u");
+    Event::parse_from(translated.as_bytes()).ok().flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ModifyOtherKeysPendingStatus, parse_modify_other_keys, parse_modify_other_keys_event,
+    };
+    use terminput::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn parse_modify_other_keys_shift_enter() {
+        assert_eq!(
+            parse_modify_other_keys_event(b"\x1B[27;2;13~"),
+            Some(Event::Key(
+                KeyEvent::new(KeyCode::Enter).modifiers(KeyModifiers::SHIFT)
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_modify_other_keys_ctrl_d() {
+        assert_eq!(
+            parse_modify_other_keys_event(b"\x1B[27;5;100~"),
+            Some(Event::Key(
+                KeyEvent::new(KeyCode::Char('d')).modifiers(KeyModifiers::CTRL)
+            ))
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_prefix_stays_buffered_until_complete() {
+        assert_eq!(
+            parse_modify_other_keys(b"\x1B[27;2;13"),
+            ModifyOtherKeysPendingStatus::Incomplete
+        );
+    }
 }

@@ -57,11 +57,8 @@ fn query_focus_mode<R: Read + AsRawFd>(stdin: &mut R, stdout: &mut dyn Write) ->
     let mut events = mio::Events::with_capacity(8);
     let mut response = Vec::new();
     for timeout_ms in [20, 10, 10] {
-        poll.poll(
-            &mut events,
-            Some(time::Duration::from_millis(timeout_ms)),
-        )
-        .ok()?;
+        poll.poll(&mut events, Some(time::Duration::from_millis(timeout_ms)))
+            .ok()?;
         if events.is_empty() {
             continue;
         }
@@ -98,7 +95,10 @@ fn parse_focus_mode_report(buf: &[u8]) -> Option<bool> {
             i += 1;
             continue;
         }
-        let code = std::str::from_utf8(&buf[start..end]).ok()?.parse::<u8>().ok()?;
+        let code = std::str::from_utf8(&buf[start..end])
+            .ok()?
+            .parse::<u8>()
+            .ok()?;
         return match code {
             1 | 3 => Some(true),
             2 | 4 => Some(false),
