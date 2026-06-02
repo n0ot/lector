@@ -707,7 +707,8 @@ impl ScreenReader {
         if diff_state == DiffState::Single {
             let mut grapheme_buf = std::mem::take(&mut self.diff_graphemes);
             grapheme_buf.clear();
-            // If there isn't just a single change, just read the whole line.
+            // Prefer the precise single-edit behavior. If there are multiple changed regions on
+            // the line, fall back to changed whitespace-delimited fields below.
             diff_state = DiffState::NoChanges;
             let mut prev_tag = None;
             for change in TextDiff::configure()
@@ -745,7 +746,7 @@ impl ScreenReader {
                 };
                 prev_tag = Some(change.tag());
                 if diff_state == DiffState::Multi {
-                    continue; // Revert to the line diff.
+                    continue;
                 }
                 if change.tag() == ChangeTag::Insert
                     && let Some(change_str) = change.as_str()
@@ -754,7 +755,12 @@ impl ScreenReader {
                 }
             }
 
-            if diff_state != DiffState::Multi {
+            if diff_state == DiffState::Multi {
+                grapheme_buf.clear();
+                if collect_inserted_fields(old_text, new_text, &mut grapheme_buf) {
+                    std::mem::swap(&mut diff_text, &mut grapheme_buf);
+                }
+            } else {
                 std::mem::swap(&mut diff_text, &mut grapheme_buf);
             }
             self.diff_graphemes = grapheme_buf;
@@ -781,6 +787,118 @@ impl ScreenReader {
             }
         }
     }
+}
+
+fn collect_inserted_fields(old_text: &str, new_text: &str, out: &mut String) -> bool {
+    let old_fields: Vec<_> = old_text.split_whitespace().collect();
+    let new_fields: Vec<_> = new_text.split_whitespace().collect();
+    let old_len = old_fields.len();
+    let new_len = new_fields.len();
+    if new_len == 0 {
+        return false;
+    }
+
+    let mut lcs = vec![0; (old_len + 1) * (new_len + 1)];
+    for old_idx in (0..old_len).rev() {
+        for new_idx in (0..new_len).rev() {
+            let idx = old_idx * (new_len + 1) + new_idx;
+            lcs[idx] = if old_fields[old_idx] == new_fields[new_idx] {
+                lcs[(old_idx + 1) * (new_len + 1) + new_idx + 1] + 1
+            } else {
+                lcs[(old_idx + 1) * (new_len + 1) + new_idx]
+                    .max(lcs[old_idx * (new_len + 1) + new_idx + 1])
+            };
+        }
+    }
+
+    let mut old_idx = 0;
+    let mut new_idx = 0;
+    let mut deleted_hunk = Vec::new();
+    let mut inserted_hunk = Vec::new();
+    let mut spoke = false;
+    while old_idx < old_len || new_idx < new_len {
+        if old_idx < old_len && new_idx < new_len && old_fields[old_idx] == new_fields[new_idx] {
+            flush_inserted_field_hunk(&deleted_hunk, &inserted_hunk, out, &mut spoke);
+            deleted_hunk.clear();
+            inserted_hunk.clear();
+            old_idx += 1;
+            new_idx += 1;
+        } else if new_idx < new_len
+            && (old_idx == old_len
+                || lcs[old_idx * (new_len + 1) + new_idx + 1]
+                    >= lcs[(old_idx + 1) * (new_len + 1) + new_idx])
+        {
+            inserted_hunk.push(new_fields[new_idx]);
+            new_idx += 1;
+        } else {
+            deleted_hunk.push(old_fields[old_idx]);
+            old_idx += 1;
+        }
+    }
+    flush_inserted_field_hunk(&deleted_hunk, &inserted_hunk, out, &mut spoke);
+
+    spoke
+}
+
+fn flush_inserted_field_hunk(
+    deleted: &[&str],
+    inserted: &[&str],
+    out: &mut String,
+    spoke: &mut bool,
+) {
+    if inserted.is_empty() {
+        return;
+    }
+
+    if deleted.len() == inserted.len() {
+        for (old_field, new_field) in deleted.iter().zip(inserted) {
+            append_inserted_field(field_replacement(old_field, new_field), out, spoke);
+        }
+    } else {
+        for field in inserted {
+            append_inserted_field(field, out, spoke);
+        }
+    }
+}
+
+fn append_inserted_field(field: &str, out: &mut String, spoke: &mut bool) {
+    if field.is_empty() {
+        return;
+    }
+    if *spoke {
+        out.push(' ');
+    }
+    out.push_str(field);
+    *spoke = true;
+}
+
+fn field_replacement<'a>(old_field: &str, new_field: &'a str) -> &'a str {
+    let mut prefix_len = 0;
+    for ((old_idx, old_ch), (new_idx, new_ch)) in
+        old_field.char_indices().zip(new_field.char_indices())
+    {
+        if old_ch != new_ch {
+            break;
+        }
+        prefix_len = new_idx + new_ch.len_utf8();
+        debug_assert_eq!(prefix_len, old_idx + old_ch.len_utf8());
+    }
+
+    let old_suffix_source = &old_field[prefix_len..];
+    let new_suffix_source = &new_field[prefix_len..];
+    let mut suffix_len = 0;
+    for (old_ch, new_ch) in old_suffix_source
+        .chars()
+        .rev()
+        .zip(new_suffix_source.chars().rev())
+    {
+        if old_ch != new_ch {
+            break;
+        }
+        suffix_len += new_ch.len_utf8();
+    }
+
+    &new_field[prefix_len..new_field.len() - suffix_len]
 }
 
 #[derive(Clone, Debug)]
@@ -924,6 +1042,44 @@ mod tests {
         let read = sr.auto_read(&mut view, &mut reporter).unwrap();
         assert!(read);
         assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn auto_read_speaks_multiple_inserted_runs_from_single_changed_line() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 40);
+        let mut reporter = perform::Reporter::new();
+
+        view.process_changes(b"left one right two");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\r\x1B[Kleft alpha right beta");
+        reporter.cursor_moves = 1;
+        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["alpha beta"]);
+    }
+
+    #[test]
+    fn auto_read_speaks_short_status_line_replacements() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 120);
+        let mut reporter = perform::Reporter::new();
+
+        view.process_changes(
+            b"[dev] 1:bash* 2:bash-                                             bash.1",
+        );
+        view.finalize_changes(0);
+
+        view.process_changes(
+            b"\r\x1B[K[dev] 1:caffeinate* 2:bash-                                      caffeinate.1",
+        );
+        reporter.cursor_moves = 1;
+        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["caffeinate caffeinate"]);
     }
 
     #[test]
