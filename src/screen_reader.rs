@@ -898,7 +898,34 @@ fn field_replacement<'a>(old_field: &str, new_field: &'a str) -> &'a str {
         suffix_len += new_ch.len_utf8();
     }
 
-    &new_field[prefix_len..new_field.len() - suffix_len]
+    let mut start = prefix_len;
+    let mut end = new_field.len() - suffix_len;
+
+    while start > 0 {
+        let Some((prev_idx, prev_ch)) = new_field[..start].char_indices().next_back() else {
+            break;
+        };
+        if !is_word_char(prev_ch) {
+            break;
+        }
+        start = prev_idx;
+    }
+
+    while end < new_field.len() {
+        let Some(next_ch) = new_field[end..].chars().next() else {
+            break;
+        };
+        if !is_word_char(next_ch) {
+            break;
+        }
+        end += next_ch.len_utf8();
+    }
+
+    &new_field[start..end]
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
 }
 
 #[derive(Clone, Debug)]
@@ -1080,6 +1107,27 @@ mod tests {
 
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["caffeinate caffeinate"]);
+    }
+
+    #[test]
+    fn auto_read_speaks_shorter_replacements_to_word_boundaries() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 120);
+        let mut reporter = perform::Reporter::new();
+
+        view.process_changes(
+            b"[dev] 1:bash* 2:bash-                                             bash.1",
+        );
+        view.finalize_changes(0);
+
+        view.process_changes(
+            b"\r\x1B[K[dev] 1:gh* 2:bash-                                                gh.1",
+        );
+        reporter.cursor_moves = 1;
+        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["gh gh"]);
     }
 
     #[test]
