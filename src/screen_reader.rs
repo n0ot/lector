@@ -815,10 +815,17 @@ fn collect_inserted_fields(old_text: &str, new_text: &str, out: &mut String) -> 
     let mut new_idx = 0;
     let mut deleted_hunk = Vec::new();
     let mut inserted_hunk = Vec::new();
+    let mut last_spoken_hunk = String::new();
     let mut spoke = false;
     while old_idx < old_len || new_idx < new_len {
         if old_idx < old_len && new_idx < new_len && old_fields[old_idx] == new_fields[new_idx] {
-            flush_inserted_field_hunk(&deleted_hunk, &inserted_hunk, out, &mut spoke);
+            flush_inserted_field_hunk(
+                &deleted_hunk,
+                &inserted_hunk,
+                out,
+                &mut last_spoken_hunk,
+                &mut spoke,
+            );
             deleted_hunk.clear();
             inserted_hunk.clear();
             old_idx += 1;
@@ -835,7 +842,13 @@ fn collect_inserted_fields(old_text: &str, new_text: &str, out: &mut String) -> 
             old_idx += 1;
         }
     }
-    flush_inserted_field_hunk(&deleted_hunk, &inserted_hunk, out, &mut spoke);
+    flush_inserted_field_hunk(
+        &deleted_hunk,
+        &inserted_hunk,
+        out,
+        &mut last_spoken_hunk,
+        &mut spoke,
+    );
 
     spoke
 }
@@ -844,32 +857,44 @@ fn flush_inserted_field_hunk(
     deleted: &[&str],
     inserted: &[&str],
     out: &mut String,
+    last_spoken_hunk: &mut String,
     spoke: &mut bool,
 ) {
     if inserted.is_empty() {
         return;
     }
 
+    let mut hunk = String::new();
     if deleted.len() == inserted.len() {
         for (old_field, new_field) in deleted.iter().zip(inserted) {
-            append_inserted_field(field_replacement(old_field, new_field), out, spoke);
+            append_inserted_field(field_replacement(old_field, new_field), &mut hunk);
         }
     } else {
         for field in inserted {
-            append_inserted_field(field, out, spoke);
+            append_inserted_field(field, &mut hunk);
         }
     }
-}
 
-fn append_inserted_field(field: &str, out: &mut String, spoke: &mut bool) {
-    if field.is_empty() {
+    if hunk.is_empty() || hunk == *last_spoken_hunk {
         return;
     }
+
     if *spoke {
         out.push(' ');
     }
-    out.push_str(field);
+    out.push_str(&hunk);
+    last_spoken_hunk.clone_from(&hunk);
     *spoke = true;
+}
+
+fn append_inserted_field(field: &str, out: &mut String) {
+    if field.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push(' ');
+    }
+    out.push_str(field);
 }
 
 fn field_replacement<'a>(old_field: &str, new_field: &'a str) -> &'a str {
@@ -1106,7 +1131,7 @@ mod tests {
         let read = sr.auto_read(&mut view, &mut reporter).unwrap();
 
         assert!(read);
-        assert_eq!(speaks.borrow().as_slice(), ["caffeinate caffeinate"]);
+        assert_eq!(speaks.borrow().as_slice(), ["caffeinate"]);
     }
 
     #[test]
@@ -1127,7 +1152,58 @@ mod tests {
         let read = sr.auto_read(&mut view, &mut reporter).unwrap();
 
         assert!(read);
-        assert_eq!(speaks.borrow().as_slice(), ["gh gh"]);
+        assert_eq!(speaks.borrow().as_slice(), ["gh"]);
+    }
+
+    #[test]
+    fn auto_read_collapses_contiguous_duplicate_replacement_hunks() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 40);
+        let mut reporter = perform::Reporter::new();
+
+        view.process_changes(b"foo bar foo");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\r\x1B[Kbum bar bum");
+        reporter.cursor_moves = 1;
+        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["bum"]);
+    }
+
+    #[test]
+    fn auto_read_preserves_non_contiguous_duplicate_replacement_hunks() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 40);
+        let mut reporter = perform::Reporter::new();
+
+        view.process_changes(b"foo bar baz foo");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\r\x1B[Kbum bar bat bum");
+        reporter.cursor_moves = 1;
+        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["bum bat bum"]);
+    }
+
+    #[test]
+    fn auto_read_keeps_repeated_words_inside_one_replacement_hunk() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 40);
+        let mut reporter = perform::Reporter::new();
+
+        view.process_changes(b"foo foo");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\r\x1B[Kbum bum");
+        reporter.cursor_moves = 1;
+        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["bum bum"]);
     }
 
     #[test]
