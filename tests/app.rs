@@ -222,6 +222,38 @@ fn cursor_tracking_wins_over_single_line_ruler_change() {
 }
 
 #[test]
+fn cursor_tracking_stays_silent_on_blank_line_during_ruler_change() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[2J\x1B[1;1Hfirst line\x1B[2;1H \x1B[4;1Hfile 1,1 All\x1B[1;1H",
+        &mut term_out,
+    )
+    .expect("draw initial screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize initial screen");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"j", &mut pty_out, &mut term_out)
+        .expect("move cursor down");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[2J\x1B[1;1Hfirst line\x1B[2;1H \x1B[4;1Hfile 2,1 All\x1B[2;1H",
+        &mut term_out,
+    )
+    .expect("draw updated screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize cursor move");
+
+    assert!(recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
 fn printed_line_wins_when_cursor_moves_past_it_to_a_blank_line() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();

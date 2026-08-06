@@ -455,7 +455,15 @@ impl ScreenReader {
         let mut cursor_report: Option<String> = None;
         if cursor.0 != prev_cursor.0 {
             // It moved to a different line
-            cursor_report = Some(view.line(cursor.0));
+            let line = view.line(cursor.0);
+            // A visually blank terminal row may contain a literal space. Do not promote that
+            // single character to character-level speech, where it would be announced as
+            // "space".
+            cursor_report = Some(if line.trim().is_empty() {
+                String::new()
+            } else {
+                line
+            });
         } else if cursor.1 != prev_cursor.1 {
             // The cursor moved left or right
             let distance_moved = (cursor.1 as i32 - prev_cursor.1 as i32).abs();
@@ -1265,6 +1273,20 @@ mod tests {
 
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["bum bum"]);
+    }
+
+    #[test]
+    fn vertical_cursor_tracking_stays_silent_on_whitespace_only_line() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 10);
+
+        view.process_changes(b"text\x1B[2;1H \x1B[1;1H");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\x1B[2;1H");
+        sr.track_cursor(&mut view).unwrap();
+
+        assert!(speaks.borrow().is_empty());
     }
 
     #[test]
