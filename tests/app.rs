@@ -107,6 +107,45 @@ fn paste_writes_to_pty_and_speaks() {
 }
 
 #[test]
+fn click_actions_write_mouse_events_at_review_cursor() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1B[?1000h\x1B[?1006h\x1B[5;8H", &mut term_out)
+        .expect("enable mouse and position cursor");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize"));
+
+    app.handle_stdin(&mut sr, b"\x1B{", &mut pty_out, &mut term_out)
+        .expect("left click");
+    app.handle_stdin(&mut sr, b"\x1B}", &mut pty_out, &mut term_out)
+        .expect("right click");
+
+    assert_eq!(pty_out, b"\x1B[<0;8;5M\x1B[<0;8;5m\x1B[<2;8;5M\x1B[<2;8;5m");
+}
+
+#[test]
+fn click_without_mouse_reporting_is_not_forwarded() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1B{", &mut pty_out, &mut term_out)
+        .expect("click without mouse reporting");
+
+    assert!(pty_out.is_empty());
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "mouse input unavailable")
+    );
+}
+
+#[test]
 fn pty_output_writes_terminal_and_autoreads() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut term_out = Vec::new();

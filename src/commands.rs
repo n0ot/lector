@@ -35,6 +35,8 @@ pub enum Action {
     RevFirst,
     RevLast,
     RevReadAttributes,
+    LeftClick,
+    RightClick,
     Backspace,
     Delete,
     SayTime,
@@ -74,6 +76,7 @@ pub enum CommandResult {
     Handled,
     ForwardInput,
     Paste(String),
+    PtyInput(Vec<u8>),
 }
 
 const ACTION_TABLE: &[(Action, &str, &str)] = &[
@@ -137,6 +140,16 @@ const ACTION_TABLE: &[(Action, &str, &str)] = &[
         Action::RevReadAttributes,
         "read attributes",
         "review_read_attributes",
+    ),
+    (
+        Action::LeftClick,
+        "left click at review cursor",
+        "left_click",
+    ),
+    (
+        Action::RightClick,
+        "right click at review cursor",
+        "right_click",
     ),
     (Action::Backspace, "backspace", "backspace"),
     (Action::Delete, "delete", "delete"),
@@ -314,6 +327,8 @@ pub fn handle(
         Action::RevFirst => action_review_first(sr, view),
         Action::RevLast => action_review_last(sr, view),
         Action::RevReadAttributes => action_review_read_attributes(sr, view),
+        Action::LeftClick => action_click(sr, view, MouseButton::Left),
+        Action::RightClick => action_click(sr, view, MouseButton::Right),
         Action::Backspace => action_backspace(sr, view),
         Action::Delete => action_delete(sr, view),
         Action::SayTime => action_say_time(sr),
@@ -355,6 +370,92 @@ pub fn handle(
 }
 
 // Actions
+#[derive(Copy, Clone)]
+enum MouseButton {
+    Left,
+    Right,
+}
+
+fn action_click(sr: &mut ScreenReader, view: &View, button: MouseButton) -> Result<CommandResult> {
+    let screen = view.screen();
+    if screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None {
+        sr.speak("mouse input unavailable", false)?;
+        return Ok(CommandResult::Handled);
+    }
+
+    let Some(input) = encode_mouse_click(
+        screen.mouse_protocol_mode(),
+        screen.mouse_protocol_encoding(),
+        button,
+        view.review_cursor_position,
+    ) else {
+        sr.speak("mouse position unavailable", false)?;
+        return Ok(CommandResult::Handled);
+    };
+
+    Ok(CommandResult::PtyInput(input))
+}
+
+fn encode_mouse_click(
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+    button: MouseButton,
+    (row, col): (u16, u16),
+) -> Option<Vec<u8>> {
+    let button_code = match button {
+        MouseButton::Left => 0,
+        MouseButton::Right => 2,
+    };
+    let include_release = mode != vt100::MouseProtocolMode::Press;
+    let mut input = Vec::new();
+
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => {
+            input.extend_from_slice(
+                format!(
+                    "\x1B[<{button_code};{};{}M",
+                    u32::from(col) + 1,
+                    u32::from(row) + 1
+                )
+                .as_bytes(),
+            );
+            if include_release {
+                input.extend_from_slice(
+                    format!(
+                        "\x1B[<{button_code};{};{}m",
+                        u32::from(col) + 1,
+                        u32::from(row) + 1
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+        vt100::MouseProtocolEncoding::Default => {
+            let col = u8::try_from(u32::from(col) + 33).ok()?;
+            let row = u8::try_from(u32::from(row) + 33).ok()?;
+            input.extend_from_slice(&[0x1B, b'[', b'M', button_code + 32, col, row]);
+            if include_release {
+                input.extend_from_slice(&[0x1B, b'[', b'M', 35, col, row]);
+            }
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let col = char::from_u32(u32::from(col) + 33)?;
+            let row = char::from_u32(u32::from(row) + 33)?;
+            input.extend_from_slice(b"\x1B[M");
+            input.push(button_code + 32);
+            input.extend_from_slice(col.to_string().as_bytes());
+            input.extend_from_slice(row.to_string().as_bytes());
+            if include_release {
+                input.extend_from_slice(b"\x1B[M#");
+                input.extend_from_slice(col.to_string().as_bytes());
+                input.extend_from_slice(row.to_string().as_bytes());
+            }
+        }
+    }
+
+    Some(input)
+}
+
 fn action_stop(sr: &mut ScreenReader) -> Result<CommandResult> {
     sr.speech.stop()?;
     Ok(CommandResult::Handled)
@@ -1453,4 +1554,75 @@ fn action_toggle_symbol_level(sr: &mut ScreenReader) -> Result<CommandResult> {
     sr.speak(&format!("{}", sr.speech.symbol_level), false)?;
 
     Ok(CommandResult::Handled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MouseButton, encode_mouse_click};
+    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
+    #[test]
+    fn encodes_sgr_left_click_with_one_based_coordinates() {
+        let input = encode_mouse_click(
+            MouseProtocolMode::PressRelease,
+            MouseProtocolEncoding::Sgr,
+            MouseButton::Left,
+            (4, 7),
+        )
+        .unwrap();
+
+        assert_eq!(input, b"\x1B[<0;8;5M\x1B[<0;8;5m");
+    }
+
+    #[test]
+    fn encodes_sgr_right_click() {
+        let input = encode_mouse_click(
+            MouseProtocolMode::ButtonMotion,
+            MouseProtocolEncoding::Sgr,
+            MouseButton::Right,
+            (0, 0),
+        )
+        .unwrap();
+
+        assert_eq!(input, b"\x1B[<2;1;1M\x1B[<2;1;1m");
+    }
+
+    #[test]
+    fn x10_mode_sends_only_button_press() {
+        let input = encode_mouse_click(
+            MouseProtocolMode::Press,
+            MouseProtocolEncoding::Default,
+            MouseButton::Left,
+            (1, 2),
+        )
+        .unwrap();
+
+        assert_eq!(input, b"\x1B[M #\"");
+    }
+
+    #[test]
+    fn default_encoding_rejects_coordinates_it_cannot_represent() {
+        assert!(
+            encode_mouse_click(
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Default,
+                MouseButton::Left,
+                (0, 223),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn encodes_utf8_mouse_click() {
+        let input = encode_mouse_click(
+            MouseProtocolMode::PressRelease,
+            MouseProtocolEncoding::Utf8,
+            MouseButton::Right,
+            (95, 95),
+        )
+        .unwrap();
+
+        assert_eq!(input, b"\x1B[M\"\xC2\x80\xC2\x80\x1B[M#\xC2\x80\xC2\x80");
+    }
 }

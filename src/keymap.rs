@@ -138,6 +138,8 @@ impl KeyBindings {
         );
         normal.insert("M-]".to_string(), Binding::Builtin(Action::NextClipboard));
         normal.insert("M-t".to_string(), Binding::Builtin(Action::ToggleTableMode));
+        normal.insert("M-{".to_string(), Binding::Builtin(Action::LeftClick));
+        normal.insert("M-}".to_string(), Binding::Builtin(Action::RightClick));
         normal.insert(
             "M-T".to_string(),
             Binding::Builtin(Action::StartTableSetupMode),

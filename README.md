@@ -198,6 +198,11 @@ lector.bindings["M-x"] = "lector.stop_speaking"
 -- toggle stop-on-focus-loss behavior
 lector.bindings["M-g"] = "lector.toggle_stop_speech_on_focus_loss"
 
+-- send mouse clicks to a mouse-aware terminal application at the review cursor
+-- these are the default bindings
+lector.bindings["M-{"] = "lector.left_click"
+lector.bindings["M-}"] = "lector.right_click"
+
 -- add a custom command
 lector.bindings["M-v"] = {
   "speak current time",

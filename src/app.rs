@@ -535,6 +535,9 @@ impl App {
                                 .handle_paste(sr, &contents, pty_out)?;
                             self.handle_view_action(sr, view_action, term_out)?;
                         }
+                        commands::CommandResult::PtyInput(input) => {
+                            self.dispatch_to_view(sr, &input, pty_out, term_out)?;
+                        }
                     }
                     if mode_before == crate::keymap::InputMode::TableSetup
                         && sr.input_mode != crate::keymap::InputMode::TableSetup
