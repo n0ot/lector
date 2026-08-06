@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use std::{collections::VecDeque, io::Write, time};
 use terminput::{Event, KeyCode, KeyEvent, KeyModifiers};
 
-pub const DIFF_DELAY: u16 = 1;
+pub const DIFF_DELAY: u16 = 30;
 pub const MAX_DIFF_DELAY: u16 = 300;
 const ESC_TIMEOUT_MS: u128 = 50;
 const FOCUS_IN_EVENT: &[u8] = b"\x1B[I";
@@ -59,6 +59,7 @@ pub struct App {
     log_enabled: bool,
     lua_repl_history: Vec<String>,
     last_stdin_update: Option<u128>,
+    first_pty_update: Option<u128>,
     last_pty_update: Option<u128>,
     clock: Box<dyn Clock>,
 }
@@ -85,6 +86,7 @@ impl App {
             log_enabled: false,
             lua_repl_history: Vec::new(),
             last_stdin_update: None,
+            first_pty_update: None,
             last_pty_update: None,
             clock,
         };
@@ -469,7 +471,7 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
-        self.update_last_key(sr, raw)?;
+        self.update_last_key(sr, raw, true)?;
         if sr.pass_through {
             sr.pass_through = false;
             return self.dispatch_to_view(sr, raw, pty_out, term_out);
@@ -583,16 +585,24 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.log_bytes("forwarding raw bytes to active view", raw);
-        self.update_last_key(sr, raw)?;
+        self.update_last_key(sr, raw, false)?;
         if sr.pass_through {
             sr.pass_through = false;
         }
         self.dispatch_to_view(sr, raw, pty_out, term_out)
     }
 
-    fn update_last_key(&mut self, sr: &mut ScreenReader, raw: &[u8]) -> Result<()> {
+    fn update_last_key(
+        &mut self,
+        sr: &mut ScreenReader,
+        raw: &[u8],
+        decoded_key_event: bool,
+    ) -> Result<()> {
         sr.clear_pending_delete();
-        if !self.ansi_csi_re.is_match(raw) {
+        // A decoded key press should always interrupt speech. In particular, Kitty's
+        // keyboard protocol encodes Control and Meta keys as CSI-u sequences, which
+        // look like non-key terminal traffic to the raw-byte heuristic below.
+        if decoded_key_event || !self.ansi_csi_re.is_match(raw) {
             sr.last_key.clear();
             sr.last_key.extend_from_slice(raw);
             sr.speech.stop()?;
@@ -707,7 +717,11 @@ impl App {
                 self.vte_parser.advance(&mut self.reporter, buf);
             }
         }
-        self.last_pty_update = Some(self.clock.now_ms());
+        let now_ms = self.clock.now_ms();
+        if self.first_pty_update.is_none() {
+            self.first_pty_update = Some(now_ms);
+        }
+        self.last_pty_update = Some(now_ms);
         Ok(())
     }
 
@@ -741,29 +755,35 @@ impl App {
         let Some(lpu) = self.last_pty_update else {
             return Ok(false);
         };
+        let first_pty_update = self.first_pty_update.unwrap_or(lpu);
         let now_ms = self.clock.now_ms();
         let overlay_active = self.view_stack.has_overlay();
         let root_view = self.view_stack.root_mut();
         let view = root_view.model();
-        if now_ms.saturating_sub(lpu) > DIFF_DELAY as u128
-            || now_ms.saturating_sub(view.prev_screen_time) > MAX_DIFF_DELAY as u128
+        if now_ms.saturating_sub(lpu) >= DIFF_DELAY as u128
+            || now_ms.saturating_sub(first_pty_update) >= MAX_DIFF_DELAY as u128
         {
+            self.first_pty_update = None;
             self.last_pty_update = None;
             if !overlay_active {
                 let mut read_text = sr.resolve_pending_delete(view)?;
                 if sr.highlight_tracking {
                     sr.track_highlighting(view)?;
                 }
+                let recent_input = self
+                    .last_stdin_update
+                    .is_some_and(|lsu| now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128);
                 let auto_read_text = if sr.auto_read {
-                    sr.auto_read(view, &mut self.reporter)?
+                    if recent_input {
+                        sr.auto_read_after_input(view, &mut self.reporter)?
+                    } else {
+                        sr.auto_read(view, &mut self.reporter)?
+                    }
                 } else {
                     false
                 };
                 read_text |= auto_read_text;
-                if let Some(lsu) = self.last_stdin_update
-                    && now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128
-                    && !read_text
-                {
+                if recent_input && !read_text {
                     sr.track_cursor(view)?;
                 }
             }
@@ -886,17 +906,21 @@ impl App {
         let overlay_active = self.view_stack.has_overlay();
         let view = self.view_stack.active_mut().model();
         let mut read_text = sr.resolve_pending_delete(view)?;
+        let recent_input = self
+            .last_stdin_update
+            .is_some_and(|lsu| now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128);
         let auto_read_text = if sr.auto_read {
             let mut reporter = perform::Reporter::new();
-            sr.auto_read(view, &mut reporter)?
+            if recent_input {
+                sr.auto_read_after_input(view, &mut reporter)?
+            } else {
+                sr.auto_read(view, &mut reporter)?
+            }
         } else {
             false
         };
         read_text |= auto_read_text;
-        if let Some(lsu) = self.last_stdin_update
-            && now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128
-            && !read_text
-        {
+        if recent_input && !read_text {
             sr.track_cursor(view)?;
         }
         if sr.review_follows_screen_cursor

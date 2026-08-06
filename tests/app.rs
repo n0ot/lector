@@ -1,5 +1,5 @@
 use lector::{
-    app::{App, Clock},
+    app::{App, Clock, DIFF_DELAY},
     screen_reader::ScreenReader,
     speech, views,
 };
@@ -115,11 +115,141 @@ fn pty_output_writes_terminal_and_autoreads() {
         .expect("handle pty");
     assert_eq!(term_out, b"hello\r\n");
 
-    clock.advance_ms(2);
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
 
     let speaks = &recorder.inner.borrow().speaks;
     assert!(speaks.iter().any(|(text, _)| text.contains("hello")));
+}
+
+#[test]
+fn screen_stabilization_uses_first_and_last_update_timers() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"a", &mut term_out)
+        .expect("first update");
+    clock.advance_ms(20);
+    app.handle_pty(&mut sr, b"b", &mut term_out)
+        .expect("second update");
+
+    clock.advance_ms(29);
+    assert!(!app.maybe_finalize_changes(&mut sr).expect("still changing"));
+
+    clock.advance_ms(1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("stable"));
+}
+
+#[test]
+fn idle_time_before_a_new_batch_does_not_trigger_the_maximum_delay() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"a", &mut term_out)
+        .expect("initial update");
+    clock.advance_ms(u128::from(DIFF_DELAY));
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize initial update")
+    );
+
+    clock.advance_ms(1_000);
+    app.handle_pty(&mut sr, b"b", &mut term_out)
+        .expect("new update after idle");
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("new batch should not finalize immediately")
+    );
+
+    clock.advance_ms(u128::from(DIFF_DELAY));
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("new batch becomes stable")
+    );
+}
+
+#[test]
+fn maximum_delay_finalizes_continuously_changing_output() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"a", &mut term_out)
+        .expect("first update");
+    for update in 1..=15 {
+        clock.advance_ms(20);
+        app.handle_pty(&mut sr, b"b", &mut term_out)
+            .expect("continuous update");
+        let finalized = app
+            .maybe_finalize_changes(&mut sr)
+            .expect("check maximum delay");
+        assert_eq!(finalized, update == 15);
+    }
+}
+
+#[test]
+fn cursor_tracking_wins_over_single_line_ruler_change() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[2J\x1B[1;1Hfirst line\x1B[2;1Hsecond line\x1B[4;1Hfile 1,1 All\x1B[1;1H",
+        &mut term_out,
+    )
+    .expect("draw initial screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize initial screen");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"j", &mut pty_out, &mut term_out)
+        .expect("move cursor down");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[2J\x1B[1;1Hfirst line\x1B[2;1Hsecond line\x1B[4;1Hfile 2,1 All\x1B[2;1H",
+        &mut term_out,
+    )
+    .expect("draw updated screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize cursor move");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("second line".into(), false)]
+    );
+}
+
+#[test]
+fn printed_line_wins_when_cursor_moves_past_it_to_a_blank_line() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1B[1;1Hworking...\x1B[1;1H", &mut term_out)
+        .expect("draw initial screen");
+    clock.advance_ms(u128::from(DIFF_DELAY));
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize initial screen");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("submit input");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[1;1H\x1B[2Kprinted line\x1B[2;1H",
+        &mut term_out,
+    )
+    .expect("print line and move cursor below it");
+    clock.advance_ms(u128::from(DIFF_DELAY));
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize printed output");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("printed line".into(), false)]
+    );
 }
 
 #[test]
@@ -138,6 +268,32 @@ fn split_alt_sequence_maps_to_action() {
     assert!(pty_out.is_empty());
     assert_eq!(sr.last_key, b"\x1Bl");
     assert!(!recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
+fn kitty_meta_key_interrupts_speech() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1B[117;3u", &mut pty_out, &mut term_out)
+        .expect("handle Kitty Meta-u");
+
+    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(sr.last_key, b"\x1B[117;3u");
+}
+
+#[test]
+fn kitty_control_key_interrupts_speech() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1B[108;5u", &mut pty_out, &mut term_out)
+        .expect("handle Kitty Control-l");
+
+    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(sr.last_key, b"\x1B[108;5u");
 }
 
 #[test]
@@ -294,7 +450,7 @@ fn auto_read_does_not_speak_when_terminal_unfocused() {
     app.handle_pty(&mut sr, b"hello\r\n", &mut term_out)
         .expect("handle pty");
 
-    clock.advance_ms(2);
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
 
     assert!(recorder.inner.borrow().speaks.is_empty());
@@ -435,7 +591,7 @@ fn backspace_waits_for_cursor_movement_before_speaking() {
 
     app.handle_pty(&mut sr, b"$ ", &mut term_out)
         .expect("handle pty");
-    clock.advance_ms(2);
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
     recorder.inner.borrow_mut().speaks.clear();
 
@@ -445,7 +601,7 @@ fn backspace_waits_for_cursor_movement_before_speaking() {
 
     app.handle_pty(&mut sr, b"", &mut term_out)
         .expect("handle pty");
-    clock.advance_ms(2);
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
 
     assert!(recorder.inner.borrow().speaks.is_empty());
@@ -460,7 +616,7 @@ fn delete_speaks_after_screen_change_with_auto_read_off() {
     sr.auto_read = false;
     app.handle_pty(&mut sr, b"abc\x1B[D\x1B[D", &mut term_out)
         .expect("handle pty");
-    clock.advance_ms(2);
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
     recorder.inner.borrow_mut().speaks.clear();
 
@@ -470,7 +626,7 @@ fn delete_speaks_after_screen_change_with_auto_read_off() {
 
     app.handle_pty(&mut sr, b"\x1B[P", &mut term_out)
         .expect("handle pty");
-    clock.advance_ms(2);
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
 
     let speaks = &recorder.inner.borrow().speaks;

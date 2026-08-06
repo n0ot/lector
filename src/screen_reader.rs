@@ -591,6 +591,25 @@ impl ScreenReader {
     /// Read what's changed between the current and previous screen.
     /// If anything was read, the value in the result will be true.
     pub fn auto_read(&mut self, view: &mut View, reporter: &mut perform::Reporter) -> Result<bool> {
+        self.auto_read_impl(view, reporter, false)
+    }
+
+    /// Auto-read an update caused by recent keyboard input, preferring cursor tracking over an
+    /// incidental single-line UI change when the application cursor also moved.
+    pub(crate) fn auto_read_after_input(
+        &mut self,
+        view: &mut View,
+        reporter: &mut perform::Reporter,
+    ) -> Result<bool> {
+        self.auto_read_impl(view, reporter, true)
+    }
+
+    fn auto_read_impl(
+        &mut self,
+        view: &mut View,
+        reporter: &mut perform::Reporter,
+        prefer_cursor: bool,
+    ) -> Result<bool> {
         self.report_application_cursor_indentation_changes(view)?;
         if view.screen().contents() == view.prev_screen().contents() {
             return Ok(false);
@@ -649,6 +668,9 @@ impl ScreenReader {
         // Do a diff instead
         let mut diff_text = std::mem::take(&mut self.diff_text);
         diff_text.clear();
+        let prev_cursor = view.prev_screen().cursor_position();
+        let cursor = view.screen().cursor_position();
+        let cursor_changed = cursor != prev_cursor;
         let (old_text, new_text, prev_hashes, curr_hashes) = view.full_contents_cached();
 
         if prev_hashes.len() == curr_hashes.len()
@@ -662,6 +684,19 @@ impl ScreenReader {
         let line_changes = TextDiff::configure()
             .algorithm(Algorithm::Patience)
             .diff_lines(old_text, new_text);
+        let single_changed_row = if prev_hashes.len() == curr_hashes.len() {
+            let mut changed_rows = prev_hashes
+                .iter()
+                .zip(curr_hashes)
+                .enumerate()
+                .filter_map(|(row, (prev, curr))| (prev != curr).then_some(row as u16));
+            match (changed_rows.next(), changed_rows.next()) {
+                (Some(row), None) => Some(row),
+                _ => None,
+            }
+        } else {
+            None
+        };
         // One deletion followed by one insertion, and no other changes,
         // means only a single line changed. In that case, only report what changed in that
         // line.
@@ -702,6 +737,32 @@ impl ScreenReader {
                 diff_text.push_str(change_str);
                 diff_text.push('\n');
             }
+        }
+
+        // A single changed line can be incidental UI text derived from a cursor move
+        // (for example, Neovim's ruler during a tmux full-pane repaint). Let cursor
+        // tracking announce the destination unless the changed row is one the cursor
+        // passed over; in that case it is likely meaningful output printed before the
+        // cursor advanced to its destination.
+        let cursor_crossed_changed_row = single_changed_row.is_some_and(|row| {
+            if cursor.0 > prev_cursor.0 {
+                row >= prev_cursor.0 && row < cursor.0
+            } else if cursor.0 < prev_cursor.0 {
+                row <= prev_cursor.0 && row > cursor.0
+            } else {
+                false
+            }
+        });
+        if prefer_cursor
+            && diff_state == DiffState::Single
+            && cursor_moves > 0
+            && !scrolled
+            && cursor_changed
+            && !cursor_crossed_changed_row
+        {
+            diff_text.clear();
+            self.diff_text = diff_text;
+            return Ok(false);
         }
 
         if diff_state == DiffState::Single {
