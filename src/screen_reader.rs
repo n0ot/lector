@@ -761,11 +761,14 @@ impl ScreenReader {
                 false
             }
         });
+        let cursor_on_changed_row =
+            single_changed_row.is_some_and(|row| row == prev_cursor.0 || row == cursor.0);
         if prefer_cursor
             && diff_state == DiffState::Single
             && cursor_moves > 0
             && !scrolled
             && cursor_changed
+            && !cursor_on_changed_row
             && !cursor_crossed_changed_row
         {
             diff_text.clear();

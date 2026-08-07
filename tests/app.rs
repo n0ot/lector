@@ -293,6 +293,33 @@ fn cursor_tracking_stays_silent_on_blank_line_during_ruler_change() {
 }
 
 #[test]
+fn diff_wins_when_cursor_movement_redraws_the_cursor_line() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"cat -frob", &mut term_out)
+        .expect("draw initial command");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize initial command");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\t", &mut pty_out, &mut term_out)
+        .expect("request completion");
+    app.handle_pty(&mut sr, b"\x1B[9D\x1B[Kcat -frobnicate-mode", &mut term_out)
+        .expect("redraw completed command");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize completion");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("nicate-mode".into(), false)]
+    );
+}
+
+#[test]
 fn printed_line_wins_when_cursor_moves_past_it_to_a_blank_line() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
