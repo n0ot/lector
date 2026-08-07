@@ -395,6 +395,97 @@ fn kitty_control_key_interrupts_speech() {
 }
 
 #[test]
+fn kitty_release_does_not_repeat_lector_binding() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(
+        &mut sr,
+        b"\x1B[39;3:1u\x1B[39;3:3u",
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("handle Kitty Meta-apostrophe press and release");
+
+    assert!(!sr.auto_read);
+    assert!(pty_out.is_empty());
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("auto read disabled".into(), false)]
+    );
+    assert_eq!(recorder.inner.borrow().stops, 1);
+}
+
+#[test]
+fn kitty_repeat_repeats_lector_binding_but_release_does_not() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(
+        &mut sr,
+        b"\x1B[39;3:1u\x1B[39;3:2u\x1B[39;3:3u",
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("handle Kitty Meta-apostrophe press, repeat, and release");
+
+    assert!(sr.auto_read);
+    assert!(pty_out.is_empty());
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [
+            ("auto read disabled".into(), false),
+            ("auto read enabled".into(), false),
+        ]
+    );
+    assert_eq!(recorder.inner.borrow().stops, 2);
+}
+
+#[test]
+fn kitty_unbound_press_and_release_are_forwarded() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let input = b"\x1B[97;1:1u\x1B[97;1:3u";
+
+    app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+        .expect("handle Kitty a press and release");
+
+    assert_eq!(pty_out, input);
+}
+
+#[test]
+fn kitty_passed_through_binding_forwards_press_and_release() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1Bn", &mut pty_out, &mut term_out)
+        .expect("enable pass-through");
+    let input = b"\x1B[39;3:1u\x1B[39;3:3u";
+    app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+        .expect("pass through Kitty Meta-apostrophe press and release");
+
+    assert_eq!(pty_out, input);
+    assert!(sr.auto_read);
+}
+
+#[test]
+fn kitty_forwarding_binding_forwards_press_and_release() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let input = b"\x1B[127;1:1u\x1B[127;1:3u";
+
+    app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+        .expect("handle Kitty Backspace press and release");
+
+    assert_eq!(pty_out, input);
+}
+
+#[test]
 fn alt_bracket_maps_after_timeout() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();

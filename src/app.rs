@@ -1,7 +1,11 @@
 use crate::{commands, keymap::Binding, perform, screen_reader::ScreenReader, views};
 use anyhow::{Context, Result};
-use std::{collections::VecDeque, io::Write, time};
-use terminput::{Event, KeyCode, KeyEvent, KeyModifiers};
+use std::{
+    collections::{HashSet, VecDeque},
+    io::Write,
+    time,
+};
+use terminput::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 pub const DIFF_DELAY: u16 = 30;
 pub const MAX_DIFF_DELAY: u16 = 300;
@@ -55,6 +59,7 @@ pub struct App {
     pending_input_last_at: Option<u128>,
     pending_pty_output: Vec<u8>,
     deferred_pty_output: Vec<u8>,
+    consumed_key_presses: HashSet<(KeyCode, KeyModifiers)>,
     app_focus_events_enabled: bool,
     log_enabled: bool,
     lua_repl_history: Vec<String>,
@@ -82,6 +87,7 @@ impl App {
             pending_input_last_at: None,
             pending_pty_output: Vec::new(),
             deferred_pty_output: Vec::new(),
+            consumed_key_presses: HashSet::new(),
             app_focus_events_enabled: false,
             log_enabled: false,
             lua_repl_history: Vec::new(),
@@ -471,9 +477,19 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        let key_id = (key_event.code, key_event.modifiers);
+        if key_event.kind == KeyEventKind::Release {
+            if self.consumed_key_presses.remove(&key_id) {
+                self.log_event("swallowing release for Lector command");
+                return Ok(());
+            }
+            return self.dispatch_to_view(sr, raw, pty_out, term_out);
+        }
+
         self.update_last_key(sr, raw, true)?;
         if sr.pass_through {
             sr.pass_through = false;
+            self.consumed_key_presses.remove(&key_id);
             return self.dispatch_to_view(sr, raw, pty_out, term_out);
         }
 
@@ -496,6 +512,7 @@ impl App {
                 } else {
                     let help = binding.help_text();
                     sr.speak(&help, false)?;
+                    self.consumed_key_presses.insert(key_id);
                     return Ok(());
                 }
             }
@@ -504,6 +521,7 @@ impl App {
                     if matches!(action, commands::Action::OpenLuaRepl) {
                         if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
                             sr.speak("Lua REPL already open", false)?;
+                            self.consumed_key_presses.insert(key_id);
                             return Ok(());
                         }
                         let (rows, cols) = self.view_stack.active_mut().model().size();
@@ -514,19 +532,21 @@ impl App {
                             views::ViewAction::Push(Box::new(repl)),
                             term_out,
                         )?;
+                        self.consumed_key_presses.insert(key_id);
                         return Ok(());
                     }
                     let mode_before = sr.input_mode;
                     let title = self.view_stack.active_mut().title().to_string();
-                    match commands::handle(
+                    let consumed = match commands::handle(
                         sr,
                         &title,
                         self.view_stack.active_mut().model(),
                         *action,
                     )? {
-                        commands::CommandResult::Handled => {}
+                        commands::CommandResult::Handled => true,
                         commands::CommandResult::ForwardInput => {
                             self.dispatch_to_view(sr, raw, pty_out, term_out)?;
+                            false
                         }
                         commands::CommandResult::Paste(contents) => {
                             let view_action = self
@@ -534,10 +554,17 @@ impl App {
                                 .active_mut()
                                 .handle_paste(sr, &contents, pty_out)?;
                             self.handle_view_action(sr, view_action, term_out)?;
+                            true
                         }
                         commands::CommandResult::PtyInput(input) => {
                             self.dispatch_to_view(sr, &input, pty_out, term_out)?;
+                            true
                         }
+                    };
+                    if consumed {
+                        self.consumed_key_presses.insert(key_id);
+                    } else {
+                        self.consumed_key_presses.remove(&key_id);
                     }
                     if mode_before == crate::keymap::InputMode::TableSetup
                         && sr.input_mode != crate::keymap::InputMode::TableSetup
@@ -548,6 +575,7 @@ impl App {
                 Binding::Lua(lua_binding) => {
                     let mode_before = sr.input_mode;
                     lua_binding.call()?;
+                    self.consumed_key_presses.insert(key_id);
                     if mode_before == crate::keymap::InputMode::TableSetup
                         && sr.input_mode != crate::keymap::InputMode::TableSetup
                     {
@@ -557,24 +585,30 @@ impl App {
             }
         } else if sr.help_mode {
             sr.speak("this key is unmapped", false)?;
+            self.consumed_key_presses.insert(key_id);
         } else {
             if matches!(
                 sr.input_mode,
                 crate::keymap::InputMode::Table | crate::keymap::InputMode::TableSetup
             ) {
                 if sr.hook_on_key_unhandled(binding_name.as_deref(), sr.input_mode)? {
+                    self.consumed_key_presses.insert(key_id);
                     return Ok(());
                 }
+                self.consumed_key_presses.insert(key_id);
                 return Ok(());
             }
             if sr.hook_on_key_unhandled(binding_name.as_deref(), sr.input_mode)? {
+                self.consumed_key_presses.insert(key_id);
                 return Ok(());
             }
             if self.view_stack.has_overlay()
                 && let Some(translated) = Self::overlay_input_bytes_for_key_event(key_event)
             {
+                self.consumed_key_presses.remove(&key_id);
                 return self.dispatch_to_view(sr, &translated, pty_out, term_out);
             }
+            self.consumed_key_presses.remove(&key_id);
             self.dispatch_to_view(sr, raw, pty_out, term_out)?;
         }
         Ok(())
