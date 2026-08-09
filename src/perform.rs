@@ -59,3 +59,37 @@ impl Perform for Reporter {
         // Nothing to do
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Reporter;
+
+    #[test]
+    fn reports_cursor_movement_scrolling_and_reset() {
+        let mut reporter = Reporter::default();
+        let mut parser = vte::Parser::new();
+
+        parser.advance(&mut reporter, b"text\x08\x1B[2A\x1B[H\x1B[S");
+
+        assert_eq!(reporter.cursor_moves, 3);
+        assert!(reporter.scrolled);
+
+        reporter.reset();
+        assert_eq!(reporter.cursor_moves, 0);
+        assert!(!reporter.scrolled);
+    }
+
+    #[test]
+    fn ignores_non_movement_and_intermediate_control_sequences() {
+        let mut reporter = Reporter::new();
+        let mut parser = vte::Parser::new();
+
+        parser.advance(
+            &mut reporter,
+            b"plain\r\n\x1B[2J\x1B[ q\x1B]title\x07\x1B7\x1BPq\x1B\\",
+        );
+
+        assert_eq!(reporter.cursor_moves, 0);
+        assert!(!reporter.scrolled);
+    }
+}

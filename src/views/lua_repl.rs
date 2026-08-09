@@ -1,14 +1,13 @@
-use super::{ViewAction, ViewController, ViewKind};
+use super::{Error, Result, ViewAction, ViewController, ViewKind};
 use crate::{
     line_editor::{EditorAction, LineEditor},
     lua,
     screen_reader::ScreenReader,
     view::View,
 };
-use anyhow::{Result, anyhow};
 use mlua::{
-    Error, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Thread, ThreadStatus, Value,
-    VmState,
+    Error as LuaError, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Thread,
+    ThreadStatus, Value, VmState,
 };
 use std::{any::Any, cell::RefCell, io::Write, rc::Rc};
 
@@ -35,11 +34,11 @@ pub struct LuaReplView {
 impl LuaReplView {
     pub fn new(rows: u16, cols: u16, history: Vec<String>) -> Result<Self> {
         let lua = Lua::new_with(StdLib::ALL_SAFE | StdLib::JIT, LuaOptions::default())
-            .map_err(|e| anyhow!(e.to_string()))?;
+            .map_err(Error::lua)?;
         let print_buffer = Rc::new(RefCell::new(ReplOutput { lines: Vec::new() }));
         let print_buffer_clone = Rc::clone(&print_buffer);
         let screen_reader_ptr = Rc::new(RefCell::new(std::ptr::null_mut()));
-        lua::setup_repl(&lua, Rc::clone(&screen_reader_ptr)).map_err(|e| anyhow!(e.to_string()))?;
+        lua::setup_repl(&lua, Rc::clone(&screen_reader_ptr)).map_err(Error::lua)?;
         let print_fn = lua
             .create_function(move |_lua, args: MultiValue| {
                 let mut pieces = Vec::new();
@@ -50,20 +49,14 @@ impl LuaReplView {
                 print_buffer_clone.borrow_mut().lines.push(line);
                 Ok(())
             })
-            .map_err(|e| anyhow!(e.to_string()))?;
-        lua.globals()
-            .set("print", print_fn)
-            .map_err(|e| anyhow!(e.to_string()))?;
+            .map_err(Error::lua)?;
+        lua.globals().set("print", print_fn).map_err(Error::lua)?;
 
-        let env = lua.create_table().map_err(|e| anyhow!(e.to_string()))?;
-        let env_meta = lua.create_table().map_err(|e| anyhow!(e.to_string()))?;
-        env_meta
-            .set("__index", lua.globals())
-            .map_err(|e| anyhow!(e.to_string()))?;
-        env.set_metatable(Some(env_meta))
-            .map_err(|e| anyhow!(e.to_string()))?;
-        env.set("_G", env.clone())
-            .map_err(|e| anyhow!(e.to_string()))?;
+        let env = lua.create_table().map_err(Error::lua)?;
+        let env_meta = lua.create_table().map_err(Error::lua)?;
+        env_meta.set("__index", lua.globals()).map_err(Error::lua)?;
+        env.set_metatable(Some(env_meta)).map_err(Error::lua)?;
+        env.set("_G", env.clone()).map_err(Error::lua)?;
 
         let view = View::new(rows, cols);
         let mut editor = LineEditor::new();
@@ -275,9 +268,9 @@ impl LuaReplView {
         }
         bytes.extend_from_slice(format!("\x1B[{};{}H", cursor_row, cursor_col).as_bytes());
 
-        self.view.next_bytes.clear();
+        self.view.clear_pending_bytes();
         self.view.process_changes(&bytes);
-        self.view.next_bytes.clear();
+        self.view.clear_pending_bytes();
         self.rendered_input = self.editor.input().to_string();
         self.rendered_cursor = self.editor.cursor();
     }
@@ -289,7 +282,7 @@ impl LuaReplView {
                 .set_name("repl")
                 .set_environment(self.env.clone())
                 .into_function()
-                .map_err(|e| anyhow!(e.to_string()))?
+                .map_err(Error::lua)?
         } else {
             let expr_code = format!("return {}", input);
             match self
@@ -300,26 +293,23 @@ impl LuaReplView {
                 .into_function()
             {
                 Ok(func) => func,
-                Err(Error::SyntaxError { .. }) => self
+                Err(LuaError::SyntaxError { .. }) => self
                     .lua
                     .load(input)
                     .set_name("repl")
                     .set_environment(self.env.clone())
                     .into_function()
-                    .map_err(|e| anyhow!(e.to_string()))?,
-                Err(err) => return Err(anyhow!(err.to_string())),
+                    .map_err(Error::lua)?,
+                Err(err) => return Err(Error::lua(err)),
             }
         };
-        let thread = self
-            .lua
-            .create_thread(func)
-            .map_err(|e| anyhow!(e.to_string()))?;
+        let thread = self.lua.create_thread(func).map_err(Error::lua)?;
         thread
             .set_hook(
                 HookTriggers::new().every_nth_instruction(1000),
                 |_lua, _debug| Ok(VmState::Yield),
             )
-            .map_err(|e| anyhow!(e.to_string()))?;
+            .map_err(Error::lua)?;
         self.thread = Some(thread);
         Ok(())
     }

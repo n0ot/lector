@@ -1,27 +1,209 @@
-use crate::view::View;
+use crate::{keymap::InputMode, view::View};
+
+mod detection;
+
+pub(crate) use detection::{detect, detect_manual_from_header};
+use detection::{is_separator_row, pipe_delimited_cell_text, row_has_fixed_width_columns};
 
 #[derive(Clone, Debug)]
-pub struct Column {
-    pub start: u16,
-    pub end: u16,
+pub(crate) struct SetupState {
+    header_row: u16,
+    tabstops: Vec<u16>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TabstopChange {
+    Added,
+    Removed,
+}
+
+impl SetupState {
+    pub(crate) fn header_row(&self) -> u16 {
+        self.header_row
+    }
+
+    pub(crate) fn tabstops(&self) -> &[u16] {
+        &self.tabstops
+    }
+
+    pub(crate) fn toggle_tabstop(&mut self, col: u16) -> TabstopChange {
+        match self.tabstops.binary_search(&col) {
+            Ok(index) => {
+                self.tabstops.remove(index);
+                TabstopChange::Removed
+            }
+            Err(index) => {
+                self.tabstops.insert(index, col);
+                TabstopChange::Added
+            }
+        }
+    }
+}
+
+pub(crate) struct Session {
+    mode: InputMode,
+    // Navigation state is intentionally independent of the input mode. Lua can bind table
+    // navigation commands in any mode, and failed detection can temporarily clear this state
+    // while table mode remains active.
+    navigation: Option<TableState>,
+    setup: Option<SetupState>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            mode: InputMode::Normal,
+            navigation: None,
+            setup: None,
+        }
+    }
+}
+
+impl Session {
+    pub(crate) fn mode(&self) -> InputMode {
+        self.mode
+    }
+
+    pub(crate) fn navigation(&self) -> Option<&TableState> {
+        self.navigation.as_ref()
+    }
+
+    pub(crate) fn navigation_mut(&mut self) -> Option<&mut TableState> {
+        self.navigation.as_mut()
+    }
+
+    pub(crate) fn set_navigation(&mut self, state: Option<TableState>) {
+        self.navigation = state;
+    }
+
+    pub(crate) fn setup(&self) -> Option<&SetupState> {
+        self.setup.as_ref()
+    }
+
+    pub(crate) fn setup_mut(&mut self) -> Option<&mut SetupState> {
+        self.setup.as_mut()
+    }
+
+    pub(crate) fn enter_setup(&mut self, header_row: u16) -> InputMode {
+        let previous = self.mode;
+        self.mode = InputMode::TableSetup;
+        self.navigation = None;
+        self.setup = Some(SetupState {
+            header_row,
+            tabstops: Vec::new(),
+        });
+        previous
+    }
+
+    pub(crate) fn enter_table(&mut self, state: TableState) -> InputMode {
+        let previous = self.mode;
+        self.mode = InputMode::Table;
+        self.navigation = Some(state);
+        self.setup = None;
+        previous
+    }
+
+    pub(crate) fn exit(&mut self) -> InputMode {
+        let previous = self.mode;
+        self.mode = InputMode::Normal;
+        self.navigation = None;
+        self.setup = None;
+        previous
+    }
 }
 
 #[derive(Clone, Debug)]
-pub struct TableModel {
-    pub top: u16,
-    pub bottom: u16,
-    pub columns: Vec<Column>,
-    pub header_row: Option<u16>,
-    pub delimiter: Option<char>,
+pub(crate) struct Column {
+    start: u16,
+    end: u16,
 }
 
 #[derive(Clone, Debug)]
-pub struct TableState {
-    pub model: TableModel,
-    pub current_col: usize,
+pub(crate) struct TableModel {
+    top: u16,
+    bottom: u16,
+    columns: Vec<Column>,
+    header_row: Option<u16>,
+    delimiter: Option<char>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TableState {
+    model: TableModel,
+    current_col: usize,
+}
+
+impl Column {
+    #[cfg(test)]
+    pub(crate) fn new(start: u16, end: u16) -> Self {
+        Self { start, end }
+    }
+
+    pub(crate) fn start(&self) -> u16 {
+        self.start
+    }
+
+    pub(crate) fn end(&self) -> u16 {
+        self.end
+    }
+}
+
+impl TableState {
+    pub(crate) fn new(model: TableModel, current_col: usize) -> Self {
+        Self { model, current_col }
+    }
+
+    pub(crate) fn model(&self) -> &TableModel {
+        &self.model
+    }
+
+    pub(crate) fn current_col(&self) -> usize {
+        self.current_col
+    }
+
+    pub(crate) fn set_current_col(&mut self, current_col: usize) {
+        self.current_col = current_col;
+    }
+
+    pub(crate) fn current_column(&self) -> Option<&Column> {
+        self.model.columns.get(self.current_col)
+    }
 }
 
 impl TableModel {
+    #[cfg(test)]
+    pub(crate) fn new(
+        top: u16,
+        bottom: u16,
+        columns: Vec<Column>,
+        header_row: Option<u16>,
+        delimiter: Option<char>,
+    ) -> Self {
+        Self {
+            top,
+            bottom,
+            columns,
+            header_row,
+            delimiter,
+        }
+    }
+
+    pub(crate) fn top(&self) -> u16 {
+        self.top
+    }
+
+    pub(crate) fn bottom(&self) -> u16 {
+        self.bottom
+    }
+
+    pub(crate) fn column_count(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub(crate) fn header_row(&self) -> Option<u16> {
+        self.header_row
+    }
+
     pub fn column_for_col(&self, col: u16) -> usize {
         for (idx, column) in self.columns.iter().enumerate() {
             if col >= column.start && col <= column.end {
@@ -45,7 +227,7 @@ impl TableModel {
         if self.delimiter == Some('|')
             && let Some(text) = pipe_delimited_cell_text(&view.line(row), col_idx)
         {
-            return text;
+            return text.to_string();
         }
 
         let Some(column) = self.columns.get(col_idx) else {
@@ -126,26 +308,15 @@ impl TableModel {
     }
 
     pub fn nearest_non_empty_col(&self, view: &View, row: u16, preferred: usize) -> usize {
-        if self.columns.is_empty() {
-            return 0;
+        if self.delimiter == Some('|') {
+            let line = view.line(row);
+            return nearest_matching_column(self.columns.len(), preferred, |col| {
+                pipe_delimited_cell_text(&line, col).is_some_and(|text| !text.is_empty())
+            });
         }
-        let preferred = preferred.min(self.columns.len() - 1);
-        if !self.cell_text(view, row, preferred).is_empty() {
-            return preferred;
-        }
-        for offset in 1..self.columns.len() {
-            if preferred >= offset {
-                let left = preferred - offset;
-                if !self.cell_text(view, row, left).is_empty() {
-                    return left;
-                }
-            }
-            let right = preferred + offset;
-            if right < self.columns.len() && !self.cell_text(view, row, right).is_empty() {
-                return right;
-            }
-        }
-        preferred
+        nearest_matching_column(self.columns.len(), preferred, |col| {
+            !self.cell_text(view, row, col).is_empty()
+        })
     }
 
     pub fn is_skippable_row(&self, view: &View, row: u16) -> bool {
@@ -155,13 +326,6 @@ impl TableModel {
     pub fn is_banner_row(&self, view: &View, row: u16) -> bool {
         if row < self.top || row > self.bottom || is_separator_row(view, row) {
             return false;
-        }
-
-        let mut non_empty_cells = 0usize;
-        for idx in 0..self.columns.len() {
-            if !self.cell_text(view, row, idx).is_empty() {
-                non_empty_cells += 1;
-            }
         }
 
         if self.delimiter.is_none() {
@@ -174,730 +338,38 @@ impl TableModel {
             return false;
         }
 
-        non_empty_cells <= 1
+        (0..self.columns.len())
+            .filter(|&col| {
+                pipe_delimited_cell_text(trimmed, col).is_some_and(|text| !text.is_empty())
+            })
+            .take(2)
+            .count()
+            <= 1
     }
 }
 
-fn pipe_delimited_cell_text(line: &str, col_idx: usize) -> Option<String> {
-    let trimmed = line.trim();
-    if !trimmed.contains('|') {
-        return None;
+fn nearest_matching_column(
+    column_count: usize,
+    preferred: usize,
+    mut matches: impl FnMut(usize) -> bool,
+) -> usize {
+    if column_count == 0 {
+        return 0;
     }
-
-    let cells: Vec<&str> = trimmed.split('|').collect();
-    if cells.len() < 2 {
-        return None;
+    let preferred = preferred.min(column_count - 1);
+    if matches(preferred) {
+        return preferred;
     }
-
-    let start = if trimmed.starts_with('|') { 1 } else { 0 };
-    let end = if trimmed.ends_with('|') {
-        cells.len().saturating_sub(1)
-    } else {
-        cells.len()
-    };
-    if end <= start {
-        return None;
-    }
-
-    let idx = start + col_idx;
-    if idx >= end {
-        return Some(String::new());
-    }
-
-    Some(cells[idx].trim().to_string())
-}
-
-pub fn detect(view: &View, row: u16) -> Option<TableModel> {
-    detect_pipe_table(view, row).or_else(|| detect_fixed_width_table(view, row))
-}
-
-pub fn detect_manual_from_header(
-    view: &View,
-    header_row: u16,
-    tabstops: &[u16],
-) -> Option<TableModel> {
-    let (rows, cols) = view.size();
-    if rows == 0 || cols == 0 || header_row >= rows {
-        return None;
-    }
-
-    let mut starts = vec![0u16];
-    for stop in tabstops.iter().copied() {
-        if stop > 0 && stop < cols {
-            starts.push(stop);
+    for offset in 1..column_count {
+        if preferred >= offset && matches(preferred - offset) {
+            return preferred - offset;
+        }
+        let right = preferred + offset;
+        if right < column_count && matches(right) {
+            return right;
         }
     }
-    starts.sort_unstable();
-    starts.dedup();
-
-    let columns = columns_from_starts(cols, &starts);
-    if columns.len() < 2 {
-        return None;
-    }
-
-    let mut top = header_row;
-    while top > 0 && row_is_manual_table_row(view, top - 1) {
-        top -= 1;
-    }
-
-    let mut bottom = header_row;
-    while bottom + 1 < rows && row_is_manual_table_row(view, bottom + 1) {
-        bottom += 1;
-    }
-
-    let mut columns = columns;
-    columns.retain(|col| column_has_content(view, top, bottom, col.start, col.end));
-    if columns.len() < 2 {
-        return None;
-    }
-
-    Some(TableModel {
-        top,
-        bottom,
-        columns,
-        header_row: Some(header_row),
-        delimiter: None,
-    })
-}
-
-fn detect_pipe_table(view: &View, row: u16) -> Option<TableModel> {
-    let rows = view.size().0;
-    let anchor = nearest_pipe_row(view, row)?;
-
-    let mut top = anchor;
-    while top > 0 && row_is_pipe_table_row(view, top - 1) {
-        top -= 1;
-    }
-
-    let mut bottom = anchor;
-    while bottom + 1 < rows && row_is_pipe_table_row(view, bottom + 1) {
-        bottom += 1;
-    }
-
-    let header_row = find_pipe_header_row_in_bounds(view, top, bottom)?;
-
-    let columns = detect_pipe_columns(view, top, bottom, header_row)?;
-    if columns.len() < 2 {
-        return None;
-    }
-
-    let header_row = detect_header_row(view, top, bottom, &columns, Some('|')).or(Some(header_row));
-
-    Some(TableModel {
-        top,
-        bottom,
-        columns,
-        header_row,
-        delimiter: Some('|'),
-    })
-}
-
-fn nearest_pipe_row(view: &View, row: u16) -> Option<u16> {
-    let rows = view.size().0;
-    if rows == 0 {
-        return None;
-    }
-
-    if row_is_pipe_table_row(view, row) {
-        return Some(row);
-    }
-
-    for offset in 1..=6u16 {
-        if row >= offset {
-            let up = row - offset;
-            if row_is_pipe_table_row(view, up) {
-                return Some(up);
-            }
-        }
-
-        let down = row + offset;
-        if down < rows && row_is_pipe_table_row(view, down) {
-            return Some(down);
-        }
-    }
-
-    None
-}
-
-fn find_pipe_header_row_in_bounds(view: &View, top: u16, bottom: u16) -> Option<u16> {
-    (top..=bottom).find(|&row| row_looks_like_pipe_header(view, row))
-}
-
-fn row_looks_like_pipe_header(view: &View, row: u16) -> bool {
-    let line = view.line(row);
-    let trimmed = line.trim();
-    if trimmed.is_empty() || is_separator_row(view, row) {
-        return false;
-    }
-    if trimmed.matches('|').count() < 1 {
-        return false;
-    }
-
-    let parts: Vec<&str> = trimmed.split('|').collect();
-    let start = if trimmed.starts_with('|') { 1 } else { 0 };
-    let end = if trimmed.ends_with('|') {
-        parts.len().saturating_sub(1)
-    } else {
-        parts.len()
-    };
-    if end <= start {
-        return false;
-    }
-
-    let cells: Vec<&str> = parts[start..end]
-        .iter()
-        .map(|cell| cell.trim())
-        .filter(|cell| !cell.is_empty())
-        .collect();
-
-    cells.len() >= 2
-}
-
-fn row_is_pipe_table_row(view: &View, row: u16) -> bool {
-    !row_is_blank(view, row) && (is_separator_row(view, row) || view.line(row).contains('|'))
-}
-
-fn detect_pipe_columns(view: &View, top: u16, bottom: u16, header_row: u16) -> Option<Vec<Column>> {
-    let positions = delimiter_positions(view, header_row, '|');
-    if positions.is_empty() {
-        return None;
-    }
-
-    let mut columns = columns_from_delimiter_positions(view, &positions);
-    columns.retain(|col| column_has_content(view, top, bottom, col.start, col.end));
-
-    if columns.len() < 2 {
-        return None;
-    }
-
-    Some(columns)
-}
-
-fn columns_from_delimiter_positions(view: &View, positions: &[u16]) -> Vec<Column> {
-    let mut columns = Vec::new();
-    let mut start = 0u16;
-    let last_col = view.size().1.saturating_sub(1);
-
-    for pos in positions.iter().copied() {
-        if pos > start {
-            columns.push(Column {
-                start,
-                end: pos.saturating_sub(1),
-            });
-        }
-        start = pos.saturating_add(1);
-    }
-
-    if start <= last_col {
-        columns.push(Column {
-            start,
-            end: last_col,
-        });
-    }
-
-    columns
-}
-
-fn columns_from_starts(cols: u16, starts: &[u16]) -> Vec<Column> {
-    let mut columns = Vec::new();
-    if cols == 0 || starts.is_empty() {
-        return columns;
-    }
-
-    for (idx, start) in starts.iter().copied().enumerate() {
-        if start >= cols {
-            continue;
-        }
-        let end = if let Some(next_start) = starts.get(idx + 1).copied() {
-            next_start.saturating_sub(1)
-        } else {
-            cols.saturating_sub(1)
-        };
-        if start <= end {
-            columns.push(Column { start, end });
-        }
-    }
-
-    columns
-}
-
-fn detect_fixed_width_table(view: &View, row: u16) -> Option<TableModel> {
-    let (rows, cols) = view.size();
-    if rows == 0 || cols == 0 {
-        return None;
-    }
-
-    let anchor = if row_is_fixed_width_candidate(view, row) {
-        row
-    } else {
-        nearest_fixed_width_candidate(view, row)?
-    };
-
-    let mut top = anchor;
-    while top > 0 && row_is_fixed_width_candidate(view, top - 1) {
-        top -= 1;
-    }
-
-    let mut bottom = anchor;
-    while bottom + 1 < rows && row_is_fixed_width_candidate(view, bottom + 1) {
-        bottom += 1;
-    }
-
-    let structural_rows: Vec<u16> = (top..=bottom)
-        .filter(|candidate| {
-            !is_separator_row(view, *candidate) && row_has_fixed_width_columns(view, *candidate)
-        })
-        .collect();
-
-    if structural_rows.len() < 2 {
-        return None;
-    }
-
-    let header_hint = choose_fixed_width_header_row(view, &structural_rows).or_else(|| {
-        (top..=bottom).find(|&candidate| {
-            !is_separator_row(view, candidate) && row_has_letters(view, candidate)
-        })
-    });
-
-    let mut columns =
-        detect_fixed_width_columns(view, top, bottom, cols, &structural_rows, header_hint)?;
-    columns.retain(|col| column_has_content(view, top, bottom, col.start, col.end));
-
-    if columns.len() < 2 {
-        return None;
-    }
-
-    let header_row = detect_header_row(view, top, bottom, &columns, None);
-
-    Some(TableModel {
-        top,
-        bottom,
-        columns,
-        header_row,
-        delimiter: None,
-    })
-}
-
-fn row_is_fixed_width_candidate(view: &View, row: u16) -> bool {
-    if row_is_blank(view, row) {
-        return false;
-    }
-
-    is_separator_row(view, row)
-        || row_has_fixed_width_columns(view, row)
-        || row_is_fixed_width_continuation(view, row)
-}
-
-fn row_is_manual_table_row(view: &View, row: u16) -> bool {
-    if row_is_blank(view, row) {
-        return false;
-    }
-    is_separator_row(view, row)
-        || row_has_fixed_width_columns(view, row)
-        || row_is_fixed_width_continuation(view, row)
-        || view.line(row).contains('|')
-}
-
-fn nearest_fixed_width_candidate(view: &View, row: u16) -> Option<u16> {
-    let rows = view.size().0;
-    if rows == 0 {
-        return None;
-    }
-
-    for offset in 1..=2u16 {
-        if row >= offset {
-            let up = row - offset;
-            if row_is_fixed_width_candidate(view, up) {
-                return Some(up);
-            }
-        }
-
-        let down = row + offset;
-        if down < rows && row_is_fixed_width_candidate(view, down) {
-            return Some(down);
-        }
-    }
-
-    None
-}
-
-fn detect_fixed_width_columns(
-    view: &View,
-    top: u16,
-    bottom: u16,
-    cols: u16,
-    structural_rows: &[u16],
-    header_row: Option<u16>,
-) -> Option<Vec<Column>> {
-    if let Some(header_row) = header_row
-        && let Some(columns) = detect_fixed_width_columns_from_header(
-            view,
-            top,
-            bottom,
-            cols,
-            structural_rows,
-            header_row,
-        )
-    {
-        return Some(columns);
-    }
-
-    detect_fixed_width_columns_from_blanks(view, top, bottom, cols, structural_rows, header_row)
-}
-
-fn detect_fixed_width_columns_from_header(
-    view: &View,
-    top: u16,
-    bottom: u16,
-    cols: u16,
-    structural_rows: &[u16],
-    header_row: u16,
-) -> Option<Vec<Column>> {
-    if cols == 0 {
-        return None;
-    }
-
-    let cuts = supported_header_cuts(view, structural_rows, header_row, cols);
-
-    if cuts.is_empty() {
-        return None;
-    }
-
-    let mut starts = Vec::with_capacity(cuts.len() + 1);
-    starts.push(0);
-    starts.extend(cuts);
-    starts.sort_unstable();
-    starts.dedup();
-
-    let mut columns = columns_from_starts(cols, &starts);
-    columns.retain(|col| column_has_content(view, top, bottom, col.start, col.end));
-    if columns.len() < 2 {
-        return None;
-    }
-    Some(columns)
-}
-
-fn choose_fixed_width_header_row(view: &View, structural_rows: &[u16]) -> Option<u16> {
-    for row in structural_rows.iter().copied() {
-        if is_separator_row(view, row) || !row_has_letters(view, row) {
-            continue;
-        }
-        let cuts = supported_header_cuts(view, structural_rows, row, view.size().1);
-        if cuts.len() >= 2 {
-            return Some(row);
-        }
-    }
-    None
-}
-
-fn supported_header_cuts(
-    view: &View,
-    structural_rows: &[u16],
-    header_row: u16,
-    cols: u16,
-) -> Vec<u16> {
-    let mut cuts = Vec::new();
-    let mut seen_text = false;
-    let mut gap_start: Option<u16> = None;
-    for col in 0..cols {
-        let has_text = cell_has_text(view, header_row, col);
-        match (gap_start, has_text) {
-            (Some(start), true) => {
-                let end = col.saturating_sub(1);
-                if let Some(cut) = supported_cut_in_gap(view, structural_rows, start, end) {
-                    cuts.push(cut);
-                }
-                gap_start = None;
-                seen_text = true;
-            }
-            (None, false) if seen_text => {
-                gap_start = Some(col);
-            }
-            (_, true) => {
-                seen_text = true;
-            }
-            _ => {}
-        }
-    }
-    cuts
-}
-
-fn detect_fixed_width_columns_from_blanks(
-    view: &View,
-    top: u16,
-    bottom: u16,
-    cols: u16,
-    structural_rows: &[u16],
-    header_row: Option<u16>,
-) -> Option<Vec<Column>> {
-    if cols == 0 || structural_rows.is_empty() {
-        return None;
-    }
-
-    let mut blank_counts = vec![0usize; cols as usize];
-    let row_count = structural_rows.len();
-    let blank_threshold = if row_count <= 2 {
-        row_count
-    } else {
-        // Allow occasional spill/wrap into a gutter column, especially on short tables.
-        (row_count * 2).div_ceil(3)
-    };
-    let min_gap_run = if row_count <= 4 { 1 } else { 2 };
-
-    for col in 0..cols {
-        for row in structural_rows {
-            let has_content = view
-                .screen()
-                .cell(*row, col)
-                .map(|cell| cell.is_wide_continuation() || !cell.contents().trim().is_empty())
-                .unwrap_or(false);
-
-            if !has_content {
-                blank_counts[col as usize] += 1;
-            }
-        }
-    }
-
-    let mostly_blank: Vec<bool> = (0..cols)
-        .map(|col| blank_counts[col as usize] >= blank_threshold)
-        .collect();
-
-    let mut columns = Vec::new();
-    let mut start: Option<u16> = None;
-    let mut col = 0u16;
-
-    while col < cols {
-        if mostly_blank[col as usize] {
-            let run_start = col;
-            while col + 1 < cols && mostly_blank[(col + 1) as usize] {
-                col += 1;
-            }
-            let run_end = col;
-            let run_len = run_end.saturating_sub(run_start) + 1;
-
-            let header_blank = header_row
-                .map(|row| row_range_is_blank(view, row, run_start, run_end))
-                .unwrap_or(true);
-            if run_len >= min_gap_run && header_blank {
-                if let Some(s) = start.take() {
-                    columns.push(Column {
-                        start: s,
-                        end: run_start.saturating_sub(1),
-                    });
-                }
-            } else if start.is_none() {
-                start = Some(run_start);
-            }
-        } else if start.is_none() {
-            start = Some(col);
-        }
-        col += 1;
-    }
-
-    if let Some(s) = start {
-        columns.push(Column {
-            start: s,
-            end: cols.saturating_sub(1),
-        });
-    }
-
-    columns.retain(|col| column_has_content(view, top, bottom, col.start, col.end));
-
-    if columns.len() < 2 {
-        return None;
-    }
-
-    Some(columns)
-}
-
-fn supported_cut_in_gap(view: &View, structural_rows: &[u16], start: u16, end: u16) -> Option<u16> {
-    let mut best: Option<(usize, u16)> = None;
-    for cut in start..=end {
-        let blank_rows = blank_count_at_cut(view, structural_rows, cut);
-        if blank_rows * 3 < structural_rows.len() * 2 {
-            continue;
-        }
-        match best {
-            None => best = Some((blank_rows, cut)),
-            Some((best_blank_rows, best_cut)) => {
-                if blank_rows > best_blank_rows || (blank_rows == best_blank_rows && cut > best_cut)
-                {
-                    best = Some((blank_rows, cut));
-                }
-            }
-        }
-    }
-    best.map(|(_, cut)| cut)
-}
-
-fn blank_count_at_cut(view: &View, structural_rows: &[u16], cut: u16) -> usize {
-    structural_rows
-        .iter()
-        .copied()
-        .filter(|row| !cell_has_text(view, *row, cut))
-        .count()
-}
-
-fn cell_has_text(view: &View, row: u16, col: u16) -> bool {
-    view.screen()
-        .cell(row, col)
-        .map(|cell| cell.is_wide_continuation() || !cell.contents().trim().is_empty())
-        .unwrap_or(false)
-}
-
-fn row_range_is_blank(view: &View, row: u16, start: u16, end: u16) -> bool {
-    for col in start..=end {
-        if let Some(cell) = view.screen().cell(row, col)
-            && (cell.is_wide_continuation() || !cell.contents().trim().is_empty())
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn row_is_blank(view: &View, row: u16) -> bool {
-    let (_, cols) = view.size();
-    for col in 0..cols {
-        if let Some(cell) = view.screen().cell(row, col)
-            && (cell.is_wide_continuation() || !cell.contents().trim().is_empty())
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn row_has_fixed_width_columns(view: &View, row: u16) -> bool {
-    let line = view.line(row);
-    fixed_width_column_count(&line) >= 2
-}
-
-fn row_is_fixed_width_continuation(view: &View, row: u16) -> bool {
-    if row_is_blank(view, row) || row_has_fixed_width_columns(view, row) {
-        return false;
-    }
-
-    let rows = view.size().0;
-    (row > 0 && row_has_fixed_width_columns(view, row - 1))
-        || (row + 1 < rows && row_has_fixed_width_columns(view, row + 1))
-}
-
-fn fixed_width_column_count(line: &str) -> usize {
-    let mut columns = 0;
-    let mut in_word = false;
-    let mut space_run = 0;
-
-    for ch in line.chars() {
-        if ch.is_whitespace() {
-            if in_word {
-                space_run += 1;
-                if space_run >= 2 {
-                    columns += 1;
-                    in_word = false;
-                }
-            }
-        } else {
-            if !in_word {
-                in_word = true;
-            }
-            space_run = 0;
-        }
-    }
-
-    if in_word {
-        columns += 1;
-    }
-
-    columns
-}
-
-fn detect_header_row(
-    view: &View,
-    top: u16,
-    bottom: u16,
-    columns: &[Column],
-    delimiter: Option<char>,
-) -> Option<u16> {
-    if top >= bottom {
-        return None;
-    }
-
-    let model = TableModel {
-        top,
-        bottom,
-        columns: columns.to_vec(),
-        header_row: None,
-        delimiter,
-    };
-
-    for row in top..=bottom {
-        if is_separator_row(view, row) && row > top {
-            let mut candidate = row - 1;
-            loop {
-                if !model.is_skippable_row(view, candidate) {
-                    return Some(candidate);
-                }
-                if candidate == top {
-                    break;
-                }
-                candidate -= 1;
-            }
-        }
-    }
-
-    (top..=bottom).find(|&row| !model.is_skippable_row(view, row) && row_has_letters(view, row))
-}
-
-fn delimiter_positions(view: &View, row: u16, delim: char) -> Vec<u16> {
-    let (_, cols) = view.size();
-    let needle = delim.to_string();
-    let mut positions = Vec::new();
-
-    for col in 0..cols {
-        if let Some(cell) = view.screen().cell(row, col)
-            && cell.contents() == needle
-        {
-            positions.push(col);
-        }
-    }
-
-    positions
-}
-
-fn column_has_content(view: &View, top: u16, bottom: u16, start: u16, end: u16) -> bool {
-    for row in top..=bottom {
-        if is_separator_row(view, row) {
-            continue;
-        }
-        for col in start..=end {
-            if let Some(cell) = view.screen().cell(row, col)
-                && (cell.is_wide_continuation() || !cell.contents().trim().is_empty())
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn row_has_letters(view: &View, row: u16) -> bool {
-    let line = view.line(row);
-    line.chars().any(|c| c.is_alphabetic())
-}
-
-fn is_separator_row(view: &View, row: u16) -> bool {
-    let line = view.line(row);
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    trimmed.chars().all(|ch| match ch {
-        '-' | '=' | '+' | '|' | '_' | ':' => true,
-        _ if ch.is_whitespace() => true,
-        _ => false,
-    })
+    preferred
 }
 
 #[cfg(test)]
@@ -973,5 +445,148 @@ mod tests {
         assert_eq!(created, "12 months ago");
         assert!(status.starts_with("Up 17 seconds"));
         assert!(!status.starts_with("ago"));
+    }
+
+    #[test]
+    fn session_transitions_keep_mode_state_coherent() {
+        let mut session = Session::default();
+        assert_eq!(session.mode(), InputMode::Normal);
+        assert!(session.navigation().is_none());
+        assert!(session.setup().is_none());
+
+        assert_eq!(session.enter_setup(4), InputMode::Normal);
+        assert_eq!(session.mode(), InputMode::TableSetup);
+        assert_eq!(session.setup().unwrap().header_row(), 4);
+        assert_eq!(
+            session.setup_mut().unwrap().toggle_tabstop(8),
+            TabstopChange::Added
+        );
+        assert_eq!(
+            session.setup_mut().unwrap().toggle_tabstop(3),
+            TabstopChange::Added
+        );
+        assert_eq!(session.setup().unwrap().tabstops(), [3, 8]);
+
+        let state = TableState::new(
+            TableModel {
+                top: 4,
+                bottom: 8,
+                columns: vec![Column { start: 0, end: 2 }, Column { start: 3, end: 7 }],
+                header_row: Some(4),
+                delimiter: None,
+            },
+            1,
+        );
+        assert_eq!(session.enter_table(state), InputMode::TableSetup);
+        assert_eq!(session.mode(), InputMode::Table);
+        assert_eq!(session.navigation().unwrap().current_col(), 1);
+        assert!(session.setup().is_none());
+
+        assert_eq!(session.exit(), InputMode::Table);
+        assert_eq!(session.mode(), InputMode::Normal);
+        assert!(session.navigation().is_none());
+        assert!(session.setup().is_none());
+    }
+
+    #[test]
+    fn navigation_state_is_independent_of_input_mode() {
+        let mut session = Session::default();
+        let state = TableState::new(
+            TableModel {
+                top: 0,
+                bottom: 2,
+                columns: vec![Column { start: 0, end: 2 }, Column { start: 3, end: 5 }],
+                header_row: Some(0),
+                delimiter: None,
+            },
+            0,
+        );
+
+        session.set_navigation(Some(state));
+        assert_eq!(session.mode(), InputMode::Normal);
+        assert!(session.navigation().is_some());
+
+        session.set_navigation(None);
+        assert_eq!(session.mode(), InputMode::Normal);
+        assert!(session.navigation().is_none());
+    }
+
+    #[test]
+    fn nearest_column_search_prefers_left_at_equal_distance() {
+        assert_eq!(nearest_matching_column(5, 2, |col| col == 1 || col == 3), 1);
+        assert_eq!(nearest_matching_column(5, 9, |col| col == 2), 2);
+        assert_eq!(nearest_matching_column(0, 3, |_| true), 0);
+    }
+
+    #[test]
+    fn toggling_tabstops_keeps_them_sorted_and_unique() {
+        let mut setup = SetupState {
+            header_row: 0,
+            tabstops: Vec::new(),
+        };
+        assert_eq!(setup.toggle_tabstop(8), TabstopChange::Added);
+        assert_eq!(setup.toggle_tabstop(3), TabstopChange::Added);
+        assert_eq!(setup.toggle_tabstop(5), TabstopChange::Added);
+        assert_eq!(setup.tabstops(), [3, 5, 8]);
+        assert_eq!(setup.toggle_tabstop(5), TabstopChange::Removed);
+        assert_eq!(setup.tabstops(), [3, 8]);
+    }
+
+    #[test]
+    fn pipe_cell_text_handles_optional_outer_delimiters_and_missing_cells() {
+        assert_eq!(pipe_delimited_cell_text("A | B | C", 0), Some("A"));
+        assert_eq!(pipe_delimited_cell_text("A | B | C", 2), Some("C"));
+        assert_eq!(pipe_delimited_cell_text("| A | B |", 0), Some("A"));
+        assert_eq!(pipe_delimited_cell_text("| A | B |", 1), Some("B"));
+        assert_eq!(pipe_delimited_cell_text("| A | B |", 9), Some(""));
+        assert_eq!(pipe_delimited_cell_text("no delimiters", 0), None);
+    }
+
+    #[test]
+    fn manual_detection_filters_tabstops_columns_and_row_bounds() {
+        let view = view_with_lines(5, 12, &["", "ID Name Age", "1  Ada  37", "2  Bob  41", ""]);
+
+        let model =
+            detect_manual_from_header(&view, 1, &[8, 3, 3, 0, 12]).expect("detect manual table");
+        assert_eq!(model.top, 1);
+        assert_eq!(model.bottom, 3);
+        assert_eq!(model.header_row, Some(1));
+        assert_eq!(model.delimiter, None);
+        assert_eq!(model.columns.len(), 3);
+        assert_eq!(model.cell_text(&view, 2, 0), "1");
+        assert_eq!(model.cell_text(&view, 2, 1), "Ada");
+        assert_eq!(model.cell_text(&view, 2, 2), "37");
+
+        assert!(detect_manual_from_header(&view, 5, &[3]).is_none());
+        assert!(detect_manual_from_header(&view, 1, &[]).is_none());
+    }
+
+    #[test]
+    fn numeric_fixed_width_tables_use_blank_gutters_without_a_header() {
+        let view = view_with_lines(4, 12, &["1  2  3", "4  5  6", "", ""]);
+
+        let model = detect(&view, 3).expect("find nearby numeric table");
+
+        assert_eq!(model.top, 0);
+        assert_eq!(model.bottom, 1);
+        assert_eq!(model.header_row, None);
+        assert_eq!(model.delimiter, None);
+        assert_eq!(model.columns.len(), 3);
+        assert_eq!(model.cell_text(&view, 0, 0), "1");
+        assert_eq!(model.cell_text(&view, 1, 2), "6");
+    }
+
+    #[test]
+    fn separator_rows_accept_table_punctuation_but_reject_content() {
+        let view = view_with_lines(
+            4,
+            16,
+            &["---+===|___:::", " - = + | _ : ", "", "-- data --"],
+        );
+
+        assert!(is_separator_row(&view, 0));
+        assert!(is_separator_row(&view, 1));
+        assert!(!is_separator_row(&view, 2));
+        assert!(!is_separator_row(&view, 3));
     }
 }

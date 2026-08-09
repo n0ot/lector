@@ -12,3 +12,9 @@ impl<T> LuaResultExt<T> for anyhow::Result<T> {
         }
     }
 }
+
+impl<T> LuaResultExt<T> for crate::screen_reader::Result<T> {
+    fn to_lua_result(self) -> Result<T> {
+        self.map_err(Error::external)
+    }
+}

@@ -1,7 +1,23 @@
 use crate::commands::{self, Action};
-use anyhow::{Result, anyhow};
 use mlua::{Function, Lua, RegistryKey, Value};
 use std::{collections::HashMap, rc::Rc};
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("Lua: {0}")]
+    Lua(String),
+    #[error("binding action must start with \"{BUILTIN_PREFIX}\"")]
+    InvalidBuiltinPrefix,
+    #[error("unknown action {0}")]
+    UnknownAction(String),
+}
+
+fn lua_error(error: mlua::Error) -> Error {
+    Error::Lua(error.to_string())
+}
 
 pub const BUILTIN_PREFIX: &str = "lector.";
 
@@ -38,10 +54,10 @@ pub enum Binding {
 }
 
 impl Binding {
-    pub fn help_text(&self) -> String {
+    pub fn help_text(&self) -> &str {
         match self {
             Binding::Builtin(action) => action.help_text(),
-            Binding::Lua(binding) => binding.help.clone(),
+            Binding::Lua(binding) => &binding.help,
         }
     }
 
@@ -61,183 +77,117 @@ pub struct LuaBinding {
 
 impl LuaBinding {
     pub fn call(&self) -> Result<()> {
-        let func: Function = self
-            .lua
-            .registry_value(&self.func)
-            .map_err(|err| anyhow!(err.to_string()))?;
-        func.call::<()>(()).map_err(|err| anyhow!(err.to_string()))
+        let func: Function = self.lua.registry_value(&self.func).map_err(lua_error)?;
+        func.call::<()>(()).map_err(lua_error)
     }
 }
 
+const NORMAL_BINDINGS: &[(&str, Action)] = &[
+    ("F1", Action::ToggleHelp),
+    ("M-'", Action::ToggleAutoRead),
+    ("M-\"", Action::ToggleReviewCursorFollowsScreenCursor),
+    ("M-s", Action::ToggleSymbolLevel),
+    ("M-r", Action::SayOverlay),
+    ("M-n", Action::PassNextKey),
+    ("M-x", Action::StopSpeaking),
+    ("M-u", Action::RevLinePrev),
+    ("M-o", Action::RevLineNext),
+    ("M-U", Action::RevLinePrevNonBlank),
+    ("M-O", Action::RevLineNextNonBlank),
+    ("M-i", Action::RevLineRead),
+    ("M-m", Action::RevCharPrev),
+    ("M-.", Action::RevCharNext),
+    ("M-,", Action::RevCharRead),
+    ("M-<", Action::RevCharReadPhonetic),
+    ("M-j", Action::RevWordPrev),
+    ("M-l", Action::RevWordNext),
+    ("M-k", Action::RevWordRead),
+    ("M-y", Action::RevTop),
+    ("M-p", Action::RevBottom),
+    ("M-h", Action::RevFirst),
+    ("M-;", Action::RevLast),
+    ("M-a", Action::RevReadAttributes),
+    ("Backspace", Action::Backspace),
+    ("C-h", Action::Backspace),
+    ("Delete", Action::Delete),
+    ("F12", Action::SayTime),
+    ("M-L", Action::OpenLuaRepl),
+    ("F5", Action::SetMark),
+    ("F6", Action::Copy),
+    ("F7", Action::Paste),
+    ("M-c", Action::SayClipboard),
+    ("M-[", Action::PreviousClipboard),
+    ("M-]", Action::NextClipboard),
+    ("M-t", Action::ToggleTableMode),
+    ("M-{", Action::LeftClick),
+    ("M-}", Action::RightClick),
+    ("M-T", Action::StartTableSetupMode),
+    ("M-g", Action::ToggleStopSpeechOnFocusLoss),
+];
+
+const TABLE_BINDINGS: &[(&str, Action)] = &[
+    ("Esc", Action::ExitTableMode),
+    ("M-u", Action::TableRowPrev),
+    ("M-o", Action::TableRowNext),
+    ("M-i", Action::TableCellRead),
+    ("j", Action::TableRowNext),
+    ("k", Action::TableRowPrev),
+    ("g", Action::TableRowTop),
+    ("G", Action::TableRowBottom),
+    ("h", Action::TableColPrev),
+    ("l", Action::TableColNext),
+    ("^", Action::TableColFirst),
+    ("$", Action::TableColLast),
+    ("i", Action::TableCellRead),
+    ("M-j", Action::TableWordPrev),
+    ("M-l", Action::TableWordNext),
+    ("M-k", Action::TableWordRead),
+    ("M-m", Action::TableCharPrev),
+    ("M-.", Action::TableCharNext),
+    ("M-,", Action::TableCharRead),
+    ("H", Action::TableHeaderRead),
+    ("M-h", Action::ToggleTableHeaderRead),
+    ("M-H", Action::ToggleTableHeaderRead),
+];
+
+const TABLE_SETUP_BINDINGS: &[(&str, Action)] = &[
+    ("Esc", Action::CancelTableSetupMode),
+    ("Enter", Action::CommitTableSetupMode),
+    ("t", Action::ToggleTableSetupTabstop),
+    ("h", Action::RevCharPrev),
+    ("l", Action::RevCharNext),
+    ("i", Action::RevCharRead),
+    ("^", Action::RevFirst),
+    ("$", Action::RevLast),
+    ("w", Action::RevWordNext),
+    ("b", Action::RevWordPrev),
+];
+
 pub struct KeyBindings {
-    bindings: HashMap<InputMode, HashMap<String, Binding>>,
+    normal: HashMap<String, Binding>,
+    table: HashMap<String, Binding>,
+    table_setup: HashMap<String, Binding>,
 }
 
 impl KeyBindings {
     pub fn new() -> Self {
-        let mut bindings = HashMap::new();
-        bindings.insert(InputMode::Normal, HashMap::new());
-        bindings.insert(InputMode::Table, HashMap::new());
-        bindings.insert(InputMode::TableSetup, HashMap::new());
-
-        let normal = bindings.get_mut(&InputMode::Normal).unwrap();
-        normal.insert("F1".to_string(), Binding::Builtin(Action::ToggleHelp));
-        normal.insert("M-'".to_string(), Binding::Builtin(Action::ToggleAutoRead));
-        normal.insert(
-            "M-\"".to_string(),
-            Binding::Builtin(Action::ToggleReviewCursorFollowsScreenCursor),
-        );
-        normal.insert(
-            "M-s".to_string(),
-            Binding::Builtin(Action::ToggleSymbolLevel),
-        );
-        normal.insert("M-r".to_string(), Binding::Builtin(Action::SayOverlay));
-        normal.insert("M-n".to_string(), Binding::Builtin(Action::PassNextKey));
-        normal.insert("M-x".to_string(), Binding::Builtin(Action::StopSpeaking));
-        normal.insert("M-u".to_string(), Binding::Builtin(Action::RevLinePrev));
-        normal.insert("M-o".to_string(), Binding::Builtin(Action::RevLineNext));
-        normal.insert(
-            "M-U".to_string(),
-            Binding::Builtin(Action::RevLinePrevNonBlank),
-        );
-        normal.insert(
-            "M-O".to_string(),
-            Binding::Builtin(Action::RevLineNextNonBlank),
-        );
-        normal.insert("M-i".to_string(), Binding::Builtin(Action::RevLineRead));
-        normal.insert("M-m".to_string(), Binding::Builtin(Action::RevCharPrev));
-        normal.insert("M-.".to_string(), Binding::Builtin(Action::RevCharNext));
-        normal.insert("M-,".to_string(), Binding::Builtin(Action::RevCharRead));
-        normal.insert(
-            "M-<".to_string(),
-            Binding::Builtin(Action::RevCharReadPhonetic),
-        );
-        normal.insert("M-j".to_string(), Binding::Builtin(Action::RevWordPrev));
-        normal.insert("M-l".to_string(), Binding::Builtin(Action::RevWordNext));
-        normal.insert("M-k".to_string(), Binding::Builtin(Action::RevWordRead));
-        normal.insert("M-y".to_string(), Binding::Builtin(Action::RevTop));
-        normal.insert("M-p".to_string(), Binding::Builtin(Action::RevBottom));
-        normal.insert("M-h".to_string(), Binding::Builtin(Action::RevFirst));
-        normal.insert("M-;".to_string(), Binding::Builtin(Action::RevLast));
-        normal.insert(
-            "M-a".to_string(),
-            Binding::Builtin(Action::RevReadAttributes),
-        );
-        normal.insert("Backspace".to_string(), Binding::Builtin(Action::Backspace));
-        normal.insert("C-h".to_string(), Binding::Builtin(Action::Backspace));
-        normal.insert("Delete".to_string(), Binding::Builtin(Action::Delete));
-        normal.insert("F12".to_string(), Binding::Builtin(Action::SayTime));
-        normal.insert("M-L".to_string(), Binding::Builtin(Action::OpenLuaRepl));
-        normal.insert("F5".to_string(), Binding::Builtin(Action::SetMark));
-        normal.insert("F6".to_string(), Binding::Builtin(Action::Copy));
-        normal.insert("F7".to_string(), Binding::Builtin(Action::Paste));
-        normal.insert("M-c".to_string(), Binding::Builtin(Action::SayClipboard));
-        normal.insert(
-            "M-[".to_string(),
-            Binding::Builtin(Action::PreviousClipboard),
-        );
-        normal.insert("M-]".to_string(), Binding::Builtin(Action::NextClipboard));
-        normal.insert("M-t".to_string(), Binding::Builtin(Action::ToggleTableMode));
-        normal.insert("M-{".to_string(), Binding::Builtin(Action::LeftClick));
-        normal.insert("M-}".to_string(), Binding::Builtin(Action::RightClick));
-        normal.insert(
-            "M-T".to_string(),
-            Binding::Builtin(Action::StartTableSetupMode),
-        );
-        normal.insert(
-            "M-g".to_string(),
-            Binding::Builtin(Action::ToggleStopSpeechOnFocusLoss),
-        );
-
-        let table = bindings.get_mut(&InputMode::Table).unwrap();
-        table.insert("Esc".to_string(), Binding::Builtin(Action::ExitTableMode));
-        table.insert("M-u".to_string(), Binding::Builtin(Action::TableRowPrev));
-        table.insert("M-o".to_string(), Binding::Builtin(Action::TableRowNext));
-        table.insert("M-i".to_string(), Binding::Builtin(Action::TableCellRead));
-        table.insert("j".to_string(), Binding::Builtin(Action::TableRowNext));
-        table.insert("k".to_string(), Binding::Builtin(Action::TableRowPrev));
-        table.insert("g".to_string(), Binding::Builtin(Action::TableRowTop));
-        table.insert("G".to_string(), Binding::Builtin(Action::TableRowBottom));
-        table.insert("h".to_string(), Binding::Builtin(Action::TableColPrev));
-        table.insert("l".to_string(), Binding::Builtin(Action::TableColNext));
-        table.insert("^".to_string(), Binding::Builtin(Action::TableColFirst));
-        table.insert("$".to_string(), Binding::Builtin(Action::TableColLast));
-        table.insert("i".to_string(), Binding::Builtin(Action::TableCellRead));
-        table.insert("M-j".to_string(), Binding::Builtin(Action::TableWordPrev));
-        table.insert("M-l".to_string(), Binding::Builtin(Action::TableWordNext));
-        table.insert("M-k".to_string(), Binding::Builtin(Action::TableWordRead));
-        table.insert("M-m".to_string(), Binding::Builtin(Action::TableCharPrev));
-        table.insert("M-.".to_string(), Binding::Builtin(Action::TableCharNext));
-        table.insert("M-,".to_string(), Binding::Builtin(Action::TableCharRead));
-        table.insert("H".to_string(), Binding::Builtin(Action::TableHeaderRead));
-        table.insert(
-            "M-h".to_string(),
-            Binding::Builtin(Action::ToggleTableHeaderRead),
-        );
-        table.insert(
-            "M-H".to_string(),
-            Binding::Builtin(Action::ToggleTableHeaderRead),
-        );
-
-        let table_setup = bindings.get_mut(&InputMode::TableSetup).unwrap();
-        table_setup.insert(
-            "Esc".to_string(),
-            Binding::Builtin(Action::CancelTableSetupMode),
-        );
-        table_setup.insert(
-            "Enter".to_string(),
-            Binding::Builtin(Action::CommitTableSetupMode),
-        );
-        table_setup.insert(
-            "t".to_string(),
-            Binding::Builtin(Action::ToggleTableSetupTabstop),
-        );
-        table_setup.insert("h".to_string(), Binding::Builtin(Action::RevCharPrev));
-        table_setup.insert("l".to_string(), Binding::Builtin(Action::RevCharNext));
-        table_setup.insert("i".to_string(), Binding::Builtin(Action::RevCharRead));
-        table_setup.insert("^".to_string(), Binding::Builtin(Action::RevFirst));
-        table_setup.insert("$".to_string(), Binding::Builtin(Action::RevLast));
-        table_setup.insert("w".to_string(), Binding::Builtin(Action::RevWordNext));
-        table_setup.insert("b".to_string(), Binding::Builtin(Action::RevWordPrev));
-
-        Self { bindings }
-    }
-
-    pub fn binding_for(&self, key: &str) -> Option<&Binding> {
-        self.binding_for_mode(InputMode::Normal, key)
+        Self {
+            normal: Self::default_map(NORMAL_BINDINGS),
+            table: Self::default_map(TABLE_BINDINGS),
+            table_setup: Self::default_map(TABLE_SETUP_BINDINGS),
+        }
     }
 
     pub fn binding_for_mode(&self, mode: InputMode, key: &str) -> Option<&Binding> {
-        if let Some(bindings) = self.bindings.get(&mode)
-            && let Some(binding) = bindings.get(key)
-        {
-            return Some(binding);
-        }
+        let binding = self.bindings(mode).get(key);
         if mode != InputMode::Normal {
-            return self
-                .bindings
-                .get(&InputMode::Normal)
-                .and_then(|bindings| bindings.get(key));
+            return binding.or_else(|| self.normal.get(key));
         }
-        None
-    }
-
-    pub fn set_builtin_binding(&mut self, key: String, action: Action) {
-        self.set_builtin_binding_for_mode(InputMode::Normal, key, action);
+        binding
     }
 
     pub fn set_builtin_binding_for_mode(&mut self, mode: InputMode, key: String, action: Action) {
         self.replace_binding(mode, key, Binding::Builtin(action));
-    }
-
-    pub fn set_lua_binding(
-        &mut self,
-        key: String,
-        help: String,
-        lua: Rc<Lua>,
-        func: Function,
-    ) -> Result<()> {
-        self.set_lua_binding_for_mode(InputMode::Normal, key, help, lua, func)
     }
 
     pub fn set_lua_binding_for_mode(
@@ -248,9 +198,7 @@ impl KeyBindings {
         lua: Rc<Lua>,
         func: Function,
     ) -> Result<()> {
-        let func_key = lua
-            .create_registry_value(func)
-            .map_err(|err| anyhow!(err.to_string()))?;
+        let func_key = lua.create_registry_value(func).map_err(lua_error)?;
         self.replace_binding(
             mode,
             key,
@@ -263,25 +211,10 @@ impl KeyBindings {
         Ok(())
     }
 
-    pub fn clear_binding(&mut self, key: &str) {
-        self.clear_binding_for_mode(InputMode::Normal, key);
-    }
-
     pub fn clear_binding_for_mode(&mut self, mode: InputMode, key: &str) {
-        if let Some(bindings) = self.bindings.get_mut(&mode)
-            && let Some(binding) = bindings.remove(key)
-        {
+        if let Some(binding) = self.bindings_mut(mode).remove(key) {
             binding.cleanup();
         }
-    }
-
-    pub fn binding_value_for_lua(
-        &self,
-        key: &str,
-        lua: &Lua,
-        allow_function: bool,
-    ) -> mlua::Result<Value> {
-        self.binding_value_for_lua_mode(InputMode::Normal, key, lua, allow_function)
     }
 
     pub fn binding_value_for_lua_mode(
@@ -317,12 +250,9 @@ impl KeyBindings {
 
     pub fn builtin_action_from_value(value: &str) -> Result<Action> {
         let Some(name) = value.strip_prefix(BUILTIN_PREFIX) else {
-            return Err(anyhow!(
-                "binding action must start with \"{}\"",
-                BUILTIN_PREFIX
-            ));
+            return Err(Error::InvalidBuiltinPrefix);
         };
-        commands::builtin_action_from_name(name).ok_or_else(|| anyhow!("unknown action {}", value))
+        commands::builtin_action_from_name(name).ok_or_else(|| Error::UnknownAction(value.into()))
     }
 
     pub fn split_mode_key<'a>(&self, key: &'a str) -> (InputMode, &'a str) {
@@ -339,16 +269,39 @@ impl KeyBindings {
     }
 
     fn replace_binding(&mut self, mode: InputMode, key: String, binding: Binding) {
-        let bindings = self.bindings.get_mut(&mode).expect("missing bindings map");
-        if let Some(prev) = bindings.insert(key, binding) {
+        if let Some(prev) = self.bindings_mut(mode).insert(key, binding) {
             prev.cleanup();
+        }
+    }
+
+    fn default_map(defaults: &[(&str, Action)]) -> HashMap<String, Binding> {
+        defaults
+            .iter()
+            .map(|(key, action)| ((*key).to_string(), Binding::Builtin(*action)))
+            .collect()
+    }
+
+    fn bindings(&self, mode: InputMode) -> &HashMap<String, Binding> {
+        match mode {
+            InputMode::Normal => &self.normal,
+            InputMode::Table => &self.table,
+            InputMode::TableSetup => &self.table_setup,
+        }
+    }
+
+    fn bindings_mut(&mut self, mode: InputMode) -> &mut HashMap<String, Binding> {
+        match mode {
+            InputMode::Normal => &mut self.normal,
+            InputMode::Table => &mut self.table,
+            InputMode::TableSetup => &mut self.table_setup,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Binding, KeyBindings};
+    use super::{Binding, Error, InputMode, KeyBindings};
+    use crate::commands::Action;
     use mlua::{Lua, LuaOptions, StdLib};
     use std::rc::Rc;
 
@@ -363,10 +316,16 @@ mod tests {
 
         let mut bindings = KeyBindings::new();
         bindings
-            .set_lua_binding("M-f".to_string(), "test".to_string(), lua.clone(), func)
+            .set_lua_binding_for_mode(
+                InputMode::Normal,
+                "M-f".to_string(),
+                "test".to_string(),
+                lua.clone(),
+                func,
+            )
             .unwrap();
 
-        let binding = bindings.binding_for("M-f").unwrap();
+        let binding = bindings.binding_for_mode(InputMode::Normal, "M-f").unwrap();
         match binding {
             Binding::Lua(binding) => binding.call().unwrap(),
             Binding::Builtin(_) => panic!("expected lua binding"),
@@ -374,5 +333,188 @@ mod tests {
 
         let count: i32 = lua.globals().get("count").unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mode_bindings_fall_back_to_normal_bindings() {
+        let bindings = KeyBindings::new();
+
+        assert!(matches!(
+            bindings.binding_for_mode(InputMode::Table, "F1"),
+            Some(Binding::Builtin(Action::ToggleHelp))
+        ));
+        assert!(matches!(
+            bindings.binding_for_mode(InputMode::Table, "j"),
+            Some(Binding::Builtin(Action::TableRowNext))
+        ));
+    }
+
+    #[test]
+    fn mode_prefixes_are_only_split_when_valid() {
+        let bindings = KeyBindings::new();
+
+        assert_eq!(
+            bindings.split_mode_key("table:M-j"),
+            (InputMode::Table, "M-j")
+        );
+        assert_eq!(
+            bindings.split_mode_key("table_setup:Enter"),
+            (InputMode::TableSetup, "Enter")
+        );
+        assert_eq!(
+            bindings.split_mode_key("custom:M-j"),
+            (InputMode::Normal, "custom:M-j")
+        );
+        assert_eq!(
+            bindings.split_mode_key("table:"),
+            (InputMode::Normal, "table:")
+        );
+    }
+
+    #[test]
+    fn builtin_values_validate_prefix_and_action_name() {
+        assert_eq!(
+            KeyBindings::builtin_action_from_value("lector.toggle_help").unwrap(),
+            Action::ToggleHelp
+        );
+        assert_eq!(
+            KeyBindings::builtin_action_from_value("toggle_help")
+                .unwrap_err()
+                .to_string(),
+            "binding action must start with \"lector.\""
+        );
+        assert_eq!(
+            KeyBindings::builtin_action_from_value("lector.missing")
+                .unwrap_err()
+                .to_string(),
+            "unknown action lector.missing"
+        );
+    }
+
+    #[test]
+    fn input_modes_round_trip_through_configuration_names() {
+        for (name, mode) in [
+            ("normal", InputMode::Normal),
+            ("table", InputMode::Table),
+            ("table_setup", InputMode::TableSetup),
+        ] {
+            assert_eq!(InputMode::from_prefix(name), Some(mode));
+            assert_eq!(mode.as_str(), name);
+        }
+        assert_eq!(InputMode::from_prefix("TABLE"), None);
+        assert_eq!(InputMode::from_prefix(""), None);
+    }
+
+    #[test]
+    fn builtin_bindings_can_be_replaced_and_cleared_per_mode() {
+        let mut bindings = KeyBindings::new();
+
+        bindings.set_builtin_binding_for_mode(
+            InputMode::Table,
+            "j".to_string(),
+            Action::TableRowTop,
+        );
+        assert!(matches!(
+            bindings.binding_for_mode(InputMode::Table, "j"),
+            Some(Binding::Builtin(Action::TableRowTop))
+        ));
+        assert_eq!(
+            bindings
+                .binding_for_mode(InputMode::Table, "j")
+                .unwrap()
+                .help_text(),
+            Action::TableRowTop.help_text()
+        );
+
+        bindings.clear_binding_for_mode(InputMode::Table, "j");
+        assert!(bindings.binding_for_mode(InputMode::Table, "j").is_none());
+        bindings.clear_binding_for_mode(InputMode::Table, "missing");
+    }
+
+    #[test]
+    fn lua_binding_values_support_introspection_with_or_without_functions() {
+        let lua = Rc::new(Lua::new_with(StdLib::ALL_SAFE, LuaOptions::default()).unwrap());
+        let func = lua.load("return function() return 42 end").eval().unwrap();
+        let mut bindings = KeyBindings::new();
+        bindings
+            .set_lua_binding_for_mode(
+                InputMode::Normal,
+                "M-f".to_string(),
+                "run test callback".to_string(),
+                Rc::clone(&lua),
+                func,
+            )
+            .unwrap();
+
+        let builtin = bindings
+            .binding_value_for_lua_mode(InputMode::Normal, "F1", &lua, true)
+            .unwrap();
+        assert_eq!(
+            builtin.as_string().unwrap().to_str().unwrap(),
+            "lector.toggle_help"
+        );
+        assert!(matches!(
+            bindings
+                .binding_value_for_lua_mode(InputMode::Normal, "missing", &lua, true)
+                .unwrap(),
+            mlua::Value::Nil
+        ));
+
+        let without_function = bindings
+            .binding_value_for_lua_mode(InputMode::Normal, "M-f", &lua, false)
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            without_function.get::<String>(1).unwrap(),
+            "run test callback"
+        );
+        assert!(matches!(
+            without_function.get::<mlua::Value>(2).unwrap(),
+            mlua::Value::Nil
+        ));
+
+        let with_function = bindings
+            .binding_value_for_lua_mode(InputMode::Normal, "M-f", &lua, true)
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            with_function
+                .get::<mlua::Function>(2)
+                .unwrap()
+                .call::<i32>(())
+                .unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn lua_callback_failures_are_reported_as_keymap_errors() {
+        let lua = Rc::new(Lua::new_with(StdLib::ALL_SAFE, LuaOptions::default()).unwrap());
+        let func = lua
+            .load("return function() error('expected callback failure') end")
+            .eval::<mlua::Function>()
+            .unwrap();
+        let mut bindings = KeyBindings::new();
+        bindings
+            .set_lua_binding_for_mode(
+                InputMode::Normal,
+                "M-f".to_string(),
+                "fail".to_string(),
+                Rc::clone(&lua),
+                func,
+            )
+            .unwrap();
+
+        let Binding::Lua(binding) = bindings.binding_for_mode(InputMode::Normal, "M-f").unwrap()
+        else {
+            panic!("expected Lua binding");
+        };
+        let error = binding.call().unwrap_err();
+        assert!(matches!(error, Error::Lua(_)));
+        assert!(error.to_string().contains("expected callback failure"));
     }
 }

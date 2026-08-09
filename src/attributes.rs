@@ -519,10 +519,33 @@ pub fn describe_color(color: vt100::Color) -> String {
         },
         Rgb(r, g, b) => {
             let rgb = format!("#{:02X}{:02X}{:02X}", r, g, b);
-            match RGB_INDEX.get(&rgb).and_then(|i| COLORS.get(i)) {
+            match RGB_INDEX
+                .get(&rgb.to_ascii_lowercase())
+                .and_then(|i| COLORS.get(i))
+            {
                 Some(s) => s.to_string(),
                 None => rgb,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe_color;
+    use vt100::Color;
+
+    #[test]
+    fn describes_default_indexed_and_rgb_colors() {
+        assert_eq!(describe_color(Color::Default), "default");
+        assert_eq!(describe_color(Color::Idx(0)), "Black");
+        assert_eq!(describe_color(Color::Idx(255)), "Grey93");
+        assert_eq!(describe_color(Color::Rgb(0, 0, 0)), "Black");
+        assert_eq!(describe_color(Color::Rgb(255, 0, 0)), "Red1");
+    }
+
+    #[test]
+    fn unknown_rgb_colors_use_fixed_width_uppercase_hex() {
+        assert_eq!(describe_color(Color::Rgb(1, 2, 10)), "#01020A");
     }
 }

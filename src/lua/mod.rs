@@ -88,3 +88,148 @@ fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Resu
     lua.globals().set("lector", tbl_lector)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::setup;
+    use crate::{
+        keymap::{Binding, InputMode},
+        screen_reader::ScreenReader,
+        speech::{self, symbols::Level},
+        table::{Column, TableModel, TableState},
+        view::View,
+    };
+    use std::{
+        cell::RefCell,
+        fs,
+        rc::Rc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct RecordingDriver(Rc<RefCell<Vec<String>>>);
+
+    impl speech::Driver for RecordingDriver {
+        fn speak(&mut self, text: &str, _interrupt: bool) -> anyhow::Result<()> {
+            self.0.borrow_mut().push(text.to_string());
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rate(&self) -> f32 {
+            1.0
+        }
+
+        fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn configuration_and_hooks_round_trip_through_the_lua_api() {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let speech = speech::Speech::new(Box::new(RecordingDriver(Rc::clone(&output))));
+        let mut screen_reader = ScreenReader::new(speech);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("lector-lua-{unique}.lua"));
+        fs::write(
+            &path,
+            r#"
+                assert(lector.o.suppress_key_echo == false)
+                lector.o.auto_read = false
+                lector.o.suppress_key_echo = true
+                lector.o.symbol_level = "all"
+                lector.symbols = { ["?"] = {"query", "all", "never", false} }
+                lector.bindings["M-z"] = "lector.stop_speaking"
+                lector.bindings["M-v"] = {
+                    "custom binding",
+                    function() lector.o.review_follows_screen_cursor = false end,
+                }
+                lector.hooks.on_startup = function(_) lector.o.help_mode = true end
+                lector.hooks.on_shutdown = function(_) lector.o.auto_read = true end
+                lector.hooks.on_screen_update = function(_) lector.o.auto_read = false end
+                lector.hooks.on_live_read = function(text, _) return text .. " hooked" end
+                lector.hooks.on_review_cursor_move = function(_) lector.o.highlight_tracking = true end
+                lector.hooks.on_mode_change = function(_, _) lector.o.stop_speech_on_focus_loss = false end
+                lector.hooks.on_table_mode_enter = function(_) lector.o.help_mode = true end
+                lector.hooks.on_table_mode_exit = function() lector.o.help_mode = false end
+                lector.hooks.on_clipboard_change = function(_, _) lector.o.auto_read = true end
+                lector.hooks.on_speech_start = function(_, _) lector.o.help_mode = false end
+                lector.hooks.on_speech_end = function(_, _) lector.o.auto_read = false end
+                lector.hooks.on_key_unhandled = function(key, mode)
+                    return key == "q" and mode == "table"
+                end
+            "#,
+        )
+        .unwrap();
+
+        setup(path.clone(), &mut screen_reader, |sr| {
+            assert!(sr.help_mode());
+            assert!(!sr.auto_read_enabled());
+            assert!(sr.suppress_key_echo());
+            assert!(sr.speech().symbol_level() == Level::All);
+            assert!(matches!(
+                sr.key_bindings().binding_for_mode(InputMode::Normal, "M-z"),
+                Some(Binding::Builtin(crate::commands::Action::StopSpeaking))
+            ));
+
+            let binding = sr
+                .key_bindings()
+                .binding_for_mode(InputMode::Normal, "M-v")
+                .unwrap();
+            let Binding::Lua(binding) = binding else {
+                panic!("expected Lua binding");
+            };
+            binding.call()?;
+            assert!(!sr.review_follows_screen_cursor());
+
+            sr.speak("?", false)?;
+            assert!(!sr.help_mode());
+            assert!(!sr.auto_read_enabled());
+            assert_eq!(
+                sr.hook_on_live_read("value", 2, false)?,
+                Some("value hooked".to_string())
+            );
+            assert!(sr.hook_on_key_unhandled(Some("q"), InputMode::Table)?);
+            assert!(!sr.hook_on_key_unhandled(Some("x"), InputMode::Normal)?);
+
+            sr.hook_on_review_cursor_move((0, 0), (0, 1))?;
+            assert!(sr.highlight_tracking_enabled());
+            sr.hook_on_mode_change(InputMode::Normal, InputMode::Table)?;
+            assert!(!sr.stop_speech_on_focus_loss());
+
+            let table_state = TableState::new(
+                TableModel::new(
+                    0,
+                    1,
+                    vec![Column::new(0, 1), Column::new(2, 3)],
+                    Some(0),
+                    None,
+                ),
+                0,
+            );
+            sr.hook_on_table_mode_enter(&table_state)?;
+            assert!(sr.help_mode());
+            sr.hook_on_table_mode_exit()?;
+            assert!(!sr.help_mode());
+
+            sr.push_clipboard("entry".to_string())?;
+            assert!(sr.auto_read_enabled());
+            let mut view = View::new(2, 8);
+            view.process_changes(b"changed");
+            sr.hook_on_screen_update(&view, false)?;
+            assert!(!sr.auto_read_enabled());
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(screen_reader.auto_read_enabled());
+        assert_eq!(output.borrow().as_slice(), [" query "]);
+        fs::remove_file(path).unwrap();
+    }
+}

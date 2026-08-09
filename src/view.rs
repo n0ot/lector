@@ -3,11 +3,11 @@ use std::cmp::min;
 
 pub struct View {
     parser: vt100::Parser,
-    pub next_bytes: Vec<u8>,
+    next_bytes: Vec<u8>,
     prev_screen: vt100::Screen,
-    pub prev_screen_time: u128,
-    pub review_cursor_position: (u16, u16), // (row, col)
-    pub(crate) review_mark_position: Option<(u16, u16)>, // (row, col)
+    prev_screen_time: u128,
+    review_cursor_position: (u16, u16),
+    review_mark_position: Option<(u16, u16)>,
     review_cursor_indent_level: u16,
     application_cursor_indent_level: u16,
     cached_full: String,
@@ -85,6 +85,42 @@ impl View {
     /// Gets the current screen backing this view
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    pub fn review_cursor_position(&self) -> (u16, u16) {
+        self.review_cursor_position
+    }
+
+    pub(crate) fn set_review_cursor_position(&mut self, position: (u16, u16)) {
+        self.review_cursor_position = position;
+    }
+
+    pub(crate) fn set_review_cursor_row(&mut self, row: u16) {
+        self.review_cursor_position.0 = row;
+    }
+
+    pub(crate) fn set_review_cursor_col(&mut self, col: u16) {
+        self.review_cursor_position.1 = col;
+    }
+
+    pub(crate) fn set_review_mark(&mut self) {
+        self.review_mark_position = Some(self.review_cursor_position);
+    }
+
+    pub(crate) fn review_mark_position(&self) -> Option<(u16, u16)> {
+        self.review_mark_position
+    }
+
+    pub(crate) fn pending_bytes(&self) -> &[u8] {
+        &self.next_bytes
+    }
+
+    pub(crate) fn clear_pending_bytes(&mut self) {
+        self.next_bytes.clear();
+    }
+
+    pub(crate) fn set_previous_screen_time(&mut self, time: u128) {
+        self.prev_screen_time = time;
     }
 
     /// Gets the previous screen backing this view
@@ -356,4 +392,151 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{View, compute_row_hashes, fnv1a_64};
+
+    #[test]
+    fn resize_clamps_review_cursor_and_clears_displaced_mark() {
+        let mut view = View::new(4, 8);
+        view.set_review_cursor_position((3, 7));
+        view.set_review_mark();
+
+        view.set_size(2, 5);
+
+        assert_eq!(view.review_cursor_position(), (1, 4));
+        assert_eq!(view.review_mark_position(), None);
+    }
+
+    #[test]
+    fn resize_preserves_mark_when_review_cursor_remains_valid() {
+        let mut view = View::new(4, 8);
+        view.set_review_cursor_position((1, 2));
+        view.set_review_mark();
+
+        view.set_size(3, 6);
+
+        assert_eq!(view.review_cursor_position(), (1, 2));
+        assert_eq!(view.review_mark_position(), Some((1, 2)));
+    }
+
+    #[test]
+    fn finalize_advances_screen_and_clears_pending_bytes() {
+        let mut view = View::new(2, 8);
+        view.process_changes(b"hello");
+        assert_eq!(view.pending_bytes(), b"hello");
+        assert_ne!(view.screen().contents(), view.prev_screen().contents());
+
+        view.finalize_changes(42);
+
+        assert!(view.pending_bytes().is_empty());
+        assert_eq!(view.screen().contents(), view.prev_screen().contents());
+        assert_eq!(view.prev_screen_time, 42);
+    }
+
+    #[test]
+    fn cached_contents_follow_process_and_finalize_lifecycle() {
+        let mut view = View::new(2, 8);
+        view.process_changes(b"old");
+        view.finalize_changes(1);
+        view.process_changes(b"\rnew");
+
+        let (previous, current, previous_hashes, current_hashes) = view.full_contents_cached();
+        assert!(previous.starts_with("old"));
+        assert!(current.starts_with("new"));
+        assert_ne!(previous_hashes, current_hashes);
+
+        view.finalize_changes(2);
+        let (previous, current, previous_hashes, current_hashes) = view.full_contents_cached();
+        assert_eq!(previous, current);
+        assert_eq!(previous_hashes, current_hashes);
+    }
+
+    #[test]
+    fn vertical_navigation_skips_blank_lines_and_stops_at_content_boundaries() {
+        let mut view = View::new(5, 10);
+        view.process_changes(b"top\r\n\r\nmiddle\r\n\r\nbottom");
+
+        assert!(!view.review_cursor_up(true));
+        assert!(view.review_cursor_down(true));
+        assert_eq!(view.review_cursor_position(), (2, 0));
+        assert!(view.review_cursor_down(true));
+        assert_eq!(view.review_cursor_position(), (4, 0));
+        assert!(!view.review_cursor_down(true));
+        assert!(view.review_cursor_up(true));
+        assert_eq!(view.review_cursor_position(), (2, 0));
+        assert!(view.review_cursor_up(false));
+        assert_eq!(view.review_cursor_position(), (1, 0));
+        assert!(view.review_cursor_down(false));
+        assert_eq!(view.review_cursor_position(), (2, 0));
+    }
+
+    #[test]
+    fn word_navigation_handles_first_last_and_inter_word_whitespace() {
+        let mut view = View::new(1, 10);
+        view.process_changes(b"one  two");
+
+        assert!(!view.review_cursor_prev_word());
+        assert!(view.review_cursor_next_word());
+        assert_eq!(view.review_cursor_position(), (0, 5));
+        assert_eq!(view.word(0, 5), "two");
+        assert!(!view.review_cursor_next_word());
+        view.set_review_cursor_col(7);
+        assert!(view.review_cursor_prev_word());
+        assert_eq!(view.review_cursor_position(), (0, 0));
+        assert_eq!(view.word(0, 4), "one  ");
+    }
+
+    #[test]
+    fn horizontal_navigation_skips_wide_continuations_and_obeys_edges() {
+        let mut view = View::new(1, 6);
+        view.process_changes("a界b".as_bytes());
+
+        assert!(!view.review_cursor_left());
+        assert!(view.review_cursor_right());
+        assert_eq!(view.review_cursor_position(), (0, 1));
+        assert_eq!(view.character(0, 1), "界");
+        assert!(view.review_cursor_right());
+        assert_eq!(view.review_cursor_position(), (0, 3));
+        assert!(view.review_cursor_left());
+        assert_eq!(view.review_cursor_position(), (0, 1));
+        assert!(view.review_cursor_left());
+        assert_eq!(view.review_cursor_position(), (0, 0));
+
+        view.set_review_cursor_col(5);
+        assert!(!view.review_cursor_right());
+    }
+
+    #[test]
+    fn indentation_and_full_content_accessors_report_changes_without_blank_resets() {
+        let mut view = View::new(3, 12);
+        view.process_changes(b"  alpha\r\n    beta\x1B[1;1H");
+
+        assert_eq!(view.review_cursor_indentation_level(), (2, true));
+        assert_eq!(view.review_cursor_indentation_level(), (2, false));
+        assert_eq!(view.application_cursor_indentation_level(), (2, true));
+        assert_eq!(view.application_cursor_indentation_level(), (2, false));
+
+        view.set_review_cursor_row(1);
+        assert_eq!(view.review_cursor_indentation_level(), (4, true));
+        view.set_review_cursor_row(2);
+        assert_eq!(view.review_cursor_indentation_level(), (4, false));
+
+        let mut contents = String::from("stale");
+        view.contents_full_into(&mut contents);
+        assert_eq!(contents, "  alpha\n    beta\n\n");
+        assert_eq!(view.line(1), "    beta");
+    }
+
+    #[test]
+    fn row_hashes_are_stable_and_reuse_the_destination() {
+        assert_eq!(fnv1a_64(b""), 0xcbf29ce484222325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63dc4c8601ec8c);
+
+        let mut hashes = vec![0, 1, 2];
+        compute_row_hashes("a\n\n", &mut hashes);
+        assert_eq!(hashes, [fnv1a_64(b"a"), fnv1a_64(b"")]);
+    }
 }

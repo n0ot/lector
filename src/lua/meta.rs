@@ -71,7 +71,7 @@ fn add_callbacks<'lua, 'scope>(
         let mut sr = screen_reader.borrow_mut();
         match value {
             mlua::Value::Nil => {
-                sr.speech.symbols_map.remove(&key);
+                sr.speech_mut().remove_symbol(&key);
                 Ok(())
             }
             mlua::Value::Table(table_value) => {
@@ -85,9 +85,8 @@ fn add_callbacks<'lua, 'scope>(
                 )
                 .to_lua_result()?;
                 let repeat: bool = table_value.get(4)?;
-                sr.speech
-                    .symbols_map
-                    .put(&key, &replacement, level, include_original, repeat);
+                sr.speech_mut()
+                    .set_symbol(&key, &replacement, level, include_original, repeat);
                 Ok(())
             }
             _ => Err(Error::external(anyhow!(
@@ -105,7 +104,7 @@ fn add_callbacks<'lua, 'scope>(
     })?;
     let get_symbol = scope.create_function(|ctx, key: String| {
         let sr = screen_reader.borrow();
-        match sr.speech.symbols_map.get(&key) {
+        match sr.speech().symbol(&key) {
             Some(v) => {
                 let tbl = ctx.create_table()?;
                 tbl.set(1, v.replacement.clone())?;
@@ -119,7 +118,7 @@ fn add_callbacks<'lua, 'scope>(
     })?;
     let clear_symbols = scope.create_function_mut(|_, ()| {
         let mut sr = screen_reader.borrow_mut();
-        sr.speech.symbols_map.clear();
+        sr.speech_mut().clear_symbols();
         Ok(())
     })?;
     let set_hook = scope.create_function_mut(|lua, (key, value): (String, Value)| {
@@ -171,7 +170,7 @@ fn add_callbacks_static(
         move |_, (key, value): (String, mlua::Value)| {
             with_screen_reader_mut(&sr_ptr, |sr| match value {
                 mlua::Value::Nil => {
-                    sr.speech.symbols_map.remove(&key);
+                    sr.speech_mut().remove_symbol(&key);
                     Ok(())
                 }
                 mlua::Value::Table(table_value) => {
@@ -187,9 +186,8 @@ fn add_callbacks_static(
                     )
                     .to_lua_result()?;
                     let repeat: bool = table_value.get(4)?;
-                    sr.speech
-                        .symbols_map
-                        .put(&key, &replacement, level, include_original, repeat);
+                    sr.speech_mut()
+                        .set_symbol(&key, &replacement, level, include_original, repeat);
                     Ok(())
                 }
                 _ => Err(Error::external(anyhow!(
@@ -218,7 +216,7 @@ fn add_callbacks_static(
         let sr_ptr = Rc::clone(&sr_ptr);
         move |lua, key: String| {
             with_screen_reader(&sr_ptr, |sr| {
-                let value = match sr.speech.symbols_map.get(&key) {
+                let value = match sr.speech().symbol(&key) {
                     Some(v) => {
                         let tbl = lua.create_table()?;
                         tbl.set(1, v.replacement.clone())?;
@@ -237,7 +235,7 @@ fn add_callbacks_static(
         let sr_ptr = Rc::clone(&sr_ptr);
         move |_, ()| {
             with_screen_reader_mut(&sr_ptr, |sr| {
-                sr.speech.symbols_map.clear();
+                sr.speech_mut().clear_symbols();
                 Ok(())
             })
         }
@@ -275,15 +273,16 @@ fn add_callbacks_static(
 
 fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua::Value> {
     match option {
-        "speech_rate" => sr.speech.get_rate().into_lua(lua),
-        "symbol_level" => sr.speech.symbol_level.to_string().into_lua(lua),
-        "help_mode" => sr.help_mode.into_lua(lua),
-        "auto_read" => sr.auto_read.into_lua(lua),
+        "speech_rate" => sr.speech().get_rate().into_lua(lua),
+        "symbol_level" => sr.speech().symbol_level().to_string().into_lua(lua),
+        "help_mode" => sr.help_mode().into_lua(lua),
+        "auto_read" => sr.auto_read_enabled().into_lua(lua),
+        "suppress_key_echo" => sr.suppress_key_echo().into_lua(lua),
         "review_follows_screen_cursor" | "rev_follows" => {
-            sr.review_follows_screen_cursor.into_lua(lua)
+            sr.review_follows_screen_cursor().into_lua(lua)
         }
-        "highlight_tracking" => sr.highlight_tracking.into_lua(lua),
-        "stop_speech_on_focus_loss" => sr.stop_speech_on_focus_loss.into_lua(lua),
+        "highlight_tracking" => sr.highlight_tracking_enabled().into_lua(lua),
+        "stop_speech_on_focus_loss" => sr.stop_speech_on_focus_loss().into_lua(lua),
         _ => Err(Error::external(anyhow!("unknown option"))),
     }
     .map_err(|e| anyhow!("{}", e))
@@ -291,35 +290,27 @@ fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua
 }
 
 fn set_binding(lua: &Lua, sr: &mut ScreenReader, key: &str, value: Value) -> anyhow::Result<()> {
-    let (mode, key) = sr.key_bindings.split_mode_key(key);
+    let (mode, key) = sr.key_bindings().split_mode_key(key);
     match value {
         Value::Nil => {
-            sr.key_bindings.clear_binding_for_mode(mode, key);
+            sr.key_bindings_mut().clear_binding_for_mode(mode, key);
             Ok(())
         }
         Value::String(name) => {
             let name = name.to_str().map_err(|err| anyhow!(err.to_string()))?;
             let action = KeyBindings::builtin_action_from_value(name.as_ref())?;
-            sr.key_bindings
+            sr.key_bindings_mut()
                 .set_builtin_binding_for_mode(mode, key.to_string(), action);
             Ok(())
         }
         Value::Table(table) => {
             let (help, func) = parse_binding_table(table)?;
-            let Some(ctx) = sr.lua_ctx.as_ref() else {
-                return Err(anyhow!("lua bindings are only available in init.lua"));
-            };
-            let Some(weak_ctx) = sr.lua_ctx_weak.as_ref() else {
-                return Err(anyhow!("lua bindings are only available in init.lua"));
-            };
-            if *weak_ctx != lua.weak() {
-                return Err(anyhow!("lua bindings are only available in init.lua"));
-            }
-            sr.key_bindings.set_lua_binding_for_mode(
+            let ctx = Rc::clone(sr.lua_binding_context(lua).map_err(anyhow::Error::new)?);
+            sr.key_bindings_mut().set_lua_binding_for_mode(
                 mode,
                 key.to_string(),
                 help,
-                Rc::clone(ctx),
+                ctx,
                 func,
             )?;
             Ok(())
@@ -341,13 +332,9 @@ fn parse_binding_table(table: Table) -> anyhow::Result<(String, Function)> {
 }
 
 fn get_binding(lua: &Lua, sr: &ScreenReader, key: &str) -> anyhow::Result<Value> {
-    let allow_function = sr
-        .lua_ctx_weak
-        .as_ref()
-        .map(|ctx| *ctx == lua.weak())
-        .unwrap_or(false);
-    let (mode, key) = sr.key_bindings.split_mode_key(key);
-    sr.key_bindings
+    let allow_function = sr.owns_lua_context(lua);
+    let (mode, key) = sr.key_bindings().split_mode_key(key);
+    sr.key_bindings()
         .binding_value_for_lua_mode(mode, key, lua, allow_function)
         .map_err(|err| anyhow!(err.to_string()))
 }
@@ -356,51 +343,65 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
     use mlua::Value::*;
     (match option {
         "speech_rate" => match value {
-            Number(v) => sr.speech.set_rate(v as f32),
-            Integer(v) => sr.speech.set_rate(v as f32),
+            Number(v) => sr
+                .speech_mut()
+                .set_rate(v as f32)
+                .map_err(anyhow::Error::new),
+            Integer(v) => sr
+                .speech_mut()
+                .set_rate(v as f32)
+                .map_err(anyhow::Error::new),
             _ => Err(anyhow!("value must be a number")),
         },
         "symbol_level" => match value {
             String(v) => {
-                sr.speech.symbol_level = v
+                let level = v
                     .to_str()
                     .map_err(|e| anyhow!("{}", e))?
                     .parse::<symbols::Level>()?;
+                sr.speech_mut().set_symbol_level(level);
                 Ok(())
             }
             _ => Err(anyhow!("value must be a string")),
         },
         "help_mode" => match value {
             Boolean(v) => {
-                sr.help_mode = v;
+                sr.set_help_mode(v);
                 Ok(())
             }
             _ => Err(anyhow!("value must be a boolean")),
         },
         "auto_read" => match value {
             Boolean(v) => {
-                sr.auto_read = v;
+                sr.set_auto_read_enabled(v);
+                Ok(())
+            }
+            _ => Err(anyhow!("value must be a boolean")),
+        },
+        "suppress_key_echo" => match value {
+            Boolean(v) => {
+                sr.set_suppress_key_echo(v);
                 Ok(())
             }
             _ => Err(anyhow!("value must be a boolean")),
         },
         "review_follows_screen_cursor" | "rev_follows" => match value {
             Boolean(v) => {
-                sr.review_follows_screen_cursor = v;
+                sr.set_review_follows_screen_cursor(v);
                 Ok(())
             }
             _ => Err(anyhow!("value must be a boolean")),
         },
         "highlight_tracking" => match value {
             Boolean(v) => {
-                sr.highlight_tracking = v;
+                sr.set_highlight_tracking_enabled(v);
                 Ok(())
             }
             _ => Err(anyhow!("value must be a boolean")),
         },
         "stop_speech_on_focus_loss" => match value {
             Boolean(v) => {
-                sr.stop_speech_on_focus_loss = v;
+                sr.set_stop_speech_on_focus_loss(v);
                 Ok(())
             }
             _ => Err(anyhow!("value must be a boolean")),

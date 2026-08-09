@@ -1,75 +1,135 @@
-use super::{
-    attributes,
-    ext::{CellExt, ScreenExt},
-    keymap::InputMode,
-    screen_reader::{CursorTrackingMode, ScreenReader, TableSetupState},
-    table::{self, TableState},
-    view::View,
-};
-use anyhow::{Result, anyhow};
+use super::{screen_reader::ScreenReader, view::View};
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Action {
-    ToggleHelp,
-    ToggleAutoRead,
-    ToggleReviewCursorFollowsScreenCursor,
-    ToggleSymbolLevel,
-    SayOverlay,
-    OpenLuaRepl,
-    PassNextKey,
-    StopSpeaking,
-    RevLinePrev,
-    RevLineNext,
-    RevLinePrevNonBlank,
-    RevLineNextNonBlank,
-    RevLineRead,
-    RevCharPrev,
-    RevCharNext,
-    RevCharRead,
-    RevCharReadPhonetic,
-    RevWordPrev,
-    RevWordNext,
-    RevWordRead,
-    RevTop,
-    RevBottom,
-    RevFirst,
-    RevLast,
-    RevReadAttributes,
-    LeftClick,
-    RightClick,
-    Backspace,
-    Delete,
-    SayTime,
-    SetMark,
-    Copy,
-    Paste,
-    SayClipboard,
-    PreviousClipboard,
-    NextClipboard,
-    ToggleTableMode,
-    ToggleStopSpeechOnFocusLoss,
-    StartTableSetupMode,
-    CancelTableSetupMode,
-    CommitTableSetupMode,
-    ToggleTableSetupTabstop,
-    ExitTableMode,
-    TableRowPrev,
-    TableRowNext,
-    TableRowTop,
-    TableRowBottom,
-    TableColPrev,
-    TableColNext,
-    TableColFirst,
-    TableColLast,
-    TableCellRead,
-    TableHeaderRead,
-    ToggleTableHeaderRead,
-    TableWordPrev,
-    TableWordNext,
-    TableWordRead,
-    TableCharPrev,
-    TableCharNext,
-    TableCharRead,
+mod clipboard;
+mod mouse;
+mod review;
+mod system;
+mod table;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error(transparent)]
+    ScreenReader(#[from] crate::screen_reader::Error),
+    #[error(transparent)]
+    Speech(#[from] crate::speech::Error),
+    #[error("cannot get cell at row {row}, column {col}")]
+    MissingCell { row: u16, col: u16 },
+}
+
+struct ActionMetadata {
+    help: &'static str,
+    name: &'static str,
+}
+
+macro_rules! define_actions {
+    ($($variant:ident => ($help:literal, $name:literal)),+ $(,)?) => {
+        #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+        #[repr(usize)]
+        pub enum Action {
+            $($variant),+
+        }
+
+        const ACTION_METADATA: &[ActionMetadata] = &[
+            $(ActionMetadata { help: $help, name: $name }),+
+        ];
+
+        #[cfg(test)]
+        const ACTION_TABLE: &[(Action, &str, &str)] = &[
+            $((Action::$variant, $help, $name)),+
+        ];
+
+        impl Action {
+            fn metadata(self) -> &'static ActionMetadata {
+                &ACTION_METADATA[self as usize]
+            }
+
+            pub fn help_text(&self) -> &'static str {
+                self.metadata().help
+            }
+        }
+
+        pub fn builtin_action_from_name(name: &str) -> Option<Action> {
+            match name {
+                $($name => Some(Action::$variant)),+,
+                _ => None,
+            }
+        }
+    };
+}
+
+define_actions! {
+    ToggleHelp => ("toggle help", "toggle_help"),
+    ToggleAutoRead => ("toggle auto read", "toggle_auto_read"),
+    ToggleReviewCursorFollowsScreenCursor => (
+        "toggle whether review cursor follows screen cursor",
+        "toggle_review_cursor_follows_screen_cursor"
+    ),
+    ToggleSymbolLevel => ("toggle symbol level", "toggle_symbol_level"),
+    SayOverlay => ("repeat current overlay", "say_overlay"),
+    OpenLuaRepl => ("open Lua REPL", "open_lua_repl"),
+    PassNextKey => ("forward next key press", "pass_next_key"),
+    StopSpeaking => ("stop speaking", "stop_speaking"),
+    RevLinePrev => ("previous line", "review_line_prev"),
+    RevLineNext => ("next line", "review_line_next"),
+    RevLinePrevNonBlank => ("previous non blank line", "review_line_prev_non_blank"),
+    RevLineNextNonBlank => ("next non blank line", "review_line_next_non_blank"),
+    RevLineRead => ("current line", "review_line_read"),
+    RevCharPrev => ("previous character", "review_char_prev"),
+    RevCharNext => ("next character", "review_char_next"),
+    RevCharRead => ("current character", "review_char_read"),
+    RevCharReadPhonetic => ("current character phonetically", "review_char_read_phonetic"),
+    RevWordPrev => ("previous word", "review_word_prev"),
+    RevWordNext => ("next word", "review_word_next"),
+    RevWordRead => ("current word", "review_word_read"),
+    RevTop => ("top", "review_top"),
+    RevBottom => ("bottom", "review_bottom"),
+    RevFirst => ("beginning of line", "review_first"),
+    RevLast => ("end of line", "review_last"),
+    RevReadAttributes => ("read attributes", "review_read_attributes"),
+    LeftClick => ("left click at review cursor", "left_click"),
+    RightClick => ("right click at review cursor", "right_click"),
+    Backspace => ("backspace", "backspace"),
+    Delete => ("delete", "delete"),
+    SayTime => ("say the time", "say_time"),
+    SetMark => ("set mark", "set_mark"),
+    Copy => ("copy", "copy"),
+    Paste => ("paste", "paste"),
+    SayClipboard => ("say clipboard", "say_clipboard"),
+    PreviousClipboard => ("previous clipboard", "previous_clipboard"),
+    NextClipboard => ("next clipboard", "next_clipboard"),
+    ToggleTableMode => ("toggle table mode", "toggle_table_mode"),
+    ToggleStopSpeechOnFocusLoss => (
+        "toggle stop speech on focus loss",
+        "toggle_stop_speech_on_focus_loss"
+    ),
+    StartTableSetupMode => ("start table setup mode", "start_table_setup_mode"),
+    CancelTableSetupMode => ("cancel table setup mode", "cancel_table_setup_mode"),
+    CommitTableSetupMode => ("commit table setup mode", "commit_table_setup_mode"),
+    ToggleTableSetupTabstop => (
+        "toggle tabstop at review cursor",
+        "toggle_table_setup_tabstop"
+    ),
+    ExitTableMode => ("exit table mode", "exit_table_mode"),
+    TableRowPrev => ("previous table row", "table_row_prev"),
+    TableRowNext => ("next table row", "table_row_next"),
+    TableRowTop => ("top table row", "table_row_top"),
+    TableRowBottom => ("bottom table row", "table_row_bottom"),
+    TableColPrev => ("previous table column", "table_col_prev"),
+    TableColNext => ("next table column", "table_col_next"),
+    TableColFirst => ("first table column", "table_col_first"),
+    TableColLast => ("last table column", "table_col_last"),
+    TableCellRead => ("current table cell", "table_cell_read"),
+    TableHeaderRead => ("current table header", "table_header_read"),
+    ToggleTableHeaderRead => ("toggle table header reading", "toggle_table_header_read"),
+    TableWordPrev => ("previous word in cell", "table_word_prev"),
+    TableWordNext => ("next word in cell", "table_word_next"),
+    TableWordRead => ("current word in cell", "table_word_read"),
+    TableCharPrev => ("previous character in cell", "table_char_prev"),
+    TableCharNext => ("next character in cell", "table_char_next"),
+    TableCharRead => ("current character in cell", "table_char_read"),
 }
 
 pub enum CommandResult {
@@ -79,212 +139,8 @@ pub enum CommandResult {
     PtyInput(Vec<u8>),
 }
 
-const ACTION_TABLE: &[(Action, &str, &str)] = &[
-    (Action::ToggleHelp, "toggle help", "toggle_help"),
-    (
-        Action::ToggleAutoRead,
-        "toggle auto read",
-        "toggle_auto_read",
-    ),
-    (
-        Action::ToggleReviewCursorFollowsScreenCursor,
-        "toggle whether review cursor follows screen cursor",
-        "toggle_review_cursor_follows_screen_cursor",
-    ),
-    (
-        Action::ToggleSymbolLevel,
-        "toggle symbol level",
-        "toggle_symbol_level",
-    ),
-    (Action::SayOverlay, "repeat current overlay", "say_overlay"),
-    (Action::OpenLuaRepl, "open Lua REPL", "open_lua_repl"),
-    (
-        Action::PassNextKey,
-        "forward next key press",
-        "pass_next_key",
-    ),
-    (Action::StopSpeaking, "stop speaking", "stop_speaking"),
-    (Action::RevLinePrev, "previous line", "review_line_prev"),
-    (Action::RevLineNext, "next line", "review_line_next"),
-    (
-        Action::RevLinePrevNonBlank,
-        "previous non blank line",
-        "review_line_prev_non_blank",
-    ),
-    (
-        Action::RevLineNextNonBlank,
-        "next non blank line",
-        "review_line_next_non_blank",
-    ),
-    (Action::RevLineRead, "current line", "review_line_read"),
-    (
-        Action::RevCharPrev,
-        "previous character",
-        "review_char_prev",
-    ),
-    (Action::RevCharNext, "next character", "review_char_next"),
-    (Action::RevCharRead, "current character", "review_char_read"),
-    (
-        Action::RevCharReadPhonetic,
-        "current character phonetically",
-        "review_char_read_phonetic",
-    ),
-    (Action::RevWordPrev, "previous word", "review_word_prev"),
-    (Action::RevWordNext, "next word", "review_word_next"),
-    (Action::RevWordRead, "current word", "review_word_read"),
-    (Action::RevTop, "top", "review_top"),
-    (Action::RevBottom, "bottom", "review_bottom"),
-    (Action::RevFirst, "beginning of line", "review_first"),
-    (Action::RevLast, "end of line", "review_last"),
-    (
-        Action::RevReadAttributes,
-        "read attributes",
-        "review_read_attributes",
-    ),
-    (
-        Action::LeftClick,
-        "left click at review cursor",
-        "left_click",
-    ),
-    (
-        Action::RightClick,
-        "right click at review cursor",
-        "right_click",
-    ),
-    (Action::Backspace, "backspace", "backspace"),
-    (Action::Delete, "delete", "delete"),
-    (Action::SayTime, "say the time", "say_time"),
-    (Action::SetMark, "set mark", "set_mark"),
-    (Action::Copy, "copy", "copy"),
-    (Action::Paste, "paste", "paste"),
-    (Action::SayClipboard, "say clipboard", "say_clipboard"),
-    (
-        Action::PreviousClipboard,
-        "previous clipboard",
-        "previous_clipboard",
-    ),
-    (Action::NextClipboard, "next clipboard", "next_clipboard"),
-    (
-        Action::ToggleTableMode,
-        "toggle table mode",
-        "toggle_table_mode",
-    ),
-    (
-        Action::ToggleStopSpeechOnFocusLoss,
-        "toggle stop speech on focus loss",
-        "toggle_stop_speech_on_focus_loss",
-    ),
-    (
-        Action::StartTableSetupMode,
-        "start table setup mode",
-        "start_table_setup_mode",
-    ),
-    (
-        Action::CancelTableSetupMode,
-        "cancel table setup mode",
-        "cancel_table_setup_mode",
-    ),
-    (
-        Action::CommitTableSetupMode,
-        "commit table setup mode",
-        "commit_table_setup_mode",
-    ),
-    (
-        Action::ToggleTableSetupTabstop,
-        "toggle tabstop at review cursor",
-        "toggle_table_setup_tabstop",
-    ),
-    (Action::ExitTableMode, "exit table mode", "exit_table_mode"),
-    (Action::TableRowPrev, "previous table row", "table_row_prev"),
-    (Action::TableRowNext, "next table row", "table_row_next"),
-    (Action::TableRowTop, "top table row", "table_row_top"),
-    (
-        Action::TableRowBottom,
-        "bottom table row",
-        "table_row_bottom",
-    ),
-    (
-        Action::TableColPrev,
-        "previous table column",
-        "table_col_prev",
-    ),
-    (Action::TableColNext, "next table column", "table_col_next"),
-    (
-        Action::TableColFirst,
-        "first table column",
-        "table_col_first",
-    ),
-    (Action::TableColLast, "last table column", "table_col_last"),
-    (
-        Action::TableCellRead,
-        "current table cell",
-        "table_cell_read",
-    ),
-    (
-        Action::TableHeaderRead,
-        "current table header",
-        "table_header_read",
-    ),
-    (
-        Action::ToggleTableHeaderRead,
-        "toggle table header reading",
-        "toggle_table_header_read",
-    ),
-    (
-        Action::TableWordPrev,
-        "previous word in cell",
-        "table_word_prev",
-    ),
-    (
-        Action::TableWordNext,
-        "next word in cell",
-        "table_word_next",
-    ),
-    (
-        Action::TableWordRead,
-        "current word in cell",
-        "table_word_read",
-    ),
-    (
-        Action::TableCharPrev,
-        "previous character in cell",
-        "table_char_prev",
-    ),
-    (
-        Action::TableCharNext,
-        "next character in cell",
-        "table_char_next",
-    ),
-    (
-        Action::TableCharRead,
-        "current character in cell",
-        "table_char_read",
-    ),
-];
-
-impl Action {
-    pub fn help_text(&self) -> String {
-        ACTION_TABLE
-            .iter()
-            .find(|(action, _, _)| action == self)
-            .map(|(_, help, _)| (*help).to_string())
-            .unwrap_or_default()
-    }
-}
-
 pub fn builtin_action_name(action: Action) -> &'static str {
-    ACTION_TABLE
-        .iter()
-        .find(|(entry, _, _)| *entry == action)
-        .map(|(_, _, builtin)| *builtin)
-        .unwrap_or("")
-}
-
-pub fn builtin_action_from_name(name: &str) -> Option<Action> {
-    ACTION_TABLE
-        .iter()
-        .find(|(_, _, builtin)| *builtin == name)
-        .map(|(action, _, _)| *action)
+    action.metadata().name
 }
 
 pub fn handle(
@@ -294,1335 +150,99 @@ pub fn handle(
     action: Action,
 ) -> Result<CommandResult> {
     if let Action::ToggleHelp = action {
-        return action_toggle_help(sr);
+        return system::toggle_help(sr);
     }
-    if sr.help_mode {
-        sr.speak(&action.help_text(), false)?;
+    if sr.help_mode() {
+        sr.speak(action.help_text(), false)?;
         return Ok(CommandResult::Handled);
     }
 
     match action {
-        Action::ToggleAutoRead => action_toggle_auto_read(sr),
+        Action::ToggleAutoRead => system::toggle_auto_read(sr),
         Action::ToggleReviewCursorFollowsScreenCursor => {
-            action_toggle_review_cursor_follows_screen_cursor(sr, view)
+            system::toggle_review_follows_screen_cursor(sr, view)
         }
-        Action::ToggleSymbolLevel => action_toggle_symbol_level(sr),
-        Action::SayOverlay => action_say_overlay(sr, title),
-        Action::PassNextKey => action_pass_next_key(sr),
-        Action::StopSpeaking => action_stop(sr),
-        Action::RevLinePrev => action_review_line_prev(sr, view, false),
-        Action::RevLineNext => action_review_line_next(sr, view, false),
-        Action::RevLinePrevNonBlank => action_review_line_prev(sr, view, true),
-        Action::RevLineNextNonBlank => action_review_line_next(sr, view, true),
-        Action::RevLineRead => action_review_line_read(sr, view),
-        Action::RevWordPrev => action_review_word_prev(sr, view),
-        Action::RevWordNext => action_review_word_next(sr, view),
-        Action::RevWordRead => action_review_word_read(sr, view),
-        Action::RevCharPrev => action_review_char_prev(sr, view),
-        Action::RevCharNext => action_review_char_next(sr, view),
-        Action::RevCharRead => action_review_char_read(sr, view),
-        Action::RevCharReadPhonetic => action_review_char_read_phonetic(sr, view),
-        Action::RevTop => action_review_top(sr, view),
-        Action::RevBottom => action_review_bottom(sr, view),
-        Action::RevFirst => action_review_first(sr, view),
-        Action::RevLast => action_review_last(sr, view),
-        Action::RevReadAttributes => action_review_read_attributes(sr, view),
-        Action::LeftClick => action_click(sr, view, MouseButton::Left),
-        Action::RightClick => action_click(sr, view, MouseButton::Right),
-        Action::Backspace => action_backspace(sr, view),
-        Action::Delete => action_delete(sr, view),
-        Action::SayTime => action_say_time(sr),
-        Action::SetMark => action_set_mark(sr, view),
-        Action::Copy => action_copy(sr, view),
-        Action::Paste => action_paste(sr),
-        Action::SayClipboard => action_clipboard_say(sr),
-        Action::PreviousClipboard => action_clipboard_prev(sr),
-        Action::NextClipboard => action_clipboard_next(sr),
-        Action::ToggleTableMode => action_toggle_table_mode(sr, view),
-        Action::ToggleStopSpeechOnFocusLoss => action_toggle_stop_speech_on_focus_loss(sr),
-        Action::StartTableSetupMode => action_start_table_setup_mode(sr, view),
-        Action::CancelTableSetupMode => action_cancel_table_setup_mode(sr),
-        Action::CommitTableSetupMode => action_commit_table_setup_mode(sr, view),
-        Action::ToggleTableSetupTabstop => action_toggle_table_setup_tabstop(sr, view),
-        Action::ExitTableMode => action_exit_table_mode(sr),
-        Action::TableRowPrev => action_table_row_prev(sr, view),
-        Action::TableRowNext => action_table_row_next(sr, view),
-        Action::TableRowTop => action_table_row_top(sr, view),
-        Action::TableRowBottom => action_table_row_bottom(sr, view),
-        Action::TableColPrev => action_table_col_prev(sr, view),
-        Action::TableColNext => action_table_col_next(sr, view),
-        Action::TableColFirst => action_table_col_first(sr, view),
-        Action::TableColLast => action_table_col_last(sr, view),
-        Action::TableCellRead => action_table_cell_read(sr, view),
-        Action::TableHeaderRead => action_table_header_read(sr, view),
-        Action::ToggleTableHeaderRead => action_toggle_table_header_read(sr),
-        Action::TableWordPrev => action_table_word_prev(sr, view),
-        Action::TableWordNext => action_table_word_next(sr, view),
-        Action::TableWordRead => action_table_word_read(sr, view),
-        Action::TableCharPrev => action_table_char_prev(sr, view),
-        Action::TableCharNext => action_table_char_next(sr, view),
-        Action::TableCharRead => action_table_char_read(sr, view),
-        _ => {
+        Action::ToggleSymbolLevel => system::toggle_symbol_level(sr),
+        Action::SayOverlay => system::say_overlay(sr, title),
+        Action::PassNextKey => system::pass_next_key(sr),
+        Action::StopSpeaking => system::stop(sr),
+        Action::RevLinePrev => review::line_previous(sr, view, false),
+        Action::RevLineNext => review::line_next(sr, view, false),
+        Action::RevLinePrevNonBlank => review::line_previous(sr, view, true),
+        Action::RevLineNextNonBlank => review::line_next(sr, view, true),
+        Action::RevLineRead => review::line_read(sr, view),
+        Action::RevWordPrev => review::word_previous(sr, view),
+        Action::RevWordNext => review::word_next(sr, view),
+        Action::RevWordRead => review::word_read(sr, view),
+        Action::RevCharPrev => review::character_previous(sr, view),
+        Action::RevCharNext => review::character_next(sr, view),
+        Action::RevCharRead => review::character_read(sr, view),
+        Action::RevCharReadPhonetic => review::character_read_phonetic(sr, view),
+        Action::RevTop => review::top(sr, view),
+        Action::RevBottom => review::bottom(sr, view),
+        Action::RevFirst => review::first(sr, view),
+        Action::RevLast => review::last(sr, view),
+        Action::RevReadAttributes => review::read_attributes(sr, view),
+        Action::LeftClick => mouse::click(sr, view, mouse::Button::Left),
+        Action::RightClick => mouse::click(sr, view, mouse::Button::Right),
+        Action::Backspace => system::backspace(sr, view),
+        Action::Delete => system::delete(sr, view),
+        Action::SayTime => system::say_time(sr),
+        Action::SetMark => clipboard::set_mark(sr, view),
+        Action::Copy => clipboard::copy(sr, view),
+        Action::Paste => clipboard::paste(sr),
+        Action::SayClipboard => clipboard::say(sr),
+        Action::PreviousClipboard => clipboard::previous(sr),
+        Action::NextClipboard => clipboard::next(sr),
+        Action::ToggleTableMode => table::toggle_mode(sr, view),
+        Action::ToggleStopSpeechOnFocusLoss => system::toggle_stop_speech_on_focus_loss(sr),
+        Action::StartTableSetupMode => table::start_setup(sr, view),
+        Action::CancelTableSetupMode => table::cancel_setup(sr),
+        Action::CommitTableSetupMode => table::commit_setup(sr, view),
+        Action::ToggleTableSetupTabstop => table::toggle_setup_tabstop(sr, view),
+        Action::ExitTableMode => table::exit_mode(sr),
+        Action::TableRowPrev => table::row_move(sr, view, table::RowMove::Previous),
+        Action::TableRowNext => table::row_move(sr, view, table::RowMove::Next),
+        Action::TableRowTop => table::row_move(sr, view, table::RowMove::First),
+        Action::TableRowBottom => table::row_move(sr, view, table::RowMove::Last),
+        Action::TableColPrev => table::column_move(sr, view, table::ColumnMove::Previous),
+        Action::TableColNext => table::column_move(sr, view, table::ColumnMove::Next),
+        Action::TableColFirst => table::column_move(sr, view, table::ColumnMove::First),
+        Action::TableColLast => table::column_move(sr, view, table::ColumnMove::Last),
+        Action::TableCellRead => table::cell_read(sr, view),
+        Action::TableHeaderRead => table::header_read(sr, view),
+        Action::ToggleTableHeaderRead => table::toggle_header_read(sr),
+        Action::TableWordPrev => table::word_previous(sr, view),
+        Action::TableWordNext => table::word_next(sr, view),
+        Action::TableWordRead => table::word_read(sr, view),
+        Action::TableCharPrev => table::character_previous(sr, view),
+        Action::TableCharNext => table::character_next(sr, view),
+        Action::TableCharRead => table::character_read(sr, view),
+        Action::ToggleHelp | Action::OpenLuaRepl => {
             sr.speak("not implemented", false)?;
             Ok(CommandResult::Handled)
         }
     }
 }
 
-// Actions
-#[derive(Copy, Clone)]
-enum MouseButton {
-    Left,
-    Right,
-}
-
-fn action_click(sr: &mut ScreenReader, view: &View, button: MouseButton) -> Result<CommandResult> {
-    let screen = view.screen();
-    if screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None {
-        sr.speak("mouse input unavailable", false)?;
-        return Ok(CommandResult::Handled);
-    }
-
-    let Some(input) = encode_mouse_click(
-        screen.mouse_protocol_mode(),
-        screen.mouse_protocol_encoding(),
-        button,
-        view.review_cursor_position,
-    ) else {
-        sr.speak("mouse position unavailable", false)?;
-        return Ok(CommandResult::Handled);
-    };
-
-    Ok(CommandResult::PtyInput(input))
-}
-
-fn encode_mouse_click(
-    mode: vt100::MouseProtocolMode,
-    encoding: vt100::MouseProtocolEncoding,
-    button: MouseButton,
-    (row, col): (u16, u16),
-) -> Option<Vec<u8>> {
-    let button_code = match button {
-        MouseButton::Left => 0,
-        MouseButton::Right => 2,
-    };
-    let include_release = mode != vt100::MouseProtocolMode::Press;
-    let mut input = Vec::new();
-
-    match encoding {
-        vt100::MouseProtocolEncoding::Sgr => {
-            input.extend_from_slice(
-                format!(
-                    "\x1B[<{button_code};{};{}M",
-                    u32::from(col) + 1,
-                    u32::from(row) + 1
-                )
-                .as_bytes(),
-            );
-            if include_release {
-                input.extend_from_slice(
-                    format!(
-                        "\x1B[<{button_code};{};{}m",
-                        u32::from(col) + 1,
-                        u32::from(row) + 1
-                    )
-                    .as_bytes(),
-                );
-            }
-        }
-        vt100::MouseProtocolEncoding::Default => {
-            let col = u8::try_from(u32::from(col) + 33).ok()?;
-            let row = u8::try_from(u32::from(row) + 33).ok()?;
-            input.extend_from_slice(&[0x1B, b'[', b'M', button_code + 32, col, row]);
-            if include_release {
-                input.extend_from_slice(&[0x1B, b'[', b'M', 35, col, row]);
-            }
-        }
-        vt100::MouseProtocolEncoding::Utf8 => {
-            let col = char::from_u32(u32::from(col) + 33)?;
-            let row = char::from_u32(u32::from(row) + 33)?;
-            input.extend_from_slice(b"\x1B[M");
-            input.push(button_code + 32);
-            input.extend_from_slice(col.to_string().as_bytes());
-            input.extend_from_slice(row.to_string().as_bytes());
-            if include_release {
-                input.extend_from_slice(b"\x1B[M#");
-                input.extend_from_slice(col.to_string().as_bytes());
-                input.extend_from_slice(row.to_string().as_bytes());
-            }
-        }
-    }
-
-    Some(input)
-}
-
-fn action_stop(sr: &mut ScreenReader) -> Result<CommandResult> {
-    sr.speech.stop()?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_toggle_auto_read(sr: &mut ScreenReader) -> Result<CommandResult> {
-    if sr.auto_read {
-        sr.auto_read = false;
-        sr.speak("auto read disabled", false)?;
-    } else {
-        sr.auto_read = true;
-        sr.speak("auto read enabled", false)?;
-    }
-
-    Ok(CommandResult::Handled)
-}
-
-fn action_toggle_stop_speech_on_focus_loss(sr: &mut ScreenReader) -> Result<CommandResult> {
-    sr.stop_speech_on_focus_loss = !sr.stop_speech_on_focus_loss;
-    let status = if sr.stop_speech_on_focus_loss {
-        "enabled"
-    } else {
-        "disabled"
-    };
-    sr.speak(&format!("stop on focus loss {}", status), false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_say_overlay(sr: &mut ScreenReader, title: &str) -> Result<CommandResult> {
-    sr.speak(title, false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_toggle_review_cursor_follows_screen_cursor(
-    sr: &mut ScreenReader,
-    view: &mut View,
-) -> Result<CommandResult> {
-    sr.review_follows_screen_cursor = !sr.review_follows_screen_cursor;
-    match sr.review_follows_screen_cursor {
-        true => {
-            let old = view.review_cursor_position;
-            view.review_cursor_position = view.screen().cursor_position();
-            sr.hook_on_review_cursor_move(old, view.review_cursor_position)?;
-            sr.speak("review cursor following screen cursor", false)?;
-        }
-        false => sr.speak("review cursor not following screen cursor", false)?,
-    };
-    Ok(CommandResult::Handled)
-}
-
-fn action_pass_next_key(sr: &mut ScreenReader) -> Result<CommandResult> {
-    sr.pass_through = true;
-    sr.speak("forward next key press", false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_toggle_help(sr: &mut ScreenReader) -> Result<CommandResult> {
-    if sr.help_mode {
-        sr.help_mode = false;
-        sr.speak("exiting help", false)?;
-    } else {
-        sr.help_mode = true;
-        sr.speak("entering help. Press this key again to exit", false)?;
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn report_review_cursor_move(
-    sr: &mut ScreenReader,
-    view: &View,
-    old_pos: (u16, u16),
-) -> Result<()> {
-    sr.hook_on_review_cursor_move(old_pos, view.review_cursor_position)
-}
-
-fn action_review_line_prev(
-    sr: &mut ScreenReader,
-    view: &mut View,
-    skip_blank_lines: bool,
-) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    if !view.review_cursor_up(skip_blank_lines) {
-        sr.speak("top", false)?;
-    }
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_line_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_line_next(
-    sr: &mut ScreenReader,
-    view: &mut View,
-    skip_blank_lines: bool,
-) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    if !view.review_cursor_down(skip_blank_lines) {
-        sr.speak("bottom", false)?;
-    }
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_line_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_line_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let row = view.review_cursor_position.0;
-    sr.report_review_cursor_indentation_changes(view)?;
-    let line = view.line(row);
-    if line.is_empty() {
-        sr.speak("blank", false)?;
-    } else {
-        sr.speak(&line, false)?;
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_word_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    if !view.review_cursor_prev_word() {
-        sr.speak("left", false)?;
-    }
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_word_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_word_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    if !view.review_cursor_next_word() {
-        sr.speak("right", false)?;
-    }
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_word_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_word_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let (row, col) = view.review_cursor_position;
-    let word = view.word(row, col);
-    sr.speak(&word, false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_char_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    if !view.review_cursor_left() {
-        sr.speak("left", false)?;
-    }
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_char_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_char_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    if !view.review_cursor_right() {
-        sr.speak("right", false)?;
-    }
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_char_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_char_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let (row, col) = view.review_cursor_position;
-    let char = view.character(row, col);
-    if char.is_empty() {
-        sr.speak("blank", false)?;
-    } else {
-        sr.speak(&char, false)?;
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_char_read_phonetic(
-    sr: &mut ScreenReader,
-    view: &mut View,
-) -> Result<CommandResult> {
-    let (row, col) = view.review_cursor_position;
-    let char = view.character(row, col);
-    let char = match char.to_lowercase().as_str() {
-        "a" => "Alpha",
-        "b" => "Bravo",
-        "c" => "Charlie",
-        "d" => "Delta",
-        "e" => "Echo",
-        "f" => "Foxtrot",
-        "g" => "Golf",
-        "h" => "Hotel",
-        "i" => "India",
-        "j" => "Juliett",
-        "k" => "Kilo",
-        "l" => "Lima",
-        "m" => "Mike",
-        "n" => "November",
-        "o" => "Oscar",
-        "p" => "Papa",
-        "q" => "Quebec",
-        "r" => "Romeo",
-        "s" => "Sierra",
-        "t" => "Tango",
-        "u" => "Uniform",
-        "v" => "Victor",
-        "w" => "Whiskey",
-        "x" => "X-ray",
-        "y" => "Yankee",
-        "z" => "Zulu",
-        _ => &char,
-    };
-    sr.speak(char, false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_top(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    let row = view.review_cursor_position.0;
-    let last_row = view.size().0 - 1;
-    let last_col = view.size().1 - 1;
-    view.review_cursor_position.0 = match row {
-        0 => view
-            .screen()
-            .find_cell(CellExt::is_in_word, 0, 0, last_row, last_col)
-            .map_or(0, |(row, _)| row),
-        _ => 0,
-    };
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_line_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_bottom(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    let row = view.review_cursor_position.0;
-    let last_row = view.size().0 - 1;
-    let last_col = view.size().1 - 1;
-    view.review_cursor_position.0 = if row == last_row {
-        view.screen()
-            .rfind_cell(CellExt::is_in_word, 0, 0, last_row, last_col)
-            .map_or(last_row, |(row, _)| row)
-    } else {
-        last_row
-    };
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_line_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_first(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    let (row, col) = view.review_cursor_position;
-    let last = view.size().1 - 1;
-    view.review_cursor_position.1 = match col {
-        0 => view
-            .screen()
-            .find_cell(CellExt::is_in_word, row, 0, row, last)
-            .map_or(0, |(_, col)| col),
-        _ => 0,
-    };
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_char_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_last(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let old_pos = view.review_cursor_position;
-    let (row, col) = view.review_cursor_position;
-    let last = view.size().1 - 1;
-    view.review_cursor_position.1 = if col == last {
-        view.screen()
-            .rfind_cell(CellExt::is_in_word, row, 0, row, last)
-            .map_or(last, |(_, col)| col)
-    } else {
-        last
-    };
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_review_char_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_review_read_attributes(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let (row, col) = view.review_cursor_position;
-    let cell = view
-        .screen()
-        .cell(row, col)
-        .ok_or_else(|| anyhow!("cannot get cell at row {}, column {}", row, col))?;
-
-    let mut attrs = String::new();
-    attrs.push_str(&format!("Row {} col {} ", row + 1, col + 1));
-    attrs.push_str(&format!(
-        "{} {}",
-        attributes::describe_color(cell.fgcolor()),
-        if let vt100::Color::Default = cell.bgcolor() {
-            "".into()
-        } else {
-            format!("on {}", attributes::describe_color(cell.bgcolor()))
-        }
-    ));
-    attrs.push_str(&format!(
-        "{}{}{}{}{}",
-        if cell.bold() { "bold " } else { "" },
-        if cell.italic() { "italic " } else { "" },
-        if cell.underline() { "underline " } else { "" },
-        if cell.inverse() { "inverse " } else { "" },
-        if cell.is_wide() { "wide " } else { "" },
-    ));
-
-    sr.speak(&attrs, false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_backspace(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    sr.defer_backspace(view);
-    // When backspacing, the cursor will end up moving to the left, but we don't want to hear
-    // that.
-    sr.cursor_tracking_mode = match sr.cursor_tracking_mode {
-        CursorTrackingMode::Off => CursorTrackingMode::Off,
-        _ => CursorTrackingMode::OffOnce,
-    };
-    Ok(CommandResult::ForwardInput)
-}
-
-fn action_delete(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    sr.defer_delete(view);
-    Ok(CommandResult::ForwardInput)
-}
-
-fn action_say_time(sr: &mut ScreenReader) -> Result<CommandResult> {
-    let date = chrono::Local::now();
-    sr.speak(&format!("{}", date.format("%H:%M")), false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_set_mark(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    view.review_mark_position = Some(view.review_cursor_position);
-    sr.speak("mark set", false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_copy(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    match view.review_mark_position {
-        Some((mark_row, mark_col)) => {
-            let (cur_row, cur_col) = view.review_cursor_position;
-            if mark_row > cur_row || (mark_row == cur_row && mark_col > cur_col) {
-                sr.speak("mark is after the review cursor", false)?;
-                return Ok(CommandResult::Handled);
-            }
-
-            let mut contents = String::new();
-            for row in mark_row..=cur_row {
-                let start = if row == mark_row { mark_col } else { 0 };
-                // end is not inclusive, so that a blank row can be achieved with start == end.
-                let end = if row == cur_row {
-                    cur_col + 1
-                } else {
-                    view.size().1
-                };
-                // Don't add trailing blank/whitespace cells
-                let end = view
-                    .screen()
-                    .rfind_cell(
-                        |c| !c.contents().trim().is_empty(),
-                        row,
-                        start,
-                        row,
-                        end - 1,
-                    )
-                    .map_or(end, |(_, col)| col + 1);
-                for col in start..end {
-                    contents.push_str(
-                        view.screen()
-                            .cell(row, col)
-                            .map_or("", vt100::Cell::contents),
-                    );
-                }
-                if row != cur_row {
-                    contents.push('\n');
-                }
-            }
-            sr.clipboard.put(contents);
-            let entry = sr.clipboard.get().map(|value| value.to_string());
-            sr.hook_on_clipboard_change("push", entry.as_deref())?;
-            sr.speak("copied", false)?;
-        }
-        None => sr.speak("no mark set", false)?,
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn action_paste(sr: &mut ScreenReader) -> Result<CommandResult> {
-    match sr.clipboard.get() {
-        Some(contents) => {
-            return Ok(CommandResult::Paste(contents.to_string()));
-        }
-        None => sr.speak("no clipboard", false)?,
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn action_clipboard_prev(sr: &mut ScreenReader) -> Result<CommandResult> {
-    if sr.clipboard.size() == 0 {
-        sr.speak("no clipboard", false)?;
-    } else if sr.clipboard.prev() {
-        let entry = sr.clipboard.get().map(|value| value.to_string());
-        sr.hook_on_clipboard_change("prev", entry.as_deref())?;
-        action_clipboard_say(sr)?;
-    } else {
-        sr.speak("first clipboard", false)?;
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn action_clipboard_next(sr: &mut ScreenReader) -> Result<CommandResult> {
-    if sr.clipboard.size() == 0 {
-        sr.speak("no clipboard", false)?;
-    } else if sr.clipboard.next() {
-        let entry = sr.clipboard.get().map(|value| value.to_string());
-        sr.hook_on_clipboard_change("next", entry.as_deref())?;
-        action_clipboard_say(sr)?;
-    } else {
-        sr.speak("last clipboard", false)?;
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn action_clipboard_say(sr: &mut ScreenReader) -> Result<CommandResult> {
-    let contents = sr.clipboard.get().map(|value| value.to_string());
-    match contents {
-        Some(contents) => sr.speak(&contents, false)?,
-        None => sr.speak("no clipboard", false)?,
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn action_toggle_table_mode(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if matches!(sr.input_mode, InputMode::Table) {
-        return action_exit_table_mode(sr);
-    }
-
-    let row = view.review_cursor_position.0;
-    let Some(model) = table::detect(view, row) else {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    enter_table_mode_with_model(sr, view, model)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_start_table_setup_mode(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if matches!(sr.input_mode, InputMode::TableSetup) {
-        sr.speak("table setup already on", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    if matches!(sr.input_mode, InputMode::Table) {
-        sr.speak("exit table mode first", false)?;
-        return Ok(CommandResult::Handled);
-    }
-
-    let row = view.review_cursor_position.0;
-    if view.line(row).trim().is_empty() {
-        sr.speak("header row is blank", false)?;
-        return Ok(CommandResult::Handled);
-    }
-
-    sr.table_setup_state = Some(TableSetupState {
-        header_row: row,
-        tabstops: Vec::new(),
-    });
-    sr.table_state = None;
-    let old_mode = sr.input_mode;
-    sr.input_mode = InputMode::TableSetup;
-    sr.hook_on_mode_change(old_mode, sr.input_mode)?;
-    sr.speak("table setup on", false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_cancel_table_setup_mode(sr: &mut ScreenReader) -> Result<CommandResult> {
-    if !matches!(sr.input_mode, InputMode::TableSetup) {
-        return Ok(CommandResult::Handled);
-    }
-
-    sr.table_setup_state = None;
-    let old_mode = sr.input_mode;
-    sr.input_mode = InputMode::Normal;
-    sr.hook_on_mode_change(old_mode, sr.input_mode)?;
-    sr.speak("table setup off", false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_toggle_table_setup_tabstop(
-    sr: &mut ScreenReader,
-    view: &mut View,
-) -> Result<CommandResult> {
-    if !matches!(sr.input_mode, InputMode::TableSetup) {
-        return Ok(CommandResult::Handled);
-    }
-    let Some(setup) = sr.table_setup_state.as_mut() else {
-        sr.speak("table setup not active", false)?;
-        return Ok(CommandResult::Handled);
-    };
-
-    let col = view.review_cursor_position.1;
-    if col == 0 {
-        sr.speak("cannot set tabstop at first column", false)?;
-        return Ok(CommandResult::Handled);
-    }
-
-    if let Some(idx) = setup.tabstops.iter().position(|stop| *stop == col) {
-        setup.tabstops.remove(idx);
-        sr.speak("tabstop removed", false)?;
-    } else {
-        setup.tabstops.push(col);
-        setup.tabstops.sort_unstable();
-        setup.tabstops.dedup();
-        sr.speak("tabstop added", false)?;
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn action_commit_table_setup_mode(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !matches!(sr.input_mode, InputMode::TableSetup) {
-        return Ok(CommandResult::Handled);
-    }
-
-    let Some(setup) = sr.table_setup_state.clone() else {
-        sr.speak("table setup not active", false)?;
-        return Ok(CommandResult::Handled);
-    };
-
-    let Some(model) = table::detect_manual_from_header(view, setup.header_row, &setup.tabstops)
-    else {
-        sr.speak("manual table setup invalid", false)?;
-        return Ok(CommandResult::Handled);
-    };
-
-    sr.table_setup_state = None;
-    enter_table_mode_with_model(sr, view, model)?;
-    Ok(CommandResult::Handled)
-}
-
-fn enter_table_mode_with_model(
-    sr: &mut ScreenReader,
-    view: &mut View,
-    model: table::TableModel,
-) -> Result<()> {
-    let old_pos = view.review_cursor_position;
-    let anchor_row = old_pos.0;
-    let entry_row = model
-        .nearest_data_row(view, anchor_row)
-        .unwrap_or(anchor_row);
-    let mut col_idx = model.column_for_col(view.review_cursor_position.1);
-    col_idx = model.nearest_non_empty_col(view, entry_row, col_idx);
-    sr.table_state = Some(TableState {
-        model,
-        current_col: col_idx,
-    });
-    if let Some(state) = sr.table_state.as_ref() {
-        let column = &state.model.columns[state.current_col];
-        view.review_cursor_position = (entry_row, column.start);
-    }
-    let old_mode = sr.input_mode;
-    sr.input_mode = InputMode::Table;
-    sr.hook_on_mode_change(old_mode, sr.input_mode)?;
-    if let Some(state) = sr.table_state.clone() {
-        sr.hook_on_table_mode_enter(&state)?;
-    }
-    report_review_cursor_move(sr, view, old_pos)?;
-    sr.speak("table mode on", false)?;
-    action_table_cell_read(sr, view)?;
-    Ok(())
-}
-
-fn action_exit_table_mode(sr: &mut ScreenReader) -> Result<CommandResult> {
-    let old_mode = sr.input_mode;
-    sr.input_mode = InputMode::Normal;
-    sr.table_state = None;
-    sr.table_setup_state = None;
-    sr.hook_on_mode_change(old_mode, sr.input_mode)?;
-    sr.hook_on_table_mode_exit()?;
-    sr.speak("table mode off", false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_row_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let state_snapshot = sr.table_state.as_ref().unwrap().clone();
-    let Some(new_row) = state_snapshot
-        .model
-        .prev_data_row(view, view.review_cursor_position.0)
-    else {
-        sr.speak("top", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let old_pos = view.review_cursor_position;
-    move_review_to_table_cell(view, &state_snapshot, new_row);
-    report_review_cursor_move(sr, view, old_pos)?;
-    speak_table_cell(sr, view, &state_snapshot, false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_row_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let state_snapshot = sr.table_state.as_ref().unwrap().clone();
-    let Some(new_row) = state_snapshot
-        .model
-        .next_data_row(view, view.review_cursor_position.0)
-    else {
-        sr.speak("bottom", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let old_pos = view.review_cursor_position;
-    move_review_to_table_cell(view, &state_snapshot, new_row);
-    report_review_cursor_move(sr, view, old_pos)?;
-    speak_table_cell(sr, view, &state_snapshot, false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_row_top(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let state_snapshot = sr.table_state.as_ref().unwrap().clone();
-    let Some(new_row) = state_snapshot
-        .model
-        .nearest_data_row(view, state_snapshot.model.top)
-    else {
-        sr.speak("top", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let old_pos = view.review_cursor_position;
-    move_review_to_table_cell(view, &state_snapshot, new_row);
-    report_review_cursor_move(sr, view, old_pos)?;
-    speak_table_cell(sr, view, &state_snapshot, false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_row_bottom(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let state_snapshot = sr.table_state.as_ref().unwrap().clone();
-    let Some(new_row) = state_snapshot
-        .model
-        .nearest_data_row(view, state_snapshot.model.bottom)
-    else {
-        sr.speak("bottom", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let old_pos = view.review_cursor_position;
-    move_review_to_table_cell(view, &state_snapshot, new_row);
-    report_review_cursor_move(sr, view, old_pos)?;
-    speak_table_cell(sr, view, &state_snapshot, false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_col_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let old_pos = view.review_cursor_position;
-    let state_snapshot = {
-        let state = sr.table_state.as_mut().unwrap();
-        if state.current_col == 0 {
-            sr.speak("left", false)?;
-            return Ok(CommandResult::Handled);
-        }
-        state.current_col -= 1;
-        move_review_to_table_cell(view, state, view.review_cursor_position.0);
-        state.clone()
-    };
-    report_review_cursor_move(sr, view, old_pos)?;
-    speak_table_cell(sr, view, &state_snapshot, sr.table_header_auto)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_col_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let old_pos = view.review_cursor_position;
-    let state_snapshot = {
-        let state = sr.table_state.as_mut().unwrap();
-        if state.current_col + 1 >= state.model.columns.len() {
-            sr.speak("right", false)?;
-            return Ok(CommandResult::Handled);
-        }
-        state.current_col += 1;
-        move_review_to_table_cell(view, state, view.review_cursor_position.0);
-        state.clone()
-    };
-    report_review_cursor_move(sr, view, old_pos)?;
-    speak_table_cell(sr, view, &state_snapshot, sr.table_header_auto)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_col_first(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let old_pos = view.review_cursor_position;
-    let state_snapshot = {
-        let state = sr.table_state.as_mut().unwrap();
-        if state.current_col == 0 {
-            sr.speak("left", false)?;
-            return Ok(CommandResult::Handled);
-        }
-        state.current_col = 0;
-        move_review_to_table_cell(view, state, view.review_cursor_position.0);
-        state.clone()
-    };
-    report_review_cursor_move(sr, view, old_pos)?;
-    speak_table_cell(sr, view, &state_snapshot, sr.table_header_auto)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_col_last(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let old_pos = view.review_cursor_position;
-    let state_snapshot = {
-        let state = sr.table_state.as_mut().unwrap();
-        let last_idx = state.model.columns.len().saturating_sub(1);
-        if state.current_col == last_idx {
-            sr.speak("right", false)?;
-            return Ok(CommandResult::Handled);
-        }
-        state.current_col = last_idx;
-        move_review_to_table_cell(view, state, view.review_cursor_position.0);
-        state.clone()
-    };
-    report_review_cursor_move(sr, view, old_pos)?;
-    speak_table_cell(sr, view, &state_snapshot, sr.table_header_auto)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_cell_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let state = sr.table_state.as_ref().unwrap().clone();
-    speak_table_cell(sr, view, &state, false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_header_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let state = sr.table_state.as_ref().unwrap().clone();
-    if let Some(text) = state.model.header_text(view, state.current_col) {
-        sr.speak(&text, false)?;
-    } else {
-        sr.speak("no header", false)?;
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn action_toggle_table_header_read(sr: &mut ScreenReader) -> Result<CommandResult> {
-    sr.table_header_auto = !sr.table_header_auto;
-    let status = if sr.table_header_auto { "on" } else { "off" };
-    sr.speak(&format!("table headers {}", status), false)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_word_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let Some((start, _end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let old_pos = view.review_cursor_position;
-    let (row, col) = old_pos;
-    if col <= start {
-        sr.speak("left", false)?;
-        action_table_word_read(sr, view)?;
-        return Ok(CommandResult::Handled);
-    }
-
-    let mut idx = col.saturating_sub(1);
-    while idx > start && is_cell_whitespace(view, row, idx) {
-        idx = idx.saturating_sub(1);
-    }
-    while idx > start && !is_cell_whitespace(view, row, idx.saturating_sub(1)) {
-        idx = idx.saturating_sub(1);
-    }
-    view.review_cursor_position.1 = idx;
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_table_word_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_word_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let Some((start, end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let old_pos = view.review_cursor_position;
-    let (row, mut idx) = old_pos;
-    let old_word_end = table_word_end_from_or_left(view, row, old_pos.1, start, end);
-    if idx < start {
-        idx = start;
-    }
-    while idx < end && !is_cell_whitespace(view, row, idx) {
-        idx += 1;
-    }
-    while idx <= end && is_cell_whitespace(view, row, idx) {
-        idx += 1;
-    }
-    if idx > end || old_word_end.is_some_and(|word_end| idx <= word_end) {
-        sr.speak("right", false)?;
-        action_table_word_read(sr, view)?;
-        return Ok(CommandResult::Handled);
-    }
-    view.review_cursor_position.1 = idx;
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_table_word_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_word_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let Some((start, end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let (row, col) = view.review_cursor_position;
-    let Some((word_start, word_end)) = table_word_bounds_at(view, row, col, start, end) else {
-        sr.speak("blank", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let text = view
-        .screen()
-        .contents_between(row, word_start, row, word_end + 1);
-    let spoken = text.trim();
-    if spoken.is_empty() {
-        sr.speak("blank", false)?;
-    } else {
-        sr.speak(spoken, false)?;
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn table_word_bounds_at(
-    view: &View,
-    row: u16,
-    col: u16,
-    start: u16,
-    end: u16,
-) -> Option<(u16, u16)> {
-    let mut idx = col.clamp(start, end);
-    if is_cell_whitespace(view, row, idx) {
-        let mut right = idx;
-        while right <= end && is_cell_whitespace(view, row, right) {
-            right += 1;
-        }
-        idx = if right <= end {
-            right
-        } else {
-            let mut left = idx;
-            while left > start && is_cell_whitespace(view, row, left) {
-                left -= 1;
-            }
-            if is_cell_whitespace(view, row, left) {
-                return None;
-            }
-            left
-        };
-    }
-
-    let mut word_start = idx;
-    while word_start > start && !is_cell_whitespace(view, row, word_start - 1) {
-        word_start -= 1;
-    }
-
-    let mut word_end = idx;
-    while word_end < end && !is_cell_whitespace(view, row, word_end + 1) {
-        word_end += 1;
-    }
-
-    Some((word_start, word_end))
-}
-
-fn table_word_end_from_or_left(
-    view: &View,
-    row: u16,
-    col: u16,
-    start: u16,
-    end: u16,
-) -> Option<u16> {
-    let mut idx = col.clamp(start, end);
-    while idx > start && is_cell_whitespace(view, row, idx) {
-        idx -= 1;
-    }
-    if is_cell_whitespace(view, row, idx) {
-        return None;
-    }
-    while idx < end && !is_cell_whitespace(view, row, idx + 1) {
-        idx += 1;
-    }
-    Some(idx)
-}
-
-fn action_table_char_prev(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let Some((start, _end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let old_pos = view.review_cursor_position;
-    if old_pos.1 <= start {
-        sr.speak("left", false)?;
-        action_table_char_read(sr, view)?;
-        return Ok(CommandResult::Handled);
-    }
-    view.review_cursor_position.1 = old_pos.1.saturating_sub(1);
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_table_char_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_char_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let Some((_start, end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let old_pos = view.review_cursor_position;
-    if old_pos.1 >= end {
-        sr.speak("right", false)?;
-        action_table_char_read(sr, view)?;
-        return Ok(CommandResult::Handled);
-    }
-    view.review_cursor_position.1 = old_pos.1 + 1;
-    report_review_cursor_move(sr, view, old_pos)?;
-    action_table_char_read(sr, view)?;
-    Ok(CommandResult::Handled)
-}
-
-fn action_table_char_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    if !ensure_table_state(sr, view) {
-        sr.speak("no table found", false)?;
-        return Ok(CommandResult::Handled);
-    }
-    let Some((start, end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
-        return Ok(CommandResult::Handled);
-    };
-    let (row, col) = view.review_cursor_position;
-    let col = col.clamp(start, end);
-    let ch = view.screen().contents_between(row, col, row, col + 1);
-    if ch.trim().is_empty() {
-        sr.speak("space", false)?;
-    } else {
-        sr.speak(&ch, false)?;
-    }
-    Ok(CommandResult::Handled)
-}
-
-fn ensure_table_state(sr: &mut ScreenReader, view: &mut View) -> bool {
-    let row = view.review_cursor_position.0;
-    let needs_refresh = match &sr.table_state {
-        Some(state) => row < state.model.top || row > state.model.bottom,
-        None => true,
-    };
-    if needs_refresh {
-        if let Some(model) = table::detect(view, row) {
-            let col_idx = model.column_for_col(view.review_cursor_position.1);
-            sr.table_state = Some(TableState {
-                model,
-                current_col: col_idx,
-            });
-        } else {
-            sr.table_state = None;
-            return false;
-        }
-    }
-    if let Some(state) = sr.table_state.as_mut() {
-        if state.model.is_skippable_row(view, row)
-            && let Some(target_row) = state.model.nearest_data_row(view, row)
-        {
-            move_review_to_table_cell(view, state, target_row);
-        }
-        state.current_col = state.model.column_for_col(view.review_cursor_position.1);
-        if state.current_col >= state.model.columns.len() {
-            state.current_col = 0;
-        }
-    }
-    true
-}
-
-fn move_review_to_table_cell(view: &mut View, state: &TableState, row: u16) {
-    let row = state.model.clamp_row(row);
-    if let Some(column) = state.model.columns.get(state.current_col) {
-        let target_col =
-            first_text_col_in_range(view, row, column.start, column.end).unwrap_or(column.start);
-        view.review_cursor_position = (row, target_col);
-    }
-}
-
-fn current_cell_text_bounds(sr: &ScreenReader, view: &View) -> Option<(u16, u16)> {
-    let state = sr.table_state.as_ref()?;
-    let row = view.review_cursor_position.0;
-    let col = state.model.columns.get(state.current_col)?;
-    let start = first_text_col_in_range(view, row, col.start, col.end)?;
-    let end = last_text_col_in_range(view, row, col.start, col.end)?;
-    Some((start, end))
-}
-
-fn first_text_col_in_range(view: &View, row: u16, start: u16, end: u16) -> Option<u16> {
-    (start..=end).find(|&col| !is_cell_whitespace(view, row, col))
-}
-
-fn last_text_col_in_range(view: &View, row: u16, start: u16, end: u16) -> Option<u16> {
-    let mut col = end;
-    loop {
-        if !is_cell_whitespace(view, row, col) {
-            return Some(col);
-        }
-        if col == start {
-            break;
-        }
-        col -= 1;
-    }
-    None
-}
-
-fn is_cell_whitespace(view: &View, row: u16, col: u16) -> bool {
-    view.screen()
-        .cell(row, col)
-        .map(|cell| !cell.is_wide_continuation() && cell.contents().trim().is_empty())
-        .unwrap_or(true)
-}
-
-fn speak_table_cell(
-    sr: &mut ScreenReader,
-    view: &View,
-    state: &TableState,
-    include_header: bool,
-) -> Result<()> {
-    let row = view.review_cursor_position.0;
-    if include_header
-        && let Some(header_row) = state.model.header_row
-        && header_row != row
-        && let Some(text) = state.model.header_text(view, state.current_col)
-    {
-        sr.speak(&text, false)?;
-    }
-    let text = state.model.cell_text(view, row, state.current_col);
-    if text.is_empty() {
-        sr.speak("blank", false)?;
-    } else {
-        sr.speak(&text, false)?;
-    }
-    Ok(())
-}
-
-fn action_toggle_symbol_level(sr: &mut ScreenReader) -> Result<CommandResult> {
-    use super::speech::symbols::Level;
-
-    sr.speech.symbol_level = match sr.speech.symbol_level {
-        Level::None => Level::Some,
-        Level::Some => Level::Most,
-        Level::Most => Level::All,
-        Level::All | Level::Character => Level::None,
-    };
-
-    sr.speak(&format!("{}", sr.speech.symbol_level), false)?;
-
-    Ok(CommandResult::Handled)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MouseButton, encode_mouse_click};
-    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+    use super::{ACTION_TABLE, builtin_action_from_name, builtin_action_name};
+    use std::collections::HashSet;
 
     #[test]
-    fn encodes_sgr_left_click_with_one_based_coordinates() {
-        let input = encode_mouse_click(
-            MouseProtocolMode::PressRelease,
-            MouseProtocolEncoding::Sgr,
-            MouseButton::Left,
-            (4, 7),
-        )
-        .unwrap();
+    fn action_metadata_is_complete_unique_and_reversible() {
+        let mut actions = Vec::new();
+        let mut names = HashSet::new();
 
-        assert_eq!(input, b"\x1B[<0;8;5M\x1B[<0;8;5m");
-    }
-
-    #[test]
-    fn encodes_sgr_right_click() {
-        let input = encode_mouse_click(
-            MouseProtocolMode::ButtonMotion,
-            MouseProtocolEncoding::Sgr,
-            MouseButton::Right,
-            (0, 0),
-        )
-        .unwrap();
-
-        assert_eq!(input, b"\x1B[<2;1;1M\x1B[<2;1;1m");
-    }
-
-    #[test]
-    fn x10_mode_sends_only_button_press() {
-        let input = encode_mouse_click(
-            MouseProtocolMode::Press,
-            MouseProtocolEncoding::Default,
-            MouseButton::Left,
-            (1, 2),
-        )
-        .unwrap();
-
-        assert_eq!(input, b"\x1B[M #\"");
-    }
-
-    #[test]
-    fn default_encoding_rejects_coordinates_it_cannot_represent() {
-        assert!(
-            encode_mouse_click(
-                MouseProtocolMode::PressRelease,
-                MouseProtocolEncoding::Default,
-                MouseButton::Left,
-                (0, 223),
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn encodes_utf8_mouse_click() {
-        let input = encode_mouse_click(
-            MouseProtocolMode::PressRelease,
-            MouseProtocolEncoding::Utf8,
-            MouseButton::Right,
-            (95, 95),
-        )
-        .unwrap();
-
-        assert_eq!(input, b"\x1B[M\"\xC2\x80\xC2\x80\x1B[M#\xC2\x80\xC2\x80");
+        for (action, help, name) in ACTION_TABLE {
+            assert!(!actions.contains(action), "duplicate action: {action:?}");
+            actions.push(*action);
+            assert!(names.insert(*name), "duplicate action name: {name}");
+            assert!(!help.is_empty());
+            assert!(!name.is_empty());
+            assert_eq!(builtin_action_name(*action), *name);
+            assert_eq!(builtin_action_from_name(name), Some(*action));
+        }
     }
 }

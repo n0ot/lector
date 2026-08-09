@@ -9,9 +9,27 @@ pub use pty::PtyView;
 pub use stack::ViewStack;
 
 use crate::{screen_reader::ScreenReader, view::View};
-use anyhow::Result;
 use std::any::Any;
 use std::io::Write;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("view I/O")]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    ScreenReader(#[from] crate::screen_reader::Error),
+    #[error("Lua: {0}")]
+    Lua(String),
+}
+
+impl Error {
+    fn lua(error: impl std::fmt::Display) -> Self {
+        Self::Lua(error.to_string())
+    }
+}
 
 pub enum ViewAction {
     None,
@@ -61,4 +79,86 @@ pub trait ViewController {
         Ok(())
     }
     fn on_resize(&mut self, rows: u16, cols: u16);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, Result, ViewAction, ViewController, ViewKind};
+    use crate::{screen_reader::ScreenReader, speech, view::View};
+    use std::{any::Any, io::Write};
+
+    struct SilentDriver;
+
+    impl speech::Driver for SilentDriver {
+        fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rate(&self) -> f32 {
+            1.0
+        }
+
+        fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct MinimalView(View);
+
+    impl ViewController for MinimalView {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn model(&mut self) -> &mut View {
+            &mut self.0
+        }
+
+        fn title(&self) -> &str {
+            "minimal"
+        }
+
+        fn handle_input(
+            &mut self,
+            _sr: &mut ScreenReader,
+            _input: &[u8],
+            _pty_stream: &mut dyn Write,
+        ) -> Result<ViewAction> {
+            Ok(ViewAction::None)
+        }
+
+        fn on_resize(&mut self, rows: u16, cols: u16) {
+            self.0.set_size(rows, cols);
+        }
+    }
+
+    #[test]
+    fn controller_defaults_are_inert() {
+        let mut view = MinimalView(View::new(2, 3));
+        let speech = speech::Speech::new(Box::new(SilentDriver));
+        let mut sr = ScreenReader::new(speech);
+        let mut output = Vec::new();
+
+        assert_eq!(view.kind(), ViewKind::Other);
+        assert!(!view.wants_tick());
+        assert!(matches!(
+            view.tick(&mut sr, &mut output).unwrap(),
+            ViewAction::None
+        ));
+        assert!(matches!(
+            view.handle_paste(&mut sr, "text", &mut output).unwrap(),
+            ViewAction::None
+        ));
+        view.handle_pty_output(b"ignored").unwrap();
+        assert!(view.model().contents_full().trim().is_empty());
+    }
+
+    #[test]
+    fn lua_errors_preserve_the_original_message() {
+        assert_eq!(Error::lua("bad chunk").to_string(), "Lua: bad chunk");
+    }
 }

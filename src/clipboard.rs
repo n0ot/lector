@@ -1,27 +1,34 @@
-#[derive(Default)]
+use std::collections::VecDeque;
+
 pub struct Clipboard {
     idx: usize,
-    clipboards: Vec<String>,
+    clipboards: VecDeque<String>,
+}
+
+impl Default for Clipboard {
+    fn default() -> Self {
+        Self {
+            idx: 0,
+            clipboards: VecDeque::with_capacity(10),
+        }
+    }
 }
 
 impl Clipboard {
     /// Get the text from the selected clipboard.
     /// If there are no clipboards, None will be returned.
     pub fn get(&self) -> Option<&str> {
-        if self.clipboards.is_empty() {
-            return None;
-        }
-        Some(&self.clipboards[self.idx])
+        self.clipboards.get(self.idx).map(String::as_str)
     }
 
     /// Add a clipboard with the specified text and select it.
     /// The oldest clipboards will be removed to make room for newer ones.
     pub fn put(&mut self, text: String) {
         if self.clipboards.len() >= 10 {
-            self.clipboards.remove(0);
+            self.clipboards.pop_front();
         }
         self.idx = self.clipboards.len();
-        self.clipboards.push(text);
+        self.clipboards.push_back(text);
     }
 
     /// Try to select the previous clipboard, and return whether a different clipboard has been selected.
@@ -53,5 +60,28 @@ impl Clipboard {
 
     pub fn index(&self) -> usize {
         self.idx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Clipboard;
+
+    #[test]
+    fn keeps_the_ten_newest_entries_and_preserves_navigation() {
+        let mut clipboard = Clipboard::default();
+        for value in 0..12 {
+            clipboard.put(value.to_string());
+        }
+
+        assert_eq!(clipboard.size(), 10);
+        assert_eq!(clipboard.get(), Some("11"));
+        for _ in 0..9 {
+            assert!(clipboard.next());
+        }
+        assert_eq!(clipboard.get(), Some("2"));
+        assert!(!clipboard.next());
+        assert!(clipboard.prev());
+        assert_eq!(clipboard.get(), Some("3"));
     }
 }

@@ -162,7 +162,8 @@ impl ScreenExt for vt100::Screen {
                     match highlight_start {
                         Some(start) => {
                             if !cell.is_highlighted() || col == self.size().1 - 1 {
-                                highlights.push(self.contents_between(row, start, row, col + 1));
+                                let end = if cell.is_highlighted() { col + 1 } else { col };
+                                highlights.push(self.contents_between(row, start, row, end));
                                 highlight_start = None;
                             }
                         }
@@ -215,5 +216,79 @@ impl CellExt for vt100::Cell {
 
     fn is_highlighted(&self) -> bool {
         self.bgcolor() == Color::Idx(11) && self.fgcolor() == Color::Idx(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CellExt, ScreenExt};
+
+    fn parser(rows: u16, cols: u16, contents: &[u8]) -> vt100::Parser {
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(contents);
+        parser
+    }
+
+    #[test]
+    fn searches_forward_and_backward_across_rows_and_clamps_end_bounds() {
+        let parser = parser(3, 5, b"a1\r\n b2\r\n  c3");
+        let screen = parser.screen();
+        let is_digit = |cell: &vt100::Cell| {
+            cell.contents()
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_digit())
+        };
+
+        assert_eq!(screen.find_cell(is_digit, 0, 0, 99, 99), Some((0, 1)));
+        assert_eq!(screen.find_cell(is_digit, 1, 2, 99, 99), Some((1, 2)));
+        assert_eq!(screen.rfind_cell(is_digit, 0, 0, 99, 99), Some((2, 3)));
+        assert_eq!(screen.find_cell(is_digit, 2, 4, 2, 4), None);
+        assert_eq!(screen.rfind_cell(is_digit, 2, 4, 2, 4), None);
+    }
+
+    #[test]
+    fn word_boundaries_cover_words_whitespace_and_screen_edges() {
+        let parser = parser(1, 10, b"one  two");
+        let screen = parser.screen();
+
+        assert_eq!(screen.find_word_start(0, 0), 0);
+        assert_eq!(screen.find_word_start(0, 4), 0);
+        assert_eq!(screen.find_word_start(0, 7), 5);
+        assert_eq!(screen.find_word_end(0, 0), 4);
+        assert_eq!(screen.find_word_end(0, 5), 9);
+        assert_eq!(screen.find_word_end(0, 9), 9);
+    }
+
+    #[test]
+    fn extracts_only_black_on_bright_yellow_highlight_runs() {
+        let parser = parser(2, 8, b"\x1B[30;103mhot\x1B[0m x\r\nabc  \x1B[30;103mend");
+
+        assert_eq!(parser.screen().get_highlights(), ["hot", "end"]);
+        assert!(parser.screen().cell(0, 0).unwrap().is_highlighted());
+        assert!(!parser.screen().cell(0, 3).unwrap().is_highlighted());
+    }
+
+    #[test]
+    fn full_contents_preserve_blank_rows_and_reuse_the_output_buffer() {
+        let parser = parser(3, 5, b"one\r\n\r\ntwo  ");
+        let screen = parser.screen();
+        let mut output = String::from("stale contents");
+
+        screen.contents_full_into(&mut output);
+
+        assert_eq!(screen.contents_full(), "one\n\ntwo\n");
+        assert_eq!(output, "one\n\ntwo\n");
+    }
+
+    #[test]
+    fn cell_word_detection_distinguishes_content_whitespace_and_blanks() {
+        let parser = parser(1, 4, "é x".as_bytes());
+        let screen = parser.screen();
+
+        assert!(screen.cell(0, 0).unwrap().is_in_word());
+        assert!(!screen.cell(0, 1).unwrap().is_in_word());
+        assert!(screen.cell(0, 2).unwrap().is_in_word());
+        assert!(!screen.cell(0, 3).unwrap().is_in_word());
     }
 }

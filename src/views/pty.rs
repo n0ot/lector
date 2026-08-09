@@ -1,6 +1,5 @@
-use super::{ViewAction, ViewController, ViewKind};
+use super::{Result, ViewAction, ViewController, ViewKind};
 use crate::{screen_reader::ScreenReader, view::View};
-use anyhow::Result;
 use std::any::Any;
 use std::io::Write;
 
@@ -67,5 +66,71 @@ impl ViewController for PtyView {
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
         self.view.set_size(rows, cols);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PtyView, ViewAction, ViewController, ViewKind};
+    use crate::{screen_reader::ScreenReader, speech};
+    use std::{cell::RefCell, rc::Rc};
+
+    struct RecordingDriver(Rc<RefCell<Vec<String>>>);
+
+    impl speech::Driver for RecordingDriver {
+        fn speak(&mut self, text: &str, _interrupt: bool) -> anyhow::Result<()> {
+            self.0.borrow_mut().push(text.to_owned());
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rate(&self) -> f32 {
+            1.0
+        }
+
+        fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn screen_reader() -> (ScreenReader, Rc<RefCell<Vec<String>>>) {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let speech = speech::Speech::new(Box::new(RecordingDriver(Rc::clone(&output))));
+        (ScreenReader::new(speech), output)
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_contents_and_announces_it() {
+        let mut view = PtyView::new(3, 10);
+        let (mut sr, speech) = screen_reader();
+        let mut pty = Vec::new();
+        view.handle_pty_output(b"\x1B[?2004h").unwrap();
+
+        let action = view.handle_paste(&mut sr, "a\nb", &mut pty).unwrap();
+
+        assert!(matches!(action, ViewAction::PtyInput));
+        assert_eq!(pty, b"\x1B[200~a\nb\x1B[201~");
+        assert_eq!(speech.borrow().as_slice(), ["pasted"]);
+    }
+
+    #[test]
+    fn input_metadata_and_resize_match_terminal_behavior() {
+        let mut view = PtyView::new(3, 10);
+        let (mut sr, _speech) = screen_reader();
+        let mut pty = Vec::new();
+
+        assert_eq!(view.title(), "Terminal");
+        assert_eq!(view.kind(), ViewKind::Terminal);
+        assert!(view.as_any().is::<PtyView>());
+        assert!(matches!(
+            view.handle_input(&mut sr, b"abc", &mut pty).unwrap(),
+            ViewAction::PtyInput
+        ));
+        assert_eq!(pty, b"abc");
+        view.on_resize(5, 12);
+        assert_eq!(view.model().size(), (5, 12));
     }
 }

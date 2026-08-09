@@ -361,6 +361,6 @@ fn do_events(
             poll_timeout = None; // No need to wakeup until we get more updates.
         }
 
-        platform::tick_runloop()?;
+        platform::tick_runloop();
     }
 }

@@ -1,0 +1,52 @@
+Scenario: help mode describes bindings without executing them
+When stdin: \x1BOP
+And stdin: \x1Bi
+And stdin: \x1BOP
+Then expect-speak: entering help. Press this key again to exit
+And expect-speak: current line
+And expect-speak: exiting help
+
+Scenario: auto read toggle round trips
+When stdin: \x1B'
+And stdin: \x1B'
+Then expect-speak: auto read disabled
+And expect-speak: auto read enabled
+
+Scenario: review movement mark copy and paste preserve their behavior
+Given pty-stdout: one two\r\nthree four
+And settled:
+When stdin: \x1Bi
+And stdin: \x1Bu
+And stdin: \x1Bo
+And stdin: \x1Bh
+And stdin: \x1B[15~
+And stdin: \x1B;
+And stdin: \x1B[17~
+And stdin: \x1B[18~
+Then expect-speak-contains: one two
+And expect-speak: three four
+And expect-speak: one two
+And expect-speak: three four
+And expect-speak: t
+And expect-speak: mark set
+And expect-speak: blank
+And expect-speak: copied
+And expect-speak: pasted
+And expect-pty-stdin: three four
+
+Scenario: table setup can be cancelled cleanly
+Given pty-stdout: A    B\r\n1    2
+When stdin: \x1BT
+And stdin: \x1B
+And tick: 51
+Then expect-speak: table setup on
+And expect-speak: table setup off
+
+Scenario: table mode can be exited with escape
+Given pty-stdout: A    B\r\n1    2
+When stdin: \x1Bt
+And stdin: \x1B
+And tick: 51
+Then expect-speak: table mode on
+And expect-speak: A
+And expect-speak: table mode off

@@ -9,7 +9,8 @@ struct State {
 fn main() -> Result<()> {
     // Minimal proc server used by tests to validate JSON-RPC wiring without real TTS.
     let mut state = State { rate: 1.0 };
-    run_server(|req| handle_request(req, &mut state))
+    run_server(|req| handle_request(req, &mut state))?;
+    Ok(())
 }
 
 fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError> {

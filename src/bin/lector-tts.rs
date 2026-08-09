@@ -22,7 +22,8 @@ fn main() -> Result<()> {
         min_rate,
         max_rate,
     };
-    run_server(|req| handle_request(req, &mut state))
+    run_server(|req| handle_request(req, &mut state))?;
+    Ok(())
 }
 
 fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError> {

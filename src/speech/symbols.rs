@@ -1,5 +1,13 @@
-use anyhow::{Result, anyhow};
 use std::collections::HashMap;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ParseError {
+    #[error("unknown symbol level")]
+    UnknownLevel,
+    #[error("unknown variant")]
+    UnknownIncludeOriginal,
+}
 
 pub struct SymbolMap(HashMap<String, SymbolDesc>);
 
@@ -990,7 +998,7 @@ impl std::fmt::Display for Level {
 }
 
 impl std::str::FromStr for Level {
-    type Err = anyhow::Error;
+    type Err = ParseError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         match input {
@@ -999,7 +1007,7 @@ impl std::str::FromStr for Level {
             "most" => Ok(Level::Most),
             "all" => Ok(Level::All),
             "character" => Ok(Level::Character),
-            _ => Err(anyhow!("unknown symbol level")),
+            _ => Err(ParseError::UnknownLevel),
         }
     }
 }
@@ -1026,14 +1034,45 @@ impl std::fmt::Display for IncludeOriginal {
 }
 
 impl std::str::FromStr for IncludeOriginal {
-    type Err = anyhow::Error;
+    type Err = ParseError;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         match input {
             "never" => Ok(IncludeOriginal::Never),
             "before" => Ok(IncludeOriginal::Before),
             "after" => Ok(IncludeOriginal::After),
-            _ => Err(anyhow!("unknown variant")),
+            _ => Err(ParseError::UnknownIncludeOriginal),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IncludeOriginal, Level};
+
+    #[test]
+    fn parses_and_formats_configuration_values() {
+        for value in ["none", "some", "most", "all", "character"] {
+            assert_eq!(value.parse::<Level>().unwrap().to_string(), value);
+        }
+        for value in ["never", "before", "after"] {
+            assert_eq!(value.parse::<IncludeOriginal>().unwrap().to_string(), value);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_configuration_values() {
+        assert_eq!(
+            "verbose".parse::<Level>().err().unwrap().to_string(),
+            "unknown symbol level"
+        );
+        assert_eq!(
+            "sometimes"
+                .parse::<IncludeOriginal>()
+                .err()
+                .unwrap()
+                .to_string(),
+            "unknown variant"
+        );
     }
 }

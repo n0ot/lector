@@ -34,3 +34,10 @@ fn harness_script_focus_events() {
     let mut harness = Harness::new(24, 80).expect("create harness");
     harness.run_script(script).expect("run script");
 }
+
+#[test]
+fn harness_script_command_modes() {
+    let script = include_str!("scripts/command_modes.txt");
+    let mut harness = Harness::new(24, 80).expect("create harness");
+    harness.run_script(script).expect("run script");
+}

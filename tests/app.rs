@@ -87,7 +87,7 @@ fn stdin_unmapped_forwards_to_pty() {
 
     assert_eq!(pty_out, b"a");
     assert!(term_out.is_empty());
-    assert_eq!(sr.last_key, b"a");
+    assert_eq!(sr.last_key(), b"a");
     assert_eq!(recorder.inner.borrow().stops, 1);
 }
 
@@ -97,7 +97,7 @@ fn paste_writes_to_pty_and_speaks() {
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
 
-    sr.clipboard.put("hello".to_string());
+    sr.push_clipboard("hello".to_string()).unwrap();
     app.handle_stdin(&mut sr, b"\x1B[18~", &mut pty_out, &mut term_out)
         .expect("handle stdin");
 
@@ -146,6 +146,54 @@ fn click_without_mouse_reporting_is_not_forwarded() {
 }
 
 #[test]
+fn table_navigation_preserves_direction_and_boundary_behavior() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"| A | B | C |\r\n|---|---|---|\r\n| 1 | 2 | 3 |\r\n| 4 | 5 | 6 |\x1B[1;1H",
+        &mut term_out,
+    )
+    .expect("draw table");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize table"));
+    app.handle_stdin(&mut sr, b"\x1Bt", &mut pty_out, &mut term_out)
+        .expect("enter table mode");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    for key in [
+        b"h".as_slice(),
+        b"l",
+        b"$",
+        b"$",
+        b"^",
+        b"j",
+        b"G",
+        b"k",
+        b"g",
+        b"k",
+    ] {
+        app.handle_stdin(&mut sr, key, &mut pty_out, &mut term_out)
+            .expect("navigate table");
+    }
+
+    let spoken: Vec<String> = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect();
+    assert_eq!(
+        spoken,
+        ["left", "B", "C", "right", "A", "1", "4", "1", "A", "top"]
+    );
+    assert!(pty_out.is_empty());
+}
+
+#[test]
 fn pty_output_writes_terminal_and_autoreads() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut term_out = Vec::new();
@@ -159,6 +207,31 @@ fn pty_output_writes_terminal_and_autoreads() {
 
     let speaks = &recorder.inner.borrow().speaks;
     assert!(speaks.iter().any(|(text, _)| text.contains("hello")));
+}
+
+#[test]
+fn key_echo_suppression_handles_typeahead_before_slow_terminal_echo() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    sr.set_suppress_key_echo(true);
+    app.handle_stdin(&mut sr, b"abcdefg", &mut pty_out, &mut term_out)
+        .expect("type ahead");
+    assert_eq!(pty_out, b"abcdefg");
+    assert_eq!(sr.last_key(), b"g");
+
+    for byte in b"abcdefg" {
+        app.handle_pty(&mut sr, &[*byte], &mut term_out)
+            .expect("receive delayed echo");
+        clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+        assert!(
+            app.maybe_finalize_changes(&mut sr)
+                .expect("finalize delayed echo")
+        );
+    }
+
+    assert!(recorder.inner.borrow().speaks.is_empty());
 }
 
 #[test]
@@ -364,7 +437,7 @@ fn split_alt_sequence_maps_to_action() {
         .expect("handle stdin");
 
     assert!(pty_out.is_empty());
-    assert_eq!(sr.last_key, b"\x1Bl");
+    assert_eq!(sr.last_key(), b"\x1Bl");
     assert!(!recorder.inner.borrow().speaks.is_empty());
 }
 
@@ -378,7 +451,7 @@ fn kitty_meta_key_interrupts_speech() {
         .expect("handle Kitty Meta-u");
 
     assert_eq!(recorder.inner.borrow().stops, 1);
-    assert_eq!(sr.last_key, b"\x1B[117;3u");
+    assert_eq!(sr.last_key(), b"\x1B[117;3u");
 }
 
 #[test]
@@ -391,7 +464,7 @@ fn kitty_control_key_interrupts_speech() {
         .expect("handle Kitty Control-l");
 
     assert_eq!(recorder.inner.borrow().stops, 1);
-    assert_eq!(sr.last_key, b"\x1B[108;5u");
+    assert_eq!(sr.last_key(), b"\x1B[108;5u");
 }
 
 #[test]
@@ -408,7 +481,7 @@ fn kitty_release_does_not_repeat_lector_binding() {
     )
     .expect("handle Kitty Meta-apostrophe press and release");
 
-    assert!(!sr.auto_read);
+    assert!(!sr.auto_read_enabled());
     assert!(pty_out.is_empty());
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
@@ -431,7 +504,7 @@ fn kitty_repeat_repeats_lector_binding_but_release_does_not() {
     )
     .expect("handle Kitty Meta-apostrophe press, repeat, and release");
 
-    assert!(sr.auto_read);
+    assert!(sr.auto_read_enabled());
     assert!(pty_out.is_empty());
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
@@ -469,7 +542,7 @@ fn kitty_passed_through_binding_forwards_press_and_release() {
         .expect("pass through Kitty Meta-apostrophe press and release");
 
     assert_eq!(pty_out, input);
-    assert!(sr.auto_read);
+    assert!(sr.auto_read_enabled());
 }
 
 #[test]
@@ -500,7 +573,7 @@ fn alt_bracket_maps_after_timeout() {
         .expect("handle tick");
 
     assert!(pty_out.is_empty());
-    assert_eq!(sr.last_key, b"\x1B[");
+    assert_eq!(sr.last_key(), b"\x1B[");
     let speaks = &recorder.inner.borrow().speaks;
     assert!(speaks.iter().any(|(text, _)| text == "no clipboard"));
 }
@@ -520,7 +593,7 @@ fn alt_close_bracket_maps_after_timeout() {
         .expect("handle tick");
 
     assert!(pty_out.is_empty());
-    assert_eq!(sr.last_key, b"\x1B]");
+    assert_eq!(sr.last_key(), b"\x1B]");
     let speaks = &recorder.inner.borrow().speaks;
     assert!(speaks.iter().any(|(text, _)| text == "no clipboard"));
 }
@@ -537,7 +610,7 @@ fn osc_sequence_forwards_to_pty() {
 
     assert_eq!(pty_out, osc);
     assert!(term_out.is_empty());
-    assert_eq!(sr.last_key, osc);
+    assert_eq!(sr.last_key(), osc);
     assert_eq!(recorder.inner.borrow().stops, 1);
 }
 
@@ -553,7 +626,7 @@ fn osc_sequence_with_st_terminator_forwards_to_pty() {
 
     assert_eq!(pty_out, osc);
     assert!(term_out.is_empty());
-    assert_eq!(sr.last_key, osc);
+    assert_eq!(sr.last_key(), osc);
     assert_eq!(recorder.inner.borrow().stops, 1);
 }
 
@@ -563,11 +636,11 @@ fn help_mode_can_toggle_off() {
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
 
-    sr.help_mode = true;
+    sr.set_help_mode(true);
     app.handle_stdin(&mut sr, b"\x1BOP", &mut pty_out, &mut term_out)
         .expect("handle stdin");
 
-    assert!(!sr.help_mode);
+    assert!(!sr.help_mode());
 }
 
 #[test]
@@ -580,7 +653,7 @@ fn focus_events_not_forwarded_without_app_request() {
         .expect("handle stdin");
 
     assert!(pty_out.is_empty());
-    assert!(!sr.terminal_focused);
+    assert!(!sr.terminal_focused());
     assert_eq!(recorder.inner.borrow().stops, 1);
 }
 
@@ -598,7 +671,7 @@ fn focus_events_forwarded_after_app_enables_them() {
         .expect("handle stdin");
 
     assert_eq!(pty_out, b"\x1B[I");
-    assert!(sr.terminal_focused);
+    assert!(sr.terminal_focused());
 }
 
 #[test]
@@ -651,11 +724,11 @@ fn focus_out_does_not_stop_when_option_disabled() {
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
 
-    sr.stop_speech_on_focus_loss = false;
+    sr.set_stop_speech_on_focus_loss(false);
     app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
         .expect("handle stdin");
 
-    assert!(!sr.terminal_focused);
+    assert!(!sr.terminal_focused());
     assert_eq!(recorder.inner.borrow().stops, 0);
 }
 
@@ -667,7 +740,7 @@ fn toggle_stop_on_focus_loss_hotkey_disables_stopping() {
 
     app.handle_stdin(&mut sr, b"\x1Bg", &mut pty_out, &mut term_out)
         .expect("handle stdin");
-    assert!(!sr.stop_speech_on_focus_loss);
+    assert!(!sr.stop_speech_on_focus_loss());
 
     app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
         .expect("handle stdin");
@@ -802,7 +875,7 @@ fn delete_speaks_after_screen_change_with_auto_read_off() {
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
 
-    sr.auto_read = false;
+    sr.set_auto_read_enabled(false);
     app.handle_pty(&mut sr, b"abc\x1B[D\x1B[D", &mut term_out)
         .expect("handle pty");
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
@@ -820,4 +893,133 @@ fn delete_speaks_after_screen_change_with_auto_read_off() {
 
     let speaks = &recorder.inner.borrow().speaks;
     assert!(speaks.iter().any(|(text, _)| text == "b"));
+}
+
+#[test]
+fn no_pty_update_never_finalizes() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+
+    clock.advance_ms(10_000);
+
+    assert!(!app.maybe_finalize_changes(&mut sr).unwrap());
+}
+
+#[test]
+fn lone_escape_flushes_at_the_exact_timeout_boundary() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1B", &mut pty_out, &mut term_out)
+        .unwrap();
+    clock.advance_ms(49);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .unwrap();
+    assert!(pty_out.is_empty());
+
+    clock.advance_ms(1);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .unwrap();
+
+    assert_eq!(pty_out, b"\x1B");
+    assert_eq!(sr.last_key(), b"\x1B");
+    assert_eq!(recorder.inner.borrow().stops, 1);
+}
+
+#[test]
+fn unterminated_control_sequence_flushes_as_raw_input_after_timeout() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let input = b"\x1B]unterminated";
+
+    app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+        .unwrap();
+    assert!(pty_out.is_empty());
+    clock.advance_ms(50);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .unwrap();
+
+    assert_eq!(pty_out, input);
+    assert_eq!(sr.last_key(), input);
+    assert_eq!(recorder.inner.borrow().stops, 1);
+}
+
+#[test]
+fn unknown_modify_other_keys_sequence_is_forwarded_verbatim() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let input = b"\x1B[27;;~";
+
+    app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+        .unwrap();
+
+    assert_eq!(pty_out, input);
+    assert_eq!(sr.last_key(), input);
+}
+
+#[test]
+fn message_overlay_renders_resizes_and_closes_without_pty_input() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    assert!(!app.has_overlay());
+    app.show_message(&mut sr, "Notice", "first\nsecond", &mut term_out)
+        .unwrap();
+
+    assert!(app.has_overlay());
+    assert!(app.debug_active_view_contents().contains("first\nsecond"));
+    assert!(String::from_utf8_lossy(&term_out).contains("first"));
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "Notice")
+    );
+
+    term_out.clear();
+    app.on_resize(12, 40, &mut term_out).unwrap();
+    assert!(String::from_utf8_lossy(&term_out).contains("second"));
+
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .unwrap();
+    assert!(!app.has_overlay());
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn pty_output_updates_root_while_overlay_remains_visible() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.show_message(&mut sr, "Notice", "foreground", &mut term_out)
+        .unwrap();
+    term_out.clear();
+    app.handle_pty(&mut sr, b"background", &mut term_out)
+        .unwrap();
+    assert!(term_out.is_empty());
+    assert!(app.debug_active_view_contents().contains("foreground"));
+
+    app.handle_stdin(&mut sr, b"\n", &mut pty_out, &mut term_out)
+        .unwrap();
+
+    assert!(!app.has_overlay());
+    assert!(app.debug_active_view_contents().contains("background"));
+    assert!(String::from_utf8_lossy(&term_out).contains("background"));
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn standard_clock_constructor_exposes_idle_terminal_state() {
+    let view_stack = views::ViewStack::new(Box::new(views::PtyView::new(2, 3)));
+    let mut app = App::new(view_stack).unwrap();
+
+    assert!(!app.has_overlay());
+    assert!(!app.wants_tick());
+    assert_eq!(app.debug_active_view_contents(), "\n\n");
 }

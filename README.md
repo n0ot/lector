@@ -183,6 +183,9 @@ lector.o.symbol_level = "most"  -- "none", "some", "most", "all", "character"
 -- live reading on/off
 lector.o.auto_read = true
 
+-- suppress terminal output that echoes recently typed keys (disabled by default)
+lector.o.suppress_key_echo = false
+
 -- interrupt speech immediately when terminal focus is lost
 lector.o.stop_speech_on_focus_loss = true
 ```

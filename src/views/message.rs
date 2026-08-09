@@ -1,6 +1,5 @@
-use super::{ViewAction, ViewController, ViewKind};
+use super::{Result, ViewAction, ViewController, ViewKind};
 use crate::{screen_reader::ScreenReader, view::View};
-use anyhow::Result;
 use std::any::Any;
 use std::io::Write;
 
@@ -68,6 +67,83 @@ fn render_message(view: &mut View, text: &str) {
         bytes.extend_from_slice(b"\r\n");
     }
     bytes.extend_from_slice(b"\r\nPress Enter or Escape to close.");
-    view.next_bytes.clear();
+    view.clear_pending_bytes();
     view.process_changes(&bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MessageView, ViewAction, ViewController, ViewKind};
+    use crate::{screen_reader::ScreenReader, speech};
+
+    struct SilentDriver;
+
+    impl speech::Driver for SilentDriver {
+        fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rate(&self) -> f32 {
+            1.0
+        }
+
+        fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn screen_reader() -> ScreenReader {
+        ScreenReader::new(speech::Speech::new(Box::new(SilentDriver)))
+    }
+
+    #[test]
+    fn renders_metadata_body_and_close_hint() {
+        let mut message = MessageView::new(5, 40, "Notice", "first\nsecond");
+
+        assert_eq!(message.title(), "Notice");
+        assert_eq!(message.kind(), ViewKind::Message);
+        assert!(message.as_any().is::<MessageView>());
+        assert_eq!(message.model().line(0), "first");
+        assert_eq!(message.model().line(1), "second");
+        assert!(
+            message
+                .model()
+                .contents_full()
+                .contains("Press Enter or Escape to close.")
+        );
+    }
+
+    #[test]
+    fn only_escape_and_line_endings_close_the_message() {
+        let mut message = MessageView::new(4, 30, "Notice", "body");
+        let mut sr = screen_reader();
+        let mut pty = Vec::new();
+
+        assert!(matches!(
+            message.handle_input(&mut sr, b"x", &mut pty).unwrap(),
+            ViewAction::None
+        ));
+        for input in [b"\x1B".as_slice(), b"\r", b"\n"] {
+            assert!(matches!(
+                message.handle_input(&mut sr, input, &mut pty).unwrap(),
+                ViewAction::Pop
+            ));
+        }
+    }
+
+    #[test]
+    fn resize_renders_from_scratch_at_the_new_dimensions() {
+        let mut message = MessageView::new(6, 40, "Notice", "body");
+        message.model().process_changes(b"stale");
+
+        message.on_resize(5, 20);
+
+        assert_eq!(message.model().size(), (5, 20));
+        assert_eq!(message.model().line(0), "body");
+        assert!(!message.model().contents_full().contains("stale"));
+    }
 }

@@ -1,11 +1,11 @@
 pub mod app;
 mod attributes;
 mod clipboard;
-pub mod commands;
+mod commands;
 mod ext;
 pub mod harness;
 mod keymap;
-pub mod line_editor;
+mod line_editor;
 pub mod lua;
 pub mod perform;
 pub mod platform;

@@ -568,4 +568,67 @@ mod tests {
         assert_eq!(editor.input(), "");
         assert_eq!(editor.cursor(), 0);
     }
+
+    #[test]
+    fn default_history_and_character_count_accessors_cover_empty_and_loaded_state() {
+        let mut editor = LineEditor::default();
+        assert_eq!(editor.len_chars(), 0);
+        editor.set_history(vec!["first".into(), "second".into()]);
+
+        assert!(matches!(feed(&mut editor, b"\x10"), EditorAction::Changed));
+        assert_eq!(editor.input(), "second");
+        assert_eq!(editor.len_chars(), 6);
+        assert!(matches!(feed(&mut editor, b"\x10"), EditorAction::Changed));
+        assert_eq!(editor.input(), "first");
+        assert!(matches!(feed(&mut editor, b"\x10"), EditorAction::Changed));
+        assert_eq!(editor.input(), "first");
+    }
+
+    #[test]
+    fn history_navigation_bells_without_a_valid_destination() {
+        let mut editor = LineEditor::new();
+        assert!(matches!(feed(&mut editor, b"\x10"), EditorAction::Bell));
+        assert!(matches!(feed(&mut editor, b"\x0E"), EditorAction::Bell));
+        assert!(matches!(feed(&mut editor, b"\x1B[A"), EditorAction::Bell));
+        assert!(matches!(feed(&mut editor, b"\x1B[B"), EditorAction::Bell));
+        assert!(matches!(feed(&mut editor, b"\x1BOA"), EditorAction::Bell));
+        assert!(matches!(feed(&mut editor, b"\x1BOB"), EditorAction::Bell));
+    }
+
+    #[test]
+    fn ss3_navigation_and_cursor_edges_do_not_move_out_of_bounds() {
+        let mut editor = LineEditor::new();
+        feed(&mut editor, b"abc");
+        feed(&mut editor, b"\x1BOH");
+        assert_eq!(editor.cursor(), 0);
+        feed(&mut editor, b"\x1BOD");
+        assert_eq!(editor.cursor(), 0);
+        feed(&mut editor, b"\x1BOC");
+        assert_eq!(editor.cursor(), 1);
+        feed(&mut editor, b"\x1BOF");
+        assert_eq!(editor.cursor(), 3);
+        feed(&mut editor, b"\x1BOC");
+        assert_eq!(editor.cursor(), 3);
+
+        feed(&mut editor, b"\x01");
+        assert!(matches!(feed(&mut editor, b"\x7F"), EditorAction::None));
+        assert_eq!(editor.input(), "abc");
+    }
+
+    #[test]
+    fn unsupported_escape_sequences_are_ignored_and_parser_state_recovers() {
+        let mut editor = LineEditor::new();
+
+        for sequence in [
+            b"\x1Bx".as_slice(),
+            b"\x1B[2~",
+            b"\x1B[;~",
+            b"\x1B[999999~",
+            b"\x1BOx",
+        ] {
+            assert!(matches!(feed(&mut editor, sequence), EditorAction::None));
+        }
+        assert!(matches!(feed(&mut editor, b"a"), EditorAction::Changed));
+        assert_eq!(editor.input(), "a");
+    }
 }

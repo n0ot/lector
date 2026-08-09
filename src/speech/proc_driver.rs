@@ -1,10 +1,49 @@
 use super::Driver;
-use anyhow::{Context, Result, bail};
+use anyhow::Result as DriverResult;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    #[error("spawn proc driver {path}")]
+    Spawn {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("capture proc driver stdin")]
+    MissingStdin,
+    #[error("capture proc driver stdout")]
+    MissingStdout,
+    #[error("serialize RPC request")]
+    Serialize(#[source] serde_json::Error),
+    #[error("{operation}")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("proc driver closed stdout while waiting for response")]
+    Closed,
+    #[error("parse RPC response")]
+    Parse(#[source] serde_json::Error),
+    #[error("proc driver RPC error {code}: {message}{data}")]
+    Rpc {
+        code: i64,
+        message: String,
+        data: String,
+    },
+}
+
+fn io_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> Error {
+    move |source| Error::Io { operation, source }
+}
 
 #[derive(Serialize)]
 struct JsonRpcRequest<'a> {
@@ -36,6 +75,8 @@ pub struct ProcDriver {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    request_buf: Vec<u8>,
+    response_buf: String,
     next_id: u64,
     rate: f32,
 }
@@ -46,13 +87,18 @@ impl ProcDriver {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .with_context(|| format!("spawn proc driver {}", path.display()))?;
-        let stdin = child.stdin.take().context("capture proc driver stdin")?;
-        let stdout = child.stdout.take().context("capture proc driver stdout")?;
+            .map_err(|source| Error::Spawn {
+                path: path.display().to_string(),
+                source,
+            })?;
+        let stdin = child.stdin.take().ok_or(Error::MissingStdin)?;
+        let stdout = child.stdout.take().ok_or(Error::MissingStdout)?;
         Ok(ProcDriver {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            request_buf: Vec::with_capacity(256),
+            response_buf: String::with_capacity(256),
             next_id: 1,
             rate: 1.0,
         })
@@ -67,34 +113,34 @@ impl ProcDriver {
             method,
             params,
         };
-        let payload = serde_json::to_string(&request).context("serialize rpc request")?;
+        self.request_buf.clear();
+        serde_json::to_writer(&mut self.request_buf, &request).map_err(Error::Serialize)?;
+        self.request_buf.push(b'\n');
         self.stdin
-            .write_all(payload.as_bytes())
-            .context("write rpc request")?;
-        self.stdin.write_all(b"\n").context("write rpc newline")?;
-        self.stdin.flush().context("flush rpc request")?;
+            .write_all(&self.request_buf)
+            .map_err(io_error("write RPC request"))?;
+        self.stdin.flush().map_err(io_error("flush RPC request"))?;
 
         loop {
-            let mut line = String::new();
+            self.response_buf.clear();
             let read = self
                 .stdout
-                .read_line(&mut line)
-                .context("read rpc response")?;
+                .read_line(&mut self.response_buf)
+                .map_err(io_error("read RPC response"))?;
             if read == 0 {
-                bail!("proc driver closed stdout while waiting for response");
+                return Err(Error::Closed);
             }
             let response: JsonRpcResponse =
-                serde_json::from_str(line.trim()).context("parse rpc response")?;
+                serde_json::from_str(self.response_buf.trim()).map_err(Error::Parse)?;
             if response.id != Some(id) {
                 continue;
             }
             if let Some(err) = response.error {
-                bail!(
-                    "proc driver rpc error {}: {}{}",
-                    err.code,
-                    err.message,
-                    err.data.map(|v| format!(" ({})", v)).unwrap_or_default()
-                );
+                return Err(Error::Rpc {
+                    code: err.code,
+                    message: err.message,
+                    data: err.data.map(|v| format!(" ({v})")).unwrap_or_default(),
+                });
             }
             return Ok(());
         }
@@ -102,22 +148,23 @@ impl ProcDriver {
 }
 
 impl Driver for ProcDriver {
-    fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
+    fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()> {
         self.call(
             "speak",
             Some(json!({ "text": text, "interrupt": interrupt })),
         )
+        .map_err(Into::into)
     }
 
-    fn stop(&mut self) -> Result<()> {
-        self.call("stop", None)
+    fn stop(&mut self) -> DriverResult<()> {
+        self.call("stop", None).map_err(Into::into)
     }
 
     fn get_rate(&self) -> f32 {
         self.rate
     }
 
-    fn set_rate(&mut self, rate: f32) -> Result<()> {
+    fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
         self.call("set_rate", Some(json!({ "rate": rate })))?;
         self.rate = rate;
         Ok(())
