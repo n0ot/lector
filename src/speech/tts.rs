@@ -24,10 +24,10 @@ pub struct TtsDriver {
 
 impl TtsDriver {
     pub fn new() -> Result<Self> {
-        let mut tts = Tts::default().map_err(backend_error)?;
-        let min_rate = tts.min_rate();
-        let max_rate = tts.max_rate();
-        let rate = tts.normal_rate();
+        let tts = Tts::default().map_err(backend_error)?;
+        let min_rate = tts.min_rate().map_err(backend_error)?;
+        let max_rate = tts.max_rate().map_err(backend_error)?;
+        let rate = tts.normal_rate().map_err(backend_error)?;
         tts.set_rate(rate).map_err(backend_error)?;
         Ok(TtsDriver {
             tts,

@@ -15,7 +15,7 @@ clap = { version = "4.5.11", features = ["derive", "env"] }
 dirs = "6.0.0"
 emojis = "0.8.0"
 mio = { version = "1.1.1", features = ["os-ext", "os-poll"] }
-nix = { version = "0.30.1", features = ["term"] }
+nix = { version = "0.26.4", features = ["term"] }
 phf = { version = "0.13.1", features = ["macros"] }
 ptyprocess = "0.5.0"
 regex = { version = "1.10.5", default-features = false, features = [
@@ -34,7 +34,7 @@ unicode-width = "0.2.2"
 vt100 = "0.16.2"
 vte = "0.15.0"
 mlua = { version = "0.11", features = ["luajit", "vendored"] }
-tts = "0.26.3"
+tts = { git = "https://github.com/ndarilek/tts-rs", rev = "8fbcb720cb86c5166a9ed46272e3777f742da18e" }
 terminput = "0.5.12"
 thiserror = "2.0.17"
 
@@ -42,6 +42,4 @@ thiserror = "2.0.17"
 cargo-clippy = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cocoa-foundation = "0.2"
 core-foundation = "0.10"
-objc = { version = "0.2", features = ["exception"] }

@@ -11,10 +11,10 @@ struct State {
 }
 
 fn main() -> Result<()> {
-    let mut tts = Tts::default().map_err(|e| anyhow::anyhow!(e))?;
-    let min_rate = tts.min_rate();
-    let max_rate = tts.max_rate();
-    let rate = tts.normal_rate();
+    let tts = Tts::default().map_err(|e| anyhow::anyhow!(e))?;
+    let min_rate = tts.min_rate().map_err(|e| anyhow::anyhow!(e))?;
+    let max_rate = tts.max_rate().map_err(|e| anyhow::anyhow!(e))?;
+    let rate = tts.normal_rate().map_err(|e| anyhow::anyhow!(e))?;
     tts.set_rate(rate).map_err(|e| anyhow::anyhow!(e))?;
     let mut state = State {
         tts,

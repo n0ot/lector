@@ -60,7 +60,7 @@ fn load_file(lua: &Lua, path: &PathBuf) -> Result<Function> {
         .to_string();
     let mut f = File::open(path)
         .map_err(anyhow::Error::from)
-        .context(format!("open {}", &path_string))
+        .context(format!("open {}", path_string))
         .to_lua_result()?;
     let mut s = String::new();
     f.read_to_string(&mut s)

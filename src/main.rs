@@ -7,7 +7,7 @@ use signal_hook::consts::signal::*;
 use signal_hook_mio::v1_0::Signals;
 use std::{
     io::{ErrorKind, Read, Write},
-    os::fd::{AsFd, AsRawFd},
+    os::fd::AsRawFd,
     process::Command,
     time,
 };
@@ -210,7 +210,7 @@ fn main() -> Result<()> {
     let mut app = app::App::new(view_stack)?;
     app.set_logging(cli.log);
 
-    let init_term_attrs = termios::tcgetattr(std::io::stdin().as_fd())?;
+    let init_term_attrs = termios::tcgetattr(std::io::stdin().as_raw_fd())?;
     // Spawn the child process, connect it to a PTY,
     // and set the PTY to match the current terminal attributes.
     let mut process = PtyProcess::spawn(Command::new(cli.shell)).context("spawn child process")?;
@@ -218,7 +218,7 @@ fn main() -> Result<()> {
         .set_window_size(term_size.cols, term_size.rows)
         .context("resize PTY")?;
     termios::tcsetattr(
-        process.get_raw_handle()?,
+        process.get_raw_handle()?.as_raw_fd(),
         termios::SetArg::TCSADRAIN,
         &init_term_attrs,
     )?;
@@ -245,7 +245,7 @@ fn main() -> Result<()> {
     };
     // Clean up before returning the above result.
     if let Err(err) = termios::tcsetattr(
-        std::io::stdin().as_fd(),
+        std::io::stdin().as_raw_fd(),
         termios::SetArg::TCSADRAIN,
         &init_term_attrs,
     ) {

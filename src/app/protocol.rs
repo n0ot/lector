@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn ss3_validation_and_timeout_translation_cover_all_supported_prefixes() {
         assert!(!is_invalid_ss3_prefix(b"\x1BO"));
-        for final_byte in [b'A', b'D', b'H', b'P', b'S'] {
+        for final_byte in *b"ADHPS" {
             assert!(!is_invalid_ss3_prefix(&[b'\x1B', b'O', final_byte]));
         }
         assert!(is_invalid_ss3_prefix(b"\x1BOx"));
