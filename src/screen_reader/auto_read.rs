@@ -101,22 +101,55 @@ impl ScreenReader {
             return Ok(false);
         }
 
-        let line_changes = TextDiff::configure()
-            .algorithm(Algorithm::Patience)
-            .diff_lines(old_text, new_text);
-        let single_changed_row = if prev_hashes.len() == curr_hashes.len() {
+        let cursor_row = usize::from(cursor.0);
+        let cursor_row_changed = prev_hashes
+            .get(cursor_row)
+            .zip(curr_hashes.get(cursor_row))
+            .is_some_and(|(prev, curr)| prev != curr);
+        let (single_changed_row, multiple_changed_rows) = if prev_hashes.len() == curr_hashes.len()
+        {
             let mut changed_rows = prev_hashes
                 .iter()
                 .zip(curr_hashes)
                 .enumerate()
                 .filter_map(|(row, (prev, curr))| (prev != curr).then_some(row as u16));
             match (changed_rows.next(), changed_rows.next()) {
-                (Some(row), None) => Some(row),
-                _ => None,
+                (Some(row), None) => (Some(row), false),
+                (_, Some(_)) => (None, true),
+                (None, None) => (None, false),
             }
         } else {
-            None
+            (None, false)
         };
+        // Full-screen applications commonly redraw a ruler or status line along with an
+        // inline edit. Keep the fine-grained insertion diff anchored to the cursor row in
+        // that case; otherwise the secondary row makes the update look like unrelated
+        // multi-line output and the whole edited line is announced.
+        let prefer_inline_cursor_row = prefer_cursor
+            && cursor_moves > 0
+            && !scrolled
+            && cursor.0 == prev_cursor.0
+            && cursor.1 > prev_cursor.1
+            && cursor_row_changed
+            && multiple_changed_rows;
+        let (diff_old_text, diff_new_text) = if prefer_inline_cursor_row {
+            (
+                old_text
+                    .split_terminator('\n')
+                    .nth(cursor_row)
+                    .unwrap_or(""),
+                new_text
+                    .split_terminator('\n')
+                    .nth(cursor_row)
+                    .unwrap_or(""),
+            )
+        } else {
+            (old_text, new_text)
+        };
+
+        let line_changes = TextDiff::configure()
+            .algorithm(Algorithm::Patience)
+            .diff_lines(diff_old_text, diff_new_text);
 
         let mut diff_state = DiffState::NoChanges;
         for change in line_changes.iter_all_changes() {
@@ -138,8 +171,8 @@ impl ScreenReader {
                 false
             }
         });
-        let cursor_on_changed_row =
-            single_changed_row.is_some_and(|row| row == prev_cursor.0 || row == cursor.0);
+        let cursor_on_changed_row = prefer_inline_cursor_row
+            || single_changed_row.is_some_and(|row| row == prev_cursor.0 || row == cursor.0);
         if prefer_cursor
             && diff_state == DiffState::Single
             && cursor_moves > 0
@@ -160,7 +193,7 @@ impl ScreenReader {
             let mut previous_tag = None;
             for change in TextDiff::configure()
                 .algorithm(Algorithm::Patience)
-                .diff_graphemes(old_text, new_text)
+                .diff_graphemes(diff_old_text, diff_new_text)
                 .iter_all_changes()
             {
                 diff_state = next_grapheme_diff_state(diff_state, previous_tag, change.tag());
@@ -176,8 +209,8 @@ impl ScreenReader {
             if diff_state == DiffState::Multi {
                 graphemes.clear();
                 if collect_inserted_fields(
-                    old_text,
-                    new_text,
+                    diff_old_text,
+                    diff_new_text,
                     &mut graphemes,
                     &mut self.auto_read_buffers.lcs,
                 ) {

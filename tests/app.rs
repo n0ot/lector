@@ -393,6 +393,53 @@ fn diff_wins_when_cursor_movement_redraws_the_cursor_line() {
 }
 
 #[test]
+fn inline_input_ignores_coupled_ruler_redraws() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[Hhe\x1B[23;1H[No Name] [+]                                                 1,3            All\x1B[1;3H",
+        &mut term_out,
+    )
+    .expect("draw initial editor screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize initial editor screen");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"l", &mut pty_out, &mut term_out)
+        .expect("append first character");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[?25ll\x1B[23;65H4\x1B[1;4H\x1B[34h\x1B[?25h",
+        &mut term_out,
+    )
+    .expect("redraw first character and ruler");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize first character");
+
+    app.handle_stdin(&mut sr, b"p", &mut pty_out, &mut term_out)
+        .expect("append second character");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[?25lp\x1B[23;65H5\x1B[1;5H\x1B[34h\x1B[?25h",
+        &mut term_out,
+    )
+    .expect("redraw second character and ruler");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize second character");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("l".into(), false), ("p".into(), false)]
+    );
+}
+
+#[test]
 fn printed_line_wins_when_cursor_moves_past_it_to_a_blank_line() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
