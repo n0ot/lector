@@ -76,6 +76,293 @@ fn make_app() -> (App, ScreenReader, Recorder, FakeClock) {
     (app, screen_reader, recorder, clock)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalKeyboardSupport {
+    LegacyOnly,
+    Kitty,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnderlyingAppKeyboardSupport {
+    Legacy,
+    Kitty,
+}
+
+#[derive(Clone, Copy)]
+enum ReplInputProtocol {
+    Legacy,
+    Kitty,
+}
+
+struct ReplLifecycleInput {
+    open_repl: &'static [&'static [u8]],
+    repeat_title: &'static [&'static [u8]],
+    underscore: &'static [&'static [u8]],
+    beginning_of_line: &'static [&'static [u8]],
+    text_x: &'static [&'static [u8]],
+    enter: &'static [&'static [u8]],
+    expression: &'static [&'static [u8]],
+    close_repl: &'static [&'static [u8]],
+    resumed_app_input: &'static [&'static [u8]],
+}
+
+const LEGACY_REPL_LIFECYCLE_INPUT: ReplLifecycleInput = ReplLifecycleInput {
+    open_repl: &[b"\x1BL"],
+    repeat_title: &[b"\x1Br"],
+    underscore: &[b"_"],
+    beginning_of_line: &[b"\x01"],
+    text_x: &[b"x"],
+    enter: &[b"\r"],
+    expression: &[b"1+1"],
+    close_repl: &[b"\x1B"],
+    resumed_app_input: &[b"_\x01"],
+};
+
+// This represents a child application which requested every progressive Kitty
+// keyboard feature, including alternate keys, event types, all-keys reporting,
+// and associated text. Presses and releases are separate byte strings so the
+// test exercises Lector's real incremental input parser.
+const KITTY_REPL_LIFECYCLE_INPUT: ReplLifecycleInput = ReplLifecycleInput {
+    open_repl: &[b"\x1B[108:76;4:1;76u", b"\x1B[108:76;4:3u"],
+    repeat_title: &[b"\x1B[114;3:1;114u", b"\x1B[114;3:3u"],
+    underscore: &[b"\x1B[45:95;2:1;95u", b"\x1B[45:95;2:3u"],
+    beginning_of_line: &[b"\x1B[97;5:1u", b"\x1B[97;5:3u"],
+    text_x: &[b"\x1B[120;1:1;120u", b"\x1B[120;1:3u"],
+    enter: &[b"\x1B[13;1:1u", b"\x1B[13;1:3u"],
+    expression: &[
+        b"\x1B[49;1:1;49u",
+        b"\x1B[49;1:3u",
+        b"\x1B[61:43;2:1;43u",
+        b"\x1B[61:43;2:3u",
+        b"\x1B[49;1:1;49u",
+        b"\x1B[49;1:3u",
+    ],
+    close_repl: &[b"\x1B[27;1:1u", b"\x1B[27;1:3u"],
+    resumed_app_input: &[
+        b"\x1B[45:95;2:1;95u",
+        b"\x1B[45:95;2:3u",
+        b"\x1B[97;5:1u",
+        b"\x1B[97;5:3u",
+    ],
+};
+
+fn send_input_events(
+    app: &mut App,
+    sr: &mut ScreenReader,
+    events: &[&[u8]],
+    pty_out: &mut Vec<u8>,
+    term_out: &mut Vec<u8>,
+    context: &str,
+) {
+    for event in events {
+        app.handle_stdin(sr, event, pty_out, term_out)
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+    }
+}
+
+fn assert_repl_lifecycle(
+    terminal: TerminalKeyboardSupport,
+    underlying_app: UnderlyingAppKeyboardSupport,
+) {
+    let (protocol, input) = match (terminal, underlying_app) {
+        (TerminalKeyboardSupport::LegacyOnly, UnderlyingAppKeyboardSupport::Legacy)
+        | (TerminalKeyboardSupport::Kitty, UnderlyingAppKeyboardSupport::Legacy) => {
+            (ReplInputProtocol::Legacy, &LEGACY_REPL_LIFECYCLE_INPUT)
+        }
+        (TerminalKeyboardSupport::Kitty, UnderlyingAppKeyboardSupport::Kitty) => {
+            (ReplInputProtocol::Kitty, &KITTY_REPL_LIFECYCLE_INPUT)
+        }
+        (TerminalKeyboardSupport::LegacyOnly, UnderlyingAppKeyboardSupport::Kitty) => {
+            panic!("a legacy-only terminal cannot enable the Kitty keyboard protocol")
+        }
+    };
+    let scenario = format!("terminal={terminal:?}, underlying_app={underlying_app:?}");
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    if underlying_app == UnderlyingAppKeyboardSupport::Kitty {
+        const ENABLE_ALL_KITTY_KEYBOARD_FEATURES: &[u8] = b"\x1B[>31u";
+        app.handle_pty(&mut sr, ENABLE_ALL_KITTY_KEYBOARD_FEATURES, &mut term_out)
+            .expect("forward child Kitty keyboard-mode request");
+        assert_eq!(
+            term_out, ENABLE_ALL_KITTY_KEYBOARD_FEATURES,
+            "child keyboard-mode control must pass through: {scenario}"
+        );
+        term_out.clear();
+    }
+
+    send_input_events(
+        &mut app,
+        &mut sr,
+        input.open_repl,
+        &mut pty_out,
+        &mut term_out,
+        "open REPL",
+    );
+    assert!(app.has_overlay(), "REPL did not open: {scenario}");
+    let contents = app.debug_active_view_contents();
+    assert!(
+        contents.contains("Lua REPL ready.") && contents.contains("Esc to close"),
+        "REPL was not rendered: {scenario}, contents={contents:?}"
+    );
+    assert!(
+        pty_out.is_empty(),
+        "REPL shortcut leaked to child: {scenario}"
+    );
+
+    recorder.inner.borrow_mut().speaks.clear();
+    send_input_events(
+        &mut app,
+        &mut sr,
+        input.repeat_title,
+        &mut pty_out,
+        &mut term_out,
+        "repeat overlay title",
+    );
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "Lua REPL"),
+        "Lector command did not run inside REPL: {scenario}"
+    );
+    assert!(app.has_overlay(), "Lector command closed REPL: {scenario}");
+
+    recorder.inner.borrow_mut().speaks.clear();
+    send_input_events(
+        &mut app,
+        &mut sr,
+        input.open_repl,
+        &mut pty_out,
+        &mut term_out,
+        "open REPL while already open",
+    );
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "Lua REPL already open"),
+        "second Lector command did not run inside REPL: {scenario}"
+    );
+    assert!(
+        app.has_overlay(),
+        "second REPL shortcut nested views: {scenario}"
+    );
+
+    for (events, context) in [
+        (input.underscore, "type underscore"),
+        (input.beginning_of_line, "move to beginning of line"),
+        (input.text_x, "insert at beginning of line"),
+    ] {
+        send_input_events(
+            &mut app,
+            &mut sr,
+            events,
+            &mut pty_out,
+            &mut term_out,
+            context,
+        );
+    }
+    let contents = app.debug_active_view_contents();
+    assert!(
+        contents.contains("> x_"),
+        "text entry or C-a editing failed: {scenario}, contents={contents:?}"
+    );
+
+    send_input_events(
+        &mut app,
+        &mut sr,
+        input.enter,
+        &mut pty_out,
+        &mut term_out,
+        "submit edited identifier",
+    );
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish first REPL evaluation");
+    send_input_events(
+        &mut app,
+        &mut sr,
+        input.expression,
+        &mut pty_out,
+        &mut term_out,
+        "type expression",
+    );
+    send_input_events(
+        &mut app,
+        &mut sr,
+        input.enter,
+        &mut pty_out,
+        &mut term_out,
+        "submit expression",
+    );
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish expression evaluation");
+    let contents = app.debug_active_view_contents();
+    assert!(
+        contents.lines().any(|line| line.trim() == "2"),
+        "REPL evaluation failed: {scenario}, contents={contents:?}"
+    );
+
+    term_out.clear();
+    app.handle_pty(&mut sr, b"underlying app output\r\n", &mut term_out)
+        .expect("receive child output while REPL is open");
+    assert!(
+        term_out.is_empty(),
+        "child output overwrote active REPL: {scenario}"
+    );
+
+    send_input_events(
+        &mut app,
+        &mut sr,
+        input.close_repl,
+        &mut pty_out,
+        &mut term_out,
+        "close REPL",
+    );
+    if matches!(protocol, ReplInputProtocol::Legacy) {
+        clock.advance_ms(50);
+        app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+            .expect("resolve legacy Escape");
+    }
+    assert!(!app.has_overlay(), "REPL did not close: {scenario}");
+    assert!(
+        app.debug_active_view_contents()
+            .contains("underlying app output"),
+        "root application was not restored: {scenario}"
+    );
+    assert!(
+        String::from_utf8_lossy(&term_out).contains("underlying app output"),
+        "restored root application was not rendered: {scenario}"
+    );
+    assert!(
+        pty_out.is_empty(),
+        "REPL input or closing release leaked to child: {scenario}"
+    );
+
+    send_input_events(
+        &mut app,
+        &mut sr,
+        input.resumed_app_input,
+        &mut pty_out,
+        &mut term_out,
+        "forward input after REPL exit",
+    );
+    let expected: Vec<u8> = input
+        .resumed_app_input
+        .iter()
+        .flat_map(|event| event.iter().copied())
+        .collect();
+    assert_eq!(
+        pty_out, expected,
+        "child input did not resume verbatim: {scenario}"
+    );
+}
+
 #[test]
 fn stdin_unmapped_forwards_to_pty() {
     let (mut app, mut sr, recorder, _clock) = make_app();
@@ -890,6 +1177,273 @@ fn lua_repl_ctrl_l_from_modify_other_keys_clears_output() {
     let after_clear = app.debug_active_view_contents();
     assert!(after_clear.contains("Esc to close"));
     assert!(!after_clear.contains("alpha"));
+}
+
+#[test]
+fn lua_repl_accepts_legacy_and_kitty_encoded_shift_punctuation() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open repl");
+    app.handle_stdin(&mut sr, b"!", &mut pty_out, &mut term_out)
+        .expect("legacy shift punctuation");
+    app.handle_stdin(
+        &mut sr,
+        b"\x1B[95;2u\x1B[43;2u\x1B[123;2u",
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("Kitty shift punctuation");
+
+    assert!(pty_out.is_empty());
+    assert!(app.debug_active_view_contents().contains("> !_+{"));
+}
+
+#[test]
+fn lua_repl_accepts_modify_other_keys_shift_punctuation() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open repl");
+    app.handle_stdin(&mut sr, b"\x1B[27;2;95~", &mut pty_out, &mut term_out)
+        .expect("modifyOtherKeys underscore");
+
+    assert!(pty_out.is_empty());
+    assert!(app.debug_active_view_contents().contains("> _"));
+}
+
+#[test]
+fn lua_repl_uses_kitty_associated_text_and_legacy_unicode() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open repl");
+    app.handle_stdin(&mut sr, "é".as_bytes(), &mut pty_out, &mut term_out)
+        .expect("legacy UTF-8 text");
+    app.handle_stdin(&mut sr, b"\x1B[45;2;95u", &mut pty_out, &mut term_out)
+        .expect("Kitty associated underscore text");
+    app.handle_stdin(&mut sr, b"\x1B[0;1;229u", &mut pty_out, &mut term_out)
+        .expect("Kitty pure text event");
+
+    assert!(pty_out.is_empty());
+    assert!(app.debug_active_view_contents().contains("> é_å"));
+}
+
+#[test]
+fn lua_repl_accepts_multiline_bracketed_paste_without_executing_controls() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open repl");
+    app.handle_stdin(
+        &mut sr,
+        b"\x1B[200~1 +\n1\x1B[201~",
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("paste multiline expression");
+    assert!(app.debug_active_view_contents().contains("> 1 +↵1"));
+
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("submit pasted expression");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish eval");
+
+    assert!(app.debug_active_view_contents().contains("2"));
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn lua_repl_semantic_commands_work_with_kitty_modifiers() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open repl");
+    app.handle_stdin(&mut sr, b"abc def", &mut pty_out, &mut term_out)
+        .expect("initial text");
+    app.handle_stdin(&mut sr, b"\x1B[98;3uX", &mut pty_out, &mut term_out)
+        .expect("Kitty Alt-b and insertion");
+    app.handle_stdin(&mut sr, b"\x1B[97;6uY", &mut pty_out, &mut term_out)
+        .expect("Kitty Ctrl-Shift-a and insertion");
+    app.handle_stdin(&mut sr, b"\x1B[101;5u", &mut pty_out, &mut term_out)
+        .expect("Kitty Ctrl-e");
+    app.handle_stdin(&mut sr, b"\x1B[104;5u", &mut pty_out, &mut term_out)
+        .expect("Kitty Ctrl-h through forwarding binding");
+    app.handle_stdin(&mut sr, b"\x1B[127;3u", &mut pty_out, &mut term_out)
+        .expect("Kitty Alt-Backspace");
+
+    assert!(pty_out.is_empty());
+    let contents = app.debug_active_view_contents();
+    assert!(contents.contains("> Yabc\n"), "contents={contents:?}");
+}
+
+#[test]
+fn lua_repl_editing_is_protocol_invariant() {
+    fn run(commands: &[&[u8]]) -> String {
+        let (mut app, mut sr, _recorder, _clock) = make_app();
+        let mut pty_out = Vec::new();
+        let mut term_out = Vec::new();
+        app.handle_stdin(&mut sr, b"\x1BLabc def", &mut pty_out, &mut term_out)
+            .expect("open repl and enter initial text");
+        for command in commands {
+            app.handle_stdin(&mut sr, command, &mut pty_out, &mut term_out)
+                .expect("apply editing command");
+        }
+        assert!(pty_out.is_empty());
+        app.debug_active_view_contents()
+    }
+
+    let legacy = run(&[
+        b"\x1Bb", b"X", b"\x01", b"Y", b"\x05", b"\x7F", b"\x1B[D", b"\x1B[3~",
+    ]);
+    let kitty = run(&[
+        b"\x1B[98;3u",
+        b"X",
+        b"\x1B[97;5u",
+        b"Y",
+        b"\x1B[101;5u",
+        b"\x1B[127;1u",
+        b"\x1B[1;1D",
+        b"\x1B[3;1~",
+    ]);
+    let modify_other_keys = run(&[
+        b"\x1B[27;3;98~",
+        b"X",
+        b"\x1B[27;5;97~",
+        b"Y",
+        b"\x1B[27;5;101~",
+        b"\x1B[27;1;127~",
+        b"\x1B[D",
+        b"\x1B[3~",
+    ]);
+
+    assert!(legacy.contains("> Yabc Xd"), "legacy={legacy:?}");
+    assert_eq!(kitty, legacy);
+    assert_eq!(modify_other_keys, legacy);
+}
+
+#[test]
+fn lua_repl_handles_kitty_special_keys_and_ignores_releases() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BLabc", &mut pty_out, &mut term_out)
+        .expect("open repl and type");
+    app.handle_stdin(
+        &mut sr,
+        b"\x1B[1;1:1D\x1B[1;1:3DX",
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("Kitty left press, release, and insertion");
+    app.handle_stdin(&mut sr, b"\x1B[3;1~", &mut pty_out, &mut term_out)
+        .expect("Kitty Delete");
+    app.handle_stdin(&mut sr, b"\x1B[127;1u", &mut pty_out, &mut term_out)
+        .expect("Kitty Backspace");
+
+    assert!(pty_out.is_empty());
+    assert!(app.debug_active_view_contents().contains("> ab"));
+}
+
+#[test]
+fn lua_repl_submits_and_closes_with_report_all_keys_encodings() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL1+1", &mut pty_out, &mut term_out)
+        .expect("open repl and type expression");
+    app.handle_stdin(&mut sr, b"\x1B[13;1u", &mut pty_out, &mut term_out)
+        .expect("Kitty Enter");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish eval");
+    assert!(app.debug_active_view_contents().contains("2"));
+
+    app.handle_stdin(&mut sr, b"\x1B[27;1u", &mut pty_out, &mut term_out)
+        .expect("Kitty Escape");
+    assert!(!app.has_overlay());
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn repl_lifecycle_on_non_kitty_terminal_with_legacy_app() {
+    assert_repl_lifecycle(
+        TerminalKeyboardSupport::LegacyOnly,
+        UnderlyingAppKeyboardSupport::Legacy,
+    );
+}
+
+#[test]
+fn repl_lifecycle_on_kitty_terminal_with_legacy_app() {
+    assert_repl_lifecycle(
+        TerminalKeyboardSupport::Kitty,
+        UnderlyingAppKeyboardSupport::Legacy,
+    );
+}
+
+#[test]
+fn repl_lifecycle_on_kitty_terminal_with_kitty_app() {
+    assert_repl_lifecycle(
+        TerminalKeyboardSupport::Kitty,
+        UnderlyingAppKeyboardSupport::Kitty,
+    );
+}
+
+#[test]
+fn kitty_associated_text_is_forwarded_verbatim_outside_overlays() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let input = b"\x1B[45;2;95u";
+
+    app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+        .expect("forward Kitty associated-text event");
+
+    assert_eq!(pty_out, input);
+}
+
+#[test]
+fn legacy_console_input_is_forwarded_verbatim_outside_overlays() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let input = b"_\x01\x1B[D\x7F";
+
+    app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+        .expect("forward legacy console input");
+
+    assert_eq!(pty_out, input);
+}
+
+#[test]
+fn kitty_report_all_enter_and_release_close_message_once() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.show_message(&mut sr, "Notice", "body", &mut term_out)
+        .expect("show message");
+
+    app.handle_stdin(
+        &mut sr,
+        b"\x1B[13;1:1u\x1B[13;1:3u",
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("Kitty Enter press and release");
+
+    assert!(!app.has_overlay());
+    assert!(pty_out.is_empty());
 }
 
 #[test]

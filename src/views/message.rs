@@ -1,5 +1,5 @@
 use super::{Result, ViewAction, ViewController, ViewKind};
-use crate::{screen_reader::ScreenReader, view::View};
+use crate::{screen_reader::ScreenReader, terminal_input::KeyInput, view::View};
 use std::any::Any;
 use std::io::Write;
 
@@ -47,6 +47,28 @@ impl ViewController for MessageView {
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         if input == b"\x1B" || input == b"\r" || input == b"\n" {
+            Ok(ViewAction::Pop)
+        } else {
+            Ok(ViewAction::None)
+        }
+    }
+
+    fn handle_key_input(
+        &mut self,
+        _sr: &mut ScreenReader,
+        key: &KeyInput,
+        _raw: &[u8],
+        _pty_stream: &mut dyn Write,
+    ) -> Result<ViewAction> {
+        if key.is_release() {
+            return Ok(ViewAction::None);
+        }
+        if matches!(key.control_code(), Some(b'\n' | b'\r' | b'\x1B'))
+            || matches!(
+                key.event().code,
+                terminput::KeyCode::Enter | terminput::KeyCode::Esc
+            )
+        {
             Ok(ViewAction::Pop)
         } else {
             Ok(ViewAction::None)

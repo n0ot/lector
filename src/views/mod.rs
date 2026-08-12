@@ -8,7 +8,7 @@ pub use message::MessageView;
 pub use pty::PtyView;
 pub use stack::ViewStack;
 
-use crate::{screen_reader::ScreenReader, view::View};
+use crate::{screen_reader::ScreenReader, terminal_input::KeyInput, view::View};
 use std::any::Any;
 use std::io::Write;
 
@@ -64,6 +64,17 @@ pub trait ViewController {
         input: &[u8],
         pty_stream: &mut dyn Write,
     ) -> Result<ViewAction>;
+    /// Handles a decoded key while retaining its original bytes for views, such
+    /// as the PTY, that must preserve the terminal's exact input protocol.
+    fn handle_key_input(
+        &mut self,
+        sr: &mut ScreenReader,
+        _key: &KeyInput,
+        raw: &[u8],
+        pty_stream: &mut dyn Write,
+    ) -> Result<ViewAction> {
+        self.handle_input(sr, raw, pty_stream)
+    }
     fn tick(&mut self, _sr: &mut ScreenReader, _pty_stream: &mut dyn Write) -> Result<ViewAction> {
         Ok(ViewAction::None)
     }

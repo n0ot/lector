@@ -13,5 +13,6 @@ pub mod proc_server_common;
 pub mod screen_reader;
 pub mod speech;
 mod table;
+pub mod terminal_input;
 pub mod view;
 pub mod views;

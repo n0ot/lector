@@ -1,3 +1,7 @@
+use crate::terminal_input::KeyInput;
+use terminput::{KeyCode, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
+
 pub struct LineEditor {
     input: String,
     cursor: usize,
@@ -96,8 +100,95 @@ impl LineEditor {
         action
     }
 
-    pub fn len_chars(&self) -> usize {
-        self.input.len()
+    pub fn handle_key_input(&mut self, key: &KeyInput) -> EditorAction {
+        if key.is_release() {
+            return EditorAction::None;
+        }
+        if let Some(text) = key.text() {
+            return self.handle_text(&text);
+        }
+        if let Some(control) = key.control_code() {
+            return self.handle_byte(control);
+        }
+
+        let event = key.normalized_event();
+        let word_modifier = event
+            .modifiers
+            .intersects(KeyModifiers::CTRL | KeyModifiers::ALT | KeyModifiers::META);
+        match event.code {
+            KeyCode::Enter => EditorAction::Submit,
+            KeyCode::Backspace if word_modifier => {
+                if self.erase_word_left() {
+                    EditorAction::Changed
+                } else {
+                    EditorAction::Bell
+                }
+            }
+            KeyCode::Backspace => self.handle_backspace(),
+            KeyCode::Delete => {
+                if self.delete() {
+                    EditorAction::Changed
+                } else {
+                    EditorAction::Bell
+                }
+            }
+            KeyCode::Left if word_modifier => {
+                self.move_word_left();
+                EditorAction::Changed
+            }
+            KeyCode::Right if word_modifier => {
+                self.move_word_right();
+                EditorAction::Changed
+            }
+            KeyCode::Left => {
+                self.move_left();
+                EditorAction::Changed
+            }
+            KeyCode::Right => {
+                self.move_right();
+                EditorAction::Changed
+            }
+            KeyCode::Up => self.handle_history_up(),
+            KeyCode::Down => self.handle_history_down(),
+            KeyCode::Home => {
+                self.cursor = 0;
+                EditorAction::Changed
+            }
+            KeyCode::End => {
+                self.cursor = self.len_graphemes();
+                EditorAction::Changed
+            }
+            KeyCode::Char(ch)
+                if event
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::META) =>
+            {
+                match ch.to_ascii_lowercase() {
+                    'b' => {
+                        self.move_word_left();
+                        EditorAction::Changed
+                    }
+                    'f' => {
+                        self.move_word_right();
+                        EditorAction::Changed
+                    }
+                    _ => EditorAction::None,
+                }
+            }
+            _ => EditorAction::None,
+        }
+    }
+
+    pub fn handle_text(&mut self, text: &str) -> EditorAction {
+        if text.is_empty() {
+            return EditorAction::None;
+        }
+        self.insert_str(text);
+        EditorAction::Changed
+    }
+
+    pub fn len_graphemes(&self) -> usize {
+        self.input.graphemes(true).count()
     }
 
     fn history_up(&mut self) -> bool {
@@ -114,7 +205,7 @@ impl LineEditor {
         };
         self.history_index = Some(next_index);
         self.input = self.history[next_index].clone();
-        self.cursor = self.input.len();
+        self.cursor = self.len_graphemes();
         true
     }
 
@@ -125,14 +216,41 @@ impl LineEditor {
         if idx + 1 >= self.history.len() {
             self.history_index = None;
             self.input = self.history_draft.clone();
-            self.cursor = self.input.len();
+            self.cursor = self.len_graphemes();
             return true;
         }
         let next_index = idx + 1;
         self.history_index = Some(next_index);
         self.input = self.history[next_index].clone();
-        self.cursor = self.input.len();
+        self.cursor = self.len_graphemes();
         true
+    }
+
+    fn handle_history_up(&mut self) -> EditorAction {
+        if self.history_up() {
+            EditorAction::Changed
+        } else {
+            EditorAction::Bell
+        }
+    }
+
+    fn handle_history_down(&mut self) -> EditorAction {
+        if self.history_down() {
+            EditorAction::Changed
+        } else {
+            EditorAction::Bell
+        }
+    }
+
+    fn handle_backspace(&mut self) -> EditorAction {
+        if self.cursor == 0 && self.input.is_empty() {
+            EditorAction::Bell
+        } else if self.cursor == 0 {
+            EditorAction::None
+        } else {
+            self.backspace();
+            EditorAction::Changed
+        }
     }
 
     fn handle_byte(&mut self, byte: u8) -> EditorAction {
@@ -146,23 +264,11 @@ impl LineEditor {
                 EditorAction::Changed
             }
             b'\x05' => {
-                self.cursor = self.input.len();
+                self.cursor = self.len_graphemes();
                 EditorAction::Changed
             }
-            b'\x10' => {
-                if self.history_up() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
-            b'\x0E' => {
-                if self.history_down() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
+            b'\x10' => self.handle_history_up(),
+            b'\x0E' => self.handle_history_down(),
             b'\x17' => {
                 if self.erase_word_left() {
                     EditorAction::Changed
@@ -171,16 +277,7 @@ impl LineEditor {
                 }
             }
             b'\r' | b'\n' => EditorAction::Submit,
-            b'\x7F' | b'\x08' => {
-                if self.cursor == 0 && self.input.is_empty() {
-                    EditorAction::Bell
-                } else if self.cursor == 0 {
-                    EditorAction::None
-                } else {
-                    self.backspace();
-                    EditorAction::Changed
-                }
-            }
+            b'\x7F' | b'\x08' => self.handle_backspace(),
             _ => {
                 if byte.is_ascii() && !byte.is_ascii_control() {
                     let ch = byte as char;
@@ -239,26 +336,14 @@ impl LineEditor {
                 self.move_right();
                 EditorAction::Changed
             }
-            b'A' => {
-                if self.history_up() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
-            b'B' => {
-                if self.history_down() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
+            b'A' => self.handle_history_up(),
+            b'B' => self.handle_history_down(),
             b'H' => {
                 self.cursor = 0;
                 EditorAction::Changed
             }
             b'F' => {
-                self.cursor = self.input.len();
+                self.cursor = self.len_graphemes();
                 EditorAction::Changed
             }
             b'~' => {
@@ -285,26 +370,14 @@ impl LineEditor {
                 self.move_right();
                 EditorAction::Changed
             }
-            b'A' => {
-                if self.history_up() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
-            b'B' => {
-                if self.history_down() {
-                    EditorAction::Changed
-                } else {
-                    EditorAction::Bell
-                }
-            }
+            b'A' => self.handle_history_up(),
+            b'B' => self.handle_history_down(),
             b'H' => {
                 self.cursor = 0;
                 EditorAction::Changed
             }
             b'F' => {
-                self.cursor = self.input.len();
+                self.cursor = self.len_graphemes();
                 EditorAction::Changed
             }
             _ => EditorAction::None,
@@ -318,14 +391,22 @@ impl LineEditor {
     }
 
     fn move_right(&mut self) {
-        if self.cursor < self.input.len() {
+        if self.cursor < self.len_graphemes() {
             self.cursor += 1;
         }
     }
 
     fn insert_str(&mut self, s: &str) {
-        self.input.insert_str(self.cursor, s);
-        self.cursor += s.len();
+        let byte_index = self.byte_index(self.cursor);
+        self.input.insert_str(byte_index, s);
+        let inserted_end = byte_index + s.len();
+        self.cursor = 0;
+        for (start, grapheme) in self.input.grapheme_indices(true) {
+            self.cursor += 1;
+            if start + grapheme.len() >= inserted_end {
+                break;
+            }
+        }
     }
 
     fn backspace(&mut self) {
@@ -333,34 +414,48 @@ impl LineEditor {
             return;
         }
         let start = self.cursor - 1;
-        self.input.replace_range(start..self.cursor, "");
+        let byte_start = self.byte_index(start);
+        let byte_end = self.byte_index(self.cursor);
+        self.input.replace_range(byte_start..byte_end, "");
         self.cursor -= 1;
+    }
+
+    fn delete(&mut self) -> bool {
+        if self.cursor >= self.len_graphemes() {
+            return false;
+        }
+        let byte_start = self.byte_index(self.cursor);
+        let byte_end = self.byte_index(self.cursor + 1);
+        self.input.replace_range(byte_start..byte_end, "");
+        true
     }
 
     fn move_word_left(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        let mut idx = self.cursor;
-        while idx > 0 && !is_word_byte(self.input.as_bytes()[idx - 1]) {
+        let graphemes: Vec<&str> = self.input.graphemes(true).collect();
+        let mut idx = self.cursor.min(graphemes.len());
+        while idx > 0 && !is_word_grapheme(graphemes[idx - 1]) {
             idx -= 1;
         }
-        while idx > 0 && is_word_byte(self.input.as_bytes()[idx - 1]) {
+        while idx > 0 && is_word_grapheme(graphemes[idx - 1]) {
             idx -= 1;
         }
         self.cursor = idx;
     }
 
     fn move_word_right(&mut self) {
-        let len = self.input.len();
+        let graphemes: Vec<&str> = self.input.graphemes(true).collect();
+        let len = graphemes.len();
         if self.cursor >= len {
             return;
         }
         let mut idx = self.cursor;
-        while idx < len && !is_word_byte(self.input.as_bytes()[idx]) {
+        while idx < len && !is_word_grapheme(graphemes[idx]) {
             idx += 1;
         }
-        while idx < len && is_word_byte(self.input.as_bytes()[idx]) {
+        while idx < len && is_word_grapheme(graphemes[idx]) {
             idx += 1;
         }
         self.cursor = idx;
@@ -377,7 +472,9 @@ impl LineEditor {
         if start == end {
             return false;
         }
-        self.input.replace_range(start..end, "");
+        let byte_start = self.byte_index(start);
+        let byte_end = self.byte_index(end);
+        self.input.replace_range(byte_start..byte_end, "");
         true
     }
 
@@ -389,9 +486,10 @@ impl LineEditor {
                 true
             }
             Some(4) | Some(8) => {
-                self.cursor = self.input.len();
+                self.cursor = self.len_graphemes();
                 true
             }
+            Some(3) => self.delete(),
             _ => false,
         }
     }
@@ -409,10 +507,21 @@ impl LineEditor {
         }
         if saw_digit { Some(value) } else { None }
     }
+
+    fn byte_index(&self, char_index: usize) -> usize {
+        self.input
+            .grapheme_indices(true)
+            .nth(char_index)
+            .map(|(index, _)| index)
+            .unwrap_or(self.input.len())
+    }
 }
 
-fn is_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
+fn is_word_grapheme(grapheme: &str) -> bool {
+    grapheme
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
 }
 
 #[cfg(test)]
@@ -572,12 +681,12 @@ mod tests {
     #[test]
     fn default_history_and_character_count_accessors_cover_empty_and_loaded_state() {
         let mut editor = LineEditor::default();
-        assert_eq!(editor.len_chars(), 0);
+        assert_eq!(editor.len_graphemes(), 0);
         editor.set_history(vec!["first".into(), "second".into()]);
 
         assert!(matches!(feed(&mut editor, b"\x10"), EditorAction::Changed));
         assert_eq!(editor.input(), "second");
-        assert_eq!(editor.len_chars(), 6);
+        assert_eq!(editor.len_graphemes(), 6);
         assert!(matches!(feed(&mut editor, b"\x10"), EditorAction::Changed));
         assert_eq!(editor.input(), "first");
         assert!(matches!(feed(&mut editor, b"\x10"), EditorAction::Changed));
@@ -630,5 +739,32 @@ mod tests {
         }
         assert!(matches!(feed(&mut editor, b"a"), EditorAction::Changed));
         assert_eq!(editor.input(), "a");
+    }
+
+    #[test]
+    fn unicode_editing_uses_grapheme_boundaries() {
+        let mut editor = LineEditor::new();
+        assert!(matches!(editor.handle_text("a e"), EditorAction::Changed));
+        assert!(matches!(
+            editor.handle_text("\u{301}"),
+            EditorAction::Changed
+        ));
+        assert_eq!(editor.len_graphemes(), 3);
+        assert_eq!(editor.cursor(), 3);
+        assert!(matches!(editor.handle_text("界"), EditorAction::Changed));
+        assert_eq!(editor.len_graphemes(), 4);
+        assert_eq!(editor.cursor(), 4);
+
+        editor.backspace();
+        assert_eq!(editor.input(), "a e\u{301}");
+        assert_eq!(editor.cursor(), 3);
+        editor.backspace();
+        assert_eq!(editor.input(), "a ");
+        assert_eq!(editor.cursor(), 2);
+
+        editor.cursor = 0;
+        assert!(editor.delete());
+        assert_eq!(editor.input(), " ");
+        assert_eq!(editor.cursor(), 0);
     }
 }

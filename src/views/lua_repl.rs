@@ -3,6 +3,7 @@ use crate::{
     line_editor::{EditorAction, LineEditor},
     lua,
     screen_reader::ScreenReader,
+    terminal_input::KeyInput,
     view::View,
 };
 use mlua::{
@@ -10,6 +11,8 @@ use mlua::{
     ThreadStatus, Value, VmState,
 };
 use std::{any::Any, cell::RefCell, io::Write, rc::Rc};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const CLOSE_HINT: &str = "Esc to close";
 
@@ -134,13 +137,17 @@ impl LuaReplView {
     fn try_append_input(&mut self) -> bool {
         let input = self.editor.input().to_string();
         let cursor = self.editor.cursor();
-        let input_len = input.chars().count();
+        let input_len = input.graphemes(true).count();
         let prev_input = self.rendered_input.as_str();
-        let prev_len = prev_input.chars().count();
+        let prev_len = prev_input.graphemes(true).count();
+        let (_, cols) = self.view.size();
+        let available = usize::from(cols).saturating_sub(2);
         if cursor == input_len
             && self.rendered_cursor == prev_len
             && input_len > prev_len
             && input.starts_with(prev_input)
+            && !input.chars().any(char::is_control)
+            && UnicodeWidthStr::width(input.as_str()) <= available
         {
             let added = &input[prev_input.len()..];
             self.write_bytes(added.as_bytes());
@@ -151,75 +158,8 @@ impl LuaReplView {
         false
     }
 
-    fn redraw_input_line(&mut self) {
-        let input = self.editor.input().to_string();
-        let cursor = self.editor.cursor();
-        let input_len = input.chars().count();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"\r\x1B[K");
-        bytes.extend_from_slice(b"> ");
-        bytes.extend_from_slice(input.as_bytes());
-        if input_len > cursor {
-            bytes.extend_from_slice(format!("\x1B[{}D", input_len - cursor).as_bytes());
-        }
-        self.write_bytes(&bytes);
-        self.rendered_input = input;
-        self.rendered_cursor = cursor;
-    }
-
     fn apply_editor_update(&mut self) {
-        let new_input = self.editor.input().to_string();
-        let new_cursor = self.editor.cursor();
-        let prev_input = self.rendered_input.clone();
-        let prev_cursor = self.rendered_cursor;
-
-        if new_input == prev_input {
-            if new_cursor + 1 == prev_cursor {
-                self.write_bytes(b"\x08");
-                self.rendered_cursor = new_cursor;
-                return;
-            }
-            if new_cursor == prev_cursor + 1 {
-                self.write_bytes(b"\x1B[C");
-                self.rendered_cursor = new_cursor;
-                return;
-            }
-        }
-
-        let new_chars: Vec<char> = new_input.chars().collect();
-        let prev_chars: Vec<char> = prev_input.chars().collect();
-
-        if new_chars.len() == prev_chars.len() + 1
-            && new_cursor == prev_cursor + 1
-            && new_chars[..prev_cursor] == prev_chars[..prev_cursor]
-            && new_chars[prev_cursor + 1..] == prev_chars[prev_cursor..]
-        {
-            let inserted = new_chars[prev_cursor];
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(b"\x1B[1@");
-            bytes.extend_from_slice(inserted.to_string().as_bytes());
-            self.write_bytes(&bytes);
-            self.rendered_input = new_input;
-            self.rendered_cursor = new_cursor;
-            return;
-        }
-
-        if new_chars.len() + 1 == prev_chars.len()
-            && new_cursor + 1 == prev_cursor
-            && new_chars[..new_cursor] == prev_chars[..new_cursor]
-            && new_chars[new_cursor..] == prev_chars[new_cursor + 1..]
-        {
-            if new_cursor == new_chars.len() {
-                self.write_bytes(b"\x08 \x08");
-            } else {
-                self.write_bytes(b"\x08\x1B[1P");
-            }
-            self.rendered_input = new_input;
-            self.rendered_cursor = new_cursor;
-            return;
-        }
-
-        self.redraw_input_line();
+        self.render_full();
     }
 
     fn render_full(&mut self) {
@@ -228,21 +168,9 @@ impl LuaReplView {
         let cols = cols as usize;
         let prompt = "> ";
         let available = cols.saturating_sub(prompt.len());
-        let total_chars = self.editor.len_chars();
-        let cursor = self.editor.cursor().min(total_chars);
-        let start = if cursor > available {
-            cursor.saturating_sub(available)
-        } else {
-            0
-        };
-        let visible_input: String = self
-            .editor
-            .input()
-            .chars()
-            .skip(start)
-            .take(available)
-            .collect();
-        let cursor_col = prompt.len() + (cursor - start);
+        let (visible_input, cursor_width) =
+            visible_input_window(self.editor.input(), self.editor.cursor(), available);
+        let cursor_col = prompt.len() + cursor_width;
 
         let body_rows = rows.saturating_sub(1);
         let mut body_lines: Vec<String> = self.output.to_vec();
@@ -345,6 +273,37 @@ impl LuaReplView {
         self.output.clear();
         self.render_full();
     }
+
+    fn apply_editor_action(&mut self, action: EditorAction) -> Result<ViewAction> {
+        match action {
+            EditorAction::Submit => {
+                let line = self.editor.input().to_string();
+                if line.trim().is_empty() {
+                    return Ok(ViewAction::Bell);
+                }
+                self.write_bytes(b"\r\n");
+                self.editor.commit_history();
+                self.editor.clear();
+                self.rendered_input.clear();
+                self.rendered_cursor = 0;
+                if let Err(err) = self.start_eval(&line) {
+                    let added = self.append_output(&format!("Error: {}", err));
+                    self.write_output_lines(&added);
+                    self.write_prompt();
+                    return Ok(ViewAction::Redraw);
+                }
+                Ok(ViewAction::Redraw)
+            }
+            EditorAction::Changed => {
+                if !self.try_append_input() {
+                    self.apply_editor_update();
+                }
+                Ok(ViewAction::Redraw)
+            }
+            EditorAction::Bell => Ok(ViewAction::Bell),
+            EditorAction::None => Ok(ViewAction::None),
+        }
+    }
 }
 
 impl ViewController for LuaReplView {
@@ -386,34 +345,51 @@ impl ViewController for LuaReplView {
         if self.thread.is_some() {
             return Ok(ViewAction::Bell);
         }
-        match self.editor.handle_bytes(input) {
-            EditorAction::Submit => {
-                let line = self.editor.input().to_string();
-                if line.trim().is_empty() {
-                    return Ok(ViewAction::Bell);
-                }
-                self.write_bytes(b"\r\n");
-                self.editor.commit_history();
-                self.editor.clear();
-                self.rendered_input.clear();
-                self.rendered_cursor = 0;
-                if let Err(err) = self.start_eval(&line) {
-                    let added = self.append_output(&format!("Error: {}", err));
-                    self.write_output_lines(&added);
-                    self.write_prompt();
-                    return Ok(ViewAction::Redraw);
-                }
-                Ok(ViewAction::Redraw)
-            }
-            EditorAction::Changed => {
-                if !self.try_append_input() {
-                    self.apply_editor_update();
-                }
-                Ok(ViewAction::Redraw)
-            }
-            EditorAction::Bell => Ok(ViewAction::Bell),
-            EditorAction::None => Ok(ViewAction::None),
+        let action = self.editor.handle_bytes(input);
+        self.apply_editor_action(action)
+    }
+
+    fn handle_key_input(
+        &mut self,
+        sr: &mut ScreenReader,
+        key: &KeyInput,
+        _raw: &[u8],
+        _pty_stream: &mut dyn Write,
+    ) -> Result<ViewAction> {
+        self.set_screen_reader(sr);
+        if key.is_release() {
+            return Ok(ViewAction::None);
         }
+        if matches!(key.control_code(), Some(0x1B))
+            || matches!(key.event().code, terminput::KeyCode::Esc)
+        {
+            self.thread = None;
+            return Ok(ViewAction::Pop);
+        }
+        if matches!(key.control_code(), Some(0x0C)) {
+            self.clear_screen();
+            return Ok(ViewAction::Redraw);
+        }
+        if self.thread.is_some() {
+            return Ok(ViewAction::Bell);
+        }
+        let action = self.editor.handle_key_input(key);
+        self.apply_editor_action(action)
+    }
+
+    fn handle_paste(
+        &mut self,
+        sr: &mut ScreenReader,
+        contents: &str,
+        _pty_stream: &mut dyn Write,
+    ) -> Result<ViewAction> {
+        self.set_screen_reader(sr);
+        if self.thread.is_some() {
+            return Ok(ViewAction::Bell);
+        }
+        let contents = contents.replace("\r\n", "\n").replace('\r', "\n");
+        let action = self.editor.handle_text(&contents);
+        self.apply_editor_action(action)
     }
 
     fn tick(&mut self, sr: &mut ScreenReader, _pty_stream: &mut dyn Write) -> Result<ViewAction> {
@@ -465,12 +441,65 @@ fn format_value(value: Value) -> String {
 }
 
 fn truncate_to_width(text: &str, width: usize) -> String {
-    text.chars().take(width).collect()
+    let mut used = 0;
+    text.graphemes(true)
+        .take_while(|grapheme| {
+            let grapheme_width = UnicodeWidthStr::width(*grapheme);
+            if used + grapheme_width > width {
+                return false;
+            }
+            used += grapheme_width;
+            true
+        })
+        .collect()
+}
+
+fn visible_input_window(input: &str, cursor: usize, available: usize) -> (String, usize) {
+    let graphemes: Vec<&str> = input.graphemes(true).collect();
+    let cursor = cursor.min(graphemes.len());
+    let mut start = cursor;
+    let mut cursor_width = 0;
+    while start > 0 {
+        let width = UnicodeWidthStr::width(display_grapheme(graphemes[start - 1]));
+        if cursor_width + width > available {
+            break;
+        }
+        cursor_width += width;
+        start -= 1;
+    }
+
+    let mut end = cursor;
+    let mut total_width = cursor_width;
+    while end < graphemes.len() {
+        let width = UnicodeWidthStr::width(display_grapheme(graphemes[end]));
+        if total_width + width > available {
+            break;
+        }
+        total_width += width;
+        end += 1;
+    }
+    (
+        graphemes[start..end]
+            .iter()
+            .map(|grapheme| display_grapheme(grapheme))
+            .collect(),
+        cursor_width,
+    )
+}
+
+fn display_grapheme(grapheme: &str) -> &str {
+    match grapheme {
+        "\n" => "↵",
+        "\t" => "⇥",
+        "\r" => "↵",
+        _ if grapheme.chars().any(char::is_control) => "�",
+        _ => grapheme,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CLOSE_HINT, LuaReplView};
+    use super::{CLOSE_HINT, LuaReplView, truncate_to_width, visible_input_window};
     use crate::{perform, screen_reader::ScreenReader, speech, views::ViewController};
     use std::{cell::RefCell, rc::Rc};
 
@@ -590,5 +619,19 @@ mod tests {
         let repl = LuaReplView::new(6, 30, vec!["print(1)".to_string(), "print(2)".to_string()])
             .expect("create lua repl");
         assert_eq!(repl.history(), ["print(1)", "print(2)"]);
+    }
+
+    #[test]
+    fn unicode_windows_preserve_graphemes_and_terminal_cell_widths() {
+        assert_eq!(truncate_to_width("a界b", 3), "a界");
+        assert_eq!(truncate_to_width("e\u{301}x", 1), "e\u{301}");
+
+        let (visible, cursor_width) = visible_input_window("a界bc", 3, 4);
+        assert_eq!(visible, "a界b");
+        assert_eq!(cursor_width, 4);
+
+        let (visible, cursor_width) = visible_input_window("e\u{301}界x", 1, 3);
+        assert_eq!(visible, "e\u{301}界");
+        assert_eq!(cursor_width, 1);
     }
 }

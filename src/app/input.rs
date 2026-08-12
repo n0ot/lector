@@ -191,7 +191,10 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         match event {
-            Event::Key(key_event) => self.handle_key_event(sr, key_event, raw, pty_out, term_out),
+            Event::Key(key_event) => {
+                let key = KeyInput::new(key_event, raw);
+                self.handle_key_event(sr, key, raw, pty_out, term_out)
+            }
             Event::Paste(contents) => {
                 self.log_event(&format!("parsed paste event: [{} chars]", contents.len()));
                 let view_action = self
@@ -207,24 +210,28 @@ impl App {
     fn handle_key_event(
         &mut self,
         sr: &mut ScreenReader,
-        key_event: KeyEvent,
+        key: KeyInput,
         raw: &[u8],
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
-        let key_id = (key_event.code, key_event.modifiers);
+        let key_event = key.event();
+        let key_id = (key_event.code, key_event.modifiers, key_event.state);
         if key_event.kind == KeyEventKind::Release {
-            if self.consumed_key_presses.remove(&key_id) {
-                self.log_event("swallowing release for Lector command");
+            let command_consumed = self.consumed_key_presses.remove(&key_id);
+            let transition_consumed = self.view_transition_key_presses.remove(&key_id);
+            if command_consumed || transition_consumed {
+                self.log_event("swallowing release for consumed key press");
                 return Ok(());
             }
-            return self.dispatch_to_view(sr, raw, pty_out, term_out);
+            return self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out);
         }
+        self.view_transition_key_presses.remove(&key_id);
 
         self.update_last_key(sr, raw, true)?;
         if sr.take_pass_through() {
             self.consumed_key_presses.remove(&key_id);
-            return self.dispatch_key_to_view(sr, key_event, raw, pty_out, term_out);
+            return self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out);
         }
 
         let binding_name = self.key_event_binding_name(key_event);
@@ -279,7 +286,7 @@ impl App {
                     )? {
                         commands::CommandResult::Handled => true,
                         commands::CommandResult::ForwardInput => {
-                            self.dispatch_key_to_view(sr, key_event, raw, pty_out, term_out)?;
+                            self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out)?;
                             false
                         }
                         commands::CommandResult::Paste(contents) => {
@@ -336,14 +343,8 @@ impl App {
                 self.consumed_key_presses.insert(key_id);
                 return Ok(());
             }
-            if self.view_stack.has_overlay()
-                && let Some(translated) = Self::overlay_input_bytes_for_key_event(key_event)
-            {
-                self.consumed_key_presses.remove(&key_id);
-                return self.dispatch_key_to_view(sr, key_event, &translated, pty_out, term_out);
-            }
             self.consumed_key_presses.remove(&key_id);
-            self.dispatch_key_to_view(sr, key_event, raw, pty_out, term_out)?;
+            self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out)?;
         }
         Ok(())
     }
@@ -351,21 +352,30 @@ impl App {
     fn dispatch_key_to_view(
         &mut self,
         sr: &mut ScreenReader,
-        key_event: KeyEvent,
+        key: &KeyInput,
         input: &[u8],
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
-        let key_event = key_event.normalize_case();
-        let has_non_shift_modifier = key_event.modifiers.contains(KeyModifiers::CTRL)
-            || key_event.modifiers.contains(KeyModifiers::ALT)
-            || key_event.modifiers.contains(KeyModifiers::META)
-            || key_event.modifiers.contains(KeyModifiers::SUPER)
-            || key_event.modifiers.contains(KeyModifiers::HYPER);
-        if !has_non_shift_modifier && let KeyCode::Char(character) = key_event.code {
-            sr.record_forwarded_character(character);
+        if !key.is_release()
+            && let Some(text) = key.text()
+        {
+            for character in text.chars() {
+                sr.record_forwarded_character(character);
+            }
         }
-        self.dispatch_to_view(sr, input, pty_out, term_out)
+        self.log_bytes("dispatching decoded key to active view", input);
+        self.last_stdin_update = Some(self.clock.now_ms());
+        let action = self
+            .view_stack
+            .active_mut()
+            .handle_key_input(sr, key, input, pty_out)?;
+        if matches!(action, views::ViewAction::Pop) {
+            let event = key.event();
+            self.view_transition_key_presses
+                .insert((event.code, event.modifiers, event.state));
+        }
+        self.handle_view_action(sr, action, term_out)
     }
 
     fn handle_raw_bytes(
@@ -437,26 +447,5 @@ impl App {
         }
 
         Some(binding)
-    }
-
-    fn overlay_input_bytes_for_key_event(key_event: KeyEvent) -> Option<Vec<u8>> {
-        let key_event = key_event.normalize_case();
-        if key_event.modifiers != KeyModifiers::CTRL {
-            return None;
-        }
-        let KeyCode::Char(ch) = key_event.code else {
-            return None;
-        };
-        let byte = match ch {
-            '@' | ' ' => 0x00,
-            'a'..='z' => (ch as u8) - b'a' + 1,
-            '[' => 0x1B,
-            '\\' => 0x1C,
-            ']' => 0x1D,
-            '^' => 0x1E,
-            '_' => 0x1F,
-            _ => return None,
-        };
-        Some(vec![byte])
     }
 }

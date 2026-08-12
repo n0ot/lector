@@ -1,4 +1,7 @@
-use crate::{commands, keymap::Binding, perform, screen_reader::ScreenReader, views};
+use crate::{
+    commands, keymap::Binding, perform, screen_reader::ScreenReader, terminal_input::KeyInput,
+    views,
+};
 use anyhow::{Context, Result};
 use std::{
     collections::{HashSet, VecDeque},
@@ -6,7 +9,7 @@ use std::{
     sync::LazyLock,
     time,
 };
-use terminput::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use terminput::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 mod input;
 mod protocol;
@@ -63,7 +66,8 @@ pub struct App {
     filtered_pty_output: Vec<u8>,
     focus_mode_changes: Vec<bool>,
     deferred_pty_output: Vec<u8>,
-    consumed_key_presses: HashSet<(KeyCode, KeyModifiers)>,
+    consumed_key_presses: HashSet<(KeyCode, KeyModifiers, KeyEventState)>,
+    view_transition_key_presses: HashSet<(KeyCode, KeyModifiers, KeyEventState)>,
     log_enabled: bool,
     lua_repl_history: Vec<String>,
     last_stdin_update: Option<u128>,
@@ -89,6 +93,7 @@ impl App {
             focus_mode_changes: Vec::new(),
             deferred_pty_output: Vec::new(),
             consumed_key_presses: HashSet::new(),
+            view_transition_key_presses: HashSet::new(),
             log_enabled: false,
             lua_repl_history: Vec::new(),
             last_stdin_update: None,
