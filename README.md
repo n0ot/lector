@@ -88,7 +88,7 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 ### Core actions (with defaults)
 
 - **Stop speech** when it’s too noisy. Default: `M-x`.
-- **Repeat the current overlay name**. Default: `M-r`.
+- **Say the current overlay name**. Default: `M-w`.
 - **Toggle auto‑read** if you want to hear only on demand. Default: `M-'`.
 - **Toggle stop on focus loss** (interrupt speech when terminal focus leaves). Default: `M-g`.
 - **Move and read** by line/word/character using the review cursor.
@@ -97,14 +97,48 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 
 You don’t need to memorize everything. Help Mode will tell you what each key does.
 
-### Review mode (reading past output)
+### Review overlay (reading past output)
 
-Use the review cursor to move around without changing the application’s cursor.
+Press `M-r` to capture the current screen and retained scrollback in a frozen
+Review overlay. Output from the running application continues in the
+background, but cannot move or replace the snapshot. Press `q` to leave Review
+and return to the underlying terminal or overlay. `Escape` never
+closes Review: it cancels a pending count, motion, search, or visual selection.
+Pressing it with nothing to cancel rings the terminal bell.
 
-- Line: previous/next line is `M-u` / `M-o`. Read current line is `M-i`.
-- Word: previous/next word is `M-j` / `M-l`. Read current word is `M-k`.
-- Character: previous/next character is `M-m` / `M-.`. Read current character is `M-,`.
-- Quickly jump to top/bottom of the screen with `M-y` / `M-p`.
+Review has its own dependency-free vi command parser:
+
+- Move with `h`/`j`/`k`/`l` or the arrow keys. `w`, `W`, `b`, `B`, `e`, and
+  `E` move by words; `0`, `^`, and `$` move within a line; `gg` and `G` move to
+  the beginning and end. Counts work, so `3w` moves forward three words.
+- `C-b` and `C-f` move by pages. Moving above or below the displayed page with
+  `k` or `j` scrolls the frozen snapshot one line at a time.
+- `[p` and `]p` jump to previous and next OSC 133 prompt markers.
+- `f`, `F`, `t`, and `T` find a character on the logical line; `;` and `,`
+  repeat that find. `%` finds and jumps between matching `()`, `[]`, and `{}`.
+- `/` and `?` search the complete frozen scrollback using regular expressions.
+  `n` repeats in the same direction and `N` repeats in the opposite direction;
+  searches wrap at the ends.
+- `y` supports motions and counts, `yy` yanks lines, `yiw`/`yaw` (and the `W`
+  variants) yank text objects, and `v`/`V` start character/line selections.
+  Yanked text is placed in Lector's clipboard history and is ready for `F7`.
+
+Invalid chords, unavailable prompt/search/find targets, unmatched `%` braces,
+and motions past a boundary ring the terminal bell. Ordinary Lector review
+commands (`M-u`/`M-o`, `M-j`/`M-l`, and so on) remain available in the overlay
+and are bounded by its currently displayed page.
+
+Lector retains up to 10,000 primary-screen rows. `M-r` works through both the
+long-established xterm Meta encoding used by non-Kitty terminals and Kitty
+keyboard events. The former `M-PageUp`/`M-PageDown` and `M-Up`/`M-Down`
+shortcuts are no longer claimed and pass through to the running application.
+
+When a shell emits the OSC 133 `B` input-boundary marker, ordinary unmodified
+Up/Down history navigation speaks the recalled editable input without the
+primary prompt. Readline does not emit a fresh marker for every history item;
+Lector correlates the forwarded arrow with the redraw after the existing `B`
+marker. Without OSC 133 integration, the existing cursor/diff behavior is
+unchanged.
 
 ### Copy/paste and clipboard history
 

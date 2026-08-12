@@ -96,7 +96,7 @@ enum ReplInputProtocol {
 
 struct ReplLifecycleInput {
     open_repl: &'static [&'static [u8]],
-    repeat_title: &'static [&'static [u8]],
+    say_overlay: &'static [&'static [u8]],
     underscore: &'static [&'static [u8]],
     beginning_of_line: &'static [&'static [u8]],
     text_x: &'static [&'static [u8]],
@@ -108,7 +108,7 @@ struct ReplLifecycleInput {
 
 const LEGACY_REPL_LIFECYCLE_INPUT: ReplLifecycleInput = ReplLifecycleInput {
     open_repl: &[b"\x1BL"],
-    repeat_title: &[b"\x1Br"],
+    say_overlay: &[b"\x1Bw"],
     underscore: &[b"_"],
     beginning_of_line: &[b"\x01"],
     text_x: &[b"x"],
@@ -124,7 +124,7 @@ const LEGACY_REPL_LIFECYCLE_INPUT: ReplLifecycleInput = ReplLifecycleInput {
 // test exercises Lector's real incremental input parser.
 const KITTY_REPL_LIFECYCLE_INPUT: ReplLifecycleInput = ReplLifecycleInput {
     open_repl: &[b"\x1B[108:76;4:1;76u", b"\x1B[108:76;4:3u"],
-    repeat_title: &[b"\x1B[114;3:1;114u", b"\x1B[114;3:3u"],
+    say_overlay: &[b"\x1B[119;3:1;119u", b"\x1B[119;3:3u"],
     underscore: &[b"\x1B[45:95;2:1;95u", b"\x1B[45:95;2:3u"],
     beginning_of_line: &[b"\x1B[97;5:1u", b"\x1B[97;5:3u"],
     text_x: &[b"\x1B[120;1:1;120u", b"\x1B[120;1:3u"],
@@ -215,10 +215,10 @@ fn assert_repl_lifecycle(
     send_input_events(
         &mut app,
         &mut sr,
-        input.repeat_title,
+        input.say_overlay,
         &mut pty_out,
         &mut term_out,
-        "repeat overlay title",
+        "say overlay title",
     );
     assert!(
         recorder
@@ -376,6 +376,287 @@ fn stdin_unmapped_forwards_to_pty() {
     assert!(term_out.is_empty());
     assert_eq!(sr.last_key(), b"a");
     assert_eq!(recorder.inner.borrow().stops, 1);
+}
+
+#[test]
+fn semantic_and_scrollback_shortcuts_forward_when_the_feature_is_unavailable() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    for input in [
+        b"\x1B[1;3A".as_slice(),
+        b"\x1B[1;3B",
+        b"\x1B[5;3~",
+        b"\x1B[6;3~",
+    ] {
+        app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+            .expect("forward unavailable review shortcut");
+    }
+
+    assert_eq!(pty_out, b"\x1B[1;3A\x1B[1;3B\x1B[5;3~\x1B[6;3~");
+}
+
+#[test]
+fn legacy_alt_arrows_are_forwarded_even_when_osc133_prompts_exist() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(
+        &mut sr,
+        b"\x1B]133;A\x07$ first\r\n\x1B]133;C\x07one\r\n\x1B]133;D;0\x07\x1B]133;A\x07$ second",
+        &mut term_out,
+    )
+    .expect("render semantic prompts");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B[1;3A", &mut pty_out, &mut term_out)
+        .expect("previous prompt");
+    app.handle_stdin(&mut sr, b"\x1B[1;3A", &mut pty_out, &mut term_out)
+        .expect("previous prompt again");
+    app.handle_stdin(&mut sr, b"\x1B[1;3B", &mut pty_out, &mut term_out)
+        .expect("next prompt");
+
+    assert_eq!(pty_out, b"\x1B[1;3A\x1B[1;3A\x1B[1;3B");
+    let spoken: Vec<_> = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect();
+    assert!(spoken.is_empty());
+}
+
+#[test]
+fn legacy_alt_page_keys_are_forwarded_even_when_scrollback_exists() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let output = (0..30)
+        .map(|line| format!("line {line}\r\n"))
+        .collect::<String>();
+    app.handle_pty(&mut sr, output.as_bytes(), &mut term_out)
+        .expect("render enough output to scroll");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B[5;3~", &mut pty_out, &mut term_out)
+        .expect("page up");
+    app.handle_stdin(&mut sr, b"\x1B[6;3~", &mut pty_out, &mut term_out)
+        .expect("page down");
+
+    assert_eq!(pty_out, b"\x1B[5;3~\x1B[6;3~");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
+fn legacy_review_overlay_freezes_output_bells_on_errors_and_restores_the_root() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"before\x1B[H", &mut term_out)
+        .expect("draw source");
+
+    term_out.clear();
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review");
+    assert!(app.has_overlay());
+    assert!(app.debug_active_view_contents().contains("before"));
+    assert!(pty_out.is_empty());
+
+    term_out.clear();
+    app.handle_pty(&mut sr, b"\x1B[Hafter", &mut term_out)
+        .expect("update root behind review");
+    assert!(term_out.is_empty());
+    assert!(app.debug_active_view_contents().contains("before"));
+    assert!(!app.debug_active_view_contents().contains("after"));
+
+    app.handle_stdin(&mut sr, b"fz", &mut pty_out, &mut term_out)
+        .expect("failed find");
+    assert_eq!(term_out, b"\x07");
+    assert!(app.has_overlay());
+
+    term_out.clear();
+    app.handle_stdin(&mut sr, b"f\x1B", &mut pty_out, &mut term_out)
+        .expect("queue cancellation escape");
+    clock.advance_ms(100);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("cancel pending find");
+    assert!(term_out.is_empty());
+    assert!(app.has_overlay());
+
+    app.handle_stdin(&mut sr, b"\x1B", &mut pty_out, &mut term_out)
+        .expect("queue idle escape");
+    clock.advance_ms(100);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("bell on idle escape");
+    assert_eq!(term_out, b"\x07");
+    assert!(app.has_overlay());
+
+    term_out.clear();
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("close review");
+    assert!(!app.has_overlay());
+    assert!(app.debug_active_view_contents().contains("after"));
+    assert!(String::from_utf8_lossy(&term_out).contains("after"));
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn kitty_meta_r_opens_review_without_toggling_or_leaking() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"snapshot", &mut term_out)
+        .expect("draw source");
+    let meta_r = b"\x1B[114;3:1u\x1B[114;3:3u";
+
+    app.handle_stdin(&mut sr, meta_r, &mut pty_out, &mut term_out)
+        .expect("open Kitty review");
+    assert!(app.has_overlay());
+    assert!(app.debug_active_view_contents().contains("snapshot"));
+
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, meta_r, &mut pty_out, &mut term_out)
+        .expect("invoke open-only action inside review");
+    assert!(app.has_overlay());
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "Review already open")
+    );
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("close review with q");
+    assert!(!app.has_overlay());
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn review_over_lua_returns_to_the_lua_overlay_normally() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open Lua");
+    assert!(app.debug_active_view_contents().contains("Lua REPL ready"));
+
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("review Lua");
+    assert!(app.debug_active_view_contents().contains("Lua REPL ready"));
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("leave review");
+    app.handle_stdin(&mut sr, b"x", &mut pty_out, &mut term_out)
+        .expect("resume Lua input");
+
+    assert!(app.has_overlay());
+    assert!(app.debug_active_view_contents().contains("> x"));
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn review_search_repeat_and_inner_word_yank_feed_f7_clipboard_paste() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"one two one three\x1B[H", &mut term_out)
+        .expect("draw searchable source");
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review");
+
+    app.handle_stdin(&mut sr, b"/one\rNnwyiw", &mut pty_out, &mut term_out)
+        .expect("search, repeat, move and yank");
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("close review");
+    app.handle_stdin(&mut sr, b"\x1B[18~", &mut pty_out, &mut term_out)
+        .expect("paste with F7");
+
+    assert_eq!(pty_out, b"three");
+}
+
+#[test]
+fn review_backward_search_and_reverse_repeat_are_motion_commands() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"one two one three\x1B[H", &mut term_out)
+        .expect("draw searchable source");
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review");
+    app.handle_stdin(&mut sr, b"?one\rNwyiwq", &mut pty_out, &mut term_out)
+        .expect("backward search, reverse repeat, move, yank and close");
+    app.handle_stdin(&mut sr, b"\x1B[18~", &mut pty_out, &mut term_out)
+        .expect("paste yank");
+
+    assert_eq!(pty_out, b"two");
+}
+
+#[test]
+fn review_prompt_jumps_use_osc133_markers() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(
+        &mut sr,
+        b"\x1B]133;A\x07$ first\r\nresult\r\n\x1B]133;A\x07$ second\x1B[H",
+        &mut term_out,
+    )
+    .expect("draw semantic prompts");
+    app.handle_stdin(&mut sr, b"\x1Br]pwyiwq", &mut pty_out, &mut term_out)
+        .expect("jump to next prompt and yank its first word");
+    app.handle_stdin(&mut sr, b"\x1B[18~", &mut pty_out, &mut term_out)
+        .expect("paste prompt word");
+
+    assert_eq!(pty_out, b"second");
+}
+
+#[test]
+fn readline_history_arrows_speak_the_recalled_input_without_the_prompt() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(
+        &mut sr,
+        b"\x1B]133;A\x07user@host$ \x1B]133;B\x07old",
+        &mut term_out,
+    )
+    .expect("render editable prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize prompt")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B[A", &mut pty_out, &mut term_out)
+        .expect("forward history up");
+    app.handle_pty(
+        &mut sr,
+        b"\r\x1B[Kuser@host$ recalled command",
+        &mut term_out,
+    )
+    .expect("render Readline history selection");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize history redraw")
+    );
+
+    assert_eq!(pty_out, b"\x1B[A");
+    let spoken: Vec<_> = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect();
+    assert_eq!(spoken, ["recalled command"]);
 }
 
 #[test]
@@ -1095,7 +1376,7 @@ fn say_overlay_hotkey_speaks_terminal_title() {
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
 
-    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+    app.handle_stdin(&mut sr, b"\x1Bw", &mut pty_out, &mut term_out)
         .expect("handle stdin");
 
     let speaks = &recorder.inner.borrow().speaks;

@@ -68,8 +68,9 @@ define_actions! {
         "toggle_review_cursor_follows_screen_cursor"
     ),
     ToggleSymbolLevel => ("toggle symbol level", "toggle_symbol_level"),
-    SayOverlay => ("repeat current overlay", "say_overlay"),
+    SayOverlay => ("say current overlay", "say_overlay"),
     OpenLuaRepl => ("open Lua REPL", "open_lua_repl"),
+    OpenReview => ("enter review mode", "open_review"),
     PassNextKey => ("forward next key press", "pass_next_key"),
     StopSpeaking => ("stop speaking", "stop_speaking"),
     RevLinePrev => ("previous line", "review_line_prev"),
@@ -218,7 +219,7 @@ pub fn handle(
         Action::TableCharPrev => table::character_previous(sr, view),
         Action::TableCharNext => table::character_next(sr, view),
         Action::TableCharRead => table::character_read(sr, view),
-        Action::ToggleHelp | Action::OpenLuaRepl => {
+        Action::ToggleHelp | Action::OpenLuaRepl | Action::OpenReview => {
             sr.speak("not implemented", false)?;
             Ok(CommandResult::Handled)
         }
@@ -243,6 +244,18 @@ mod tests {
             assert!(!name.is_empty());
             assert_eq!(builtin_action_name(*action), *name);
             assert_eq!(builtin_action_from_name(name), Some(*action));
+        }
+    }
+
+    #[test]
+    fn removed_direct_scrollback_actions_are_not_configurable() {
+        for name in [
+            "review_page_prev",
+            "review_page_next",
+            "review_prompt_prev",
+            "review_prompt_next",
+        ] {
+            assert_eq!(builtin_action_from_name(name), None, "name={name}");
         }
     }
 }

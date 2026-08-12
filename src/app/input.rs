@@ -259,6 +259,23 @@ impl App {
             }
             match binding {
                 Binding::Builtin(action) => {
+                    if matches!(action, commands::Action::OpenReview) {
+                        if self.view_stack.active_mut().kind() == views::ViewKind::Review {
+                            sr.speak("Review already open", false)?;
+                        } else {
+                            let review = {
+                                let active = self.view_stack.active_mut();
+                                views::ReviewView::new(active.model())
+                            };
+                            self.handle_view_action(
+                                sr,
+                                views::ViewAction::Push(Box::new(review)),
+                                term_out,
+                            )?;
+                        }
+                        self.consumed_key_presses.insert(key_id);
+                        return Ok(());
+                    }
                     if matches!(action, commands::Action::OpenLuaRepl) {
                         if self.view_stack.active_mut().kind() == views::ViewKind::LuaRepl {
                             sr.speak("Lua REPL already open", false)?;
@@ -357,6 +374,13 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        let event = key.event();
+        if !key.is_release()
+            && event.modifiers.is_empty()
+            && matches!(event.code, KeyCode::Up | KeyCode::Down)
+        {
+            sr.set_pending_history_navigation();
+        }
         if !key.is_release()
             && let Some(text) = key.text()
         {
@@ -398,6 +422,7 @@ impl App {
         decoded_key_event: bool,
     ) -> Result<()> {
         sr.clear_pending_delete();
+        sr.clear_pending_history_navigation();
         // A decoded key press should always interrupt speech. In particular, Kitty's
         // keyboard protocol encodes Control and Meta keys as CSI-u sequences, which
         // look like non-key terminal traffic to the raw-byte heuristic below.
@@ -440,6 +465,15 @@ impl App {
             KeyCode::Esc => binding.push_str("Esc"),
             KeyCode::Enter => binding.push_str("Enter"),
             KeyCode::Tab => binding.push_str("Tab"),
+            KeyCode::Up => binding.push_str("Up"),
+            KeyCode::Down => binding.push_str("Down"),
+            KeyCode::Left => binding.push_str("Left"),
+            KeyCode::Right => binding.push_str("Right"),
+            KeyCode::Home => binding.push_str("Home"),
+            KeyCode::End => binding.push_str("End"),
+            KeyCode::PageUp => binding.push_str("PageUp"),
+            KeyCode::PageDown => binding.push_str("PageDown"),
+            KeyCode::Insert => binding.push_str("Insert"),
             KeyCode::F(num) => {
                 binding.push_str(&format!("F{num}"));
             }

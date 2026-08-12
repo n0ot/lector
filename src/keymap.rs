@@ -87,7 +87,8 @@ const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("M-'", Action::ToggleAutoRead),
     ("M-\"", Action::ToggleReviewCursorFollowsScreenCursor),
     ("M-s", Action::ToggleSymbolLevel),
-    ("M-r", Action::SayOverlay),
+    ("M-r", Action::OpenReview),
+    ("M-w", Action::SayOverlay),
     ("M-n", Action::PassNextKey),
     ("M-x", Action::StopSpeaking),
     ("M-u", Action::RevLinePrev),
@@ -347,6 +348,26 @@ mod tests {
             bindings.binding_for_mode(InputMode::Table, "j"),
             Some(Binding::Builtin(Action::TableRowNext))
         ));
+    }
+
+    #[test]
+    fn default_review_and_overlay_bindings_follow_the_overlay_convention() {
+        let bindings = KeyBindings::new();
+
+        assert!(matches!(
+            bindings.binding_for_mode(InputMode::Normal, "M-r"),
+            Some(Binding::Builtin(Action::OpenReview))
+        ));
+        assert!(matches!(
+            bindings.binding_for_mode(InputMode::Normal, "M-w"),
+            Some(Binding::Builtin(Action::SayOverlay))
+        ));
+        for key in ["M-z", "M-PageUp", "M-PageDown", "M-Up", "M-Down"] {
+            assert!(
+                bindings.binding_for_mode(InputMode::Normal, key).is_none(),
+                "key={key}"
+            );
+        }
     }
 
     #[test]

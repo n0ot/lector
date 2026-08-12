@@ -1,6 +1,7 @@
 use super::{CommandResult, Result};
+#[cfg(test)]
+use crate::ext::ScreenExt;
 use crate::{
-    ext::ScreenExt,
     screen_reader::{ClipboardMove, ScreenReader},
     view::View,
 };
@@ -11,12 +12,12 @@ pub(super) fn set_mark(sr: &mut ScreenReader, view: &mut View) -> Result<Command
     Ok(CommandResult::Handled)
 }
 
-pub(super) fn copy(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> {
+pub(super) fn copy(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     let Some(mark) = view.review_mark_position() else {
         sr.speak("no mark set", false)?;
         return Ok(CommandResult::Handled);
     };
-    let Some(contents) = copy_selection(view, mark, view.review_cursor_position()) else {
+    let Some(contents) = view.copy_review_selection(mark) else {
         sr.speak("mark is after the review cursor", false)?;
         return Ok(CommandResult::Handled);
     };
@@ -26,6 +27,7 @@ pub(super) fn copy(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> 
     Ok(CommandResult::Handled)
 }
 
+#[cfg(test)]
 fn copy_selection(
     view: &View,
     (mark_row, mark_col): (u16, u16),
@@ -169,7 +171,7 @@ mod tests {
 
         set_mark(&mut sr, &mut view).unwrap();
         view.set_review_cursor_col(2);
-        copy(&mut sr, &view).unwrap();
+        copy(&mut sr, &mut view).unwrap();
 
         let CommandResult::Paste(contents) = paste(&mut sr).unwrap() else {
             panic!("expected paste contents");
@@ -207,11 +209,11 @@ mod tests {
         let mut view = View::new(2, 8);
         view.process_changes(b"abc");
 
-        copy(&mut sr, &view).unwrap();
+        copy(&mut sr, &mut view).unwrap();
         view.set_review_cursor_col(2);
         set_mark(&mut sr, &mut view).unwrap();
         view.set_review_cursor_col(0);
-        copy(&mut sr, &view).unwrap();
+        copy(&mut sr, &mut view).unwrap();
 
         assert_eq!(
             output.borrow().as_slice(),

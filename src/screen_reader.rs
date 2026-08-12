@@ -62,6 +62,7 @@ pub struct ScreenReader {
     lua_hooks: LuaHooks,
     auto_read_buffers: AutoReadBuffers,
     pending_delete: Option<PendingDelete>,
+    pending_history_navigation: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -89,6 +90,7 @@ impl ScreenReader {
             lua_hooks: LuaHooks::default(),
             auto_read_buffers: AutoReadBuffers::default(),
             pending_delete: None,
+            pending_history_navigation: false,
         }
     }
 
@@ -131,6 +133,18 @@ impl ScreenReader {
             self.pending_key_echo.pop_front();
         }
         self.pending_key_echo.push_back(character);
+    }
+
+    pub(crate) fn set_pending_history_navigation(&mut self) {
+        self.pending_history_navigation = true;
+    }
+
+    pub(crate) fn clear_pending_history_navigation(&mut self) {
+        self.pending_history_navigation = false;
+    }
+
+    pub(crate) fn take_pending_history_navigation(&mut self) -> bool {
+        std::mem::take(&mut self.pending_history_navigation)
     }
 
     fn should_suppress_key_echo(&mut self, text: &str) -> bool {

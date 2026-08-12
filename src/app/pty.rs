@@ -109,46 +109,62 @@ impl App {
         let first_pty_update = self.first_pty_update.unwrap_or(lpu);
         let now_ms = self.clock.now_ms();
         let overlay_active = self.view_stack.has_overlay();
-        let root_view = self.view_stack.root_mut();
-        let view = root_view.model();
         if now_ms.saturating_sub(lpu) >= DIFF_DELAY as u128
             || now_ms.saturating_sub(first_pty_update) >= MAX_DIFF_DELAY as u128
         {
             self.first_pty_update = None;
             self.last_pty_update = None;
-            if !overlay_active {
-                let mut read_text = sr.resolve_pending_delete(view)?;
-                if sr.highlight_tracking_enabled() {
-                    sr.track_highlighting(view)?;
-                }
-                let recent_input = self
-                    .last_stdin_update
-                    .is_some_and(|lsu| now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128);
-                let auto_read_text = if sr.auto_read_enabled() {
-                    if recent_input {
-                        sr.auto_read_after_input(view, &mut self.reporter)?
+            let recent_input = self
+                .last_stdin_update
+                .is_some_and(|lsu| now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128);
+            let reporter = &mut self.reporter;
+            let view = self.view_stack.root_mut().model();
+            view.with_live_screen(|view| -> Result<()> {
+                if !overlay_active {
+                    let mut read_text = sr.resolve_pending_delete(view)?;
+                    let semantic_history_read = if sr.take_pending_history_navigation() {
+                        if let Some(input) = view.active_semantic_input() {
+                            sr.speak(if input.is_empty() { "blank" } else { &input }, false)?;
+                            true
+                        } else {
+                            false
+                        }
                     } else {
-                        sr.auto_read(view, &mut self.reporter)?
+                        false
+                    };
+                    if semantic_history_read {
+                        read_text = true;
+                    } else {
+                        if sr.highlight_tracking_enabled() {
+                            sr.track_highlighting(view)?;
+                        }
+                        let auto_read_text = if sr.auto_read_enabled() {
+                            if recent_input {
+                                sr.auto_read_after_input(view, reporter)?
+                            } else {
+                                sr.auto_read(view, reporter)?
+                            }
+                        } else {
+                            false
+                        };
+                        read_text |= auto_read_text;
                     }
-                } else {
-                    false
-                };
-                read_text |= auto_read_text;
-                if recent_input && !read_text {
-                    sr.track_cursor(view)?;
+                    if recent_input && !read_text {
+                        sr.track_cursor(view)?;
+                    }
                 }
-            }
 
-            if sr.review_follows_screen_cursor()
-                && view.screen().cursor_position() != view.prev_screen().cursor_position()
-            {
-                let old = view.review_cursor_position();
-                view.set_review_cursor_position(view.screen().cursor_position());
-                sr.hook_on_review_cursor_move(old, view.review_cursor_position())?;
-            }
-
-            sr.hook_on_screen_update(view, overlay_active)?;
-            view.finalize_changes(now_ms);
+                if sr.review_follows_screen_cursor()
+                    && view.screen().cursor_position() != view.prev_screen().cursor_position()
+                {
+                    let old = view.review_cursor_position();
+                    view.follow_application_cursor();
+                    sr.hook_on_review_cursor_move(old, view.review_cursor_position())?;
+                }
+                sr.hook_on_screen_update(view, overlay_active)?;
+                view.finalize_changes(now_ms);
+                Ok(())
+            })?;
             return Ok(true);
         }
         Ok(false)

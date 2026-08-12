@@ -1,11 +1,13 @@
 mod lua_repl;
 mod message;
 mod pty;
+mod review;
 mod stack;
 
 pub use lua_repl::LuaReplView;
 pub use message::MessageView;
 pub use pty::PtyView;
+pub use review::ReviewView;
 pub use stack::ViewStack;
 
 use crate::{screen_reader::ScreenReader, terminal_input::KeyInput, view::View};
@@ -45,6 +47,7 @@ pub enum ViewKind {
     Terminal,
     Message,
     LuaRepl,
+    Review,
     Other,
 }
 

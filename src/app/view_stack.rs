@@ -69,68 +69,74 @@ impl App {
 
     pub(super) fn render_active_view(&mut self, term_out: &mut dyn Write) -> Result<()> {
         let view = self.view_stack.active_mut().model();
-        term_out
-            .write_all(b"\x1B[2J\x1B[H")
-            .context("clear screen")?;
-        term_out
-            .write_all(&view.screen().contents_formatted())
-            .context("render view contents")?;
-        term_out
-            .write_all(&view.screen().cursor_state_formatted())
-            .context("render cursor state")?;
-        term_out
-            .write_all(&view.screen().input_mode_formatted())
-            .context("render input modes")?;
-        term_out.flush().context("flush view render")?;
-        Ok(())
+        view.with_live_screen(|view| -> Result<()> {
+            term_out
+                .write_all(b"\x1B[2J\x1B[H")
+                .context("clear screen")?;
+            term_out
+                .write_all(&view.screen().contents_formatted())
+                .context("render view contents")?;
+            term_out
+                .write_all(&view.screen().cursor_state_formatted())
+                .context("render cursor state")?;
+            term_out
+                .write_all(&view.screen().input_mode_formatted())
+                .context("render input modes")?;
+            term_out.flush().context("flush view render")?;
+            Ok(())
+        })
     }
 
     pub(super) fn announce_view_change(&mut self, sr: &mut ScreenReader) -> Result<()> {
         let title = self.view_stack.active_mut().title().to_string();
         let view = self.view_stack.active_mut().model();
-        sr.speak(&title, false)?;
-        let contents = view.contents_full();
-        if contents.trim().is_empty() {
-            sr.speak("blank screen", false)?;
-        } else {
-            sr.speak(&contents, false)?;
-        }
-        view.finalize_changes(self.clock.now_ms());
-        Ok(())
+        view.with_live_screen(|view| -> Result<()> {
+            sr.speak(&title, false)?;
+            let contents = view.contents_full();
+            if contents.trim().is_empty() {
+                sr.speak("blank screen", false)?;
+            } else {
+                sr.speak(&contents, false)?;
+            }
+            view.finalize_changes(self.clock.now_ms());
+            Ok(())
+        })
     }
 
     fn read_active_view_changes(&mut self, sr: &mut ScreenReader) -> Result<()> {
         let now_ms = self.clock.now_ms();
         let overlay_active = self.view_stack.has_overlay();
-        let view = self.view_stack.active_mut().model();
-        let mut read_text = sr.resolve_pending_delete(view)?;
         let recent_input = self
             .last_stdin_update
             .is_some_and(|lsu| now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128);
-        let auto_read_text = if sr.auto_read_enabled() {
-            let mut reporter = perform::Reporter::new();
-            if recent_input {
-                sr.auto_read_after_input(view, &mut reporter)?
+        let view = self.view_stack.active_mut().model();
+        view.with_live_screen(|view| -> Result<()> {
+            let mut read_text = sr.resolve_pending_delete(view)?;
+            let auto_read_text = if sr.auto_read_enabled() {
+                let mut reporter = perform::Reporter::new();
+                if recent_input {
+                    sr.auto_read_after_input(view, &mut reporter)?
+                } else {
+                    sr.auto_read(view, &mut reporter)?
+                }
             } else {
-                sr.auto_read(view, &mut reporter)?
+                false
+            };
+            read_text |= auto_read_text;
+            if recent_input && !read_text {
+                sr.track_cursor(view)?;
             }
-        } else {
-            false
-        };
-        read_text |= auto_read_text;
-        if recent_input && !read_text {
-            sr.track_cursor(view)?;
-        }
-        if sr.review_follows_screen_cursor()
-            && view.screen().cursor_position() != view.prev_screen().cursor_position()
-        {
-            let old = view.review_cursor_position();
-            view.set_review_cursor_position(view.screen().cursor_position());
-            sr.hook_on_review_cursor_move(old, view.review_cursor_position())?;
-        }
-        sr.hook_on_screen_update(view, overlay_active)?;
-        view.finalize_changes(now_ms);
-        Ok(())
+            if sr.review_follows_screen_cursor()
+                && view.screen().cursor_position() != view.prev_screen().cursor_position()
+            {
+                let old = view.review_cursor_position();
+                view.follow_application_cursor();
+                sr.hook_on_review_cursor_move(old, view.review_cursor_position())?;
+            }
+            sr.hook_on_screen_update(view, overlay_active)?;
+            view.finalize_changes(now_ms);
+            Ok(())
+        })
     }
 
     pub fn debug_active_view_contents(&mut self) -> String {

@@ -40,7 +40,7 @@ pub(super) fn toggle_review_follows_screen_cursor(
 ) -> Result<CommandResult> {
     if sr.toggle_review_follows_screen_cursor() {
         let old_position = view.review_cursor_position();
-        view.set_review_cursor_position(view.screen().cursor_position());
+        view.follow_application_cursor();
         sr.hook_on_review_cursor_move(old_position, view.review_cursor_position())?;
         sr.speak("review cursor following screen cursor", false)?;
     } else {
