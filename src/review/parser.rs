@@ -45,13 +45,28 @@ pub(crate) enum VisualKind {
     Line,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ViewportPlacement {
+    Top,
+    Center,
+    Bottom,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Command {
     None,
     Bell,
     Exit,
     Move(Motion, usize),
-    ScrollPage { forward: bool, count: usize },
+    ScrollPage {
+        forward: bool,
+        count: usize,
+    },
+    RepositionViewport {
+        placement: ViewportPlacement,
+        line: Option<usize>,
+        first_nonblank: bool,
+    },
     YankMotion(Motion, usize),
     YankLine(usize),
     YankTextObject(TextObject, usize),
@@ -60,7 +75,10 @@ pub(crate) enum Command {
     MoveVisual(Motion, usize),
     YankVisual,
     StartSearch(SearchDirection),
-    RepeatSearch { reverse: bool, count: usize },
+    RepeatSearch {
+        reverse: bool,
+        count: usize,
+    },
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -81,6 +99,7 @@ pub(crate) enum Key {
 enum Prefix {
     None,
     G,
+    Z,
     Bracket {
         forward: bool,
     },
@@ -183,6 +202,10 @@ impl Parser {
                 self.prefix = Prefix::G;
                 Command::None
             }
+            Key::Char('z') => {
+                self.prefix = Prefix::Z;
+                Command::None
+            }
             Key::Char('[') => {
                 self.prefix = Prefix::Bracket { forward: false };
                 Command::None
@@ -251,6 +274,10 @@ impl Parser {
                 self.prefix = Prefix::G;
                 Command::None
             }
+            Key::Char('z') => {
+                self.prefix = Prefix::Z;
+                Command::None
+            }
             Key::Char('[') => {
                 self.prefix = Prefix::Bracket { forward: false };
                 Command::None
@@ -275,7 +302,27 @@ impl Parser {
 
     fn feed_prefix(&mut self, key: Key) -> Command {
         let prefix = std::mem::replace(&mut self.prefix, Prefix::None);
-        let count = self.take_count();
+        let pending_count = self.count.take();
+        if prefix == Prefix::Z {
+            let (placement, first_nonblank) = match key {
+                Key::Char('t') => (ViewportPlacement::Top, false),
+                Key::Enter => (ViewportPlacement::Top, true),
+                Key::Char('z') => (ViewportPlacement::Center, false),
+                Key::Char('.') => (ViewportPlacement::Center, true),
+                Key::Char('b') => (ViewportPlacement::Bottom, false),
+                Key::Char('-') => (ViewportPlacement::Bottom, true),
+                _ => {
+                    self.reset_pending();
+                    return Command::Bell;
+                }
+            };
+            return self.finish(Command::RepositionViewport {
+                placement,
+                line: pending_count,
+                first_nonblank,
+            });
+        }
+        let count = pending_count.unwrap_or(1).max(1);
         let motion = match (prefix, key) {
             (Prefix::G, Key::Char('g')) => Some(Motion::DocumentStart),
             (Prefix::Bracket { forward }, Key::Char('p')) => Some(Motion::Prompt { forward }),
@@ -284,6 +331,7 @@ impl Parser {
                 till,
                 target,
             }),
+            (Prefix::Z, _) => None,
             _ => None,
         };
         let Some(motion) = motion else {
@@ -354,6 +402,7 @@ impl Parser {
                     till,
                     target,
                 }),
+                (Prefix::Z, _) => None,
                 _ => None,
             };
             let Some(motion) = motion else {
@@ -514,7 +563,9 @@ fn motion_for_key(key: Key) -> Option<Motion> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, FindDirection, Key, Motion, Parser, TextObject, VisualKind};
+    use super::{
+        Command, FindDirection, Key, Motion, Parser, TextObject, ViewportPlacement, VisualKind,
+    };
     use crate::review::document::{SearchDirection, WordMove, WordStyle};
 
     fn feed(parser: &mut Parser, keys: &[Key]) -> Vec<Command> {
@@ -674,6 +725,81 @@ mod tests {
                 reverse: true,
                 count: 3
             }
+        );
+    }
+
+    #[test]
+    fn parses_cursor_relative_viewport_commands_and_counts() {
+        let mut parser = Parser::default();
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('z'), Key::Char('t')]),
+            vec![
+                Command::None,
+                Command::RepositionViewport {
+                    placement: ViewportPlacement::Top,
+                    line: None,
+                    first_nonblank: false,
+                }
+            ]
+        );
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('z'), Key::Enter]),
+            vec![
+                Command::None,
+                Command::RepositionViewport {
+                    placement: ViewportPlacement::Top,
+                    line: None,
+                    first_nonblank: true,
+                }
+            ]
+        );
+        assert_eq!(
+            feed(
+                &mut parser,
+                &[Key::Char('2'), Key::Char('z'), Key::Char('z')]
+            ),
+            vec![
+                Command::None,
+                Command::None,
+                Command::RepositionViewport {
+                    placement: ViewportPlacement::Center,
+                    line: Some(2),
+                    first_nonblank: false,
+                }
+            ]
+        );
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('z'), Key::Char('.')]),
+            vec![
+                Command::None,
+                Command::RepositionViewport {
+                    placement: ViewportPlacement::Center,
+                    line: None,
+                    first_nonblank: true,
+                }
+            ]
+        );
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('z'), Key::Char('b')]),
+            vec![
+                Command::None,
+                Command::RepositionViewport {
+                    placement: ViewportPlacement::Bottom,
+                    line: None,
+                    first_nonblank: false,
+                }
+            ]
+        );
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('z'), Key::Char('-')]),
+            vec![
+                Command::None,
+                Command::RepositionViewport {
+                    placement: ViewportPlacement::Bottom,
+                    line: None,
+                    first_nonblank: true,
+                }
+            ]
         );
     }
 

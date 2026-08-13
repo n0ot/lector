@@ -507,6 +507,127 @@ fn legacy_review_overlay_freezes_output_bells_on_errors_and_restores_the_root() 
 }
 
 #[test]
+fn popping_review_resets_hidden_updates_and_later_clear_does_not_restore_snapshot() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+
+    app.handle_pty(&mut sr, b"snapshot\x1B[H", &mut term_out)
+        .expect("draw initial state");
+    terminal.process(&term_out);
+    term_out.clear();
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review");
+    terminal.process(&term_out);
+    term_out.clear();
+
+    app.handle_pty(&mut sr, b"\r\x1B[2Krunning one", &mut term_out)
+        .expect("first hidden update");
+    app.handle_pty(&mut sr, b"\r\x1B[2Krunning two", &mut term_out)
+        .expect("second hidden update");
+    assert!(term_out.is_empty());
+    app.handle_stdin(&mut sr, b"\x0C", &mut pty_out, &mut term_out)
+        .expect("ignore ctrl-l in review");
+    assert!(pty_out.is_empty());
+    terminal.process(&term_out);
+    term_out.clear();
+
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("close review");
+    terminal.process(&term_out);
+    term_out.clear();
+    assert!(terminal.screen().contents().contains("running two"));
+    assert!(!terminal.screen().contents().contains("snapshot"));
+
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(!app.maybe_finalize_changes(&mut sr).expect("no stale batch"));
+
+    app.handle_stdin(&mut sr, b"\x0C", &mut pty_out, &mut term_out)
+        .expect("forward ctrl-l after review");
+    assert_eq!(pty_out, b"\x0C");
+    app.handle_pty(&mut sr, b"\x1B[2J\x1B[Hprompt", &mut term_out)
+        .expect("application clears the screen");
+    terminal.process(&term_out);
+    term_out.clear();
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize clear"));
+
+    assert_eq!(terminal.screen().contents().trim(), "prompt");
+    assert_eq!(app.debug_active_view_contents().trim(), "prompt");
+    assert!(term_out.is_empty());
+}
+
+#[test]
+fn popping_review_restores_hidden_alternate_screen_transitions() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let mut terminal = vt100::Parser::new(24, 80, 0);
+
+    app.handle_pty(&mut sr, b"primary\x1B[H", &mut term_out)
+        .expect("draw primary screen");
+    terminal.process(&term_out);
+    term_out.clear();
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review");
+    terminal.process(&term_out);
+    term_out.clear();
+
+    app.handle_pty(&mut sr, b"\x1B[?1049hfullscreen", &mut term_out)
+        .expect("enter alternate screen behind review");
+    assert!(term_out.is_empty());
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("close review onto alternate screen");
+    assert!(term_out.starts_with(b"\x1B[?1049h\x1B[2J\x1B[H"));
+    terminal.process(&term_out);
+    term_out.clear();
+    assert!(terminal.screen().alternate_screen());
+    assert!(terminal.screen().contents().contains("fullscreen"));
+
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("review alternate screen");
+    terminal.process(&term_out);
+    term_out.clear();
+    app.handle_pty(&mut sr, b"\x1B[?1049l\x1B[2J\x1B[Hshell", &mut term_out)
+        .expect("leave alternate screen behind review");
+    assert!(term_out.is_empty());
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("close review onto primary screen");
+    assert!(term_out.starts_with(b"\x1B[?1049l\x1B[2J\x1B[H"));
+    terminal.process(&term_out);
+
+    assert!(!terminal.screen().alternate_screen());
+    assert_eq!(terminal.screen().contents().trim(), "shell");
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn review_overlay_uses_normal_cursor_tracking_for_horizontal_motions() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"abcd\x1B[H", &mut term_out)
+        .expect("draw source");
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"llh", &mut pty_out, &mut term_out)
+        .expect("move the visible review cursor");
+
+    let spoken = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(spoken, ["b", "c", "b"]);
+    assert!(pty_out.is_empty());
+}
+
+#[test]
 fn kitty_meta_r_opens_review_without_toggling_or_leaking() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
@@ -691,6 +812,62 @@ fn click_actions_write_mouse_events_at_review_cursor() {
         .expect("right click");
 
     assert_eq!(pty_out, b"\x1B[<0;8;5M\x1B[<0;8;5m\x1B[<2;8;5M\x1B[<2;8;5m");
+}
+
+#[test]
+fn left_click_action_places_the_review_overlay_application_cursor_locally() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"abcdef\x1B[H", &mut term_out)
+        .expect("draw source");
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review");
+
+    app.handle_stdin(&mut sr, b"\x1B.", &mut pty_out, &mut term_out)
+        .expect("move review cursor right");
+    app.handle_stdin(&mut sr, b"\x1B.", &mut pty_out, &mut term_out)
+        .expect("move review cursor right again");
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1B{", &mut pty_out, &mut term_out)
+        .expect("place application cursor with left click action");
+    app.handle_stdin(&mut sr, b"l", &mut pty_out, &mut term_out)
+        .expect("continue vi navigation from placed cursor");
+
+    let spoken = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(spoken, ["c", "d"]);
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn right_click_action_keeps_its_existing_behavior_in_review() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"abcdef\x1B[H", &mut term_out)
+        .expect("draw source");
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B}", &mut pty_out, &mut term_out)
+        .expect("invoke right click action");
+
+    assert!(pty_out.is_empty());
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "mouse input unavailable")
+    );
 }
 
 #[test]

@@ -293,6 +293,17 @@ impl App {
                         self.consumed_key_presses.insert(key_id);
                         return Ok(());
                     }
+                    if matches!(action, commands::Action::LeftClick)
+                        && let Some(view_action) = self
+                            .view_stack
+                            .active_mut()
+                            .place_application_cursor_at_review_cursor()
+                    {
+                        self.last_stdin_update = Some(self.clock.now_ms());
+                        self.handle_view_action(sr, view_action, term_out)?;
+                        self.consumed_key_presses.insert(key_id);
+                        return Ok(());
+                    }
                     let mode_before = sr.input_mode();
                     let title = self.view_stack.active_mut().title().to_string();
                     let consumed = match commands::handle(

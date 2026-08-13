@@ -105,6 +105,10 @@ background, but cannot move or replace the snapshot. Press `q` to leave Review
 and return to the underlying terminal or overlay. `Escape` never
 closes Review: it cancels a pending count, motion, search, or visual selection.
 Pressing it with nothing to cancel rings the terminal bell.
+Review opens with its visible application cursor at the source view's review
+cursor. Inside Review, the left-click action (`M-{`) places that visible cursor
+at the independent review cursor instead of sending a mouse event to the
+background application.
 
 Review has its own dependency-free vi command parser:
 
@@ -113,6 +117,9 @@ Review has its own dependency-free vi command parser:
   the beginning and end. Counts work, so `3w` moves forward three words.
 - `C-b` and `C-f` move by pages. Moving above or below the displayed page with
   `k` or `j` scrolls the frozen snapshot one line at a time.
+- `zt`, `zz`, and `zb` place the cursor line at the top, center, or bottom of
+  the terminal. `z<Enter>`, `z.`, and `z-` do the same and move to the first
+  nonblank character. A count selects the one-based snapshot line first.
 - `[p` and `]p` jump to previous and next OSC 133 prompt markers.
 - `f`, `F`, `t`, and `T` find a character on the logical line; `;` and `,`
   repeat that find. `%` finds and jumps between matching `()`, `[]`, and `{}`.

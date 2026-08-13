@@ -52,6 +52,12 @@ impl App {
         }
         let overlay_active = self.view_stack.has_overlay();
         self.view_stack.root_mut().handle_pty_output(buf)?;
+        let root_alternate_screen = self
+            .view_stack
+            .root_mut()
+            .model()
+            .screen()
+            .alternate_screen();
         if !overlay_active {
             if filtered {
                 term_out
@@ -64,6 +70,7 @@ impl App {
             if sr.auto_read_enabled() {
                 self.vte_parser.advance(&mut self.reporter, buf);
             }
+            self.displayed_alternate_screen = root_alternate_screen;
         }
         let now_ms = self.clock.now_ms();
         if self.first_pty_update.is_none() {

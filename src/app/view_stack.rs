@@ -39,8 +39,18 @@ impl App {
             views::ViewAction::Pop => {
                 self.capture_lua_repl_history();
                 if self.view_stack.pop() {
+                    if !self.view_stack.has_overlay() {
+                        self.restore_root_screen_selection(term_out)?;
+                    }
                     self.render_active_view(term_out)?;
                     self.announce_view_change(sr)?;
+                    if !self.view_stack.has_overlay() {
+                        // Hidden PTY changes have now been rendered and finalized.
+                        // Do not let their old stabilization deadline run again.
+                        self.first_pty_update = None;
+                        self.last_pty_update = None;
+                        self.reporter.reset();
+                    }
                 }
             }
             views::ViewAction::Redraw => {
@@ -49,6 +59,28 @@ impl App {
             }
             views::ViewAction::None => {}
         }
+        Ok(())
+    }
+
+    fn restore_root_screen_selection(&mut self, term_out: &mut dyn Write) -> Result<()> {
+        let alternate_screen = self
+            .view_stack
+            .root_mut()
+            .model()
+            .screen()
+            .alternate_screen();
+        if alternate_screen == self.displayed_alternate_screen {
+            return Ok(());
+        }
+
+        term_out
+            .write_all(if alternate_screen {
+                b"\x1B[?1049h"
+            } else {
+                b"\x1B[?1049l"
+            })
+            .context("restore terminal screen selection")?;
+        self.displayed_alternate_screen = alternate_screen;
         Ok(())
     }
 
@@ -80,6 +112,9 @@ impl App {
                 .write_all(&view.screen().cursor_state_formatted())
                 .context("render cursor state")?;
             term_out
+                .write_all(&view.screen().attributes_formatted())
+                .context("restore drawing attributes")?;
+            term_out
                 .write_all(&view.screen().input_mode_formatted())
                 .context("render input modes")?;
             term_out.flush().context("flush view render")?;
@@ -91,6 +126,13 @@ impl App {
         let title = self.view_stack.active_mut().title().to_string();
         let view = self.view_stack.active_mut().model();
         view.with_live_screen(|view| -> Result<()> {
+            if sr.review_follows_screen_cursor()
+                && view.review_cursor_position() != view.screen().cursor_position()
+            {
+                let old = view.review_cursor_position();
+                view.follow_application_cursor();
+                sr.hook_on_review_cursor_move(old, view.review_cursor_position())?;
+            }
             sr.speak(&title, false)?;
             let contents = view.contents_full();
             if contents.trim().is_empty() {

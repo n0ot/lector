@@ -3,7 +3,9 @@ use crate::{
     perform::HistoryPosition,
     review::{
         document::{ReviewDocument, SearchDirection},
-        parser::{Command, FindDirection, Key, Motion, Parser, TextObject, VisualKind},
+        parser::{
+            Command, FindDirection, Key, Motion, Parser, TextObject, ViewportPlacement, VisualKind,
+        },
     },
     screen_reader::ScreenReader,
     terminal_input::KeyInput,
@@ -50,6 +52,9 @@ pub struct ReviewView {
 
 impl ReviewView {
     pub fn new(source: &mut View) -> Self {
+        // Review opens at the source's independent review cursor, not at the
+        // source application's cursor. render() exposes this as the overlay's
+        // application cursor so normal cursor tracking starts from that point.
         let (document, cursor, viewport_top) = ReviewDocument::capture(source);
         let (rows, cols) = source.size();
         let mut review = Self {
@@ -77,24 +82,14 @@ impl ReviewView {
 
     fn ensure_cursor_visible(&mut self) {
         let height = self.document_height().max(1);
-        let max_top = self.document.max_viewport_top(height);
         if self.cursor.row < self.viewport_top {
             self.viewport_top = self.cursor.row;
         } else if self.cursor.row >= self.viewport_top.saturating_add(height) {
             self.viewport_top = self.cursor.row.saturating_add(1).saturating_sub(height);
         }
-        self.viewport_top = self.viewport_top.min(max_top);
-    }
-
-    /// Ordinary Lector review commands remain available in this overlay. They
-    /// operate on the rendered page, so absorb their cursor before applying a
-    /// vi command to the frozen document.
-    fn sync_cursor_from_model(&mut self) {
-        let (row, col) = self.view.review_cursor_position();
-        self.cursor = self.document.clamp(HistoryPosition {
-            row: self.viewport_top.saturating_add(usize::from(row)),
-            col,
-        });
+        self.viewport_top = self
+            .viewport_top
+            .min(self.document.row_count().saturating_sub(1));
     }
 
     fn render(&mut self) {
@@ -137,22 +132,15 @@ impl ReviewView {
             bytes.extend_from_slice(format!("\x1B[{row};{col}H\x1B[?25h").as_bytes());
         }
 
-        let mut view = View::new(self.rows, self.cols);
-        view.process_changes(&bytes);
-        let visible_row = self
-            .cursor
-            .row
-            .saturating_sub(self.viewport_top)
-            .min(usize::from(self.rows.saturating_sub(1))) as u16;
-        view.set_review_cursor_position((
-            visible_row,
-            self.cursor.col.min(self.cols.saturating_sub(1)),
-        ));
-        view.finalize_changes(0);
-        self.view = view;
+        // Keep one View alive for the lifetime of the overlay. Its application
+        // cursor is the visible terminal cursor, and preserving prev_screen lets
+        // the shared cursor tracker report review motions just like PTY motions.
+        self.view.clear_pending_bytes();
+        self.view.process_changes(&bytes);
+        self.view.clear_pending_bytes();
     }
 
-    fn handle_search_key(&mut self, sr: &mut ScreenReader, key: Key) -> Result<ViewAction> {
+    fn handle_search_key(&mut self, key: Key) -> Result<ViewAction> {
         match key {
             Key::Escape => {
                 self.search_prompt = None;
@@ -177,7 +165,7 @@ impl ReviewView {
                 self.render();
                 Ok(ViewAction::Redraw)
             }
-            Key::Enter => self.finish_search(sr),
+            Key::Enter => self.finish_search(),
             Key::Char(ch) if !ch.is_control() => {
                 self.search_prompt
                     .as_mut()
@@ -191,7 +179,7 @@ impl ReviewView {
         }
     }
 
-    fn finish_search(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+    fn finish_search(&mut self) -> Result<ViewAction> {
         let prompt = self.search_prompt.as_ref().expect("search prompt");
         let query = if prompt.query.is_empty() {
             let Some(last) = &self.last_search else {
@@ -207,7 +195,7 @@ impl ReviewView {
         };
         self.last_search = Some(LastSearch { query, direction });
         self.search_prompt = None;
-        self.move_to(sr, target)
+        Ok(self.move_to(target))
     }
 
     fn handle_command(&mut self, sr: &mut ScreenReader, command: Command) -> Result<ViewAction> {
@@ -236,9 +224,14 @@ impl ReviewView {
                 let Some(target) = self.motion_target(motion, count) else {
                     return Ok(ViewAction::Bell);
                 };
-                self.move_to(sr, target)
+                Ok(self.move_to(target))
             }
-            Command::ScrollPage { forward, count } => self.scroll_page(sr, forward, count),
+            Command::ScrollPage { forward, count } => Ok(self.scroll_page(forward, count)),
+            Command::RepositionViewport {
+                placement,
+                line,
+                first_nonblank,
+            } => Ok(self.reposition_viewport(placement, line, first_nonblank)),
             Command::YankMotion(motion, count) => {
                 let Some(target) = self.motion_target(motion, count) else {
                     return Ok(ViewAction::Bell);
@@ -314,7 +307,7 @@ impl ReviewView {
                 else {
                     return Ok(ViewAction::Bell);
                 };
-                self.move_to(sr, target)
+                Ok(self.move_to(target))
             }
         }
     }
@@ -413,18 +406,39 @@ impl ReviewView {
         }
     }
 
-    fn scroll_page(
-        &mut self,
-        sr: &mut ScreenReader,
-        forward: bool,
-        count: usize,
-    ) -> Result<ViewAction> {
+    fn scroll_page(&mut self, forward: bool, count: usize) -> ViewAction {
         let distance = self.document_height().max(1).saturating_mul(count);
         let target = self.document.move_vertical(self.cursor, forward, distance);
         let Some(target) = target else {
-            return Ok(ViewAction::Bell);
+            return ViewAction::Bell;
         };
-        self.move_to(sr, target)
+        self.move_to(target)
+    }
+
+    fn reposition_viewport(
+        &mut self,
+        placement: ViewportPlacement,
+        line: Option<usize>,
+        first_nonblank: bool,
+    ) -> ViewAction {
+        if let Some(line) = line {
+            self.cursor.row = line
+                .saturating_sub(1)
+                .min(self.document.row_count().saturating_sub(1));
+            self.cursor = self.document.clamp(self.cursor);
+        }
+        if first_nonblank {
+            self.cursor.col = self.document.line_first_nonblank(self.cursor.row);
+        }
+
+        let height = self.document_height().max(1);
+        self.viewport_top = match placement {
+            ViewportPlacement::Top => self.cursor.row,
+            ViewportPlacement::Center => self.cursor.row.saturating_sub(height / 2),
+            ViewportPlacement::Bottom => self.cursor.row.saturating_sub(height.saturating_sub(1)),
+        };
+        self.render();
+        ViewAction::Redraw
     }
 
     fn yank_motion_text(&self, motion: Motion, target: HistoryPosition) -> Option<String> {
@@ -457,21 +471,10 @@ impl ReviewView {
         self.document.yank_range(first, last, false)
     }
 
-    fn move_to(&mut self, sr: &mut ScreenReader, target: HistoryPosition) -> Result<ViewAction> {
-        let old_visible = self.view.review_cursor_position();
+    fn move_to(&mut self, target: HistoryPosition) -> ViewAction {
         self.cursor = self.document.clamp(target);
         self.render();
-        sr.hook_on_review_cursor_move(old_visible, self.view.review_cursor_position())?;
-        let line = self.document.line_text(self.cursor.row);
-        sr.speak(
-            if line.trim().is_empty() {
-                "blank"
-            } else {
-                &line
-            },
-            false,
-        )?;
-        Ok(ViewAction::Redraw)
+        ViewAction::Redraw
     }
 
     fn yank(&mut self, sr: &mut ScreenReader, text: String) -> Result<ViewAction> {
@@ -482,9 +485,8 @@ impl ReviewView {
     }
 
     fn handle_review_key(&mut self, sr: &mut ScreenReader, key: Key) -> Result<ViewAction> {
-        self.sync_cursor_from_model();
         if self.search_prompt.is_some() {
-            self.handle_search_key(sr, key)
+            self.handle_search_key(key)
         } else {
             let command = self.parser.feed(key);
             self.handle_command(sr, command)
@@ -525,6 +527,15 @@ impl ViewController for ReviewView {
 
     fn kind(&self) -> ViewKind {
         ViewKind::Review
+    }
+
+    fn place_application_cursor_at_review_cursor(&mut self) -> Option<ViewAction> {
+        let (row, col) = self.view.review_cursor_position();
+        let target = HistoryPosition {
+            row: self.viewport_top.saturating_add(usize::from(row)),
+            col,
+        };
+        Some(self.move_to(target))
     }
 
     fn handle_input(
@@ -572,6 +583,7 @@ impl ViewController for ReviewView {
     fn on_resize(&mut self, rows: u16, cols: u16) {
         self.rows = rows;
         self.cols = cols;
+        self.view.set_size(rows, cols);
         self.cursor.col = self
             .cursor
             .col
@@ -687,6 +699,25 @@ mod tests {
     }
 
     #[test]
+    fn review_application_cursor_starts_at_the_source_review_cursor() {
+        let mut source = View::new(3, 20);
+        source.process_changes(b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
+        source.set_review_history_position(HistoryPosition { row: 1, col: 2 });
+        let expected = source.review_history_position();
+
+        let review = ReviewView::new(&mut source);
+
+        assert_eq!(review.cursor, expected);
+        assert_eq!(
+            review.view.screen().cursor_position(),
+            (
+                expected.row.saturating_sub(review.viewport_top) as u16,
+                expected.col
+            )
+        );
+    }
+
+    #[test]
     fn escape_cancels_pending_command_without_closing() {
         let (mut view, mut sr, _) = setup(b"abc");
         assert!(matches!(input(&mut view, &mut sr, b"f"), ViewAction::None));
@@ -705,6 +736,67 @@ mod tests {
         let (mut view, mut sr, _) = setup(b"abc");
         assert!(matches!(input(&mut view, &mut sr, b"h"), ViewAction::Bell));
         assert!(matches!(input(&mut view, &mut sr, b"fz"), ViewAction::Bell));
+    }
+
+    #[test]
+    fn vi_motions_do_not_use_or_move_the_independent_review_cursor() {
+        let (mut view, mut sr, _) = setup(b"abcd");
+        view.model().set_review_cursor_col(2);
+
+        assert!(matches!(
+            input(&mut view, &mut sr, b"l"),
+            ViewAction::Redraw
+        ));
+        assert_eq!(view.cursor.col, 1);
+        assert_eq!(view.model().review_cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn z_commands_place_the_cursor_line_in_the_viewport() {
+        let mut source = View::new(5, 20);
+        source.process_changes(
+            b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\n  six\r\nseven\r\neight",
+        );
+        source.set_review_history_position(HistoryPosition { row: 6, col: 4 });
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(RecordingDriver(output))));
+        let mut view = ReviewView::new(&mut source);
+
+        assert!(matches!(
+            input(&mut view, &mut sr, b"zt"),
+            ViewAction::Redraw
+        ));
+        assert_eq!(view.viewport_top, 6);
+        assert_eq!(view.model().screen().cursor_position(), (0, 4));
+
+        assert!(matches!(
+            input(&mut view, &mut sr, b"zz"),
+            ViewAction::Redraw
+        ));
+        assert_eq!(view.viewport_top, 4);
+        assert_eq!(view.model().screen().cursor_position(), (2, 4));
+
+        assert!(matches!(
+            input(&mut view, &mut sr, b"zb"),
+            ViewAction::Redraw
+        ));
+        assert_eq!(view.viewport_top, 2);
+        assert_eq!(view.model().screen().cursor_position(), (4, 4));
+
+        assert!(matches!(
+            input(&mut view, &mut sr, b"z\r"),
+            ViewAction::Redraw
+        ));
+        assert_eq!(view.viewport_top, 6);
+        assert_eq!(view.cursor.col, 2);
+
+        assert!(matches!(
+            input(&mut view, &mut sr, b"3z."),
+            ViewAction::Redraw
+        ));
+        assert_eq!(view.cursor, HistoryPosition { row: 2, col: 0 });
+        assert_eq!(view.viewport_top, 0);
+        assert_eq!(view.model().screen().cursor_position(), (2, 0));
     }
 
     #[test]

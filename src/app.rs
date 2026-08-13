@@ -73,6 +73,7 @@ pub struct App {
     last_stdin_update: Option<u128>,
     first_pty_update: Option<u128>,
     last_pty_update: Option<u128>,
+    displayed_alternate_screen: bool,
     clock: Box<dyn Clock>,
 }
 
@@ -99,6 +100,7 @@ impl App {
             last_stdin_update: None,
             first_pty_update: None,
             last_pty_update: None,
+            displayed_alternate_screen: false,
             clock,
         };
         let now_ms = app.clock.now_ms();

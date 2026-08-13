@@ -58,6 +58,11 @@ pub trait ViewController {
     fn kind(&self) -> ViewKind {
         ViewKind::Other
     }
+    /// Gives overlays a chance to interpret Lector's mouse-click actions as
+    /// local cursor placement instead of forwarding a mouse event.
+    fn place_application_cursor_at_review_cursor(&mut self) -> Option<ViewAction> {
+        None
+    }
     fn wants_tick(&self) -> bool {
         false
     }

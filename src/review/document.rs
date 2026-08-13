@@ -176,6 +176,7 @@ impl ReviewDocument {
             .unwrap_or(0) as u16
     }
 
+    #[cfg(test)]
     pub(crate) fn line_text(&self, row: usize) -> String {
         let Some(row) = self.rows.get(row) else {
             return String::new();
