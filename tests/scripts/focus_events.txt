@@ -26,6 +26,20 @@ And stdin: \x1B[O
 Then expect-stdout: xy
 And expect-pty-stdin: \x1B[O
 
+Scenario: focus-mode queries use per-app state and never reach the terminal
+When pty-stdout: before\x1B[?1004$pafter
+And tick:
+And pty-stdout: \x1B[?1004h
+And pty-stdout: \x1B[?1004$p
+And tick:
+And stdin: \x1B[I
+And pty-stdout: \x1B[?1004l
+And pty-stdout: \x1B[?1004$p
+And tick:
+And stdin: \x1B[O
+Then expect-stdout: beforeafter
+And expect-pty-stdin: \x1B[?1004;2$y\x1B[?1004;1$y\x1B[I\x1B[?1004;2$y
+
 Scenario: auto-read speech suppressed while unfocused
 When stdin: \x1B[O
 And pty-stdout: hidden\r\n

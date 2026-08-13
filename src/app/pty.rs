@@ -1,5 +1,8 @@
 use super::*;
 
+const FOCUS_EVENTS_ENABLED_REPORT: &[u8] = b"\x1B[?1004;1$y";
+const FOCUS_EVENTS_DISABLED_REPORT: &[u8] = b"\x1B[?1004;2$y";
+
 impl App {
     pub fn handle_pty(
         &mut self,
@@ -36,6 +39,7 @@ impl App {
             buf,
             &mut self.filtered_pty_output,
             &mut self.focus_mode_changes,
+            &mut self.focus_mode_queries,
         );
         for &enabled in &self.focus_mode_changes {
             self.log_event(if enabled {
@@ -43,6 +47,19 @@ impl App {
             } else {
                 "focus mode: app disabled ?1004 passthrough"
             });
+        }
+        for &enabled in &self.focus_mode_queries {
+            self.log_event(if enabled {
+                "focus mode: app queried ?1004; reporting enabled"
+            } else {
+                "focus mode: app queried ?1004; reporting disabled"
+            });
+            self.pending_focus_mode_reports
+                .extend_from_slice(if enabled {
+                    FOCUS_EVENTS_ENABLED_REPORT
+                } else {
+                    FOCUS_EVENTS_DISABLED_REPORT
+                });
         }
         if filtered && self.filtered_pty_output != buf {
             self.log_bytes(
@@ -104,6 +121,17 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        if !self.pending_focus_mode_reports.is_empty() {
+            self.log_bytes(
+                "focus mode reports to app",
+                &self.pending_focus_mode_reports,
+            );
+            pty_out
+                .write_all(&self.pending_focus_mode_reports)
+                .context("write focus mode report")?;
+            pty_out.flush().context("flush focus mode report")?;
+            self.pending_focus_mode_reports.clear();
+        }
         self.flush_pending_input(sr, pty_out, term_out)?;
         let tick_action = self.view_stack.active_mut().tick(sr, pty_out)?;
         self.handle_view_action(sr, tick_action, term_out)

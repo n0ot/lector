@@ -4,6 +4,7 @@ pub(super) const FOCUS_IN_EVENT: &[u8] = b"\x1B[I";
 pub(super) const FOCUS_OUT_EVENT: &[u8] = b"\x1B[O";
 const FOCUS_EVENTS_ENABLE: &[u8] = b"\x1B[?1004h";
 const FOCUS_EVENTS_DISABLE: &[u8] = b"\x1B[?1004l";
+const FOCUS_EVENTS_QUERY: &[u8] = b"\x1B[?1004$p";
 const MODIFY_OTHER_KEYS_PREFIX: &[u8] = b"\x1B[27;";
 const OSC_START: u8 = b']';
 const ST_ESCAPE: u8 = b'\\';
@@ -38,9 +39,11 @@ impl FocusModeFilter {
         input: &[u8],
         output: &mut Vec<u8>,
         focus_changes: &mut Vec<bool>,
+        focus_queries: &mut Vec<bool>,
     ) -> bool {
         output.clear();
         focus_changes.clear();
+        focus_queries.clear();
         if self.pending.is_empty() && !input.contains(&b'\x1B') {
             return false;
         }
@@ -59,8 +62,12 @@ impl FocusModeFilter {
                 self.enabled = false;
                 focus_changes.push(false);
                 consumed += FOCUS_EVENTS_DISABLE.len();
+            } else if remaining.starts_with(FOCUS_EVENTS_QUERY) {
+                focus_queries.push(self.enabled);
+                consumed += FOCUS_EVENTS_QUERY.len();
             } else if FOCUS_EVENTS_ENABLE.starts_with(remaining)
                 || FOCUS_EVENTS_DISABLE.starts_with(remaining)
+                || FOCUS_EVENTS_QUERY.starts_with(remaining)
             {
                 break;
             } else {
@@ -207,15 +214,16 @@ mod tests {
         let mut filter = FocusModeFilter::default();
         let mut output = Vec::new();
         let mut changes = Vec::new();
-        assert!(!filter.filter_into(b"plain", &mut output, &mut changes));
+        let mut queries = Vec::new();
+        assert!(!filter.filter_into(b"plain", &mut output, &mut changes, &mut queries));
         assert!(output.is_empty());
-        assert!(filter.filter_into(b"x\x1B[?10", &mut output, &mut changes));
+        assert!(filter.filter_into(b"x\x1B[?10", &mut output, &mut changes, &mut queries));
         assert_eq!(output, b"x");
-        assert!(filter.filter_into(b"04hy", &mut output, &mut changes));
+        assert!(filter.filter_into(b"04hy", &mut output, &mut changes, &mut queries));
         assert_eq!(output, b"y");
         assert_eq!(changes, [true]);
         assert!(filter.enabled());
-        assert!(filter.filter_into(b"z\x1B[?1004l", &mut output, &mut changes));
+        assert!(filter.filter_into(b"z\x1B[?1004l", &mut output, &mut changes, &mut queries));
         assert_eq!(output, b"z");
         assert_eq!(changes, [false]);
         assert!(!filter.enabled());
@@ -342,21 +350,51 @@ mod tests {
         let mut filter = FocusModeFilter::default();
         let mut output = vec![1];
         let mut changes = vec![true];
+        let mut queries = vec![true];
 
-        assert!(!filter.filter_into(b"plain", &mut output, &mut changes));
+        assert!(!filter.filter_into(b"plain", &mut output, &mut changes, &mut queries));
         assert!(output.is_empty());
         assert!(changes.is_empty());
+        assert!(queries.is_empty());
 
-        assert!(filter.filter_into(b"a\x1B[?1004hb\x1B[?1004lc", &mut output, &mut changes));
+        assert!(filter.filter_into(
+            b"a\x1B[?1004hb\x1B[?1004lc",
+            &mut output,
+            &mut changes,
+            &mut queries
+        ));
         assert_eq!(output, b"abc");
         assert_eq!(changes, [true, false]);
         assert!(!filter.enabled());
 
-        assert!(filter.filter_into(b"\x1B[?10", &mut output, &mut changes));
+        assert!(filter.filter_into(b"\x1B[?10", &mut output, &mut changes, &mut queries));
         assert!(output.is_empty());
         assert!(changes.is_empty());
-        assert!(filter.filter_into(b"05x", &mut output, &mut changes));
+        assert!(filter.filter_into(b"05x", &mut output, &mut changes, &mut queries));
         assert_eq!(output, b"\x1B[?1005x");
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn focus_filter_answers_queries_from_its_virtual_mode_state() {
+        let mut filter = FocusModeFilter::default();
+        let mut output = Vec::new();
+        let mut changes = Vec::new();
+        let mut queries = Vec::new();
+
+        assert!(filter.filter_into(
+            b"a\x1B[?1004$p\x1B[?1004h\x1B[?1004$pb\x1B[?1004l\x1B[?10",
+            &mut output,
+            &mut changes,
+            &mut queries,
+        ));
+        assert_eq!(output, b"ab");
+        assert_eq!(changes, [true, false]);
+        assert_eq!(queries, [false, true]);
+
+        assert!(filter.filter_into(b"04$pc", &mut output, &mut changes, &mut queries));
+        assert_eq!(output, b"c");
+        assert!(changes.is_empty());
+        assert_eq!(queries, [false]);
     }
 }
