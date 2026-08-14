@@ -359,42 +359,6 @@ pub fn assert_snapshot(
     );
 }
 
-pub fn assert_raw_presentation(
-    test_name: &str,
-    intended_scene: &str,
-    source: &[u8],
-    chunk_boundaries: &[usize],
-    emitted: &[u8],
-    expected: &NormalizedTerminalSnapshot,
-    oracle_result: &NormalizedTerminalSnapshot,
-) {
-    if source == emitted && expected == oracle_result {
-        return;
-    }
-    let artifact = FailureArtifact {
-        schema_version: 1,
-        test_name: test_name.to_owned(),
-        intended_scene: intended_scene.to_owned(),
-        source_hex: encode_hex(source),
-        chunk_boundaries: chunk_boundaries.to_vec(),
-        emitted_hex: encode_hex(emitted),
-        expected: expected.clone(),
-        oracle_result: oracle_result.clone(),
-    };
-    let path = artifact_path(test_name);
-    let write_result = write_failure_artifact(&path, &artifact);
-    panic!(
-        "raw presentation mismatch for {test_name}; artifact: {}{}\nsource: {}\nemitted: {}\nexpected state: {expected:#?}\noracle state: {oracle_result:#?}",
-        path.display(),
-        write_result
-            .err()
-            .map(|error| format!(" (artifact write failed: {error})"))
-            .unwrap_or_default(),
-        encode_hex(source),
-        encode_hex(emitted),
-    );
-}
-
 pub fn write_failure_artifact(path: &Path, artifact: &FailureArtifact) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)

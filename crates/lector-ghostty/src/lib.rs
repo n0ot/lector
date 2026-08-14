@@ -113,16 +113,32 @@ pub enum ColorSnapshot {
     Rgb(u8, u8, u8),
 }
 
-/// The review-relevant style attributes of a Ghostty cell.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnderlineSnapshot {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+/// The complete presentation-relevant style attributes of a Ghostty cell.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StyleSnapshot {
     pub foreground: ColorSnapshot,
     pub background: ColorSnapshot,
+    pub underline_color: ColorSnapshot,
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub blink: bool,
     pub inverse: bool,
+    pub invisible: bool,
+    pub strikethrough: bool,
+    pub overline: bool,
+    pub underline: UnderlineSnapshot,
 }
 
 /// An exact OSC 133 boundary observed in the same stream Ghostty consumes.
@@ -153,6 +169,43 @@ pub struct CellSnapshot {
     pub hyperlink: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KittyImageFormatSnapshot {
+    Rgb,
+    Rgba,
+    GrayAlpha,
+    Gray,
+}
+
+/// A copied, mutation-safe view of one Kitty image placement on the active
+/// Ghostty screen. Pixel bytes are decoded and uncompressed by Ghostty before
+/// they cross this safe boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KittyImagePlacementSnapshot {
+    pub image_id: u32,
+    pub placement_id: u32,
+    pub image_number: u32,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+    pub rendered_pixel_width: u32,
+    pub rendered_pixel_height: u32,
+    pub format: KittyImageFormatSnapshot,
+    pub data: Vec<u8>,
+    pub x_offset: u32,
+    pub y_offset: u32,
+    pub viewport_col: i32,
+    pub viewport_row: i32,
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub source_x: u32,
+    pub source_y: u32,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub z_index: i32,
+    pub virtual_placement: bool,
+    pub visible: bool,
+}
+
 /// A normalized visible row from Ghostty.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RowSnapshot {
@@ -181,10 +234,20 @@ impl RowSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CursorShapeSnapshot {
+    Bar,
+    #[default]
+    Block,
+    Underline,
+    BlockHollow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CursorSnapshot {
     pub row: u16,
     pub col: u16,
     pub visible: bool,
+    pub shape: CursorShapeSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -246,6 +309,32 @@ pub enum QuerySnapshot {
     Size,
     ColorScheme,
     DeviceAttributes,
+    Clipboard,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalColorScheme {
+    Light,
+    #[default]
+    Dark,
+}
+
+/// Virtual terminal values supplied to Ghostty's query callbacks.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TerminalProfile {
+    pub rows: u16,
+    pub columns: u16,
+    pub cell_width: u32,
+    pub cell_height: u32,
+    pub color_scheme: TerminalColorScheme,
+    pub enquiry: Vec<u8>,
+    pub version: String,
+    pub da_conformance: u16,
+    pub da_features: Vec<u16>,
+    pub da_device_type: u16,
+    pub da_firmware_version: u16,
+    pub da_unit_id: u32,
+    pub clipboard_read: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -287,14 +376,65 @@ pub struct PrintedRunSnapshot {
     pub boundary: PrintBoundarySnapshot,
 }
 
+/// A non-authoritative operation hint observed in the same VT stream Ghostty
+/// consumed. Renderers must validate these hints against Ghostty's resulting
+/// cells before using them as an optimization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OperationSnapshot {
+    ScrollUp { top: u16, bottom: u16, count: u16 },
+    ScrollDown { top: u16, bottom: u16, count: u16 },
+    InsertLines { row: u16, bottom: u16, count: u16 },
+    DeleteLines { row: u16, bottom: u16, count: u16 },
+    InsertChars { row: u16, col: u16, count: u16 },
+    DeleteChars { row: u16, col: u16, count: u16 },
+    EraseChars { row: u16, col: u16, count: u16 },
+    WriteRun { row: u16, col: u16, text: String },
+}
+
+/// Dirty state consumed from Ghostty's stateful render API for one write.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum RenderDamageSnapshot {
+    #[default]
+    None,
+    Rows(Vec<RangeInclusive<u16>>),
+    Full,
+}
+
+impl RenderDamageSnapshot {
+    fn merge(&mut self, next: Self) {
+        *self = match (std::mem::take(self), next) {
+            (Self::Full, _) | (_, Self::Full) => Self::Full,
+            (Self::None, damage) | (damage, Self::None) => damage,
+            (Self::Rows(mut left), Self::Rows(mut right)) => {
+                left.append(&mut right);
+                normalize_row_ranges(&mut left);
+                Self::Rows(left)
+            }
+        };
+    }
+
+    fn changed_rows(&self, row_count: usize) -> Vec<RangeInclusive<u16>> {
+        match self {
+            Self::None => Vec::new(),
+            Self::Rows(rows) => rows.clone(),
+            Self::Full => (row_count > 0)
+                .then(|| 0..=row_index(row_count - 1))
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
 /// Operation and damage facts produced by the same write that mutated Ghostty.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpdateSnapshot {
     pub effects: Vec<EffectSnapshot>,
     pub pty_replies: Vec<u8>,
     pub printed_runs: Vec<PrintedRunSnapshot>,
+    pub operations: Vec<OperationSnapshot>,
     pub cursor_operations: usize,
     pub scroll_operations: usize,
+    pub damage: RenderDamageSnapshot,
     pub changed_rows: Vec<RangeInclusive<u16>>,
     pub cursor_before: CursorSnapshot,
     pub cursor_after: CursorSnapshot,
@@ -330,6 +470,7 @@ pub struct DiagnosticSnapshot {
     observer_continuation: Vec<u8>,
     active_hyperlink: Option<String>,
     scrollback_capacity: usize,
+    terminal_profile: TerminalProfile,
 }
 
 impl TerminalSnapshot {
@@ -417,6 +558,47 @@ impl Drop for TerminalHandle {
     }
 }
 
+struct KittyPlacementIteratorHandle(NonNull<c_void>);
+
+impl KittyPlacementIteratorHandle {
+    fn new() -> Result<Self, Error> {
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: the output points to writable storage and null selects
+        // Ghostty's default allocator. A successful result owns the iterator.
+        result_from_code(unsafe {
+            ffi::ghostty_kitty_graphics_placement_iterator_new(std::ptr::null(), &mut handle)
+        })?;
+        NonNull::new(handle).map(Self).ok_or(Error::NullHandle)
+    }
+
+    fn as_ptr(&self) -> ffi::KittyGraphicsPlacementIterator {
+        self.0.as_ptr()
+    }
+
+    fn populate(&mut self, graphics: ffi::KittyGraphics) -> Result<(), Error> {
+        let mut handle = self.as_ptr();
+        // SAFETY: both handles are valid and `handle` is writable storage for
+        // the documented pre-allocated iterator query.
+        result_from_code(unsafe {
+            ffi::ghostty_kitty_graphics_get(
+                graphics,
+                ffi::KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR,
+                (&mut handle as *mut ffi::KittyGraphicsPlacementIterator).cast(),
+            )
+        })?;
+        self.0 = NonNull::new(handle).ok_or(Error::NullHandle)?;
+        Ok(())
+    }
+}
+
+impl Drop for KittyPlacementIteratorHandle {
+    fn drop(&mut self) {
+        // SAFETY: this iterator is uniquely owned and is independent of the
+        // borrowed graphics/image handles it was populated from.
+        unsafe { ffi::ghostty_kitty_graphics_placement_iterator_free(self.as_ptr()) };
+    }
+}
+
 struct SnapshotDecoderHandle(NonNull<c_void>);
 
 impl SnapshotDecoderHandle {
@@ -458,12 +640,14 @@ impl Drop for SnapshotDecoderHandle {
 
 const UNKNOWN_SEQUENCE_MAX_BYTES: usize = 256;
 const CONTINUATION_MAX_BYTES: usize = 64 * 1024;
+const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Default)]
 struct EffectSink {
     events: Vec<EffectSnapshot>,
     pty_replies: Vec<u8>,
     error: Option<Error>,
+    terminal_profile: TerminalProfile,
 }
 
 impl EffectSink {
@@ -586,11 +770,15 @@ extern "C" fn effect_enquiry(
     userdata: *mut c_void,
 ) -> ffi::GhosttyString {
     // SAFETY: see `effect_write_pty`.
-    if let Some(sink) = unsafe { effect_sink(userdata) } {
-        sink.events
-            .push(EffectSnapshot::Query(QuerySnapshot::Enquiry));
+    let Some(sink) = (unsafe { effect_sink(userdata) }) else {
+        return ffi::GhosttyString::default();
+    };
+    sink.events
+        .push(EffectSnapshot::Query(QuerySnapshot::Enquiry));
+    ffi::GhosttyString {
+        ptr: sink.terminal_profile.enquiry.as_ptr(),
+        len: sink.terminal_profile.enquiry.len(),
     }
-    ffi::GhosttyString::default()
 }
 
 extern "C" fn effect_xtversion(
@@ -598,21 +786,36 @@ extern "C" fn effect_xtversion(
     userdata: *mut c_void,
 ) -> ffi::GhosttyString {
     // SAFETY: see `effect_write_pty`.
-    if let Some(sink) = unsafe { effect_sink(userdata) } {
-        sink.events
-            .push(EffectSnapshot::Query(QuerySnapshot::XtVersion));
+    let Some(sink) = (unsafe { effect_sink(userdata) }) else {
+        return ffi::GhosttyString::default();
+    };
+    sink.events
+        .push(EffectSnapshot::Query(QuerySnapshot::XtVersion));
+    ffi::GhosttyString {
+        ptr: sink.terminal_profile.version.as_ptr(),
+        len: sink.terminal_profile.version.len(),
     }
-    ffi::GhosttyString::default()
 }
 
 extern "C" fn effect_size(
     _terminal: ffi::Terminal,
     userdata: *mut c_void,
-    _out: *mut c_void,
+    out: *mut ffi::SizeReportSize,
 ) -> bool {
     // SAFETY: see `effect_write_pty`.
     if let Some(sink) = unsafe { effect_sink(userdata) } {
         sink.events.push(EffectSnapshot::Query(QuerySnapshot::Size));
+        let Some(out) = (unsafe { out.as_mut() }) else {
+            sink.record_error(Error::InvalidValue);
+            return false;
+        };
+        *out = ffi::SizeReportSize {
+            rows: sink.terminal_profile.rows,
+            columns: sink.terminal_profile.columns,
+            cell_width: sink.terminal_profile.cell_width,
+            cell_height: sink.terminal_profile.cell_height,
+        };
+        return true;
     }
     false
 }
@@ -620,12 +823,21 @@ extern "C" fn effect_size(
 extern "C" fn effect_color_scheme(
     _terminal: ffi::Terminal,
     userdata: *mut c_void,
-    _out: *mut c_void,
+    out: *mut ffi::ColorScheme,
 ) -> bool {
     // SAFETY: see `effect_write_pty`.
     if let Some(sink) = unsafe { effect_sink(userdata) } {
         sink.events
             .push(EffectSnapshot::Query(QuerySnapshot::ColorScheme));
+        let Some(out) = (unsafe { out.as_mut() }) else {
+            sink.record_error(Error::InvalidValue);
+            return false;
+        };
+        *out = match sink.terminal_profile.color_scheme {
+            TerminalColorScheme::Light => ffi::COLOR_SCHEME_LIGHT,
+            TerminalColorScheme::Dark => ffi::COLOR_SCHEME_DARK,
+        };
+        return true;
     }
     false
 }
@@ -633,12 +845,36 @@ extern "C" fn effect_color_scheme(
 extern "C" fn effect_device_attributes(
     _terminal: ffi::Terminal,
     userdata: *mut c_void,
-    _out: *mut c_void,
+    out: *mut ffi::DeviceAttributes,
 ) -> bool {
     // SAFETY: see `effect_write_pty`.
     if let Some(sink) = unsafe { effect_sink(userdata) } {
         sink.events
             .push(EffectSnapshot::Query(QuerySnapshot::DeviceAttributes));
+        let Some(out) = (unsafe { out.as_mut() }) else {
+            sink.record_error(Error::InvalidValue);
+            return false;
+        };
+        let features_len = sink.terminal_profile.da_features.len().min(64);
+        let mut features = [0; 64];
+        features[..features_len]
+            .copy_from_slice(&sink.terminal_profile.da_features[..features_len]);
+        *out = ffi::DeviceAttributes {
+            primary: ffi::DeviceAttributesPrimary {
+                conformance_level: sink.terminal_profile.da_conformance,
+                features,
+                num_features: features_len,
+            },
+            secondary: ffi::DeviceAttributesSecondary {
+                device_type: sink.terminal_profile.da_device_type,
+                firmware_version: sink.terminal_profile.da_firmware_version,
+                rom_cartridge: 0,
+            },
+            tertiary: ffi::DeviceAttributesTertiary {
+                unit_id: sink.terminal_profile.da_unit_id,
+            },
+        };
+        return true;
     }
     false
 }
@@ -1013,13 +1249,122 @@ struct StreamObserver {
     events: Vec<SemanticKindSnapshot>,
     printed_runs: Vec<PrintedRunSnapshot>,
     current_print: String,
+    operations: Vec<OperationSnapshot>,
+    operation_rows: u16,
+    operation_cols: u16,
+    operation_row: u16,
+    operation_col: u16,
+    scroll_region: Option<(u16, u16)>,
+    origin_mode: bool,
+    left_right_margin_mode: bool,
+    autowrap: bool,
+    operation_reliable: bool,
+    last_printed: Option<char>,
     cursor_operations: usize,
     scroll_operations: usize,
     history_cleared: bool,
     active_hyperlink: Option<String>,
+    clipboard_read_queries: Vec<Vec<u8>>,
 }
 
 impl StreamObserver {
+    fn begin_update(&mut self, snapshot: &TerminalSnapshot) {
+        self.operations.clear();
+        self.operation_rows = snapshot.rows.len().try_into().unwrap_or(u16::MAX);
+        self.operation_cols = snapshot
+            .rows
+            .first()
+            .map_or(0, |row| row.cells.len().try_into().unwrap_or(u16::MAX));
+        self.operation_row = snapshot.cursor.row;
+        self.operation_col = snapshot.cursor.col;
+        self.operation_reliable = self.operation_rows > 0 && self.operation_cols > 0;
+        if self.scroll_region.is_some_and(|(top, bottom)| {
+            top >= self.operation_rows || bottom >= self.operation_rows
+        }) {
+            self.scroll_region = None;
+        }
+    }
+
+    fn scroll_bounds(&self) -> (u16, u16) {
+        self.scroll_region
+            .unwrap_or((0, self.operation_rows.saturating_sub(1)))
+    }
+
+    fn parameter(params: &vte::Params, index: usize, default: u16) -> u16 {
+        params
+            .iter()
+            .nth(index)
+            .and_then(|values| values.first())
+            .copied()
+            .filter(|value| *value != 0)
+            .unwrap_or(default)
+    }
+
+    fn count(params: &vte::Params) -> u16 {
+        Self::parameter(params, 0, 1)
+    }
+
+    fn record_write(&mut self, character: char) {
+        if !character.is_ascii() || self.operation_col >= self.operation_cols {
+            self.operation_reliable = false;
+            return;
+        }
+        if self.operation_col == self.operation_cols.saturating_sub(1) {
+            // Ghostty owns wrap-pending truth. The C render API does not expose
+            // that transient state, so right-margin writes remain a diff case.
+            self.operation_reliable = false;
+            return;
+        }
+        match self.operations.last_mut() {
+            Some(OperationSnapshot::WriteRun { row, col, text })
+                if *row == self.operation_row
+                    && col.saturating_add(text.chars().count().try_into().unwrap_or(u16::MAX))
+                        == self.operation_col =>
+            {
+                text.push(character);
+            }
+            _ => self.operations.push(OperationSnapshot::WriteRun {
+                row: self.operation_row,
+                col: self.operation_col,
+                text: character.to_string(),
+            }),
+        }
+        self.operation_col = self.operation_col.saturating_add(1);
+        self.last_printed = Some(character);
+    }
+
+    fn record_erase(&mut self, row: u16, col: u16, count: u16) {
+        let count = count.min(self.operation_cols.saturating_sub(col));
+        if count > 0 && row < self.operation_rows {
+            self.operations
+                .push(OperationSnapshot::EraseChars { row, col, count });
+        }
+    }
+
+    fn line_feed(&mut self) {
+        let (top, bottom) = self.scroll_bounds();
+        if self.operation_row == bottom {
+            self.operations.push(OperationSnapshot::ScrollUp {
+                top,
+                bottom,
+                count: 1,
+            });
+        } else {
+            self.operation_row = self
+                .operation_row
+                .saturating_add(1)
+                .min(self.operation_rows.saturating_sub(1));
+        }
+    }
+
+    fn has_boundary_events(&self) -> bool {
+        !self.events.is_empty() || !self.clipboard_read_queries.is_empty()
+    }
+
+    fn take_clipboard_read_queries(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.clipboard_read_queries)
+    }
+
     fn take_semantic_events(&mut self) -> Vec<SemanticKindSnapshot> {
         std::mem::take(&mut self.events)
     }
@@ -1050,11 +1395,21 @@ impl StreamObserver {
         });
     }
 
-    fn take_update(&mut self) -> StreamUpdate {
+    fn take_update(&mut self, snapshot: &TerminalSnapshot) -> StreamUpdate {
         self.flush_print();
         self.history_cleared = false;
+        let operations = if self.operation_reliable
+            && self.operation_row == snapshot.cursor.row
+            && self.operation_col == snapshot.cursor.col
+        {
+            std::mem::take(&mut self.operations)
+        } else {
+            self.operations.clear();
+            Vec::new()
+        };
         StreamUpdate {
             printed_runs: std::mem::take(&mut self.printed_runs),
+            operations,
             cursor_operations: std::mem::take(&mut self.cursor_operations),
             scroll_operations: std::mem::take(&mut self.scroll_operations),
         }
@@ -1064,6 +1419,7 @@ impl StreamObserver {
 #[derive(Default)]
 struct StreamUpdate {
     printed_runs: Vec<PrintedRunSnapshot>,
+    operations: Vec<OperationSnapshot>,
     cursor_operations: usize,
     scroll_operations: usize,
 }
@@ -1071,13 +1427,24 @@ struct StreamUpdate {
 impl vte::Perform for StreamObserver {
     fn print(&mut self, character: char) {
         self.current_print.push(character);
+        self.record_write(character);
     }
     fn execute(&mut self, byte: u8) {
         self.flush_print();
         match byte {
-            b'\x08' => self.cursor_operations += 1,
-            b'\r' => self.push_boundary(PrintBoundarySnapshot::CarriageReturn),
-            b'\n' | b'\x0b' | b'\x0c' => self.push_boundary(PrintBoundarySnapshot::LineFeed),
+            b'\x08' => {
+                self.cursor_operations += 1;
+                self.operation_col = self.operation_col.saturating_sub(1);
+            }
+            b'\r' => {
+                self.push_boundary(PrintBoundarySnapshot::CarriageReturn);
+                self.operation_col = 0;
+            }
+            b'\n' | b'\x0b' | b'\x0c' => {
+                self.push_boundary(PrintBoundarySnapshot::LineFeed);
+                self.line_feed();
+            }
+            b'\t' => self.operation_reliable = false,
             _ => {}
         }
     }
@@ -1086,6 +1453,10 @@ impl vte::Perform for StreamObserver {
     }
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         self.flush_print();
+        if let [b"52", location, b"?"] = params {
+            self.clipboard_read_queries.push(location.to_vec());
+            return;
+        }
         if params.first() == Some(&b"8".as_slice()) {
             let uri = params.get(2..).unwrap_or_default().iter().enumerate().fold(
                 Vec::new(),
@@ -1129,6 +1500,31 @@ impl vte::Perform for StreamObserver {
         action: char,
     ) {
         self.flush_print();
+        if intermediates == b"?" && matches!(action, 'h' | 'l') {
+            let enabled = action == 'h';
+            for values in params.iter() {
+                for value in values {
+                    match *value {
+                        6 => self.origin_mode = enabled,
+                        7 => self.autowrap = enabled,
+                        69 => self.left_right_margin_mode = enabled,
+                        47 | 1047 | 1049 => {
+                            self.scroll_region = None;
+                            self.operation_reliable = false;
+                        }
+                        // Input/reporting and cursor-visibility modes do not
+                        // alter the location or meaning of cell operations.
+                        1 | 12 | 25 | 66 | 67 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015
+                        | 1016 | 2004 | 2026 => {}
+                        // Unmodeled private modes can save/restore the cursor,
+                        // resize/reset the grid, or change how later controls
+                        // are interpreted. The dirty-state path remains safe.
+                        _ => self.operation_reliable = false,
+                    }
+                }
+            }
+            return;
+        }
         if intermediates.is_empty() {
             if action == 'J'
                 && params
@@ -1141,14 +1537,227 @@ impl vte::Perform for StreamObserver {
                 self.history_cleared = true;
             }
             match action {
-                'A'..='H' => self.cursor_operations += 1,
-                'S' | 'T' => self.scroll_operations += 1,
-                _ => {}
+                'A' => {
+                    self.cursor_operations += 1;
+                    self.operation_row = self.operation_row.saturating_sub(Self::count(params));
+                }
+                'B' => {
+                    self.cursor_operations += 1;
+                    self.operation_row = self
+                        .operation_row
+                        .saturating_add(Self::count(params))
+                        .min(self.operation_rows.saturating_sub(1));
+                }
+                'C' => {
+                    self.cursor_operations += 1;
+                    self.operation_col = self
+                        .operation_col
+                        .saturating_add(Self::count(params))
+                        .min(self.operation_cols.saturating_sub(1));
+                }
+                'D' => {
+                    self.cursor_operations += 1;
+                    self.operation_col = self.operation_col.saturating_sub(Self::count(params));
+                }
+                'E' => {
+                    self.cursor_operations += 1;
+                    self.operation_row = self
+                        .operation_row
+                        .saturating_add(Self::count(params))
+                        .min(self.operation_rows.saturating_sub(1));
+                    self.operation_col = 0;
+                }
+                'F' => {
+                    self.cursor_operations += 1;
+                    self.operation_row = self.operation_row.saturating_sub(Self::count(params));
+                    self.operation_col = 0;
+                }
+                'G' | '`' => {
+                    self.cursor_operations += 1;
+                    self.operation_col = Self::parameter(params, 0, 1)
+                        .saturating_sub(1)
+                        .min(self.operation_cols.saturating_sub(1));
+                }
+                'H' | 'f' => {
+                    self.cursor_operations += 1;
+                    let mut row = Self::parameter(params, 0, 1).saturating_sub(1);
+                    if self.origin_mode {
+                        row = row.saturating_add(self.scroll_bounds().0);
+                    }
+                    self.operation_row = row.min(self.operation_rows.saturating_sub(1));
+                    self.operation_col = Self::parameter(params, 1, 1)
+                        .saturating_sub(1)
+                        .min(self.operation_cols.saturating_sub(1));
+                }
+                'd' => {
+                    self.cursor_operations += 1;
+                    self.operation_row = Self::parameter(params, 0, 1)
+                        .saturating_sub(1)
+                        .min(self.operation_rows.saturating_sub(1));
+                }
+                'r' if !self.left_right_margin_mode => {
+                    let top = Self::parameter(params, 0, 1).saturating_sub(1);
+                    let bottom = Self::parameter(params, 1, self.operation_rows)
+                        .saturating_sub(1)
+                        .min(self.operation_rows.saturating_sub(1));
+                    if top < bottom && bottom < self.operation_rows {
+                        self.scroll_region = (top != 0
+                            || bottom != self.operation_rows.saturating_sub(1))
+                        .then_some((top, bottom));
+                        self.operation_row = if self.origin_mode { top } else { 0 };
+                        self.operation_col = 0;
+                    } else {
+                        self.operation_reliable = false;
+                    }
+                }
+                'S' | 'T' => {
+                    self.scroll_operations += 1;
+                    let (top, bottom) = self.scroll_bounds();
+                    let operation = if action == 'S' {
+                        OperationSnapshot::ScrollUp {
+                            top,
+                            bottom,
+                            count: Self::count(params),
+                        }
+                    } else {
+                        OperationSnapshot::ScrollDown {
+                            top,
+                            bottom,
+                            count: Self::count(params),
+                        }
+                    };
+                    self.operations.push(operation);
+                }
+                'L' | 'M' => {
+                    let (_, bottom) = self.scroll_bounds();
+                    if self.operation_row <= bottom {
+                        let operation = if action == 'L' {
+                            OperationSnapshot::InsertLines {
+                                row: self.operation_row,
+                                bottom,
+                                count: Self::count(params),
+                            }
+                        } else {
+                            OperationSnapshot::DeleteLines {
+                                row: self.operation_row,
+                                bottom,
+                                count: Self::count(params),
+                            }
+                        };
+                        self.operations.push(operation);
+                    }
+                }
+                '@' => self.operations.push(OperationSnapshot::InsertChars {
+                    row: self.operation_row,
+                    col: self.operation_col,
+                    count: Self::count(params),
+                }),
+                'P' => self.operations.push(OperationSnapshot::DeleteChars {
+                    row: self.operation_row,
+                    col: self.operation_col,
+                    count: Self::count(params),
+                }),
+                'X' => {
+                    self.record_erase(self.operation_row, self.operation_col, Self::count(params))
+                }
+                'K' => match Self::parameter(params, 0, 0) {
+                    0 => self.record_erase(
+                        self.operation_row,
+                        self.operation_col,
+                        self.operation_cols.saturating_sub(self.operation_col),
+                    ),
+                    1 => self.record_erase(
+                        self.operation_row,
+                        0,
+                        self.operation_col.saturating_add(1),
+                    ),
+                    2 => self.record_erase(self.operation_row, 0, self.operation_cols),
+                    _ => self.operation_reliable = false,
+                },
+                'J' => match Self::parameter(params, 0, 0) {
+                    0 => {
+                        self.record_erase(
+                            self.operation_row,
+                            self.operation_col,
+                            self.operation_cols.saturating_sub(self.operation_col),
+                        );
+                        for row in self.operation_row.saturating_add(1)..self.operation_rows {
+                            self.record_erase(row, 0, self.operation_cols);
+                        }
+                    }
+                    1 => {
+                        for row in 0..self.operation_row {
+                            self.record_erase(row, 0, self.operation_cols);
+                        }
+                        self.record_erase(
+                            self.operation_row,
+                            0,
+                            self.operation_col.saturating_add(1),
+                        );
+                    }
+                    2 => {
+                        for row in 0..self.operation_rows {
+                            self.record_erase(row, 0, self.operation_cols);
+                        }
+                    }
+                    3 => {}
+                    _ => self.operation_reliable = false,
+                },
+                'b' => {
+                    if let Some(character) = self.last_printed {
+                        for _ in 0..Self::count(params) {
+                            self.record_write(character);
+                        }
+                    } else {
+                        self.operation_reliable = false;
+                    }
+                }
+                // SGR and device/query controls do not invalidate cell
+                // operation hints; their modeled effects are reconciled later.
+                'm' | 'n' | 'c' => {}
+                // Save/restore, standard modes, window operations, and any
+                // control not explicitly modeled above are ambiguous here.
+                _ => self.operation_reliable = false,
             }
+        } else {
+            // Intermediate-bearing controls include resets and cursor/style
+            // operations whose terminal-state effects are not modeled here.
+            self.operation_reliable = false;
         }
     }
-    fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {
+    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         self.flush_print();
+        if !intermediates.is_empty() {
+            self.operation_reliable = false;
+            return;
+        }
+        match byte {
+            b'D' => self.line_feed(),
+            b'E' => {
+                self.operation_col = 0;
+                self.line_feed();
+            }
+            b'M' => {
+                let (top, bottom) = self.scroll_bounds();
+                if self.operation_row == top {
+                    self.operations.push(OperationSnapshot::ScrollDown {
+                        top,
+                        bottom,
+                        count: 1,
+                    });
+                } else {
+                    self.operation_row = self.operation_row.saturating_sub(1);
+                }
+            }
+            b'c' => {
+                self.scroll_region = None;
+                self.origin_mode = false;
+                self.left_right_margin_mode = false;
+                self.autowrap = true;
+                self.operation_reliable = false;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1184,9 +1793,30 @@ impl Terminal {
         cols: u16,
         scrollback_capacity: usize,
     ) -> Result<Self, Error> {
+        Self::new_with_profile(
+            rows,
+            cols,
+            scrollback_capacity,
+            TerminalProfile {
+                rows,
+                columns: cols,
+                ..TerminalProfile::default()
+            },
+        )
+    }
+
+    pub fn new_with_profile(
+        rows: u16,
+        cols: u16,
+        scrollback_capacity: usize,
+        profile: TerminalProfile,
+    ) -> Result<Self, Error> {
         // Keep callback userdata alive until after the terminal even if a
         // later constructor step fails and local variables unwind.
-        let mut effect_sink = Box::<EffectSink>::default();
+        let mut effect_sink = Box::new(EffectSink {
+            terminal_profile: profile,
+            ..EffectSink::default()
+        });
         let terminal = TerminalHandle::new(rows, cols)?;
         // Ghostty prunes complete pages when its physical line limit is
         // crossed. Keep one logical window of line headroom so a page prune
@@ -1197,6 +1827,10 @@ impl Terminal {
         terminal.set_option(
             ffi::TERMINAL_OPT_CONTINUATION_MAX_BYTES,
             (&CONTINUATION_MAX_BYTES as *const usize).cast(),
+        )?;
+        terminal.set_option(
+            ffi::TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT,
+            (&KITTY_IMAGE_STORAGE_LIMIT_BYTES as *const u64).cast(),
         )?;
         register_effects(&terminal, &mut effect_sink)?;
         let render_state = RenderStateHandle::new()?;
@@ -1221,26 +1855,30 @@ impl Terminal {
 
     pub fn advance(&mut self, bytes: &[u8]) -> Result<UpdateSnapshot, Error> {
         let before = self.snapshot.clone();
+        self.stream_observer.begin_update(&before);
+        let mut render_damage = RenderDamageSnapshot::None;
         let new_semantic_start = self.semantic_marks.len();
         let mut segment_start = 0;
         for (index, byte) in bytes.iter().copied().enumerate() {
             self.stream_parser
                 .advance(&mut self.stream_observer, &[byte]);
-            if self.stream_observer.events.is_empty() {
+            if !self.stream_observer.has_boundary_events() {
                 continue;
             }
             self.write_vt(&bytes[segment_start..=index]);
-            self.refresh_snapshot()?;
+            self.answer_clipboard_queries();
+            render_damage.merge(self.refresh_snapshot()?);
             self.anchor_semantic_events(before.scrollback_extent)?;
             segment_start = index + 1;
         }
         if segment_start < bytes.len() {
             self.write_vt(&bytes[segment_start..]);
-            self.refresh_snapshot()?;
+            self.answer_clipboard_queries();
+            render_damage.merge(self.refresh_snapshot()?);
         }
         self.recalibrate_new_semantic_marks(new_semantic_start)?;
         self.refresh_semantic_marks()?;
-        let stream = self.stream_observer.take_update();
+        let stream = self.stream_observer.take_update(&self.snapshot);
         let (effects, pty_replies) = self.effect_sink.take()?;
         // Ghostty represents both an unset string and a reported empty string
         // as a zero-length terminal-data value. The callback itself is the
@@ -1258,19 +1896,40 @@ impl Terminal {
         }) {
             self.snapshot.working_directory = Some(path.clone());
         }
+        let changed_rows = render_damage.changed_rows(self.snapshot.rows.len());
         Ok(UpdateSnapshot {
             effects,
             pty_replies,
             printed_runs: stream.printed_runs,
+            operations: stream.operations,
             cursor_operations: stream.cursor_operations,
             scroll_operations: stream.scroll_operations,
-            changed_rows: changed_row_ranges(&before, &self.snapshot),
+            damage: render_damage,
+            changed_rows,
             cursor_before: before.cursor,
             cursor_after: self.snapshot.cursor,
             alternate_screen_before: before.alternate_screen,
             alternate_screen_after: self.snapshot.alternate_screen,
             synchronized_output: self.snapshot.modes.synchronized_output,
         })
+    }
+
+    fn answer_clipboard_queries(&mut self) {
+        for location in self.stream_observer.take_clipboard_read_queries() {
+            self.effect_sink
+                .events
+                .push(EffectSnapshot::Query(QuerySnapshot::Clipboard));
+            if location.len() > 16 || !location.iter().all(|byte| byte.is_ascii_alphanumeric()) {
+                continue;
+            }
+            // Clipboard reads never escape to the outer terminal. The secure
+            // virtual profile answers with empty content; a future local
+            // clipboard provider can fill this without changing routing.
+            let _advertised = self.effect_sink.terminal_profile.clipboard_read;
+            self.effect_sink.pty_replies.extend_from_slice(b"\x1b]52;");
+            self.effect_sink.pty_replies.extend_from_slice(&location);
+            self.effect_sink.pty_replies.extend_from_slice(b";\x1b\\");
+        }
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Error> {
@@ -1287,6 +1946,10 @@ impl Terminal {
         if rows == 0 || cols == 0 {
             return Err(Error::InvalidValue);
         }
+        self.effect_sink.terminal_profile.rows = rows;
+        self.effect_sink.terminal_profile.columns = cols;
+        self.effect_sink.terminal_profile.cell_width = cell_width_px;
+        self.effect_sink.terminal_profile.cell_height = cell_height_px;
         // SAFETY: the terminal handle is valid and dimensions were validated.
         let result = unsafe {
             ffi::ghostty_terminal_resize(
@@ -1310,6 +1973,7 @@ impl Terminal {
             observer_continuation: continuation_bytes(&self.terminal)?,
             active_hyperlink: self.stream_observer.active_hyperlink.clone(),
             scrollback_capacity: self.scrollback_capacity,
+            terminal_profile: self.effect_sink.terminal_profile.clone(),
         })
     }
 
@@ -1321,10 +1985,14 @@ impl Terminal {
             observer_continuation,
             active_hyperlink,
             scrollback_capacity,
+            terminal_profile,
         } = snapshot;
         // Declare callback storage before the decoded terminal so partial
         // constructor unwinding always frees the terminal first.
-        let mut effect_sink = Box::<EffectSink>::default();
+        let mut effect_sink = Box::new(EffectSink {
+            terminal_profile,
+            ..EffectSink::default()
+        });
         let decoder = SnapshotDecoderHandle::new(&bytes)?;
         let terminal = decoder.decode()?;
         drop(decoder);
@@ -1333,6 +2001,10 @@ impl Terminal {
             ffi::TERMINAL_OPT_CONTINUATION_MAX_BYTES,
             (&CONTINUATION_MAX_BYTES as *const usize).cast(),
         )?;
+        terminal.set_option(
+            ffi::TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT,
+            (&KITTY_IMAGE_STORAGE_LIMIT_BYTES as *const u64).cast(),
+        )?;
         register_effects(&terminal, &mut effect_sink)?;
         let render_state = RenderStateHandle::new()?;
         let row_iterator = RowIteratorHandle::new()?;
@@ -1340,7 +2012,8 @@ impl Terminal {
         let mut stream_parser = vte::Parser::new();
         let mut stream_observer = StreamObserver::default();
         stream_parser.advance(&mut stream_observer, &observer_continuation);
-        let _ = stream_observer.take_update();
+        stream_observer.begin_update(&TerminalSnapshot::default());
+        let _ = stream_observer.take_update(&TerminalSnapshot::default());
         stream_observer.active_hyperlink = active_hyperlink;
         let mut result = Self {
             row_cells,
@@ -1368,7 +2041,7 @@ impl Terminal {
         self.stream_observer = StreamObserver::default();
         let _ = self.effect_sink.take()?;
         self.semantic_marks.clear();
-        self.refresh_snapshot()
+        self.refresh_snapshot().map(|_| ())
     }
 
     pub fn snapshot(&self) -> &TerminalSnapshot {
@@ -1393,6 +2066,105 @@ impl Terminal {
     /// The currently active OSC 8 URI applied to subsequently printed cells.
     pub fn active_hyperlink(&self) -> Option<&str> {
         self.stream_observer.active_hyperlink.as_deref()
+    }
+
+    /// Copies all Kitty image placements and referenced decoded pixel data
+    /// from the active screen. Every borrowed C handle is consumed before the
+    /// method returns, so callers may retain the result across mutations.
+    pub fn kitty_image_placements(&self) -> Result<Vec<KittyImagePlacementSnapshot>, Error> {
+        let graphics = terminal_query::<ffi::KittyGraphics>(
+            &self.terminal,
+            ffi::TERMINAL_DATA_KITTY_GRAPHICS,
+        )?;
+        if graphics.is_null() {
+            return Err(Error::NullHandle);
+        }
+        let mut iterator = KittyPlacementIteratorHandle::new()?;
+        iterator.populate(graphics)?;
+        let mut placements = Vec::new();
+        // SAFETY: the iterator is valid and the terminal remains immutable for
+        // this complete traversal.
+        while unsafe { ffi::ghostty_kitty_graphics_placement_next(iterator.as_ptr()) } {
+            let image_id =
+                kitty_placement_query::<u32>(&iterator, ffi::KITTY_PLACEMENT_DATA_IMAGE_ID)?;
+            // SAFETY: the graphics handle remains valid while the terminal is
+            // immutable. A null result means the placement is malformed.
+            let image = unsafe { ffi::ghostty_kitty_graphics_image(graphics, image_id) };
+            if image.is_null() {
+                return Err(Error::NullHandle);
+            }
+            let data_len = kitty_image_query::<usize>(image, ffi::KITTY_IMAGE_DATA_DATA_LEN)?;
+            let data_ptr = kitty_image_query::<*const u8>(image, ffi::KITTY_IMAGE_DATA_DATA_PTR)?;
+            if data_len > 0 && data_ptr.is_null() {
+                return Err(Error::NullString);
+            }
+            let data = if data_len == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: Ghostty documents exactly `data_len` decoded bytes,
+                // borrowed until the terminal mutates. Copy them immediately.
+                unsafe { std::slice::from_raw_parts(data_ptr, data_len) }.to_vec()
+            };
+            let format = match kitty_image_query::<ffi::KittyImageFormat>(
+                image,
+                ffi::KITTY_IMAGE_DATA_FORMAT,
+            )? {
+                ffi::KITTY_IMAGE_FORMAT_RGB => KittyImageFormatSnapshot::Rgb,
+                ffi::KITTY_IMAGE_FORMAT_RGBA => KittyImageFormatSnapshot::Rgba,
+                ffi::KITTY_IMAGE_FORMAT_GRAY_ALPHA => KittyImageFormatSnapshot::GrayAlpha,
+                ffi::KITTY_IMAGE_FORMAT_GRAY => KittyImageFormatSnapshot::Gray,
+                _ => return Err(Error::InvalidValue),
+            };
+            let mut render = ffi::KittyGraphicsPlacementRenderInfo::init();
+            // SAFETY: all handles are valid during this immutable traversal and
+            // the sized output struct follows the official header layout.
+            result_from_code(unsafe {
+                ffi::ghostty_kitty_graphics_placement_render_info(
+                    iterator.as_ptr(),
+                    image,
+                    self.terminal.as_ptr(),
+                    &mut render,
+                )
+            })?;
+            placements.push(KittyImagePlacementSnapshot {
+                image_id,
+                placement_id: kitty_placement_query(
+                    &iterator,
+                    ffi::KITTY_PLACEMENT_DATA_PLACEMENT_ID,
+                )?,
+                image_number: kitty_image_query(image, ffi::KITTY_IMAGE_DATA_NUMBER)?,
+                pixel_width: kitty_image_query(image, ffi::KITTY_IMAGE_DATA_WIDTH)?,
+                pixel_height: kitty_image_query(image, ffi::KITTY_IMAGE_DATA_HEIGHT)?,
+                rendered_pixel_width: render.pixel_width,
+                rendered_pixel_height: render.pixel_height,
+                format,
+                data,
+                x_offset: kitty_placement_query(&iterator, ffi::KITTY_PLACEMENT_DATA_X_OFFSET)?,
+                y_offset: kitty_placement_query(&iterator, ffi::KITTY_PLACEMENT_DATA_Y_OFFSET)?,
+                viewport_col: render.viewport_col,
+                viewport_row: render.viewport_row,
+                grid_cols: render.grid_cols,
+                grid_rows: render.grid_rows,
+                source_x: render.source_x,
+                source_y: render.source_y,
+                source_width: render.source_width,
+                source_height: render.source_height,
+                z_index: kitty_placement_query(&iterator, ffi::KITTY_PLACEMENT_DATA_Z)?,
+                virtual_placement: kitty_placement_query(
+                    &iterator,
+                    ffi::KITTY_PLACEMENT_DATA_IS_VIRTUAL,
+                )?,
+                visible: render.viewport_visible,
+            });
+        }
+        placements.sort_by_key(|placement| {
+            (
+                placement.z_index,
+                placement.image_id,
+                placement.placement_id,
+            )
+        });
+        Ok(placements)
     }
 
     fn write_vt(&mut self, bytes: &[u8]) {
@@ -1568,7 +2340,7 @@ impl Terminal {
         Ok(())
     }
 
-    fn refresh_snapshot(&mut self) -> Result<(), Error> {
+    fn refresh_snapshot(&mut self) -> Result<RenderDamageSnapshot, Error> {
         // SAFETY: both owned handles are valid and are only accessed from
         // this thread while `&mut self` excludes concurrent mutation.
         let result = unsafe {
@@ -1576,6 +2348,10 @@ impl Terminal {
         };
         result_from_code(result)?;
 
+        let global_dirty = render_query::<ffi::RenderStateDirty>(
+            &self.render_state,
+            ffi::RENDER_STATE_DATA_DIRTY,
+        )?;
         let rows = render_query::<u16>(&self.render_state, ffi::RENDER_STATE_DATA_ROWS)?;
         let cols = render_query::<u16>(&self.render_state, ffi::RENDER_STATE_DATA_COLS)?;
         let mut iterator = self.row_iterator.as_ptr();
@@ -1589,13 +2365,27 @@ impl Terminal {
         }
 
         let mut normalized_rows = Vec::with_capacity(usize::from(rows));
+        let mut dirty_ranges = Vec::new();
         for row in 0..rows {
             // SAFETY: the iterator was populated from the current render
             // state and remains valid until its next render-state update.
             if !unsafe { ffi::ghostty_render_state_row_iterator_next(self.row_iterator.as_ptr()) } {
                 return Err(Error::NoValue);
             }
+            if row_iterator_query::<bool>(&self.row_iterator, ffi::RENDER_STATE_ROW_DATA_DIRTY)? {
+                append_dirty_row(&mut dirty_ranges, row);
+            }
             normalized_rows.push(self.read_row(row, cols)?);
+            let clean = false;
+            // SAFETY: the iterator is positioned on the current live row and
+            // the option's documented value type is `bool`.
+            result_from_code(unsafe {
+                ffi::ghostty_render_state_row_set(
+                    self.row_iterator.as_ptr(),
+                    ffi::RENDER_STATE_ROW_OPTION_DIRTY,
+                    (&clean as *const bool).cast(),
+                )
+            })?;
         }
         // Detect an ABI or iteration contract change rather than silently
         // truncating a viewport.
@@ -1603,6 +2393,16 @@ impl Terminal {
         if unsafe { ffi::ghostty_render_state_row_iterator_next(self.row_iterator.as_ptr()) } {
             return Err(Error::InvalidValue);
         }
+        let clean = ffi::RENDER_STATE_DIRTY_FALSE;
+        // SAFETY: the render state is live and the option's documented value
+        // type is `GhosttyRenderStateDirty` (a header-checked C enum).
+        result_from_code(unsafe {
+            ffi::ghostty_render_state_set(
+                self.render_state.as_ptr(),
+                ffi::RENDER_STATE_OPTION_DIRTY,
+                (&clean as *const ffi::RenderStateDirty).cast(),
+            )
+        })?;
 
         let screen = terminal_query::<ffi::TerminalScreen>(
             &self.terminal,
@@ -1620,6 +2420,18 @@ impl Terminal {
                 row: terminal_query(&self.terminal, ffi::TERMINAL_DATA_CURSOR_Y)?,
                 col: terminal_query(&self.terminal, ffi::TERMINAL_DATA_CURSOR_X)?,
                 visible: terminal_query(&self.terminal, ffi::TERMINAL_DATA_CURSOR_VISIBLE)?,
+                shape: match render_query::<ffi::RenderCursorVisualStyle>(
+                    &self.render_state,
+                    ffi::RENDER_STATE_DATA_CURSOR_VISUAL_STYLE,
+                )? {
+                    ffi::RENDER_CURSOR_VISUAL_STYLE_BAR => CursorShapeSnapshot::Bar,
+                    ffi::RENDER_CURSOR_VISUAL_STYLE_BLOCK => CursorShapeSnapshot::Block,
+                    ffi::RENDER_CURSOR_VISUAL_STYLE_UNDERLINE => CursorShapeSnapshot::Underline,
+                    ffi::RENDER_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW => {
+                        CursorShapeSnapshot::BlockHollow
+                    }
+                    _ => return Err(Error::InvalidValue),
+                },
             },
             width_px: terminal_query(&self.terminal, ffi::TERMINAL_DATA_WIDTH_PX)?,
             height_px: terminal_query(&self.terminal, ffi::TERMINAL_DATA_HEIGHT_PX)?,
@@ -1634,7 +2446,21 @@ impl Terminal {
             scrollback_extent,
             semantic_marks: Vec::new(),
         };
-        Ok(())
+        match global_dirty {
+            ffi::RENDER_STATE_DIRTY_FULL => Ok(RenderDamageSnapshot::Full),
+            ffi::RENDER_STATE_DIRTY_PARTIAL if dirty_ranges.is_empty() => {
+                // A partial frame without row flags violates Ghostty's
+                // two-layer contract. Full damage is the safe interpretation.
+                Ok(RenderDamageSnapshot::Full)
+            }
+            ffi::RENDER_STATE_DIRTY_PARTIAL | ffi::RENDER_STATE_DIRTY_FALSE
+                if !dirty_ranges.is_empty() =>
+            {
+                Ok(RenderDamageSnapshot::Rows(dirty_ranges))
+            }
+            ffi::RENDER_STATE_DIRTY_FALSE => Ok(RenderDamageSnapshot::None),
+            _ => Err(Error::InvalidValue),
+        }
     }
 
     fn read_row(&mut self, row: u16, cols: u16) -> Result<RowSnapshot, Error> {
@@ -1743,6 +2569,34 @@ fn terminal_query<T>(handle: &TerminalHandle, tag: ffi::TerminalData) -> Result<
     let result =
         unsafe { ffi::ghostty_terminal_get(handle.as_ptr(), tag, value.as_mut_ptr().cast()) };
     result_from_code(result)?;
+    // SAFETY: success promises initialization of the correctly typed output.
+    Ok(unsafe { value.assume_init() })
+}
+
+fn kitty_placement_query<T>(
+    iterator: &KittyPlacementIteratorHandle,
+    tag: ffi::KittyGraphicsPlacementData,
+) -> Result<T, Error> {
+    let mut value = MaybeUninit::<T>::uninit();
+    // SAFETY: private callers pair each placement tag with the documented
+    // output type and invoke this only while the iterator is positioned.
+    result_from_code(unsafe {
+        ffi::ghostty_kitty_graphics_placement_get(iterator.as_ptr(), tag, value.as_mut_ptr().cast())
+    })?;
+    // SAFETY: success promises initialization of the correctly typed output.
+    Ok(unsafe { value.assume_init() })
+}
+
+fn kitty_image_query<T>(
+    image: ffi::KittyGraphicsImage,
+    tag: ffi::KittyGraphicsImageData,
+) -> Result<T, Error> {
+    let mut value = MaybeUninit::<T>::uninit();
+    // SAFETY: private callers pair each image tag with the documented output
+    // type and the borrowed image handle remains valid for this query.
+    result_from_code(unsafe {
+        ffi::ghostty_kitty_graphics_image_get(image, tag, value.as_mut_ptr().cast())
+    })?;
     // SAFETY: success promises initialization of the correctly typed output.
     Ok(unsafe { value.assume_init() })
 }
@@ -1890,29 +2744,32 @@ fn read_modes(handle: &TerminalHandle) -> Result<ModesSnapshot, Error> {
     })
 }
 
-fn changed_row_ranges(
-    before: &TerminalSnapshot,
-    after: &TerminalSnapshot,
-) -> Vec<RangeInclusive<u16>> {
-    let row_count = before.rows.len().max(after.rows.len());
-    let mut ranges = Vec::new();
-    let mut start = None;
-    for row in 0..row_count {
-        let changed = before.rows.get(row) != after.rows.get(row)
-            || before.alternate_screen != after.alternate_screen;
-        match (start, changed) {
-            (None, true) => start = Some(row),
-            (Some(first), false) => {
-                ranges.push(row_index(first)..=row_index(row.saturating_sub(1)));
-                start = None;
-            }
-            _ => {}
+fn append_dirty_row(ranges: &mut Vec<RangeInclusive<u16>>, row: u16) {
+    if let Some(previous) = ranges.last_mut()
+        && row <= previous.end().saturating_add(1)
+    {
+        let start = *previous.start();
+        *previous = start..=row.max(*previous.end());
+    } else {
+        ranges.push(row..=row);
+    }
+}
+
+fn normalize_row_ranges(ranges: &mut Vec<RangeInclusive<u16>>) {
+    ranges.sort_unstable_by_key(|range| *range.start());
+    let mut merged: Vec<RangeInclusive<u16>> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(previous) = merged.last_mut()
+            && range.start() <= &previous.end().saturating_add(1)
+        {
+            let start = *previous.start();
+            let end = (*previous.end()).max(*range.end());
+            *previous = start..=end;
+        } else {
+            merged.push(range);
         }
     }
-    if let Some(first) = start {
-        ranges.push(row_index(first)..=row_index(row_count.saturating_sub(1)));
-    }
-    ranges
+    *ranges = merged;
 }
 
 fn row_index(row: usize) -> u16 {
@@ -2028,11 +2885,24 @@ fn normalize_style(style: ffi::Style) -> Result<StyleSnapshot, Error> {
     Ok(StyleSnapshot {
         foreground: normalize_style_color(style.fg_color)?,
         background: normalize_style_color(style.bg_color)?,
+        underline_color: normalize_style_color(style.underline_color)?,
         bold: style.bold,
         dim: style.faint,
         italic: style.italic,
-        underline: style.underline != 0,
+        blink: style.blink,
         inverse: style.inverse,
+        invisible: style.invisible,
+        strikethrough: style.strikethrough,
+        overline: style.overline,
+        underline: match style.underline {
+            ffi::SGR_UNDERLINE_NONE => UnderlineSnapshot::None,
+            ffi::SGR_UNDERLINE_SINGLE => UnderlineSnapshot::Single,
+            ffi::SGR_UNDERLINE_DOUBLE => UnderlineSnapshot::Double,
+            ffi::SGR_UNDERLINE_CURLY => UnderlineSnapshot::Curly,
+            ffi::SGR_UNDERLINE_DOTTED => UnderlineSnapshot::Dotted,
+            ffi::SGR_UNDERLINE_DASHED => UnderlineSnapshot::Dashed,
+            _ => return Err(Error::InvalidValue),
+        },
     })
 }
 

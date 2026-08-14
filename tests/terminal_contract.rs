@@ -50,7 +50,8 @@ fn contract_exposes_cells_modes_semantics_effects_damage_and_replies() {
         Cursor {
             row: 0,
             col: 3,
-            visible: true
+            visible: true,
+            ..Cursor::default()
         }
     );
     assert!(snapshot.modes.bracketed_paste);

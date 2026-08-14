@@ -3,9 +3,8 @@
 Ghostty is Lector's mandatory and sole terminal engine. Every PTY byte is
 parsed by `GhosttyEngine`, and its normalized cells, cursor, history, modes,
 semantic anchors, and effects drive accessibility. Lector no longer depends on
-the `vt100` crate or a second production grid parser. The original PTY bytes
-remain authoritative for physical presentation until Phase 2's compositor is
-enabled.
+the `vt100` crate or a second production grid parser. The mandatory compositor
+renders from Ghostty state and never replays source application bytes.
 
 Once a verified Ghostty archive has been prepared, ordinary builds are
 network-free and require neither Zig nor an installed Ghostty application:
@@ -53,15 +52,88 @@ treating Ghostty's current `cursor_at_prompt` boolean as semantic history.
 
 Auto-read consumes an engine-neutral `UpdateSummary` produced by the same
 advance call that mutates terminal state. It records printable runs, cursor and
-explicit-scroll operation counts, normalized changed-row ranges, cursor and
-screen identity before and after the write, and synchronized-output mode.
+explicit-scroll operation counts, Ghostty's official full/partial render
+damage, normalized changed-row ranges, cursor and screen identity before and
+after the write, and synchronized-output mode.
 Ghostty exposes the final cursor, screen, mode, and render state but does not
 currently expose printable or cursor-operation callbacks. The owned adapter's
-narrow `vte` stream observer therefore collects only those operation facts,
-OSC 133 boundaries, and the active OSC 8 URI needed to restore today's raw
-presentation after an overlay. It does not maintain cells, a cursor, modes,
-history, or any second terminal grid. Changed rows come directly from the
-before/after Ghostty render state.
+narrow `vte` stream observer therefore collects operation hints, OSC 133
+boundaries, and the active OSC 8 URI needed to annotate semantic operation
+hints. For semantic rendering it speculatively tracks only the
+cursor, scroll margins, origin, autowrap, and horizontal-margin mode required
+to locate an operation. It owns no cells, history, or second terminal grid,
+and discards all hints unless its final cursor agrees with Ghostty's
+authoritative state. Changed rows come from Ghostty's stateful global and
+per-row dirty flags; the adapter acknowledges both layers after each snapshot
+so damage cannot leak into a later frame.
+
+The compositor maps pane-local dirty rows into clipped scene
+coordinates and compares only those candidate cells with its confirmed
+`PresentedScene`. Incremental runs use absolute cursor placement and
+self-contained style and hyperlink state. Failed or partial physical writes,
+resize, suspend/resume, changed image state, inconsistent shadows, and damaged
+wrap metadata all invalidate the optimization and use the full-scene,
+oracle-tested fallback. Text damage around unchanged images can still use the
+incremental path without retransmitting image data.
+
+When operation hints are consistent with the authoritative scene, the
+compositor can apply full or partial scrolling, line/character insertion and
+deletion, erasure, and adjacent ASCII write runs directly to both the physical
+terminal and a cloned shadow. It accepts that shadow only after affected rows
+match Ghostty's intended scene and the complete transaction is flushed. Any
+occlusion, clipping, media changes, wide-cell ambiguity, geometry mismatch,
+unsupported operation, or failed validation falls back to the same
+dirty-region or full-scene correctness path. The release benchmark checks
+semantic-path coverage and compares bytes and latency with a pure dirty-region
+renderer on a tmux-style structural workload.
+
+OSC 8 hyperlinks remain part of the modeled cell state and are closed at every
+physical transaction boundary. Ghostty-decoded Kitty graphics live in bounded
+pane-scoped stores: uploads and placements have separate lifetimes, unchanged
+pixel buffers are shared, and scene composition maps pane-local identifiers to
+collision-safe outer identifiers. Placements are clipped to pane and overlay
+geometry, including partial occlusion; hidden uploads can remain cached while
+their placements are removed and later restored without retransmission. The
+outer backend chunks uploads, deletes stale placement and upload identifiers,
+and conservatively rebuilds its cache after physical-state uncertainty. A
+terminal without advertised Kitty support receives the complete text scene and
+no graphics protocol. The default limits are 32 MiB per image, 64 MiB per
+pane, 128 MiB per scene, and 4,096 placements.
+
+After its bounded initial focus-mode ownership query, the live event loop
+routes physical presentation and capability-control bytes through a single
+`OutputScheduler`. Standard output is nonblocking while the loop runs and is
+registered for writable readiness only after `EAGAIN`; the original descriptor
+flags are restored before terminal lifecycle cleanup. Scheduler writes retry
+`EINTR`, resume partial transactions without interleaving, and confirm a
+predicted `PresentedScene` only after its bytes flush successfully. Fatal
+writer errors invalidate renderer state for an authoritative reconstruction.
+
+Modeled visual updates have a 4 ms event-boundary latency budget and a 64 KiB
+per-drain write budget. An unstarted render can be replaced by the newest
+authoritative scene, while started transactions, lifecycle/control bytes, and
+bells are retained. This bounds obsolete incremental visual work
+without delaying terminal replies or input sent to the application PTY.
+Application mode 2026 is treated as pane-local batching intent: Lector owns at
+most one physical synchronized-output wrapper, strips nested renderer wrappers,
+and releases abandoned intent after 100 ms. Lector-owned overlays and resizes
+remain responsive rather than inheriting a pane's synchronization hold. Bells
+are emitted only after the visual transaction and its global synchronization
+boundary. Title, working-directory, progress, clipboard, and notification
+events remain typed scheduler work until activation; output policy is applied
+at that boundary instead of retaining raw escape strings. Pending effect
+payloads are bounded and UTF-8-safe, zero-byte secure-policy effects complete
+normally, and backpressured work counts against the same retention cap.
+
+The modeled compositor keeps the root terminal and every stacked Lector view as
+separate, stable-z scene surfaces. Source engines continue parsing while an
+overlay is visible; hidden source damage can therefore be confirmed as a valid
+zero-byte physical update when the overlay fully occludes it. Popping a layer
+recomposes from current authoritative snapshots instead of replaying buffered
+PTY data. Message, Review, Lua REPL, table-setup, and reviewable popup layers
+retain their existing input rules, while frozen Review and table-setup layers
+own independent cursors. Announcement and error popups produce a dismissal;
+confirmation popups distinguish `Enter` acceptance from `Escape` cancellation.
 
 Terminal side effects use the same pane boundary. Ghostty callbacks copy bell,
 title, working-directory, clipboard-write, desktop-notification, progress,
@@ -78,12 +150,21 @@ and working-directory values are retained exactly as applications report them,
 including empty clears and raw `file://` URIs; they are not interpreted as SSH
 destinations.
 
-Raw-output mode still sends the application's original bytes to the physical
-terminal, which remains responsible for answering terminal queries. Replies
-produced by Ghostty are retained as pane-scoped reply bytes but are not written
-to the child PTY until Phase 2's protocol broker owns that route. Ghostty's
-current public API intentionally ignores OSC 52 clipboard-read requests; Lector characterizes
-that behavior while preserving the original request for the physical terminal.
+Lector virtualizes application-facing terminal identity. Application
+capability queries are never placed in physical-terminal output, are answered
+from the owning pane's stable Lector profile, and routed back only to that
+pane's PTY. A narrow observer fills
+the one current public-C-API gap for OSC 52 clipboard reads and generates the
+secure empty local reply; reads never reach the physical terminal.
+
+The child receives `TERM=lector` and a bundled compiled terminfo entry
+materialized in Lector's cache directory. Lector derives a separate physical
+profile from conservative defaults, outer terminfo, bounded startup probes, and
+explicit overrides. Probe replies are consumed before input parsing. Clipboard
+writes enter Lector's local clipboard history; desktop notifications and
+unknown APC effects are dropped; title, working directory, progress, hyperlink,
+and bell state remain modeled. This separation keeps application promises
+independent of the outer terminal's identity and capabilities.
 
 Resize handling reads the outer terminal's complete Unix `winsize`, derives
 per-cell pixel dimensions from its cell and grid-pixel fields, and routes the

@@ -1,5 +1,8 @@
 use super::ViewController;
-use crate::terminal::TerminalGeometry;
+use crate::{
+    presentation::{GridPoint, GridRect, Scene, SurfaceId},
+    terminal::{TerminalGeometry, TerminalSnapshot},
+};
 
 pub struct ViewStack {
     views: Vec<Box<dyn ViewController>>,
@@ -38,6 +41,34 @@ impl ViewStack {
 
     pub fn has_overlay(&self) -> bool {
         self.views.len() > 1
+    }
+
+    pub(crate) fn live_snapshots(&mut self) -> Vec<TerminalSnapshot> {
+        self.views
+            .iter_mut()
+            .map(|view| {
+                view.model()
+                    .with_live_screen(|model| model.screen().clone())
+            })
+            .collect()
+    }
+
+    pub(crate) fn append_live_media(&mut self, scene: &mut Scene) -> anyhow::Result<()> {
+        for (index, view) in self.views.iter_mut().enumerate() {
+            let id = SurfaceId(u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1));
+            view.model()
+                .with_live_screen(|model| -> anyhow::Result<()> {
+                    let geometry = model.screen().geometry;
+                    model.presentation_media()?.append_to_scene(
+                        id,
+                        GridPoint::new(0, 0),
+                        GridRect::new(GridPoint::new(0, 0), geometry.rows, geometry.cols),
+                        scene,
+                    )?;
+                    Ok(())
+                })?;
+        }
+        Ok(())
     }
 
     pub fn on_resize(&mut self, rows: u16, cols: u16) {

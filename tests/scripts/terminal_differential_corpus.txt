@@ -1,9 +1,8 @@
-Scenario: fragmented shell prompt compiler and test output remains raw and reviewable
+Scenario: fragmented shell prompt compiler and test output remains modeled and reviewable
 Given pty-stdout: \x1B]133;A\x07dev@host:~/lector$ \x1B]133;B\x07car
 When pty-stdout: go test\x1B]133;C\x07\r\n\x1B[1;31merror\x1B[0m: expected `;`\r\n
 And pty-stdout: test result: \x1B[32mok\x1B[0m. 341 passed\r\n\x1B]133;D;0\x07
-Then expect-stdout: \x1B]133;A\x07dev@host:~/lector$ \x1B]133;B\x07cargo test\x1B]133;C\x07\r\n\x1B[1;31merror\x1B[0m: expected `;`\r\ntest result: \x1B[32mok\x1B[0m. 341 passed\r\n\x1B]133;D;0\x07
-And expect-screen-contains: 341 passed
+Then expect-screen-contains: 341 passed
 
 Scenario: pager and editor alternate screens survive fragmented controls
 Given pty-stdout: primary shell\r\n
@@ -11,11 +10,9 @@ When pty-stdout: \x1B[?104
 And pty-stdout: 9h\x1B[H\x1B[?25lREADME\r\nline two\x1B[3;1H/foo
 And resize: 8 32 8 16
 And pty-stdout: \x1B[?25h\x1B[?1049l
-Then expect-stdout: primary shell\r\n\x1B[?1049h\x1B[H\x1B[?25lREADME\r\nline two\x1B[3;1H/foo\x1B[?25h\x1B[?1049l
-And expect-screen-contains: primary shell
+Then expect-screen-contains: primary shell
 
-Scenario: long string protocols and malformed cancellation do not leak presentation changes
+Scenario: long string protocols and malformed cancellation preserve text but drop unknown APC effects
 Given pty-stdout: before\x1B]2;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x07
 When pty-stdout: \x1BPqignored-dcs\x1B\\\x1B_unknown-apc\x18after
-Then expect-stdout: before\x1B]2;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x07\x1BPqignored-dcs\x1B\\\x1B_unknown-apc\x18after
-And expect-screen-contains: beforeafter
+Then expect-screen-contains: beforeafter

@@ -1,5 +1,6 @@
 use crate::{
     app::{self, App, Clock},
+    output_scheduler::{DrainReport, OutputSchedulerConfig},
     screen_reader::ScreenReader,
     speech,
     terminal::TerminalGeometry,
@@ -10,7 +11,8 @@ use std::fmt::Write as FmtWrite;
 use std::{
     cell::{Cell, RefCell},
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
+    ops::Deref,
     rc::Rc,
 };
 
@@ -46,6 +48,34 @@ struct HarnessDriver {
     recorder: SpeechRecorder,
 }
 
+#[derive(Default)]
+struct PhysicalWriteRecorder {
+    bytes: Vec<u8>,
+    writes: Vec<Vec<u8>>,
+}
+
+impl Write for PhysicalWriteRecorder {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !buf.is_empty() {
+            self.bytes.extend_from_slice(buf);
+            self.writes.push(buf.to_vec());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Deref for PhysicalWriteRecorder {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
 impl speech::Driver for HarnessDriver {
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
         self.recorder
@@ -75,17 +105,28 @@ pub struct Harness {
     sr: ScreenReader,
     clock: FakeClock,
     pty_out: Vec<u8>,
-    term_out: Vec<u8>,
+    term_out: PhysicalWriteRecorder,
     speak_log: SpeechRecorder,
     pty_cursor: usize,
     term_cursor: usize,
     speak_cursor: usize,
     rows: u16,
     cols: u16,
+    output_scheduler_enabled: bool,
 }
 
 impl Harness {
     pub fn new(rows: u16, cols: u16) -> Result<Self> {
+        Self::new_with_scheduler(rows, cols, false)
+    }
+
+    /// Builds the deterministic compositor harness with the same serialized
+    /// physical-output scheduler used by the live application.
+    pub fn new_scheduled(rows: u16, cols: u16) -> Result<Self> {
+        Self::new_with_scheduler(rows, cols, true)
+    }
+
+    fn new_with_scheduler(rows: u16, cols: u16, output_scheduler_enabled: bool) -> Result<Self> {
         let recorder = SpeechRecorder::default();
         let driver = HarnessDriver {
             recorder: recorder.clone(),
@@ -94,19 +135,23 @@ impl Harness {
         let sr = ScreenReader::new(speech);
         let view_stack = views::ViewStack::new(Box::new(views::PtyView::new(rows, cols)));
         let clock = FakeClock::default();
-        let app = App::new_with_clock(view_stack, Box::new(clock.clone()))?;
+        let mut app = App::new_with_clock(view_stack, Box::new(clock.clone()))?;
+        if output_scheduler_enabled {
+            app.enable_output_scheduler(OutputSchedulerConfig::default());
+        }
         Ok(Self {
             app,
             sr,
             clock,
             pty_out: Vec::new(),
-            term_out: Vec::new(),
+            term_out: PhysicalWriteRecorder::default(),
             speak_log: recorder,
             pty_cursor: 0,
             term_cursor: 0,
             speak_cursor: 0,
             rows,
             cols,
+            output_scheduler_enabled,
         })
     }
 
@@ -435,6 +480,90 @@ impl Harness {
         &self.term_out
     }
 
+    /// Returns each slice accepted by the physical writer in order. Tests use
+    /// this to replay the exact writer-side transaction stream through the
+    /// terminal oracle instead of treating the concatenated output as source
+    /// application bytes.
+    pub fn physical_writes(&self) -> &[Vec<u8>] {
+        &self.term_out.writes
+    }
+
+    /// Advances the application loop through the same reply/input flush path
+    /// used by the live event loop.
+    pub fn tick(&mut self, delta_ms: u128) -> Result<()> {
+        self.clock.advance_ms(delta_ms);
+        self.app
+            .handle_tick(&mut self.sr, &mut self.pty_out, &mut self.term_out)
+    }
+
+    /// Drains presentation output at the current fake-clock time. Passing
+    /// `writable` resumes a scheduler previously stopped by backpressure.
+    pub fn drain_scheduled_output(&mut self, writable: bool) -> Result<DrainReport> {
+        if writable {
+            self.app.notify_scheduled_output_writable();
+        }
+        self.app.drain_scheduled_output(&mut self.term_out, false)
+    }
+
+    /// Returns bytes routed back to the application PTY.
+    pub fn application_input(&self) -> &[u8] {
+        &self.pty_out
+    }
+
+    pub fn start_capability_probes(&mut self) -> Result<()> {
+        self.app.start_capability_probes(&mut self.term_out)
+    }
+
+    pub fn handle_terminal_input(&mut self, bytes: &[u8]) -> Result<()> {
+        self.app
+            .handle_stdin(&mut self.sr, bytes, &mut self.pty_out, &mut self.term_out)
+    }
+
+    pub fn physical_profile(&self) -> &crate::terminal_protocol::PhysicalTerminalProfile {
+        self.app.physical_profile()
+    }
+
+    pub fn set_physical_profile(
+        &mut self,
+        profile: crate::terminal_protocol::PhysicalTerminalProfile,
+    ) {
+        self.app.set_physical_profile(profile);
+    }
+
+    pub fn configure_physical_terminal(&mut self, focus_was_enabled: Option<bool>) {
+        self.app.configure_physical_terminal(focus_was_enabled);
+    }
+
+    pub fn activate_physical_terminal(&mut self) -> Result<()> {
+        self.app.activate_physical_terminal(&mut self.term_out)
+    }
+
+    pub fn suspend_physical_terminal(&mut self) -> Result<()> {
+        self.app.suspend_physical_terminal(&mut self.term_out)
+    }
+
+    pub fn resume_physical_terminal(&mut self) -> Result<()> {
+        self.app.resume_physical_terminal(&mut self.term_out)
+    }
+
+    pub fn shutdown_physical_terminal(&mut self) -> Result<()> {
+        self.app.shutdown_physical_terminal(&mut self.term_out)
+    }
+
+    pub fn resize_with_geometry(
+        &mut self,
+        geometry: crate::terminal::TerminalGeometry,
+    ) -> Result<()> {
+        self.rows = geometry.rows;
+        self.cols = geometry.cols;
+        self.app
+            .on_resize_with_geometry(geometry, &mut self.term_out)
+    }
+
+    pub fn clipboard_text(&self) -> Option<&str> {
+        self.sr.clipboard_text()
+    }
+
     fn next_speak(&mut self, _line_no: usize) -> Option<(String, bool)> {
         let log = self.speak_log.inner.borrow();
         if self.speak_cursor >= log.speaks.len() {
@@ -448,7 +577,7 @@ impl Harness {
     fn reset(&mut self) -> Result<()> {
         let rows = self.rows;
         let cols = self.cols;
-        *self = Harness::new(rows, cols)?;
+        *self = Self::new_with_scheduler(rows, cols, self.output_scheduler_enabled)?;
         Ok(())
     }
 

@@ -12,16 +12,33 @@ pub enum Color {
     Rgb(u8, u8, u8),
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Style {
     pub foreground: Color,
     pub background: Color,
+    pub underline_color: Color,
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
-    pub underline: bool,
+    pub blink: bool,
     pub inverse: bool,
+    pub invisible: bool,
+    pub strikethrough: bool,
+    pub overline: bool,
+    pub underline: UnderlineStyle,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -84,7 +101,7 @@ impl Cell {
     }
 
     pub fn underline(&self) -> bool {
-        self.style.underline
+        self.style.underline != UnderlineStyle::None
     }
 
     pub fn inverse(&self) -> bool {
@@ -106,11 +123,22 @@ impl Row {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorShape {
+    Bar,
+    #[default]
+    Block,
+    Underline,
+    BlockHollow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Cursor {
     pub row: u16,
     pub col: u16,
     pub visible: bool,
+    pub shape: CursorShape,
 }
 
 /// Cell and pixel geometry for one terminal grid.
@@ -265,6 +293,7 @@ pub enum TerminalQuery {
     Size,
     ColorScheme,
     DeviceAttributes,
+    Clipboard,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -320,12 +349,28 @@ pub struct PrintedRun {
     pub boundary: PrintBoundary,
 }
 
+/// A renderer optimization hint recorded alongside Ghostty mutation. Ghostty's
+/// resulting snapshot remains authoritative; consumers must validate an
+/// operation before translating it to physical-terminal bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalOperation {
+    ScrollUp { top: u16, bottom: u16, count: u16 },
+    ScrollDown { top: u16, bottom: u16, count: u16 },
+    InsertLines { row: u16, bottom: u16, count: u16 },
+    DeleteLines { row: u16, bottom: u16, count: u16 },
+    InsertChars { row: u16, col: u16, count: u16 },
+    DeleteChars { row: u16, col: u16, count: u16 },
+    EraseChars { row: u16, col: u16, count: u16 },
+    WriteRun { row: u16, col: u16, text: String },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateSummary {
     pub effects: TerminalEffects,
     pub damage: TerminalDamage,
     pub pty_replies: Vec<u8>,
     pub printed_runs: Vec<PrintedRun>,
+    pub operations: Vec<TerminalOperation>,
     pub cursor_operations: usize,
     pub scroll_operations: usize,
     pub changed_rows: Vec<RangeInclusive<u16>>,
@@ -344,6 +389,7 @@ impl Default for UpdateSummary {
             damage: TerminalDamage::None,
             pty_replies: Vec::new(),
             printed_runs: Vec::new(),
+            operations: Vec::new(),
             cursor_operations: 0,
             scroll_operations: 0,
             changed_rows: Vec::new(),
@@ -375,6 +421,7 @@ impl UpdateSummary {
         self.effects.events.append(&mut next.effects.events);
         self.pty_replies.append(&mut next.pty_replies);
         append_printed_runs(&mut self.printed_runs, next.printed_runs);
+        append_terminal_operations(&mut self.operations, next.operations);
         self.cursor_operations = self
             .cursor_operations
             .saturating_add(next.cursor_operations);
@@ -432,6 +479,28 @@ fn append_printed_runs(target: &mut Vec<PrintedRun>, source: Vec<PrintedRun>) {
             previous.text.push_str(&run.text);
         } else {
             target.push(run);
+        }
+    }
+}
+
+fn append_terminal_operations(target: &mut Vec<TerminalOperation>, source: Vec<TerminalOperation>) {
+    for operation in source {
+        match (target.last_mut(), operation) {
+            (
+                Some(TerminalOperation::WriteRun {
+                    row: previous_row,
+                    col: previous_col,
+                    text: previous_text,
+                }),
+                TerminalOperation::WriteRun { row, col, text },
+            ) if *previous_row == row
+                && previous_col.saturating_add(
+                    previous_text.chars().count().try_into().unwrap_or(u16::MAX),
+                ) == col =>
+            {
+                previous_text.push_str(&text);
+            }
+            (_, operation) => target.push(operation),
         }
     }
 }
@@ -674,8 +743,9 @@ pub use lector_ghostty::{
     CellSnapshot as GhosttyCell, ClipboardContentSnapshot as GhosttyClipboardContent,
     ClipboardLocationSnapshot as GhosttyClipboardLocation, ColorSnapshot as GhosttyColor,
     CursorSnapshot as GhosttyCursor, EffectSnapshot as GhosttyEffect,
-    ModesSnapshot as GhosttyModes, PrintBoundarySnapshot as GhosttyPrintBoundary,
-    ProgressStateSnapshot as GhosttyProgressState, QuerySnapshot as GhosttyQuery,
+    ModesSnapshot as GhosttyModes, OperationSnapshot as GhosttyOperation,
+    PrintBoundarySnapshot as GhosttyPrintBoundary, ProgressStateSnapshot as GhosttyProgressState,
+    QuerySnapshot as GhosttyQuery, RenderDamageSnapshot as GhosttyDamage,
     RowSnapshot as GhosttyRow, SemanticKindSnapshot as GhosttySemanticKind,
     StyleSnapshot as GhosttyStyle, TerminalSnapshot as GhosttySnapshot,
     UpdateSnapshot as GhosttyUpdate,
@@ -727,8 +797,54 @@ impl GhosttyEngine {
         cols: u16,
         scrollback_capacity: usize,
     ) -> Result<Self, lector_ghostty::Error> {
-        let terminal =
-            lector_ghostty::Terminal::new_with_scrollback(rows, cols, scrollback_capacity)?;
+        let profile = crate::terminal_protocol::VirtualTerminalProfile::lector(
+            TerminalGeometry::from_cells(rows, cols),
+            crate::terminal_protocol::ColorScheme::Dark,
+        );
+        Self::new_with_scrollback_and_profile(rows, cols, scrollback_capacity, profile)
+    }
+
+    pub fn new_with_profile(
+        rows: u16,
+        cols: u16,
+        profile: crate::terminal_protocol::VirtualTerminalProfile,
+    ) -> Result<Self, lector_ghostty::Error> {
+        Self::new_with_scrollback_and_profile(rows, cols, 10_000, profile)
+    }
+
+    fn new_with_scrollback_and_profile(
+        rows: u16,
+        cols: u16,
+        scrollback_capacity: usize,
+        profile: crate::terminal_protocol::VirtualTerminalProfile,
+    ) -> Result<Self, lector_ghostty::Error> {
+        let terminal = lector_ghostty::Terminal::new_with_profile(
+            rows,
+            cols,
+            scrollback_capacity,
+            lector_ghostty::TerminalProfile {
+                rows: profile.geometry.rows,
+                columns: profile.geometry.cols,
+                cell_width: profile.geometry.cell_width_px,
+                cell_height: profile.geometry.cell_height_px,
+                color_scheme: match profile.color_scheme {
+                    crate::terminal_protocol::ColorScheme::Light => {
+                        lector_ghostty::TerminalColorScheme::Light
+                    }
+                    crate::terminal_protocol::ColorScheme::Dark => {
+                        lector_ghostty::TerminalColorScheme::Dark
+                    }
+                },
+                enquiry: profile.enquiry,
+                version: profile.version,
+                da_conformance: profile.da_conformance,
+                da_features: profile.da_features,
+                da_device_type: profile.da_device_type,
+                da_firmware_version: profile.da_firmware_version,
+                da_unit_id: profile.da_unit_id,
+                clipboard_read: profile.clipboard_read,
+            },
+        )?;
         let snapshot = normalize_ghostty_snapshot(terminal.snapshot());
         Ok(Self {
             terminal,
@@ -826,6 +942,12 @@ impl GhosttyEngine {
         self.terminal.snapshot_with_history()
     }
 
+    pub fn kitty_image_placements(
+        &self,
+    ) -> Result<Vec<lector_ghostty::KittyImagePlacementSnapshot>, lector_ghostty::Error> {
+        self.terminal.kitty_image_placements()
+    }
+
     pub fn scrollback_extent(&self) -> usize {
         self.terminal.scrollback_extent()
     }
@@ -872,38 +994,11 @@ impl GhosttyEngine {
         Ok((row < logical_rows).then_some(HistoryPosition { row, col }))
     }
 
-    /// Raw presentation remains authoritative through Stop 1.8, so Ghostty's
-    /// generated replies are not returned to the child until the capability
-    /// broker owns the outer terminal in Phase 2.
+    /// Replies are drained into `UpdateSummary` and routed by the owning
+    /// application's capability broker rather than exposed through this
+    /// historical compatibility accessor.
     pub fn pty_replies(&self) -> &[u8] {
         &[]
-    }
-
-    pub(crate) fn presentation_contents(&self) -> Vec<u8> {
-        format_terminal_contents(&self.snapshot)
-    }
-
-    pub(crate) fn presentation_cursor(&self) -> Vec<u8> {
-        format_terminal_cursor(&self.snapshot)
-    }
-
-    pub(crate) fn presentation_attributes(&self) -> Vec<u8> {
-        let style = self
-            .terminal
-            .cursor_style()
-            .map(normalize_ghostty_style)
-            .unwrap_or_else(|error| panic!("Ghostty cursor-style query failed: {error}"));
-        let mut bytes = b"\x1b]8;;".to_vec();
-        if let Some(uri) = self.terminal.active_hyperlink() {
-            bytes.extend(uri.bytes().filter(|byte| *byte >= b' ' && *byte != 0x7f));
-        }
-        bytes.extend_from_slice(b"\x1b\\");
-        write_terminal_style(&mut bytes, &style);
-        bytes
-    }
-
-    pub(crate) fn presentation_input_modes(&self) -> Vec<u8> {
-        format_terminal_input_modes(&self.snapshot.modes)
     }
 
     fn refresh_snapshot(&mut self) -> Result<(), lector_ghostty::Error> {
@@ -1006,131 +1101,6 @@ impl TerminalEngine for GhosttyEngine {
     }
 }
 
-/// Serialize a complete visible grid for the legacy overlay-restoration path.
-/// Raw PTY bytes remain the normal presentation path until Phase 2; this
-/// serializer is deliberately correctness-first and is replaced by the scene
-/// renderer there.
-fn format_terminal_contents(snapshot: &TerminalSnapshot) -> Vec<u8> {
-    let mut bytes = b"\x1b[0m\x1b]8;;\x1b\\".to_vec();
-    let mut active_style = Style::default();
-    let mut active_link: Option<&str> = None;
-
-    for (row_index, row) in snapshot.rows.iter().enumerate() {
-        bytes.extend_from_slice(format!("\x1b[{};1H", row_index + 1).as_bytes());
-        for cell in &row.cells {
-            if cell.continuation {
-                continue;
-            }
-            let link = cell.hyperlink.as_deref();
-            if link != active_link {
-                bytes.extend_from_slice(b"\x1b]8;;\x1b\\");
-                if let Some(uri) = link {
-                    bytes.extend_from_slice(b"\x1b]8;;");
-                    bytes.extend(uri.bytes().filter(|byte| *byte >= b' ' && *byte != 0x7f));
-                    bytes.extend_from_slice(b"\x1b\\");
-                }
-                active_link = link;
-            }
-            if cell.style != active_style {
-                write_terminal_style(&mut bytes, &cell.style);
-                active_style = cell.style.clone();
-            }
-            if cell.grapheme.is_empty() {
-                bytes.push(b' ');
-            } else {
-                bytes.extend_from_slice(cell.grapheme.as_bytes());
-            }
-        }
-    }
-    if active_link.is_some() {
-        bytes.extend_from_slice(b"\x1b]8;;\x1b\\");
-    }
-    bytes
-}
-
-fn write_terminal_style(bytes: &mut Vec<u8>, style: &Style) {
-    bytes.extend_from_slice(b"\x1b[0");
-    if style.bold {
-        bytes.extend_from_slice(b";1");
-    }
-    if style.dim {
-        bytes.extend_from_slice(b";2");
-    }
-    if style.italic {
-        bytes.extend_from_slice(b";3");
-    }
-    if style.underline {
-        bytes.extend_from_slice(b";4");
-    }
-    if style.inverse {
-        bytes.extend_from_slice(b";7");
-    }
-    write_terminal_color(bytes, style.foreground, true);
-    write_terminal_color(bytes, style.background, false);
-    bytes.push(b'm');
-}
-
-fn write_terminal_color(bytes: &mut Vec<u8>, color: Color, foreground: bool) {
-    let selector = if foreground { 38 } else { 48 };
-    match color {
-        Color::Default => {}
-        Color::Indexed(index) => {
-            bytes.extend_from_slice(format!(";{selector};5;{index}").as_bytes());
-        }
-        Color::Rgb(red, green, blue) => {
-            bytes.extend_from_slice(format!(";{selector};2;{red};{green};{blue}").as_bytes());
-        }
-    }
-}
-
-fn format_terminal_cursor(snapshot: &TerminalSnapshot) -> Vec<u8> {
-    format!(
-        "\x1b[{};{}H\x1b[?25{}",
-        snapshot.cursor.row.saturating_add(1),
-        snapshot.cursor.col.saturating_add(1),
-        if snapshot.cursor.visible { 'h' } else { 'l' },
-    )
-    .into_bytes()
-}
-
-fn format_terminal_input_modes(modes: &TerminalModes) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(if modes.application_keypad {
-        b"\x1b="
-    } else {
-        b"\x1b>"
-    });
-    write_private_mode(&mut bytes, 1, modes.application_cursor);
-    write_private_mode(&mut bytes, 2004, modes.bracketed_paste);
-    write_private_mode(&mut bytes, 1004, modes.focus_reporting);
-    for mode in [9, 1000, 1002, 1003] {
-        write_private_mode(&mut bytes, mode, false);
-    }
-    let mouse_mode = match modes.mouse_protocol {
-        MouseProtocol::None => None,
-        MouseProtocol::Press => Some(9),
-        MouseProtocol::PressRelease => Some(1000),
-        MouseProtocol::ButtonMotion => Some(1002),
-        MouseProtocol::AnyMotion => Some(1003),
-    };
-    if let Some(mode) = mouse_mode {
-        write_private_mode(&mut bytes, mode, true);
-    }
-    write_private_mode(&mut bytes, 1005, false);
-    write_private_mode(&mut bytes, 1006, false);
-    match modes.mouse_encoding {
-        MouseEncoding::Default => {}
-        MouseEncoding::Utf8 => write_private_mode(&mut bytes, 1005, true),
-        MouseEncoding::Sgr => write_private_mode(&mut bytes, 1006, true),
-    }
-    bytes.extend_from_slice(format!("\x1b[={}u", modes.kitty_keyboard_flags).as_bytes());
-    bytes
-}
-
-fn write_private_mode(bytes: &mut Vec<u8>, mode: u16, enabled: bool) {
-    bytes.extend_from_slice(format!("\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).as_bytes());
-}
-
 fn normalize_ghostty_snapshot(snapshot: &GhosttySnapshot) -> TerminalSnapshot {
     let (rows, cols) = snapshot.size();
     TerminalSnapshot {
@@ -1144,6 +1114,12 @@ fn normalize_ghostty_snapshot(snapshot: &GhosttySnapshot) -> TerminalSnapshot {
             row: snapshot.cursor.row,
             col: snapshot.cursor.col,
             visible: snapshot.cursor.visible,
+            shape: match snapshot.cursor.shape {
+                lector_ghostty::CursorShapeSnapshot::Bar => CursorShape::Bar,
+                lector_ghostty::CursorShapeSnapshot::Block => CursorShape::Block,
+                lector_ghostty::CursorShapeSnapshot::Underline => CursorShape::Underline,
+                lector_ghostty::CursorShapeSnapshot::BlockHollow => CursorShape::BlockHollow,
+            },
         },
         geometry: TerminalGeometry::from_grid_pixels(
             rows,
@@ -1193,6 +1169,11 @@ fn normalize_ghostty_snapshot(snapshot: &GhosttySnapshot) -> TerminalSnapshot {
 }
 
 fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
+    let damage = match &update.damage {
+        GhosttyDamage::None => TerminalDamage::None,
+        GhosttyDamage::Rows(rows) => TerminalDamage::Rows(rows.clone()),
+        GhosttyDamage::Full => TerminalDamage::Full,
+    };
     let changed_rows = update.changed_rows;
     let effects = update
         .effects
@@ -1212,11 +1193,7 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
             events: effects,
         },
         pty_replies: update.pty_replies,
-        damage: if changed_rows.is_empty() {
-            TerminalDamage::None
-        } else {
-            TerminalDamage::Rows(changed_rows.clone())
-        },
+        damage,
         printed_runs: update
             .printed_runs
             .into_iter()
@@ -1229,6 +1206,11 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
                 },
             })
             .collect(),
+        operations: update
+            .operations
+            .into_iter()
+            .map(normalize_ghostty_operation)
+            .collect(),
         cursor_operations: update.cursor_operations,
         scroll_operations: update.scroll_operations,
         changed_rows,
@@ -1238,6 +1220,35 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         screen_after: ghostty_screen_identity(update.alternate_screen_after),
         synchronized_output: update.synchronized_output,
         batch_count: 1,
+    }
+}
+
+fn normalize_ghostty_operation(operation: GhosttyOperation) -> TerminalOperation {
+    match operation {
+        GhosttyOperation::ScrollUp { top, bottom, count } => {
+            TerminalOperation::ScrollUp { top, bottom, count }
+        }
+        GhosttyOperation::ScrollDown { top, bottom, count } => {
+            TerminalOperation::ScrollDown { top, bottom, count }
+        }
+        GhosttyOperation::InsertLines { row, bottom, count } => {
+            TerminalOperation::InsertLines { row, bottom, count }
+        }
+        GhosttyOperation::DeleteLines { row, bottom, count } => {
+            TerminalOperation::DeleteLines { row, bottom, count }
+        }
+        GhosttyOperation::InsertChars { row, col, count } => {
+            TerminalOperation::InsertChars { row, col, count }
+        }
+        GhosttyOperation::DeleteChars { row, col, count } => {
+            TerminalOperation::DeleteChars { row, col, count }
+        }
+        GhosttyOperation::EraseChars { row, col, count } => {
+            TerminalOperation::EraseChars { row, col, count }
+        }
+        GhosttyOperation::WriteRun { row, col, text } => {
+            TerminalOperation::WriteRun { row, col, text }
+        }
     }
 }
 
@@ -1281,6 +1292,7 @@ fn normalize_ghostty_effect(effect: GhosttyEffect) -> TerminalEvent {
             GhosttyQuery::Size => TerminalQuery::Size,
             GhosttyQuery::ColorScheme => TerminalQuery::ColorScheme,
             GhosttyQuery::DeviceAttributes => TerminalQuery::DeviceAttributes,
+            GhosttyQuery::Clipboard => TerminalQuery::Clipboard,
         }),
         GhosttyEffect::PtyReply(bytes) => TerminalEvent::PtyReply(bytes),
         GhosttyEffect::UnknownSequence { content, truncated } => {
@@ -1294,6 +1306,12 @@ fn normalize_ghostty_cursor(cursor: GhosttyCursor) -> Cursor {
         row: cursor.row,
         col: cursor.col,
         visible: cursor.visible,
+        shape: match cursor.shape {
+            lector_ghostty::CursorShapeSnapshot::Bar => CursorShape::Bar,
+            lector_ghostty::CursorShapeSnapshot::Block => CursorShape::Block,
+            lector_ghostty::CursorShapeSnapshot::Underline => CursorShape::Underline,
+            lector_ghostty::CursorShapeSnapshot::BlockHollow => CursorShape::BlockHollow,
+        },
     }
 }
 
@@ -1326,11 +1344,23 @@ fn normalize_ghostty_style(style: GhosttyStyle) -> Style {
     Style {
         foreground: normalize_ghostty_color(style.foreground),
         background: normalize_ghostty_color(style.background),
+        underline_color: normalize_ghostty_color(style.underline_color),
         bold: style.bold,
         dim: style.dim,
         italic: style.italic,
-        underline: style.underline,
+        blink: style.blink,
         inverse: style.inverse,
+        invisible: style.invisible,
+        strikethrough: style.strikethrough,
+        overline: style.overline,
+        underline: match style.underline {
+            lector_ghostty::UnderlineSnapshot::None => UnderlineStyle::None,
+            lector_ghostty::UnderlineSnapshot::Single => UnderlineStyle::Single,
+            lector_ghostty::UnderlineSnapshot::Double => UnderlineStyle::Double,
+            lector_ghostty::UnderlineSnapshot::Curly => UnderlineStyle::Curly,
+            lector_ghostty::UnderlineSnapshot::Dotted => UnderlineStyle::Dotted,
+            lector_ghostty::UnderlineSnapshot::Dashed => UnderlineStyle::Dashed,
+        },
     }
 }
 

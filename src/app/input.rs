@@ -9,7 +9,13 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.log_bytes("stdin from terminal", input);
-        for &byte in input {
+        let input = if let Some(broker) = self.startup_probe_broker.as_mut() {
+            broker.ingest(input, self.clock.now_ms())
+        } else {
+            input.to_vec()
+        };
+        self.refresh_probed_profile();
+        for byte in input {
             self.pending_input_last_at = Some(self.clock.now_ms());
             self.pending_input.push_back(byte);
 
@@ -311,7 +317,23 @@ impl App {
                         return Ok(());
                     }
                     let mode_before = sr.input_mode();
-                    let title = self.view_stack.active_mut().title().to_string();
+                    let title = {
+                        let active = self.view_stack.active_mut();
+                        if active.kind() == views::ViewKind::Terminal {
+                            active
+                                .model()
+                                .screen()
+                                .title
+                                .as_deref()
+                                .filter(|title| !title.is_empty())
+                                .map_or_else(
+                                    || "terminal".to_string(),
+                                    |title| format!("terminal, {title}"),
+                                )
+                        } else {
+                            active.title().to_string()
+                        }
+                    };
                     let consumed = match commands::handle(
                         sr,
                         &title,
@@ -341,21 +363,13 @@ impl App {
                     } else {
                         self.consumed_key_presses.remove(&key_id);
                     }
-                    if mode_before == crate::keymap::InputMode::TableSetup
-                        && sr.input_mode() != crate::keymap::InputMode::TableSetup
-                    {
-                        self.flush_deferred_pty_output(sr, term_out)?;
-                    }
+                    self.sync_table_setup_layer(mode_before, sr, term_out)?;
                 }
                 Binding::Lua(lua_binding) => {
                     let mode_before = sr.input_mode();
                     lua_binding.call()?;
                     self.consumed_key_presses.insert(key_id);
-                    if mode_before == crate::keymap::InputMode::TableSetup
-                        && sr.input_mode() != crate::keymap::InputMode::TableSetup
-                    {
-                        self.flush_deferred_pty_output(sr, term_out)?;
-                    }
+                    self.sync_table_setup_layer(mode_before, sr, term_out)?;
                 }
             }
         } else if sr.help_mode() {
@@ -411,7 +425,10 @@ impl App {
             .view_stack
             .active_mut()
             .handle_key_input(sr, key, input, pty_out)?;
-        if matches!(action, views::ViewAction::Pop) {
+        if matches!(
+            action,
+            views::ViewAction::Pop | views::ViewAction::PopupResponse(_)
+        ) {
             let event = key.event();
             self.view_transition_key_presses
                 .insert((event.code, event.modifiers, event.state));

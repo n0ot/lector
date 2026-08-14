@@ -1,11 +1,13 @@
 mod lua_repl;
 mod message;
+mod popup;
 mod pty;
 mod review;
 mod stack;
 
 pub use lua_repl::LuaReplView;
 pub use message::MessageView;
+pub use popup::{PopupResponse, PopupView};
 pub use pty::PtyView;
 pub use review::ReviewView;
 pub use stack::ViewStack;
@@ -41,6 +43,7 @@ pub enum ViewAction {
     PtyInput,
     Push(Box<dyn ViewController>),
     Pop,
+    PopupResponse(PopupResponse),
     Redraw,
 }
 
@@ -50,6 +53,8 @@ pub enum ViewKind {
     Message,
     LuaRepl,
     Review,
+    Popup,
+    TableSetup,
     Other,
 }
 

@@ -1,8 +1,10 @@
 use lector::{
     app::{App, Clock, DIFF_DELAY, MAX_DIFF_DELAY},
+    presentation::PresentedScene,
     screen_reader::ScreenReader,
     speech,
     terminal::{Color, GhosttyEngine, TerminalEngine},
+    terminal_protocol::PhysicalTerminalProfile,
     views,
 };
 use std::{cell::Cell, cell::RefCell, rc::Rc};
@@ -186,10 +188,20 @@ fn assert_repl_lifecycle(
     if underlying_app == UnderlyingAppKeyboardSupport::Kitty {
         const ENABLE_ALL_KITTY_KEYBOARD_FEATURES: &[u8] = b"\x1B[>31u";
         app.handle_pty(&mut sr, ENABLE_ALL_KITTY_KEYBOARD_FEATURES, &mut term_out)
-            .expect("forward child Kitty keyboard-mode request");
+            .expect("model child Kitty keyboard-mode request");
+        assert!(
+            !term_out
+                .windows(ENABLE_ALL_KITTY_KEYBOARD_FEATURES.len())
+                .any(|window| window == ENABLE_ALL_KITTY_KEYBOARD_FEATURES),
+            "child keyboard-mode control reached the outer terminal: {scenario}"
+        );
+        let mut physical = GhosttyEngine::new(24, 80).expect("Kitty mode oracle");
+        physical
+            .advance(&term_out)
+            .expect("parse compositor output");
         assert_eq!(
-            term_out, ENABLE_ALL_KITTY_KEYBOARD_FEATURES,
-            "child keyboard-mode control must pass through: {scenario}"
+            physical.normalized_snapshot().modes.kitty_keyboard_flags,
+            31
         );
         term_out.clear();
     }
@@ -609,7 +621,6 @@ fn popping_review_restores_hidden_alternate_screen_transitions() {
     assert!(term_out.is_empty());
     app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
         .expect("close review onto alternate screen");
-    assert!(term_out.starts_with(b"\x1B[?1049h\x1B[2J\x1B[H"));
     terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
     assert!(terminal.snapshot().alternate_screen());
@@ -624,7 +635,6 @@ fn popping_review_restores_hidden_alternate_screen_transitions() {
     assert!(term_out.is_empty());
     app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
         .expect("close review onto primary screen");
-    assert!(term_out.starts_with(b"\x1B[?1049l\x1B[2J\x1B[H"));
     terminal.advance(&term_out).expect("advance render oracle");
 
     assert!(!terminal.snapshot().alternate_screen());
@@ -633,11 +643,16 @@ fn popping_review_restores_hidden_alternate_screen_transitions() {
 }
 
 #[test]
-fn popping_review_restores_the_authoritative_pen_style_before_raw_output_resumes() {
+fn popping_review_restores_the_authoritative_pen_style_before_compositor_output_resumes() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
     let mut oracle = GhosttyEngine::new_with_scrollback(24, 80, 0).expect("create render oracle");
+    let mut profile = PhysicalTerminalProfile::conservative(
+        lector::terminal::TerminalGeometry::from_cells(24, 80),
+    );
+    profile.hyperlinks = true;
+    app.set_physical_profile(profile);
 
     app.handle_pty(
         &mut sr,
@@ -658,7 +673,15 @@ fn popping_review_restores_the_authoritative_pen_style_before_raw_output_resumes
     term_out.clear();
 
     app.handle_pty(&mut sr, b"B", &mut term_out)
-        .expect("resume raw styled output");
+        .expect("resume styled compositor output");
+    let intended = PresentedScene::compose(&app.composed_scene().expect("compose source scene"))
+        .expect("present source scene")
+        .into_terminal_snapshot();
+    assert_eq!(
+        intended.cell(0, 1).unwrap().hyperlink.as_deref(),
+        Some("https://example.test/active"),
+        "the authoritative source model must retain the active OSC 8 link"
+    );
     oracle.advance(&term_out).expect("advance resumed output");
 
     let actual = oracle.normalized_snapshot();
@@ -675,6 +698,50 @@ fn popping_review_restores_the_authoritative_pen_style_before_raw_output_resumes
     assert_eq!(actual.cursor_position(), (0, 2));
     assert!(actual.modes.application_cursor);
     assert!(actual.modes.bracketed_paste);
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn phase_two_baseline_preserves_full_overlay_redraw_title_cursor_and_modes() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let source = b"\x1b]2;editor title\x07\x1b[2;4Hroot\x1b[?25l\x1b[?1h\x1b[?2004h";
+    let mut expected = GhosttyEngine::new_with_scrollback(24, 80, 0).expect("create expected root");
+    expected.advance(source).expect("construct expected root");
+    let expected = expected.normalized_snapshot();
+    let mut physical = GhosttyEngine::new_with_scrollback(24, 80, 0).expect("create outer oracle");
+
+    app.handle_pty(&mut sr, source, &mut term_out)
+        .expect("draw root");
+    physical.advance(&term_out).expect("advance root output");
+    term_out.clear();
+
+    app.show_message(&mut sr, "Notice", "foreground", &mut term_out)
+        .expect("push message overlay");
+    physical.advance(&term_out).expect("advance overlay redraw");
+    assert!(physical.snapshot().contents().contains("foreground"));
+    assert_eq!(physical.snapshot().title.as_deref(), Some("editor title"));
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "Notice")
+    );
+
+    term_out.clear();
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("pop message overlay");
+    physical.advance(&term_out).expect("restore root redraw");
+    let actual = physical.normalized_snapshot();
+    let mut expected = expected;
+    expected.modes.focus_reporting = true;
+    assert_eq!(actual.contents_full(), expected.contents_full());
+    assert_eq!(actual.cursor, expected.cursor);
+    assert_eq!(actual.modes, expected.modes);
+    assert_eq!(actual.title, expected.title);
     assert!(pty_out.is_empty());
 }
 
@@ -1021,7 +1088,11 @@ fn pty_output_writes_terminal_and_autoreads() {
 
     app.handle_pty(&mut sr, b"hello\r\n", &mut term_out)
         .expect("handle pty");
-    assert_eq!(term_out, b"hello\r\n");
+    let mut physical = GhosttyEngine::new(24, 80).expect("physical oracle");
+    physical
+        .advance(&term_out)
+        .expect("parse compositor output");
+    assert!(physical.normalized_snapshot().contents().contains("hello"));
 
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
@@ -1591,7 +1662,11 @@ fn focus_events_forwarded_after_app_enables_them() {
 
     app.handle_pty(&mut sr, b"\x1B[?1004h", &mut term_out)
         .expect("handle pty");
-    assert!(term_out.is_empty());
+    let mut physical = GhosttyEngine::new(24, 80).expect("physical oracle");
+    physical
+        .advance(&term_out)
+        .expect("parse compositor output");
+    assert!(physical.normalized_snapshot().modes.focus_reporting);
 
     app.handle_stdin(&mut sr, b"\x1B[I", &mut pty_out, &mut term_out)
         .expect("handle stdin");
@@ -1601,18 +1676,26 @@ fn focus_events_forwarded_after_app_enables_them() {
 }
 
 #[test]
-fn focus_mode_sequences_are_filtered_from_terminal_output() {
+fn focus_mode_is_modeled_and_controls_only_application_input_routing() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut term_out = Vec::new();
     let mut pty_out = Vec::new();
 
     app.handle_pty(&mut sr, b"x\x1B[?10", &mut term_out)
         .expect("handle pty");
-    assert_eq!(term_out, b"x");
+    let mut physical = GhosttyEngine::new(24, 80).expect("physical oracle");
+    physical
+        .advance(&term_out)
+        .expect("parse first compositor frame");
+    assert_eq!(physical.normalized_snapshot().contents().trim(), "x");
+    term_out.clear();
 
     app.handle_pty(&mut sr, b"04hy", &mut term_out)
         .expect("handle pty");
-    assert_eq!(term_out, b"xy");
+    physical.advance(&term_out).expect("parse enabled frame");
+    assert_eq!(physical.normalized_snapshot().contents().trim(), "xy");
+    assert!(physical.normalized_snapshot().modes.focus_reporting);
+    term_out.clear();
 
     app.handle_stdin(&mut sr, b"\x1B[I", &mut pty_out, &mut term_out)
         .expect("handle stdin");
@@ -1620,7 +1703,8 @@ fn focus_mode_sequences_are_filtered_from_terminal_output() {
 
     app.handle_pty(&mut sr, b"\x1B[?1004l", &mut term_out)
         .expect("handle pty");
-    assert_eq!(term_out, b"xy");
+    physical.advance(&term_out).expect("parse disabled frame");
+    assert!(physical.normalized_snapshot().modes.focus_reporting);
 
     app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
         .expect("handle stdin");
@@ -1682,16 +1766,24 @@ fn toggle_stop_on_focus_loss_hotkey_disables_stopping() {
 }
 
 #[test]
-fn say_overlay_hotkey_speaks_terminal_title() {
+fn say_overlay_hotkey_speaks_terminal_mode_and_current_title() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1b]2;Build status\x1b\\", &mut term_out)
+        .expect("model application title");
 
     app.handle_stdin(&mut sr, b"\x1Bw", &mut pty_out, &mut term_out)
         .expect("handle stdin");
 
     let speaks = &recorder.inner.borrow().speaks;
-    assert!(speaks.iter().any(|(text, _)| text == "Terminal"));
+    assert!(
+        speaks
+            .iter()
+            .any(|(text, _)| text == "terminal, Build status"),
+        "speaks={speaks:?}"
+    );
 }
 
 #[test]
@@ -2214,25 +2306,40 @@ fn resize_and_alternate_screen_transition_remain_live_behind_overlay() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
+    let mut physical = GhosttyEngine::new(24, 80).expect("physical oracle");
     app.show_message(&mut sr, "Notice", "foreground", &mut term_out)
         .unwrap();
+    physical.advance(&term_out).expect("parse initial overlay");
 
     term_out.clear();
     app.handle_pty(&mut sr, b"\x1b[?1049halt-hidden", &mut term_out)
         .unwrap();
-    assert!(term_out.is_empty());
+    assert!(term_out.is_empty(), "hidden output={term_out:?}");
 
     let geometry = TerminalGeometry::new(12, 40, 9, 18);
     app.on_resize_with_geometry(geometry, &mut term_out)
         .unwrap();
+    physical
+        .resize_with_geometry(geometry)
+        .expect("resize physical oracle");
+    physical.advance(&term_out).expect("parse resized overlay");
     assert_eq!(app.debug_root_terminal_geometry(), geometry);
     assert!(String::from_utf8_lossy(&term_out).contains("foreground"));
 
     term_out.clear();
     app.handle_stdin(&mut sr, b"\n", &mut pty_out, &mut term_out)
         .unwrap();
+    physical
+        .advance(&term_out)
+        .expect("parse restored alternate screen");
     assert!(!app.has_overlay());
-    assert!(term_out.windows(8).any(|bytes| bytes == b"\x1b[?1049h"));
+    assert!(physical.normalized_snapshot().alternate_screen());
+    assert!(
+        physical
+            .normalized_snapshot()
+            .contents()
+            .contains("alt-hidden")
+    );
     assert!(app.debug_active_view_contents().contains("alt-hidden"));
     assert!(pty_out.is_empty());
 }

@@ -769,7 +769,7 @@ fn write_style(bytes: &mut Vec<u8>, style: &Style) {
     if style.italic {
         bytes.extend_from_slice(b";3");
     }
-    if style.underline {
+    if style.underline != crate::terminal::UnderlineStyle::None {
         bytes.extend_from_slice(b";4");
     }
     if style.inverse {

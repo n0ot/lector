@@ -1,0 +1,13 @@
+# Lifecycle harness: hidden application state remains live behind overlays.
+Scenario: hidden output is composed back after a complete review lifecycle
+Given pty-stdout: \x1B]2;editor title\x07\x1B[2;4Hroot\x1B[?25l\x1B[?1h\x1B[?2004h
+When stdin: \x1Br
+And pty-stdout: \x1B[2J\x1B[Hhidden update
+And stdin: q
+Then expect-stdout-contains: hidden update
+And expect-screen-contains: hidden update
+And expect-no-pty-stdin:
+And expect-speak: Review
+And expect-speak-contains: root
+And expect-speak: Terminal
+And expect-speak-contains: hidden update

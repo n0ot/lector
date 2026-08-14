@@ -7,7 +7,7 @@ Then expect-pty-stdin: ab
 Scenario: focus events forwarded when app enables ?1004
 When pty-stdout: pre\x1B[?1004hpost
 And stdin: \x1B[I
-Then expect-stdout: prepost
+Then expect-screen-contains: prepost
 And expect-pty-stdin: \x1B[I
 
 Scenario: focus events not forwarded after app disables ?1004
@@ -23,7 +23,7 @@ Scenario: split focus-mode sequence is filtered and still enables forwarding
 When pty-stdout: x\x1B[?10
 And pty-stdout: 04hy
 And stdin: \x1B[O
-Then expect-stdout: xy
+Then expect-screen-contains: xy
 And expect-pty-stdin: \x1B[O
 
 Scenario: focus-mode queries use per-app state and never reach the terminal
@@ -37,7 +37,7 @@ And pty-stdout: \x1B[?1004l
 And pty-stdout: \x1B[?1004$p
 And tick:
 And stdin: \x1B[O
-Then expect-stdout: beforeafter
+Then expect-screen-contains: beforeafter
 And expect-pty-stdin: \x1B[?1004;2$y\x1B[?1004;1$y\x1B[I\x1B[?1004;2$y
 
 Scenario: auto-read speech suppressed while unfocused

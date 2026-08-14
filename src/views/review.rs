@@ -37,6 +37,8 @@ struct SearchPrompt {
 
 pub struct ReviewView {
     view: View,
+    title: String,
+    kind: ViewKind,
     document: ReviewDocument,
     parser: Parser,
     cursor: HistoryPosition,
@@ -52,6 +54,14 @@ pub struct ReviewView {
 
 impl ReviewView {
     pub fn new(source: &mut View) -> Self {
+        Self::new_with_identity(source, "Review", ViewKind::Review)
+    }
+
+    pub(crate) fn new_table_setup(source: &mut View, title: impl Into<String>) -> Self {
+        Self::new_with_identity(source, title, ViewKind::TableSetup)
+    }
+
+    fn new_with_identity(source: &mut View, title: impl Into<String>, kind: ViewKind) -> Self {
         // Review opens at the source's independent review cursor, not at the
         // source application's cursor. render() exposes this as the overlay's
         // application cursor so normal cursor tracking starts from that point.
@@ -59,6 +69,8 @@ impl ReviewView {
         let (rows, cols) = source.size();
         let mut review = Self {
             view: View::new(rows, cols),
+            title: title.into(),
+            kind,
             document,
             parser: Parser::default(),
             cursor,
@@ -505,7 +517,9 @@ impl ReviewView {
                 ViewAction::Pop | ViewAction::Bell => return Ok(action),
                 ViewAction::Redraw => result = ViewAction::Redraw,
                 ViewAction::None => {}
-                ViewAction::PtyInput | ViewAction::Push(_) => unreachable!(),
+                ViewAction::PtyInput | ViewAction::Push(_) | ViewAction::PopupResponse(_) => {
+                    unreachable!()
+                }
             }
         }
         Ok(result)
@@ -522,11 +536,11 @@ impl ViewController for ReviewView {
     }
 
     fn title(&self) -> &str {
-        "Review"
+        &self.title
     }
 
     fn kind(&self) -> ViewKind {
-        ViewKind::Review
+        self.kind
     }
 
     fn place_application_cursor_at_review_cursor(&mut self) -> Option<ViewAction> {

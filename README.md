@@ -40,6 +40,76 @@ Run Lector with your shell:
 cargo run -- --shell /bin/zsh
 ```
 
+The modeled compositor is Lector's only presentation path. Application PTY
+bytes are parsed by Ghostty and never written directly to the physical
+terminal. After its initial full reconstruction, the compositor consumes
+Ghostty's cell/row damage and emits only changed runs. It keeps a confirmed
+physical-terminal shadow and falls back to a full redraw after resize, failed
+or partial writes, uncertain state, or unsupported content. For unobscured,
+rectangular terminal updates it also translates validated scrolling,
+line/character insertion and deletion, erasure, and adjacent write hints into
+semantic VT operations. Clipped, overlaid, media-changing, ambiguous, or
+inconsistent hints automatically return to the dirty-region or full-scene
+oracle-tested path. Text damage around unchanged images remains incremental.
+
+OSC 8 hyperlinks are reconstructed with an explicit text-only fallback and
+are closed at every output-transaction boundary. Kitty graphics are decoded by
+Ghostty into pane-scoped media stores, mapped to collision-safe outer IDs, and
+clipped against panes and overlays. Pixel uploads and placement state have
+separate lifetimes, so opening an overlay can remove placements and closing it
+can restore them without decoding, copying, or retransmitting unchanged pixel
+data. Default limits are 32 MiB per image, 64 MiB per pane, 128 MiB per scene,
+and 4,096 placements; stale outer uploads are explicitly deleted. If the outer
+terminal does not advertise Kitty graphics, Lector renders text and emits no
+graphics protocol.
+
+The application and every Lector overlay are independent scene layers. The
+application terminal engine continues consuming output while
+Message, Review, Lua REPL, table setup, or popup layers are visible, so closing
+an overlay reveals the current composed source scene without replaying deferred
+PTY bytes. Review and table setup retain frozen, independently navigable
+snapshots. Reviewable announcement, error, and confirmation popups close with
+`Enter` or `Escape`; confirmations report accept and cancel separately.
+
+After the initial outer focus-mode ownership query, all live presentation,
+effect, bell, and lifecycle output passes through one serialized scheduler. It
+coalesces modeled scene updates at event-loop boundaries with a 4 ms latency
+budget, completes any
+started escape transaction before beginning another, and keeps application
+input and terminal replies independent of presentation backpressure. On outer
+terminals that support synchronized output, Lector owns one global update
+boundary; abandoned application synchronization is released after a bounded
+timeout. Audible bells follow the completed visual transaction.
+
+### Virtual terminal capabilities
+
+Lector launches the child with `TERM=lector` and a bundled terminfo entry that
+it materializes under the user cache directory. Applications therefore see a
+stable Lector terminal instead of inheriting the physical terminal's vendor
+identity. Device, mode, geometry, pixel-size, color-scheme, keyboard, focus,
+and clipboard queries are answered locally from the owning pane's Ghostty
+engine; replies from Lector's bounded startup probes are consumed and never
+sent to the application.
+
+The virtual terminal implements 256 colors, true color, OSC 8 hyperlinks, and
+the ordinary `xterm-256color` contract, so an inherited `COLORTERM` remains
+valid. Clipboard reads return an empty local reply by default, clipboard writes
+go to Lector's clipboard history, and desktop notifications and unknown APC
+effects are dropped. Titles, working directories, progress, hyperlinks, and
+bells remain modeled Lector state. In the live scheduler, title,
+working-directory, progress, clipboard, and notification events remain typed
+until the scheduler applies their explicit output policy; sensitive clipboard
+and notification payloads are never replayed as raw terminal bytes.
+
+Physical-terminal rendering starts conservatively, then applies terminfo,
+bounded probes, and finally explicit environment overrides. The supported
+overrides are `LECTOR_OUTER_COLORS` (an integer) and these boolean variables:
+`LECTOR_OUTER_TRUE_COLOR`, `LECTOR_OUTER_HYPERLINKS`, `LECTOR_OUTER_SYNC`,
+`LECTOR_OUTER_KITTY_KEYBOARD`, `LECTOR_OUTER_KITTY_GRAPHICS`,
+`LECTOR_OUTER_FOCUS`, and `LECTOR_OUTER_CLIPBOARD_READ`. Boolean values accept
+`true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`. These describe the outer
+terminal only; they do not change what Lector promises to applications.
+
 Or use the `SHELL` environment variable:
 
 ```bash

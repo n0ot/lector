@@ -220,7 +220,7 @@ fn ghostty_snapshot_preserves_review_sensitive_cells_styles_and_links() {
     assert!(styled.style.bold);
     assert!(styled.style.dim);
     assert!(styled.style.italic);
-    assert!(styled.style.underline);
+    assert!(styled.underline());
 
     assert_eq!(snapshot.cell(0, 2).unwrap().grapheme, "e\u{301}");
     assert_eq!(snapshot.cell(0, 2).unwrap().width, 1);

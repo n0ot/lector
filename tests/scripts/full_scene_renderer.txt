@@ -1,0 +1,13 @@
+# Stop 2.2 harness: application bytes are modeled, never passed through.
+Scenario: full renderer restores hidden output after overlay and resize
+Given pty-stdout: before
+When stdin: \x1Br
+And pty-stdout: \x1B[2;1Hhidden wide \xE7\x95\x8C\x1B[?1h\x1B[?2004h
+And resize: 3 10 9 18
+And stdin: q
+Then expect-screen-contains: hidden wid
+And expect-no-pty-stdin:
+And expect-speak: Review
+And expect-speak-contains: before
+And expect-speak: Terminal
+And expect-speak-contains: hidden wid

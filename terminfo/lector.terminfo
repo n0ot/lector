@@ -1,0 +1,5 @@
+# Lector's application-facing virtual terminal. The Ghostty engine implements
+# the xterm-256color contract; Lector virtualizes queries and presentation so
+# this identity does not expose the physical terminal's vendor or raw replies.
+lector|Lector virtual terminal,
+	use=xterm-256color,

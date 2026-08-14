@@ -151,7 +151,6 @@ fn malformed_and_incomplete_effects_do_not_escape_as_partial_events() {
     let mut engine = engine(2, 20, 10);
     for (index, malformed) in [
         b"\x1B]52;c;%%%\x1B\\".as_slice(),
-        b"\x1B]52;c;?\x1B\\",
         b"\x1B]52;c;YQ==;ignored\x1B\\",
         b"\x1B]1337;Copy=:YQ==;ignored\x1B\\",
         b"\x1B]1337;CurrentDir=\x1B\\",
@@ -164,6 +163,13 @@ fn malformed_and_incomplete_effects_do_not_escape_as_partial_events() {
         let events = engine.advance(malformed).effects.events;
         assert!(events.is_empty(), "malformed case {index}: {events:?}");
     }
+
+    let clipboard_query = engine.advance(b"\x1B]52;c;?\x1B\\");
+    assert_eq!(
+        clipboard_query.effects.events,
+        [TerminalEvent::Query(TerminalQuery::Clipboard)]
+    );
+    assert_eq!(clipboard_query.pty_replies, b"\x1B]52;c;\x1B\\");
 
     // OSC 9 is also Ghostty's desktop-notification protocol. An invalid
     // progress subcommand therefore remains a complete notification rather
@@ -243,7 +249,7 @@ fn progress_reports_preserve_ghostty_defaults_clamping_and_missing_values() {
 }
 
 #[test]
-fn clipboard_writes_accept_ghostty_base64_variants_and_ignore_reads() {
+fn clipboard_writes_accept_ghostty_base64_variants_and_reads_are_brokered() {
     let mut engine = engine(2, 20, 10);
     let mut events = Vec::new();
     for sequence in [
@@ -260,12 +266,20 @@ fn clipboard_writes_accept_ghostty_base64_variants_and_ignore_reads() {
         events.extend(engine.advance(sequence).effects.events);
     }
 
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, TerminalEvent::Query(TerminalQuery::Clipboard)))
+            .count(),
+        1
+    );
     let writes = events
         .into_iter()
-        .map(|event| match event {
+        .filter_map(|event| match event {
             TerminalEvent::ClipboardWrite { location, contents } => {
-                (location, contents.into_iter().next().unwrap().data)
+                Some((location, contents.into_iter().next().unwrap().data))
             }
+            TerminalEvent::Query(TerminalQuery::Clipboard) => None,
             other => panic!("unexpected event: {other:?}"),
         })
         .collect::<Vec<_>>();
@@ -609,11 +623,12 @@ fn ghostty_handles_clipboard_and_known_apc_edges_without_spurious_events() {
                 .events,
         );
     }
-    assert_eq!(events.len(), 5);
+    assert_eq!(events.len(), 6);
     assert!(matches!(events[0], TerminalEvent::ClipboardWrite { .. }));
     assert!(matches!(events[1], TerminalEvent::ClipboardWrite { .. }));
+    assert_eq!(events[2], TerminalEvent::Query(TerminalQuery::Clipboard));
     assert_eq!(
-        &events[2..],
+        &events[3..],
         [
             TerminalEvent::ProgressReport {
                 state: ProgressState::Set,

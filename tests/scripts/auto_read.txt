@@ -3,7 +3,7 @@ Scenario: fragmented line output is spoken as one batch
 When pty-stdout: alpha\r\n
 And pty-stdout: beta
 And settled:
-Then expect-stdout: alpha\r\nbeta
+Then expect-screen-contains: alpha
 And expect-speak: alpha\nbeta
 And expect-no-speak:
 

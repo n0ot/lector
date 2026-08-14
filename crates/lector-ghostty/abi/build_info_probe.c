@@ -3,9 +3,11 @@
 #include <ghostty/vt/build_info.h>
 #include <ghostty/vt/grid_ref.h>
 #include <ghostty/vt/grid_ref_tracked.h>
+#include <ghostty/vt/kitty_graphics.h>
 #include <ghostty/vt/point.h>
 #include <ghostty/vt/render.h>
 #include <ghostty/vt/screen.h>
+#include <ghostty/vt/sgr.h>
 #include <ghostty/vt/snapshot.h>
 #include <ghostty/vt/style.h>
 #include <ghostty/vt/terminal.h>
@@ -35,6 +37,35 @@ _Static_assert(offsetof(GhosttyBuffer, len) == 2 * sizeof(size_t),
                "GhosttyBuffer.len offset changed");
 _Static_assert(sizeof(GhosttyTerminalModeConfig) == 4,
                "GhosttyTerminalModeConfig layout changed");
+_Static_assert(GHOSTTY_COLOR_SCHEME_LIGHT == 0 &&
+                   GHOSTTY_COLOR_SCHEME_DARK == 1,
+               "GhosttyColorScheme values changed");
+_Static_assert(GHOSTTY_RENDER_STATE_DIRTY_FALSE == 0 &&
+                   GHOSTTY_RENDER_STATE_DIRTY_PARTIAL == 1 &&
+                   GHOSTTY_RENDER_STATE_DIRTY_FULL == 2 &&
+                   GHOSTTY_RENDER_STATE_DATA_DIRTY == 3 &&
+                   GHOSTTY_RENDER_STATE_OPTION_DIRTY == 0 &&
+                   GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY == 1 &&
+                   GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY == 0,
+               "Ghostty render damage values changed");
+_Static_assert(sizeof(GhosttySizeReportSize) == 12,
+               "GhosttySizeReportSize layout changed");
+_Static_assert(offsetof(GhosttySizeReportSize, rows) == 0 &&
+                   offsetof(GhosttySizeReportSize, columns) == 2 &&
+                   offsetof(GhosttySizeReportSize, cell_width) == 4 &&
+                   offsetof(GhosttySizeReportSize, cell_height) == 8,
+               "GhosttySizeReportSize fields changed");
+_Static_assert(sizeof(GhosttyDeviceAttributesPrimary) == 144 &&
+                   offsetof(GhosttyDeviceAttributesPrimary, features) == 2 &&
+                   offsetof(GhosttyDeviceAttributesPrimary, num_features) == 136,
+               "GhosttyDeviceAttributesPrimary layout changed");
+_Static_assert(sizeof(GhosttyDeviceAttributesSecondary) == 6 &&
+                   sizeof(GhosttyDeviceAttributesTertiary) == 4 &&
+                   sizeof(GhosttyDeviceAttributes) == 160,
+               "GhosttyDeviceAttributes layout changed");
+_Static_assert(offsetof(GhosttyDeviceAttributes, secondary) == 144 &&
+                   offsetof(GhosttyDeviceAttributes, tertiary) == 152,
+               "GhosttyDeviceAttributes fields changed");
 _Static_assert(offsetof(GhosttyTerminalModeConfig, mode) == 0,
                "GhosttyTerminalModeConfig.mode offset changed");
 _Static_assert(offsetof(GhosttyTerminalModeConfig, value) == 2,
@@ -102,6 +133,17 @@ _Static_assert(offsetof(GhosttyStyle, size) == 0,
                "GhosttyStyle.size offset changed");
 _Static_assert(offsetof(GhosttyStyle, fg_color) == sizeof(size_t),
                "GhosttyStyle.fg_color offset changed");
+_Static_assert(offsetof(GhosttyKittyGraphicsPlacementRenderInfo, size) == 0,
+               "GhosttyKittyGraphicsPlacementRenderInfo.size offset changed");
+_Static_assert(offsetof(GhosttyKittyGraphicsPlacementRenderInfo, pixel_width) ==
+                   sizeof(size_t),
+               "GhosttyKittyGraphicsPlacementRenderInfo.pixel_width offset changed");
+_Static_assert(offsetof(GhosttyKittyGraphicsPlacementRenderInfo,
+                        viewport_visible) == 32,
+               "GhosttyKittyGraphicsPlacementRenderInfo.viewport_visible offset changed");
+_Static_assert(offsetof(GhosttyKittyGraphicsPlacementRenderInfo, source_x) ==
+                   36,
+               "GhosttyKittyGraphicsPlacementRenderInfo.source_x offset changed");
 #if SIZE_MAX == UINT64_MAX
 _Static_assert(sizeof(GhosttyTerminalProgressReport) == 16,
                "GhosttyTerminalProgressReport layout changed");
@@ -119,6 +161,8 @@ _Static_assert(sizeof(GhosttyGridRef) == 24,
 _Static_assert(sizeof(GhosttyStyleColor) == 16,
                "GhosttyStyleColor layout changed");
 _Static_assert(sizeof(GhosttyStyle) == 72, "GhosttyStyle layout changed");
+_Static_assert(sizeof(GhosttyKittyGraphicsPlacementRenderInfo) == 56,
+               "GhosttyKittyGraphicsPlacementRenderInfo layout changed");
 #endif
 
 _Static_assert(GHOSTTY_SUCCESS == 0, "GhosttyResult values changed");
@@ -135,6 +179,12 @@ _Static_assert(GHOSTTY_TERMINAL_DATA_CURSOR_X == 3,
                "GhosttyTerminalData values changed");
 _Static_assert(GHOSTTY_TERMINAL_DATA_CURSOR_STYLE == 10,
                "GhosttyTerminalData cursor style changed");
+_Static_assert(GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE == 10 &&
+                   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR == 0 &&
+                   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK == 1 &&
+                   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE == 2 &&
+                   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW == 3,
+               "Ghostty render cursor visual style values changed");
 _Static_assert(GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS == 8 &&
                    GHOSTTY_TERMINAL_DATA_TITLE == 12 &&
                    GHOSTTY_TERMINAL_DATA_PWD == 13,
@@ -147,6 +197,10 @@ _Static_assert(GHOSTTY_TERMINAL_DATA_WIDTH_PX == 16 &&
                    GHOSTTY_TERMINAL_DATA_HEIGHT_PX == 17 &&
                    GHOSTTY_TERMINAL_DATA_CONTINUATION_MAX_BYTES == 36,
                "GhosttyTerminalData geometry/continuation values changed");
+_Static_assert(GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS == 30,
+               "GhosttyTerminalData Kitty graphics value changed");
+_Static_assert(GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT == 15,
+               "GhosttyTerminalOption Kitty graphics value changed");
 _Static_assert(GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES == 28,
                "GhosttyTerminalOption values changed");
 _Static_assert(GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES == 31,
@@ -201,3 +255,25 @@ _Static_assert(GHOSTTY_POINT_TAG_HISTORY == 3,
                "GhosttyPointTag values changed");
 _Static_assert(GHOSTTY_STYLE_COLOR_RGB == 2,
                "GhosttyStyleColorTag values changed");
+_Static_assert(GHOSTTY_SGR_UNDERLINE_NONE == 0 &&
+                   GHOSTTY_SGR_UNDERLINE_SINGLE == 1 &&
+                   GHOSTTY_SGR_UNDERLINE_DOUBLE == 2 &&
+                   GHOSTTY_SGR_UNDERLINE_CURLY == 3 &&
+                   GHOSTTY_SGR_UNDERLINE_DOTTED == 4 &&
+                   GHOSTTY_SGR_UNDERLINE_DASHED == 5,
+               "GhosttySgrUnderline values changed");
+_Static_assert(GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR == 1 &&
+                   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID == 1 &&
+                   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID == 2 &&
+                   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL == 3 &&
+                   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_X_OFFSET == 4 &&
+                   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Y_OFFSET == 5 &&
+                   GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z == 12,
+               "Ghostty Kitty placement data values changed");
+_Static_assert(GHOSTTY_KITTY_IMAGE_DATA_NUMBER == 2 &&
+                   GHOSTTY_KITTY_IMAGE_DATA_WIDTH == 3 &&
+                   GHOSTTY_KITTY_IMAGE_DATA_HEIGHT == 4 &&
+                   GHOSTTY_KITTY_IMAGE_DATA_FORMAT == 5 &&
+                   GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR == 7 &&
+                   GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN == 8,
+               "Ghostty Kitty image data values changed");

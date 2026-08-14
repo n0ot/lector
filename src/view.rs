@@ -1,5 +1,6 @@
 use super::{
     ext::ScreenExt,
+    presentation::{PaneMediaStore, PresentationError},
     terminal::{
         GhosttyEngine, GhosttyReviewMark, HistoryPosition, SemanticKind as Osc133Kind,
         SemanticMark as Osc133Mark, TerminalEngine, TerminalGeometry, TerminalSnapshot,
@@ -14,6 +15,7 @@ pub const SCROLLBACK_LINES: usize = 10_000;
 
 pub struct View {
     engine: GhosttyEngine,
+    media: PaneMediaStore,
     pending_update: UpdateSummary,
     prev_screen: TerminalSnapshot,
     prev_screen_time: u128,
@@ -39,6 +41,7 @@ impl View {
         let prev_screen = engine.snapshot().clone();
         View {
             engine,
+            media: PaneMediaStore::new(Default::default()),
             pending_update: UpdateSummary::default(),
             prev_screen,
             prev_screen_time: 0,
@@ -128,20 +131,10 @@ impl View {
         self.engine.snapshot_with_history()
     }
 
-    pub(crate) fn presentation_contents(&self) -> Vec<u8> {
-        self.engine.presentation_contents()
-    }
-
-    pub(crate) fn presentation_cursor(&self) -> Vec<u8> {
-        self.engine.presentation_cursor()
-    }
-
-    pub(crate) fn presentation_attributes(&self) -> Vec<u8> {
-        self.engine.presentation_attributes()
-    }
-
-    pub(crate) fn presentation_input_modes(&self) -> Vec<u8> {
-        self.engine.presentation_input_modes()
+    pub(crate) fn presentation_media(&mut self) -> Result<&PaneMediaStore, PresentationError> {
+        let placements = self.engine.kitty_image_placements()?;
+        self.media.synchronize(&placements)?;
+        Ok(&self.media)
     }
 
     /// Runs work against the live drawing screen, then returns to the review

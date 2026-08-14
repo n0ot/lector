@@ -8,10 +8,46 @@ use nix::sys::{
 use nix::unistd::{Pid, dup};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::path::Path;
+
+const LECTOR_TERMINFO: &[u8] = include_bytes!("../terminfo/compiled/6c/lector");
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualTerminalEnvironment {
+    pub term: String,
+    pub terminfo_dir: std::path::PathBuf,
+}
+
+impl VirtualTerminalEnvironment {
+    pub fn apply(&self, command: &mut CommandBuilder) {
+        command.env("TERM", &self.term);
+        command.env("TERMINFO", &self.terminfo_dir);
+        // COLORTERM is deliberately untouched: callers preserve it only when
+        // the selected virtual profile implements the advertised color mode.
+    }
+}
+
+/// Materialize the bundled compiled terminfo under both directory conventions
+/// used by supported ncurses implementations (hex and first-character).
+pub fn install_lector_terminfo(root: &Path) -> Result<VirtualTerminalEnvironment> {
+    for relative in ["6c/lector", "l/lector"] {
+        let path = root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).context("create Lector terminfo directory")?;
+        }
+        let current = fs::read(&path).ok();
+        if current.as_deref() != Some(LECTOR_TERMINFO) {
+            fs::write(&path, LECTOR_TERMINFO).context("write bundled Lector terminfo")?;
+        }
+    }
+    Ok(VirtualTerminalEnvironment {
+        term: "lector".to_owned(),
+        terminfo_dir: root.to_path_buf(),
+    })
+}
 
 pub struct Process {
     master: Box<dyn MasterPty + Send>,
@@ -48,6 +84,20 @@ impl Process {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        Self::spawn_with_geometry_and_environment(program, args, geometry, terminal_attrs, None)
+    }
+
+    pub fn spawn_with_geometry_and_environment<I, S>(
+        program: &Path,
+        args: I,
+        geometry: TerminalGeometry,
+        terminal_attrs: &termios::Termios,
+        environment: Option<&VirtualTerminalEnvironment>,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let current_dir = std::env::current_dir().context("resolve current directory")?;
         let pair = native_pty_system()
             .openpty(pty_size(geometry))
@@ -66,6 +116,9 @@ impl Process {
         let mut command = CommandBuilder::new(program);
         command.args(args);
         command.cwd(current_dir);
+        if let Some(environment) = environment {
+            environment.apply(&mut command);
+        }
         let child = pair
             .slave
             .spawn_command(command)
@@ -208,7 +261,7 @@ pub fn set_raw(fd: RawFd) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Process, set_raw, terminal_geometry};
+    use super::{Process, install_lector_terminfo, set_raw, terminal_geometry};
     use crate::terminal::TerminalGeometry;
     use nix::sys::termios::{self, LocalFlags};
     use portable_pty::{PtySize, native_pty_system};
@@ -381,6 +434,32 @@ mod tests {
             .canonicalize()
             .expect("canonicalize current directory");
         assert_eq!(actual, expected);
+        assert!(process.wait().expect("wait for child").success());
+    }
+
+    #[test]
+    fn spawn_applies_the_virtual_terminal_environment_to_the_real_child() {
+        let attrs = terminal_attrs();
+        let root = Path::new("target/test-artifacts/pty-lector-terminfo");
+        let environment = install_lector_terminfo(root).expect("install bundled terminfo");
+        let mut process = Process::spawn_with_geometry_and_environment(
+            Path::new("/bin/sh"),
+            ["-c", "printf '%s|%s\\n' \"$TERM\" \"$TERMINFO\""],
+            TerminalGeometry::new(5, 13, 8, 16),
+            &attrs,
+            Some(&environment),
+        )
+        .expect("spawn child with virtual terminal environment");
+        let mut stream = process.stream().expect("clone PTY stream");
+        let mut output = String::new();
+        stream
+            .read_to_string(&mut output)
+            .expect("read child environment");
+
+        assert!(
+            output.contains(&format!("lector|{}", root.display())),
+            "{output:?}"
+        );
         assert!(process.wait().expect("wait for child").success());
     }
 
