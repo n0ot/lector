@@ -141,8 +141,10 @@ mod tests {
             &path,
             r#"
                 assert(lector.o.suppress_key_echo == false)
+                assert(lector.o.tmux_bells == "off")
                 lector.o.auto_read = false
                 lector.o.suppress_key_echo = true
+                lector.o.tmux_bells = "spoken"
                 lector.o.symbol_level = "all"
                 lector.symbols = { ["?"] = {"query", "all", "never", false} }
                 lector.bindings["M-z"] = "lector.stop_speaking"
@@ -172,6 +174,7 @@ mod tests {
             assert!(sr.help_mode());
             assert!(!sr.auto_read_enabled());
             assert!(sr.suppress_key_echo());
+            assert_eq!(sr.tmux_bell_mode().to_string(), "spoken");
             assert!(sr.speech().symbol_level() == Level::All);
             assert!(matches!(
                 sr.key_bindings().binding_for_mode(InputMode::Normal, "M-z"),

@@ -1,3 +1,5 @@
+use super::TmuxBellMode;
+
 pub(super) struct Options {
     help_mode: bool,
     auto_read: bool,
@@ -6,6 +8,7 @@ pub(super) struct Options {
     highlight_tracking: bool,
     table_header_auto: bool,
     stop_speech_on_focus_loss: bool,
+    tmux_bell_mode: TmuxBellMode,
 }
 
 impl Default for Options {
@@ -18,6 +21,7 @@ impl Default for Options {
             highlight_tracking: false,
             table_header_auto: true,
             stop_speech_on_focus_loss: true,
+            tmux_bell_mode: TmuxBellMode::Off,
         }
     }
 }
@@ -99,11 +103,19 @@ impl Options {
         self.stop_speech_on_focus_loss = !self.stop_speech_on_focus_loss;
         self.stop_speech_on_focus_loss
     }
+
+    pub(super) fn tmux_bell_mode(&self) -> TmuxBellMode {
+        self.tmux_bell_mode
+    }
+
+    pub(super) fn set_tmux_bell_mode(&mut self, value: TmuxBellMode) {
+        self.tmux_bell_mode = value;
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Options;
+    use super::{Options, TmuxBellMode};
 
     #[test]
     fn defaults_match_the_user_facing_configuration() {
@@ -115,6 +127,7 @@ mod tests {
         assert!(!options.highlight_tracking());
         assert!(options.table_header_auto());
         assert!(options.stop_speech_on_focus_loss());
+        assert_eq!(options.tmux_bell_mode(), TmuxBellMode::Off);
     }
 
     #[test]

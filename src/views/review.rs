@@ -517,7 +517,15 @@ impl ReviewView {
                 ViewAction::Pop | ViewAction::Bell => return Ok(action),
                 ViewAction::Redraw => result = ViewAction::Redraw,
                 ViewAction::None => {}
-                ViewAction::PtyInput | ViewAction::Push(_) | ViewAction::PopupResponse(_) => {
+                ViewAction::PtyInput
+                | ViewAction::Push(_)
+                | ViewAction::PopupResponse(_)
+                | ViewAction::ActivateTmuxConnection(_)
+                | ViewAction::ActivateTerminal
+                | ViewAction::TmuxConnectionRename { .. }
+                | ViewAction::TmuxChooserSelect { .. }
+                | ViewAction::TmuxCommandSubmit { .. }
+                | ViewAction::TmuxInput { .. } => {
                     unreachable!()
                 }
             }
@@ -528,6 +536,10 @@ impl ReviewView {
 
 impl ViewController for ReviewView {
     fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 

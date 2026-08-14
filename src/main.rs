@@ -618,7 +618,10 @@ fn do_events(
                     PTY_TOKEN => {
                         let mut buf = [0; 8192];
                         let n = match pty_stream.read(&mut buf) {
-                            Ok(0) => return Ok(()), // The child process exited
+                            Ok(0) => {
+                                app.handle_pty_eof(sr, &mut stdout)?;
+                                return Ok(()); // The child process exited
+                            }
                             Ok(n) => n,
                             Err(e) => bail!("error reading from PTY: {}", e),
                         };

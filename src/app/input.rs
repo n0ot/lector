@@ -143,7 +143,7 @@ impl App {
     ) -> Result<()> {
         let forward_to_app = self
             .view_stack
-            .root_mut()
+            .active_mut()
             .model()
             .screen()
             .focus_reporting();
@@ -215,6 +215,18 @@ impl App {
                     .handle_paste(sr, &contents, pty_out)?;
                 self.handle_view_action(sr, view_action, term_out)
             }
+            Event::Mouse(mouse) => {
+                if let Some(view) = self.view_stack.active_tmux_connection_mut() {
+                    if let Some(action) = view.translate_mouse_input(mouse) {
+                        self.last_stdin_update = Some(self.clock.now_ms());
+                        self.handle_view_action(sr, action, term_out)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    self.handle_raw_bytes(sr, raw, pty_out, term_out)
+                }
+            }
             _ => self.handle_raw_bytes(sr, raw, pty_out, term_out),
         }
     }
@@ -246,6 +258,11 @@ impl App {
             return self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out);
         }
 
+        if self.handle_tmux_prefix_key(sr, &key, term_out)? {
+            self.consumed_key_presses.insert(key_id);
+            return Ok(());
+        }
+
         let binding_name = self.key_event_binding_name(key_event);
         if self.log_enabled {
             eprintln!(
@@ -271,6 +288,7 @@ impl App {
             }
             match binding {
                 Binding::Builtin(action) => {
+                    let action = *action;
                     if matches!(action, commands::Action::OpenReview) {
                         if self.view_stack.active_mut().kind() == views::ViewKind::Review {
                             sr.speak("Review already open", false)?;
@@ -305,6 +323,69 @@ impl App {
                         self.consumed_key_presses.insert(key_id);
                         return Ok(());
                     }
+                    let tmux_overlay_opened = match action {
+                        commands::Action::OpenTmuxConnectionChooser => {
+                            Some(self.show_tmux_connection_chooser(sr, term_out)?)
+                        }
+                        commands::Action::RenameTmuxConnection => {
+                            Some(self.show_tmux_connection_rename(sr, term_out)?)
+                        }
+                        commands::Action::OpenTmuxSessionChooser => {
+                            Some(self.show_tmux_session_chooser(sr, term_out)?)
+                        }
+                        commands::Action::OpenTmuxWindowChooser => {
+                            Some(self.show_tmux_window_chooser(sr, term_out)?)
+                        }
+                        commands::Action::OpenTmuxPaneChooser => {
+                            Some(self.show_tmux_pane_chooser(sr, term_out)?)
+                        }
+                        commands::Action::OpenTmuxCommandPrompt => {
+                            Some(self.show_tmux_command_prompt(sr, term_out)?)
+                        }
+                        commands::Action::DetachTmuxConnection => {
+                            Some(self.request_tmux_gateway_action(
+                                sr,
+                                crate::tmux_lifecycle::GatewayControlAction::GracefulDetach,
+                                term_out,
+                            )?)
+                        }
+                        commands::Action::InterruptTmuxGateway => {
+                            Some(self.request_tmux_gateway_action(
+                                sr,
+                                crate::tmux_lifecycle::GatewayControlAction::Interrupt,
+                                term_out,
+                            )?)
+                        }
+                        commands::Action::ForceCloseTmuxGateway => {
+                            Some(self.request_tmux_gateway_action(
+                                sr,
+                                crate::tmux_lifecycle::GatewayControlAction::ForceClose,
+                                term_out,
+                            )?)
+                        }
+                        commands::Action::SendTmuxSshEscapeDisconnect => {
+                            Some(self.request_tmux_gateway_action(
+                                sr,
+                                crate::tmux_lifecycle::GatewayControlAction::SshEscapeDisconnect,
+                                term_out,
+                            )?)
+                        }
+                        commands::Action::SendTmuxSshEscapeHelp => {
+                            Some(self.request_tmux_gateway_action(
+                                sr,
+                                crate::tmux_lifecycle::GatewayControlAction::SshEscapeHelp,
+                                term_out,
+                            )?)
+                        }
+                        _ => None,
+                    };
+                    if tmux_overlay_opened.is_some() {
+                        if tmux_overlay_opened == Some(false) {
+                            self.emit_physical_bells(term_out, 1)?;
+                        }
+                        self.consumed_key_presses.insert(key_id);
+                        return Ok(());
+                    }
                     if matches!(action, commands::Action::LeftClick)
                         && let Some(view_action) = self
                             .view_stack
@@ -319,7 +400,11 @@ impl App {
                     let mode_before = sr.input_mode();
                     let title = {
                         let active = self.view_stack.active_mut();
-                        if active.kind() == views::ViewKind::Terminal {
+                        if let Some(tmux) =
+                            active.as_any().downcast_ref::<views::TmuxConnectionView>()
+                        {
+                            tmux.accessible_title()
+                        } else if active.kind() == views::ViewKind::Terminal {
                             active
                                 .model()
                                 .screen()
@@ -338,7 +423,7 @@ impl App {
                         sr,
                         &title,
                         self.view_stack.active_mut().model(),
-                        *action,
+                        action,
                     )? {
                         commands::CommandResult::Handled => true,
                         commands::CommandResult::ForwardInput => {

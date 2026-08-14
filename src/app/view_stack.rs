@@ -85,8 +85,76 @@ impl App {
                 }
             }
             views::ViewAction::PopupResponse(response) => {
-                self.popup_responses.push_back(response);
-                self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
+                let gateway_confirmation = self.pending_gateway_confirmation.take();
+                if let Some(confirmation) = gateway_confirmation {
+                    let confirmed = response == views::PopupResponse::Confirmed;
+                    self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
+                    if confirmed && !self.accept_gateway_confirmation(confirmation)? {
+                        self.show_popup_error(
+                            sr,
+                            "tmux gateway disappeared",
+                            "the confirmed tmux gateway no longer exists; no bytes were sent",
+                            term_out,
+                        )?;
+                    }
+                    return Ok(());
+                }
+                let tmux_confirmation = self.pending_tmux_confirmation.take();
+                if let Some(confirmation) = tmux_confirmation {
+                    let confirmed = response == views::PopupResponse::Confirmed;
+                    let target_exists = self.tmux_confirmation_target_exists(&confirmation);
+                    self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
+                    if confirmed && target_exists {
+                        self.queue_tmux_user_command(
+                            confirmation.connection_id,
+                            &confirmation.command,
+                        )?;
+                    } else if confirmed {
+                        self.show_popup_error(
+                            sr,
+                            "tmux target disappeared",
+                            "the confirmed tmux target no longer exists; no command was sent",
+                            term_out,
+                        )?;
+                    }
+                } else {
+                    self.popup_responses.push_back(response);
+                    self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
+                }
+            }
+            views::ViewAction::ActivateTmuxConnection(connection_id) => {
+                if !self.activate_tmux_connection(connection_id, sr, term_out)? {
+                    self.emit_physical_bells(term_out, 1)?;
+                }
+            }
+            views::ViewAction::ActivateTerminal => {
+                self.activate_terminal_mode(sr, term_out)?;
+            }
+            views::ViewAction::TmuxConnectionRename {
+                connection_id,
+                label,
+            } => {
+                self.handle_tmux_connection_rename(sr, connection_id, label, term_out)?;
+            }
+            views::ViewAction::TmuxChooserSelect {
+                connection_id,
+                target,
+            } => {
+                self.handle_tmux_chooser_selection(sr, connection_id, target, term_out)?;
+            }
+            views::ViewAction::TmuxCommandSubmit {
+                connection_id,
+                command,
+            } => {
+                self.handle_tmux_command_submit(sr, connection_id, command, term_out)?;
+            }
+            views::ViewAction::TmuxInput {
+                connection_id,
+                pane_id,
+                bytes,
+            } => {
+                self.queue_tmux_input(connection_id, pane_id, &bytes)?;
+                self.last_stdin_update = Some(self.clock.now_ms());
             }
             views::ViewAction::Redraw => {
                 self.render_active_view(term_out)?;
@@ -97,7 +165,7 @@ impl App {
         Ok(())
     }
 
-    fn capture_lua_repl_history(&mut self) {
+    pub(super) fn capture_lua_repl_history(&mut self) {
         if self.view_stack.active_mut().kind() != views::ViewKind::LuaRepl {
             return;
         }
@@ -139,13 +207,55 @@ impl App {
         bell_count: usize,
         terminal_update: Option<&UpdateSummary>,
     ) -> Result<()> {
-        let mut scene = self.composed_scene_with_bells(bell_count)?;
-        let scheduled = self.output_scheduler.is_some();
-        scene.effects.bell_count = if scheduled { 0 } else { bell_count };
-
-        let mut damage = terminal_update.map_or(SceneDamage::Full, |update| {
+        let scene = self.composed_scene_with_bells(bell_count)?;
+        let damage = terminal_update.map_or(SceneDamage::Full, |update| {
             SceneDamage::from_terminal_update(&scene.panes[0], update, scene.geometry)
         });
+        self.render_prepared_scene(term_out, bell_count, terminal_update, scene, damage)
+    }
+
+    pub(super) fn render_tmux_pane_update(
+        &mut self,
+        term_out: &mut dyn Write,
+        pane_id: crate::tmux_model::PaneId,
+        bell_count: usize,
+        update: &UpdateSummary,
+    ) -> Result<()> {
+        let Some(surface_id) = self
+            .view_stack
+            .active_tmux_connection_mut()
+            .and_then(|view| view.surface_id(pane_id))
+        else {
+            return Ok(());
+        };
+        let scene = self.composed_scene_with_bells(bell_count)?;
+        let Some(surface) = scene.panes.iter().find(|surface| surface.id == surface_id) else {
+            return Ok(());
+        };
+        let damage = SceneDamage::from_terminal_update(surface, update, scene.geometry);
+        self.render_prepared_scene(term_out, bell_count, Some(update), scene, damage)
+    }
+
+    pub(super) fn render_tmux_topology_update(&mut self, term_out: &mut dyn Write) -> Result<()> {
+        let scene = self.composed_scene_with_bells(0)?;
+        let damage = SceneDamage::regions([crate::presentation::GridRect::new(
+            GridPoint::new(0, 0),
+            scene.geometry.rows,
+            scene.geometry.cols,
+        )]);
+        self.render_prepared_scene(term_out, 0, None, scene, damage)
+    }
+
+    fn render_prepared_scene(
+        &mut self,
+        term_out: &mut dyn Write,
+        bell_count: usize,
+        terminal_update: Option<&UpdateSummary>,
+        mut scene: Scene,
+        mut damage: SceneDamage,
+    ) -> Result<()> {
+        let scheduled = self.output_scheduler.is_some();
+        scene.effects.bell_count = if scheduled { 0 } else { bell_count };
         if scheduled
             && self
                 .output_scheduler
@@ -218,6 +328,43 @@ impl App {
 
     fn composed_scene_with_bells(&mut self, bell_count: usize) -> Result<Scene> {
         let scheduled = self.output_scheduler.is_some();
+        let has_overlay = self.view_stack.has_overlay();
+        let root_geometry = self.view_stack.root_mut().model().screen().geometry;
+        if let Some(connection) = self.view_stack.presented_tmux_connection_mut()
+            && connection.is_ready()
+            && !connection.is_showing_portal()
+        {
+            let mut scene = connection.composed_scene(root_geometry)?;
+            if scheduled {
+                for pane in &mut scene.panes {
+                    pane.snapshot.modes.synchronized_output = false;
+                }
+            }
+            scene.effects.bell_count = bell_count;
+            if !has_overlay {
+                return Ok(scene);
+            }
+
+            let presentation_screen = self.presented_scene.screen();
+            let overlay_snapshots = self.view_stack.overlay_snapshots();
+            for (index, mut overlay) in overlay_snapshots.into_iter().enumerate() {
+                overlay.screen = presentation_screen;
+                if scheduled {
+                    overlay.modes.synchronized_output = false;
+                }
+                let id = SurfaceId(u64::try_from(index).unwrap_or(u64::MAX).saturating_add(2));
+                scene.overlays.push(SceneOverlay::new(
+                    SceneSurface::new(id, GridPoint::new(0, 0), overlay),
+                    i32::try_from(index).unwrap_or(i32::MAX),
+                ));
+                scene.cursor_owner = CursorOwner::Overlay(id);
+            }
+            if let Some(active) = scene.overlays.last_mut() {
+                active.surface.snapshot.modes.focus_reporting = true;
+            }
+            self.view_stack.append_overlay_media(&mut scene)?;
+            return Ok(scene);
+        }
         let mut snapshots = self.view_stack.live_snapshots().into_iter();
         let mut root = snapshots
             .next()

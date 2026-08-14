@@ -1,0 +1,4 @@
+{
+  "source": "captured from tmux 3.7b under a local PTY on 2026-08-14; command output was injected with send-keys",
+  "stream": "\u001bP1000p%begin 1786697214 286 0\r\n%end 1786697214 286 0\r\n%session-changed $0 lector_fixture\r\n%output %0 printf 'B\\134001\\134177\\134\\134Q\\134n'\\015\\012\r\n%sessions-changed\r\n%exit\r\n\u001b\\"
+}

@@ -222,6 +222,7 @@ enum RendererWorkloadKind {
     CursorMove,
     Scroll,
     TmuxLike,
+    ZellijLike,
 }
 
 struct RendererWorkload {
@@ -1218,6 +1219,32 @@ fn renderer_update(
             _ => format!("\x1b[10;5H\x1b[12X{iteration:06}"),
         }
         .into_bytes(),
+        RendererWorkloadKind::ZellijLike => match iteration % 6 {
+            0 => format!(
+                "\x1b[1;1H\x1b[1;38;5;15;48;5;4m tab-{iteration:06} {:<56}\x1b[0m\x1b[K",
+                "active pane"
+            ),
+            1 => format!(
+                "\x1b[2;1H\x1b[38;5;8m+{}+\x1b[0m",
+                "-".repeat(usize::from(geometry.cols.saturating_sub(2)))
+            ),
+            2 => format!(
+                "\x1b[{};1H\x1b[7m status {iteration:06} {:<54}\x1b[0m\x1b[K",
+                geometry.rows,
+                iteration % 100
+            ),
+            3 => format!("\x1b[4;3Hpane title {iteration:06}\x1b[K"),
+            4 => format!(
+                "\x1b[3;{}r\x1b[S\x1b[{};2Hzellij scroll {iteration:06}\x1b[K\x1b[r",
+                geometry.rows.saturating_sub(1),
+                geometry.rows.saturating_sub(1),
+            ),
+            _ => format!(
+                "\x1b[?2026h\x1b[5;5Hlayer-a {iteration:06}\x1b[6;5Hlayer-b {:06}\x1b[?2026l",
+                iteration.wrapping_mul(17)
+            ),
+        }
+        .into_bytes(),
     }
 }
 
@@ -1253,6 +1280,11 @@ fn renderer_workloads(self_test: bool) -> Vec<RendererWorkload> {
         RendererWorkload {
             name: "tmux-like-structural-edits",
             kind: RendererWorkloadKind::TmuxLike,
+            iterations: 5_000,
+        },
+        RendererWorkload {
+            name: "zellij-like-layered-redraws",
+            kind: RendererWorkloadKind::ZellijLike,
             iterations: 5_000,
         },
     ]

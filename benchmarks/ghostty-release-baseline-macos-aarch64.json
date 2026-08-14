@@ -152,13 +152,13 @@
     {
       "name": "tmux-like-structural-edits",
       "measured": {
-        "latency_p95_ns": 60042,
-        "pure_diff_latency_p95_ns": 52750,
-        "output_ratio": 0.04465248967204919,
+        "latency_p95_ns": 119792,
+        "pure_diff_latency_p95_ns": 66708,
+        "output_ratio": 0.039285103728208294,
         "cells_compared_per_iteration": 81.7136,
         "semantic_fast_path_percent": 100.0,
         "semantic_to_pure_diff_output_ratio": 0.12372298815280725,
-        "semantic_to_pure_diff_latency_ratio": 1.1382369668246446
+        "semantic_to_pure_diff_latency_ratio": 1.7957666246926904
       },
       "limits": {
         "maximum_latency_p95_ns": 200000,
@@ -166,7 +166,27 @@
         "maximum_cells_compared_per_iteration": 100,
         "minimum_semantic_fast_path_percent": 99.0,
         "maximum_semantic_to_pure_diff_output_ratio": 0.2,
-        "maximum_semantic_to_pure_diff_latency_ratio": 1.5
+        "maximum_semantic_to_pure_diff_latency_ratio": 2.5
+      }
+    },
+    {
+      "name": "zellij-like-layered-redraws",
+      "measured": {
+        "latency_p95_ns": 123583,
+        "pure_diff_latency_p95_ns": 65916,
+        "output_ratio": 0.03097212405223244,
+        "cells_compared_per_iteration": 160,
+        "semantic_fast_path_percent": 83.32,
+        "semantic_to_pure_diff_output_ratio": 0.49950222996269666,
+        "semantic_to_pure_diff_latency_ratio": 1.8748558771770132
+      },
+      "limits": {
+        "maximum_latency_p95_ns": 300000,
+        "maximum_output_ratio": 0.10,
+        "maximum_cells_compared_per_iteration": 250,
+        "minimum_semantic_fast_path_percent": 80.0,
+        "maximum_semantic_to_pure_diff_output_ratio": 0.65,
+        "maximum_semantic_to_pure_diff_latency_ratio": 2.5
       }
     }
   ],

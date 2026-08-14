@@ -71,6 +71,24 @@ PTY bytes. Review and table setup retain frozen, independently navigable
 snapshots. Reviewable announcement, error, and confirmation popups close with
 `Enter` or `Escape`; confirmations report accept and cancel separately.
 
+### tmux control mode
+
+Run `tmux -CC` from a shell inside Lector to enter the accessible control-mode
+integration. Each tmux pane keeps an independent Ghostty engine, scrollback,
+review state, and media namespace; splits, hidden windows, overlays, images,
+multiple servers, and nested SSH/tmux connections use the same compositor as
+ordinary terminal mode. Lector discovers the server's actual prefix and
+bindings instead of assuming `C-b` or `C-a`.
+
+Lector requests bounded tmux output flow control, coalesces pause/resume, and
+rebuilds pane text/history from an authoritative capture if tmux reports stale
+incremental output. A capture cannot reconstruct images, partial parser state,
+or already-consumed semantic metadata, so those limitations are explicit and
+spoken rather than guessed. Setup, bounds, performance measurements,
+troubleshooting, and recovery are in
+[docs/tmux-completion.md](docs/tmux-completion.md); prefix and chooser behavior
+is in [docs/tmux-prefix.md](docs/tmux-prefix.md).
+
 After the initial outer focus-mode ownership query, all live presentation,
 effect, bell, and lifecycle output passes through one serialized scheduler. It
 coalesces modeled scene updates at event-loop boundaries with a 4 ms latency
@@ -315,6 +333,9 @@ lector.o.suppress_key_echo = false
 
 -- interrupt speech immediately when terminal focus is lost
 lector.o.stop_speech_on_focus_loss = true
+
+-- tmux pane bells: "off" (default), "spoken", or "audible"
+lector.o.tmux_bells = "spoken"
 ```
 
 ### Simple key customization

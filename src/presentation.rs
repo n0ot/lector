@@ -991,6 +991,18 @@ fn compose_image_records(scene: &Scene) -> Vec<ComposedImage> {
                 fragment.pixel_width = upload.pixel_width;
                 fragment.pixel_height = upload.pixel_height;
             }
+            // Pane engines may not know the physical cell size even when the
+            // outer terminal does. Kitty derives a placement's rendered pixel
+            // dimensions from its cell rectangle in that case, so keep the
+            // presentation shadow in the same physical units.
+            if fragment.rendered_pixel_width == 0 && scene.geometry.cell_width_px > 0 {
+                fragment.rendered_pixel_width =
+                    u32::from(fragment.grid_rect.cols).saturating_mul(scene.geometry.cell_width_px);
+            }
+            if fragment.rendered_pixel_height == 0 && scene.geometry.cell_height_px > 0 {
+                fragment.rendered_pixel_height = u32::from(fragment.grid_rect.rows)
+                    .saturating_mul(scene.geometry.cell_height_px);
+            }
             fragment.image_id = outer_image_id;
             fragment.placement_id = allocate_outer_id(
                 stable_namespace_seed(
@@ -2468,7 +2480,16 @@ fn write_terminal_string(bytes: &mut Vec<u8>, code: u8, value: Option<&str>) {
 
 fn write_full_rows(bytes: &mut Vec<u8>, intended: &PresentedScene) {
     for (row_index, row) in intended.rows.iter().enumerate() {
+        if !row.wrapped {
+            // A hard line may legitimately occupy the final column. Disable
+            // autowrap while reconstructing it so the outer terminal does not
+            // invent a soft-wrap marker that is absent from the source scene.
+            bytes.extend_from_slice(b"\x1b[?7l");
+        }
         write_row_at(bytes, row_index, row);
+        if !row.wrapped {
+            bytes.extend_from_slice(b"\x1b[?7h");
+        }
         // Filling the final column leaves autowrap pending. One temporary cell
         // on the following row realizes Ghostty's wrap boundary; that cell is
         // overwritten when the following row is reconstructed.
@@ -2497,6 +2518,12 @@ fn write_full_rows(bytes: &mut Vec<u8>, intended: &PresentedScene) {
 
 fn write_row_at(bytes: &mut Vec<u8>, row_index: usize, row: &Row) {
     bytes.extend_from_slice(format!("\x1b[{};1H", row_index + 1).as_bytes());
+    if !row.wrapped {
+        // Repainting cells does not itself clear a pre-existing soft-wrap
+        // marker on several terminals. EL resets that row metadata before the
+        // complete hard line is reconstructed.
+        bytes.extend_from_slice(b"\x1b[2K");
+    }
     bytes.extend_from_slice(b"\x1b[0m");
     let mut active_style = Style::default();
     let mut active_link: Option<&str> = None;

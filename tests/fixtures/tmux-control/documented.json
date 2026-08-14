@@ -1,0 +1,4 @@
+{
+  "source": "tmux 3.7b manual, CONTROL MODE example plus documented notifications",
+  "stream": "\u001bP1000p%begin 1363006971 2 1\n0: ksh* (1 panes) [80x24] [layout b25f,80x24,0,0,2] @2 (active)\n%end 1363006971 2 1\n%output %7 A\\001\\134\\377Z\n%extended-output %7 42 future field : B\\000C\n%pause %7\n%continue %7\n%message fixture ready\n%exit fixture complete\n\u001b\\"
+}

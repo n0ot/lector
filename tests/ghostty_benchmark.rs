@@ -254,7 +254,15 @@ fn checked_in_release_baseline_has_regression_thresholds_for_every_workload() {
     let renderer_workloads = baseline["renderer_workloads"]
         .as_array()
         .expect("renderer baseline workloads");
-    assert_eq!(renderer_workloads.len(), 5);
+    assert_eq!(renderer_workloads.len(), 6);
+    for workload_name in ["tmux-like-structural-edits", "zellij-like-layered-redraws"] {
+        assert!(
+            renderer_workloads
+                .iter()
+                .any(|workload| workload["name"] == workload_name),
+            "missing mux comparison workload {workload_name}"
+        );
+    }
     assert!(
         renderer_workloads
             .iter()

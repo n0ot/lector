@@ -4,6 +4,12 @@ mod popup;
 mod pty;
 mod review;
 mod stack;
+mod text_input;
+mod tmux_chooser;
+mod tmux_command;
+mod tmux_connection;
+mod tmux_connections;
+mod tmux_portal;
 
 pub use lua_repl::LuaReplView;
 pub use message::MessageView;
@@ -11,6 +17,13 @@ pub use popup::{PopupResponse, PopupView};
 pub use pty::PtyView;
 pub use review::ReviewView;
 pub use stack::ViewStack;
+pub use tmux_chooser::{TmuxChooserTarget, TmuxChooserView};
+pub use tmux_command::TmuxCommandView;
+pub use tmux_connection::TmuxConnectionView;
+pub use tmux_connections::{
+    TmuxConnectionChooserView, TmuxConnectionItem, TmuxConnectionRenameView, TmuxConnectionTarget,
+};
+pub use tmux_portal::TmuxPortalView;
 
 use crate::{
     screen_reader::ScreenReader, terminal::TerminalGeometry, terminal_input::KeyInput, view::View,
@@ -44,6 +57,25 @@ pub enum ViewAction {
     Push(Box<dyn ViewController>),
     Pop,
     PopupResponse(PopupResponse),
+    ActivateTmuxConnection(u64),
+    ActivateTerminal,
+    TmuxConnectionRename {
+        connection_id: u64,
+        label: String,
+    },
+    TmuxChooserSelect {
+        connection_id: u64,
+        target: TmuxChooserTarget,
+    },
+    TmuxCommandSubmit {
+        connection_id: u64,
+        command: String,
+    },
+    TmuxInput {
+        connection_id: u64,
+        pane_id: crate::tmux_model::PaneId,
+        bytes: Vec<u8>,
+    },
     Redraw,
 }
 
@@ -55,11 +87,18 @@ pub enum ViewKind {
     Review,
     Popup,
     TableSetup,
+    TmuxConnection,
+    TmuxConnectionChooser,
+    TmuxConnectionRename,
+    TmuxChooser,
+    TmuxCommand,
+    TmuxPortal,
     Other,
 }
 
 pub trait ViewController {
     fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
     fn model(&mut self) -> &mut View;
     fn title(&self) -> &str;
     fn kind(&self) -> ViewKind {
@@ -140,6 +179,10 @@ mod tests {
 
     impl ViewController for MinimalView {
         fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
             self
         }
 

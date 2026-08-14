@@ -85,7 +85,10 @@ occlusion, clipping, media changes, wide-cell ambiguity, geometry mismatch,
 unsupported operation, or failed validation falls back to the same
 dirty-region or full-scene correctness path. The release benchmark checks
 semantic-path coverage and compares bytes and latency with a pure dirty-region
-renderer on a tmux-style structural workload.
+renderer on both a tmux-style structural workload and a Zellij-style layered
+redraw workload. Both retain an independently constructed full-redraw result as
+the correctness reference; the checked-in baseline gates semantic coverage,
+bytes, latency, scheduler bounds, peak RSS, and media throughput.
 
 OSC 8 hyperlinks remain part of the modeled cell state and are closed at every
 physical transaction boundary. Ghostty-decoded Kitty graphics live in bounded

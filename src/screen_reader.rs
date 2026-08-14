@@ -5,7 +5,7 @@ use super::{
     table::Session as TableSession,
 };
 use mlua::{Lua, WeakLua};
-use std::{collections::VecDeque, rc::Rc};
+use std::{collections::VecDeque, fmt, rc::Rc, str::FromStr};
 
 mod auto_read;
 mod hooks;
@@ -20,6 +20,41 @@ use tracking::{CursorTrackingMode, PendingDelete};
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAX_PENDING_KEY_ECHO_CHARS: usize = 256;
+
+/// How bells received from panes in a tmux control connection are presented.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TmuxBellMode {
+    /// Discard pane bells.
+    #[default]
+    Off,
+    /// Speak stable connection, session, window, and pane context.
+    Spoken,
+    /// Emit one physical BEL at a scheduler transaction boundary.
+    Audible,
+}
+
+impl fmt::Display for TmuxBellMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "off",
+            Self::Spoken => "spoken",
+            Self::Audible => "audible",
+        })
+    }
+}
+
+impl FromStr for TmuxBellMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "off" => Ok(Self::Off),
+            "spoken" => Ok(Self::Spoken),
+            "audible" => Ok(Self::Audible),
+            _ => anyhow::bail!("tmux bell mode must be off, spoken, or audible"),
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -298,6 +333,14 @@ impl ScreenReader {
 
     pub fn set_stop_speech_on_focus_loss(&mut self, value: bool) {
         self.options.set_stop_speech_on_focus_loss(value);
+    }
+
+    pub fn tmux_bell_mode(&self) -> TmuxBellMode {
+        self.options.tmux_bell_mode()
+    }
+
+    pub fn set_tmux_bell_mode(&mut self, value: TmuxBellMode) {
+        self.options.set_tmux_bell_mode(value);
     }
 
     pub(crate) fn toggle_stop_speech_on_focus_loss(&mut self) -> bool {

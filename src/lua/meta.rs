@@ -283,6 +283,7 @@ fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua
         }
         "highlight_tracking" => sr.highlight_tracking_enabled().into_lua(lua),
         "stop_speech_on_focus_loss" => sr.stop_speech_on_focus_loss().into_lua(lua),
+        "tmux_bells" => sr.tmux_bell_mode().to_string().into_lua(lua),
         _ => Err(Error::external(anyhow!("unknown option"))),
     }
     .map_err(|e| anyhow!("{}", e))
@@ -405,6 +406,17 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
                 Ok(())
             }
             _ => Err(anyhow!("value must be a boolean")),
+        },
+        "tmux_bells" => match value {
+            String(v) => {
+                let mode = v
+                    .to_str()
+                    .map_err(|e| anyhow!(e.to_string()))?
+                    .parse::<crate::screen_reader::TmuxBellMode>()?;
+                sr.set_tmux_bell_mode(mode);
+                Ok(())
+            }
+            _ => Err(anyhow!("value must be a string")),
         },
         _ => Err(anyhow!("unknown option")),
     })

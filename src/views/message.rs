@@ -28,6 +28,10 @@ impl ViewController for MessageView {
         self
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+
     fn model(&mut self) -> &mut View {
         &mut self.view
     }

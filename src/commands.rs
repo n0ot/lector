@@ -71,6 +71,20 @@ define_actions! {
     SayOverlay => ("say current overlay", "say_overlay"),
     OpenLuaRepl => ("open Lua REPL", "open_lua_repl"),
     OpenReview => ("enter review mode", "open_review"),
+    OpenTmuxConnectionChooser => (
+        "open tmux connection chooser",
+        "open_tmux_connection_chooser"
+    ),
+    RenameTmuxConnection => ("rename tmux connection", "rename_tmux_connection"),
+    OpenTmuxSessionChooser => ("open tmux session chooser", "open_tmux_session_chooser"),
+    OpenTmuxWindowChooser => ("open tmux window chooser", "open_tmux_window_chooser"),
+    OpenTmuxPaneChooser => ("open tmux pane chooser", "open_tmux_pane_chooser"),
+    OpenTmuxCommandPrompt => ("open tmux command prompt", "open_tmux_command_prompt"),
+    DetachTmuxConnection => ("gracefully detach the active tmux connection", "detach_tmux_connection"),
+    InterruptTmuxGateway => ("interrupt the active tmux gateway transport", "interrupt_tmux_gateway"),
+    ForceCloseTmuxGateway => ("force close the active tmux gateway transport", "force_close_tmux_gateway"),
+    SendTmuxSshEscapeDisconnect => ("send the SSH disconnect escape to the active tmux gateway", "send_tmux_ssh_escape_disconnect"),
+    SendTmuxSshEscapeHelp => ("send the SSH escape help sequence to the active tmux gateway", "send_tmux_ssh_escape_help"),
     PassNextKey => ("forward next key press", "pass_next_key"),
     StopSpeaking => ("stop speaking", "stop_speaking"),
     RevLinePrev => ("previous line", "review_line_prev"),
@@ -219,7 +233,20 @@ pub fn handle(
         Action::TableCharPrev => table::character_previous(sr, view),
         Action::TableCharNext => table::character_next(sr, view),
         Action::TableCharRead => table::character_read(sr, view),
-        Action::ToggleHelp | Action::OpenLuaRepl | Action::OpenReview => {
+        Action::ToggleHelp
+        | Action::OpenLuaRepl
+        | Action::OpenReview
+        | Action::OpenTmuxConnectionChooser
+        | Action::RenameTmuxConnection
+        | Action::OpenTmuxSessionChooser
+        | Action::OpenTmuxWindowChooser
+        | Action::OpenTmuxPaneChooser
+        | Action::OpenTmuxCommandPrompt
+        | Action::DetachTmuxConnection
+        | Action::InterruptTmuxGateway
+        | Action::ForceCloseTmuxGateway
+        | Action::SendTmuxSshEscapeDisconnect
+        | Action::SendTmuxSshEscapeHelp => {
             sr.speak("not implemented", false)?;
             Ok(CommandResult::Handled)
         }
@@ -228,7 +255,7 @@ pub fn handle(
 
 #[cfg(test)]
 mod tests {
-    use super::{ACTION_TABLE, builtin_action_from_name, builtin_action_name};
+    use super::{ACTION_TABLE, Action, builtin_action_from_name, builtin_action_name};
     use std::collections::HashSet;
 
     #[test]
@@ -244,6 +271,23 @@ mod tests {
             assert!(!name.is_empty());
             assert_eq!(builtin_action_name(*action), *name);
             assert_eq!(builtin_action_from_name(name), Some(*action));
+        }
+    }
+
+    #[test]
+    fn exceptional_tmux_gateway_actions_have_stable_configuration_names() {
+        for (name, action) in [
+            ("detach_tmux_connection", Action::DetachTmuxConnection),
+            ("interrupt_tmux_gateway", Action::InterruptTmuxGateway),
+            ("force_close_tmux_gateway", Action::ForceCloseTmuxGateway),
+            (
+                "send_tmux_ssh_escape_disconnect",
+                Action::SendTmuxSshEscapeDisconnect,
+            ),
+            ("send_tmux_ssh_escape_help", Action::SendTmuxSshEscapeHelp),
+        ] {
+            assert_eq!(builtin_action_from_name(name), Some(action));
+            assert_eq!(builtin_action_name(action), name);
         }
     }
 
