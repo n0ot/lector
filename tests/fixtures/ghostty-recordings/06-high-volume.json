@@ -1,0 +1,11 @@
+{
+  "name": "high-volume-scrollback",
+  "source": "sanitized line-oriented build log recording",
+  "rows": 5,
+  "cols": 32,
+  "scrollback": 16,
+  "operations": [
+    {"operation": "write", "chunks": ["001 checking core\r\n002 checking alloc\r\n003 checking std\r\n004 checking mio\r\n", "005 checking nix\r\n006 checking vte\r\n007 checking ghostty\r\n008 checking lector\r\n", "009 testing shell\r\n010 testing editor\r\n011 testing pager\r\n012 testing compiler\r\n", "013 testing harness\r\n014 testing resize\r\n015 testing effects\r\n016 finished\r\n"]}
+  ],
+  "expected_difference_classes": []
+}

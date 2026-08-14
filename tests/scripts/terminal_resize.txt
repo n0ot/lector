@@ -1,0 +1,19 @@
+Scenario: fragmented UTF-8 and OSC survive rapid geometry changes
+Given pty-stdout: \xE7\x95
+When resize: 3 10 8 16
+And pty-stdout: \x8C\x1B]2;res
+And resize: 40 120 10 20
+And resize: 4 16 9 18
+And pty-stdout: ized\x07done
+Then expect-stdout: \xE7\x95\x8C\x1B]2;resized\x07done
+And expect-root-geometry: 4 16 9 18
+And expect-screen-contains: 界done
+
+Scenario: alternate screen remains isolated across resize
+Given pty-stdout: primary
+When pty-stdout: \x1B[?1049h\x1B[Halt-hidden
+And resize: 2 8 7 14
+And pty-stdout: \x1B[?1049l
+Then expect-stdout: primary\x1B[?1049h\x1B[Halt-hidden\x1B[?1049l
+And expect-root-geometry: 2 8 7 14
+And expect-screen-contains: primary

@@ -1,5 +1,5 @@
 use super::{Error, Result, ScreenReader};
-use crate::{ext::ScreenExt, keymap::InputMode, table::TableState, view::View};
+use crate::{keymap::InputMode, table::TableState, view::View};
 use mlua::{Function, Lua, RegistryKey, Value};
 
 impl ScreenReader {

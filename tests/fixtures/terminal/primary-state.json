@@ -1,0 +1,53 @@
+{
+  "name": "primary-state",
+  "rows": 4,
+  "cols": 12,
+  "title": "characterization title",
+  "intended_scene": "Styled, linked, wide and combining text plus semantic marks, wrapping, cursor state, and input modes on the primary screen.",
+  "operations": [
+    { "operation": "process", "hex": "1B5D303B636861726163746572697A6174696F6E207469746C6507" },
+    { "operation": "process", "hex": "1B5D383B3B68747470733A2F2F6578616D706C652E746573741B5C" },
+    { "operation": "process", "hex": "1B5B313B33316D4165CC81E7958C1B5B306D" },
+    { "operation": "process", "hex": "1B5D383B3B1B5C0D0A1B5D3133333B410724201B5D3133333B4207636D64" },
+    { "operation": "process", "hex": "1B5B333B314831323334353637383930313258" },
+    { "operation": "process", "hex": "1B5B323B36481B5B3F31681B3D1B5B3F32303034681B5B3F31303030681B5B3F31303036681B5B3F32356C" }
+  ],
+  "expected": {
+    "size": { "rows": 4, "cols": 12 },
+    "rows": [
+      { "cells": [
+        { "grapheme": "A", "style": { "foreground": { "indexed": 1 }, "bold": true } },
+        { "grapheme": "é", "style": { "foreground": { "indexed": 1 }, "bold": true } },
+        { "grapheme": "界", "width": 2, "style": { "foreground": { "indexed": 1 }, "bold": true } },
+        { "width": 0, "continuation": true, "style": { "foreground": { "indexed": 1 }, "bold": true } }
+      ] },
+      { "cells": [
+        { "grapheme": "$" },
+        { "grapheme": " " },
+        { "grapheme": "c" },
+        { "grapheme": "m" },
+        { "grapheme": "d" }
+      ] },
+      { "cells": [
+        { "grapheme": "1" }, { "grapheme": "2" }, { "grapheme": "3" },
+        { "grapheme": "4" }, { "grapheme": "5" }, { "grapheme": "6" },
+        { "grapheme": "7" }, { "grapheme": "8" }, { "grapheme": "9" },
+        { "grapheme": "0" }, { "grapheme": "1" }, { "grapheme": "2" }
+      ], "wrapped": true },
+      { "cells": [{ "grapheme": "X" }] }
+    ],
+    "cursor": { "row": 1, "col": 5, "visible": false },
+    "modes": {
+      "application_keypad": true,
+      "application_cursor": true,
+      "bracketed_paste": true,
+      "mouse_protocol": "press_release",
+      "mouse_encoding": "sgr"
+    },
+    "title": "characterization title",
+    "semantic_marks": [
+      { "kind": "prompt_start", "row": 1, "col": 0 },
+      { "kind": "input_start", "row": 1, "col": 2 }
+    ]
+  }
+}

@@ -1,6 +1,5 @@
 use super::{Result, ViewAction, ViewController, ViewKind};
 use crate::{
-    perform::HistoryPosition,
     review::{
         document::{ReviewDocument, SearchDirection},
         parser::{
@@ -8,6 +7,7 @@ use crate::{
         },
     },
     screen_reader::ScreenReader,
+    terminal::HistoryPosition,
     terminal_input::KeyInput,
     view::View,
 };
@@ -135,9 +135,9 @@ impl ReviewView {
         // Keep one View alive for the lifetime of the overlay. Its application
         // cursor is the visible terminal cursor, and preserving prev_screen lets
         // the shared cursor tracker report review motions just like PTY motions.
-        self.view.clear_pending_bytes();
+        self.view.clear_update_summary();
         self.view.process_changes(&bytes);
-        self.view.clear_pending_bytes();
+        self.view.clear_update_summary();
     }
 
     fn handle_search_key(&mut self, key: Key) -> Result<ViewAction> {
@@ -645,9 +645,9 @@ fn raw_key(byte: u8) -> Key {
 mod tests {
     use super::ReviewView;
     use crate::{
-        perform::HistoryPosition,
         screen_reader::ScreenReader,
         speech,
+        terminal::HistoryPosition,
         view::View,
         views::{ViewAction, ViewController, ViewKind},
     };
@@ -674,7 +674,7 @@ mod tests {
     fn setup(text: &[u8]) -> (ReviewView, ScreenReader, Rc<RefCell<Vec<String>>>) {
         let mut source = View::new(3, 30);
         source.process_changes(text);
-        source.set_review_history_position(crate::perform::HistoryPosition { row: 0, col: 0 });
+        source.set_review_history_position(crate::terminal::HistoryPosition { row: 0, col: 0 });
         let output = Rc::new(RefCell::new(Vec::new()));
         let sr = ScreenReader::new(speech::Speech::new(Box::new(RecordingDriver(
             output.clone(),

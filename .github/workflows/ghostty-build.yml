@@ -1,0 +1,79 @@
+---
+name: Ghostty build matrix
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tier-one:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS ARM64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - name: macOS x86-64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: Linux ARM64 glibc
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: Linux x86-64 glibc
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Verify native architecture
+        run: >-
+          test "$(rustc -vV | sed -n 's/^host: //p')"
+          = "${{ matrix.target }}"
+      - name: Build and test linked Ghostty metadata
+        run: cargo ghostty-check
+      - name: Run complete suite
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --locked --all-targets --features ghostty-vt
+      - name: Run authoritative Ghostty corpus and harnesses
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo test --locked --features ghostty-vt --test ghostty_authoritative
+          cargo test --locked --features ghostty-vt --test ghostty_differential
+          cargo test --locked --features ghostty-vt --test ghostty_engine
+          cargo test --locked --features ghostty-vt --test semantic_history
+          cargo test --locked --features ghostty-vt --test terminal_effects
+          cargo test --locked --features ghostty-vt --test terminal_resize
+          cargo test --locked --features ghostty-vt --test harness
+
+  tier-two-compile:
+    name: ${{ matrix.target }} compile check
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-musl
+          - x86_64-unknown-linux-musl
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Bootstrap pinned Ghostty archive
+        run: >-
+          cargo ghostty-bootstrap --target "${{ matrix.target }}"
+          --optimize Debug
+      - name: Compile authoritative Ghostty path
+        run: >-
+          cargo check --locked --target "${{ matrix.target }}"
+          --features ghostty-vt

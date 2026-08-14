@@ -1,7 +1,9 @@
 use lector::{
-    app::{App, Clock, DIFF_DELAY},
+    app::{App, Clock, DIFF_DELAY, MAX_DIFF_DELAY},
     screen_reader::ScreenReader,
-    speech, views,
+    speech,
+    terminal::{Color, GhosttyEngine, TerminalEngine},
+    views,
 };
 use std::{cell::Cell, cell::RefCell, rc::Rc};
 
@@ -511,15 +513,15 @@ fn popping_review_resets_hidden_updates_and_later_clear_does_not_restore_snapsho
     let (mut app, mut sr, _recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
-    let mut terminal = vt100::Parser::new(24, 80, 0);
+    let mut terminal = GhosttyEngine::new_with_scrollback(24, 80, 0).expect("create render oracle");
 
     app.handle_pty(&mut sr, b"snapshot\x1B[H", &mut term_out)
         .expect("draw initial state");
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
     app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
         .expect("open review");
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
 
     app.handle_pty(&mut sr, b"\r\x1B[2Krunning one", &mut term_out)
@@ -530,15 +532,15 @@ fn popping_review_resets_hidden_updates_and_later_clear_does_not_restore_snapsho
     app.handle_stdin(&mut sr, b"\x0C", &mut pty_out, &mut term_out)
         .expect("ignore ctrl-l in review");
     assert!(pty_out.is_empty());
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
 
     app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
         .expect("close review");
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
-    assert!(terminal.screen().contents().contains("running two"));
-    assert!(!terminal.screen().contents().contains("snapshot"));
+    assert!(terminal.snapshot().contents().contains("running two"));
+    assert!(!terminal.snapshot().contents().contains("snapshot"));
 
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(!app.maybe_finalize_changes(&mut sr).expect("no stale batch"));
@@ -548,14 +550,42 @@ fn popping_review_resets_hidden_updates_and_later_clear_does_not_restore_snapsho
     assert_eq!(pty_out, b"\x0C");
     app.handle_pty(&mut sr, b"\x1B[2J\x1B[Hprompt", &mut term_out)
         .expect("application clears the screen");
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(app.maybe_finalize_changes(&mut sr).expect("finalize clear"));
 
-    assert_eq!(terminal.screen().contents().trim(), "prompt");
+    assert_eq!(terminal.snapshot().contents().trim(), "prompt");
     assert_eq!(app.debug_active_view_contents().trim(), "prompt");
     assert!(term_out.is_empty());
+}
+
+#[test]
+fn terminal_update_remains_synchronized_when_review_opens_between_fragments() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"old screen\x1B[", &mut term_out)
+        .expect("receive first terminal fragment");
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review between fragments");
+    recorder.inner.borrow_mut().speaks.clear();
+    term_out.clear();
+
+    app.handle_pty(&mut sr, b"2J\x1B[Hbackground", &mut term_out)
+        .expect("complete hidden terminal update");
+    assert!(term_out.is_empty());
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("close review");
+
+    assert!(!app.has_overlay());
+    assert_eq!(app.debug_active_view_contents().trim(), "background");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("hidden update was finalized on restore")
+    );
 }
 
 #[test]
@@ -563,15 +593,15 @@ fn popping_review_restores_hidden_alternate_screen_transitions() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
-    let mut terminal = vt100::Parser::new(24, 80, 0);
+    let mut terminal = GhosttyEngine::new_with_scrollback(24, 80, 0).expect("create render oracle");
 
     app.handle_pty(&mut sr, b"primary\x1B[H", &mut term_out)
         .expect("draw primary screen");
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
     app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
         .expect("open review");
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
 
     app.handle_pty(&mut sr, b"\x1B[?1049hfullscreen", &mut term_out)
@@ -580,14 +610,14 @@ fn popping_review_restores_hidden_alternate_screen_transitions() {
     app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
         .expect("close review onto alternate screen");
     assert!(term_out.starts_with(b"\x1B[?1049h\x1B[2J\x1B[H"));
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
-    assert!(terminal.screen().alternate_screen());
-    assert!(terminal.screen().contents().contains("fullscreen"));
+    assert!(terminal.snapshot().alternate_screen());
+    assert!(terminal.snapshot().contents().contains("fullscreen"));
 
     app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
         .expect("review alternate screen");
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
     term_out.clear();
     app.handle_pty(&mut sr, b"\x1B[?1049l\x1B[2J\x1B[Hshell", &mut term_out)
         .expect("leave alternate screen behind review");
@@ -595,10 +625,56 @@ fn popping_review_restores_hidden_alternate_screen_transitions() {
     app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
         .expect("close review onto primary screen");
     assert!(term_out.starts_with(b"\x1B[?1049l\x1B[2J\x1B[H"));
-    terminal.process(&term_out);
+    terminal.advance(&term_out).expect("advance render oracle");
 
-    assert!(!terminal.screen().alternate_screen());
-    assert_eq!(terminal.screen().contents().trim(), "shell");
+    assert!(!terminal.snapshot().alternate_screen());
+    assert_eq!(terminal.snapshot().contents().trim(), "shell");
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn popping_review_restores_the_authoritative_pen_style_before_raw_output_resumes() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let mut oracle = GhosttyEngine::new_with_scrollback(24, 80, 0).expect("create render oracle");
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[1;31m\x1B]8;;https://example.test/active\x1B\\A\x1B[?1h\x1B[?2004h",
+        &mut term_out,
+    )
+    .expect("draw styled source");
+    oracle.advance(&term_out).expect("advance render oracle");
+    term_out.clear();
+
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open review");
+    oracle.advance(&term_out).expect("render review");
+    term_out.clear();
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("close review");
+    oracle.advance(&term_out).expect("restore source view");
+    term_out.clear();
+
+    app.handle_pty(&mut sr, b"B", &mut term_out)
+        .expect("resume raw styled output");
+    oracle.advance(&term_out).expect("advance resumed output");
+
+    let actual = oracle.normalized_snapshot();
+    assert_eq!(actual.cell(0, 1).unwrap().grapheme, "B");
+    assert_eq!(
+        actual.cell(0, 1).unwrap().style.foreground,
+        Color::Indexed(1)
+    );
+    assert!(actual.cell(0, 1).unwrap().style.bold);
+    assert_eq!(
+        actual.cell(0, 1).unwrap().hyperlink.as_deref(),
+        Some("https://example.test/active")
+    );
+    assert_eq!(actual.cursor_position(), (0, 2));
+    assert!(actual.modes.application_cursor);
+    assert!(actual.modes.bracketed_paste);
     assert!(pty_out.is_empty());
 }
 
@@ -977,6 +1053,64 @@ fn key_echo_suppression_handles_typeahead_before_slow_terminal_echo() {
     }
 
     assert!(recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
+fn fragmented_cursor_update_survives_auto_read_toggle_between_fragments() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"cat -frob", &mut term_out)
+        .expect("draw initial command");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize initial command");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\t", &mut pty_out, &mut term_out)
+        .expect("request completion");
+    sr.set_auto_read_enabled(false);
+    app.handle_pty(&mut sr, b"\x1B[", &mut term_out)
+        .expect("receive partial cursor sequence");
+    sr.set_auto_read_enabled(true);
+    app.handle_pty(&mut sr, b"9D\x1B[Kcat -frobnicate-mode", &mut term_out)
+        .expect("complete cursor sequence and redraw");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize fragmented redraw");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("nicate-mode".into(), false)]
+    );
+}
+
+#[test]
+fn synchronized_output_waits_for_the_complete_screen_update_before_speaking() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1B[?2026hpartial", &mut term_out)
+        .expect("begin synchronized output");
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("defer synchronized update")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    app.handle_pty(&mut sr, b" complete\x1B[?2026l", &mut term_out)
+        .expect("end synchronized output");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize synchronized update")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("partial complete".into(), false)]
+    );
 }
 
 #[test]
@@ -2070,6 +2204,36 @@ fn pty_output_updates_root_while_overlay_remains_visible() {
     assert!(!app.has_overlay());
     assert!(app.debug_active_view_contents().contains("background"));
     assert!(String::from_utf8_lossy(&term_out).contains("background"));
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn resize_and_alternate_screen_transition_remain_live_behind_overlay() {
+    use lector::terminal::TerminalGeometry;
+
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.show_message(&mut sr, "Notice", "foreground", &mut term_out)
+        .unwrap();
+
+    term_out.clear();
+    app.handle_pty(&mut sr, b"\x1b[?1049halt-hidden", &mut term_out)
+        .unwrap();
+    assert!(term_out.is_empty());
+
+    let geometry = TerminalGeometry::new(12, 40, 9, 18);
+    app.on_resize_with_geometry(geometry, &mut term_out)
+        .unwrap();
+    assert_eq!(app.debug_root_terminal_geometry(), geometry);
+    assert!(String::from_utf8_lossy(&term_out).contains("foreground"));
+
+    term_out.clear();
+    app.handle_stdin(&mut sr, b"\n", &mut pty_out, &mut term_out)
+        .unwrap();
+    assert!(!app.has_overlay());
+    assert!(term_out.windows(8).any(|bytes| bytes == b"\x1b[?1049h"));
+    assert!(app.debug_active_view_contents().contains("alt-hidden"));
     assert!(pty_out.is_empty());
 }
 

@@ -1,5 +1,5 @@
 use super::{Result, ViewAction, ViewController, ViewKind};
-use crate::{screen_reader::ScreenReader, view::View};
+use crate::{screen_reader::ScreenReader, terminal::TerminalGeometry, view::View};
 use std::any::Any;
 use std::io::Write;
 
@@ -9,9 +9,13 @@ pub struct PtyView {
 
 impl PtyView {
     pub fn new(rows: u16, cols: u16) -> Self {
-        Self {
-            view: View::new(rows, cols),
-        }
+        Self::new_with_geometry(TerminalGeometry::from_cells(rows, cols))
+    }
+
+    pub fn new_with_geometry(geometry: TerminalGeometry) -> Self {
+        let mut view = View::new(geometry.rows, geometry.cols);
+        view.set_size_with_geometry(geometry);
+        Self { view }
     }
 }
 
@@ -66,6 +70,10 @@ impl ViewController for PtyView {
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
         self.view.set_size(rows, cols);
+    }
+
+    fn on_resize_with_geometry(&mut self, geometry: TerminalGeometry) {
+        self.view.set_size_with_geometry(geometry);
     }
 }
 

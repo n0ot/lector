@@ -41,3 +41,38 @@ fn harness_script_command_modes() {
     let mut harness = Harness::new(24, 80).expect("create harness");
     harness.run_script(script).expect("run script");
 }
+
+#[test]
+fn harness_script_semantic_history() {
+    let script = include_str!("scripts/semantic_history.txt");
+    let mut harness = Harness::new(24, 80).expect("create harness");
+    harness.run_script(script).expect("run script");
+}
+
+#[test]
+fn harness_script_auto_read() {
+    let script = include_str!("scripts/auto_read.txt");
+    let mut harness = Harness::new(24, 80).expect("create harness");
+    harness.run_script(script).expect("run script");
+}
+
+#[test]
+fn harness_script_terminal_effects_and_modes() {
+    let script = include_str!("scripts/terminal_effects_and_modes.txt");
+    let mut harness = Harness::new(24, 80).expect("create harness");
+    harness.run_script(script).expect("run script");
+}
+
+#[test]
+fn harness_script_terminal_resize() {
+    let script = include_str!("scripts/terminal_resize.txt");
+    let mut harness = Harness::new(24, 80).expect("create harness");
+    harness.run_script(script).expect("run script");
+}
+
+#[test]
+fn harness_script_terminal_differential_corpus() {
+    let script = include_str!("scripts/terminal_differential_corpus.txt");
+    let mut harness = Harness::new(24, 80).expect("create harness");
+    harness.run_script(script).expect("run script");
+}

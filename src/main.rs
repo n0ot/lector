@@ -1,14 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
-use lector::{app, lua, platform, screen_reader::ScreenReader, speech, views};
+use lector::{app, lua, platform, pty, screen_reader::ScreenReader, speech, views};
 use nix::sys::termios;
-use ptyprocess::{PtyProcess, Signal};
 use signal_hook::consts::signal::*;
 use signal_hook_mio::v1_0::Signals;
 use std::{
     io::{ErrorKind, Read, Write},
-    os::fd::AsRawFd,
-    process::Command,
+    os::fd::{AsFd, AsRawFd},
     time,
 };
 
@@ -189,7 +187,22 @@ enum SpeechDriverKind {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let term_size = termsize::get().ok_or_else(|| anyhow!("cannot get terminal size"))?;
+    let terminal_geometry =
+        pty::terminal_geometry(std::io::stdin().as_raw_fd()).context("cannot get terminal size")?;
+
+    // Keep PTY creation ahead of anything that may start threads. The macOS
+    // AVFoundation speech backend owns its synthesizer on a dedicated thread,
+    // and Unix PTY launchers still require a small post-fork setup window.
+    let init_term_attrs =
+        termios::tcgetattr(std::io::stdin().as_fd()).context("read terminal settings")?;
+    let mut process = pty::Process::spawn_with_geometry(
+        &cli.shell,
+        std::iter::empty::<&str>(),
+        terminal_geometry,
+        &init_term_attrs,
+    )
+    .context("spawn child process")?;
+
     let speech_driver: Box<dyn speech::Driver> = match cli.speech_driver {
         SpeechDriverKind::Tts => {
             Box::new(speech::tts::TtsDriver::new().context("create tts driver")?)
@@ -203,25 +216,11 @@ fn main() -> Result<()> {
     };
     let speech = speech::Speech::new(speech_driver);
     let mut screen_reader = ScreenReader::new(speech);
-    let view_stack = views::ViewStack::new(Box::new(views::PtyView::new(
-        term_size.rows,
-        term_size.cols,
+    let view_stack = views::ViewStack::new(Box::new(views::PtyView::new_with_geometry(
+        terminal_geometry,
     )));
     let mut app = app::App::new(view_stack)?;
     app.set_logging(cli.log);
-
-    let init_term_attrs = termios::tcgetattr(std::io::stdin().as_raw_fd())?;
-    // Spawn the child process, connect it to a PTY,
-    // and set the PTY to match the current terminal attributes.
-    let mut process = PtyProcess::spawn(Command::new(cli.shell)).context("spawn child process")?;
-    process
-        .set_window_size(term_size.cols, term_size.rows)
-        .context("resize PTY")?;
-    termios::tcsetattr(
-        process.get_raw_handle()?.as_raw_fd(),
-        termios::SetArg::TCSADRAIN,
-        &init_term_attrs,
-    )?;
 
     let mut conf_dir = dirs::config_dir().ok_or_else(|| anyhow!("cannot get config directory"))?;
     conf_dir.push("lector");
@@ -245,27 +244,26 @@ fn main() -> Result<()> {
     };
     // Clean up before returning the above result.
     if let Err(err) = termios::tcsetattr(
-        std::io::stdin().as_raw_fd(),
+        std::io::stdin().as_fd(),
         termios::SetArg::TCSADRAIN,
         &init_term_attrs,
     ) {
         eprintln!("failed to restore terminal settings: {err}");
     }
-    let _ = process.kill(ptyprocess::Signal::SIGKILL);
-    let _ = process.wait();
+    process.terminate();
     result.map_err(|e| anyhow!("{}", e))
 }
 
 fn do_events(
     sr: &mut ScreenReader,
     app: &mut app::App,
-    process: &mut ptyprocess::PtyProcess,
+    process: &mut pty::Process,
     initial_message: Option<String>,
 ) -> Result<()> {
-    let mut pty_stream = process.get_pty_stream().context("get PTY stream")?;
+    let mut pty_stream = process.stream().context("get PTY stream")?;
     // Set stdin to raw, so that input is read character by character,
     // and so that signals like SIGINT aren't send when pressing keys like ^C.
-    ptyprocess::set_raw(0).context("set STDIN to raw")?;
+    pty::set_raw(std::io::stdin().as_raw_fd()).context("set STDIN to raw")?;
 
     // Set up a mio poll, to select between reading from stdin, and the PTY.
     let mut signals = Signals::new([SIGWINCH])?;
@@ -336,13 +334,10 @@ fn do_events(
                     for signal in signals.pending() {
                         match signal {
                             SIGWINCH => {
-                                let term_size = termsize::get()
-                                    .ok_or_else(|| anyhow!("cannot get terminal size"))?;
-                                process
-                                    .set_window_size(term_size.cols, term_size.rows)
-                                    .context("resize PTY")?;
-                                process.signal(Signal::SIGWINCH)?;
-                                app.on_resize(term_size.rows, term_size.cols, &mut stdout)?;
+                                let geometry =
+                                    pty::terminal_geometry(std::io::stdin().as_raw_fd())?;
+                                process.resize_with_geometry(geometry)?;
+                                app.on_resize_with_geometry(geometry, &mut stdout)?;
                             }
                             _ => unreachable!("unknown signal"),
                         }

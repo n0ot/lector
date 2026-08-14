@@ -509,11 +509,11 @@ static RGB_INDEX: phf::Map<&str, u8> = phf_map! {
     "#626262" => 241,
 };
 
-pub fn describe_color(color: vt100::Color) -> String {
-    use vt100::Color::*;
+pub fn describe_color(color: crate::terminal::Color) -> String {
+    use crate::terminal::Color::*;
     match color {
         Default => "default".into(),
-        Idx(i) => match COLORS.get(&i) {
+        Indexed(i) => match COLORS.get(&i) {
             Some(s) => s.to_string(),
             None => "unknown".into(),
         },
@@ -533,13 +533,13 @@ pub fn describe_color(color: vt100::Color) -> String {
 #[cfg(test)]
 mod tests {
     use super::describe_color;
-    use vt100::Color;
+    use crate::terminal::Color;
 
     #[test]
     fn describes_default_indexed_and_rgb_colors() {
         assert_eq!(describe_color(Color::Default), "default");
-        assert_eq!(describe_color(Color::Idx(0)), "Black");
-        assert_eq!(describe_color(Color::Idx(255)), "Grey93");
+        assert_eq!(describe_color(Color::Indexed(0)), "Black");
+        assert_eq!(describe_color(Color::Indexed(255)), "Grey93");
         assert_eq!(describe_color(Color::Rgb(0, 0, 0)), "Black");
         assert_eq!(describe_color(Color::Rgb(255, 0, 0)), "Red1");
     }

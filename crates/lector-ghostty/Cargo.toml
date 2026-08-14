@@ -1,0 +1,16 @@
+[package]
+name = "lector-ghostty"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+links = "ghostty-vt"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+vte = "0.15.0"

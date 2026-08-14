@@ -232,7 +232,7 @@ pub(super) fn read_attributes(sr: &mut ScreenReader, view: &View) -> Result<Comm
     attrs.push_str(&format!(
         "{} {}",
         attributes::describe_color(cell.fgcolor()),
-        if let vt100::Color::Default = cell.bgcolor() {
+        if let crate::terminal::Color::Default = cell.bgcolor() {
             "".into()
         } else {
             format!("on {}", attributes::describe_color(cell.bgcolor()))

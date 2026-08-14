@@ -1,0 +1,23 @@
+{
+  "name": "scrollback-and-resize",
+  "rows": 3,
+  "cols": 6,
+  "intended_scene": "Primary-screen history survives scrolling and a wider resize while the live cursor and viewport remain normalized.",
+  "operations": [
+    { "operation": "process", "hex": "6F6E650D0A74776F0D0A74687265650D0A666F7572" },
+    { "operation": "resize", "rows": 3, "cols": 8 }
+  ],
+  "expected": {
+    "size": { "rows": 3, "cols": 8 },
+    "rows": [
+      { "cells": [{ "grapheme": "t" }, { "grapheme": "w" }, { "grapheme": "o" }] },
+      { "cells": [{ "grapheme": "t" }, { "grapheme": "h" }, { "grapheme": "r" }, { "grapheme": "e" }, { "grapheme": "e" }] },
+      { "cells": [{ "grapheme": "f" }, { "grapheme": "o" }, { "grapheme": "u" }, { "grapheme": "r" }] }
+    ],
+    "scrollback": [
+      { "cells": [{ "grapheme": "o" }, { "grapheme": "n" }, { "grapheme": "e" }] }
+    ],
+    "cursor": { "row": 2, "col": 4, "visible": true },
+    "modes": { "mouse_protocol": "none", "mouse_encoding": "default" }
+  }
+}

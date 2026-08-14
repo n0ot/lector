@@ -1,14 +1,12 @@
 use super::{Result, ScreenReader};
-use crate::{perform, view::View};
+use crate::view::View;
 use similar::{Algorithm, ChangeTag, TextDiff};
-use std::fmt::Write;
 
 #[derive(Default)]
 pub(super) struct AutoReadBuffers {
     diff_text: String,
     graphemes: String,
     live_text: String,
-    cursor_move: String,
     lcs: Vec<usize>,
 }
 
@@ -21,47 +19,26 @@ enum DiffState {
 }
 
 impl ScreenReader {
-    pub fn auto_read(&mut self, view: &mut View, reporter: &mut perform::Reporter) -> Result<bool> {
-        self.auto_read_impl(view, reporter, false)
+    pub fn auto_read(&mut self, view: &mut View) -> Result<bool> {
+        self.auto_read_impl(view, false)
     }
 
-    pub(crate) fn auto_read_after_input(
-        &mut self,
-        view: &mut View,
-        reporter: &mut perform::Reporter,
-    ) -> Result<bool> {
-        self.auto_read_impl(view, reporter, true)
+    pub(crate) fn auto_read_after_input(&mut self, view: &mut View) -> Result<bool> {
+        self.auto_read_impl(view, true)
     }
 
-    fn auto_read_impl(
-        &mut self,
-        view: &mut View,
-        reporter: &mut perform::Reporter,
-        prefer_cursor: bool,
-    ) -> Result<bool> {
+    fn auto_read_impl(&mut self, view: &mut View, prefer_cursor: bool) -> Result<bool> {
         self.report_application_cursor_indentation_changes(view)?;
         if view.screen().contents() == view.prev_screen().contents() {
             return Ok(false);
         }
 
-        let cursor_moves = reporter.cursor_moves;
-        let scrolled = reporter.scrolled;
-        reporter.reset();
+        let cursor_moves = view.update_summary().cursor_operations;
+        let scrolled = view.update_summary().scroll_operations > 0;
+        let changed_row_ranges = view.update_summary().changed_rows.clone();
 
         let mut live_text = std::mem::take(&mut self.auto_read_buffers.live_text);
-        live_text.clear();
-        if !view.pending_bytes().is_empty() {
-            let (rows, cols) = view.size();
-            let mut parser = vt100::Parser::new(rows * 10, cols, 0);
-            let mut cursor_move = std::mem::take(&mut self.auto_read_buffers.cursor_move);
-            cursor_move.clear();
-            write!(&mut cursor_move, "\x1B[{}B", rows * 10)
-                .expect("writing to a String cannot fail");
-            parser.process(cursor_move.as_bytes());
-            parser.process(view.pending_bytes());
-            live_text = parser.screen().contents();
-            self.auto_read_buffers.cursor_move = cursor_move;
-        }
+        view.update_summary().printed_text_into(&mut live_text);
 
         let mut live_read_result = None;
         {
@@ -108,11 +85,12 @@ impl ScreenReader {
             .is_some_and(|(prev, curr)| prev != curr);
         let (single_changed_row, multiple_changed_rows) = if prev_hashes.len() == curr_hashes.len()
         {
-            let mut changed_rows = prev_hashes
+            let mut changed_rows = changed_row_ranges
                 .iter()
-                .zip(curr_hashes)
-                .enumerate()
-                .filter_map(|(row, (prev, curr))| (prev != curr).then_some(row as u16));
+                .flat_map(|range| range.clone())
+                .filter(|row| {
+                    prev_hashes.get(usize::from(*row)) != curr_hashes.get(usize::from(*row))
+                });
             match (changed_rows.next(), changed_rows.next()) {
                 (Some(row), None) => (Some(row), false),
                 (_, Some(_)) => (None, true),

@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "target": "aarch64-apple-darwin",
+  "recorded_at": "2026-08-13",
+  "environment": {
+    "ghostty_version": "0.1.0-dev",
+    "ghostty_commit": "43fe699071c7dceb161dc3b0c04fce46ade36174",
+    "rust": "rustc 1.99.0-nightly (3d6c19bb9 2026-08-11)",
+    "os": "macOS 26.5.2 (25F84)",
+    "hardware": "Apple ARM64 T6000"
+  },
+  "workloads": [
+    {
+      "name": "shell-and-semantic-prompts",
+      "measured": {
+        "throughput_mib_per_second": 0.3858996040358491,
+        "allocations": 795976,
+        "allocated_bytes": 1981620544,
+        "peak_rss_bytes": 11468800,
+        "latency_p95_ns": 168125,
+        "scrollback_extent": 0
+      },
+      "limits": {
+        "minimum_throughput_mib_per_second": 0.19,
+        "maximum_latency_p95_ns": 400000,
+        "maximum_allocations": 1200000,
+        "maximum_allocated_bytes": 3000000000,
+        "maximum_peak_rss_bytes": 33554432,
+        "minimum_scrollback_extent": 0
+      }
+    },
+    {
+      "name": "control-heavy-redraw",
+      "measured": {
+        "throughput_mib_per_second": 0.538119911954274,
+        "allocations": 6803675,
+        "allocated_bytes": 2542764032,
+        "peak_rss_bytes": 12517376,
+        "latency_p95_ns": 70291,
+        "scrollback_extent": 0
+      },
+      "limits": {
+        "minimum_throughput_mib_per_second": 0.25,
+        "maximum_latency_p95_ns": 200000,
+        "maximum_allocations": 10000000,
+        "maximum_allocated_bytes": 4000000000,
+        "maximum_peak_rss_bytes": 33554432,
+        "minimum_scrollback_extent": 0
+      }
+    },
+    {
+      "name": "bounded-scrollback",
+      "measured": {
+        "throughput_mib_per_second": 0.4511151767977291,
+        "allocations": 36260398,
+        "allocated_bytes": 5011352098,
+        "peak_rss_bytes": 25395200,
+        "latency_p95_ns": 86875,
+        "scrollback_extent": 10000
+      },
+      "limits": {
+        "minimum_throughput_mib_per_second": 0.20,
+        "maximum_latency_p95_ns": 250000,
+        "maximum_allocations": 55000000,
+        "maximum_allocated_bytes": 8000000000,
+        "maximum_peak_rss_bytes": 33554432,
+        "minimum_scrollback_extent": 10000
+      }
+    }
+  ]
+}

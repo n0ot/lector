@@ -1,0 +1,11 @@
+{
+  "name": "wide-tail-metadata",
+  "source": "regression extracted from the Phase 0 primary-state fixture; Ghostty retains the wide-cell head style and hyperlink on its continuation cell",
+  "rows": 2,
+  "cols": 8,
+  "scrollback": 16,
+  "operations": [
+    {"operation": "write", "chunks": ["\u001b]8;;https://example.test\u001b\\", "\u001b[1;31mA界\u001b[0m", "\u001b]8;;\u001b\\"]}
+  ],
+  "expected_difference_classes": ["ghostty_correctness_improvement"]
+}

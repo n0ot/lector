@@ -1,5 +1,8 @@
 use crate::{
-    perform::{HistoryPosition, Osc133Kind, Osc133Mark},
+    terminal::{
+        Color, HistoryPosition, SemanticKind as Osc133Kind, SemanticMark as Osc133Mark, Style,
+        TerminalSnapshot,
+    },
     view::View,
 };
 use regex::RegexBuilder;
@@ -9,6 +12,7 @@ use std::ops::Range;
 struct Cell {
     text: String,
     wide_continuation: bool,
+    style: Style,
 }
 
 #[derive(Clone, Debug)]
@@ -49,10 +53,8 @@ impl SearchDirection {
 /// A frozen, addressable copy of a terminal view and all of its retained
 /// scrollback. The source `View` and its parser are never consulted again.
 pub(crate) struct ReviewDocument {
-    screen: vt100::Screen,
     rows: Vec<Row>,
     marks: Vec<Osc133Mark>,
-    history_len: usize,
     capture_cols: u16,
     alternate_screen: bool,
     flat_text: String,
@@ -66,33 +68,34 @@ impl ReviewDocument {
         let (capture_rows, capture_cols) = view.size();
         let initial = view.review_history_position();
         let initial_top = history_len.saturating_sub(view.scrollback());
-        let alternate_screen = view.screen().alternate_screen();
-        let marks = view.osc133_marks().to_vec();
-        let mut screen = view.screen().clone();
-        let mut rows = Vec::with_capacity(history_len + usize::from(capture_rows));
+        let snapshot = view.snapshot_with_history();
+        let document = Self::from_snapshot(snapshot, capture_cols);
+        let initial = document.clamp(initial);
+        let max_top = document.max_viewport_top(usize::from(capture_rows));
+        (document, initial, initial_top.min(max_top))
+    }
 
-        for absolute_row in 0..history_len + usize::from(capture_rows) {
-            let (offset, visible_row) = if absolute_row < history_len {
-                (history_len - absolute_row, 0)
-            } else {
-                (0, (absolute_row - history_len) as u16)
-            };
-            screen.set_scrollback(offset);
+    pub(crate) fn from_snapshot(snapshot: TerminalSnapshot, capture_cols: u16) -> Self {
+        let alternate_screen = snapshot.alternate_screen();
+        let marks = snapshot.semantic_marks.clone();
+        let mut rows = Vec::with_capacity(snapshot.scrollback.len() + snapshot.rows.len());
+        for source_row in snapshot.scrollback.iter().chain(&snapshot.rows) {
             let mut cells = Vec::with_capacity(usize::from(capture_cols));
             let mut end = 0;
             for col in 0..capture_cols {
-                let cell = screen.cell(visible_row, col);
-                let text = cell.map_or("", vt100::Cell::contents).to_string();
-                let wide_continuation = cell.is_some_and(vt100::Cell::is_wide_continuation);
+                let cell = source_row.cells.get(usize::from(col));
+                let text = cell.map_or("", |cell| cell.contents()).to_string();
+                let wide_continuation = cell.is_some_and(|cell| cell.is_wide_continuation());
                 if !text.is_empty() || wide_continuation {
                     end = col.saturating_add(1);
                 }
                 cells.push(Cell {
                     text,
                     wide_continuation,
+                    style: cell.map_or_else(Style::default, |cell| cell.style.clone()),
                 });
             }
-            let wrapped = screen.row_wrapped(visible_row);
+            let wrapped = source_row.wrapped;
             if wrapped {
                 end = capture_cols;
             }
@@ -102,13 +105,9 @@ impl ReviewDocument {
                 end,
             });
         }
-        screen.set_scrollback(0);
-
         let mut document = Self {
-            screen,
             rows,
             marks,
-            history_len,
             capture_cols,
             alternate_screen,
             flat_text: String::new(),
@@ -116,9 +115,7 @@ impl ReviewDocument {
             positions: Vec::new(),
         };
         document.build_search_text();
-        let initial = document.clamp(initial);
-        let max_top = document.max_viewport_top(usize::from(capture_rows));
-        (document, initial, initial_top.min(max_top))
+        document
     }
 
     #[cfg(test)]
@@ -217,14 +214,18 @@ impl ReviewDocument {
                 if position.col >= last {
                     break;
                 }
-                position.col += 1;
-                while position.col < last
+                let mut next = position.col + 1;
+                while next <= last
                     && self
-                        .cell(position.row, position.col)
+                        .cell(position.row, next)
                         .is_some_and(|cell| cell.wide_continuation)
                 {
-                    position.col += 1;
+                    next += 1;
                 }
+                if next > last {
+                    break;
+                }
+                position.col = next;
             } else {
                 if position.col == 0 {
                     break;
@@ -729,27 +730,76 @@ impl ReviewDocument {
             .and_then(|index| self.positions.get(index).copied())
     }
 
-    pub(crate) fn formatted_row(&mut self, absolute_row: usize, width: u16) -> Vec<u8> {
-        if absolute_row >= self.row_count() {
+    pub(crate) fn formatted_row(&self, absolute_row: usize, width: u16) -> Vec<u8> {
+        let Some(row) = self.rows.get(absolute_row) else {
             return Vec::new();
-        }
-        let (offset, visible_row) = if absolute_row < self.history_len {
-            (self.history_len - absolute_row, 0usize)
-        } else {
-            (0, absolute_row - self.history_len)
         };
-        self.screen.set_scrollback(offset);
-        self.screen
-            .rows_formatted(0, width.min(self.capture_cols))
-            .nth(visible_row)
-            .unwrap_or_default()
+        let mut bytes = Vec::new();
+        let mut style = Style::default();
+        for cell in row
+            .cells
+            .iter()
+            .take(usize::from(width.min(self.capture_cols)))
+        {
+            if cell.wide_continuation {
+                continue;
+            }
+            if cell.style != style {
+                write_style(&mut bytes, &cell.style);
+                style = cell.style.clone();
+            }
+            if cell.text.is_empty() {
+                bytes.push(b' ');
+            } else {
+                bytes.extend_from_slice(cell.text.as_bytes());
+            }
+        }
+        bytes
+    }
+}
+
+fn write_style(bytes: &mut Vec<u8>, style: &Style) {
+    bytes.extend_from_slice(b"\x1B[0");
+    if style.bold {
+        bytes.extend_from_slice(b";1");
+    }
+    if style.dim {
+        bytes.extend_from_slice(b";2");
+    }
+    if style.italic {
+        bytes.extend_from_slice(b";3");
+    }
+    if style.underline {
+        bytes.extend_from_slice(b";4");
+    }
+    if style.inverse {
+        bytes.extend_from_slice(b";7");
+    }
+    write_color(bytes, style.foreground, true);
+    write_color(bytes, style.background, false);
+    bytes.push(b'm');
+}
+
+fn write_color(bytes: &mut Vec<u8>, color: Color, foreground: bool) {
+    match color {
+        Color::Default => {}
+        Color::Indexed(index) => bytes.extend_from_slice(
+            format!(";{};5;{index}", if foreground { 38 } else { 48 }).as_bytes(),
+        ),
+        Color::Rgb(red, green, blue) => bytes.extend_from_slice(
+            format!(
+                ";{};2;{red};{green};{blue}",
+                if foreground { 38 } else { 48 }
+            )
+            .as_bytes(),
+        ),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ReviewDocument, SearchDirection, WordMove, WordStyle};
-    use crate::{perform::HistoryPosition, view::View};
+    use crate::{terminal::HistoryPosition, view::View};
 
     fn pos(row: usize, col: u16) -> HistoryPosition {
         HistoryPosition { row, col }
@@ -841,5 +891,84 @@ mod tests {
             document.yank_range(pos(1, 0), pos(2, 1), false),
             Some("f\nxy".into())
         );
+    }
+
+    #[test]
+    fn horizontal_motion_never_lands_on_a_double_width_tail() {
+        let document = ReviewDocument::from_text(1, 8, "a界b".as_bytes());
+        assert_eq!(
+            document.move_horizontal(pos(0, 0), true, 1),
+            Some(pos(0, 1))
+        );
+        assert_eq!(
+            document.move_horizontal(pos(0, 1), true, 1),
+            Some(pos(0, 3))
+        );
+        assert_eq!(
+            document.move_horizontal(pos(0, 3), false, 1),
+            Some(pos(0, 1))
+        );
+
+        let document = ReviewDocument::from_text(1, 3, "a界".as_bytes());
+        assert_eq!(document.move_horizontal(pos(0, 1), true, 1), None);
+    }
+
+    #[test]
+    fn ghostty_backed_document_preserves_history_unicode_styles_and_copying() {
+        use crate::terminal::GhosttyEngine;
+
+        let mut engine =
+            GhosttyEngine::new_with_scrollback(3, 12, 20).expect("create Ghostty engine");
+        engine
+            .advance("old\r\n\x1b[31mwide 界\x1b[0m\r\nlive e\u{301}\r\nfinal".as_bytes())
+            .expect("advance review fixture");
+        let snapshot = engine
+            .normalized_snapshot_with_history()
+            .expect("capture Ghostty history");
+        let document = ReviewDocument::from_snapshot(snapshot, 12);
+
+        assert_eq!(document.line_text(0), "old");
+        assert_eq!(document.line_text(1), "wide 界");
+        assert_eq!(document.line_text(2), "live e\u{301}");
+        assert_eq!(document.line_text(3), "final");
+        assert_eq!(document.move_horizontal(pos(1, 5), true, 1), None);
+        assert_eq!(
+            document.move_word(pos(0, 0), WordMove::ForwardStart, WordStyle::Word, 1),
+            Some(pos(1, 0))
+        );
+        assert_eq!(
+            document.search("final", pos(0, 0), SearchDirection::Forward, 1),
+            Some(pos(3, 0))
+        );
+        assert_eq!(
+            document.yank_range(pos(0, 0), pos(3, 4), false),
+            Some("old\nwide 界\nlive e\u{301}\nfinal".into())
+        );
+        assert!(
+            document
+                .formatted_row(1, 12)
+                .starts_with(b"\x1b[0;38;5;1mwide")
+        );
+
+        engine.advance(b"\r\nnew output").unwrap();
+        assert_eq!(document.line_text(0), "old");
+        assert_eq!(document.row_count(), 4);
+    }
+
+    #[test]
+    fn ghostty_backed_document_navigates_exact_semantic_prompts() {
+        use crate::terminal::GhosttyEngine;
+
+        let mut engine = GhosttyEngine::new_with_scrollback(3, 16, 20).unwrap();
+        engine
+            .advance(
+                b"\x1b]133;A\x07$ \x1b]133;B\x07one\x1b]133;C\x07\r\nout\x1b]133;D;0\x07\r\n\x1b]133;A\x07$ ",
+            )
+            .unwrap();
+        let document =
+            ReviewDocument::from_snapshot(engine.normalized_snapshot_with_history().unwrap(), 16);
+
+        assert_eq!(document.prompt(pos(0, 1), true, 1), Some(pos(2, 0)));
+        assert_eq!(document.prompt(pos(2, 0), false, 1), Some(pos(0, 0)));
     }
 }

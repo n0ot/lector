@@ -1,5 +1,9 @@
 use super::{CommandResult, Result};
-use crate::{screen_reader::ScreenReader, view::View};
+use crate::{
+    screen_reader::ScreenReader,
+    terminal::{MouseEncoding, MouseProtocol},
+    view::View,
+};
 
 #[derive(Copy, Clone)]
 pub(super) enum Button {
@@ -9,7 +13,7 @@ pub(super) enum Button {
 
 pub(super) fn click(sr: &mut ScreenReader, view: &View, button: Button) -> Result<CommandResult> {
     let screen = view.screen();
-    if screen.mouse_protocol_mode() == vt100::MouseProtocolMode::None {
+    if screen.mouse_protocol_mode() == MouseProtocol::None {
         sr.speak("mouse input unavailable", false)?;
         return Ok(CommandResult::Handled);
     }
@@ -28,8 +32,8 @@ pub(super) fn click(sr: &mut ScreenReader, view: &View, button: Button) -> Resul
 }
 
 fn encode_click(
-    mode: vt100::MouseProtocolMode,
-    encoding: vt100::MouseProtocolEncoding,
+    mode: MouseProtocol,
+    encoding: MouseEncoding,
     button: Button,
     (row, col): (u16, u16),
 ) -> Option<Vec<u8>> {
@@ -37,11 +41,11 @@ fn encode_click(
         Button::Left => 0,
         Button::Right => 2,
     };
-    let include_release = mode != vt100::MouseProtocolMode::Press;
+    let include_release = mode != MouseProtocol::Press;
     let mut input = Vec::new();
 
     match encoding {
-        vt100::MouseProtocolEncoding::Sgr => {
+        MouseEncoding::Sgr => {
             input.extend_from_slice(
                 format!(
                     "\x1B[<{button_code};{};{}M",
@@ -61,7 +65,7 @@ fn encode_click(
                 );
             }
         }
-        vt100::MouseProtocolEncoding::Default => {
+        MouseEncoding::Default => {
             let col = u8::try_from(u32::from(col) + 33).ok()?;
             let row = u8::try_from(u32::from(row) + 33).ok()?;
             input.extend_from_slice(&[0x1B, b'[', b'M', button_code + 32, col, row]);
@@ -69,7 +73,7 @@ fn encode_click(
                 input.extend_from_slice(&[0x1B, b'[', b'M', 35, col, row]);
             }
         }
-        vt100::MouseProtocolEncoding::Utf8 => {
+        MouseEncoding::Utf8 => {
             let col = char::from_u32(u32::from(col) + 33)?;
             let row = char::from_u32(u32::from(row) + 33)?;
             let mut col_buf = [0; 4];
@@ -94,13 +98,13 @@ fn encode_click(
 #[cfg(test)]
 mod tests {
     use super::{Button, encode_click};
-    use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+    use crate::terminal::{MouseEncoding, MouseProtocol};
 
     #[test]
     fn encodes_sgr_left_click_with_one_based_coordinates() {
         let input = encode_click(
-            MouseProtocolMode::PressRelease,
-            MouseProtocolEncoding::Sgr,
+            MouseProtocol::PressRelease,
+            MouseEncoding::Sgr,
             Button::Left,
             (4, 7),
         )
@@ -111,8 +115,8 @@ mod tests {
     #[test]
     fn encodes_sgr_right_click() {
         let input = encode_click(
-            MouseProtocolMode::ButtonMotion,
-            MouseProtocolEncoding::Sgr,
+            MouseProtocol::ButtonMotion,
+            MouseEncoding::Sgr,
             Button::Right,
             (0, 0),
         )
@@ -123,8 +127,8 @@ mod tests {
     #[test]
     fn x10_mode_sends_only_button_press() {
         let input = encode_click(
-            MouseProtocolMode::Press,
-            MouseProtocolEncoding::Default,
+            MouseProtocol::Press,
+            MouseEncoding::Default,
             Button::Left,
             (1, 2),
         )
@@ -136,8 +140,8 @@ mod tests {
     fn default_encoding_rejects_coordinates_it_cannot_represent() {
         assert!(
             encode_click(
-                MouseProtocolMode::PressRelease,
-                MouseProtocolEncoding::Default,
+                MouseProtocol::PressRelease,
+                MouseEncoding::Default,
                 Button::Left,
                 (0, 223),
             )
@@ -148,8 +152,8 @@ mod tests {
     #[test]
     fn encodes_utf8_mouse_click() {
         let input = encode_click(
-            MouseProtocolMode::PressRelease,
-            MouseProtocolEncoding::Utf8,
+            MouseProtocol::PressRelease,
+            MouseEncoding::Utf8,
             Button::Right,
             (95, 95),
         )

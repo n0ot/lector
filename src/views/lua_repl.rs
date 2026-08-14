@@ -196,9 +196,9 @@ impl LuaReplView {
         }
         bytes.extend_from_slice(format!("\x1B[{};{}H", cursor_row, cursor_col).as_bytes());
 
-        self.view.clear_pending_bytes();
+        self.view.clear_update_summary();
         self.view.process_changes(&bytes);
-        self.view.clear_pending_bytes();
+        self.view.clear_update_summary();
         self.rendered_input = self.editor.input().to_string();
         self.rendered_cursor = self.editor.cursor();
     }
@@ -500,7 +500,7 @@ fn display_grapheme(grapheme: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{CLOSE_HINT, LuaReplView, truncate_to_width, visible_input_window};
-    use crate::{perform, screen_reader::ScreenReader, speech, views::ViewController};
+    use crate::{screen_reader::ScreenReader, speech, views::ViewController};
     use std::{cell::RefCell, rc::Rc};
 
     struct TestDriver {
@@ -578,16 +578,12 @@ mod tests {
     fn lua_repl_auto_read_speaks_incoming_output_without_banner() {
         let mut repl = LuaReplView::new(6, 30, Vec::new()).expect("create lua repl");
         let (mut sr, speaks) = make_screen_reader();
-        let mut reporter = perform::Reporter::new();
-
         repl.model().finalize_changes(0);
         let added = repl.append_output("alpha\nbeta\ngamma\ndelta");
         repl.write_output_lines(&added);
         repl.write_prompt();
 
-        let read = sr
-            .auto_read(repl.model(), &mut reporter)
-            .expect("auto read");
+        let read = sr.auto_read(repl.model()).expect("auto read");
         assert!(read);
 
         let speaks = speaks.borrow();

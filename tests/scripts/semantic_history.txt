@@ -1,0 +1,6 @@
+# Real OSC 133 stream through the end-to-end shell harness
+Scenario: semantic prompt navigation and copy
+When pty-stdout: \x1B]133;A\x07$ first\r\nresult\r\n\x1B]133;A\x07$ second\x1B[H
+And stdin: \x1Br]pwyiwq
+And stdin: \x1B[18~
+Then expect-pty-stdin: second

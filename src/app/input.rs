@@ -135,15 +135,21 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        let forward_to_app = self
+            .view_stack
+            .root_mut()
+            .model()
+            .screen()
+            .focus_reporting();
         if self.log_enabled {
             eprintln!(
                 "focus event: {} (forward_to_app={})",
                 if focused { "in" } else { "out" },
-                self.focus_mode.enabled(),
+                forward_to_app,
             );
         }
         sr.set_terminal_focused(focused)?;
-        if self.focus_mode.enabled() {
+        if forward_to_app {
             let raw = if focused {
                 FOCUS_IN_EVENT
             } else {

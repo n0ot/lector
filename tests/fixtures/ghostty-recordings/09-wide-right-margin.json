@@ -1,0 +1,11 @@
+{
+  "name": "wide-grapheme-right-margin",
+  "source": "regression captured during Stop 1.2 strict shadow review",
+  "rows": 2,
+  "cols": 6,
+  "scrollback": 16,
+  "operations": [
+    {"operation": "write", "chunks": ["\u001b[1;5H", "界"]}
+  ],
+  "expected_difference_classes": ["ghostty_correctness_improvement"]
+}

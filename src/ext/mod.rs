@@ -1,4 +1,4 @@
-use vt100::Color;
+use crate::terminal::{Cell, Color, TerminalSnapshot};
 
 pub trait ScreenExt {
     /// Find the first cell between (row_start, col_start) and (row_end, col_end) where matcher(cell) returns true.
@@ -11,7 +11,7 @@ pub trait ScreenExt {
         col_end: u16,
     ) -> Option<(u16, u16)>
     where
-        F: Fn(&vt100::Cell) -> bool;
+        F: Fn(&Cell) -> bool;
 
     /// Find the last cell between (row_start, col_start) and (row_end, col_end) where matcher(cell) returns true.
     fn rfind_cell<F>(
@@ -23,7 +23,7 @@ pub trait ScreenExt {
         col_end: u16,
     ) -> Option<(u16, u16)>
     where
-        F: Fn(&vt100::Cell) -> bool;
+        F: Fn(&Cell) -> bool;
 
     /// Find the beginning of the word relative to row, col.
     /// If row, col is not in a word, the starting position of the previous word will be returned,
@@ -41,17 +41,9 @@ pub trait ScreenExt {
 
     /// Get the highlighted text on this screen.
     fn get_highlights(&self) -> Vec<String>;
-
-    /// Get the contents of the screen, including blank lines.
-    /// Trailing whitespace will be removed from each line.
-    fn contents_full(&self) -> String;
-
-    /// Write the contents of the screen into an existing buffer.
-    /// Trailing whitespace will be removed from each line.
-    fn contents_full_into(&self, out: &mut String);
 }
 
-impl ScreenExt for vt100::Screen {
+impl ScreenExt for TerminalSnapshot {
     fn find_cell<F>(
         &self,
         matcher: F,
@@ -61,7 +53,7 @@ impl ScreenExt for vt100::Screen {
         col_end: u16,
     ) -> Option<(u16, u16)>
     where
-        F: Fn(&vt100::Cell) -> bool,
+        F: Fn(&Cell) -> bool,
     {
         // row_end and col_end cannot be off the screen.
         let (row_end, col_end) = (
@@ -94,7 +86,7 @@ impl ScreenExt for vt100::Screen {
         col_end: u16,
     ) -> Option<(u16, u16)>
     where
-        F: Fn(&vt100::Cell) -> bool,
+        F: Fn(&Cell) -> bool,
     {
         // row_end and col_end cannot be off the screen.
         let (row_end, col_end) = (
@@ -183,22 +175,6 @@ impl ScreenExt for vt100::Screen {
 
         highlights
     }
-
-    fn contents_full(&self) -> String {
-        self.rows(0, self.size().1)
-            .map(|row| format!("{}\n", row.trim_end()))
-            .collect::<String>()
-    }
-
-    fn contents_full_into(&self, out: &mut String) {
-        out.clear();
-        let (rows, cols) = self.size();
-        out.reserve((rows as usize) * (cols as usize + 1));
-        for row in self.rows(0, cols) {
-            out.push_str(row.trim_end());
-            out.push('\n');
-        }
-    }
 }
 
 pub trait CellExt {
@@ -209,13 +185,13 @@ pub trait CellExt {
     fn is_highlighted(&self) -> bool;
 }
 
-impl CellExt for vt100::Cell {
+impl CellExt for Cell {
     fn is_in_word(&self) -> bool {
         self.has_contents() && !self.contents().chars().any(char::is_whitespace)
     }
 
     fn is_highlighted(&self) -> bool {
-        self.bgcolor() == Color::Idx(11) && self.fgcolor() == Color::Idx(0)
+        self.bgcolor() == Color::Indexed(11) && self.fgcolor() == Color::Indexed(0)
     }
 }
 
@@ -223,17 +199,20 @@ impl CellExt for vt100::Cell {
 mod tests {
     use super::{CellExt, ScreenExt};
 
-    fn parser(rows: u16, cols: u16, contents: &[u8]) -> vt100::Parser {
-        let mut parser = vt100::Parser::new(rows, cols, 0);
-        parser.process(contents);
+    use crate::terminal::{GhosttyEngine, TerminalEngine};
+
+    fn parser(rows: u16, cols: u16, contents: &[u8]) -> GhosttyEngine {
+        let mut parser =
+            GhosttyEngine::new_with_scrollback(rows, cols, 0).expect("create Ghostty engine");
+        parser.advance(contents).expect("parse terminal fixture");
         parser
     }
 
     #[test]
     fn searches_forward_and_backward_across_rows_and_clamps_end_bounds() {
         let parser = parser(3, 5, b"a1\r\n b2\r\n  c3");
-        let screen = parser.screen();
-        let is_digit = |cell: &vt100::Cell| {
+        let screen = parser.snapshot();
+        let is_digit = |cell: &crate::terminal::Cell| {
             cell.contents()
                 .chars()
                 .next()
@@ -250,7 +229,7 @@ mod tests {
     #[test]
     fn word_boundaries_cover_words_whitespace_and_screen_edges() {
         let parser = parser(1, 10, b"one  two");
-        let screen = parser.screen();
+        let screen = parser.snapshot();
 
         assert_eq!(screen.find_word_start(0, 0), 0);
         assert_eq!(screen.find_word_start(0, 4), 0);
@@ -264,15 +243,15 @@ mod tests {
     fn extracts_only_black_on_bright_yellow_highlight_runs() {
         let parser = parser(2, 8, b"\x1B[30;103mhot\x1B[0m x\r\nabc  \x1B[30;103mend");
 
-        assert_eq!(parser.screen().get_highlights(), ["hot", "end"]);
-        assert!(parser.screen().cell(0, 0).unwrap().is_highlighted());
-        assert!(!parser.screen().cell(0, 3).unwrap().is_highlighted());
+        assert_eq!(parser.snapshot().get_highlights(), ["hot", "end"]);
+        assert!(parser.snapshot().cell(0, 0).unwrap().is_highlighted());
+        assert!(!parser.snapshot().cell(0, 3).unwrap().is_highlighted());
     }
 
     #[test]
     fn full_contents_preserve_blank_rows_and_reuse_the_output_buffer() {
         let parser = parser(3, 5, b"one\r\n\r\ntwo  ");
-        let screen = parser.screen();
+        let screen = parser.snapshot();
         let mut output = String::from("stale contents");
 
         screen.contents_full_into(&mut output);
@@ -284,11 +263,30 @@ mod tests {
     #[test]
     fn cell_word_detection_distinguishes_content_whitespace_and_blanks() {
         let parser = parser(1, 4, "é x".as_bytes());
-        let screen = parser.screen();
+        let screen = parser.snapshot();
 
         assert!(screen.cell(0, 0).unwrap().is_in_word());
         assert!(!screen.cell(0, 1).unwrap().is_in_word());
         assert!(screen.cell(0, 2).unwrap().is_in_word());
         assert!(!screen.cell(0, 3).unwrap().is_in_word());
+    }
+
+    #[test]
+    fn ghostty_backed_snapshot_supports_highlights_words_and_reusable_content_buffers() {
+        let mut engine = GhosttyEngine::new(2, 12).expect("create Ghostty engine");
+        engine
+            .advance(b"\x1b[30;103mhot\x1b[0m  word")
+            .expect("draw highlighted text");
+        let snapshot = engine.normalized_snapshot();
+
+        assert_eq!(snapshot.get_highlights(), ["hot"]);
+        assert_eq!(snapshot.find_word_start(0, 10), 5);
+        assert_eq!(snapshot.find_word_end(0, 5), 11);
+
+        let mut contents = String::from("stale allocation");
+        snapshot.contents_full_into(&mut contents);
+        assert_eq!(contents, "hot  word\n\n");
+        snapshot.contents_full_into(&mut contents);
+        assert_eq!(contents, "hot  word\n\n");
     }
 }

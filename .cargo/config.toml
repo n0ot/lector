@@ -1,0 +1,6 @@
+[alias]
+ghostty-bootstrap = "run --locked --package lector-xtask -- ghostty-bootstrap"
+ghostty-debug = "run --locked --package lector-xtask -- ghostty-debug"
+ghostty-release = "run --locked --package lector-xtask -- ghostty-release"
+ghostty-check = "run --locked --package lector-xtask -- ghostty-check"
+ghostty-bench = "run --locked --package lector-xtask -- ghostty-bench"

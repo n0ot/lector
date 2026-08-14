@@ -1,0 +1,165 @@
+# Auto-read corpus through the end-to-end PTY and speech harness
+Scenario: fragmented line output is spoken as one batch
+When pty-stdout: alpha\r\n
+And pty-stdout: beta
+And settled:
+Then expect-stdout: alpha\r\nbeta
+And expect-speak: alpha\nbeta
+And expect-no-speak:
+
+Scenario: fragmented cursor redraw announces only inserted completion
+When pty-stdout: cat -frob
+And settled:
+And stdin: \x09
+And auto-read: off
+And pty-stdout: \x1B[
+And auto-read: on
+And pty-stdout: 9D\x1B[Kcat -frobnicate-mode
+And settled:
+Then expect-speak: cat -frob
+And expect-pty-stdin: \x09
+And expect-speak: nicate-mode
+And expect-no-speak:
+
+Scenario: synchronized output speaks only after the completed frame
+When pty-stdout: \x1B[?2026hpartial
+And advance: 301
+And finalize:
+And pty-stdout: \x20complete\x1B[?2026l
+And settled:
+Then expect-speak: partial complete
+And expect-no-speak:
+
+Scenario: slow terminal echo is suppressed after typeahead
+Given suppress-key-echo: on
+When stdin: abcdefg
+And pty-stdout: a
+And settled:
+And pty-stdout: b
+And settled:
+And pty-stdout: c
+And settled:
+And pty-stdout: d
+And settled:
+And pty-stdout: e
+And settled:
+And pty-stdout: f
+And settled:
+And pty-stdout: g
+And settled:
+Then expect-pty-stdin: abcdefg
+And expect-no-speak:
+
+Scenario: backspace speaks the deleted character after terminal confirmation
+Given pty-stdout: abc
+And settled:
+And clear-speech:
+When stdin: \x7F
+And pty-stdout: \x08 \x08
+And settled:
+Then expect-pty-stdin: \x7F
+And expect-speak: c
+And expect-no-speak:
+
+Scenario: forward delete speaks with auto read disabled
+Given auto-read: off
+And pty-stdout: abc\x1B[D\x1B[D
+And settled:
+And clear-speech:
+When stdin: \x1B[3~
+And pty-stdout: \x1B[P
+And settled:
+Then expect-pty-stdin: \x1B[3~
+And expect-speak: b
+And expect-no-speak:
+
+Scenario: continuous output is finalized at the maximum batch delay
+Given pty-stdout: a
+When advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+And advance: 20
+And pty-stdout: b
+And finalize:
+Then expect-speak: abbbbbbbbbbbbbbb
+And expect-no-speak:
+
+Scenario: explicit scrolling speaks newly printed text
+Given pty-stdout: \x1B[24;1Hbottom
+And settled:
+And clear-speech:
+When pty-stdout: \x1B[S\x1B[24;1Hnew
+And settled:
+Then expect-speak: new
+And expect-no-speak:
+
+Scenario: carriage return status redraw speaks only the changed field
+Given pty-stdout: Downloading 10%
+And settled:
+And clear-speech:
+When pty-stdout: \r\x1B[KDownloading 20%
+And settled:
+Then expect-speak-contains: 20 percent
+And expect-no-speak:
+
+Scenario: cursor movement wins over a coupled full screen ruler redraw
+Given pty-stdout: \x1B[2J\x1B[1;1Hfirst line\x1B[2;1Hsecond line\x1B[4;1Hfile 1,1 All\x1B[1;1H
+And settled:
+And clear-speech:
+When stdin: j
+And pty-stdout: \x1B[2J\x1B[1;1Hfirst line\x1B[2;1Hsecond line\x1B[4;1Hfile 2,1 All\x1B[2;1H
+And settled:
+Then expect-pty-stdin: j
+And expect-speak: second line
+And expect-no-speak:
+
+Scenario: review opened between escape fragments restores the completed update
+Given pty-stdout: old screen\x1B[
+When stdin: \x1Br
+And clear-speech:
+And pty-stdout: 2J\x1B[Hbackground
+And stdin: q
+And settled:
+Then expect-screen-contains: background
+And expect-speak: Terminal
+And expect-speak: background
+And expect-no-speak:

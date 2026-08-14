@@ -1,0 +1,25 @@
+# End-to-end protocol regression coverage for the Stop 1.5 manual checklist.
+Scenario: terminal effects and queries remain physical-terminal passthrough only
+When pty-stdout: \x07\x1B]2;effects title\x07\x1B]7;file://host/tmp\x1B\\\x1B]52;c;aGVsbG8=\x1B\\\x1B]777;notify;Build;Done\x1B\\\x1B]9;4;1;50\x07\x1B[c\x1B[18t\x1B[?996n\x1B[>q
+Then expect-stdout: \x07\x1B]2;effects title\x07\x1B]7;file://host/tmp\x1B\\\x1B]52;c;aGVsbG8=\x1B\\\x1B]777;notify;Build;Done\x1B\\\x1B]9;4;1;50\x07\x1B[c\x1B[18t\x1B[?996n\x1B[>q
+And expect-no-pty-stdin:
+
+Scenario: bracketed paste follows the child terminal mode
+Given pty-stdout: \x1B[?2004h
+When stdin: \x1B[200~hello\nworld\x1B[201~
+Then expect-stdout: \x1B[?2004h
+And expect-pty-stdin: \x1B[200~hello\nworld\x1B[201~
+And expect-speak: pasted
+
+Scenario: mouse click encoding follows child mouse protocol and coordinates
+Given pty-stdout: \x1B[?1000h\x1B[?1006h\x1B[5;8H
+When settled:
+And stdin: \x1B{
+Then expect-stdout: \x1B[?1000h\x1B[?1006h\x1B[5;8H
+And expect-pty-stdin: \x1B[<0;8;5M\x1B[<0;8;5m
+
+Scenario: Kitty keyboard mode and encoded input remain raw and ordered
+Given pty-stdout: \x1B[>31u
+When stdin: \x1B[120u
+Then expect-stdout: \x1B[>31u
+And expect-pty-stdin: \x1B[120u

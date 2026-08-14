@@ -1,0 +1,13 @@
+{
+  "name": "primary-resize-reflow",
+  "source": "minimal regression for Ghostty primary-screen reflow versus vt100 crop behavior",
+  "rows": 4,
+  "cols": 12,
+  "scrollback": 32,
+  "operations": [
+    {"operation": "write", "chunks": ["one two three four five six"]},
+    {"operation": "resize", "rows": 6, "cols": 7},
+    {"operation": "write", "chunks": ["\r\npost-resize"]}
+  ],
+  "expected_difference_classes": ["accepted_behavior_change"]
+}

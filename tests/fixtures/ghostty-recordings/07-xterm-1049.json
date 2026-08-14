@@ -1,0 +1,11 @@
+{
+  "name": "xterm-1049-cursor-inheritance",
+  "source": "minimal regression extracted from Ghostty's xterm-compatible mode 1049 test",
+  "rows": 4,
+  "cols": 20,
+  "scrollback": 32,
+  "operations": [
+    {"operation": "write", "chunks": ["1A\r\n2A", "\u001b[?1049h", "3B"]}
+  ],
+  "expected_difference_classes": ["ghostty_correctness_improvement"]
+}

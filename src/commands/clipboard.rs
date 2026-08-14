@@ -59,7 +59,7 @@ fn copy_selection(
             contents.push_str(
                 view.screen()
                     .cell(row, col)
-                    .map_or("", vt100::Cell::contents),
+                    .map_or("", crate::terminal::Cell::contents),
             );
         }
         if row != cursor_row {

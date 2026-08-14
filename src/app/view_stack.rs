@@ -49,7 +49,6 @@ impl App {
                         // Do not let their old stabilization deadline run again.
                         self.first_pty_update = None;
                         self.last_pty_update = None;
-                        self.reporter.reset();
                     }
                 }
             }
@@ -106,16 +105,16 @@ impl App {
                 .write_all(b"\x1B[2J\x1B[H")
                 .context("clear screen")?;
             term_out
-                .write_all(&view.screen().contents_formatted())
+                .write_all(&view.presentation_contents())
                 .context("render view contents")?;
             term_out
-                .write_all(&view.screen().cursor_state_formatted())
+                .write_all(&view.presentation_cursor())
                 .context("render cursor state")?;
             term_out
-                .write_all(&view.screen().attributes_formatted())
+                .write_all(&view.presentation_attributes())
                 .context("restore drawing attributes")?;
             term_out
-                .write_all(&view.screen().input_mode_formatted())
+                .write_all(&view.presentation_input_modes())
                 .context("render input modes")?;
             term_out.flush().context("flush view render")?;
             Ok(())
@@ -155,11 +154,10 @@ impl App {
         view.with_live_screen(|view| -> Result<()> {
             let mut read_text = sr.resolve_pending_delete(view)?;
             let auto_read_text = if sr.auto_read_enabled() {
-                let mut reporter = perform::Reporter::new();
                 if recent_input {
-                    sr.auto_read_after_input(view, &mut reporter)?
+                    sr.auto_read_after_input(view)?
                 } else {
-                    sr.auto_read(view, &mut reporter)?
+                    sr.auto_read(view)?
                 }
             } else {
                 false
@@ -183,5 +181,9 @@ impl App {
 
     pub fn debug_active_view_contents(&mut self) -> String {
         self.view_stack.active_mut().model().contents_full()
+    }
+
+    pub fn debug_root_terminal_geometry(&mut self) -> crate::terminal::TerminalGeometry {
+        self.view_stack.root_mut().model().screen().geometry
     }
 }

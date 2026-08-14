@@ -1,4 +1,5 @@
 use super::ViewController;
+use crate::terminal::TerminalGeometry;
 
 pub struct ViewStack {
     views: Vec<Box<dyn ViewController>>,
@@ -40,8 +41,12 @@ impl ViewStack {
     }
 
     pub fn on_resize(&mut self, rows: u16, cols: u16) {
+        self.on_resize_with_geometry(TerminalGeometry::from_cells(rows, cols));
+    }
+
+    pub fn on_resize_with_geometry(&mut self, geometry: TerminalGeometry) {
         for view in &mut self.views {
-            view.on_resize(rows, cols);
+            view.on_resize_with_geometry(geometry);
         }
     }
 }

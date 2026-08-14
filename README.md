@@ -12,11 +12,27 @@ Lector is a terminal screen reader. It speaks what appears in your terminal and 
 
 ## Get started
 
-Build:
+`libghostty-vt` is Lector's sole terminal engine. From a fresh clone, build a
+release—including downloading, verifying, and caching the project-pinned Zig
+toolchain and Ghostty source—with:
 
 ```bash
-cargo build --release
+cargo ghostty-release
 ```
+
+This alias is defined inside the repository; it does not require a global
+Cargo plugin, Make, an installed Ghostty application, or a system Ghostty
+library. Once the verified archive is cached under the ignored `target`
+directory, ordinary Cargo commands reuse it:
+
+```bash
+cargo build --locked --release
+```
+
+Lector owns its narrow Rust adapter over Ghostty's official C API and links the
+verified archive statically. Exact Zig/source pins, supported targets, offline
+packaging, upgrades, and troubleshooting are documented in
+[docs/ghostty-builds.md](docs/ghostty-builds.md).
 
 Run Lector with your shell:
 

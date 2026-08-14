@@ -1,5 +1,6 @@
-use super::{Column, TableModel};
-use crate::view::View;
+use super::{Column, TableModel, TerminalSurface};
+
+type View = dyn TerminalSurface;
 
 pub(super) fn pipe_delimited_cell_text(line: &str, col_idx: usize) -> Option<&str> {
     let trimmed = line.trim();
@@ -578,7 +579,7 @@ fn row_is_blank(view: &View, row: u16) -> bool {
     true
 }
 
-pub(super) fn row_has_fixed_width_columns(view: &View, row: u16) -> bool {
+pub(super) fn row_has_fixed_width_columns(view: &(dyn TerminalSurface + '_), row: u16) -> bool {
     let line = view.line(row);
     fixed_width_column_count(&line) >= 2
 }
@@ -697,7 +698,7 @@ fn row_has_letters(view: &View, row: u16) -> bool {
     line.chars().any(|c| c.is_alphabetic())
 }
 
-pub(super) fn is_separator_row(view: &View, row: u16) -> bool {
+pub(super) fn is_separator_row(view: &(dyn TerminalSurface + '_), row: u16) -> bool {
     let line = view.line(row);
     let trimmed = line.trim();
     if trimmed.is_empty() {

@@ -1,0 +1,13 @@
+{
+  "name": "editor-alternate-screen",
+  "source": "sanitized Vim startup, status redraw, and shutdown recording",
+  "rows": 8,
+  "cols": 40,
+  "scrollback": 128,
+  "operations": [
+    {"operation": "write", "chunks": ["shell$ vim README.md\r\n", "\u001b[?1049h\u001b[H\u001b[?25l", "\u001b[1;1H# Lector\u001b[2;1Hterminal reader", "\u001b[8;1H\u001b[7m README.md  2L, 26B \u001b[0m", "\u001b[?25h"]},
+    {"operation": "resize", "rows": 10, "cols": 52},
+    {"operation": "write", "chunks": ["\u001b[10;1H\u001b[7m README.md  2L, 26B \u001b[0m", "\u001b[?1049l"]}
+  ],
+  "expected_difference_classes": []
+}

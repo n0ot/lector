@@ -1,0 +1,32 @@
+{
+  "name": "alternate-screen",
+  "rows": 2,
+  "cols": 8,
+  "intended_scene": "The alternate screen is active with its own contents and cursor; the primary screen remains isolated.",
+  "operations": [
+    { "operation": "process", "hex": "7072696D617279" },
+    { "operation": "process", "hex": "1B5B3F3130343968" },
+    { "operation": "process", "hex": "616C740D0A73637265656E" },
+    { "operation": "process", "hex": "1B5B313B3448" }
+  ],
+  "expected": {
+    "size": { "rows": 2, "cols": 8 },
+    "rows": [
+      { "cells": [
+        { "grapheme": "l" },
+        { "grapheme": "t" }
+      ] },
+      { "cells": [
+        { "grapheme": "s" },
+        { "grapheme": "c" },
+        { "grapheme": "r" },
+        { "grapheme": "e" },
+        { "grapheme": "e" },
+        { "grapheme": "n" }
+      ], "wrapped": true }
+    ],
+    "cursor": { "row": 0, "col": 3, "visible": true },
+    "screen": "alternate",
+    "modes": { "mouse_protocol": "none", "mouse_encoding": "default" }
+  }
+}

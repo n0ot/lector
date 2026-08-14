@@ -1,0 +1,11 @@
+{
+  "name": "pager-search",
+  "source": "sanitized less alternate-screen search recording",
+  "rows": 7,
+  "cols": 36,
+  "scrollback": 128,
+  "operations": [
+    {"operation": "write", "chunks": ["shell$ less CHANGELOG\r\n", "\u001b[?1049h\u001b[H", "v0.3.1\r\n- Ghostty engine\r\n- resize support", "\u001b[7;1H/ghost", "\u001b[?1049l"]}
+  ],
+  "expected_difference_classes": []
+}

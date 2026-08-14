@@ -1,6 +1,6 @@
 use crate::{
-    commands, keymap::Binding, perform, screen_reader::ScreenReader, terminal_input::KeyInput,
-    views,
+    commands, keymap::Binding, screen_reader::ScreenReader, terminal::TerminalGeometry,
+    terminal_input::KeyInput, views,
 };
 use anyhow::{Context, Result};
 use std::{
@@ -58,8 +58,6 @@ impl Clock for StdClock {
 
 pub struct App {
     view_stack: views::ViewStack,
-    vte_parser: vte::Parser,
-    reporter: perform::Reporter,
     pending_input: VecDeque<u8>,
     pending_input_last_at: Option<u128>,
     focus_mode: protocol::FocusModeFilter,
@@ -87,8 +85,6 @@ impl App {
     pub fn new_with_clock(view_stack: views::ViewStack, clock: Box<dyn Clock>) -> Result<Self> {
         let mut app = Self {
             view_stack,
-            vte_parser: vte::Parser::new(),
-            reporter: perform::Reporter::new(),
             pending_input: VecDeque::new(),
             pending_input_last_at: None,
             focus_mode: protocol::FocusModeFilter::default(),
@@ -159,7 +155,15 @@ impl App {
     }
 
     pub fn on_resize(&mut self, rows: u16, cols: u16, term_out: &mut dyn Write) -> Result<()> {
-        self.view_stack.on_resize(rows, cols);
+        self.on_resize_with_geometry(TerminalGeometry::from_cells(rows, cols), term_out)
+    }
+
+    pub fn on_resize_with_geometry(
+        &mut self,
+        geometry: TerminalGeometry,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        self.view_stack.on_resize_with_geometry(geometry);
         if self.view_stack.has_overlay() {
             self.render_active_view(term_out)?;
         }

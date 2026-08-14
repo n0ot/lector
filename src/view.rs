@@ -1,8 +1,9 @@
 use super::{
     ext::ScreenExt,
-    perform::{
-        HistoryPosition, Osc133Kind, Osc133Mark, Reporter, SemanticCallbacks,
-        retained_scrollback_len,
+    terminal::{
+        GhosttyEngine, GhosttyReviewMark, HistoryPosition, SemanticKind as Osc133Kind,
+        SemanticMark as Osc133Mark, TerminalEngine, TerminalGeometry, TerminalSnapshot,
+        UpdateSummary, Viewport,
     },
 };
 use std::cmp::min;
@@ -12,14 +13,14 @@ use std::cmp::min;
 pub const SCROLLBACK_LINES: usize = 10_000;
 
 pub struct View {
-    parser: vt100::Parser<SemanticCallbacks>,
-    next_bytes: Vec<u8>,
-    prev_screen: vt100::Screen,
+    engine: GhosttyEngine,
+    pending_update: UpdateSummary,
+    prev_screen: TerminalSnapshot,
     prev_screen_time: u128,
     review_cursor_position: (u16, u16),
     review_scrollback: usize,
     retained_history_len: usize,
-    review_mark_position: Option<HistoryPosition>,
+    review_mark: Option<GhosttyReviewMark>,
     review_cursor_indent_level: u16,
     application_cursor_indent_level: u16,
     cached_full: String,
@@ -32,23 +33,19 @@ pub struct View {
 
 impl View {
     pub fn new(rows: u16, cols: u16) -> Self {
-        let parser = vt100::Parser::new_with_callbacks(
-            rows,
-            cols,
-            SCROLLBACK_LINES,
-            SemanticCallbacks::default(),
-        );
-        let cursor_position = parser.screen().cursor_position();
-        let prev_screen = parser.screen().clone();
+        let engine = GhosttyEngine::new_with_scrollback(rows.max(1), cols.max(1), SCROLLBACK_LINES)
+            .unwrap_or_else(|error| panic!("could not create Ghostty terminal engine: {error}"));
+        let cursor_position = engine.snapshot().cursor_position();
+        let prev_screen = engine.snapshot().clone();
         View {
-            parser,
-            next_bytes: Vec::new(),
+            engine,
+            pending_update: UpdateSummary::default(),
             prev_screen,
             prev_screen_time: 0,
             review_cursor_position: cursor_position,
             review_scrollback: 0,
             retained_history_len: 0,
-            review_mark_position: None,
+            review_mark: None,
             review_cursor_indent_level: 0,
             application_cursor_indent_level: 0,
             cached_full: String::new(),
@@ -67,17 +64,10 @@ impl View {
 
         // Output is always interpreted against the live drawing screen. The
         // selected review viewport is restored afterward.
-        self.parser.screen_mut().set_scrollback(0);
-
-        // Once the bounded buffer is full, vt100 does not expose how many old
-        // rows a given update evicted. Discard positions rather than allowing
-        // stale semantic/copy marks to point at unrelated text.
-        if old_history_len == SCROLLBACK_LINES && may_evict_scrollback(buf) {
-            self.parser.callbacks_mut().clear();
-            self.review_mark_position = None;
-        }
-        self.parser.process(buf);
-        let history_len = retained_scrollback_len(self.parser.screen_mut());
+        self.engine.select_viewport(Viewport::Live);
+        let update = TerminalEngine::advance(&mut self.engine, buf);
+        self.pending_update.merge(update);
+        let history_len = self.engine.scrollback_extent();
         self.retained_history_len = history_len;
         self.review_scrollback = if old_review_scrollback == 0 {
             0
@@ -86,10 +76,8 @@ impl View {
                 .saturating_add(history_len.saturating_sub(old_history_len))
                 .min(history_len)
         };
-        self.parser
-            .screen_mut()
-            .set_scrollback(self.review_scrollback);
-        self.next_bytes.extend_from_slice(buf);
+        self.engine
+            .select_viewport(Viewport::Scrollback(self.review_scrollback));
         self.cached_full_valid = false;
         self.cached_full_row_hashes.clear();
         // If the screen's size changed, the cursor may now be out of bounds.
@@ -106,19 +94,20 @@ impl View {
         // it's because the screen was resized.
         // Clear the mark, because it's probably not where you'd expect it.
         if review_cursor_position != self.review_cursor_position {
-            self.review_mark_position = None;
+            self.clear_review_mark();
         }
     }
 
     /// Advances the previous screen to match the current one,
     /// and sets its update time to now
     pub fn finalize_changes(&mut self, now_ms: u128) {
-        let visible_offset = self.parser.screen().scrollback();
-        self.parser.screen_mut().set_scrollback(0);
-        self.prev_screen = self.parser.screen().clone();
-        self.parser.screen_mut().set_scrollback(visible_offset);
+        let visible_offset = self.review_scrollback;
+        self.engine.select_viewport(Viewport::Live);
+        self.prev_screen = self.engine.snapshot().clone();
+        self.engine
+            .select_viewport(Viewport::Scrollback(visible_offset));
         self.prev_screen_time = now_ms;
-        self.next_bytes.clear();
+        self.pending_update = UpdateSummary::default();
         if self.cached_full_valid {
             self.cached_prev_full.clone_from(&self.cached_full);
             self.cached_prev_full_valid = true;
@@ -131,22 +120,41 @@ impl View {
     }
 
     /// Gets the current screen backing this view
-    pub fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
+    pub fn screen(&self) -> &TerminalSnapshot {
+        self.engine.snapshot()
+    }
+
+    pub fn snapshot_with_history(&mut self) -> TerminalSnapshot {
+        self.engine.snapshot_with_history()
+    }
+
+    pub(crate) fn presentation_contents(&self) -> Vec<u8> {
+        self.engine.presentation_contents()
+    }
+
+    pub(crate) fn presentation_cursor(&self) -> Vec<u8> {
+        self.engine.presentation_cursor()
+    }
+
+    pub(crate) fn presentation_attributes(&self) -> Vec<u8> {
+        self.engine.presentation_attributes()
+    }
+
+    pub(crate) fn presentation_input_modes(&self) -> Vec<u8> {
+        self.engine.presentation_input_modes()
     }
 
     /// Runs work against the live drawing screen, then returns to the review
     /// viewport. Screen diffing and application-cursor tracking must not read
     /// whichever historical page the review cursor happens to be on.
     pub(crate) fn with_live_screen<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.parser.screen_mut().set_scrollback(0);
+        self.engine.select_viewport(Viewport::Live);
         let result = f(self);
-        let history_len = retained_scrollback_len(self.parser.screen_mut());
+        let history_len = self.engine.scrollback_extent();
         self.retained_history_len = history_len;
         self.review_scrollback = self.review_scrollback.min(history_len);
-        self.parser
-            .screen_mut()
-            .set_scrollback(self.review_scrollback);
+        self.engine
+            .select_viewport(Viewport::Scrollback(self.review_scrollback));
         result
     }
 
@@ -168,8 +176,8 @@ impl View {
 
     pub(crate) fn follow_application_cursor(&mut self) {
         self.review_scrollback = 0;
-        self.parser.screen_mut().set_scrollback(0);
-        self.review_cursor_position = self.parser.screen().cursor_position();
+        self.engine.select_viewport(Viewport::Live);
+        self.review_cursor_position = self.engine.snapshot().cursor_position();
     }
 
     pub(crate) fn set_review_cursor_row(&mut self, row: u16) {
@@ -210,9 +218,8 @@ impl View {
             current_start
         };
         self.review_scrollback = history_len.saturating_sub(visible_start);
-        self.parser
-            .screen_mut()
-            .set_scrollback(self.review_scrollback);
+        self.engine
+            .select_viewport(Viewport::Scrollback(self.review_scrollback));
         self.review_cursor_position = (
             target_row.saturating_sub(visible_start) as u16,
             position.col.min(self.size().1.saturating_sub(1)),
@@ -220,19 +227,35 @@ impl View {
     }
 
     pub(crate) fn set_review_mark(&mut self) {
-        self.review_mark_position = Some(self.review_history_position());
+        let position = self.review_history_position();
+        self.review_mark = Some(
+            self.engine
+                .track_review_mark(position)
+                .unwrap_or_else(|error| panic!("could not track Ghostty review mark: {error}")),
+        );
     }
 
     pub(crate) fn review_mark_position(&self) -> Option<HistoryPosition> {
-        self.review_mark_position
+        self.review_mark.as_ref().and_then(|mark| {
+            self.engine
+                .review_mark_position(mark)
+                .unwrap_or_else(|error| panic!("could not resolve Ghostty review mark: {error}"))
+        })
     }
 
-    pub(crate) fn pending_bytes(&self) -> &[u8] {
-        &self.next_bytes
+    pub(crate) fn update_summary(&self) -> &UpdateSummary {
+        &self.pending_update
     }
 
-    pub(crate) fn clear_pending_bytes(&mut self) {
-        self.next_bytes.clear();
+    /// Pane-scoped terminal side effects observed since the last finalized
+    /// screen update. Borrowed callback data has already been copied into
+    /// owned, normalized values before reaching this model.
+    pub fn terminal_events(&self) -> &[crate::terminal::TerminalEvent] {
+        &self.pending_update.effects.events
+    }
+
+    pub(crate) fn clear_update_summary(&mut self) {
+        self.pending_update = UpdateSummary::default();
     }
 
     pub(crate) fn set_previous_screen_time(&mut self, time: u128) {
@@ -240,7 +263,7 @@ impl View {
     }
 
     /// Gets the previous screen backing this view
-    pub fn prev_screen(&self) -> &vt100::Screen {
+    pub fn prev_screen(&self) -> &TerminalSnapshot {
         &self.prev_screen
     }
     /// Gets the size of this view
@@ -250,26 +273,41 @@ impl View {
 
     /// Resizes this view
     pub fn set_size(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows, cols);
-        let history_len = retained_scrollback_len(self.parser.screen_mut());
+        self.set_size_with_geometry(TerminalGeometry::from_cells(rows, cols));
+    }
+
+    /// Resizes this view while preserving per-cell pixel geometry for
+    /// size-query and image consumers.
+    pub fn set_size_with_geometry(&mut self, geometry: TerminalGeometry) {
+        let geometry = TerminalGeometry::new(
+            geometry.rows,
+            geometry.cols,
+            geometry.cell_width_px,
+            geometry.cell_height_px,
+        );
+        TerminalEngine::resize_with_geometry(&mut self.engine, geometry);
+        let history_len = self.engine.scrollback_extent();
         self.retained_history_len = history_len;
         self.review_scrollback = self.review_scrollback.min(history_len);
-        self.parser
-            .screen_mut()
-            .set_scrollback(self.review_scrollback);
+        self.engine
+            .select_viewport(Viewport::Scrollback(self.review_scrollback));
         self.cached_full_valid = false;
         self.cached_full_row_hashes.clear();
         // If the screen's size changed, the cursor may now be out of bounds.
         let review_cursor_position = self.review_cursor_position;
-        let max_row = rows.saturating_sub(1);
-        let max_col = cols.saturating_sub(1);
+        let max_row = geometry.rows.saturating_sub(1);
+        let max_col = geometry.cols.saturating_sub(1);
         self.review_cursor_position = (
             min(self.review_cursor_position.0, max_row),
             min(self.review_cursor_position.1, max_col),
         );
         if review_cursor_position != self.review_cursor_position {
-            self.review_mark_position = None;
+            self.clear_review_mark();
         }
+    }
+
+    fn clear_review_mark(&mut self) {
+        self.review_mark = None;
     }
 
     /// Gets the indentation level of the line under the review cursor,
@@ -326,9 +364,8 @@ impl View {
                 return false;
             }
             self.review_scrollback += 1;
-            self.parser
-                .screen_mut()
-                .set_scrollback(self.review_scrollback);
+            self.engine
+                .select_viewport(Viewport::Scrollback(self.review_scrollback));
             return true;
         }
         let original = self.current_history_position();
@@ -357,9 +394,8 @@ impl View {
                 return false;
             }
             self.review_scrollback -= 1;
-            self.parser
-                .screen_mut()
-                .set_scrollback(self.review_scrollback);
+            self.engine
+                .select_viewport(Viewport::Scrollback(self.review_scrollback));
             return true;
         }
         let original = self.current_history_position();
@@ -373,14 +409,14 @@ impl View {
     }
 
     pub fn osc133_marks(&self) -> &[Osc133Mark] {
-        self.parser.callbacks().marks()
+        &self.screen().semantic_marks
     }
 
     /// Returns the most recently submitted command line delimited by OSC 133
     /// B/C, excluding the prompt. This describes submitted input, not a
     /// transient Readline history selection that has not been executed.
     pub fn last_submitted_input(&mut self) -> Option<String> {
-        let marks = self.parser.callbacks().marks();
+        let marks = self.osc133_marks();
         let alternate_screen = self.screen().alternate_screen();
         let command_index = marks.iter().rposition(|mark| {
             mark.alternate_screen == alternate_screen
@@ -412,9 +448,7 @@ impl View {
     pub fn active_semantic_input(&mut self) -> Option<String> {
         let alternate_screen = self.screen().alternate_screen();
         let current_marks: Vec<_> = self
-            .parser
-            .callbacks()
-            .marks()
+            .osc133_marks()
             .iter()
             .filter(|mark| mark.alternate_screen == alternate_screen)
             .collect();
@@ -472,12 +506,13 @@ impl View {
             } else {
                 let row = absolute_row - self.retained_history_len;
                 if row >= usize::from(self.size().0) {
-                    self.parser.screen_mut().set_scrollback(saved_offset);
+                    self.engine
+                        .select_viewport(Viewport::Scrollback(saved_offset));
                     return None;
                 }
                 (0, row as u16)
             };
-            self.parser.screen_mut().set_scrollback(offset);
+            self.engine.select_viewport(Viewport::Scrollback(offset));
             let start_col = if absolute_row == start.row {
                 start.col
             } else {
@@ -492,7 +527,7 @@ impl View {
                 contents.push_str(
                     self.screen()
                         .cell(visible_row, col)
-                        .map_or("", vt100::Cell::contents),
+                        .map_or("", crate::terminal::Cell::contents),
                 );
             }
             if absolute_row != end.row && !self.screen().row_wrapped(visible_row) {
@@ -500,7 +535,8 @@ impl View {
             }
         }
 
-        self.parser.screen_mut().set_scrollback(saved_offset);
+        self.engine
+            .select_viewport(Viewport::Scrollback(saved_offset));
         Some(contents)
     }
 
@@ -659,22 +695,6 @@ impl View {
     }
 }
 
-fn may_evict_scrollback(buf: &[u8]) -> bool {
-    if buf
-        .iter()
-        .any(|byte| matches!(byte, b'\n' | b'\x0B' | b'\x0C'))
-        || buf
-            .windows(2)
-            .any(|pair| matches!(pair, [b'\x1B', b'D' | b'E']))
-    {
-        return true;
-    }
-    let mut parser = vte::Parser::new();
-    let mut reporter = Reporter::new();
-    parser.advance(&mut reporter, buf);
-    reporter.scrolled
-}
-
 fn compute_row_hashes(source: &str, out: &mut Vec<u64>) {
     out.clear();
     for line in source.split_terminator('\n') {
@@ -694,7 +714,7 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{View, compute_row_hashes, fnv1a_64};
-    use crate::perform::{HistoryPosition, Osc133Kind};
+    use crate::terminal::{HistoryPosition, SemanticKind as Osc133Kind};
 
     #[test]
     fn resize_clamps_review_cursor_and_clears_displaced_mark() {
@@ -724,15 +744,15 @@ mod tests {
     }
 
     #[test]
-    fn finalize_advances_screen_and_clears_pending_bytes() {
+    fn finalize_advances_screen_and_clears_pending_update() {
         let mut view = View::new(2, 8);
         view.process_changes(b"hello");
-        assert_eq!(view.pending_bytes(), b"hello");
+        assert_eq!(view.update_summary().printed_text(), "hello");
         assert_ne!(view.screen().contents(), view.prev_screen().contents());
 
         view.finalize_changes(42);
 
-        assert!(view.pending_bytes().is_empty());
+        assert_eq!(view.update_summary().batch_count, 0);
         assert_eq!(view.screen().contents(), view.prev_screen().contents());
         assert_eq!(view.prev_screen_time, 42);
     }

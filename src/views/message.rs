@@ -89,7 +89,7 @@ fn render_message(view: &mut View, text: &str) {
         bytes.extend_from_slice(b"\r\n");
     }
     bytes.extend_from_slice(b"\r\nPress Enter or Escape to close.");
-    view.clear_pending_bytes();
+    view.clear_update_summary();
     view.process_changes(&bytes);
 }
 

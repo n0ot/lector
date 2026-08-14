@@ -10,7 +10,9 @@ pub use pty::PtyView;
 pub use review::ReviewView;
 pub use stack::ViewStack;
 
-use crate::{screen_reader::ScreenReader, terminal_input::KeyInput, view::View};
+use crate::{
+    screen_reader::ScreenReader, terminal::TerminalGeometry, terminal_input::KeyInput, view::View,
+};
 use std::any::Any;
 use std::io::Write;
 
@@ -98,6 +100,9 @@ pub trait ViewController {
         Ok(())
     }
     fn on_resize(&mut self, rows: u16, cols: u16);
+    fn on_resize_with_geometry(&mut self, geometry: TerminalGeometry) {
+        self.on_resize(geometry.rows, geometry.cols);
+    }
 }
 
 #[cfg(test)]

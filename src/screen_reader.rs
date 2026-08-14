@@ -327,7 +327,7 @@ impl ScreenReader {
 #[cfg(test)]
 mod tests {
     use super::{ClipboardMove, ScreenReader};
-    use crate::{perform, speech, view::View};
+    use crate::{speech, view::View};
     use mlua::{Lua, Value};
     use std::{
         cell::{Cell, RefCell},
@@ -371,12 +371,10 @@ mod tests {
     fn auto_read_returns_false_when_unchanged() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
-        let mut reporter = perform::Reporter::new();
-
         view.process_changes(b"hello");
         view.finalize_changes(0);
 
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        let read = sr.auto_read(&mut view).unwrap();
         assert!(!read);
         assert!(speaks.borrow().is_empty());
     }
@@ -385,10 +383,8 @@ mod tests {
     fn auto_read_speaks_new_text() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
-        let mut reporter = perform::Reporter::new();
-
         view.process_changes(b"hi");
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        let read = sr.auto_read(&mut view).unwrap();
         assert!(read);
         let speaks = speaks.borrow();
         assert_eq!(speaks.len(), 1);
@@ -399,11 +395,9 @@ mod tests {
     fn auto_read_speaks_key_echo_by_default() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
-        let mut reporter = perform::Reporter::new();
-
         sr.record_last_key(b"g");
         view.process_changes(b"abcdefg");
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        let read = sr.auto_read(&mut view).unwrap();
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["abcdefg"]);
     }
@@ -412,15 +406,13 @@ mod tests {
     fn auto_read_suppresses_live_echo_when_enabled() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
-        let mut reporter = perform::Reporter::new();
-
         sr.set_suppress_key_echo(true);
         for character in "abcdefg".chars() {
             sr.record_forwarded_character(character);
         }
         sr.record_last_key(b"g");
         view.process_changes(b"abcdefg");
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        let read = sr.auto_read(&mut view).unwrap();
         assert!(read);
         assert!(speaks.borrow().is_empty());
     }
@@ -429,8 +421,6 @@ mod tests {
     fn auto_read_suppresses_slow_character_at_a_time_echo_when_enabled() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
-        let mut reporter = perform::Reporter::new();
-
         sr.set_suppress_key_echo(true);
         for character in "abcdefg".chars() {
             sr.record_forwarded_character(character);
@@ -439,7 +429,7 @@ mod tests {
 
         for byte in b"abcdefg" {
             view.process_changes(&[*byte]);
-            let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+            let read = sr.auto_read(&mut view).unwrap();
             assert!(read);
             assert!(speaks.borrow().is_empty());
             view.finalize_changes(0);
@@ -450,17 +440,14 @@ mod tests {
     fn auto_read_suppresses_diff_echo_when_enabled() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
-        let mut reporter = perform::Reporter::new();
-
         view.process_changes(b"a");
         view.finalize_changes(0);
         sr.set_suppress_key_echo(true);
         sr.record_forwarded_character('b');
         sr.record_last_key(b"b");
-        view.process_changes(b"\rb");
-        reporter.cursor_moves = 1;
+        view.process_changes(b"\x1B[1Gb");
 
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        let read = sr.auto_read(&mut view).unwrap();
         assert!(read);
         assert!(speaks.borrow().is_empty());
     }
@@ -469,14 +456,11 @@ mod tests {
     fn auto_read_speaks_multiple_inserted_runs_from_single_changed_line() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 40);
-        let mut reporter = perform::Reporter::new();
-
         view.process_changes(b"left one right two");
         view.finalize_changes(0);
 
-        view.process_changes(b"\r\x1B[Kleft alpha right beta");
-        reporter.cursor_moves = 1;
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        view.process_changes(b"\x1B[1G\x1B[Kleft alpha right beta");
+        let read = sr.auto_read(&mut view).unwrap();
 
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["alpha beta"]);
@@ -486,18 +470,15 @@ mod tests {
     fn auto_read_speaks_short_status_line_replacements() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 120);
-        let mut reporter = perform::Reporter::new();
-
         view.process_changes(
             b"[dev] 1:bash* 2:bash-                                             bash.1",
         );
         view.finalize_changes(0);
 
         view.process_changes(
-            b"\r\x1B[K[dev] 1:caffeinate* 2:bash-                                      caffeinate.1",
+            b"\x1B[1G\x1B[K[dev] 1:caffeinate* 2:bash-                                      caffeinate.1",
         );
-        reporter.cursor_moves = 1;
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        let read = sr.auto_read(&mut view).unwrap();
 
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["caffeinate"]);
@@ -507,18 +488,15 @@ mod tests {
     fn auto_read_speaks_shorter_replacements_to_word_boundaries() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 120);
-        let mut reporter = perform::Reporter::new();
-
         view.process_changes(
             b"[dev] 1:bash* 2:bash-                                             bash.1",
         );
         view.finalize_changes(0);
 
         view.process_changes(
-            b"\r\x1B[K[dev] 1:gh* 2:bash-                                                gh.1",
+            b"\x1B[1G\x1B[K[dev] 1:gh* 2:bash-                                                gh.1",
         );
-        reporter.cursor_moves = 1;
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        let read = sr.auto_read(&mut view).unwrap();
 
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["gh"]);
@@ -528,14 +506,11 @@ mod tests {
     fn auto_read_collapses_contiguous_duplicate_replacement_hunks() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 40);
-        let mut reporter = perform::Reporter::new();
-
         view.process_changes(b"foo bar foo");
         view.finalize_changes(0);
 
-        view.process_changes(b"\r\x1B[Kbum bar bum");
-        reporter.cursor_moves = 1;
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        view.process_changes(b"\x1B[1G\x1B[Kbum bar bum");
+        let read = sr.auto_read(&mut view).unwrap();
 
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["bum"]);
@@ -545,14 +520,11 @@ mod tests {
     fn auto_read_preserves_non_contiguous_duplicate_replacement_hunks() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 40);
-        let mut reporter = perform::Reporter::new();
-
         view.process_changes(b"foo bar baz foo");
         view.finalize_changes(0);
 
-        view.process_changes(b"\r\x1B[Kbum bar bat bum");
-        reporter.cursor_moves = 1;
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        view.process_changes(b"\x1B[1G\x1B[Kbum bar bat bum");
+        let read = sr.auto_read(&mut view).unwrap();
 
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["bum bat bum"]);
@@ -562,14 +534,11 @@ mod tests {
     fn auto_read_keeps_repeated_words_inside_one_replacement_hunk() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 40);
-        let mut reporter = perform::Reporter::new();
-
         view.process_changes(b"foo foo");
         view.finalize_changes(0);
 
-        view.process_changes(b"\r\x1B[Kbum bum");
-        reporter.cursor_moves = 1;
-        let read = sr.auto_read(&mut view, &mut reporter).unwrap();
+        view.process_changes(b"\x1B[1G\x1B[Kbum bum");
+        let read = sr.auto_read(&mut view).unwrap();
 
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["bum bum"]);

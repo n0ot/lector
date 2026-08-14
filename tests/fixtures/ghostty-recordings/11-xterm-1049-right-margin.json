@@ -1,0 +1,11 @@
+{
+  "name": "xterm-1049-right-margin-wrap",
+  "source": "regression extracted from the Phase 0 alternate-screen fixture; pinned Ghostty tests copy the primary cursor on mode 1049 entry",
+  "rows": 2,
+  "cols": 8,
+  "scrollback": 16,
+  "operations": [
+    {"operation": "write", "chunks": ["primary", "\u001b[?1049h", "alt\r\nscreen", "\u001b[1;4H", "\u001b[?1049l"]}
+  ],
+  "expected_difference_classes": ["ghostty_correctness_improvement"]
+}

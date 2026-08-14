@@ -1,9 +1,34 @@
-use crate::{keymap::InputMode, view::View};
+use crate::{keymap::InputMode, terminal::TerminalSnapshot, view::View};
 
 mod detection;
 
 pub(crate) use detection::{detect, detect_manual_from_header};
 use detection::{is_separator_row, pipe_delimited_cell_text, row_has_fixed_width_columns};
+
+pub(crate) trait TerminalSurface {
+    fn screen(&self) -> &TerminalSnapshot;
+
+    fn size(&self) -> (u16, u16) {
+        self.screen().size()
+    }
+
+    fn line(&self, row: u16) -> String {
+        let (_, cols) = self.size();
+        self.screen().contents_between(row, 0, row, cols)
+    }
+}
+
+impl TerminalSurface for View {
+    fn screen(&self) -> &TerminalSnapshot {
+        self.screen()
+    }
+}
+
+impl TerminalSurface for TerminalSnapshot {
+    fn screen(&self) -> &TerminalSnapshot {
+        self
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct SetupState {
@@ -223,7 +248,12 @@ impl TableModel {
         }
     }
 
-    pub fn cell_text(&self, view: &View, row: u16, col_idx: usize) -> String {
+    pub fn cell_text<V: TerminalSurface + ?Sized>(
+        &self,
+        view: &V,
+        row: u16,
+        col_idx: usize,
+    ) -> String {
         if self.delimiter == Some('|')
             && let Some(text) = pipe_delimited_cell_text(&view.line(row), col_idx)
         {
@@ -240,13 +270,17 @@ impl TableModel {
         text.trim().to_string()
     }
 
-    pub fn header_text(&self, view: &View, col_idx: usize) -> Option<String> {
+    pub fn header_text<V: TerminalSurface + ?Sized>(
+        &self,
+        view: &V,
+        col_idx: usize,
+    ) -> Option<String> {
         let header_row = self.header_row?;
         let text = self.cell_text(view, header_row, col_idx);
         if text.is_empty() { None } else { Some(text) }
     }
 
-    pub fn prev_data_row(&self, view: &View, row: u16) -> Option<u16> {
+    pub fn prev_data_row<V: TerminalSurface + ?Sized>(&self, view: &V, row: u16) -> Option<u16> {
         if row <= self.top {
             return None;
         }
@@ -262,7 +296,7 @@ impl TableModel {
         }
     }
 
-    pub fn next_data_row(&self, view: &View, row: u16) -> Option<u16> {
+    pub fn next_data_row<V: TerminalSurface + ?Sized>(&self, view: &V, row: u16) -> Option<u16> {
         if row >= self.bottom {
             return None;
         }
@@ -278,7 +312,7 @@ impl TableModel {
         }
     }
 
-    pub fn nearest_data_row(&self, view: &View, row: u16) -> Option<u16> {
+    pub fn nearest_data_row<V: TerminalSurface + ?Sized>(&self, view: &V, row: u16) -> Option<u16> {
         if row >= self.top && row <= self.bottom && !self.is_skippable_row(view, row) {
             return Some(row);
         }
@@ -307,7 +341,12 @@ impl TableModel {
         None
     }
 
-    pub fn nearest_non_empty_col(&self, view: &View, row: u16, preferred: usize) -> usize {
+    pub fn nearest_non_empty_col<V: TerminalSurface + ?Sized>(
+        &self,
+        view: &V,
+        row: u16,
+        preferred: usize,
+    ) -> usize {
         if self.delimiter == Some('|') {
             let line = view.line(row);
             return nearest_matching_column(self.columns.len(), preferred, |col| {
@@ -319,17 +358,17 @@ impl TableModel {
         })
     }
 
-    pub fn is_skippable_row(&self, view: &View, row: u16) -> bool {
-        is_separator_row(view, row) || self.is_banner_row(view, row)
+    pub fn is_skippable_row<V: TerminalSurface + ?Sized>(&self, view: &V, row: u16) -> bool {
+        is_separator_row(view.screen(), row) || self.is_banner_row(view, row)
     }
 
-    pub fn is_banner_row(&self, view: &View, row: u16) -> bool {
-        if row < self.top || row > self.bottom || is_separator_row(view, row) {
+    pub fn is_banner_row<V: TerminalSurface + ?Sized>(&self, view: &V, row: u16) -> bool {
+        if row < self.top || row > self.bottom || is_separator_row(view.screen(), row) {
             return false;
         }
 
         if self.delimiter.is_none() {
-            return !row_has_fixed_width_columns(view, row);
+            return !row_has_fixed_width_columns(view.screen(), row);
         }
 
         let line = view.line(row);
@@ -588,5 +627,23 @@ mod tests {
         assert!(is_separator_row(&view, 1));
         assert!(!is_separator_row(&view, 2));
         assert!(!is_separator_row(&view, 3));
+    }
+
+    #[test]
+    fn ghostty_backed_snapshot_supports_table_detection_and_cell_analysis() {
+        use crate::terminal::GhosttyEngine;
+
+        let mut engine = GhosttyEngine::new(4, 24).expect("create Ghostty engine");
+        engine
+            .advance(b"| Name | Age |\r\n| --- | --- |\r\n| Ada  | 37  |")
+            .expect("draw table");
+        let snapshot = engine.normalized_snapshot();
+        let model = detect(&snapshot, 2).expect("detect Ghostty-backed table");
+
+        assert_eq!(model.header_row(), Some(0));
+        assert_eq!(model.column_count(), 2);
+        assert_eq!(model.header_text(&snapshot, 0).as_deref(), Some("Name"));
+        assert_eq!(model.cell_text(&snapshot, 2, 0), "Ada");
+        assert_eq!(model.cell_text(&snapshot, 2, 1), "37");
     }
 }

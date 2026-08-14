@@ -1,0 +1,11 @@
+{
+  "name": "wide-and-combining-midline",
+  "source": "regression extracted from the Phase 0 normalized Unicode fixture; pinned Ghostty tests define OSC 133 A as fresh-line-new-prompt",
+  "rows": 2,
+  "cols": 8,
+  "scrollback": 16,
+  "operations": [
+    {"operation": "write", "chunks": ["\u001b[38;2;12;34;56;48;5;200;1;3;4;7mA\u001b[0m\u001b[2mB\u001b[0mé界", "\u001b]133;A\u0007", "\u001b[?1h", "\u001b=", "\u001b[?2004h", "\u001b[?1000h", "\u001b[?1006h", "\u001b[?25l"]}
+  ],
+  "expected_difference_classes": ["ghostty_correctness_improvement"]
+}

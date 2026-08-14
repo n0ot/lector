@@ -1,0 +1,11 @@
+{
+  "name": "compiler-diagnostics",
+  "source": "sanitized rustc diagnostic recording",
+  "rows": 10,
+  "cols": 60,
+  "scrollback": 128,
+  "operations": [
+    {"operation": "write", "chunks": ["   Compiling lector v0.3.1\r\n", "\u001b[1;31merror[E0308]\u001b[0m: mismatched types\r\n", " \u001b[1;34m-->\u001b[0m src/main.rs:7:9\r\n", "  \u001b[1;34m|\u001b[0m expected `u16`, found `usize`\r\n"]}
+  ],
+  "expected_difference_classes": []
+}

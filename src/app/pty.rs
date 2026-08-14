@@ -16,11 +16,11 @@ impl App {
         }
 
         if self.deferred_pty_output.is_empty() {
-            self.process_pty_output(sr, buf, term_out)?;
+            self.process_pty_output(buf, term_out)?;
         } else {
             let mut merged = std::mem::take(&mut self.deferred_pty_output);
             merged.extend_from_slice(buf);
-            let result = self.process_pty_output(sr, &merged, term_out);
+            let result = self.process_pty_output(&merged, term_out);
             merged.clear();
             self.deferred_pty_output = merged;
             result?;
@@ -28,12 +28,7 @@ impl App {
         Ok(())
     }
 
-    fn process_pty_output(
-        &mut self,
-        sr: &mut ScreenReader,
-        buf: &[u8],
-        term_out: &mut dyn Write,
-    ) -> Result<()> {
+    fn process_pty_output(&mut self, buf: &[u8], term_out: &mut dyn Write) -> Result<()> {
         self.log_bytes("pty output from app", buf);
         let filtered = self.focus_mode.filter_into(
             buf,
@@ -69,6 +64,15 @@ impl App {
         }
         let overlay_active = self.view_stack.has_overlay();
         self.view_stack.root_mut().handle_pty_output(buf)?;
+        debug_assert_eq!(
+            self.focus_mode.enabled(),
+            self.view_stack
+                .root_mut()
+                .model()
+                .screen()
+                .focus_reporting(),
+            "focus filter and terminal mode observation diverged"
+        );
         let root_alternate_screen = self
             .view_stack
             .root_mut()
@@ -84,9 +88,6 @@ impl App {
                 term_out.write_all(buf).context("write PTY output")?;
             }
             term_out.flush().context("flush output")?;
-            if sr.auto_read_enabled() {
-                self.vte_parser.advance(&mut self.reporter, buf);
-            }
             self.displayed_alternate_screen = root_alternate_screen;
         }
         let now_ms = self.clock.now_ms();
@@ -109,7 +110,7 @@ impl App {
             return Ok(());
         }
         let mut deferred = std::mem::take(&mut self.deferred_pty_output);
-        let result = self.process_pty_output(sr, &deferred, term_out);
+        let result = self.process_pty_output(&deferred, term_out);
         deferred.clear();
         self.deferred_pty_output = deferred;
         result
@@ -144,6 +145,15 @@ impl App {
         let first_pty_update = self.first_pty_update.unwrap_or(lpu);
         let now_ms = self.clock.now_ms();
         let overlay_active = self.view_stack.has_overlay();
+        if self
+            .view_stack
+            .root_mut()
+            .model()
+            .update_summary()
+            .synchronized_output
+        {
+            return Ok(false);
+        }
         if now_ms.saturating_sub(lpu) >= DIFF_DELAY as u128
             || now_ms.saturating_sub(first_pty_update) >= MAX_DIFF_DELAY as u128
         {
@@ -152,7 +162,6 @@ impl App {
             let recent_input = self
                 .last_stdin_update
                 .is_some_and(|lsu| now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128);
-            let reporter = &mut self.reporter;
             let view = self.view_stack.root_mut().model();
             view.with_live_screen(|view| -> Result<()> {
                 if !overlay_active {
@@ -175,9 +184,9 @@ impl App {
                         }
                         let auto_read_text = if sr.auto_read_enabled() {
                             if recent_input {
-                                sr.auto_read_after_input(view, reporter)?
+                                sr.auto_read_after_input(view)?
                             } else {
-                                sr.auto_read(view, reporter)?
+                                sr.auto_read(view)?
                             }
                         } else {
                             false

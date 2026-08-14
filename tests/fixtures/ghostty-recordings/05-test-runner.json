@@ -1,0 +1,11 @@
+{
+  "name": "test-runner",
+  "source": "sanitized cargo-nextest progress redraw recording",
+  "rows": 8,
+  "cols": 52,
+  "scrollback": 128,
+  "operations": [
+    {"operation": "write", "chunks": ["running 383 tests\r", "\u001b[2K[ 96/383] terminal::effects ... \u001b[33mrunning\u001b[0m\r", "\u001b[2K[383/383] terminal::resize ... \u001b[32mok\u001b[0m\r\n", "test result: ok. 383 passed; 0 failed\r\n"]}
+  ],
+  "expected_difference_classes": []
+}

@@ -1,7 +1,9 @@
 use crate::{
     app::{self, App, Clock},
     screen_reader::ScreenReader,
-    speech, views,
+    speech,
+    terminal::TerminalGeometry,
+    views,
 };
 use anyhow::{Result, anyhow, bail};
 use std::fmt::Write as FmtWrite;
@@ -223,6 +225,19 @@ impl Harness {
                         self.clock.advance_ms(delta);
                         Ok(())
                     }
+                    "auto-read" => {
+                        self.sr.set_auto_read_enabled(parse_switch(payload)?);
+                        Ok(())
+                    }
+                    "suppress-key-echo" => {
+                        self.sr.set_suppress_key_echo(parse_switch(payload)?);
+                        Ok(())
+                    }
+                    "clear-speech" => {
+                        self.speak_log.inner.borrow_mut().speaks.clear();
+                        self.speak_cursor = 0;
+                        Ok(())
+                    }
                     "finalize" => {
                         let _ = self.app.maybe_finalize_changes(&mut self.sr)?;
                         Ok(())
@@ -239,7 +254,37 @@ impl Harness {
                             .ok_or_else(|| anyhow!("line {}: missing cols", line_no + 1))?
                             .parse::<u16>()
                             .map_err(|_| anyhow!("line {}: invalid cols", line_no + 1))?;
-                        self.app.on_resize(rows, cols, &mut self.term_out)?;
+                        let cell_width_px = parts
+                            .next()
+                            .map(|value| value.parse::<u32>())
+                            .transpose()
+                            .map_err(|_| {
+                                anyhow!("line {}: invalid cell pixel width", line_no + 1)
+                            })?;
+                        let cell_height_px = parts
+                            .next()
+                            .map(|value| value.parse::<u32>())
+                            .transpose()
+                            .map_err(|_| {
+                                anyhow!("line {}: invalid cell pixel height", line_no + 1)
+                            })?;
+                        if parts.next().is_some()
+                            || cell_width_px.is_some() != cell_height_px.is_some()
+                        {
+                            bail!(
+                                "line {}: resize expects rows cols and optional cell-width-px cell-height-px",
+                                line_no + 1
+                            );
+                        }
+                        self.app.on_resize_with_geometry(
+                            TerminalGeometry::new(
+                                rows,
+                                cols,
+                                cell_width_px.unwrap_or(0),
+                                cell_height_px.unwrap_or(0),
+                            ),
+                            &mut self.term_out,
+                        )?;
                         Ok(())
                     }
                     "expect-pty-stdin" => {
@@ -251,6 +296,17 @@ impl Harness {
                             "pty-stdin",
                             line_no + 1,
                         )?;
+                        Ok(())
+                    }
+                    "expect-no-pty-stdin" => {
+                        let remaining = &self.pty_out[self.pty_cursor..];
+                        if !remaining.is_empty() {
+                            bail!(
+                                "line {}: expected no PTY stdin, got {:?}",
+                                line_no + 1,
+                                remaining
+                            );
+                        }
                         Ok(())
                     }
                     "expect-stdout" => {
@@ -306,6 +362,42 @@ impl Harness {
                         }
                         Ok(())
                     }
+                    "expect-no-speak" => {
+                        if let Some((text, interrupt)) = self.next_speak(line_no + 1) {
+                            bail!(
+                                "line {}: expected no speech, got {:?} (interrupt={})",
+                                line_no + 1,
+                                text,
+                                interrupt
+                            );
+                        }
+                        Ok(())
+                    }
+                    "expect-screen-contains" => {
+                        let expected = parse_text(payload)?;
+                        let actual = self.app.debug_active_view_contents();
+                        if !actual.contains(&expected) {
+                            bail!(
+                                "line {}: active screen does not contain {:?}",
+                                line_no + 1,
+                                expected
+                            );
+                        }
+                        Ok(())
+                    }
+                    "expect-root-geometry" => {
+                        let expected = parse_geometry(payload, line_no + 1)?;
+                        let actual = self.app.debug_root_terminal_geometry();
+                        if actual != expected {
+                            bail!(
+                                "line {}: expected root geometry {:?}, got {:?}",
+                                line_no + 1,
+                                expected,
+                                actual
+                            );
+                        }
+                        Ok(())
+                    }
                     "expect-stops" => {
                         let expected = payload
                             .parse::<usize>()
@@ -329,6 +421,18 @@ impl Harness {
             }
         }
         Ok(())
+    }
+
+    /// Sends one application-output chunk through the same path used by a
+    /// harness script. This is useful for byte-boundary and render-oracle
+    /// tests that need to retain the original chunk boundaries.
+    pub fn handle_pty_output(&mut self, bytes: &[u8]) -> Result<()> {
+        self.app.handle_pty(&mut self.sr, bytes, &mut self.term_out)
+    }
+
+    /// Returns every presentation byte emitted by the application so far.
+    pub fn terminal_output(&self) -> &[u8] {
+        &self.term_out
     }
 
     fn next_speak(&mut self, _line_no: usize) -> Option<(String, bool)> {
@@ -447,6 +551,14 @@ fn parse_bytes(input: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+fn parse_switch(input: &str) -> Result<bool> {
+    match input {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(anyhow!("expected on or off, got {:?}", input)),
+    }
+}
+
 #[derive(Copy, Clone)]
 enum BddPrefix {
     Given,
@@ -505,12 +617,40 @@ fn is_assert_command(cmd: &str) -> bool {
     matches!(
         cmd,
         "expect-pty-stdin"
+            | "expect-no-pty-stdin"
             | "expect-stdout"
             | "expect-stdout-contains"
             | "expect-speak"
             | "expect-speak-contains"
+            | "expect-no-speak"
+            | "expect-screen-contains"
+            | "expect-root-geometry"
             | "expect-stops"
     )
+}
+
+fn parse_geometry(payload: &str, line_no: usize) -> Result<TerminalGeometry> {
+    let values = payload
+        .split_whitespace()
+        .map(|value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| anyhow!("line {line_no}: invalid geometry value"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let [rows, cols, cell_width_px, cell_height_px] = values.as_slice() else {
+        bail!("line {line_no}: geometry expects rows cols cell-width-px cell-height-px");
+    };
+    Ok(TerminalGeometry::new(
+        (*rows)
+            .try_into()
+            .map_err(|_| anyhow!("line {line_no}: rows exceed u16"))?,
+        (*cols)
+            .try_into()
+            .map_err(|_| anyhow!("line {line_no}: cols exceed u16"))?,
+        *cell_width_px,
+        *cell_height_px,
+    ))
 }
 
 fn format_bytes_remaining(buffer: &[u8], cursor: usize) -> String {
@@ -544,7 +684,7 @@ mod tests {
     use super::{
         BddPrefix, FakeClock, Harness, HarnessDriver, SpeechRecorder, consume_expected,
         format_bytes_remaining, is_assert_command, parse_bdd_prefix, parse_bytes, parse_scenario,
-        parse_text,
+        parse_switch, parse_text,
     };
     use crate::{app::Clock, speech::Driver};
 
@@ -604,16 +744,23 @@ mod tests {
         assert_eq!(parse_scenario("SCENARIO : spaced"), Some("spaced"));
         assert_eq!(parse_scenario("Scenarios: nope"), None);
         assert_eq!(parse_scenario("Scenario name"), None);
+        assert!(parse_switch("on").unwrap());
+        assert!(!parse_switch("off").unwrap());
+        assert!(parse_switch("true").is_err());
     }
 
     #[test]
     fn assertion_classification_is_exhaustive() {
         for command in [
             "expect-pty-stdin",
+            "expect-no-pty-stdin",
             "expect-stdout",
             "expect-stdout-contains",
             "expect-speak",
             "expect-speak-contains",
+            "expect-no-speak",
+            "expect-screen-contains",
+            "expect-root-geometry",
             "expect-stops",
         ] {
             assert!(is_assert_command(command));
@@ -705,6 +852,10 @@ mod tests {
             (
                 "Scenario: x\nThen expect-pty-stdin: missing",
                 "pty-stdin output too short",
+            ),
+            (
+                "Scenario: x\nWhen stdin: x\nThen expect-no-pty-stdin:",
+                "expected no PTY stdin",
             ),
             ("Scenario: x\nThen expect-speak: missing", "no speech"),
             ("Scenario: x\nThen expect-stops: nope", "invalid stop count"),

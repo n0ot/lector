@@ -1,0 +1,1361 @@
+//! Engine-neutral terminal state and Lector's Ghostty terminal adapter.
+
+use serde::{Deserialize, Serialize};
+use std::ops::RangeInclusive;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Color {
+    #[default]
+    Default,
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct Style {
+    pub foreground: Color,
+    pub background: Color,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct Cell {
+    pub grapheme: String,
+    pub width: u8,
+    pub continuation: bool,
+    pub style: Style,
+    pub hyperlink: Option<String>,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            grapheme: String::new(),
+            width: 1,
+            continuation: false,
+            style: Style::default(),
+            hyperlink: None,
+        }
+    }
+}
+
+impl Cell {
+    pub fn contents(&self) -> &str {
+        &self.grapheme
+    }
+
+    pub fn has_contents(&self) -> bool {
+        !self.grapheme.is_empty()
+    }
+
+    pub fn is_wide(&self) -> bool {
+        self.width == 2 && !self.continuation
+    }
+
+    pub fn is_wide_continuation(&self) -> bool {
+        self.continuation
+    }
+
+    pub fn fgcolor(&self) -> Color {
+        self.style.foreground
+    }
+
+    pub fn bgcolor(&self) -> Color {
+        self.style.background
+    }
+
+    pub fn bold(&self) -> bool {
+        self.style.bold
+    }
+
+    pub fn dim(&self) -> bool {
+        self.style.dim
+    }
+
+    pub fn italic(&self) -> bool {
+        self.style.italic
+    }
+
+    pub fn underline(&self) -> bool {
+        self.style.underline
+    }
+
+    pub fn inverse(&self) -> bool {
+        self.style.inverse
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct Row {
+    pub cells: Vec<Cell>,
+    pub wrapped: bool,
+}
+
+impl Row {
+    pub fn contents(&self) -> String {
+        row_contents(self, 0, self.cells.len() as u16)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct Cursor {
+    pub row: u16,
+    pub col: u16,
+    pub visible: bool,
+}
+
+/// Cell and pixel geometry for one terminal grid.
+///
+/// Pixel dimensions are expressed per cell because that is the geometry
+/// libghostty-vt consumes. The total grid dimensions are derived separately
+/// for PTY `winsize` propagation and terminal size reports.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct TerminalGeometry {
+    pub rows: u16,
+    pub cols: u16,
+    pub cell_width_px: u32,
+    pub cell_height_px: u32,
+}
+
+impl TerminalGeometry {
+    pub const fn new(rows: u16, cols: u16, cell_width_px: u32, cell_height_px: u32) -> Self {
+        Self {
+            rows: if rows == 0 { 1 } else { rows },
+            cols: if cols == 0 { 1 } else { cols },
+            cell_width_px,
+            cell_height_px,
+        }
+    }
+
+    pub const fn from_cells(rows: u16, cols: u16) -> Self {
+        Self::new(rows, cols, 0, 0)
+    }
+
+    pub fn from_grid_pixels(rows: u16, cols: u16, width_px: u32, height_px: u32) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        Self::new(
+            rows,
+            cols,
+            width_px / u32::from(cols),
+            height_px / u32::from(rows),
+        )
+    }
+
+    pub const fn width_px(self) -> u32 {
+        self.cell_width_px.saturating_mul(self.cols as u32)
+    }
+
+    pub const fn height_px(self) -> u32 {
+        self.cell_height_px.saturating_mul(self.rows as u32)
+    }
+}
+
+impl Default for TerminalGeometry {
+    fn default() -> Self {
+        Self::from_cells(1, 1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenIdentity {
+    #[default]
+    Primary,
+    Alternate,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseProtocol {
+    #[default]
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct TerminalModes {
+    pub application_keypad: bool,
+    pub application_cursor: bool,
+    pub bracketed_paste: bool,
+    pub synchronized_output: bool,
+    pub focus_reporting: bool,
+    pub kitty_keyboard_flags: u8,
+    pub mouse_protocol: MouseProtocol,
+    pub mouse_encoding: MouseEncoding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct HistoryPosition {
+    pub row: usize,
+    pub col: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SemanticKind {
+    PromptStart,
+    InputStart,
+    CommandStart,
+    CommandFinished { exit_code: Option<i32> },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SemanticMark {
+    pub kind: SemanticKind,
+    pub position: HistoryPosition,
+    pub alternate_screen: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TerminalEffects {
+    pub bells: usize,
+    pub title_changed: bool,
+    pub events: Vec<TerminalEvent>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClipboardLocation {
+    Standard,
+    Selection,
+    Primary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardContent {
+    pub mime: String,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgressState {
+    Remove,
+    Set,
+    Error,
+    Indeterminate,
+    Pause,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalQuery {
+    Enquiry,
+    XtVersion,
+    Size,
+    ColorScheme,
+    DeviceAttributes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerminalEvent {
+    Bell,
+    TitleChanged(String),
+    WorkingDirectoryChanged(String),
+    ClipboardWrite {
+        location: ClipboardLocation,
+        contents: Vec<ClipboardContent>,
+    },
+    DesktopNotification {
+        title: String,
+        body: String,
+    },
+    ProgressReport {
+        state: ProgressState,
+        progress: Option<u8>,
+    },
+    Query(TerminalQuery),
+    PtyReply(Vec<u8>),
+    UnknownSequence {
+        content: Vec<u8>,
+        truncated: bool,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum TerminalDamage {
+    #[default]
+    None,
+    Rows(Vec<RangeInclusive<u16>>),
+    Full,
+}
+
+impl TerminalDamage {
+    pub fn is_dirty(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PrintBoundary {
+    #[default]
+    Continue,
+    LineFeed,
+    CarriageReturn,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PrintedRun {
+    pub text: String,
+    pub boundary: PrintBoundary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateSummary {
+    pub effects: TerminalEffects,
+    pub damage: TerminalDamage,
+    pub pty_replies: Vec<u8>,
+    pub printed_runs: Vec<PrintedRun>,
+    pub cursor_operations: usize,
+    pub scroll_operations: usize,
+    pub changed_rows: Vec<RangeInclusive<u16>>,
+    pub cursor_before: Cursor,
+    pub cursor_after: Cursor,
+    pub screen_before: ScreenIdentity,
+    pub screen_after: ScreenIdentity,
+    pub synchronized_output: bool,
+    pub batch_count: usize,
+}
+
+impl Default for UpdateSummary {
+    fn default() -> Self {
+        Self {
+            effects: TerminalEffects::default(),
+            damage: TerminalDamage::None,
+            pty_replies: Vec::new(),
+            printed_runs: Vec::new(),
+            cursor_operations: 0,
+            scroll_operations: 0,
+            changed_rows: Vec::new(),
+            cursor_before: Cursor::default(),
+            cursor_after: Cursor::default(),
+            screen_before: ScreenIdentity::Primary,
+            screen_after: ScreenIdentity::Primary,
+            synchronized_output: false,
+            batch_count: 0,
+        }
+    }
+}
+
+impl UpdateSummary {
+    pub fn merge(&mut self, mut next: Self) {
+        if next.batch_count == 0 {
+            return;
+        }
+        if self.batch_count == 0 {
+            self.cursor_before = next.cursor_before;
+            self.screen_before = next.screen_before;
+        }
+        self.cursor_after = next.cursor_after;
+        self.screen_after = next.screen_after;
+        self.synchronized_output = next.synchronized_output;
+        self.batch_count = self.batch_count.saturating_add(next.batch_count);
+        self.effects.bells = self.effects.bells.saturating_add(next.effects.bells);
+        self.effects.title_changed |= next.effects.title_changed;
+        self.effects.events.append(&mut next.effects.events);
+        self.pty_replies.append(&mut next.pty_replies);
+        append_printed_runs(&mut self.printed_runs, next.printed_runs);
+        self.cursor_operations = self
+            .cursor_operations
+            .saturating_add(next.cursor_operations);
+        self.scroll_operations = self
+            .scroll_operations
+            .saturating_add(next.scroll_operations);
+        self.changed_rows.append(&mut next.changed_rows);
+        normalize_row_ranges(&mut self.changed_rows);
+        self.damage = merge_damage(
+            std::mem::take(&mut self.damage),
+            std::mem::take(&mut next.damage),
+        );
+    }
+
+    pub fn printed_text(&self) -> String {
+        let mut text = String::new();
+        self.printed_text_into(&mut text);
+        text
+    }
+
+    pub fn printed_text_into(&self, text: &mut String) {
+        text.clear();
+        for run in &self.printed_runs {
+            match run.boundary {
+                PrintBoundary::Continue => {}
+                PrintBoundary::LineFeed => {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                }
+                PrintBoundary::CarriageReturn => {
+                    let line_start = text.rfind('\n').map_or(0, |index| index + 1);
+                    text.truncate(line_start);
+                }
+            }
+            text.push_str(&run.text);
+        }
+    }
+}
+
+fn append_printed_runs(target: &mut Vec<PrintedRun>, source: Vec<PrintedRun>) {
+    for run in source {
+        if run.boundary == PrintBoundary::LineFeed
+            && run.text.is_empty()
+            && let Some(previous) = target.last_mut()
+            && previous.boundary == PrintBoundary::CarriageReturn
+            && previous.text.is_empty()
+        {
+            previous.boundary = PrintBoundary::LineFeed;
+            continue;
+        }
+        if run.boundary == PrintBoundary::Continue
+            && let Some(previous) = target.last_mut()
+        {
+            previous.text.push_str(&run.text);
+        } else {
+            target.push(run);
+        }
+    }
+}
+
+fn merge_damage(left: TerminalDamage, right: TerminalDamage) -> TerminalDamage {
+    match (left, right) {
+        (TerminalDamage::Full, _) | (_, TerminalDamage::Full) => TerminalDamage::Full,
+        (TerminalDamage::None, damage) | (damage, TerminalDamage::None) => damage,
+        (TerminalDamage::Rows(mut left), TerminalDamage::Rows(mut right)) => {
+            left.append(&mut right);
+            normalize_row_ranges(&mut left);
+            TerminalDamage::Rows(left)
+        }
+    }
+}
+
+fn normalize_row_ranges(ranges: &mut Vec<RangeInclusive<u16>>) {
+    ranges.sort_unstable_by_key(|range| *range.start());
+    let mut merged: Vec<RangeInclusive<u16>> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(previous) = merged.last_mut()
+            && range.start() <= &previous.end().saturating_add(1)
+        {
+            let start = *previous.start();
+            let end = (*previous.end()).max(*range.end());
+            *previous = start..=end;
+        } else {
+            merged.push(range);
+        }
+    }
+    *ranges = merged;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Viewport {
+    #[default]
+    Live,
+    Scrollback(usize),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TerminalSnapshot {
+    pub rows: Vec<Row>,
+    pub scrollback: Vec<Row>,
+    pub cursor: Cursor,
+    pub geometry: TerminalGeometry,
+    pub screen: ScreenIdentity,
+    pub modes: TerminalModes,
+    pub title: Option<String>,
+    pub working_directory: Option<String>,
+    pub semantic_marks: Vec<SemanticMark>,
+    pub scrollback_extent: usize,
+    pub viewport: Viewport,
+}
+
+impl TerminalSnapshot {
+    pub fn size(&self) -> (u16, u16) {
+        (
+            self.rows.len().try_into().unwrap_or(u16::MAX),
+            self.rows
+                .first()
+                .map_or(0, |row| row.cells.len().try_into().unwrap_or(u16::MAX)),
+        )
+    }
+
+    pub fn cell(&self, row: u16, col: u16) -> Option<&Cell> {
+        self.rows.get(usize::from(row))?.cells.get(usize::from(col))
+    }
+
+    pub fn row_wrapped(&self, row: u16) -> bool {
+        self.rows
+            .get(usize::from(row))
+            .is_some_and(|row| row.wrapped)
+    }
+
+    pub fn cursor_position(&self) -> (u16, u16) {
+        (self.cursor.row, self.cursor.col)
+    }
+
+    pub fn alternate_screen(&self) -> bool {
+        self.screen == ScreenIdentity::Alternate
+    }
+
+    pub fn application_keypad(&self) -> bool {
+        self.modes.application_keypad
+    }
+
+    pub fn application_cursor(&self) -> bool {
+        self.modes.application_cursor
+    }
+
+    pub fn hide_cursor(&self) -> bool {
+        !self.cursor.visible
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.modes.bracketed_paste
+    }
+
+    pub fn focus_reporting(&self) -> bool {
+        self.modes.focus_reporting
+    }
+
+    pub fn kitty_keyboard_flags(&self) -> u8 {
+        self.modes.kitty_keyboard_flags
+    }
+
+    pub fn mouse_protocol_mode(&self) -> MouseProtocol {
+        self.modes.mouse_protocol
+    }
+
+    pub fn mouse_protocol_encoding(&self) -> MouseEncoding {
+        self.modes.mouse_encoding
+    }
+
+    pub fn contents(&self) -> String {
+        let mut contents = String::new();
+        let mut wrapping = false;
+        for row in &self.rows {
+            let text = row.contents();
+            if !text.is_empty() {
+                contents.push_str(&text);
+            } else if wrapping {
+                contents.push('\n');
+            }
+            if !row.wrapped {
+                contents.push('\n');
+            }
+            wrapping = row.wrapped;
+        }
+        while contents.ends_with('\n') {
+            contents.pop();
+        }
+        contents
+    }
+
+    pub fn rows(&self, start: u16, width: u16) -> impl Iterator<Item = String> + '_ {
+        self.rows
+            .iter()
+            .map(move |row| row_contents(row, start, width))
+    }
+
+    pub fn contents_between(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> String {
+        match start_row.cmp(&end_row) {
+            std::cmp::Ordering::Less => {
+                let (_, cols) = self.size();
+                let mut contents = String::new();
+                for row_index in start_row..=end_row {
+                    let Some(row) = self.rows.get(usize::from(row_index)) else {
+                        break;
+                    };
+                    if row_index == start_row {
+                        contents.push_str(&row_contents(
+                            row,
+                            start_col,
+                            cols.saturating_sub(start_col),
+                        ));
+                    } else if row_index == end_row {
+                        contents.push_str(&row_contents(row, 0, end_col));
+                    } else {
+                        contents.push_str(&row_contents(row, 0, cols));
+                    }
+                    if row_index != end_row && !row.wrapped {
+                        contents.push('\n');
+                    }
+                }
+                contents
+            }
+            std::cmp::Ordering::Equal if start_col < end_col => self
+                .rows
+                .get(usize::from(start_row))
+                .map_or_else(String::new, |row| {
+                    row_contents(row, start_col, end_col - start_col)
+                }),
+            _ => String::new(),
+        }
+    }
+
+    pub fn contents_full(&self) -> String {
+        let mut out = String::new();
+        self.contents_full_into(&mut out);
+        out
+    }
+
+    pub fn contents_full_into(&self, out: &mut String) {
+        out.clear();
+        let (_, cols) = self.size();
+        for row in &self.rows {
+            out.push_str(row_contents(row, 0, cols).trim_end());
+            out.push('\n');
+        }
+    }
+}
+
+fn row_contents(row: &Row, start: u16, width: u16) -> String {
+    let end = usize::from(start.saturating_add(width)).min(row.cells.len());
+    let start = usize::from(start).min(end);
+    let mut output = String::new();
+    let mut pending_spaces = 0;
+    for cell in &row.cells[start..end] {
+        if cell.continuation {
+            continue;
+        }
+        if cell.grapheme.is_empty() {
+            pending_spaces += 1;
+        } else {
+            output.extend(std::iter::repeat_n(' ', pending_spaces));
+            pending_spaces = 0;
+            output.push_str(&cell.grapheme);
+        }
+    }
+    output
+}
+
+pub trait TerminalEngine {
+    fn advance(&mut self, bytes: &[u8]) -> UpdateSummary;
+    fn resize(&mut self, rows: u16, cols: u16) -> UpdateSummary {
+        self.resize_with_geometry(TerminalGeometry::from_cells(rows, cols))
+    }
+    fn resize_with_geometry(&mut self, geometry: TerminalGeometry) -> UpdateSummary;
+    fn reset(&mut self) -> UpdateSummary;
+    fn select_viewport(&mut self, viewport: Viewport);
+    fn viewport(&self) -> Viewport;
+    fn snapshot(&self) -> &TerminalSnapshot;
+    fn snapshot_with_history(&mut self) -> TerminalSnapshot;
+    fn scrollback_extent(&self) -> usize;
+}
+
+fn full_row_range(rows: u16) -> Vec<RangeInclusive<u16>> {
+    (rows > 0).then(|| 0..=rows - 1).into_iter().collect()
+}
+
+pub use lector_ghostty::{
+    CellSnapshot as GhosttyCell, ClipboardContentSnapshot as GhosttyClipboardContent,
+    ClipboardLocationSnapshot as GhosttyClipboardLocation, ColorSnapshot as GhosttyColor,
+    CursorSnapshot as GhosttyCursor, EffectSnapshot as GhosttyEffect,
+    ModesSnapshot as GhosttyModes, PrintBoundarySnapshot as GhosttyPrintBoundary,
+    ProgressStateSnapshot as GhosttyProgressState, QuerySnapshot as GhosttyQuery,
+    RowSnapshot as GhosttyRow, SemanticKindSnapshot as GhosttySemanticKind,
+    StyleSnapshot as GhosttyStyle, TerminalSnapshot as GhosttySnapshot,
+    UpdateSnapshot as GhosttyUpdate,
+};
+
+/// Lector's sole authoritative terminal engine.
+///
+/// This adapter is intentionally not `Send` or `Sync`: the owned Ghostty
+/// handles stay on the thread where the engine was constructed.
+pub struct GhosttyEngine {
+    terminal: lector_ghostty::Terminal,
+    snapshot: TerminalSnapshot,
+    viewport: Viewport,
+}
+
+/// A Ghostty-owned review anchor. The reference follows its cell through
+/// scrolling and reflow and resolves to `None` once that cell leaves Lector's
+/// logically retained history window.
+pub struct GhosttyReviewMark {
+    reference: lector_ghostty::TrackedGridRef,
+    alternate_screen: bool,
+}
+
+const _: () = {
+    struct Check<T: ?Sized>(std::marker::PhantomData<T>);
+    trait AmbiguousIfSend<A> {
+        fn marker() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for Check<T> {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for Check<T> {}
+
+    trait AmbiguousIfSync<A> {
+        fn marker() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for Check<T> {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for Check<T> {}
+
+    let _ = <Check<GhosttyEngine> as AmbiguousIfSend<_>>::marker;
+    let _ = <Check<GhosttyEngine> as AmbiguousIfSync<_>>::marker;
+};
+
+impl GhosttyEngine {
+    pub fn new(rows: u16, cols: u16) -> Result<Self, lector_ghostty::Error> {
+        Self::new_with_scrollback(rows, cols, 10_000)
+    }
+
+    pub fn new_with_scrollback(
+        rows: u16,
+        cols: u16,
+        scrollback_capacity: usize,
+    ) -> Result<Self, lector_ghostty::Error> {
+        let terminal =
+            lector_ghostty::Terminal::new_with_scrollback(rows, cols, scrollback_capacity)?;
+        let snapshot = normalize_ghostty_snapshot(terminal.snapshot());
+        Ok(Self {
+            terminal,
+            snapshot,
+            viewport: Viewport::Live,
+        })
+    }
+
+    pub fn try_advance(&mut self, bytes: &[u8]) -> Result<UpdateSummary, lector_ghostty::Error> {
+        let update = self.terminal.advance(bytes).map(normalize_ghostty_update)?;
+        self.refresh_snapshot()?;
+        Ok(update)
+    }
+
+    /// Fallible direct adapter API. Production callers use `TerminalEngine`;
+    /// diagnostics and adapter tests can retain the underlying error.
+    pub fn advance(&mut self, bytes: &[u8]) -> Result<UpdateSummary, lector_ghostty::Error> {
+        self.try_advance(bytes)
+    }
+
+    pub fn try_resize(&mut self, rows: u16, cols: u16) -> Result<(), lector_ghostty::Error> {
+        self.terminal.resize(rows, cols)?;
+        self.refresh_snapshot()
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), lector_ghostty::Error> {
+        self.try_resize(rows, cols)
+    }
+
+    pub fn try_resize_with_geometry(
+        &mut self,
+        geometry: TerminalGeometry,
+    ) -> Result<(), lector_ghostty::Error> {
+        self.terminal.resize_with_geometry(
+            geometry.rows,
+            geometry.cols,
+            geometry.cell_width_px,
+            geometry.cell_height_px,
+        )?;
+        self.refresh_snapshot()
+    }
+
+    pub fn resize_with_geometry(
+        &mut self,
+        geometry: TerminalGeometry,
+    ) -> Result<(), lector_ghostty::Error> {
+        self.try_resize_with_geometry(geometry)
+    }
+
+    pub fn diagnostic_snapshot(
+        &self,
+    ) -> Result<lector_ghostty::DiagnosticSnapshot, lector_ghostty::Error> {
+        self.terminal.diagnostic_snapshot()
+    }
+
+    pub fn restore_diagnostic_snapshot(
+        snapshot: lector_ghostty::DiagnosticSnapshot,
+    ) -> Result<Self, lector_ghostty::Error> {
+        let terminal = lector_ghostty::Terminal::restore_diagnostic_snapshot(snapshot)?;
+        let snapshot = normalize_ghostty_snapshot(terminal.snapshot());
+        Ok(Self {
+            terminal,
+            snapshot,
+            viewport: Viewport::Live,
+        })
+    }
+
+    pub fn try_reset(&mut self) -> Result<(), lector_ghostty::Error> {
+        self.terminal.reset()?;
+        self.viewport = Viewport::Live;
+        self.refresh_snapshot()
+    }
+
+    pub fn reset(&mut self) -> Result<(), lector_ghostty::Error> {
+        self.try_reset()
+    }
+
+    pub fn ghostty_snapshot(&self) -> &GhosttySnapshot {
+        self.terminal.snapshot()
+    }
+
+    pub fn normalized_snapshot(&self) -> TerminalSnapshot {
+        normalize_ghostty_snapshot(self.terminal.snapshot())
+    }
+
+    pub fn normalized_snapshot_with_history(
+        &self,
+    ) -> Result<TerminalSnapshot, lector_ghostty::Error> {
+        self.terminal
+            .snapshot_with_history()
+            .map(|snapshot| normalize_ghostty_snapshot(&snapshot))
+    }
+
+    pub fn ghostty_snapshot_with_history(&self) -> Result<GhosttySnapshot, lector_ghostty::Error> {
+        self.terminal.snapshot_with_history()
+    }
+
+    pub fn scrollback_extent(&self) -> usize {
+        self.terminal.scrollback_extent()
+    }
+
+    pub fn track_review_mark(
+        &self,
+        position: HistoryPosition,
+    ) -> Result<GhosttyReviewMark, lector_ghostty::Error> {
+        let snapshot = self.terminal.snapshot();
+        let logical_rows = snapshot
+            .scrollback_extent
+            .saturating_add(snapshot.rows.len());
+        if position.row >= logical_rows {
+            return Err(lector_ghostty::Error::InvalidValue);
+        }
+        let physical_row = self.terminal.history_origin()?.saturating_add(position.row);
+        Ok(GhosttyReviewMark {
+            reference: self
+                .terminal
+                .track_screen_position(physical_row, position.col)?,
+            alternate_screen: snapshot.alternate_screen,
+        })
+    }
+
+    pub fn review_mark_position(
+        &self,
+        mark: &GhosttyReviewMark,
+    ) -> Result<Option<HistoryPosition>, lector_ghostty::Error> {
+        if mark.alternate_screen != self.terminal.snapshot().alternate_screen {
+            return Ok(None);
+        }
+        let Some((physical_row, col)) = mark.reference.screen_position()? else {
+            return Ok(None);
+        };
+        let origin = self.terminal.history_origin()?;
+        if physical_row < origin {
+            return Ok(None);
+        }
+        let row = physical_row - origin;
+        let logical_rows = self
+            .terminal
+            .scrollback_extent()
+            .saturating_add(self.terminal.snapshot().rows.len());
+        Ok((row < logical_rows).then_some(HistoryPosition { row, col }))
+    }
+
+    /// Raw presentation remains authoritative through Stop 1.8, so Ghostty's
+    /// generated replies are not returned to the child until the capability
+    /// broker owns the outer terminal in Phase 2.
+    pub fn pty_replies(&self) -> &[u8] {
+        &[]
+    }
+
+    pub(crate) fn presentation_contents(&self) -> Vec<u8> {
+        format_terminal_contents(&self.snapshot)
+    }
+
+    pub(crate) fn presentation_cursor(&self) -> Vec<u8> {
+        format_terminal_cursor(&self.snapshot)
+    }
+
+    pub(crate) fn presentation_attributes(&self) -> Vec<u8> {
+        let style = self
+            .terminal
+            .cursor_style()
+            .map(normalize_ghostty_style)
+            .unwrap_or_else(|error| panic!("Ghostty cursor-style query failed: {error}"));
+        let mut bytes = b"\x1b]8;;".to_vec();
+        if let Some(uri) = self.terminal.active_hyperlink() {
+            bytes.extend(uri.bytes().filter(|byte| *byte >= b' ' && *byte != 0x7f));
+        }
+        bytes.extend_from_slice(b"\x1b\\");
+        write_terminal_style(&mut bytes, &style);
+        bytes
+    }
+
+    pub(crate) fn presentation_input_modes(&self) -> Vec<u8> {
+        format_terminal_input_modes(&self.snapshot.modes)
+    }
+
+    fn refresh_snapshot(&mut self) -> Result<(), lector_ghostty::Error> {
+        let live = normalize_ghostty_snapshot(self.terminal.snapshot());
+        let Viewport::Scrollback(requested_offset) = self.viewport else {
+            self.snapshot = live;
+            return Ok(());
+        };
+        let full = self
+            .terminal
+            .snapshot_with_history()
+            .map(|snapshot| normalize_ghostty_snapshot(&snapshot))?;
+        let offset = requested_offset.min(full.scrollback.len());
+        if offset == 0 {
+            self.viewport = Viewport::Live;
+            self.snapshot = live;
+            return Ok(());
+        }
+        let visible_rows = live.rows.len();
+        let history_rows = full.scrollback.len();
+        let mut all_rows = full.scrollback;
+        all_rows.extend(full.rows);
+        let start = history_rows.saturating_sub(offset);
+        let end = start.saturating_add(visible_rows).min(all_rows.len());
+        self.snapshot = live;
+        self.snapshot.rows = all_rows[start..end].to_vec();
+        while self.snapshot.rows.len() < visible_rows {
+            self.snapshot.rows.push(Row {
+                cells: vec![Cell::default(); usize::from(self.snapshot.geometry.cols)],
+                wrapped: false,
+            });
+        }
+        self.snapshot.viewport = Viewport::Scrollback(offset);
+        self.viewport = self.snapshot.viewport;
+        Ok(())
+    }
+}
+
+impl TerminalEngine for GhosttyEngine {
+    fn advance(&mut self, bytes: &[u8]) -> UpdateSummary {
+        self.try_advance(bytes)
+            .unwrap_or_else(|error| panic!("Ghostty terminal advance failed: {error}"))
+    }
+
+    fn resize_with_geometry(&mut self, geometry: TerminalGeometry) -> UpdateSummary {
+        let before = self.snapshot.clone();
+        self.try_resize_with_geometry(geometry)
+            .unwrap_or_else(|error| panic!("Ghostty terminal resize failed: {error}"));
+        UpdateSummary {
+            damage: TerminalDamage::Full,
+            changed_rows: full_row_range(self.snapshot.geometry.rows),
+            cursor_before: before.cursor,
+            cursor_after: self.snapshot.cursor,
+            screen_before: before.screen,
+            screen_after: self.snapshot.screen,
+            synchronized_output: self.snapshot.modes.synchronized_output,
+            batch_count: 1,
+            ..UpdateSummary::default()
+        }
+    }
+
+    fn reset(&mut self) -> UpdateSummary {
+        let before = self.snapshot.clone();
+        self.try_reset()
+            .unwrap_or_else(|error| panic!("Ghostty terminal reset failed: {error}"));
+        UpdateSummary {
+            damage: TerminalDamage::Full,
+            changed_rows: full_row_range(self.snapshot.geometry.rows),
+            cursor_before: before.cursor,
+            cursor_after: self.snapshot.cursor,
+            screen_before: before.screen,
+            screen_after: self.snapshot.screen,
+            synchronized_output: self.snapshot.modes.synchronized_output,
+            batch_count: 1,
+            ..UpdateSummary::default()
+        }
+    }
+
+    fn select_viewport(&mut self, viewport: Viewport) {
+        self.viewport = viewport;
+        self.refresh_snapshot()
+            .unwrap_or_else(|error| panic!("Ghostty viewport selection failed: {error}"));
+    }
+
+    fn viewport(&self) -> Viewport {
+        self.viewport
+    }
+
+    fn snapshot(&self) -> &TerminalSnapshot {
+        &self.snapshot
+    }
+
+    fn snapshot_with_history(&mut self) -> TerminalSnapshot {
+        self.normalized_snapshot_with_history()
+            .unwrap_or_else(|error| panic!("Ghostty history snapshot failed: {error}"))
+    }
+
+    fn scrollback_extent(&self) -> usize {
+        self.terminal.scrollback_extent()
+    }
+}
+
+/// Serialize a complete visible grid for the legacy overlay-restoration path.
+/// Raw PTY bytes remain the normal presentation path until Phase 2; this
+/// serializer is deliberately correctness-first and is replaced by the scene
+/// renderer there.
+fn format_terminal_contents(snapshot: &TerminalSnapshot) -> Vec<u8> {
+    let mut bytes = b"\x1b[0m\x1b]8;;\x1b\\".to_vec();
+    let mut active_style = Style::default();
+    let mut active_link: Option<&str> = None;
+
+    for (row_index, row) in snapshot.rows.iter().enumerate() {
+        bytes.extend_from_slice(format!("\x1b[{};1H", row_index + 1).as_bytes());
+        for cell in &row.cells {
+            if cell.continuation {
+                continue;
+            }
+            let link = cell.hyperlink.as_deref();
+            if link != active_link {
+                bytes.extend_from_slice(b"\x1b]8;;\x1b\\");
+                if let Some(uri) = link {
+                    bytes.extend_from_slice(b"\x1b]8;;");
+                    bytes.extend(uri.bytes().filter(|byte| *byte >= b' ' && *byte != 0x7f));
+                    bytes.extend_from_slice(b"\x1b\\");
+                }
+                active_link = link;
+            }
+            if cell.style != active_style {
+                write_terminal_style(&mut bytes, &cell.style);
+                active_style = cell.style.clone();
+            }
+            if cell.grapheme.is_empty() {
+                bytes.push(b' ');
+            } else {
+                bytes.extend_from_slice(cell.grapheme.as_bytes());
+            }
+        }
+    }
+    if active_link.is_some() {
+        bytes.extend_from_slice(b"\x1b]8;;\x1b\\");
+    }
+    bytes
+}
+
+fn write_terminal_style(bytes: &mut Vec<u8>, style: &Style) {
+    bytes.extend_from_slice(b"\x1b[0");
+    if style.bold {
+        bytes.extend_from_slice(b";1");
+    }
+    if style.dim {
+        bytes.extend_from_slice(b";2");
+    }
+    if style.italic {
+        bytes.extend_from_slice(b";3");
+    }
+    if style.underline {
+        bytes.extend_from_slice(b";4");
+    }
+    if style.inverse {
+        bytes.extend_from_slice(b";7");
+    }
+    write_terminal_color(bytes, style.foreground, true);
+    write_terminal_color(bytes, style.background, false);
+    bytes.push(b'm');
+}
+
+fn write_terminal_color(bytes: &mut Vec<u8>, color: Color, foreground: bool) {
+    let selector = if foreground { 38 } else { 48 };
+    match color {
+        Color::Default => {}
+        Color::Indexed(index) => {
+            bytes.extend_from_slice(format!(";{selector};5;{index}").as_bytes());
+        }
+        Color::Rgb(red, green, blue) => {
+            bytes.extend_from_slice(format!(";{selector};2;{red};{green};{blue}").as_bytes());
+        }
+    }
+}
+
+fn format_terminal_cursor(snapshot: &TerminalSnapshot) -> Vec<u8> {
+    format!(
+        "\x1b[{};{}H\x1b[?25{}",
+        snapshot.cursor.row.saturating_add(1),
+        snapshot.cursor.col.saturating_add(1),
+        if snapshot.cursor.visible { 'h' } else { 'l' },
+    )
+    .into_bytes()
+}
+
+fn format_terminal_input_modes(modes: &TerminalModes) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(if modes.application_keypad {
+        b"\x1b="
+    } else {
+        b"\x1b>"
+    });
+    write_private_mode(&mut bytes, 1, modes.application_cursor);
+    write_private_mode(&mut bytes, 2004, modes.bracketed_paste);
+    write_private_mode(&mut bytes, 1004, modes.focus_reporting);
+    for mode in [9, 1000, 1002, 1003] {
+        write_private_mode(&mut bytes, mode, false);
+    }
+    let mouse_mode = match modes.mouse_protocol {
+        MouseProtocol::None => None,
+        MouseProtocol::Press => Some(9),
+        MouseProtocol::PressRelease => Some(1000),
+        MouseProtocol::ButtonMotion => Some(1002),
+        MouseProtocol::AnyMotion => Some(1003),
+    };
+    if let Some(mode) = mouse_mode {
+        write_private_mode(&mut bytes, mode, true);
+    }
+    write_private_mode(&mut bytes, 1005, false);
+    write_private_mode(&mut bytes, 1006, false);
+    match modes.mouse_encoding {
+        MouseEncoding::Default => {}
+        MouseEncoding::Utf8 => write_private_mode(&mut bytes, 1005, true),
+        MouseEncoding::Sgr => write_private_mode(&mut bytes, 1006, true),
+    }
+    bytes.extend_from_slice(format!("\x1b[={}u", modes.kitty_keyboard_flags).as_bytes());
+    bytes
+}
+
+fn write_private_mode(bytes: &mut Vec<u8>, mode: u16, enabled: bool) {
+    bytes.extend_from_slice(format!("\x1b[?{mode}{}", if enabled { 'h' } else { 'l' }).as_bytes());
+}
+
+fn normalize_ghostty_snapshot(snapshot: &GhosttySnapshot) -> TerminalSnapshot {
+    let (rows, cols) = snapshot.size();
+    TerminalSnapshot {
+        rows: snapshot.rows.iter().map(normalize_ghostty_row).collect(),
+        scrollback: snapshot
+            .scrollback
+            .iter()
+            .map(normalize_ghostty_row)
+            .collect(),
+        cursor: Cursor {
+            row: snapshot.cursor.row,
+            col: snapshot.cursor.col,
+            visible: snapshot.cursor.visible,
+        },
+        geometry: TerminalGeometry::from_grid_pixels(
+            rows,
+            cols,
+            snapshot.width_px,
+            snapshot.height_px,
+        ),
+        screen: if snapshot.alternate_screen {
+            ScreenIdentity::Alternate
+        } else {
+            ScreenIdentity::Primary
+        },
+        modes: TerminalModes {
+            application_keypad: snapshot.modes.application_keypad,
+            application_cursor: snapshot.modes.application_cursor,
+            bracketed_paste: snapshot.modes.bracketed_paste,
+            synchronized_output: snapshot.modes.synchronized_output,
+            focus_reporting: snapshot.modes.focus_reporting,
+            kitty_keyboard_flags: snapshot.modes.kitty_keyboard_flags,
+            mouse_protocol: normalize_ghostty_mouse_protocol(snapshot.modes.mouse_protocol),
+            mouse_encoding: normalize_ghostty_mouse_encoding(snapshot.modes.mouse_encoding),
+        },
+        title: snapshot.title.clone(),
+        working_directory: snapshot.working_directory.clone(),
+        semantic_marks: snapshot
+            .semantic_marks
+            .iter()
+            .map(|mark| SemanticMark {
+                kind: match mark.kind {
+                    GhosttySemanticKind::PromptStart => SemanticKind::PromptStart,
+                    GhosttySemanticKind::InputStart => SemanticKind::InputStart,
+                    GhosttySemanticKind::CommandStart => SemanticKind::CommandStart,
+                    GhosttySemanticKind::CommandFinished { exit_code } => {
+                        SemanticKind::CommandFinished { exit_code }
+                    }
+                },
+                position: HistoryPosition {
+                    row: mark.row,
+                    col: mark.col,
+                },
+                alternate_screen: mark.alternate_screen,
+            })
+            .collect(),
+        scrollback_extent: snapshot.scrollback_extent,
+        viewport: Viewport::Live,
+    }
+}
+
+fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
+    let changed_rows = update.changed_rows;
+    let effects = update
+        .effects
+        .into_iter()
+        .map(normalize_ghostty_effect)
+        .filter(|event| !matches!(event, TerminalEvent::PtyReply(_)))
+        .collect::<Vec<_>>();
+    UpdateSummary {
+        effects: TerminalEffects {
+            bells: effects
+                .iter()
+                .filter(|event| matches!(event, TerminalEvent::Bell))
+                .count(),
+            title_changed: effects
+                .iter()
+                .any(|event| matches!(event, TerminalEvent::TitleChanged(_))),
+            events: effects,
+        },
+        pty_replies: update.pty_replies,
+        damage: if changed_rows.is_empty() {
+            TerminalDamage::None
+        } else {
+            TerminalDamage::Rows(changed_rows.clone())
+        },
+        printed_runs: update
+            .printed_runs
+            .into_iter()
+            .map(|run| PrintedRun {
+                text: run.text,
+                boundary: match run.boundary {
+                    GhosttyPrintBoundary::Continue => PrintBoundary::Continue,
+                    GhosttyPrintBoundary::LineFeed => PrintBoundary::LineFeed,
+                    GhosttyPrintBoundary::CarriageReturn => PrintBoundary::CarriageReturn,
+                },
+            })
+            .collect(),
+        cursor_operations: update.cursor_operations,
+        scroll_operations: update.scroll_operations,
+        changed_rows,
+        cursor_before: normalize_ghostty_cursor(update.cursor_before),
+        cursor_after: normalize_ghostty_cursor(update.cursor_after),
+        screen_before: ghostty_screen_identity(update.alternate_screen_before),
+        screen_after: ghostty_screen_identity(update.alternate_screen_after),
+        synchronized_output: update.synchronized_output,
+        batch_count: 1,
+    }
+}
+
+fn normalize_ghostty_effect(effect: GhosttyEffect) -> TerminalEvent {
+    match effect {
+        GhosttyEffect::Bell => TerminalEvent::Bell,
+        GhosttyEffect::TitleChanged(title) => TerminalEvent::TitleChanged(title),
+        GhosttyEffect::WorkingDirectoryChanged(path) => {
+            TerminalEvent::WorkingDirectoryChanged(path)
+        }
+        GhosttyEffect::ClipboardWrite { location, contents } => TerminalEvent::ClipboardWrite {
+            location: match location {
+                GhosttyClipboardLocation::Standard => ClipboardLocation::Standard,
+                GhosttyClipboardLocation::Selection => ClipboardLocation::Selection,
+                GhosttyClipboardLocation::Primary => ClipboardLocation::Primary,
+            },
+            contents: contents
+                .into_iter()
+                .map(|content: GhosttyClipboardContent| ClipboardContent {
+                    mime: content.mime,
+                    data: content.data,
+                })
+                .collect(),
+        },
+        GhosttyEffect::DesktopNotification { title, body } => {
+            TerminalEvent::DesktopNotification { title, body }
+        }
+        GhosttyEffect::ProgressReport { state, progress } => TerminalEvent::ProgressReport {
+            state: match state {
+                GhosttyProgressState::Remove => ProgressState::Remove,
+                GhosttyProgressState::Set => ProgressState::Set,
+                GhosttyProgressState::Error => ProgressState::Error,
+                GhosttyProgressState::Indeterminate => ProgressState::Indeterminate,
+                GhosttyProgressState::Pause => ProgressState::Pause,
+            },
+            progress,
+        },
+        GhosttyEffect::Query(query) => TerminalEvent::Query(match query {
+            GhosttyQuery::Enquiry => TerminalQuery::Enquiry,
+            GhosttyQuery::XtVersion => TerminalQuery::XtVersion,
+            GhosttyQuery::Size => TerminalQuery::Size,
+            GhosttyQuery::ColorScheme => TerminalQuery::ColorScheme,
+            GhosttyQuery::DeviceAttributes => TerminalQuery::DeviceAttributes,
+        }),
+        GhosttyEffect::PtyReply(bytes) => TerminalEvent::PtyReply(bytes),
+        GhosttyEffect::UnknownSequence { content, truncated } => {
+            TerminalEvent::UnknownSequence { content, truncated }
+        }
+    }
+}
+
+fn normalize_ghostty_cursor(cursor: GhosttyCursor) -> Cursor {
+    Cursor {
+        row: cursor.row,
+        col: cursor.col,
+        visible: cursor.visible,
+    }
+}
+
+fn ghostty_screen_identity(alternate: bool) -> ScreenIdentity {
+    if alternate {
+        ScreenIdentity::Alternate
+    } else {
+        ScreenIdentity::Primary
+    }
+}
+
+fn normalize_ghostty_row(row: &GhosttyRow) -> Row {
+    Row {
+        cells: row
+            .cells
+            .iter()
+            .map(|cell| Cell {
+                grapheme: cell.grapheme.clone(),
+                width: cell.width,
+                continuation: cell.continuation,
+                style: normalize_ghostty_style(cell.style.clone()),
+                hyperlink: cell.hyperlink.clone(),
+            })
+            .collect(),
+        wrapped: row.wrapped,
+    }
+}
+
+fn normalize_ghostty_style(style: GhosttyStyle) -> Style {
+    Style {
+        foreground: normalize_ghostty_color(style.foreground),
+        background: normalize_ghostty_color(style.background),
+        bold: style.bold,
+        dim: style.dim,
+        italic: style.italic,
+        underline: style.underline,
+        inverse: style.inverse,
+    }
+}
+
+fn normalize_ghostty_color(color: GhosttyColor) -> Color {
+    match color {
+        GhosttyColor::Default => Color::Default,
+        GhosttyColor::Indexed(index) => Color::Indexed(index),
+        GhosttyColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
+    }
+}
+
+fn normalize_ghostty_mouse_protocol(value: lector_ghostty::MouseProtocol) -> MouseProtocol {
+    match value {
+        lector_ghostty::MouseProtocol::None => MouseProtocol::None,
+        lector_ghostty::MouseProtocol::Press => MouseProtocol::Press,
+        lector_ghostty::MouseProtocol::PressRelease => MouseProtocol::PressRelease,
+        lector_ghostty::MouseProtocol::ButtonMotion => MouseProtocol::ButtonMotion,
+        lector_ghostty::MouseProtocol::AnyMotion => MouseProtocol::AnyMotion,
+    }
+}
+
+fn normalize_ghostty_mouse_encoding(value: lector_ghostty::MouseEncoding) -> MouseEncoding {
+    match value {
+        lector_ghostty::MouseEncoding::Default => MouseEncoding::Default,
+        lector_ghostty::MouseEncoding::Utf8 => MouseEncoding::Utf8,
+        lector_ghostty::MouseEncoding::Sgr => MouseEncoding::Sgr,
+    }
+}
