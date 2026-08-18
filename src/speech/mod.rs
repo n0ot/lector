@@ -6,6 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 pub mod proc_driver;
 pub mod symbols;
 pub mod tts;
+pub mod worker;
 
 const MIN_REPEAT_COUNT: usize = 4;
 static EXPAND_START_CAPS: LazyLock<Regex> = LazyLock::new(|| {
@@ -175,7 +176,6 @@ impl Speech {
         self.driver.stop().map_err(Error::Driver)
     }
 
-    #[allow(dead_code)]
     pub fn get_rate(&self) -> f32 {
         self.driver.get_rate()
     }

@@ -9,12 +9,12 @@ sessions to one control client, so Lector does not claim that broader scope.
 
 The Lua option `lector.o.tmux_bells` accepts exactly three values:
 
-- `"off"` discards tmux pane bells and is the default.
+- `"off"` discards tmux pane bells.
 - `"spoken"` announces the connection, attached session, window, and pane
   using tmux's stable numeric IDs together with their current names or title.
-- `"audible"` schedules one physical BEL after the complete compositor
-  transaction for a visible pane. Bells from a pane that is not currently
-  presented still use the same sole physical-output scheduler.
+- `"audible"` is the default and schedules one physical BEL after the complete
+  compositor transaction for a visible pane. Bells from a pane that is not
+  currently presented still use the same sole physical-output scheduler.
 
 One pane-output record containing multiple BEL bytes produces one notice.
 Repeated notices from the same connection and pane within 250 milliseconds are

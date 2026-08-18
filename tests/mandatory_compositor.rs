@@ -5,7 +5,7 @@ use lector::{
         Scene, SceneSurface, SurfaceId,
     },
     terminal::{GhosttyEngine, TerminalGeometry},
-    terminal_protocol::PhysicalTerminalProfile,
+    terminal_protocol::{PhysicalTerminalProfile, ShutdownFenceBroker},
 };
 use serde::Deserialize;
 use std::{fs, path::Path};
@@ -113,6 +113,12 @@ fn scheduled_lifecycle_restores_modes_and_reconstructs_after_resume() {
     assert!(
         harness
             .terminal_output()
+            .windows(b"\x1b[?1049h".len())
+            .any(|window| window == b"\x1b[?1049h")
+    );
+    assert!(
+        harness
+            .terminal_output()
             .windows(b"\x1b[?1004h".len())
             .any(|window| window == b"\x1b[?1004h")
     );
@@ -133,6 +139,7 @@ fn scheduled_lifecycle_restores_modes_and_reconstructs_after_resume() {
         b"\x1b[=0u",
         b"\x1b[?25h",
         b"\x1b[?1004l",
+        b"\x1b[?1049l",
     ] {
         assert!(
             cleanup.windows(reset.len()).any(|window| window == reset),
@@ -206,7 +213,7 @@ fn shutdown_discards_unstarted_render_work_and_cleanup_is_last() {
         "an unstarted render was emitted during shutdown"
     );
     assert!(
-        output.ends_with(b"\x1b[?1004l"),
+        output.ends_with(b"\x1b[?1049l"),
         "terminal cleanup was not the final transaction: {output:?}"
     );
 }
@@ -255,6 +262,127 @@ fn drain_live_boundary(harness: &mut Harness) {
             break;
         }
     }
+}
+
+#[derive(Default)]
+struct FocusReportingGhosttyHost {
+    observed_output: usize,
+}
+
+impl FocusReportingGhosttyHost {
+    fn replies_to_new_output(&mut self, output: &[u8]) -> Vec<u8> {
+        const ENABLE_FOCUS_REPORTING: &[u8] = b"\x1b[?1004h";
+        assert!(
+            output.len() >= self.observed_output,
+            "physical output must be append-only"
+        );
+        let new_output = &output[self.observed_output..];
+        let mut replies = Vec::new();
+        let mut index = 0;
+        while index < new_output.len() {
+            let remaining = &new_output[index..];
+            if remaining.starts_with(ENABLE_FOCUS_REPORTING) {
+                replies.extend_from_slice(b"\x1b[I");
+                index += ENABLE_FOCUS_REPORTING.len();
+            } else if remaining.starts_with(b"\x1b[c") {
+                replies.extend_from_slice(b"\x1b[?62;22;52c");
+                index += b"\x1b[c".len();
+            } else {
+                index += 1;
+            }
+        }
+        self.observed_output = output.len();
+        replies
+    }
+}
+
+#[test]
+fn shutdown_fence_consumes_focus_reply_generated_by_the_final_eof_render() {
+    let mut harness = Harness::new_scheduled(4, 40).expect("live harness");
+    let mut ghostty = FocusReportingGhosttyHost::default();
+    harness.configure_physical_terminal(Some(false));
+    harness
+        .activate_physical_terminal()
+        .expect("activate physical terminal");
+    harness
+        .drain_scheduled_output_to_boundary()
+        .expect("drain activation");
+
+    // Ghostty reports its current focus whenever mode 1004 is enabled. While
+    // the event loop is active, Lector consumes those reports locally.
+    let startup_replies = ghostty.replies_to_new_output(harness.terminal_output());
+    assert!(!startup_replies.is_empty());
+    harness
+        .handle_terminal_input(&startup_replies)
+        .expect("consume startup focus replies");
+    assert!(harness.application_input().is_empty());
+
+    // Ordinary input and output can continue for an arbitrary amount of time;
+    // this does not account for the bell observed only after child EOF.
+    harness
+        .handle_terminal_input(b"x")
+        .expect("route ordinary input");
+    for output in [b"used ".as_slice(), b"for ", b"awhile"] {
+        harness
+            .handle_pty_output(output)
+            .expect("handle ordinary application output");
+        drain_live_boundary(&mut harness);
+        let replies = ghostty.replies_to_new_output(harness.terminal_output());
+        harness
+            .handle_terminal_input(&replies)
+            .expect("consume focus replies while running");
+    }
+    assert_eq!(harness.application_input(), b"x");
+
+    // Two unpresented updates make the final authoritative render a full
+    // fallback. The live loop force-drains this render after observing EOF.
+    harness
+        .handle_pty_output(b"\r\nfirst exit frame")
+        .expect("queue first final frame");
+    harness
+        .handle_pty_output(b"\x1b[2J\x1b[Hfinal exit frame")
+        .expect("supersede with final frame");
+    harness.handle_pty_eof().expect("finish child transport");
+    harness
+        .drain_scheduled_output_to_boundary()
+        .expect("drain final EOF render");
+
+    let escaped_reply = ghostty.replies_to_new_output(harness.terminal_output());
+    assert_eq!(
+        escaped_reply, b"\x1b[I",
+        "the final full render should reproduce Ghostty's late focus reply"
+    );
+
+    // Orderly cleanup keeps the alternate screen active, places DA1 after all
+    // reply-generating output, and continues owning terminal input.
+    harness
+        .begin_physical_terminal_shutdown_fence()
+        .expect("queue cleanup and shutdown fence");
+    harness
+        .drain_scheduled_output_to_boundary()
+        .expect("drain cleanup and shutdown fence");
+    assert!(!harness.terminal_output().ends_with(b"\x1b[?1049l"));
+    let fence_reply = ghostty.replies_to_new_output(harness.terminal_output());
+    assert_eq!(fence_reply, b"\x1b[?62;22;52c");
+
+    let mut fence = ShutdownFenceBroker::new(0);
+    let mut terminal_input = escaped_reply;
+    terminal_input.extend_from_slice(&fence_reply);
+    for byte in terminal_input {
+        fence.ingest_byte(byte);
+    }
+    assert!(
+        fence.is_matched(),
+        "DA1 must follow and drain the late focus reply"
+    );
+
+    harness
+        .finish_physical_terminal_shutdown_fence()
+        .expect("release physical alternate screen");
+    harness
+        .drain_scheduled_output_to_boundary()
+        .expect("drain alternate-screen release");
+    assert!(harness.terminal_output().ends_with(b"\x1b[?1049l"));
 }
 
 #[test]

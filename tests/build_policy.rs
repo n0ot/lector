@@ -28,13 +28,41 @@ fn ghostty_dependency_and_source_revisions_are_exactly_pinned() {
 }
 
 #[test]
-fn cargo_build_is_network_free_and_source_bootstrap_is_explicit() {
+fn root_binary_targets_are_explicit() {
+    let manifest = include_str!("../Cargo.toml");
+    let binaries = [
+        ("lector", "src/main.rs"),
+        ("lector-harness", "src/bin/lector-harness.rs"),
+        ("lector-tts", "src/bin/lector-tts.rs"),
+        ("proc_stub_server", "src/bin/proc_stub_server.rs"),
+        (
+            "tmux-control-adversary",
+            "src/bin/tmux-control-adversary.rs",
+        ),
+        ("lector-ghostty-bench", "src/bin/lector-ghostty-bench.rs"),
+    ];
+
+    assert!(manifest.contains("autobins = false"));
+    assert!(manifest.contains("default-run = \"lector\""));
+    assert_eq!(manifest.matches("[[bin]]").count(), binaries.len());
+    for (name, path) in binaries {
+        assert!(
+            manifest.contains(&format!("name = \"{name}\"\npath = \"{path}\"")),
+            "missing explicit binary target {name} at {path}"
+        );
+    }
+    assert!(!manifest.contains("cargo-clippy"));
+}
+
+#[test]
+fn cargo_build_automatically_bootstraps_and_validates_the_native_cache() {
     let wrapper_build = include_str!("../crates/lector-ghostty/build.rs");
     assert!(wrapper_build.contains("GHOSTTY_PREBUILT_ROOT"));
     assert!(wrapper_build.contains(ghostty::GHOSTTY_COMMIT));
     assert!(wrapper_build.contains(ghostty::REQUIRED_ZIG_VERSION));
     assert!(wrapper_build.contains("join(\"static-lib\")"));
-    assert!(!wrapper_build.contains("Command::new(\"git\")"));
+    assert!(wrapper_build.contains("ensure_verified_archive"));
+    assert!(wrapper_build.contains("scripts/bootstrap_ghostty.sh"));
     assert!(!wrapper_build.contains("git clone"));
     assert!(!wrapper_build.contains("curl"));
 
@@ -44,17 +72,20 @@ fn cargo_build_is_network_free_and_source_bootstrap_is_explicit() {
     assert!(bootstrap.contains("shasum -a 256"));
     assert!(bootstrap.contains("build_info_probe.c"));
     assert!(bootstrap.contains("static_lib_dir=\"$prefix/static-lib\""));
+    assert!(bootstrap.contains("reusing verified Ghostty archive"));
+    assert!(bootstrap.contains("abi_probe_sha256="));
+    assert!(bootstrap.contains("archive_sha256="));
 }
 
 #[test]
-fn project_cargo_alias_bootstraps_a_verified_cached_zig_before_ghostty() {
+fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     let cargo_config = include_str!("../.cargo/config.toml");
-    assert!(cargo_config.contains("ghostty-release"));
+    assert!(!cargo_config.contains("ghostty-release"));
+    assert!(!cargo_config.contains("ghostty-debug"));
     assert!(cargo_config.contains("ghostty-bench"));
     assert!(cargo_config.contains("--package lector-xtask"));
 
     let xtask = include_str!("../xtask/src/main.rs");
-    assert!(xtask.contains("scripts/bootstrap_zig.sh"));
     assert!(xtask.contains("scripts/bootstrap_ghostty.sh"));
     assert!(xtask.contains("\"--release\""));
     assert!(xtask.contains("\"ghostty-vt\""));
@@ -93,7 +124,8 @@ fn project_cargo_alias_bootstraps_a_verified_cached_zig_before_ghostty() {
     let ci = include_str!("../.github/workflows/ghostty-build.yml");
     assert!(!ci.contains("setup-zig"));
     assert!(ci.contains("cargo ghostty-check"));
-    assert!(ci.contains("cargo ghostty-bootstrap"));
+    assert!(!ci.contains("cargo ghostty-bootstrap"));
+    assert!(ci.contains("cargo check --locked --target"));
 }
 
 #[test]
@@ -124,9 +156,9 @@ fn owned_adapter_keeps_raw_ffi_private_and_auditable() {
 fn zig_policy_pins_an_exact_release_and_has_an_actionable_error() {
     assert_eq!(ghostty::REQUIRED_ZIG_VERSION, "0.16.0");
     let bootstrap = include_str!("../scripts/bootstrap_ghostty.sh");
-    assert!(bootstrap.contains("actual_zig=$(zig version"));
-    assert!(bootstrap.contains("Ghostty bootstrap requires Zig $REQUIRED_ZIG_VERSION on PATH"));
-    assert!(bootstrap.contains("found ${actual_zig:-nothing}"));
+    assert!(bootstrap.contains("actual_zig=$(\"$zig_bin\" version"));
+    assert!(bootstrap.contains("scripts/bootstrap_zig.sh"));
+    assert!(bootstrap.contains("actual_zig\" != \"$REQUIRED_ZIG_VERSION"));
 }
 
 #[test]

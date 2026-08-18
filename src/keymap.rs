@@ -113,6 +113,7 @@ const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("Delete", Action::Delete),
     ("F12", Action::SayTime),
     ("M-L", Action::OpenLuaRepl),
+    ("M-C", Action::OpenTmuxConnectionChooser),
     ("F5", Action::SetMark),
     ("F6", Action::Copy),
     ("F7", Action::Paste),
@@ -450,6 +451,25 @@ mod tests {
         bindings.clear_binding_for_mode(InputMode::Table, "j");
         assert!(bindings.binding_for_mode(InputMode::Table, "j").is_none());
         bindings.clear_binding_for_mode(InputMode::Table, "missing");
+    }
+
+    #[test]
+    fn connection_manager_is_reachable_without_stealing_application_control_backslash() {
+        let bindings = KeyBindings::new();
+        assert!(matches!(
+            bindings.binding_for_mode(InputMode::Normal, "M-C"),
+            Some(Binding::Builtin(Action::OpenTmuxConnectionChooser))
+        ));
+        assert!(
+            bindings
+                .binding_for_mode(InputMode::Normal, "C-\\")
+                .is_none()
+        );
+        assert!(
+            bindings
+                .binding_for_mode(InputMode::Normal, "C-4")
+                .is_none()
+        );
     }
 
     #[test]

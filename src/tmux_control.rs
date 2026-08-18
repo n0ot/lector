@@ -91,10 +91,6 @@ pub enum ControlParseError {
     MalformedRecord,
     #[error("invalid numeric {field} in tmux control record")]
     InvalidNumber { field: &'static str },
-    #[error("tmux command terminator did not match its begin record")]
-    MismatchedCommand,
-    #[error("tmux command block began inside another command block")]
-    NestedCommand,
     #[error("tmux command terminator appeared without a command block")]
     UnexpectedCommandTerminator,
     #[error("invalid tmux pane id")]
@@ -255,10 +251,9 @@ impl TmuxControlParser {
                     self.state = ParseState::Start { matched };
                 }
             }
-            ParseState::Records if self.line.is_empty() && byte == 0x1b => {
-                if self.pending_command.is_some() {
-                    return Err(ControlParseError::MalformedRecord);
-                }
+            ParseState::Records
+                if self.line.is_empty() && byte == 0x1b && self.pending_command.is_none() =>
+            {
                 self.state = ParseState::PossibleStringTerminator;
             }
             ParseState::Records if byte == b'\n' => {
@@ -295,25 +290,22 @@ impl TmuxControlParser {
         events: &mut Vec<ControlEvent>,
     ) -> Result<(), ControlParseError> {
         if let Some(pending) = self.pending_command.as_mut() {
-            if let Some(rest) = line.strip_prefix(b"%end ") {
-                let tag = parse_command_tag(rest)?;
-                if tag != pending.tag {
-                    return Err(ControlParseError::MismatchedCommand);
-                }
+            if let Some(rest) = line.strip_prefix(b"%end ")
+                && parse_command_tag(rest).is_ok_and(|tag| tag == pending.tag)
+            {
                 self.finish_command(CommandStatus::Success, events);
                 return Ok(());
             }
-            if let Some(rest) = line.strip_prefix(b"%error ") {
-                let tag = parse_command_tag(rest)?;
-                if tag != pending.tag {
-                    return Err(ControlParseError::MismatchedCommand);
-                }
+            if let Some(rest) = line.strip_prefix(b"%error ")
+                && parse_command_tag(rest).is_ok_and(|tag| tag == pending.tag)
+            {
                 self.finish_command(CommandStatus::Error, events);
                 return Ok(());
             }
-            if line.starts_with(b"%begin ") {
-                return Err(ControlParseError::NestedCommand);
-            }
+            // Command output is arbitrary text. In particular, capture-pane
+            // of a pane running a nested control client can contain complete
+            // `%begin`/`%end` records. Only the terminator whose tag matches
+            // this outer block is framing; every other line is payload.
             if pending.output.len() == self.limits.max_command_output_lines {
                 return Err(ControlParseError::TooManyCommandOutputLines {
                     limit: self.limits.max_command_output_lines,

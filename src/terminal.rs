@@ -373,12 +373,17 @@ pub struct UpdateSummary {
     pub operations: Vec<TerminalOperation>,
     pub cursor_operations: usize,
     pub scroll_operations: usize,
+    pub history_changed: bool,
     pub changed_rows: Vec<RangeInclusive<u16>>,
     pub cursor_before: Cursor,
     pub cursor_after: Cursor,
     pub screen_before: ScreenIdentity,
     pub screen_after: ScreenIdentity,
     pub synchronized_output: bool,
+    /// This batch crossed an actual false-to-true synchronized-output
+    /// boundary, including a close/reopen sequence whose final mode is still
+    /// enabled.
+    pub synchronized_output_opened: bool,
     pub batch_count: usize,
 }
 
@@ -392,12 +397,14 @@ impl Default for UpdateSummary {
             operations: Vec::new(),
             cursor_operations: 0,
             scroll_operations: 0,
+            history_changed: false,
             changed_rows: Vec::new(),
             cursor_before: Cursor::default(),
             cursor_after: Cursor::default(),
             screen_before: ScreenIdentity::Primary,
             screen_after: ScreenIdentity::Primary,
             synchronized_output: false,
+            synchronized_output_opened: false,
             batch_count: 0,
         }
     }
@@ -415,6 +422,7 @@ impl UpdateSummary {
         self.cursor_after = next.cursor_after;
         self.screen_after = next.screen_after;
         self.synchronized_output = next.synchronized_output;
+        self.synchronized_output_opened |= next.synchronized_output_opened;
         self.batch_count = self.batch_count.saturating_add(next.batch_count);
         self.effects.bells = self.effects.bells.saturating_add(next.effects.bells);
         self.effects.title_changed |= next.effects.title_changed;
@@ -428,6 +436,7 @@ impl UpdateSummary {
         self.scroll_operations = self
             .scroll_operations
             .saturating_add(next.scroll_operations);
+        self.history_changed |= next.history_changed;
         self.changed_rows.append(&mut next.changed_rows);
         normalize_row_ranges(&mut self.changed_rows);
         self.damage = merge_damage(
@@ -552,6 +561,9 @@ pub struct TerminalSnapshot {
     pub title: Option<String>,
     pub working_directory: Option<String>,
     pub semantic_marks: Vec<SemanticMark>,
+    /// Monotonic lineage coordinate of the bounded primary-history window.
+    /// This is stable across Ghostty's internal whole-page coordinate rebases.
+    pub history_origin: usize,
     pub scrollback_extent: usize,
     pub viewport: Viewport,
 }
@@ -759,6 +771,11 @@ pub struct GhosttyEngine {
     terminal: lector_ghostty::Terminal,
     snapshot: TerminalSnapshot,
     viewport: Viewport,
+    synchronized_output_open_snapshot: Option<TerminalSnapshot>,
+    #[cfg(test)]
+    snapshot_refresh_count: usize,
+    #[cfg(test)]
+    history_snapshot_refresh_count: usize,
 }
 
 /// A Ghostty-owned review anchor. The reference follows its cell through
@@ -850,13 +867,29 @@ impl GhosttyEngine {
             terminal,
             snapshot,
             viewport: Viewport::Live,
+            synchronized_output_open_snapshot: None,
+            #[cfg(test)]
+            snapshot_refresh_count: 0,
+            #[cfg(test)]
+            history_snapshot_refresh_count: 0,
         })
     }
 
     pub fn try_advance(&mut self, bytes: &[u8]) -> Result<UpdateSummary, lector_ghostty::Error> {
-        let update = self.terminal.advance(bytes).map(normalize_ghostty_update)?;
+        let mut update = self.terminal.advance(bytes)?;
+        let synchronized_output_opened = update.synchronized_output_open_snapshot.is_some();
+        self.synchronized_output_open_snapshot = update
+            .synchronized_output_open_snapshot
+            .take()
+            .map(|snapshot| normalize_ghostty_snapshot(&snapshot));
+        let mut update = normalize_ghostty_update(update);
+        update.synchronized_output_opened = synchronized_output_opened;
         self.refresh_snapshot()?;
         Ok(update)
+    }
+
+    pub fn take_synchronized_output_open_snapshot(&mut self) -> Option<TerminalSnapshot> {
+        self.synchronized_output_open_snapshot.take()
     }
 
     /// Fallible direct adapter API. Production callers use `TerminalEngine`;
@@ -909,6 +942,11 @@ impl GhosttyEngine {
             terminal,
             snapshot,
             viewport: Viewport::Live,
+            synchronized_output_open_snapshot: None,
+            #[cfg(test)]
+            snapshot_refresh_count: 0,
+            #[cfg(test)]
+            history_snapshot_refresh_count: 0,
         })
     }
 
@@ -963,7 +1001,10 @@ impl GhosttyEngine {
         if position.row >= logical_rows {
             return Err(lector_ghostty::Error::InvalidValue);
         }
-        let physical_row = self.terminal.history_origin()?.saturating_add(position.row);
+        let physical_row = self
+            .terminal
+            .physical_history_origin()?
+            .saturating_add(position.row);
         Ok(GhosttyReviewMark {
             reference: self
                 .terminal
@@ -982,7 +1023,7 @@ impl GhosttyEngine {
         let Some((physical_row, col)) = mark.reference.screen_position()? else {
             return Ok(None);
         };
-        let origin = self.terminal.history_origin()?;
+        let origin = self.terminal.physical_history_origin()?;
         if physical_row < origin {
             return Ok(None);
         }
@@ -1002,11 +1043,21 @@ impl GhosttyEngine {
     }
 
     fn refresh_snapshot(&mut self) -> Result<(), lector_ghostty::Error> {
+        #[cfg(test)]
+        {
+            self.snapshot_refresh_count = self.snapshot_refresh_count.saturating_add(1);
+        }
         let live = normalize_ghostty_snapshot(self.terminal.snapshot());
         let Viewport::Scrollback(requested_offset) = self.viewport else {
             self.snapshot = live;
             return Ok(());
         };
+        debug_assert_ne!(requested_offset, 0, "zero scrollback is the live viewport");
+        #[cfg(test)]
+        {
+            self.history_snapshot_refresh_count =
+                self.history_snapshot_refresh_count.saturating_add(1);
+        }
         let full = self
             .terminal
             .snapshot_with_history()
@@ -1035,6 +1086,20 @@ impl GhosttyEngine {
         self.viewport = self.snapshot.viewport;
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn reset_snapshot_refresh_counts(&mut self) {
+        self.snapshot_refresh_count = 0;
+        self.history_snapshot_refresh_count = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn snapshot_refresh_counts(&self) -> (usize, usize) {
+        (
+            self.snapshot_refresh_count,
+            self.history_snapshot_refresh_count,
+        )
+    }
 }
 
 impl TerminalEngine for GhosttyEngine {
@@ -1055,6 +1120,7 @@ impl TerminalEngine for GhosttyEngine {
             screen_before: before.screen,
             screen_after: self.snapshot.screen,
             synchronized_output: self.snapshot.modes.synchronized_output,
+            synchronized_output_opened: false,
             batch_count: 1,
             ..UpdateSummary::default()
         }
@@ -1072,12 +1138,20 @@ impl TerminalEngine for GhosttyEngine {
             screen_before: before.screen,
             screen_after: self.snapshot.screen,
             synchronized_output: self.snapshot.modes.synchronized_output,
+            synchronized_output_opened: false,
             batch_count: 1,
             ..UpdateSummary::default()
         }
     }
 
     fn select_viewport(&mut self, viewport: Viewport) {
+        let viewport = match viewport {
+            Viewport::Scrollback(0) => Viewport::Live,
+            viewport => viewport,
+        };
+        if self.viewport == viewport {
+            return;
+        }
         self.viewport = viewport;
         self.refresh_snapshot()
             .unwrap_or_else(|error| panic!("Ghostty viewport selection failed: {error}"));
@@ -1163,6 +1237,7 @@ fn normalize_ghostty_snapshot(snapshot: &GhosttySnapshot) -> TerminalSnapshot {
                 alternate_screen: mark.alternate_screen,
             })
             .collect(),
+        history_origin: snapshot.history_origin,
         scrollback_extent: snapshot.scrollback_extent,
         viewport: Viewport::Live,
     }
@@ -1213,12 +1288,14 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
             .collect(),
         cursor_operations: update.cursor_operations,
         scroll_operations: update.scroll_operations,
+        history_changed: update.history_changed,
         changed_rows,
         cursor_before: normalize_ghostty_cursor(update.cursor_before),
         cursor_after: normalize_ghostty_cursor(update.cursor_after),
         screen_before: ghostty_screen_identity(update.alternate_screen_before),
         screen_after: ghostty_screen_identity(update.alternate_screen_after),
         synchronized_output: update.synchronized_output,
+        synchronized_output_opened: false,
         batch_count: 1,
     }
 }
@@ -1387,5 +1464,52 @@ fn normalize_ghostty_mouse_encoding(value: lector_ghostty::MouseEncoding) -> Mou
         lector_ghostty::MouseEncoding::Default => MouseEncoding::Default,
         lector_ghostty::MouseEncoding::Utf8 => MouseEncoding::Utf8,
         lector_ghostty::MouseEncoding::Sgr => MouseEncoding::Sgr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GhosttyEngine, TerminalEngine, Viewport};
+
+    #[test]
+    fn viewport_selection_canonicalizes_zero_and_skips_unchanged_snapshots() {
+        let mut engine =
+            GhosttyEngine::new_with_scrollback(2, 8, 32).expect("create Ghostty engine");
+        engine
+            .advance(b"one\r\ntwo\r\nthree")
+            .expect("seed retained history");
+        assert_eq!(engine.scrollback_extent(), 1);
+
+        let live = engine.snapshot().clone();
+        engine.reset_snapshot_refresh_counts();
+        engine.select_viewport(Viewport::Scrollback(0));
+
+        assert_eq!(engine.viewport(), Viewport::Live);
+        assert_eq!(engine.snapshot(), &live);
+        assert_eq!(
+            engine.snapshot_refresh_counts(),
+            (0, 0),
+            "zero scrollback must not refresh the live grid or copy history"
+        );
+
+        engine.select_viewport(Viewport::Scrollback(1));
+        assert_eq!(engine.viewport(), Viewport::Scrollback(1));
+        assert_eq!(engine.snapshot_refresh_counts(), (1, 1));
+
+        engine.select_viewport(Viewport::Scrollback(1));
+        assert_eq!(
+            engine.snapshot_refresh_counts(),
+            (1, 1),
+            "reselecting the current historical viewport must be a no-op"
+        );
+
+        engine.select_viewport(Viewport::Live);
+        assert_eq!(engine.snapshot_refresh_counts(), (2, 1));
+        engine.select_viewport(Viewport::Live);
+        assert_eq!(
+            engine.snapshot_refresh_counts(),
+            (2, 1),
+            "reselecting the live viewport must be a no-op"
+        );
     }
 }

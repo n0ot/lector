@@ -46,7 +46,7 @@ fn inventory_groups(session_two_name: &str) -> Vec<Vec<Vec<u8>>> {
         vec![b"C\tclient_name\ttest".to_vec()],
         vec![b"O\tprefix\tC-a".to_vec()],
         vec![b"O\tprefix2\tNone".to_vec()],
-        vec![b"O\tmode-keys\tvi".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
         vec![b"O\trepeat-time\t500".to_vec()],
         vec![
             b"B\ts\t0\tchoose-tree -Zs".to_vec(),
@@ -144,14 +144,21 @@ fn ready_app() -> (App, ScreenReader, Recorder, Vec<u8>) {
         commands,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
     app.handle_pty(&mut sr, &reply(2, &[], true), &mut physical)
         .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
     for (index, group) in inventory_groups("work").iter().enumerate() {
-        app.handle_pty(&mut sr, &reply(index + 3, group, true), &mut physical)
+        app.handle_pty(&mut sr, &reply(index + 4, group, true), &mut physical)
             .unwrap();
     }
     commands.clear();
@@ -222,7 +229,13 @@ fn chooser_search_duplicate_ids_stable_selection_empty_cancel_and_resize() {
     let mut sink = Vec::new();
 
     assert_eq!(chooser.title(), "tmux sessions");
-    assert!(chooser.model().contents_full().contains("$1 work"));
+    let contents = chooser.model().contents_full();
+    assert!(contents.contains("$1 work"));
+    assert!(
+        !contents.contains("> "),
+        "selector marker remained: {contents:?}"
+    );
+    assert_eq!(chooser.model().screen().cursor_position(), (1, 0));
     assert!(chooser.model().contents_full().contains("$2 work"));
     assert_eq!(
         chooser.selected_target(),
@@ -320,6 +333,8 @@ fn chooser_scrolls_a_bounded_viewport_to_keep_selection_and_help_visible() {
     assert!(contents.contains("$7 session-7"), "{contents:?}");
     assert!(contents.contains("Up/Down select"), "{contents:?}");
     assert!(!contents.contains("$1 work"), "{contents:?}");
+    let cursor_row = chooser.model().screen().cursor_position().0;
+    assert!(chooser.model().line(cursor_row).contains("$7 session-7"));
 }
 
 #[test]
@@ -664,7 +679,7 @@ fn tmux_m_w_announces_connection_and_window_while_terminal_wording_stays_separat
             .0
             .borrow()
             .iter()
-            .any(|message| message == "tmux, tmux 1, duplicate")
+            .any(|message| message == "tmux, work, 1.1: duplicate")
     );
 
     let recorder = Recorder::default();
@@ -679,6 +694,21 @@ fn tmux_m_w_announces_connection_and_window_while_terminal_wording_stays_separat
             .iter()
             .any(|message| message == "terminal")
     );
+}
+
+#[test]
+fn window_and_session_changes_announce_the_new_location_concisely() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    recorder.0.borrow_mut().clear();
+
+    app.handle_pty(&mut sr, b"%session-window-changed $1 @11\n", &mut physical)
+        .unwrap();
+    assert_eq!(&*recorder.0.borrow(), &["2: duplicate"]);
+
+    recorder.0.borrow_mut().clear();
+    app.handle_pty(&mut sr, b"%session-changed $2 remote\n", &mut physical)
+        .unwrap();
+    assert_eq!(&*recorder.0.borrow(), &["remote", "1: duplicate"]);
 }
 
 fn write_real_commands(
@@ -728,7 +758,7 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
-        .expect("Stop 3 integration tests require tmux on PATH");
+        .expect("tmux integration tests require tmux on PATH");
     assert!(tmux.status.success(), "tmux -V failed");
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

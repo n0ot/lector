@@ -1,0 +1,14 @@
+#!/bin/bash
+
+stty sane
+export BASH_SILENCE_DEPRECATION_WARNING=1
+export LECTOR_PROC_STUB_LOG="$LECTOR_TEST_INNER_SPEECH_LOG"
+fixture_dir=$(dirname "$0")
+PATH="$fixture_dir/bin:$PATH"
+export PATH
+if [[ ${LECTOR_INNER_SHELL:-} == 1 ]]; then
+    export PS1='LECTOR-INNER-PROMPT>'
+else
+    export PS1='LECTOR-OUTER-PROMPT>'
+fi
+exec /bin/bash --noprofile --norc -i

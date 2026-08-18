@@ -1,5 +1,18 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicationPresentationModel {
+    Live,
+    Committed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RenderSynchronization {
+    opened: bool,
+    activity: bool,
+    compositor_bypass: bool,
+}
+
 impl App {
     pub(super) fn sync_table_setup_layer(
         &mut self,
@@ -77,10 +90,14 @@ impl App {
                     self.render_active_view(term_out)?;
                     self.announce_view_change(sr)?;
                     if !self.view_stack.has_overlay() {
-                        // Hidden PTY changes have now been rendered and finalized.
-                        // Do not let their old stabilization deadline run again.
-                        self.first_pty_update = None;
-                        self.last_pty_update = None;
+                        // `announce_view_change` cannot finalize an open
+                        // synchronized-output frame. Preserve its stabilization
+                        // deadline so the real close still drives one atomic
+                        // auto-read/finalization pass.
+                        if !self.view_stack.presented_holds_synchronized_output() {
+                            self.first_pty_update = None;
+                            self.last_pty_update = None;
+                        }
                     }
                 }
             }
@@ -127,8 +144,26 @@ impl App {
                     self.emit_physical_bells(term_out, 1)?;
                 }
             }
-            views::ViewAction::ActivateTerminal => {
-                self.activate_terminal_mode(sr, term_out)?;
+            views::ViewAction::TmuxConnectionControl {
+                connection_id,
+                action,
+            } => {
+                if !self.request_tmux_gateway_action_for(connection_id, sr, action, term_out)? {
+                    self.emit_physical_bells(term_out, 1)?;
+                } else if !action.requires_confirmation() {
+                    let description = match action {
+                        crate::tmux_lifecycle::GatewayControlAction::GracefulDetach => {
+                            "graceful teardown requested"
+                        }
+                        crate::tmux_lifecycle::GatewayControlAction::ForceAbandon => {
+                            unreachable!("confirmation-gated action")
+                        }
+                    };
+                    sr.speak(
+                        &format!("{description} for tmux connection {connection_id}"),
+                        false,
+                    )?;
+                }
             }
             views::ViewAction::TmuxConnectionRename {
                 connection_id,
@@ -159,6 +194,15 @@ impl App {
             views::ViewAction::Redraw => {
                 self.render_active_view(term_out)?;
                 self.read_active_view_changes(sr)?;
+            }
+            views::ViewAction::RedrawSilently => {
+                self.render_active_view(term_out)?;
+                let auto_read_enabled = sr.auto_read_enabled();
+                sr.set_auto_read_enabled(false);
+                sr.suppress_cursor_tracking_once();
+                let result = self.read_active_view_changes(sr);
+                sr.set_auto_read_enabled(auto_read_enabled);
+                result?;
             }
             views::ViewAction::None => {}
         }
@@ -208,10 +252,25 @@ impl App {
         terminal_update: Option<&UpdateSummary>,
     ) -> Result<()> {
         let scene = self.composed_scene_with_bells(bell_count)?;
-        let damage = terminal_update.map_or(SceneDamage::Full, |update| {
-            SceneDamage::from_terminal_update(&scene.panes[0], update, scene.geometry)
-        });
-        self.render_prepared_scene(term_out, bell_count, terminal_update, scene, damage)
+        let compositor_transition = self.view_stack.compositor_transition_pending();
+        let damage = if compositor_transition {
+            SceneDamage::Full
+        } else {
+            terminal_update.map_or(SceneDamage::Full, |update| {
+                SceneDamage::from_terminal_update(&scene.panes[0], update, scene.geometry)
+            })
+        };
+        self.render_prepared_scene(
+            term_out,
+            bell_count,
+            RenderSynchronization {
+                opened: terminal_update.is_some_and(|update| update.synchronized_output_opened),
+                activity: terminal_update.is_some_and(|update| update.synchronized_output),
+                compositor_bypass: compositor_transition,
+            },
+            scene,
+            damage,
+        )
     }
 
     pub(super) fn render_tmux_pane_update(
@@ -232,25 +291,76 @@ impl App {
         let Some(surface) = scene.panes.iter().find(|surface| surface.id == surface_id) else {
             return Ok(());
         };
-        let damage = SceneDamage::from_terminal_update(surface, update, scene.geometry);
-        self.render_prepared_scene(term_out, bell_count, Some(update), scene, damage)
+        let compositor_transition = self.view_stack.compositor_transition_pending();
+        let damage = if compositor_transition {
+            SceneDamage::Full
+        } else {
+            SceneDamage::from_terminal_update(surface, update, scene.geometry)
+        };
+        self.render_prepared_scene(
+            term_out,
+            bell_count,
+            RenderSynchronization {
+                opened: update.synchronized_output_opened,
+                activity: update.synchronized_output,
+                compositor_bypass: compositor_transition,
+            },
+            scene,
+            damage,
+        )
+    }
+
+    pub(super) fn render_tmux_batched_update(
+        &mut self,
+        term_out: &mut dyn Write,
+        bell_count: usize,
+        synchronized_output_opened: bool,
+        synchronized_output_activity: bool,
+    ) -> Result<()> {
+        let scene = self.composed_scene_with_bells(bell_count)?;
+        let compositor_transition = self.view_stack.compositor_transition_pending();
+        self.render_prepared_scene(
+            term_out,
+            bell_count,
+            RenderSynchronization {
+                opened: synchronized_output_opened,
+                activity: synchronized_output_activity,
+                compositor_bypass: compositor_transition,
+            },
+            scene,
+            SceneDamage::Full,
+        )
     }
 
     pub(super) fn render_tmux_topology_update(&mut self, term_out: &mut dyn Write) -> Result<()> {
         let scene = self.composed_scene_with_bells(0)?;
-        let damage = SceneDamage::regions([crate::presentation::GridRect::new(
-            GridPoint::new(0, 0),
-            scene.geometry.rows,
-            scene.geometry.cols,
-        )]);
-        self.render_prepared_scene(term_out, 0, None, scene, damage)
+        let compositor_transition = self.view_stack.compositor_transition_pending();
+        let damage = if compositor_transition {
+            SceneDamage::Full
+        } else {
+            SceneDamage::regions([crate::presentation::GridRect::new(
+                GridPoint::new(0, 0),
+                scene.geometry.rows,
+                scene.geometry.cols,
+            )])
+        };
+        self.render_prepared_scene(
+            term_out,
+            0,
+            RenderSynchronization {
+                compositor_bypass: compositor_transition,
+                ..RenderSynchronization::default()
+            },
+            scene,
+            damage,
+        )
     }
 
     fn render_prepared_scene(
         &mut self,
         term_out: &mut dyn Write,
         bell_count: usize,
-        terminal_update: Option<&UpdateSummary>,
+        synchronization: RenderSynchronization,
         mut scene: Scene,
         mut damage: SceneDamage,
     ) -> Result<()> {
@@ -268,16 +378,24 @@ impl App {
             self.scene_renderer.invalidate();
             damage = SceneDamage::Full;
         }
+        let presented_application_synchronized =
+            self.view_stack.presented_holds_synchronized_output();
+        let compositor_overlay_visible = self.view_stack.has_overlay();
+        let compensate_compositor_effects = scheduled
+            && (synchronization.compositor_bypass
+                || (compositor_overlay_visible && presented_application_synchronized));
         let title_effect = (scheduled
-            && scene.effects.title.as_deref() != self.presented_scene.title())
+            && (compensate_compositor_effects
+                || scene.effects.title.as_deref() != self.presented_scene.title()))
         .then(|| {
             crate::terminal::TerminalEvent::TitleChanged(
                 scene.effects.title.clone().unwrap_or_default(),
             )
         });
         let working_directory_effect = (scheduled
-            && scene.effects.working_directory.as_deref()
-                != self.presented_scene.working_directory())
+            && (compensate_compositor_effects
+                || scene.effects.working_directory.as_deref()
+                    != self.presented_scene.working_directory()))
         .then(|| {
             crate::terminal::TerminalEvent::WorkingDirectoryChanged(
                 scene.effects.working_directory.clone().unwrap_or_default(),
@@ -287,23 +405,45 @@ impl App {
             .scene_renderer
             .render(&scene, &damage, &self.presented_scene)?;
         if let Some(scheduler) = &mut self.output_scheduler {
+            let accessibility = self.view_stack.capture_presentation_bundle(
+                !compositor_overlay_visible
+                    && (!synchronization.compositor_bypass || !presented_application_synchronized),
+            );
             if let Some(effect) = title_effect {
                 scheduler.enqueue_terminal_effect(ROOT_SOURCE, effect, self.clock.now_ms());
             }
             if let Some(effect) = working_directory_effect {
                 scheduler.enqueue_terminal_effect(ROOT_SOURCE, effect, self.clock.now_ms());
             }
-            if let Some(update) = terminal_update {
-                scheduler
-                    .set_application_synchronized(update.synchronized_output, self.clock.now_ms());
-            } else {
-                // Application synchronization batches application damage; it
-                // must not freeze a compositor-owned overlay, resize, or
-                // other authoritative Lector scene.
-                scheduler.set_application_synchronized(false, self.clock.now_ms());
-            }
-            scheduler.enqueue_render(batch, self.clock.now_ms());
+            // Aggregate every currently presented terminal surface. One tmux
+            // pane's ordinary update must not release another visible pane's
+            // open transaction. An opaque Lector overlay may bypass the hold,
+            // but it does not erase the underlying epoch or its timeout.
+            scheduler.observe_application_synchronization(
+                presented_application_synchronized,
+                synchronization.opened,
+                synchronization.activity,
+                self.clock.now_ms(),
+            );
+            scheduler.set_application_synchronization_bypassed(
+                compositor_overlay_visible || synchronization.compositor_bypass,
+            );
+            let render_outcome = scheduler.enqueue_render_with_accessibility(
+                batch,
+                accessibility,
+                self.clock.now_ms(),
+            );
             scheduler.enqueue_bell(bell_count, self.clock.now_ms());
+            self.prune_retired_accessibility_views();
+            if render_outcome == crate::output_scheduler::EnqueueOutcome::DroppedForCapacity {
+                self.log_event("discarded physical render which exceeded the scheduler budget");
+            } else if synchronization.compositor_bypass && !presented_application_synchronized {
+                // With no application transaction to hold a replacement, every
+                // subsequent live scene is also committed. The accepted render
+                // therefore completes the compositor handoff logically even
+                // though its physical flush is asynchronous.
+                self.view_stack.complete_compositor_transition();
+            }
             return Ok(());
         }
         for transaction in &batch.transactions {
@@ -318,6 +458,9 @@ impl App {
         }
         self.scene_renderer.confirm(&batch.predicted);
         self.presented_scene = batch.predicted;
+        if synchronization.compositor_bypass {
+            self.view_stack.complete_compositor_transition();
+        }
         Ok(())
     }
 
@@ -327,14 +470,35 @@ impl App {
     }
 
     fn composed_scene_with_bells(&mut self, bell_count: usize) -> Result<Scene> {
+        let application_model = if self.view_stack.has_overlay()
+            || (self.view_stack.compositor_transition_pending()
+                && self.view_stack.presented_holds_synchronized_output())
+        {
+            ApplicationPresentationModel::Committed
+        } else {
+            ApplicationPresentationModel::Live
+        };
+        self.composed_scene_with_bells_and_model(bell_count, application_model)
+    }
+
+    fn composed_scene_with_bells_and_model(
+        &mut self,
+        bell_count: usize,
+        application_model: ApplicationPresentationModel,
+    ) -> Result<Scene> {
         let scheduled = self.output_scheduler.is_some();
         let has_overlay = self.view_stack.has_overlay();
-        let root_geometry = self.view_stack.root_mut().model().screen().geometry;
+        let root_geometry = self.view_stack.root_mut().model().live_screen().geometry;
         if let Some(connection) = self.view_stack.presented_tmux_connection_mut()
             && connection.is_ready()
             && !connection.is_showing_portal()
         {
-            let mut scene = connection.composed_scene(root_geometry)?;
+            let mut scene = match application_model {
+                ApplicationPresentationModel::Live => connection.composed_scene(root_geometry)?,
+                ApplicationPresentationModel::Committed => {
+                    connection.composed_committed_scene(root_geometry)?
+                }
+            };
             if scheduled {
                 for pane in &mut scene.panes {
                     pane.snapshot.modes.synchronized_output = false;
@@ -365,7 +529,13 @@ impl App {
             self.view_stack.append_overlay_media(&mut scene)?;
             return Ok(scene);
         }
-        let mut snapshots = self.view_stack.live_snapshots().into_iter();
+        let mut snapshots = match application_model {
+            ApplicationPresentationModel::Live => self.view_stack.live_snapshots(),
+            ApplicationPresentationModel::Committed => {
+                self.view_stack.committed_presentation_snapshots()
+            }
+        }
+        .into_iter();
         let mut root = snapshots
             .next()
             .expect("view stack always contains a root surface");
@@ -424,40 +594,105 @@ impl App {
         scene.effects.title = title;
         scene.effects.working_directory = working_directory;
         scene.effects.bell_count = bell_count;
-        self.view_stack.append_live_media(&mut scene)?;
+        match application_model {
+            ApplicationPresentationModel::Live => self.view_stack.append_live_media(&mut scene)?,
+            ApplicationPresentationModel::Committed => self
+                .view_stack
+                .append_committed_presentation_media(&mut scene)?,
+        }
         Ok(scene)
     }
 
     pub(super) fn announce_view_change(&mut self, sr: &mut ScreenReader) -> Result<()> {
-        let title = self.view_stack.active_mut().title().to_string();
+        if !self.accessibility_announcement_ready() {
+            self.pending_view_announcement = true;
+            return Ok(());
+        }
+        self.pending_view_announcement = false;
+        self.announce_active_view(sr, true)
+    }
+
+    pub(super) fn announce_view_contents(&mut self, sr: &mut ScreenReader) -> Result<()> {
+        if !self.accessibility_announcement_ready() {
+            self.pending_view_announcement = true;
+            return Ok(());
+        }
+        self.announce_active_view(sr, false)
+    }
+
+    pub(super) fn logical_accessibility_view_is_presented(&mut self) -> bool {
+        if self.output_scheduler.is_none() {
+            return true;
+        }
+        let Some(presented) = self.presented_accessibility_view else {
+            return false;
+        };
+        if presented != self.view_stack.logical_active_view_id() {
+            return false;
+        }
+        self.view_stack
+            .model_by_id_mut(presented)
+            .is_some_and(|view| !view.accessibility_awaiting_presentation())
+    }
+
+    pub(super) fn accessibility_announcement_ready(&mut self) -> bool {
+        self.pending_tmux_presentation_batch.is_none()
+            && self.logical_accessibility_view_is_presented()
+            && self
+                .output_scheduler
+                .as_ref()
+                .is_none_or(|scheduler| !scheduler.has_render_work())
+    }
+
+    fn announce_active_view(&mut self, sr: &mut ScreenReader, announce_title: bool) -> Result<()> {
+        self.pending_active_view_read = None;
+        let title = if !announce_title {
+            None
+        } else if self.output_scheduler.is_some() {
+            self.presented_accessibility_label.clone()
+        } else {
+            Some(self.view_stack.active_mut().title().to_string())
+        };
+        let now_ms = self.clock.now_ms();
         let view = self.view_stack.active_mut().model();
         view.with_live_screen(|view| -> Result<()> {
             if sr.review_follows_screen_cursor()
-                && view.review_cursor_position() != view.screen().cursor_position()
+                && (view.scrollback() != 0
+                    || view.review_cursor_position() != view.screen().cursor_position())
             {
                 let old = view.review_cursor_position();
                 view.follow_application_cursor();
                 sr.hook_on_review_cursor_move(old, view.review_cursor_position())?;
             }
-            sr.speak(&title, false)?;
+            if let Some(title) = &title {
+                sr.speak(title, false)?;
+            }
             let contents = view.contents_full();
-            if contents.trim().is_empty() {
-                sr.speak("blank screen", false)?;
-            } else {
+            if !contents.trim().is_empty() {
                 sr.speak(&contents, false)?;
             }
-            view.finalize_changes(self.clock.now_ms());
+            view.finalize_changes(now_ms);
             Ok(())
         })
     }
 
-    fn read_active_view_changes(&mut self, sr: &mut ScreenReader) -> Result<()> {
+    pub(super) fn read_active_view_changes(&mut self, sr: &mut ScreenReader) -> Result<()> {
+        let logical_view = self.view_stack.logical_active_view_id();
+        if !self.logical_accessibility_view_is_presented() {
+            self.pending_active_view_read = Some(logical_view);
+            return Ok(());
+        }
+        self.pending_active_view_read = None;
         let now_ms = self.clock.now_ms();
         let overlay_active = self.view_stack.has_overlay();
         let recent_input = self
             .last_stdin_update
             .is_some_and(|lsu| now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128);
-        let view = self.view_stack.active_mut().model();
+        let view = if self.output_scheduler.is_some() {
+            self.presented_accessibility_model_mut()
+        } else {
+            self.view_stack.active_mut().model()
+        };
         view.with_live_screen(|view| -> Result<()> {
             let mut read_text = sr.resolve_pending_delete(view)?;
             let auto_read_text = if sr.auto_read_enabled() {
@@ -473,13 +708,7 @@ impl App {
             if recent_input && !read_text {
                 sr.track_cursor(view)?;
             }
-            if sr.review_follows_screen_cursor()
-                && view.screen().cursor_position() != view.prev_screen().cursor_position()
-            {
-                let old = view.review_cursor_position();
-                view.follow_application_cursor();
-                sr.hook_on_review_cursor_move(old, view.review_cursor_position())?;
-            }
+            synchronize_pending_review_cursor(sr, view)?;
             sr.hook_on_screen_update(view, overlay_active)?;
             view.finalize_changes(now_ms);
             Ok(())
@@ -491,6 +720,6 @@ impl App {
     }
 
     pub fn debug_root_terminal_geometry(&mut self) -> crate::terminal::TerminalGeometry {
-        self.view_stack.root_mut().model().screen().geometry
+        self.view_stack.root_mut().model().live_screen().geometry
     }
 }

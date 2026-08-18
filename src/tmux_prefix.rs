@@ -1,21 +1,27 @@
 //! tmux prefix key naming and safe binding classification.
 
+use crate::tmux_model::TmuxTopology;
 use terminput::{KeyCode, KeyEvent, KeyModifiers};
 use thiserror::Error;
-
-pub const PREFIX_TIMEOUT_MS: u128 = 1_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindingAction {
     Execute(String),
     Detach,
-    Confirm { prompt: String, command: String },
+    Confirm {
+        prompt: String,
+        command: String,
+    },
     SendPrefix,
     ChooseSession,
     ChooseWindow,
     ChoosePane,
     CommandPrompt,
-    UnsupportedKeyTable(String),
+    SetKeyTable {
+        command: String,
+        table: String,
+        persistent: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -71,10 +77,12 @@ pub fn classify_binding(command: &str) -> Result<BindingAction, PrefixError> {
             }
         }
     }
-    if let Some(table) = configured_key_table(command)
-        && table != "prefix"
-    {
-        return Ok(BindingAction::UnsupportedKeyTable(table.to_owned()));
+    if let Some((table, persistent)) = configured_key_table(command) {
+        return Ok(BindingAction::SetKeyTable {
+            command: command.to_owned(),
+            table,
+            persistent,
+        });
     }
     Ok(BindingAction::Execute(command.to_owned()))
 }
@@ -102,11 +110,70 @@ pub fn command_may_change_key_configuration(command: &str) -> bool {
         })
 }
 
-fn configured_key_table(command: &str) -> Option<&str> {
-    let marker = "key-table ";
-    let rest = command.split_once(marker)?.1;
-    rest.split(|character: char| character.is_ascii_whitespace() || character == '\\')
-        .find(|field| !field.is_empty())
+/// Resolve a simple numeric `select-window` binding against the session to
+/// which this control client is attached. The stable window ID avoids tmux
+/// interpreting an unqualified number in some other client/session context.
+#[must_use]
+pub fn scope_select_window_command(topology: &TmuxTopology, command: &str) -> Option<String> {
+    let mut words = command.split_ascii_whitespace();
+    if words.next()? != "select-window" || words.next()? != "-t" {
+        return None;
+    }
+    let raw_target = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    let target = raw_target.trim_matches(|character| matches!(character, '\'' | '"'));
+    let index = target.strip_prefix(":=").unwrap_or(target).parse().ok()?;
+    let session = topology.session(topology.attached_session()?)?;
+    let window_id = session.windows.get(&index)?;
+    Some(format!("select-window -t @{}", window_id.0))
+}
+
+fn configured_key_table(command: &str) -> Option<(String, bool)> {
+    let mut transition = None;
+    for segment in command.split("\\;").flat_map(|chunk| chunk.split(';')) {
+        let words = segment
+            .split_ascii_whitespace()
+            .map(|word| word.trim_matches(['\'', '"']))
+            .filter(|word| !word.is_empty())
+            .collect::<Vec<_>>();
+        let Some(program) = words.first().copied() else {
+            continue;
+        };
+        if program == "switch-client" {
+            for (index, word) in words.iter().enumerate().skip(1) {
+                let table = if *word == "-T" {
+                    words.get(index + 1).copied()
+                } else {
+                    word.strip_prefix("-T").filter(|table| !table.is_empty())
+                };
+                if let Some(table) = table.and_then(valid_key_table) {
+                    transition = Some((table.to_owned(), false));
+                }
+            }
+        } else if matches!(program, "set" | "set-option") {
+            for (index, word) in words.iter().enumerate().skip(1) {
+                if *word == "key-table"
+                    && let Some(table) = words
+                        .get(index + 1)
+                        .and_then(|table| valid_key_table(table))
+                {
+                    transition = Some((table.to_owned(), true));
+                }
+            }
+        }
+    }
+    transition
+}
+
+fn valid_key_table(table: &str) -> Option<&str> {
+    (!table.is_empty()
+        && table.len() <= 128
+        && !table
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b';' | b'\'' | b'"')))
+    .then_some(table)
 }
 
 #[must_use]

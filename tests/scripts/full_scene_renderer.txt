@@ -1,4 +1,4 @@
-# Stop 2.2 harness: application bytes are modeled, never passed through.
+# Full-scene harness: application bytes are modeled, never passed through.
 Scenario: full renderer restores hidden output after overlay and resize
 Given pty-stdout: before
 When stdin: \x1Br

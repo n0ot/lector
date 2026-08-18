@@ -6,18 +6,24 @@
 //! never interleaved with another transaction.
 
 use crate::{
-    presentation::{PresentedScene, RenderBatch, SurfaceId},
+    presentation::{PresentedAccessibilityBundle, PresentedScene, RenderBatch, SurfaceId, ViewId},
     terminal::{ProgressState, TerminalEvent, TerminalGeometry},
 };
 use std::{collections::VecDeque, io, io::Write};
 
 const SYNCHRONIZED_OUTPUT_START: &[u8] = b"\x1b[?2026h";
 const SYNCHRONIZED_OUTPUT_END: &[u8] = b"\x1b[?2026l";
+const CONTROL_BACKLOG_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutputSchedulerConfig {
     pub latency_budget_ms: u128,
+    /// How long an application synchronized-output transaction may remain
+    /// idle before its newest available render is released.
     pub synchronization_timeout_ms: u128,
+    /// Absolute bound for a synchronized-output transaction which keeps
+    /// producing data without ever closing.
+    pub synchronization_hard_timeout_ms: u128,
     pub write_budget_bytes: usize,
     pub maximum_pending_bytes: usize,
 }
@@ -27,6 +33,7 @@ impl Default for OutputSchedulerConfig {
         Self {
             latency_budget_ms: 4,
             synchronization_timeout_ms: 100,
+            synchronization_hard_timeout_ms: 2_000,
             write_budget_bytes: 64 * 1024,
             maximum_pending_bytes: 2 * 1024 * 1024,
         }
@@ -43,12 +50,16 @@ pub enum ScheduledOutputClass {
 pub enum EnqueueOutcome {
     Queued,
     ReplacedObsoleteRender,
+    DroppedForCapacity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompletedRender {
     pub predicted: PresentedScene,
     pub geometry: TerminalGeometry,
+    /// Accessibility state for the exact render generation which has now
+    /// completed a successful physical-terminal flush.
+    pub accessibility: PresentedAccessibilityBundle,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -59,12 +70,29 @@ pub struct DrainReport {
     pub blocked: bool,
     pub write_budget_exhausted: bool,
     pub synchronization_timed_out: bool,
+    /// A compositor-owned render crossed an application's synchronized-output
+    /// hold and has now been physically flushed.
+    pub application_synchronization_bypass_completed: bool,
 }
 
 #[derive(Clone, Debug)]
 struct PendingBytes {
     class: ScheduledOutputClass,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingRender {
+    batch: RenderBatch,
+    generation: u64,
+    accessibility: PresentedAccessibilityBundle,
+}
+
+#[derive(Clone, Debug)]
+struct TrackedRender {
+    predicted: PresentedScene,
+    generation: u64,
+    accessibility: PresentedAccessibilityBundle,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -78,7 +106,7 @@ struct ActiveTransaction {
     kind: ActiveTransactionKind,
     bytes: Vec<u8>,
     offset: usize,
-    completed_render: Option<PresentedScene>,
+    completed_render: Option<TrackedRender>,
     completed_effects: Vec<ScheduledTerminalEffect>,
 }
 
@@ -88,6 +116,18 @@ enum ActiveTransactionKind {
     Render,
     Effect,
     Bell,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplicationSynchronization {
+    Active {
+        started_ms: u128,
+        last_activity_ms: u128,
+    },
+    /// A missing close must not create a repeating hold/release cycle. Once an
+    /// abandoned transaction is released, later chunks flow normally until
+    /// the application eventually closes that same transaction.
+    IgnoringUntilClose,
 }
 
 impl ActiveTransaction {
@@ -100,16 +140,20 @@ pub struct OutputScheduler {
     config: OutputSchedulerConfig,
     synchronized_output_supported: bool,
     pending_bytes: VecDeque<PendingBytes>,
-    pending_render: Option<RenderBatch>,
+    pending_render: Option<PendingRender>,
     pending_effects: VecDeque<ScheduledTerminalEffect>,
     pending_bells: usize,
     pending_since_ms: Option<u128>,
     active: VecDeque<ActiveTransaction>,
-    awaiting_flush_renders: Vec<PresentedScene>,
+    awaiting_flush_renders: Vec<TrackedRender>,
     awaiting_flush_effects: Vec<ScheduledTerminalEffect>,
     flush_required: bool,
     waiting_for_writable: bool,
-    application_sync_started_ms: Option<u128>,
+    application_synchronization: Option<ApplicationSynchronization>,
+    bypass_next_render: bool,
+    application_synchronization_bypass_generation: Option<u64>,
+    next_render_generation: u64,
+    synchronization_timeout_release_generation: Option<u64>,
     needs_reconciliation: bool,
 }
 
@@ -128,7 +172,11 @@ impl OutputScheduler {
             awaiting_flush_effects: Vec::new(),
             flush_required: false,
             waiting_for_writable: false,
-            application_sync_started_ms: None,
+            application_synchronization: None,
+            bypass_next_render: false,
+            application_synchronization_bypass_generation: None,
+            next_render_generation: 1,
+            synchronization_timeout_release_generation: None,
             needs_reconciliation: false,
         }
     }
@@ -136,6 +184,40 @@ impl OutputScheduler {
     pub fn enqueue_bytes(&mut self, class: ScheduledOutputClass, bytes: Vec<u8>, now_ms: u128) {
         if bytes.is_empty() {
             return;
+        }
+        let control_bytes = self.control_bytes();
+        if bytes.len() > CONTROL_BACKLOG_LIMIT_BYTES
+            || control_bytes.saturating_add(bytes.len()) > CONTROL_BACKLOG_LIMIT_BYTES
+        {
+            return;
+        }
+        if self.pending_bytes().saturating_add(bytes.len()) > self.config.maximum_pending_bytes {
+            // Lifecycle/control bytes outrank visual work. All discarded work
+            // is unstarted and can be regenerated from the authoritative
+            // scene; a partially written transaction and a render selected as
+            // a synchronization release boundary are never removed.
+            let release_generation = self.synchronization_timeout_release_generation;
+            let bypass_generation = self.application_synchronization_bypass_generation;
+            if !self.pending_render.as_ref().is_some_and(|render| {
+                Some(render.generation) == release_generation
+                    || Some(render.generation) == bypass_generation
+            }) {
+                self.pending_render = None;
+            }
+            self.pending_effects.clear();
+            self.pending_bells = 0;
+            self.active.retain(|transaction| {
+                transaction.offset > 0
+                    || transaction.kind == ActiveTransactionKind::Control
+                    || transaction.completed_render.as_ref().is_some_and(|render| {
+                        Some(render.generation) == release_generation
+                            || Some(render.generation) == bypass_generation
+                    })
+            });
+            if self.pending_bytes().saturating_add(bytes.len()) > self.config.maximum_pending_bytes
+            {
+                return;
+            }
         }
         self.note_pending(now_ms);
         if let Some(last) = self.pending_bytes.back_mut()
@@ -158,7 +240,16 @@ impl OutputScheduler {
         self.pending_effects.clear();
         self.pending_bells = 0;
         self.active.retain(|transaction| transaction.offset > 0);
-        self.application_sync_started_ms = None;
+        // A render whose bytes are waiting only for flush still has to reach
+        // that fence before cleanup bytes are written, but its presentation
+        // receipt is obsolete: the lifecycle transaction will supersede the
+        // scene in the same drain call before the application can observe the
+        // report.
+        self.awaiting_flush_renders.clear();
+        self.application_synchronization = None;
+        self.bypass_next_render = false;
+        self.application_synchronization_bypass_generation = None;
+        self.synchronization_timeout_release_generation = None;
         if self.active.is_empty()
             && self.awaiting_flush_renders.is_empty()
             && self.awaiting_flush_effects.is_empty()
@@ -168,14 +259,69 @@ impl OutputScheduler {
     }
 
     pub fn enqueue_render(&mut self, batch: RenderBatch, now_ms: u128) -> EnqueueOutcome {
-        self.note_pending(now_ms);
-        if self.pending_render.replace(batch).is_some() {
-            return EnqueueOutcome::ReplacedObsoleteRender;
-        }
-        if let Some(render_index) = self.active.iter().position(|transaction| {
+        self.enqueue_render_with_accessibility(
+            batch,
+            PresentedAccessibilityBundle::default(),
+            now_ms,
+        )
+    }
+
+    /// Queues a render and binds its accessibility state to the same write and
+    /// flush lifecycle. Replacing an unstarted render replaces its bundle too;
+    /// a started render retains its own bundle until its flush completes.
+    pub fn enqueue_render_with_accessibility(
+        &mut self,
+        batch: RenderBatch,
+        accessibility: PresentedAccessibilityBundle,
+        now_ms: u128,
+    ) -> EnqueueOutcome {
+        let bypass_requested = std::mem::take(&mut self.bypass_next_render);
+        let Some(render_bytes) = render_batch_byte_len(&batch, self.synchronized_output_supported)
+        else {
+            return EnqueueOutcome::DroppedForCapacity;
+        };
+        let replaceable_pending_bytes = self.pending_render.as_ref().map_or(0, |render| {
+            render_batch_byte_len(&render.batch, self.synchronized_output_supported)
+                .unwrap_or(usize::MAX)
+        });
+        let replaceable_active_index = self.active.iter().position(|transaction| {
             transaction.kind == ActiveTransactionKind::Render && transaction.offset == 0
-        }) {
-            self.active.remove(render_index);
+        });
+        let replaceable_active_bytes = replaceable_active_index
+            .and_then(|index| self.active.get(index))
+            .map_or(0, |transaction| transaction.bytes.len());
+        let retained_bytes = self
+            .pending_bytes()
+            .saturating_sub(replaceable_pending_bytes)
+            .saturating_sub(replaceable_active_bytes);
+        if render_bytes > self.config.maximum_pending_bytes
+            || retained_bytes.saturating_add(render_bytes) > self.config.maximum_pending_bytes
+        {
+            return EnqueueOutcome::DroppedForCapacity;
+        }
+
+        let mut outcome = EnqueueOutcome::Queued;
+        let mut replaces_timeout_release = false;
+        let mut replaces_synchronization_bypass = false;
+        if let Some(replaced) = self.pending_render.take() {
+            replaces_timeout_release |=
+                Some(replaced.generation) == self.synchronization_timeout_release_generation;
+            replaces_synchronization_bypass |=
+                Some(replaced.generation) == self.application_synchronization_bypass_generation;
+            outcome = EnqueueOutcome::ReplacedObsoleteRender;
+        }
+        if let Some(render_index) = replaceable_active_index {
+            let replaced = self
+                .active
+                .remove(render_index)
+                .expect("render index exists");
+            replaces_timeout_release |= replaced.completed_render.as_ref().is_some_and(|render| {
+                Some(render.generation) == self.synchronization_timeout_release_generation
+            });
+            replaces_synchronization_bypass |=
+                replaced.completed_render.as_ref().is_some_and(|render| {
+                    Some(render.generation) == self.application_synchronization_bypass_generation
+                });
             let mut index = 0;
             while index < self.active.len() {
                 if self.active[index].kind == ActiveTransactionKind::Bell
@@ -188,9 +334,23 @@ impl OutputScheduler {
                 }
             }
             self.pending_since_ms = Some(now_ms.saturating_sub(self.config.latency_budget_ms));
-            return EnqueueOutcome::ReplacedObsoleteRender;
+            outcome = EnqueueOutcome::ReplacedObsoleteRender;
         }
-        EnqueueOutcome::Queued
+        let generation = self.next_render_generation;
+        self.next_render_generation = self.next_render_generation.wrapping_add(1).max(1);
+        if replaces_timeout_release {
+            self.synchronization_timeout_release_generation = Some(generation);
+        }
+        if bypass_requested || replaces_synchronization_bypass {
+            self.application_synchronization_bypass_generation = Some(generation);
+        }
+        self.note_pending(now_ms);
+        self.pending_render = Some(PendingRender {
+            batch,
+            generation,
+            accessibility,
+        });
+        outcome
     }
 
     pub fn enqueue_terminal_effect(
@@ -200,17 +360,35 @@ impl OutputScheduler {
         now_ms: u128,
     ) {
         let event = bound_terminal_effect(event, self.config.maximum_pending_bytes);
+        let event_kind = terminal_event_kind(&event);
+        if matches!(
+            event_kind,
+            TerminalEventKind::Title | TerminalEventKind::WorkingDirectory
+        ) {
+            // These model effects describe current state, so only their newest
+            // unstarted value is authoritative. This also lets a compositor
+            // render replace a held working-frame value with the committed one.
+            self.pending_effects.retain(|pending| {
+                pending.owner != owner || terminal_event_kind(&pending.event) != event_kind
+            });
+            self.active.retain(|transaction| {
+                transaction.offset != 0
+                    || transaction.kind != ActiveTransactionKind::Effect
+                    || !transaction.completed_effects.iter().any(|pending| {
+                        pending.owner == owner && terminal_event_kind(&pending.event) == event_kind
+                    })
+            });
+        }
         let retained = terminal_event_retained_bytes(&event);
         let pending = self.retained_effect_bytes();
         if pending.saturating_add(retained) > self.config.maximum_pending_bytes
             && let Some(index) = self.pending_effects.iter().position(|pending| {
-                pending.owner == owner
-                    && terminal_event_kind(&pending.event) == terminal_event_kind(&event)
+                pending.owner == owner && terminal_event_kind(&pending.event) == event_kind
             })
         {
             self.pending_effects.remove(index);
         }
-        let pending = self.retained_effect_bytes();
+        let pending = self.pending_bytes();
         if pending.saturating_add(retained) > self.config.maximum_pending_bytes {
             return;
         }
@@ -236,22 +414,89 @@ impl OutputScheduler {
         if count == 0 {
             return;
         }
-        self.note_pending(now_ms);
-        self.pending_bells = self.pending_bells.saturating_add(count);
+        let retained = count.min(
+            self.config
+                .maximum_pending_bytes
+                .saturating_sub(self.pending_bytes()),
+        );
+        if retained != 0 {
+            self.note_pending(now_ms);
+            self.pending_bells = self.pending_bells.saturating_add(retained);
+        }
     }
 
     pub fn set_application_synchronized(&mut self, synchronized: bool, now_ms: u128) {
+        self.set_application_synchronization(synchronized, false, now_ms);
+    }
+
+    pub fn set_application_synchronization(
+        &mut self,
+        synchronized: bool,
+        opened: bool,
+        now_ms: u128,
+    ) {
+        self.observe_application_synchronization(synchronized, opened, true, now_ms);
+    }
+
+    pub fn observe_application_synchronization(
+        &mut self,
+        synchronized: bool,
+        opened: bool,
+        activity: bool,
+        now_ms: u128,
+    ) {
         if synchronized {
-            self.application_sync_started_ms.get_or_insert(now_ms);
+            match &mut self.application_synchronization {
+                Some(ApplicationSynchronization::IgnoringUntilClose) if opened => {
+                    self.application_synchronization = Some(ApplicationSynchronization::Active {
+                        started_ms: now_ms,
+                        last_activity_ms: now_ms,
+                    });
+                    self.synchronization_timeout_release_generation = None;
+                }
+                Some(ApplicationSynchronization::Active {
+                    last_activity_ms, ..
+                }) if activity => {
+                    *last_activity_ms = now_ms;
+                }
+                Some(ApplicationSynchronization::Active { .. }) => {}
+                Some(ApplicationSynchronization::IgnoringUntilClose) => {}
+                None => {
+                    self.application_synchronization = Some(ApplicationSynchronization::Active {
+                        started_ms: now_ms,
+                        last_activity_ms: now_ms,
+                    });
+                }
+            }
         } else {
-            self.application_sync_started_ms = None;
+            self.application_synchronization = None;
+            self.bypass_next_render = false;
+            self.synchronization_timeout_release_generation = None;
         }
+    }
+
+    /// Arms the next render enqueue to pass the application's synchronization
+    /// hold. The bypass belongs to that accepted render, follows an unstarted
+    /// replacement, and ends only after the render has been flushed.
+    pub fn set_application_synchronization_bypassed(&mut self, bypassed: bool) {
+        self.bypass_next_render = bypassed && self.application_synchronization.is_some();
     }
 
     pub fn next_deadline_ms(&self) -> Option<u128> {
         if self.waiting_for_writable {
             return None;
         }
+        let synchronization_deadline = match self.application_synchronization {
+            Some(ApplicationSynchronization::Active {
+                started_ms,
+                last_activity_ms,
+            }) => Some(
+                last_activity_ms
+                    .saturating_add(self.config.synchronization_timeout_ms)
+                    .min(started_ms.saturating_add(self.config.synchronization_hard_timeout_ms)),
+            ),
+            Some(ApplicationSynchronization::IgnoringUntilClose) | None => None,
+        };
         if self.active.is_empty()
             && self.pending_bytes.is_empty()
             && self.pending_render.is_none()
@@ -259,16 +504,32 @@ impl OutputScheduler {
             && self.pending_bells == 0
             && !self.flush_required
         {
-            return None;
+            return synchronization_deadline;
         }
-        if !self.active.is_empty() || self.flush_required {
+        let application_hold_blocks_unstarted_active =
+            matches!(
+                self.application_synchronization,
+                Some(ApplicationSynchronization::Active { .. })
+            ) && self.application_synchronization_bypass_generation.is_none()
+                && self
+                    .active
+                    .front()
+                    .is_some_and(|transaction| transaction.offset == 0);
+        if (!self.active.is_empty() || self.flush_required)
+            && !application_hold_blocks_unstarted_active
+        {
             return Some(0);
         }
-        if let Some(started) = self.application_sync_started_ms {
-            return Some(started.saturating_add(self.config.synchronization_timeout_ms));
+        if self.application_synchronization_bypass_generation.is_none()
+            && let Some(deadline) = synchronization_deadline
+        {
+            return Some(deadline);
         }
         self.pending_since_ms
             .map(|started| started.saturating_add(self.config.latency_budget_ms))
+            .into_iter()
+            .chain(synchronization_deadline)
+            .min()
     }
 
     pub fn pending_bytes(&self) -> usize {
@@ -282,12 +543,9 @@ impl OutputScheduler {
             .iter()
             .map(|transaction| transaction.bytes.len())
             .sum::<usize>();
-        let render = self.pending_render.as_ref().map_or(0, |batch| {
-            batch
-                .transactions
-                .iter()
-                .map(|transaction| transaction.bytes.len())
-                .sum()
+        let render = self.pending_render.as_ref().map_or(0, |render| {
+            render_batch_byte_len(&render.batch, self.synchronized_output_supported)
+                .unwrap_or(usize::MAX)
         });
         let effects = self
             .pending_effects
@@ -311,6 +569,33 @@ impl OutputScheduler {
                 .sum::<usize>()
     }
 
+    /// View identities still owned by an uncompleted physical render.
+    /// Callers use this to retain logically removed view models only while a
+    /// pending, started, or flush-blocked receipt can still make one current.
+    pub(crate) fn retained_accessibility_view_ids(&self) -> Vec<ViewId> {
+        let mut ids = Vec::new();
+        let mut collect = |bundle: &PresentedAccessibilityBundle| {
+            if let Some(active_view) = bundle.active_view {
+                ids.push(active_view);
+            }
+            ids.extend(bundle.frames.iter().map(|frame| frame.view_id));
+        };
+        if let Some(render) = &self.pending_render {
+            collect(&render.accessibility);
+        }
+        for render in self
+            .active
+            .iter()
+            .filter_map(|transaction| transaction.completed_render.as_ref())
+            .chain(self.awaiting_flush_renders.iter())
+        {
+            collect(&render.accessibility);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
     fn retained_effect_bytes(&self) -> usize {
         self.pending_effects
             .iter()
@@ -322,6 +607,20 @@ impl OutputScheduler {
             )
             .map(|effect| terminal_event_retained_bytes(&effect.event))
             .sum()
+    }
+
+    fn control_bytes(&self) -> usize {
+        let active = self
+            .active
+            .iter()
+            .filter(|transaction| transaction.kind == ActiveTransactionKind::Control)
+            .map(|transaction| transaction.bytes.len().saturating_sub(transaction.offset))
+            .sum::<usize>();
+        self.pending_bytes
+            .iter()
+            .map(|pending| pending.bytes.len())
+            .sum::<usize>()
+            .saturating_add(active)
     }
 
     pub const fn needs_reconciliation(&self) -> bool {
@@ -358,15 +657,52 @@ impl OutputScheduler {
             return Ok(report);
         }
 
-        if let Some(started) = self.application_sync_started_ms {
-            let timed_out =
-                now_ms >= started.saturating_add(self.config.synchronization_timeout_ms);
-            if !force && !timed_out {
-                return Ok(report);
+        let mut finish_started_transaction_only = false;
+        if let Some(ApplicationSynchronization::Active {
+            started_ms,
+            last_activity_ms,
+        }) = self.application_synchronization
+        {
+            let idle_timed_out =
+                now_ms >= last_activity_ms.saturating_add(self.config.synchronization_timeout_ms);
+            let hard_timed_out =
+                now_ms >= started_ms.saturating_add(self.config.synchronization_hard_timeout_ms);
+            let timed_out = idle_timed_out || hard_timed_out;
+            if !force && !timed_out && self.application_synchronization_bypass_generation.is_none()
+            {
+                if self
+                    .active
+                    .front()
+                    .is_some_and(|transaction| transaction.offset > 0)
+                {
+                    finish_started_transaction_only = true;
+                } else {
+                    return Ok(report);
+                }
             }
             if timed_out {
-                report.synchronization_timed_out = true;
-                self.application_sync_started_ms = None;
+                self.application_synchronization =
+                    Some(ApplicationSynchronization::IgnoringUntilClose);
+                self.synchronization_timeout_release_generation = self
+                    .pending_render
+                    .as_ref()
+                    .map(|render| render.generation)
+                    .or_else(|| {
+                        self.active.iter().rev().find_map(|transaction| {
+                            transaction
+                                .completed_render
+                                .as_ref()
+                                .map(|render| render.generation)
+                        })
+                    })
+                    .or_else(|| {
+                        self.awaiting_flush_renders
+                            .last()
+                            .map(|render| render.generation)
+                    });
+                if self.synchronization_timeout_release_generation.is_none() {
+                    report.synchronization_timed_out = true;
+                }
             }
         }
         if !force
@@ -380,17 +716,29 @@ impl OutputScheduler {
 
         self.activate_pending();
         let budget = self.config.write_budget_bytes.max(1);
+        let mut reached_synchronization_bypass = false;
         while report.bytes_written < budget {
             let Some(transaction) = self.active.front_mut() else {
                 break;
             };
+            if finish_started_transaction_only && transaction.offset == 0 {
+                break;
+            }
             if transaction.remaining().is_empty() {
                 let completed = self.active.pop_front().expect("active front exists");
+                reached_synchronization_bypass =
+                    completed.completed_render.as_ref().is_some_and(|render| {
+                        Some(render.generation)
+                            == self.application_synchronization_bypass_generation
+                    });
                 if let Some(predicted) = completed.completed_render {
                     self.awaiting_flush_renders.push(predicted);
                 }
                 self.awaiting_flush_effects
                     .extend(completed.completed_effects);
+                if reached_synchronization_bypass {
+                    break;
+                }
                 continue;
             }
             let remaining_budget = budget.saturating_sub(report.bytes_written);
@@ -413,12 +761,17 @@ impl OutputScheduler {
             }
         }
         // Record a render whose last byte landed exactly on the budget.
-        while self
-            .active
-            .front()
-            .is_some_and(|transaction| transaction.remaining().is_empty())
+        while !reached_synchronization_bypass
+            && self
+                .active
+                .front()
+                .is_some_and(|transaction| transaction.remaining().is_empty())
         {
             let completed = self.active.pop_front().expect("active front exists");
+            reached_synchronization_bypass =
+                completed.completed_render.as_ref().is_some_and(|render| {
+                    Some(render.generation) == self.application_synchronization_bypass_generation
+                });
             if let Some(predicted) = completed.completed_render {
                 self.awaiting_flush_renders.push(predicted);
             }
@@ -431,7 +784,15 @@ impl OutputScheduler {
         if !self.flush_required {
             self.complete_awaiting_renders(&mut report);
         }
-        report.write_budget_exhausted = !self.active.is_empty();
+        // A call may finish the previously active transaction without having
+        // activated work which was queued behind it. Report that remaining
+        // boundary work so EOF/suspend/shutdown drain loops call us again
+        // instead of discarding the newest complete scene during cleanup.
+        report.write_budget_exhausted = !self.active.is_empty()
+            || !self.pending_bytes.is_empty()
+            || self.pending_render.is_some()
+            || !self.pending_effects.is_empty()
+            || self.pending_bells != 0;
         Ok(report)
     }
 
@@ -463,12 +824,12 @@ impl OutputScheduler {
                 completed_effects: vec![effect],
             });
         }
-        if let Some(batch) = self.pending_render.take() {
+        if let Some(render) = self.pending_render.take() {
             let mut bytes = Vec::new();
             if self.synchronized_output_supported {
                 bytes.extend_from_slice(SYNCHRONIZED_OUTPUT_START);
             }
-            for transaction in batch.transactions {
+            for transaction in render.batch.transactions {
                 append_without_synchronization_markers(&mut bytes, &transaction.bytes);
             }
             if self.synchronized_output_supported {
@@ -478,7 +839,11 @@ impl OutputScheduler {
                 kind: ActiveTransactionKind::Render,
                 bytes,
                 offset: 0,
-                completed_render: Some(batch.predicted),
+                completed_render: Some(TrackedRender {
+                    predicted: render.batch.predicted,
+                    generation: render.generation,
+                    accessibility: render.accessibility,
+                }),
                 completed_effects: Vec::new(),
             });
         }
@@ -506,7 +871,10 @@ impl OutputScheduler {
         self.pending_effects.clear();
         self.pending_bells = 0;
         self.pending_since_ms = None;
-        self.application_sync_started_ms = None;
+        self.application_synchronization = None;
+        self.bypass_next_render = false;
+        self.application_synchronization_bypass_generation = None;
+        self.synchronization_timeout_release_generation = None;
         self.needs_reconciliation = true;
         Err(error)
     }
@@ -535,16 +903,25 @@ impl OutputScheduler {
     }
 
     fn complete_awaiting_renders(&mut self, report: &mut DrainReport) {
-        report
-            .completed_renders
-            .extend(
-                self.awaiting_flush_renders
-                    .drain(..)
-                    .map(|predicted| CompletedRender {
-                        geometry: predicted.geometry(),
-                        predicted,
-                    }),
-            );
+        for render in self.awaiting_flush_renders.drain(..) {
+            let releases_synchronization =
+                Some(render.generation) == self.synchronization_timeout_release_generation;
+            let completes_synchronization_bypass =
+                Some(render.generation) == self.application_synchronization_bypass_generation;
+            report.completed_renders.push(CompletedRender {
+                geometry: render.predicted.geometry(),
+                predicted: render.predicted,
+                accessibility: render.accessibility,
+            });
+            if releases_synchronization {
+                report.synchronization_timed_out = true;
+                self.synchronization_timeout_release_generation = None;
+            }
+            if completes_synchronization_bypass {
+                self.application_synchronization_bypass_generation = None;
+                report.application_synchronization_bypass_completed = true;
+            }
+        }
         report
             .completed_effects
             .append(&mut self.awaiting_flush_effects);
@@ -613,6 +990,25 @@ fn terminal_event_kind(event: &TerminalEvent) -> TerminalEventKind {
         TerminalEvent::PtyReply(_) => TerminalEventKind::Reply,
         TerminalEvent::UnknownSequence { .. } => TerminalEventKind::Unknown,
     }
+}
+
+fn render_batch_byte_len(
+    batch: &RenderBatch,
+    synchronized_output_supported: bool,
+) -> Option<usize> {
+    batch
+        .transactions
+        .iter()
+        .try_fold(0usize, |total, transaction| {
+            total.checked_add(transaction.bytes.len())
+        })
+        .and_then(|total| {
+            total.checked_add(if synchronized_output_supported {
+                SYNCHRONIZED_OUTPUT_START.len() + SYNCHRONIZED_OUTPUT_END.len()
+            } else {
+                0
+            })
+        })
 }
 
 fn terminal_event_retained_bytes(event: &TerminalEvent) -> usize {

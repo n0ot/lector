@@ -12,27 +12,23 @@ Lector is a terminal screen reader. It speaks what appears in your terminal and 
 
 ## Get started
 
-`libghostty-vt` is Lector's sole terminal engine. From a fresh clone, build a
-release—including downloading, verifying, and caching the project-pinned Zig
-toolchain and Ghostty source—with:
-
-```bash
-cargo ghostty-release
-```
-
-This alias is defined inside the repository; it does not require a global
-Cargo plugin, Make, an installed Ghostty application, or a system Ghostty
-library. Once the verified archive is cached under the ignored `target`
-directory, ordinary Cargo commands reuse it:
+Build a release from a fresh clone with the standard Cargo command:
 
 ```bash
 cargo build --locked --release
 ```
 
-Lector owns its narrow Rust adapter over Ghostty's official C API and links the
-verified archive statically. Exact Zig/source pins, supported targets, offline
-packaging, upgrades, and troubleshooting are documented in
+Cargo automatically downloads, verifies, builds, and caches Lector's pinned
+terminal engine when needed. Normal development and release builds reuse the
+same cached native archive; installed Lector binaries have no extra runtime
+dependency. Exact pins, supported targets, offline packaging, upgrades, and
+maintainer diagnostics are documented in
 [docs/ghostty-builds.md](docs/ghostty-builds.md).
+
+For a concise map of runtime ownership, data flow, concurrency boundaries, and
+source directories, see [docs/architecture.md](docs/architecture.md).
+The [documentation index](docs/README.md) and [contributor guide](CONTRIBUTING.md)
+collect the deeper design notes and verification commands.
 
 Run Lector with your shell:
 
@@ -80,6 +76,17 @@ multiple servers, and nested SSH/tmux connections use the same compositor as
 ordinary terminal mode. Lector discovers the server's actual prefix and
 bindings instead of assuming `C-b` or `C-a`.
 
+Press `M-C` while any tmux connection exists to open Lector's connection
+manager. It can switch to another local, nested, or remote connection even
+when the selected control process is silent or flooding. Its active row starts
+with `*`; compact rows show the stable ID, optional custom label, and tmux
+server host without repeating `connection` or `tmux`. Press `d` to
+detach the selected connection tree gracefully, deepest child first. Confirmed `D`
+first sends Control-backslash; if the transport remains stuck, Lector stops
+parsing that stream as tmux control and exposes the underlying terminal or
+parent pane so commands such as `detach-client` or an SSH `~.` escape can be
+entered directly.
+
 Lector requests bounded tmux output flow control, coalesces pause/resume, and
 rebuilds pane text/history from an authoritative capture if tmux reports stale
 incremental output. A capture cannot reconstruct images, partial parser state,
@@ -89,25 +96,53 @@ troubleshooting, and recovery are in
 [docs/tmux-completion.md](docs/tmux-completion.md); prefix and chooser behavior
 is in [docs/tmux-prefix.md](docs/tmux-prefix.md).
 
+For crash and hang diagnosis, the repository includes a socket-free hostile
+control peer and a kill-bounded live suite covering malformed records, silent
+and unread transports, active and hidden floods, window switching, and nested
+SSH-like control sessions. See
+[`docs/tmux-adversary.md`](docs/tmux-adversary.md).
+
 After the initial outer focus-mode ownership query, all live presentation,
 effect, bell, and lifecycle output passes through one serialized scheduler. It
 coalesces modeled scene updates at event-loop boundaries with a 4 ms latency
-budget, completes any
-started escape transaction before beginning another, and keeps application
-input and terminal replies independent of presentation backpressure. On outer
-terminals that support synchronized output, Lector owns one global update
-boundary; abandoned application synchronization is released after a bounded
-timeout. Audible bells follow the completed visual transaction.
+budget, completes any started escape transaction before beginning another,
+and keeps application input and terminal replies independent of presentation
+backpressure. Child PTY output also yields after 32 KiB or 4 ms, checked after
+each read of at most 8 KiB; synchronized output does not receive a larger turn.
+
+Each render carries the exact accessibility state represented by its pixels.
+Screen-reading and review commands advance only after that render successfully
+flushes; coalesced, replaced, capacity-dropped, or backpressured candidates
+remain private. Changed scrollback is revisioned and shared, so ordinary frames
+do not copy the bounded history on every update. Raw application input remains
+independent of presentation. Consequently, reading a cell and then sending
+coordinate-based input has the normal UI time-of-check to time-of-use race.
+
+DEC private mode 2026 gates when a scene may be presented. A real close makes
+the final candidate eligible but does not make it readable before its physical
+flush. A frame idle for 100 ms, or continuously open for 2 seconds, is released
+as a bounded failure case so a broken application cannot freeze the terminal.
+Once that exact partial render flushes, accessibility advances to the same
+partial generation a sighted user sees; newer parser state cannot leak ahead of
+it. Visible tmux panes commit as one composed generation, and overlay/base
+announcements follow the physically completed active view. On outer terminals
+that support synchronized output, Lector owns one global update boundary.
+Audible bells follow the completed visual transaction.
 
 ### Virtual terminal capabilities
 
-Lector launches the child with `TERM=lector` and a bundled terminfo entry that
-it materializes under the user cache directory. Applications therefore see a
-stable Lector terminal instead of inheriting the physical terminal's vendor
-identity. Device, mode, geometry, pixel-size, color-scheme, keyboard, focus,
-and clipboard queries are answered locally from the owning pane's Ghostty
-engine; replies from Lector's bounded startup probes are consumed and never
-sent to the application.
+Lector launches the child with `TERM=xterm-256color` and removes any inherited
+`TERMINFO`. This is the widely installed compatibility contract the compositor
+currently implements. Lector deliberately does not inherit the physical
+terminal's vendor identity or advertise `xterm-ghostty`: using Ghostty's parser
+does not mean Lector implements every Ghostty extension. Device, mode,
+geometry, pixel-size, color-scheme, keyboard, focus, and clipboard queries from
+Lector's root child are answered locally by its Ghostty engine. tmux owns the
+PTYs behind a control connection and answers those pane queries itself; Lector's
+pane engines are observational shadows and discard their duplicate replies.
+Lector puts DA1 last in its bounded physical-terminal startup probes and
+consumes replies through that processing fence; those replies are never sent to
+the application.
 
 The virtual terminal implements 256 colors, true color, OSC 8 hyperlinks, and
 the ordinary `xterm-256color` contract, so an inherited `COLORTERM` remains
@@ -179,6 +214,23 @@ Then run Lector:
 ```bash
 target/release/lector --shell /bin/zsh --speech-driver proc --speech-server target/release/lector-tts
 ```
+
+### Recording a diagnostic session
+
+`scripts/lector-trace` is a transparent PTY shim for reproducing interactive
+terminal problems while using the real TTS server. It records exact bytes in
+both directions, Lector's `--log` diagnostics, and every speech RPC in separate
+files. The trace contains everything typed, displayed, and spoken.
+
+When `lector`, `lector-tts`, and `lector-trace` are installed together, run:
+
+```bash
+lector-trace --shell "$SHELL"
+```
+
+The launcher creates a timestamped directory under the system temporary
+directory and prints its path before Lector starts and again after it exits.
+Pass `--trace-dir /path/to/new-directory` to choose the location.
 
 ## How to use Lector
 
@@ -334,7 +386,7 @@ lector.o.suppress_key_echo = false
 -- interrupt speech immediately when terminal focus is lost
 lector.o.stop_speech_on_focus_loss = true
 
--- tmux pane bells: "off" (default), "spoken", or "audible"
+-- tmux pane bells: "audible" (default), "spoken", or "off"
 lector.o.tmux_bells = "spoken"
 ```
 

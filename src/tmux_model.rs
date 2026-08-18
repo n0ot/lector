@@ -3,22 +3,42 @@
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-/// tmux emits one `%begin`/`%end` reply for every semicolon-separated command.
-pub const INVENTORY_REPLY_COUNT: usize = 12;
+/// One independently parsed control command is used for each inventory layer.
+/// Keeping these as separate commands means a syntax error in one layer still
+/// produces exactly one correlated reply and cannot strand the transaction.
+pub const INVENTORY_COMMANDS: [&str; 12] = [
+    "list-sessions -F 'S\t#{session_id}\t#{session_name}'\n",
+    "list-windows -a -F 'W\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}'\n",
+    "list-panes -a -F 'P\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{history_size}\t#{pane_title}'\n",
+    "display-message -p -F 'A\t#{session_id}\t#{host}'\n",
+    "display-message -p -F 'O\tbase-index\t#{base-index}'\n",
+    "display-message -p -F 'O\tpane-base-index\t#{pane-base-index}'\n",
+    "display-message -p -F 'C\tclient_name\t#{client_name}'\n",
+    "display-message -p -F 'O\tprefix\t#{prefix}'\n",
+    "display-message -p -F 'O\tprefix2\t#{prefix2}'\n",
+    "display-message -p -F 'O\tkey-table\t#{key-table}'\n",
+    "display-message -p -F 'O\trepeat-time\t#{repeat-time}'\n",
+    // `list-keys -F` was added after tmux 3.7b. The no-format form has
+    // emitted canonical, reloadable `bind-key` syntax for much longer.
+    "list-keys -a\n",
+];
 
+pub const INVENTORY_REPLY_COUNT: usize = INVENTORY_COMMANDS.len();
+
+/// Concatenated form retained for diagnostics, fixtures, and byte-level tests.
 pub const INVENTORY_COMMAND: &str = concat!(
-    "list-sessions -F 'S\t#{session_id}\t#{session_name}' ; ",
-    "list-windows -a -F 'W\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}' ; ",
-    "list-panes -a -F 'P\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{history_size}\t#{pane_title}' ; ",
-    "display-message -p -F 'A\t#{session_id}' ; ",
-    "display-message -p -F 'O\tbase-index\t#{base-index}' ; ",
-    "display-message -p -F 'O\tpane-base-index\t#{pane-base-index}' ; ",
-    "display-message -p -F 'C\tclient_name\t#{client_name}' ; ",
-    "display-message -p -F 'O\tprefix\t#{prefix}' ; ",
-    "display-message -p -F 'O\tprefix2\t#{prefix2}' ; ",
-    "display-message -p -F 'O\tmode-keys\t#{mode-keys}' ; ",
-    "display-message -p -F 'O\trepeat-time\t#{repeat-time}' ; ",
-    "list-keys -T prefix -F 'B\t#{key_string}\t#{key_repeat}\t#{key_command}'\n",
+    "list-sessions -F 'S\t#{session_id}\t#{session_name}'\n",
+    "list-windows -a -F 'W\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}'\n",
+    "list-panes -a -F 'P\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{history_size}\t#{pane_title}'\n",
+    "display-message -p -F 'A\t#{session_id}\t#{host}'\n",
+    "display-message -p -F 'O\tbase-index\t#{base-index}'\n",
+    "display-message -p -F 'O\tpane-base-index\t#{pane-base-index}'\n",
+    "display-message -p -F 'C\tclient_name\t#{client_name}'\n",
+    "display-message -p -F 'O\tprefix\t#{prefix}'\n",
+    "display-message -p -F 'O\tprefix2\t#{prefix2}'\n",
+    "display-message -p -F 'O\tkey-table\t#{key-table}'\n",
+    "display-message -p -F 'O\trepeat-time\t#{repeat-time}'\n",
+    "list-keys -a\n",
 );
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -75,8 +95,71 @@ pub struct Pane {
     pub history_size: u32,
 }
 
+/// Pane-local state sampled immediately around an authoritative capture.
+///
+/// Inventory is intentionally not used for recovery: alternate-screen, tmux
+/// mode, cursor, and geometry state can all change between inventories.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneCaptureMetadata {
+    pub pane_id: PaneId,
+    pub left: u32,
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dead: bool,
+    pub cursor_x: u32,
+    pub cursor_y: u32,
+    pub cursor_visible: bool,
+    pub cursor_shape: String,
+    pub alternate_on: bool,
+    pub pane_in_mode: u32,
+    pub history_size: u32,
+}
+
+impl PaneCaptureMetadata {
+    #[must_use]
+    pub fn capture_basis_matches(&self, other: &Self) -> bool {
+        self.pane_id == other.pane_id
+            && self.width == other.width
+            && self.height == other.height
+            && self.alternate_on == other.alternate_on
+            && self.pane_in_mode == other.pane_in_mode
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TmuxLocation {
+    pub session_id: SessionId,
+    pub session_name: String,
+    pub window_id: WindowId,
+    pub window_index: u32,
+    pub window_name: String,
+    pub pane_id: Option<PaneId>,
+    pub pane_index: Option<u32>,
+    pub pane_count: usize,
+}
+
+impl TmuxLocation {
+    #[must_use]
+    pub fn window_title(&self) -> String {
+        if self.pane_count > 1
+            && let Some(pane_index) = self.pane_index
+        {
+            format!("{}.{}: {}", self.window_index, pane_index, self.window_name)
+        } else {
+            format!("{}: {}", self.window_index, self.window_name)
+        }
+    }
+
+    #[must_use]
+    pub fn accessible_title(&self) -> String {
+        format!("tmux, {}, {}", self.session_name, self.window_title())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TmuxBinding {
+    pub table: String,
     pub key: String,
     pub repeatable: bool,
     pub command: String,
@@ -111,6 +194,7 @@ pub enum TopologyError {
 pub struct TmuxTopology {
     connection_id: u64,
     label: String,
+    host: Option<String>,
     sessions: BTreeMap<SessionId, Session>,
     windows: BTreeMap<WindowId, Window>,
     panes: BTreeMap<PaneId, Pane>,
@@ -118,6 +202,7 @@ pub struct TmuxTopology {
     options: BTreeMap<String, String>,
     client_info: BTreeMap<String, String>,
     bindings: BTreeMap<String, TmuxBinding>,
+    key_tables: BTreeMap<String, BTreeMap<String, TmuxBinding>>,
     needs_resync: bool,
 }
 
@@ -127,6 +212,7 @@ impl TmuxTopology {
         Self {
             connection_id,
             label: format!("tmux {connection_id}"),
+            host: None,
             sessions: BTreeMap::new(),
             windows: BTreeMap::new(),
             panes: BTreeMap::new(),
@@ -134,6 +220,7 @@ impl TmuxTopology {
             options: BTreeMap::new(),
             client_info: BTreeMap::new(),
             bindings: BTreeMap::new(),
+            key_tables: BTreeMap::new(),
             needs_resync: false,
         }
     }
@@ -146,6 +233,11 @@ impl TmuxTopology {
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    #[must_use]
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
     }
 
     pub fn set_label(&mut self, label: &str) -> Result<(), TopologyError> {
@@ -199,6 +291,34 @@ impl TmuxTopology {
     }
 
     #[must_use]
+    pub fn attached_location(&self) -> Option<TmuxLocation> {
+        let session = self.session(self.attached_session?)?;
+        let window_id = session.active_window?;
+        let (&window_index, _) = session
+            .windows
+            .iter()
+            .find(|(_, candidate)| **candidate == window_id)?;
+        let window = self.window(window_id)?;
+        let pane_id = window.active_pane;
+        let pane_index = pane_id.and_then(|pane_id| self.pane(pane_id).map(|pane| pane.index));
+        let pane_count = self
+            .panes
+            .values()
+            .filter(|pane| pane.window_id == window_id)
+            .count();
+        Some(TmuxLocation {
+            session_id: session.id,
+            session_name: session.name.clone(),
+            window_id,
+            window_index,
+            window_name: window.name.clone(),
+            pane_id,
+            pane_index,
+            pane_count,
+        })
+    }
+
+    #[must_use]
     pub fn option(&self, name: &str) -> Option<&str> {
         self.options.get(name).map(String::as_str)
     }
@@ -219,12 +339,50 @@ impl TmuxTopology {
     }
 
     #[must_use]
+    pub fn binding_in_table(&self, table: &str, key: &str) -> Option<&TmuxBinding> {
+        if table == "prefix" {
+            return self.binding(key);
+        }
+        self.key_tables.get(table)?.get(key)
+    }
+
+    #[must_use]
+    pub fn has_key_table(&self, table: &str) -> bool {
+        table == "prefix" && !self.bindings.is_empty() || self.key_tables.contains_key(table)
+    }
+
+    #[must_use]
     pub fn needs_resync(&self) -> bool {
         self.needs_resync
     }
 
     pub fn mark_resync_required(&mut self) {
         self.needs_resync = true;
+    }
+
+    pub fn update_pane_capture_metadata(
+        &mut self,
+        metadata: &PaneCaptureMetadata,
+    ) -> Result<(), TopologyError> {
+        let pane =
+            self.panes
+                .get_mut(&metadata.pane_id)
+                .ok_or(TopologyError::ContradictoryInventory(
+                    "pane capture metadata references a missing pane",
+                ))?;
+        pane.left = metadata.left;
+        pane.top = metadata.top;
+        pane.width = metadata.width;
+        pane.height = metadata.height;
+        pane.dead = metadata.dead;
+        pane.cursor_x = metadata.cursor_x;
+        pane.cursor_y = metadata.cursor_y;
+        pane.cursor_visible = metadata.cursor_visible;
+        pane.cursor_shape.clone_from(&metadata.cursor_shape);
+        pane.alternate_on = metadata.alternate_on;
+        pane.pane_in_mode = metadata.pane_in_mode;
+        pane.history_size = metadata.history_size;
+        Ok(())
     }
 
     pub fn replace_inventory(&mut self, lines: &[Vec<u8>]) -> Result<(), TopologyError> {
@@ -406,6 +564,7 @@ impl TmuxTopology {
             Some(b'O') => self.inventory_key_value(line, true),
             Some(b'C') => self.inventory_key_value(line, false),
             Some(b'B') => self.inventory_binding(line),
+            Some(b'b') => self.inventory_legacy_binding(line),
             _ => Err(TopologyError::MalformedInventory),
         }
     }
@@ -553,12 +712,20 @@ impl TmuxTopology {
     }
 
     fn inventory_attached(&mut self, line: &[u8]) -> Result<(), TopologyError> {
-        let fields = split_inventory(line, 2)?;
+        let has_host = line.iter().filter(|byte| **byte == b'\t').count() >= 2;
+        let fields = split_inventory(line, if has_host { 3 } else { 2 })?;
         let id = parse_session_id(fields[1])?;
         if self.attached_session.replace(id).is_some() {
             return Err(TopologyError::ContradictoryInventory(
                 "multiple attached records",
             ));
+        }
+        if has_host {
+            let host = text(fields[2], "server host")?;
+            if host.len() > 256 || host.chars().any(char::is_control) {
+                return Err(TopologyError::MalformedInventory);
+            }
+            self.host = (!host.is_empty()).then(|| host.to_owned());
         }
         Ok(())
     }
@@ -584,30 +751,71 @@ impl TmuxTopology {
     }
 
     fn inventory_binding(&mut self, line: &[u8]) -> Result<(), TopologyError> {
-        let fields = split_inventory(line, 4)?;
-        let key = text(fields[1], "binding key")?;
-        let command = text(fields[3], "binding command")?;
-        if key.is_empty()
-            || key.len() > 128
-            || command.is_empty()
-            || command.len() > 64 * 1024
-            || key
-                .bytes()
-                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
-            || command
-                .bytes()
-                .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
-        {
+        let has_table = line.iter().filter(|byte| **byte == b'\t').count() >= 4;
+        let fields = split_inventory(line, if has_table { 5 } else { 4 })?;
+        let table = if has_table {
+            text(fields[1], "binding table")?
+        } else {
+            "prefix"
+        };
+        let key_index = usize::from(has_table) + 1;
+        let repeat_index = key_index + 1;
+        let command_index = repeat_index + 1;
+        let key = text(fields[key_index], "binding key")?;
+        let command = text(fields[command_index], "binding command")?;
+        validate_binding(table, key, command)?;
+        self.insert_binding(TmuxBinding {
+            table: table.to_owned(),
+            key: key.to_owned(),
+            repeatable: boolean(fields[repeat_index], "binding repeatable")?,
+            command: command.to_owned(),
+        })
+    }
+
+    fn inventory_legacy_binding(&mut self, line: &[u8]) -> Result<(), TopologyError> {
+        let mut lexer = LegacyBindingLexer::new(line);
+        if lexer.next()?.as_deref() != Some(b"bind-key") {
             return Err(TopologyError::MalformedInventory);
         }
-        let binding = TmuxBinding {
-            key: key.to_owned(),
-            repeatable: boolean(fields[2], "binding repeatable")?,
-            command: command.to_owned(),
+
+        let mut token = lexer.next()?.ok_or(TopologyError::MalformedInventory)?;
+        let repeatable = token == b"-r";
+        if repeatable {
+            token = lexer.next()?.ok_or(TopologyError::MalformedInventory)?;
+        }
+        let table = match token.as_slice() {
+            b"-T" => lexer.next()?.ok_or(TopologyError::MalformedInventory)?,
+            // Very old tmux represented root-table bindings with `-n`.
+            b"-n" => b"root".to_vec(),
+            _ => return Err(TopologyError::MalformedInventory),
         };
-        if self.bindings.insert(key.to_owned(), binding).is_some() {
+        // The key is positional after the table option and may itself begin
+        // with `-`, so it must never be interpreted as another option.
+        let key = lexer.next()?.ok_or(TopologyError::MalformedInventory)?;
+        let command = lexer.remainder()?;
+        let table = text(&table, "binding table")?;
+        let key = text(&key, "binding key")?;
+        let command = text(command, "binding command")?;
+        validate_binding(table, key, command)?;
+        self.insert_binding(TmuxBinding {
+            table: table.to_owned(),
+            key: key.to_owned(),
+            repeatable,
+            command: command.to_owned(),
+        })
+    }
+
+    fn insert_binding(&mut self, binding: TmuxBinding) -> Result<(), TopologyError> {
+        let table = binding.table.clone();
+        let key = binding.key.clone();
+        let bindings = if table == "prefix" {
+            &mut self.bindings
+        } else {
+            self.key_tables.entry(table).or_default()
+        };
+        if bindings.insert(key, binding).is_some() {
             return Err(TopologyError::ContradictoryInventory(
-                "duplicate prefix binding",
+                "duplicate key-table binding",
             ));
         }
         Ok(())
@@ -711,6 +919,96 @@ impl TmuxTopology {
     }
 }
 
+fn validate_binding(table: &str, key: &str, command: &str) -> Result<(), TopologyError> {
+    if table.is_empty()
+        || table.len() > 128
+        || key.is_empty()
+        || key.len() > 128
+        || command.is_empty()
+        || command.len() > 64 * 1024
+        || table
+            .bytes()
+            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n' | b'\t'))
+        || key
+            .bytes()
+            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+        || command
+            .bytes()
+            .any(|byte| matches!(byte, b'\0' | b'\r' | b'\n'))
+    {
+        return Err(TopologyError::MalformedInventory);
+    }
+    Ok(())
+}
+
+/// Lexer for the reloadable syntax printed by pre-`list-keys -F` tmux.
+/// Only the `bind-key` prefix is decoded; the command remainder stays byte-for-
+/// byte identical so Lector can safely send it back to the same tmux server.
+struct LegacyBindingLexer<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> LegacyBindingLexer<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self { input, offset: 0 }
+    }
+
+    fn next(&mut self) -> Result<Option<Vec<u8>>, TopologyError> {
+        self.skip_whitespace();
+        if self.offset == self.input.len() {
+            return Ok(None);
+        }
+
+        let mut token = Vec::new();
+        let mut quote = None;
+        while self.offset < self.input.len() {
+            let byte = self.input[self.offset];
+            if quote.is_none() && byte.is_ascii_whitespace() {
+                break;
+            }
+            self.offset += 1;
+            match byte {
+                b'\\' => {
+                    let escaped = self
+                        .input
+                        .get(self.offset)
+                        .copied()
+                        .ok_or(TopologyError::MalformedInventory)?;
+                    token.push(escaped);
+                    self.offset += 1;
+                }
+                b'\'' | b'"' if quote == Some(byte) => quote = None,
+                b'\'' | b'"' if quote.is_none() => quote = Some(byte),
+                _ => token.push(byte),
+            }
+        }
+        if quote.is_some() || token.is_empty() {
+            return Err(TopologyError::MalformedInventory);
+        }
+        Ok(Some(token))
+    }
+
+    fn remainder(&mut self) -> Result<&'a [u8], TopologyError> {
+        self.skip_whitespace();
+        let remainder = &self.input[self.offset..];
+        if remainder.is_empty() {
+            return Err(TopologyError::MalformedInventory);
+        }
+        Ok(remainder)
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .input
+            .get(self.offset)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            self.offset += 1;
+        }
+    }
+}
+
 fn empty_session(id: SessionId) -> Session {
     Session {
         id,
@@ -798,6 +1096,46 @@ fn boolean(bytes: &[u8], field: &'static str) -> Result<bool, TopologyError> {
         b"1" => Ok(true),
         _ => Err(TopologyError::InvalidNumber { field }),
     }
+}
+
+#[must_use]
+pub fn pane_capture_metadata_command(pane_id: PaneId) -> Vec<u8> {
+    format!(
+        "display-message -p -t %{} -F 'R\t#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}\t#{{pane_width}}\t#{{pane_height}}\t#{{pane_dead}}\t#{{cursor_x}}\t#{{cursor_y}}\t#{{cursor_flag}}\t#{{cursor_shape}}\t#{{alternate_on}}\t#{{pane_in_mode}}\t#{{history_size}}'\n",
+        pane_id.0
+    )
+    .into_bytes()
+}
+
+pub fn parse_pane_capture_metadata(
+    line: &[u8],
+    expected_pane_id: PaneId,
+) -> Result<PaneCaptureMetadata, TopologyError> {
+    let fields = split_inventory(line, 14)?;
+    if fields[0] != b"R" {
+        return Err(TopologyError::MalformedInventory);
+    }
+    let pane_id = parse_pane_id(fields[1])?;
+    if pane_id != expected_pane_id {
+        return Err(TopologyError::ContradictoryInventory(
+            "pane capture metadata names a different pane",
+        ));
+    }
+    Ok(PaneCaptureMetadata {
+        pane_id,
+        left: number(fields[2], "pane left")?,
+        top: number(fields[3], "pane top")?,
+        width: number(fields[4], "pane width")?,
+        height: number(fields[5], "pane height")?,
+        dead: boolean(fields[6], "pane dead")?,
+        cursor_x: number(fields[7], "cursor x")?,
+        cursor_y: number(fields[8], "cursor y")?,
+        cursor_visible: boolean(fields[9], "cursor visible")?,
+        cursor_shape: text(fields[10], "cursor shape")?.to_owned(),
+        alternate_on: boolean(fields[11], "alternate screen")?,
+        pane_in_mode: number(fields[12], "pane mode")?,
+        history_size: number(fields[13], "history size")?,
+    })
 }
 
 fn parse_session_id(bytes: &[u8]) -> Result<SessionId, TopologyError> {

@@ -434,6 +434,8 @@ pub struct UpdateSnapshot {
     pub operations: Vec<OperationSnapshot>,
     pub cursor_operations: usize,
     pub scroll_operations: usize,
+    /// Primary-screen retained history may have changed during this update.
+    pub history_changed: bool,
     pub damage: RenderDamageSnapshot,
     pub changed_rows: Vec<RangeInclusive<u16>>,
     pub cursor_before: CursorSnapshot,
@@ -441,6 +443,13 @@ pub struct UpdateSnapshot {
     pub alternate_screen_before: bool,
     pub alternate_screen_after: bool,
     pub synchronized_output: bool,
+    /// The visible terminal model immediately after an actual false-to-true
+    /// synchronized-output transition. The marker itself only changes mode,
+    /// so after clearing that mode bit this is the exact committed model from
+    /// immediately before the transaction opened. Retained history is
+    /// included only when the prefix before this opener changed it; callers
+    /// can otherwise reuse their previous committed history allocation.
+    pub synchronized_output_open_snapshot: Option<TerminalSnapshot>,
 }
 
 /// Ghostty state normalized for Lector's engine-neutral consumers.
@@ -455,6 +464,12 @@ pub struct TerminalSnapshot {
     pub modes: ModesSnapshot,
     pub title: Option<String>,
     pub working_directory: Option<String>,
+    /// Monotonic lineage coordinate of the first row in Lector's bounded
+    /// primary-screen history window. This advances when the oldest logical
+    /// row is evicted even though `scrollback_extent` remains at its cap.
+    /// It is deliberately distinct from Ghostty's page-relative grid offset,
+    /// which can move backwards when Ghostty prunes a whole allocation page.
+    pub history_origin: usize,
     pub scrollback_extent: usize,
     pub semantic_marks: Vec<SemanticMarkSnapshot>,
 }
@@ -471,6 +486,8 @@ pub struct DiagnosticSnapshot {
     active_hyperlink: Option<String>,
     scrollback_capacity: usize,
     terminal_profile: TerminalProfile,
+    primary_history_origin: usize,
+    primary_history_high_water: usize,
 }
 
 impl TerminalSnapshot {
@@ -1244,6 +1261,14 @@ struct TrackedSemanticMark {
     row_offset: isize,
 }
 
+/// The stable primary active-top/history-boundary cell. Ghostty moves this
+/// reference when it prunes physical history pages, which lets us distinguish
+/// page-coordinate rebasing from eviction out of Lector's logical window.
+struct HistoryLineageAnchor {
+    reference: TrackedGridRef,
+    absolute_row: usize,
+}
+
 #[derive(Default)]
 struct StreamObserver {
     events: Vec<SemanticKindSnapshot>,
@@ -1258,13 +1283,17 @@ struct StreamObserver {
     origin_mode: bool,
     left_right_margin_mode: bool,
     autowrap: bool,
+    alternate_screen: bool,
     operation_reliable: bool,
     last_printed: Option<char>,
     cursor_operations: usize,
     scroll_operations: usize,
     history_cleared: bool,
+    history_changed: bool,
     active_hyperlink: Option<String>,
     clipboard_read_queries: Vec<Vec<u8>>,
+    default_color_queries: Vec<u8>,
+    synchronized_output_boundary: Option<bool>,
 }
 
 impl StreamObserver {
@@ -1277,6 +1306,7 @@ impl StreamObserver {
             .map_or(0, |row| row.cells.len().try_into().unwrap_or(u16::MAX));
         self.operation_row = snapshot.cursor.row;
         self.operation_col = snapshot.cursor.col;
+        self.alternate_screen = snapshot.alternate_screen;
         self.operation_reliable = self.operation_rows > 0 && self.operation_cols > 0;
         if self.scroll_region.is_some_and(|(top, bottom)| {
             top >= self.operation_rows || bottom >= self.operation_rows
@@ -1305,13 +1335,25 @@ impl StreamObserver {
     }
 
     fn record_write(&mut self, character: char) {
-        if !character.is_ascii() || self.operation_col >= self.operation_cols {
+        if self.operation_col >= self.operation_cols {
             self.operation_reliable = false;
             return;
         }
         if self.operation_col == self.operation_cols.saturating_sub(1) {
+            if !self.alternate_screen && self.operation_row == self.operation_rows.saturating_sub(1)
+            {
+                // The C render API does not expose wrap-pending. Treat a
+                // primary-screen right-margin write on the bottom row as a
+                // possible history mutation; a false positive only refreshes
+                // the bounded history cache once.
+                self.history_changed = true;
+            }
             // Ghostty owns wrap-pending truth. The C render API does not expose
             // that transient state, so right-margin writes remain a diff case.
+            self.operation_reliable = false;
+            return;
+        }
+        if !character.is_ascii() {
             self.operation_reliable = false;
             return;
         }
@@ -1344,6 +1386,10 @@ impl StreamObserver {
     fn line_feed(&mut self) {
         let (top, bottom) = self.scroll_bounds();
         if self.operation_row == bottom {
+            if !self.alternate_screen && top == 0 && bottom == self.operation_rows.saturating_sub(1)
+            {
+                self.history_changed = true;
+            }
             self.operations.push(OperationSnapshot::ScrollUp {
                 top,
                 bottom,
@@ -1358,15 +1404,32 @@ impl StreamObserver {
     }
 
     fn has_boundary_events(&self) -> bool {
-        !self.events.is_empty() || !self.clipboard_read_queries.is_empty()
+        !self.events.is_empty()
+            || !self.clipboard_read_queries.is_empty()
+            || !self.default_color_queries.is_empty()
+            || self.synchronized_output_boundary.is_some()
+    }
+
+    fn take_synchronized_output_boundary(&mut self) -> Option<bool> {
+        self.synchronized_output_boundary.take()
     }
 
     fn take_clipboard_read_queries(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.clipboard_read_queries)
     }
 
+    fn take_default_color_queries(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.default_color_queries)
+    }
+
     fn take_semantic_events(&mut self) -> Vec<SemanticKindSnapshot> {
         std::mem::take(&mut self.events)
+    }
+
+    fn take_history_checkpoint_change(&mut self) -> bool {
+        let changed = std::mem::take(&mut self.history_changed) || self.history_cleared;
+        self.history_cleared = false;
+        changed
     }
 
     fn flush_print(&mut self) {
@@ -1397,7 +1460,7 @@ impl StreamObserver {
 
     fn take_update(&mut self, snapshot: &TerminalSnapshot) -> StreamUpdate {
         self.flush_print();
-        self.history_cleared = false;
+        let history_changed = self.take_history_checkpoint_change();
         let operations = if self.operation_reliable
             && self.operation_row == snapshot.cursor.row
             && self.operation_col == snapshot.cursor.col
@@ -1412,6 +1475,7 @@ impl StreamObserver {
             operations,
             cursor_operations: std::mem::take(&mut self.cursor_operations),
             scroll_operations: std::mem::take(&mut self.scroll_operations),
+            history_changed,
         }
     }
 }
@@ -1422,6 +1486,7 @@ struct StreamUpdate {
     operations: Vec<OperationSnapshot>,
     cursor_operations: usize,
     scroll_operations: usize,
+    history_changed: bool,
 }
 
 impl vte::Perform for StreamObserver {
@@ -1455,6 +1520,11 @@ impl vte::Perform for StreamObserver {
         self.flush_print();
         if let [b"52", location, b"?"] = params {
             self.clipboard_read_queries.push(location.to_vec());
+            return;
+        }
+        if let [kind @ (b"10" | b"11"), b"?"] = params {
+            self.default_color_queries
+                .push(if *kind == b"10" { 10 } else { 11 });
             return;
         }
         if params.first() == Some(&b"8".as_slice()) {
@@ -1509,13 +1579,15 @@ impl vte::Perform for StreamObserver {
                         7 => self.autowrap = enabled,
                         69 => self.left_right_margin_mode = enabled,
                         47 | 1047 | 1049 => {
+                            self.alternate_screen = enabled;
                             self.scroll_region = None;
                             self.operation_reliable = false;
                         }
                         // Input/reporting and cursor-visibility modes do not
                         // alter the location or meaning of cell operations.
+                        2026 => self.synchronized_output_boundary = Some(enabled),
                         1 | 12 | 25 | 66 | 67 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015
-                        | 1016 | 2004 | 2026 => {}
+                        | 1016 | 2004 => {}
                         // Unmodeled private modes can save/restore the cursor,
                         // resize/reset the grid, or change how later controls
                         // are interpreted. The dirty-state path remains safe.
@@ -1535,6 +1607,7 @@ impl vte::Perform for StreamObserver {
                     == Some(3)
             {
                 self.history_cleared = true;
+                self.history_changed = true;
             }
             match action {
                 'A' => {
@@ -1613,6 +1686,13 @@ impl vte::Perform for StreamObserver {
                 'S' | 'T' => {
                     self.scroll_operations += 1;
                     let (top, bottom) = self.scroll_bounds();
+                    if action == 'S'
+                        && !self.alternate_screen
+                        && top == 0
+                        && bottom == self.operation_rows.saturating_sub(1)
+                    {
+                        self.history_changed = true;
+                    }
                     let operation = if action == 'S' {
                         OperationSnapshot::ScrollUp {
                             top,
@@ -1779,6 +1859,20 @@ pub struct Terminal {
     scrollback_capacity: usize,
     stream_parser: vte::Parser,
     stream_observer: StreamObserver,
+    /// Monotonic identity of the oldest row in Lector's bounded primary
+    /// history window. Never derive this directly from Ghostty's current
+    /// physical scrollback extent: whole-page pruning rebases that extent.
+    primary_history_origin: usize,
+    /// First unassigned row identity. Used only when Ghostty discards the
+    /// lineage anchor and the new grid must be placed after the entire old
+    /// interval rather than risk aliasing surviving cached coordinates.
+    primary_history_high_water: usize,
+    primary_history_anchor: Option<HistoryLineageAnchor>,
+    /// Primary-screen history changed since the last synchronized-output
+    /// opening checkpoint. This spans `advance` calls, allowing View to keep
+    /// only cheap visible committed state during ordinary scrolling and to
+    /// request the expensive bounded-history copy only at an actual opener.
+    history_changed_since_open_checkpoint: bool,
     semantic_marks: Vec<TrackedSemanticMark>,
     _thread_bound: PhantomData<Rc<()>>,
 }
@@ -1846,6 +1940,10 @@ impl Terminal {
             scrollback_capacity,
             stream_parser: vte::Parser::new(),
             stream_observer: StreamObserver::default(),
+            primary_history_origin: 0,
+            primary_history_high_water: 0,
+            primary_history_anchor: None,
+            history_changed_since_open_checkpoint: false,
             semantic_marks: Vec::new(),
             _thread_bound: PhantomData,
         };
@@ -1857,6 +1955,10 @@ impl Terminal {
         let before = self.snapshot.clone();
         self.stream_observer.begin_update(&before);
         let mut render_damage = RenderDamageSnapshot::None;
+        let mut synchronized_output_open_snapshot = None;
+        let mut history_extent_at_latest_checkpoint = before.scrollback_extent;
+        let mut history_origin_at_latest_checkpoint = before.history_origin;
+        let mut history_changed_before_latest_checkpoint = false;
         let new_semantic_start = self.semantic_marks.len();
         let mut segment_start = 0;
         for (index, byte) in bytes.iter().copied().enumerate() {
@@ -1865,20 +1967,61 @@ impl Terminal {
             if !self.stream_observer.has_boundary_events() {
                 continue;
             }
+            let synchronized_before = self.snapshot.modes.synchronized_output;
             self.write_vt(&bytes[segment_start..=index]);
             self.answer_clipboard_queries();
+            self.answer_default_color_queries();
             render_damage.merge(self.refresh_snapshot()?);
             self.anchor_semantic_events(before.scrollback_extent)?;
+            let synchronization_boundary = self.stream_observer.take_synchronized_output_boundary();
+            if synchronization_boundary == Some(true)
+                && !synchronized_before
+                && self.snapshot.modes.synchronized_output
+            {
+                self.refresh_semantic_marks()?;
+                let segment_history_changed = self.stream_observer.take_history_checkpoint_change()
+                    || self.snapshot.scrollback_extent != history_extent_at_latest_checkpoint
+                    || self.snapshot.history_origin != history_origin_at_latest_checkpoint;
+                history_changed_before_latest_checkpoint |= segment_history_changed;
+                // Visible state is captured for every frame. Full history is
+                // materially more expensive, so include it only when bytes
+                // before this opener actually changed primary-screen history;
+                // View retains the previous committed history otherwise.
+                let history_changed_before_open =
+                    self.history_changed_since_open_checkpoint || segment_history_changed;
+                let primary_checkpoint = !self.snapshot.alternate_screen;
+                let mut snapshot = if history_changed_before_open && primary_checkpoint {
+                    self.snapshot_with_history()?
+                } else {
+                    self.snapshot.clone()
+                };
+                snapshot.modes.synchronized_output = false;
+                synchronized_output_open_snapshot = Some(snapshot);
+                // An alternate-screen opener cannot checkpoint the primary
+                // history which changed before the switch. Keep it dirty so
+                // the next primary opener receives a coherent full copy.
+                if primary_checkpoint {
+                    self.history_changed_since_open_checkpoint = false;
+                }
+                history_extent_at_latest_checkpoint = self.snapshot.scrollback_extent;
+                history_origin_at_latest_checkpoint = self.snapshot.history_origin;
+            }
             segment_start = index + 1;
         }
         if segment_start < bytes.len() {
             self.write_vt(&bytes[segment_start..]);
             self.answer_clipboard_queries();
+            self.answer_default_color_queries();
             render_damage.merge(self.refresh_snapshot()?);
         }
         self.recalibrate_new_semantic_marks(new_semantic_start)?;
         self.refresh_semantic_marks()?;
-        let stream = self.stream_observer.take_update(&self.snapshot);
+        let mut stream = self.stream_observer.take_update(&self.snapshot);
+        let history_changed_after_latest_checkpoint = stream.history_changed
+            || self.snapshot.scrollback_extent != history_extent_at_latest_checkpoint
+            || self.snapshot.history_origin != history_origin_at_latest_checkpoint;
+        self.history_changed_since_open_checkpoint |= history_changed_after_latest_checkpoint;
+        stream.history_changed |= history_changed_before_latest_checkpoint;
         let (effects, pty_replies) = self.effect_sink.take()?;
         // Ghostty represents both an unset string and a reported empty string
         // as a zero-length terminal-data value. The callback itself is the
@@ -1904,6 +2047,7 @@ impl Terminal {
             operations: stream.operations,
             cursor_operations: stream.cursor_operations,
             scroll_operations: stream.scroll_operations,
+            history_changed: stream.history_changed,
             damage: render_damage,
             changed_rows,
             cursor_before: before.cursor,
@@ -1911,6 +2055,7 @@ impl Terminal {
             alternate_screen_before: before.alternate_screen,
             alternate_screen_after: self.snapshot.alternate_screen,
             synchronized_output: self.snapshot.modes.synchronized_output,
+            synchronized_output_open_snapshot,
         })
     }
 
@@ -1932,6 +2077,32 @@ impl Terminal {
         }
     }
 
+    fn answer_default_color_queries(&mut self) {
+        for query in self.stream_observer.take_default_color_queries() {
+            // libghostty-vt exposes the light/dark preference but no exact
+            // default-color callback. Give applications a deterministic
+            // virtual default consistent with that preference. tmux control
+            // clients can then return this raw OSC report with
+            // `refresh-client -r` without routing it through pane input.
+            let light =
+                self.effect_sink.terminal_profile.color_scheme == TerminalColorScheme::Light;
+            let white = b"rgb:ffff/ffff/ffff";
+            let black = b"rgb:0000/0000/0000";
+            let color: &[u8] = match (query, light) {
+                (10, true) | (11, false) => black,
+                (10, false) | (11, true) => white,
+                _ => continue,
+            };
+            self.effect_sink.pty_replies.extend_from_slice(b"\x1b]");
+            self.effect_sink
+                .pty_replies
+                .extend_from_slice(query.to_string().as_bytes());
+            self.effect_sink.pty_replies.push(b';');
+            self.effect_sink.pty_replies.extend_from_slice(color);
+            self.effect_sink.pty_replies.extend_from_slice(b"\x1b\\");
+        }
+    }
+
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Error> {
         self.resize_with_geometry(rows, cols, 0, 0)
     }
@@ -1946,10 +2117,28 @@ impl Terminal {
         if rows == 0 || cols == 0 {
             return Err(Error::InvalidValue);
         }
+        let cell_layout_changed = self.effect_sink.terminal_profile.rows != rows
+            || self.effect_sink.terminal_profile.columns != cols;
         self.effect_sink.terminal_profile.rows = rows;
         self.effect_sink.terminal_profile.columns = cols;
         self.effect_sink.terminal_profile.cell_width = cell_width_px;
         self.effect_sink.terminal_profile.cell_height = cell_height_px;
+        // Reflow changes row boundaries non-uniformly, so a single numeric
+        // origin shift cannot preserve arbitrary old logical positions. Start
+        // a disjoint lineage; Ghostty's separate tracked marks still follow
+        // individual cells through reflow where possible.
+        if cell_layout_changed {
+            self.primary_history_origin = self.primary_history_high_water.max(
+                self.primary_history_origin
+                    .saturating_add(self.snapshot.scrollback_extent)
+                    .saturating_add(self.snapshot.rows.len()),
+            );
+            self.primary_history_anchor = None;
+        }
+        // Reflow may alter retained history even when its logical extent stays
+        // at the configured cap. The next opener must receive a full history
+        // checkpoint rather than reuse View's pre-resize allocation.
+        self.history_changed_since_open_checkpoint = true;
         // SAFETY: the terminal handle is valid and dimensions were validated.
         let result = unsafe {
             ffi::ghostty_terminal_resize(
@@ -1974,6 +2163,8 @@ impl Terminal {
             active_hyperlink: self.stream_observer.active_hyperlink.clone(),
             scrollback_capacity: self.scrollback_capacity,
             terminal_profile: self.effect_sink.terminal_profile.clone(),
+            primary_history_origin: self.primary_history_origin,
+            primary_history_high_water: self.primary_history_high_water,
         })
     }
 
@@ -1986,6 +2177,8 @@ impl Terminal {
             active_hyperlink,
             scrollback_capacity,
             terminal_profile,
+            primary_history_origin,
+            primary_history_high_water,
         } = snapshot;
         // Declare callback storage before the decoded terminal so partial
         // constructor unwinding always frees the terminal first.
@@ -2025,6 +2218,12 @@ impl Terminal {
             scrollback_capacity,
             stream_parser,
             stream_observer,
+            primary_history_origin,
+            primary_history_high_water,
+            primary_history_anchor: None,
+            // The restored terminal can already contain retained history
+            // which no external View cache has observed.
+            history_changed_since_open_checkpoint: true,
             // OSC 133 grid references are deliberately not part of this
             // diagnostic path yet. Runtime correctness never restores here.
             semantic_marks: Vec::new(),
@@ -2035,10 +2234,19 @@ impl Terminal {
     }
 
     pub fn reset(&mut self) -> Result<(), Error> {
+        // The reset grid must occupy a disjoint lineage interval so an old
+        // cached position cannot alias a new cell with the same local row.
+        self.primary_history_origin = self.primary_history_high_water.max(
+            self.primary_history_origin
+                .saturating_add(self.snapshot.scrollback_extent)
+                .saturating_add(self.snapshot.rows.len()),
+        );
+        self.primary_history_anchor = None;
         // SAFETY: the terminal handle is valid.
         unsafe { ffi::ghostty_terminal_reset(self.terminal.as_ptr()) };
         self.stream_parser = vte::Parser::new();
         self.stream_observer = StreamObserver::default();
+        self.history_changed_since_open_checkpoint = true;
         let _ = self.effect_sink.take()?;
         self.semantic_marks.clear();
         self.refresh_snapshot().map(|_| ())
@@ -2197,16 +2405,19 @@ impl Terminal {
         self.snapshot.scrollback_extent
     }
 
-    /// The number of physically retained Ghostty rows older than Lector's
-    /// logical scrollback window.
-    pub fn history_origin(&self) -> Result<usize, Error> {
+    /// The current page-relative Ghostty rows older than Lector's logical
+    /// window. This may move backwards after whole-page pruning and is used
+    /// only to translate Ghostty tracked references, never as snapshot
+    /// lineage identity.
+    pub fn physical_history_origin(&self) -> Result<usize, Error> {
         Ok(self
             .actual_scrollback_extent()?
             .saturating_sub(self.scrollback_capacity))
     }
 
     /// Tracks a point in Ghostty's physical full-screen coordinate space.
-    /// Callers should add `history_origin()` to a Lector logical row first.
+    /// Callers should add `physical_history_origin()` to a Lector-local row
+    /// first; the monotonic snapshot lineage is a different coordinate space.
     pub fn track_screen_position(&self, row: usize, col: u16) -> Result<TrackedGridRef, Error> {
         let total_rows = terminal_query::<usize>(&self.terminal, ffi::TERMINAL_DATA_TOTAL_ROWS)?;
         let (_, cols) = self.snapshot.size();
@@ -2408,11 +2619,22 @@ impl Terminal {
             &self.terminal,
             ffi::TERMINAL_DATA_ACTIVE_SCREEN,
         )?;
+        let alternate_screen = match screen {
+            ffi::TERMINAL_SCREEN_PRIMARY => false,
+            ffi::TERMINAL_SCREEN_ALTERNATE => true,
+            _ => return Err(Error::InvalidValue),
+        };
         let title = terminal_string(&self.terminal, ffi::TERMINAL_DATA_TITLE)?;
         let working_directory = terminal_string(&self.terminal, ffi::TERMINAL_DATA_PWD)?;
-        let scrollback_extent = self
-            .actual_scrollback_extent()?
-            .min(self.scrollback_capacity);
+        let actual_scrollback_extent = self.actual_scrollback_extent()?;
+        let scrollback_extent = actual_scrollback_extent.min(self.scrollback_capacity);
+        if !alternate_screen {
+            self.refresh_primary_history_lineage(
+                actual_scrollback_extent,
+                scrollback_extent,
+                usize::from(rows),
+            )?;
+        }
         self.snapshot = TerminalSnapshot {
             rows: normalized_rows,
             scrollback: Vec::new(),
@@ -2435,14 +2657,11 @@ impl Terminal {
             },
             width_px: terminal_query(&self.terminal, ffi::TERMINAL_DATA_WIDTH_PX)?,
             height_px: terminal_query(&self.terminal, ffi::TERMINAL_DATA_HEIGHT_PX)?,
-            alternate_screen: match screen {
-                ffi::TERMINAL_SCREEN_PRIMARY => false,
-                ffi::TERMINAL_SCREEN_ALTERNATE => true,
-                _ => return Err(Error::InvalidValue),
-            },
+            alternate_screen,
             modes: read_modes(&self.terminal)?,
             title,
             working_directory,
+            history_origin: self.primary_history_origin,
             scrollback_extent,
             semantic_marks: Vec::new(),
         };
@@ -2528,6 +2747,56 @@ impl Terminal {
 
     fn actual_scrollback_extent(&self) -> Result<usize, Error> {
         terminal_query(&self.terminal, ffi::TERMINAL_DATA_SCROLLBACK_ROWS)
+    }
+
+    fn refresh_primary_history_lineage(
+        &mut self,
+        actual_history: usize,
+        logical_history: usize,
+        visible_rows: usize,
+    ) -> Result<(), Error> {
+        let physical_window_origin = actual_history.saturating_sub(logical_history);
+        if let Some(anchor) = self.primary_history_anchor.take() {
+            let candidate = anchor
+                .reference
+                .screen_position()?
+                .and_then(|(physical_row, _)| {
+                    if physical_row >= physical_window_origin {
+                        anchor
+                            .absolute_row
+                            .checked_sub(physical_row - physical_window_origin)
+                    } else {
+                        anchor
+                            .absolute_row
+                            .checked_add(physical_window_origin - physical_row)
+                    }
+                });
+            if let Some(candidate) =
+                candidate.filter(|candidate| *candidate >= self.primary_history_origin)
+            {
+                self.primary_history_origin = candidate;
+            } else {
+                // A missing or non-monotonic boundary cannot map the old
+                // model exactly (notably after reset/reflow). Start a disjoint
+                // monotonic interval; consumers can safely clamp or discard
+                // every position from the previous interval.
+                self.primary_history_origin = self
+                    .primary_history_origin
+                    .max(self.primary_history_high_water);
+            }
+        }
+
+        self.primary_history_high_water = self.primary_history_high_water.max(
+            self.primary_history_origin
+                .saturating_add(logical_history)
+                .saturating_add(visible_rows),
+        );
+        let reference = self.track_position(ffi::POINT_TAG_VIEWPORT, 0, 0)?;
+        self.primary_history_anchor = Some(HistoryLineageAnchor {
+            reference,
+            absolute_row: self.primary_history_origin.saturating_add(logical_history),
+        });
+        Ok(())
     }
 
     fn read_grid_row(&self, row: usize, cols: u16) -> Result<RowSnapshot, Error> {

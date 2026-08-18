@@ -1051,6 +1051,7 @@ fn run_scheduler_workload(workload: SchedulerWorkload) -> Result<SchedulerWorklo
     let config = OutputSchedulerConfig {
         latency_budget_ms: 4,
         synchronization_timeout_ms: 100,
+        synchronization_hard_timeout_ms: 2_000,
         write_budget_bytes: 64 * 1024,
         maximum_pending_bytes: 2 * 1024 * 1024,
     };

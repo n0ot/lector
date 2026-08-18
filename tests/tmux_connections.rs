@@ -1,6 +1,7 @@
 use lector::{
-    app::App, screen_reader::ScreenReader, speech, tmux_gateway::TmuxGatewayRouter,
-    tmux_model::INVENTORY_REPLY_COUNT, views,
+    app::App, output_scheduler::OutputSchedulerConfig, screen_reader::ScreenReader, speech,
+    terminal::GhosttyEngine, tmux_gateway::TmuxGatewayRouter, tmux_model::INVENTORY_REPLY_COUNT,
+    views,
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
@@ -50,13 +51,13 @@ fn inventory(
             format!("P\t@10\t%20\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\t{pane_title}")
                 .into_bytes(),
         ],
-        vec![b"A\t$1".to_vec()],
+        vec![format!("A\t$1\t{session_name}.example").into_bytes()],
         vec![b"O\tbase-index\t1".to_vec()],
         vec![b"O\tpane-base-index\t1".to_vec()],
         vec![format!("C\tclient_name\t{client}").into_bytes()],
         vec![b"O\tprefix\tC-a".to_vec()],
         vec![b"O\tprefix2\tNone".to_vec()],
-        vec![b"O\tmode-keys\tvi".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
         vec![b"O\trepeat-time\t500".to_vec()],
         vec![
             b"B\t1\t0\tselect-window -t :=1".to_vec(),
@@ -118,25 +119,33 @@ fn add_ready_connection(
         commands,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
     feed(app, sr, &mut router, &reply(2, &[], true), physical);
+    feed(
+        app,
+        sr,
+        &mut router,
+        &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()], true),
+        physical,
+    );
     assert_eq!(groups.len(), INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
         feed(
             app,
             sr,
             &mut router,
-            &reply(index + 3, group, true),
+            &reply(index + 4, group, true),
             physical,
         );
     }
     commands.clear();
     app.drain_tmux_commands_for(connection_id, &mut commands)
         .unwrap();
-    assert_eq!(commands, b"capture-pane -p -e -J -S - -t %20\n");
+    assert_eq!(commands, b"capture-pane -p -e -F -J -S - -t %20\n");
     feed(
         app,
         sr,
@@ -258,7 +267,7 @@ fn identical_tmux_ids_remain_isolated_across_connections_input_replies_and_speec
             .0
             .borrow()
             .iter()
-            .any(|message| message == "tmux, tmux 2, same"),
+            .any(|message| message == "tmux, same, 1: same"),
         "speech={:?}",
         recorder.0.borrow()
     );
@@ -341,7 +350,119 @@ fn rapid_connection_switches_never_cross_pane_state_or_input_routes() {
 }
 
 #[test]
-fn connection_chooser_switches_terminal_and_connections_and_survives_selected_removal() {
+fn base_switch_replacements_present_only_the_targets_committed_frame() {
+    let (mut app, mut sr, _recorder, mut physical) = app();
+    let mut first = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        inventory("one", "one", "one", "/dev/ttys-one"),
+        "FIRST COMMITTED",
+    );
+    let _second = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        2,
+        inventory("two", "two", "two", "/dev/ttys-two"),
+        "SECOND",
+    );
+    let mut oracle = GhosttyEngine::new(24, 80).expect("create physical oracle");
+    oracle.advance(&physical).expect("apply setup output");
+    physical.clear();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        synchronization_timeout_ms: 10_000,
+        synchronization_hard_timeout_ms: 10_000,
+        ..OutputSchedulerConfig::default()
+    });
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut first,
+        b"%output %20 \\033[?2026h\\033[2J\\033[HPARTIAL ONE\n",
+        &mut physical,
+    );
+    app.show_message(&mut sr, "Notice", "SWITCH OVERLAY", &mut physical)
+        .expect("show overlay on the current base");
+    app.drain_scheduled_output(&mut physical, false)
+        .expect("present overlay");
+    oracle.advance(&physical).expect("apply overlay");
+    assert!(
+        oracle
+            .normalized_snapshot()
+            .contents()
+            .contains("SWITCH OVERLAY")
+    );
+    physical.clear();
+
+    assert!(
+        app.activate_tmux_connection(1, &mut sr, &mut physical)
+            .expect("switch to frozen connection")
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut first,
+        b"%output %20 REPLACEMENT PARTIAL\n",
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, false)
+        .expect("flush replacement transition");
+    oracle.advance(&physical).expect("apply switched base");
+
+    let contents = oracle.normalized_snapshot().contents();
+    assert!(contents.contains("FIRST COMMITTED"), "{contents:?}");
+    assert!(!contents.contains("PARTIAL ONE"), "{contents:?}");
+    assert!(!contents.contains("REPLACEMENT PARTIAL"), "{contents:?}");
+    assert!(!contents.contains("SWITCH OVERLAY"), "{contents:?}");
+    assert!(!contents.contains("SECOND"), "{contents:?}");
+}
+
+#[test]
+fn tmux_location_announcement_waits_for_the_matching_physical_frame() {
+    let (mut app, mut sr, recorder, mut physical) = app();
+    let mut router = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        inventory("work", "old", "pane", "/dev/ttys-one"),
+        "PANE CONTENTS",
+    );
+    recorder.0.borrow_mut().clear();
+    physical.clear();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%window-renamed @10 renamed\n",
+        &mut physical,
+    );
+    assert!(
+        recorder.0.borrow().is_empty(),
+        "the renamed logical window was announced before its render flushed"
+    );
+
+    let report = app
+        .drain_scheduled_output(&mut physical, false)
+        .expect("present the renamed window");
+    assert_eq!(report.completed_renders.len(), 1);
+    let mut root = Vec::new();
+    app.handle_tick(&mut sr, &mut root, &mut physical)
+        .expect("announce the physically presented window");
+    assert_eq!(recorder.0.borrow().as_slice(), ["1: renamed"]);
+}
+
+#[test]
+fn connection_chooser_switches_connections_and_survives_selected_removal() {
     let (mut app, mut sr, _recorder, mut physical) = app();
     let mut first = TmuxGatewayRouter::with_first_connection_id(1);
     feed(
@@ -357,6 +478,7 @@ fn connection_chooser_switches_terminal_and_connections_and_survives_selected_re
         ignored,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -368,6 +490,13 @@ fn connection_chooser_switches_terminal_and_connections_and_survives_selected_re
         &reply(2, &[], true),
         &mut physical,
     );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut first,
+        &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()], true),
+        &mut physical,
+    );
     for (index, group) in inventory("one", "one-window", "one-pane", "/dev/ttys-one")
         .iter()
         .enumerate()
@@ -376,7 +505,7 @@ fn connection_chooser_switches_terminal_and_connections_and_survives_selected_re
             &mut app,
             &mut sr,
             &mut first,
-            &reply(index + 3, group, true),
+            &reply(index + 4, group, true),
             &mut physical,
         );
     }
@@ -403,9 +532,9 @@ fn connection_chooser_switches_terminal_and_connections_and_survives_selected_re
             .unwrap()
     );
     let chooser = app.debug_active_view_contents();
-    assert!(chooser.contains("terminal"), "{chooser:?}");
-    assert!(chooser.contains("connection 1 tmux 1"), "{chooser:?}");
-    assert!(chooser.contains("connection 2 tmux 2"), "{chooser:?}");
+    assert!(!chooser.contains("\nterminal"), "{chooser:?}");
+    assert!(chooser.contains("  1, one.example"), "{chooser:?}");
+    assert!(chooser.contains("* 2, two.example"), "{chooser:?}");
     input(&mut app, &mut sr, &mut physical, b"\x1b[A\r");
     assert_eq!(app.active_tmux_connection(), Some(1));
     assert!(app.debug_active_view_contents().contains("ONE"));
@@ -414,9 +543,9 @@ fn connection_chooser_switches_terminal_and_connections_and_survives_selected_re
         app.show_tmux_connection_chooser(&mut sr, &mut physical)
             .unwrap()
     );
-    input(&mut app, &mut sr, &mut physical, b"\x1b[A\r");
-    assert_eq!(app.active_tmux_connection(), None);
-    assert!(app.debug_active_view_contents().contains("gateway prompt"));
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    assert_eq!(app.active_tmux_connection(), Some(2));
+    assert!(app.debug_active_view_contents().contains("TWO"));
 
     assert!(
         app.activate_tmux_connection(2, &mut sr, &mut physical)
@@ -435,10 +564,121 @@ fn connection_chooser_switches_terminal_and_connections_and_survives_selected_re
     );
     assert!(app.has_overlay(), "the chooser should remain reachable");
     let chooser = app.debug_active_view_contents();
-    assert!(!chooser.contains("connection 2"), "{chooser:?}");
-    assert!(chooser.contains("connection 1"), "{chooser:?}");
+    assert!(!chooser.contains("2, two.example"), "{chooser:?}");
+    assert!(chooser.contains("* 1, one.example"), "{chooser:?}");
     input(&mut app, &mut sr, &mut physical, b"\r");
     assert_eq!(app.active_tmux_connection(), Some(1));
+}
+
+#[test]
+fn manager_shortcut_preempts_an_incomplete_prefix() {
+    let (mut app, mut sr, _recorder, mut physical) = app();
+    let _router = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        inventory("one", "one-window", "one-pane", "/dev/ttys-one"),
+        "ONE",
+    );
+
+    input(&mut app, &mut sr, &mut physical, b"\x01");
+    let root = input(&mut app, &mut sr, &mut physical, b"\x1bC");
+    assert!(root.is_empty());
+    assert!(app.has_overlay());
+    assert!(
+        app.debug_active_view_contents()
+            .contains("* 1, one.example"),
+        "manager did not open: {:?}",
+        app.debug_active_view_contents()
+    );
+
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    let mut command = input(&mut app, &mut sr, &mut physical, b"n");
+    command.extend(drain(&mut app, 1));
+    assert!(
+        String::from_utf8_lossy(&command).starts_with("send-keys -H -t %20 6e"),
+        "stale prefix survived manager entry: {command:?}"
+    );
+}
+
+#[test]
+fn manager_shortcut_remains_application_input_when_no_tmux_connection_exists() {
+    let (mut app, mut sr, _recorder, mut physical) = app();
+    assert_eq!(input(&mut app, &mut sr, &mut physical, b"\x1bC"), b"\x1bC");
+    assert!(!app.has_overlay());
+}
+
+#[test]
+fn connection_manager_arrow_keys_announce_only_the_selected_row() {
+    let (mut app, mut sr, recorder, mut physical) = app();
+    let _first = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        inventory("one", "one", "one", "/dev/ttys-one"),
+        "ONE",
+    );
+    let _second = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        2,
+        inventory("two", "two", "two", "/dev/ttys-two"),
+        "TWO",
+    );
+    assert!(
+        app.show_tmux_connection_chooser(&mut sr, &mut physical)
+            .unwrap()
+    );
+
+    recorder.0.borrow_mut().clear();
+    input(&mut app, &mut sr, &mut physical, b"\x1b[A");
+    let speech = recorder.0.borrow();
+    assert_eq!(speech.len(), 1, "manager movement speech={speech:?}");
+    assert_eq!(speech[0], "1, one.example");
+}
+
+#[test]
+fn kitty_enter_release_does_not_reach_the_connection_selected_by_the_manager() {
+    let (mut app, mut sr, _recorder, mut physical) = app();
+    let _first = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        inventory("one", "one", "one", "/dev/ttys-one"),
+        "ONE",
+    );
+    let _second = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        2,
+        inventory("two", "two", "two", "/dev/ttys-two"),
+        "TWO",
+    );
+    assert!(
+        app.show_tmux_connection_chooser(&mut sr, &mut physical)
+            .unwrap()
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1b[A");
+
+    let root = input(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        b"\x1b[13;1:1u\x1b[13;1:3u",
+    );
+
+    assert_eq!(app.active_tmux_connection(), Some(1));
+    assert!(root.is_empty());
+    assert!(
+        drain(&mut app, 1).is_empty(),
+        "the manager's Enter release leaked to the selected connection"
+    );
+    assert!(drain(&mut app, 2).is_empty());
 }
 
 #[test]
@@ -487,7 +727,7 @@ fn prefix_partial_state_command_history_and_detach_are_scoped_to_the_announced_c
     assert!(drain(&mut app, 1).is_empty());
 
     input(&mut app, &mut sr, &mut physical, b"\x01d");
-    assert_eq!(drain(&mut app, 2), b"detach-client -t =/dev/ttys-two\n");
+    assert_eq!(drain(&mut app, 2), b"detach-client\n");
     assert!(drain(&mut app, 1).is_empty());
 
     assert!(
@@ -574,11 +814,11 @@ fn connection_labels_are_stable_distinguish_duplicates_and_do_not_leak_to_new_id
     );
     let duplicate = app.debug_active_view_contents();
     assert!(
-        duplicate.contains("connection 1 shared label"),
+        duplicate.contains("1, shared label, one.example"),
         "{duplicate:?}"
     );
     assert!(
-        duplicate.contains("connection 2 shared label"),
+        duplicate.contains("2, shared label, two.example"),
         "{duplicate:?}"
     );
     input(&mut app, &mut sr, &mut physical, b"\x1b");
@@ -632,6 +872,17 @@ fn connection_labels_are_stable_distinguish_duplicates_and_do_not_leak_to_new_id
             .unwrap()
             .starts_with("connection 3: tmux 3")
     );
+    assert!(
+        app.show_tmux_connection_chooser(&mut sr, &mut physical)
+            .unwrap()
+    );
+    let restarted = app.debug_active_view_contents();
+    assert!(
+        restarted.contains("1, shared label, one.example"),
+        "{restarted:?}"
+    );
+    assert!(!restarted.contains("2, two.example"), "{restarted:?}");
+    assert!(restarted.contains("* 3, three.example"), "{restarted:?}");
 }
 
 struct DisposableServer {

@@ -4,6 +4,9 @@ set -euo pipefail
 ZIG_VERSION=0.16.0
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Resolved dynamically from this script's repository root.
+# shellcheck disable=SC1091
+source "$repo_dir/scripts/lib/lock.sh"
 toolchain_root=${LECTOR_TOOLCHAIN_ROOT:-"$repo_dir/target/toolchains"}
 install_dir="$toolchain_root/zig/$ZIG_VERSION"
 zig_bin="$install_dir/zig"
@@ -30,6 +33,19 @@ case "$(uname -s):$(uname -m)" in
         exit 2
         ;;
 esac
+
+bootstrap_lock_dir="$toolchain_root/bootstrap-locks/zig-$ZIG_VERSION"
+extract_dir=
+
+cleanup() {
+    if [[ -n "$extract_dir" && -d "$extract_dir" ]]; then
+        rm -rf "$extract_dir"
+    fi
+    lector_release_lock "$bootstrap_lock_dir"
+}
+
+trap cleanup EXIT
+lector_acquire_lock "$bootstrap_lock_dir" "Zig $ZIG_VERSION bootstrap"
 
 marker="$install_dir/.lector-zig-toolchain"
 if [[ -x "$zig_bin" && -f "$marker" ]] &&
@@ -79,7 +95,6 @@ if [[ "$actual_sha" != "$archive_sha" ]]; then
 fi
 
 extract_dir=$(mktemp -d "$toolchain_root/extract.XXXXXX")
-trap 'rm -rf "$extract_dir"' EXIT
 tar -xJf "$archive" --strip-components=1 -C "$extract_dir"
 
 actual_version=$("$extract_dir/zig" version)
@@ -95,7 +110,7 @@ fi
 } > "$extract_dir/.lector-zig-toolchain"
 
 mv "$extract_dir" "$install_dir"
-trap - EXIT
+extract_dir=
 
 echo "installed verified Zig $ZIG_VERSION at $install_dir" >&2
 printf '%s\n' "$zig_bin"

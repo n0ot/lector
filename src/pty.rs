@@ -7,46 +7,38 @@ use nix::sys::{
 };
 use nix::unistd::{Pid, dup};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::path::Path;
-
-const LECTOR_TERMINFO: &[u8] = include_bytes!("../terminfo/compiled/6c/lector");
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VirtualTerminalEnvironment {
     pub term: String,
-    pub terminfo_dir: std::path::PathBuf,
 }
 
 impl VirtualTerminalEnvironment {
     pub fn apply(&self, command: &mut CommandBuilder) {
         command.env("TERM", &self.term);
-        command.env("TERMINFO", &self.terminfo_dir);
+        // A nested Lector can inherit its parent's application-facing
+        // TERMINFO. That private database must not be paired with the public
+        // compatibility identity.
+        command.env_remove("TERMINFO");
         // COLORTERM is deliberately untouched: callers preserve it only when
         // the selected virtual profile implements the advertised color mode.
     }
 }
 
-/// Materialize the bundled compiled terminfo under both directory conventions
-/// used by supported ncurses implementations (hex and first-character).
-pub fn install_lector_terminfo(root: &Path) -> Result<VirtualTerminalEnvironment> {
-    for relative in ["6c/lector", "l/lector"] {
-        let path = root.join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context("create Lector terminfo directory")?;
-        }
-        let current = fs::read(&path).ok();
-        if current.as_deref() != Some(LECTOR_TERMINFO) {
-            fs::write(&path, LECTOR_TERMINFO).context("write bundled Lector terminfo")?;
-        }
+/// The application-facing contract Lector currently implements. Inheriting a
+/// vendor TERM (including xterm-ghostty) would promise protocols owned by the
+/// physical terminal rather than by Lector's compositor.
+#[must_use]
+pub fn compatible_terminal_environment() -> VirtualTerminalEnvironment {
+    VirtualTerminalEnvironment {
+        term: "xterm-256color".to_owned(),
     }
-    Ok(VirtualTerminalEnvironment {
-        term: "lector".to_owned(),
-        terminfo_dir: root.to_path_buf(),
-    })
 }
 
 pub struct Process {
@@ -139,6 +131,8 @@ impl Process {
         let stream_fd = dup(master_fd).context("duplicate PTY master")?;
         Ok(PtyStream {
             inner: unsafe { File::from_raw_fd(stream_fd) },
+            pending_write: VecDeque::new(),
+            dropped_write_bytes: 0,
         })
     }
 
@@ -219,6 +213,86 @@ pub fn terminal_geometry(fd: RawFd) -> Result<TerminalGeometry> {
 
 pub struct PtyStream {
     inner: File,
+    pending_write: VecDeque<u8>,
+    dropped_write_bytes: usize,
+}
+
+const PTY_WRITE_BUFFER_LIMIT: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PtyWriteReport {
+    pub bytes_written: usize,
+    pub blocked: bool,
+}
+
+impl PtyStream {
+    #[must_use]
+    pub fn pending_write_bytes(&self) -> usize {
+        self.pending_write.len()
+    }
+
+    #[must_use]
+    pub fn has_pending_writes(&self) -> bool {
+        !self.pending_write.is_empty()
+    }
+
+    pub fn take_dropped_write_bytes(&mut self) -> usize {
+        std::mem::take(&mut self.dropped_write_bytes)
+    }
+
+    /// Make bounded progress on bytes previously accepted from the app. A
+    /// blocked child is a readiness condition, not an application error.
+    pub fn drain_pending_writes(&mut self) -> io::Result<PtyWriteReport> {
+        let mut report = PtyWriteReport::default();
+        while !self.pending_write.is_empty() {
+            let contiguous = self.pending_write.make_contiguous();
+            match self.inner.write(contiguous) {
+                Ok(0) => {
+                    report.blocked = true;
+                    break;
+                }
+                Ok(count) => {
+                    self.pending_write.drain(..count);
+                    report.bytes_written = report.bytes_written.saturating_add(count);
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    report.blocked = true;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(report)
+    }
+
+    fn accept_write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let _ = self.drain_pending_writes()?;
+        if self.pending_write.is_empty() {
+            match self.inner.write(bytes) {
+                Ok(count) if count == bytes.len() => return Ok(count),
+                Ok(count) => return Ok(self.queue_remainder(bytes, count)),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(self.queue_remainder(bytes, 0))
+    }
+
+    fn queue_remainder(&mut self, bytes: &[u8], written: usize) -> usize {
+        let remainder = &bytes[written..];
+        let capacity = PTY_WRITE_BUFFER_LIMIT.saturating_sub(self.pending_write.len());
+        let retained = capacity.min(remainder.len());
+        self.pending_write.extend(&remainder[..retained]);
+        self.dropped_write_bytes = self
+            .dropped_write_bytes
+            .saturating_add(remainder.len().saturating_sub(retained));
+        // Report logical acceptance so existing write_all callers remain
+        // responsive. The event loop observes overflow and terminates only the
+        // failed child transport before later protocol commands can overtake it.
+        bytes.len()
+    }
 }
 
 impl Read for PtyStream {
@@ -232,15 +306,25 @@ impl Read for PtyStream {
 
 impl Write for PtyStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
+        self.accept_write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        let _ = self.drain_pending_writes()?;
+        if self.pending_write.is_empty() {
+            self.inner.flush()
+        } else {
+            Ok(())
+        }
     }
 
     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        self.inner.write_vectored(bufs)
+        let mut accepted = 0_usize;
+        for buffer in bufs {
+            self.accept_write(buffer)?;
+            accepted = accepted.saturating_add(buffer.len());
+        }
+        Ok(accepted)
     }
 }
 
@@ -261,13 +345,34 @@ pub fn set_raw(fd: RawFd) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Process, install_lector_terminfo, set_raw, terminal_geometry};
+    use super::{
+        PTY_WRITE_BUFFER_LIMIT, Process, PtyStream, compatible_terminal_environment, set_raw,
+        terminal_geometry,
+    };
     use crate::terminal::TerminalGeometry;
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::sys::termios::{self, LocalFlags};
-    use portable_pty::{PtySize, native_pty_system};
+    use nix::unistd::pipe;
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::fd::{AsRawFd, BorrowedFd};
     use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    // macOS has a finite system PTY pool. These tests each hold a real PTY
+    // while a child runs, and concurrent test processes may already consume
+    // much of that pool. Keeping this module's live-PTY cases serialized
+    // prevents unrelated assertions from observing an early/empty child when
+    // the test harness runs them in parallel. Recover a poisoned lock so one
+    // useful failure does not turn every remaining PTY test into noise.
+    static REAL_PTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serialize_real_pty_test() -> MutexGuard<'static, ()> {
+        REAL_PTY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn terminal_attrs() -> termios::Termios {
         let pair = native_pty_system()
@@ -284,7 +389,50 @@ mod tests {
     }
 
     #[test]
+    fn compatible_environment_advertises_only_the_supported_xterm_contract() {
+        let environment = compatible_terminal_environment();
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.env("TERMINFO", "/stale/private/terminfo");
+
+        environment.apply(&mut command);
+
+        assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
+        assert!(command.get_env("TERMINFO").is_none());
+    }
+
+    #[test]
+    fn nonblocking_pty_writes_are_buffered_and_overflow_is_reported_not_returned() {
+        let (_read, write) = pipe().expect("create PTY-write stand-in pipe");
+        let original = OFlag::from_bits_truncate(
+            fcntl(write.as_raw_fd(), FcntlArg::F_GETFL).expect("read pipe flags"),
+        );
+        fcntl(
+            write.as_raw_fd(),
+            FcntlArg::F_SETFL(original | OFlag::O_NONBLOCK),
+        )
+        .expect("make pipe nonblocking");
+        let mut stream = PtyStream {
+            inner: std::fs::File::from(write),
+            pending_write: std::collections::VecDeque::new(),
+            dropped_write_bytes: 0,
+        };
+        let input = vec![b'x'; PTY_WRITE_BUFFER_LIMIT * 2];
+
+        stream
+            .write_all(&input)
+            .expect("backpressure is queued rather than returned as EAGAIN");
+        assert_eq!(stream.pending_write_bytes(), PTY_WRITE_BUFFER_LIMIT);
+        assert!(stream.take_dropped_write_bytes() > 0);
+        let report = stream
+            .drain_pending_writes()
+            .expect("retry a still-backpressured write");
+        assert!(report.blocked);
+        assert_eq!(stream.pending_write_bytes(), PTY_WRITE_BUFFER_LIMIT);
+    }
+
+    #[test]
     fn process_stream_is_duplex_and_reports_eof_after_child_exit() {
+        let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
         let mut process = Process::spawn(
             Path::new("/bin/sh"),
@@ -309,6 +457,7 @@ mod tests {
 
     #[test]
     fn resize_updates_the_child_terminal_dimensions() {
+        let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
         let mut process = Process::spawn(
             Path::new("/bin/sh"),
@@ -344,6 +493,7 @@ mod tests {
 
     #[test]
     fn resize_notifies_the_child_process() {
+        let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
         let mut process = Process::spawn(
             &std::env::current_exe().expect("resolve test binary"),
@@ -411,6 +561,7 @@ mod tests {
 
     #[test]
     fn spawn_preserves_the_callers_current_directory() {
+        let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
         let mut process = Process::spawn(
             Path::new("/bin/pwd"),
@@ -438,13 +589,13 @@ mod tests {
     }
 
     #[test]
-    fn spawn_applies_the_virtual_terminal_environment_to_the_real_child() {
+    fn spawn_applies_the_compatible_terminal_environment_to_the_real_child() {
+        let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
-        let root = Path::new("target/test-artifacts/pty-lector-terminfo");
-        let environment = install_lector_terminfo(root).expect("install bundled terminfo");
+        let environment = compatible_terminal_environment();
         let mut process = Process::spawn_with_geometry_and_environment(
             Path::new("/bin/sh"),
-            ["-c", "printf '%s|%s\\n' \"$TERM\" \"$TERMINFO\""],
+            ["-c", "printf '%s|%s\\n' \"$TERM\" \"${TERMINFO-unset}\""],
             TerminalGeometry::new(5, 13, 8, 16),
             &attrs,
             Some(&environment),
@@ -456,15 +607,13 @@ mod tests {
             .read_to_string(&mut output)
             .expect("read child environment");
 
-        assert!(
-            output.contains(&format!("lector|{}", root.display())),
-            "{output:?}"
-        );
+        assert!(output.contains("xterm-256color|unset"), "{output:?}");
         assert!(process.wait().expect("wait for child").success());
     }
 
     #[test]
     fn spawn_copies_the_requested_terminal_attributes() {
+        let _guard = serialize_real_pty_test();
         let mut attrs = terminal_attrs();
         attrs.local_flags.remove(LocalFlags::ECHO);
         let mut process = Process::spawn(Path::new("/bin/sh"), ["-c", "stty -a"], 5, 13, &attrs)
@@ -484,6 +633,7 @@ mod tests {
 
     #[test]
     fn spawn_reports_a_missing_program_before_returning_a_process() {
+        let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
         let err = Process::spawn(
             Path::new("/definitely/missing/lector-pty-test"),
@@ -502,6 +652,7 @@ mod tests {
 
     #[test]
     fn raw_mode_disables_canonical_input_echo_and_terminal_signals() {
+        let _guard = serialize_real_pty_test();
         let pair = native_pty_system()
             .openpty(PtySize::default())
             .expect("open PTY");

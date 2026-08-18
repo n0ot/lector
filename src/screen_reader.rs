@@ -20,16 +20,18 @@ use tracking::{CursorTrackingMode, PendingDelete};
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAX_PENDING_KEY_ECHO_CHARS: usize = 256;
+const MAX_PENDING_DELETE_INTENTS: usize = 64;
+const MAX_PENDING_DELETE_PRESENTATIONS: u8 = 64;
 
 /// How bells received from panes in a tmux control connection are presented.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TmuxBellMode {
     /// Discard pane bells.
-    #[default]
     Off,
     /// Speak stable connection, session, window, and pane context.
     Spoken,
     /// Emit one physical BEL at a scheduler transaction boundary.
+    #[default]
     Audible,
 }
 
@@ -96,7 +98,8 @@ pub struct ScreenReader {
     lua_ctx_weak: Option<WeakLua>,
     lua_hooks: LuaHooks,
     auto_read_buffers: AutoReadBuffers,
-    pending_delete: Option<PendingDelete>,
+    pending_deletes: VecDeque<PendingDelete>,
+    input_sequence: u64,
     pending_history_navigation: bool,
 }
 
@@ -124,7 +127,8 @@ impl ScreenReader {
             lua_ctx_weak: None,
             lua_hooks: LuaHooks::default(),
             auto_read_buffers: AutoReadBuffers::default(),
-            pending_delete: None,
+            pending_deletes: VecDeque::new(),
+            input_sequence: 0,
             pending_history_navigation: false,
         }
     }
@@ -156,6 +160,7 @@ impl ScreenReader {
     }
 
     pub(crate) fn record_last_key(&mut self, raw: &[u8]) {
+        self.input_sequence = self.input_sequence.wrapping_add(1);
         self.last_key.clear();
         self.last_key.extend_from_slice(raw);
     }
@@ -369,7 +374,9 @@ impl ScreenReader {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardMove, ScreenReader};
+    use super::{
+        ClipboardMove, MAX_PENDING_DELETE_INTENTS, MAX_PENDING_DELETE_PRESENTATIONS, ScreenReader,
+    };
     use crate::{speech, view::View};
     use mlua::{Lua, Value};
     use std::{
@@ -643,6 +650,174 @@ mod tests {
         let read = sr.resolve_pending_delete(&view).unwrap();
         assert!(read);
         assert_eq!(speaks.borrow().as_slice(), ["b"]);
+    }
+
+    #[test]
+    fn queued_pre_input_presentation_does_not_consume_backspace() {
+        use crate::presentation::SurfaceId;
+
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 12);
+        view.process_changes(b"abc");
+        view.finalize_changes(0);
+        view.enable_presentation_tracking();
+
+        // This status repaint was parsed before the key press, but has not
+        // reached the physical terminal yet.
+        view.process_changes(b"\x1b7\x1b[2;1Hstatus\x1b8");
+        let pre_input_frame = view.capture_live_presentation_frame(SurfaceId(1));
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        assert!(view.apply_presented_frame(pre_input_frame));
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert!(speaks.borrow().is_empty());
+
+        view.process_changes(b"\x08\x1b[P");
+        let deletion_frame = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(deletion_frame));
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["c"]);
+    }
+
+    #[test]
+    fn ordinary_key_does_not_discard_pending_backspace() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 12);
+        view.process_changes(b"abc");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        sr.record_last_key(b"x");
+
+        view.process_changes(b"\x08\x1b[P");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["c"]);
+    }
+
+    #[test]
+    fn rapid_backspaces_speak_each_virtual_character_once_in_input_order() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 12);
+        view.process_changes(b"abc");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        view.process_changes(b"\x08\x1b[P\x08\x1b[P");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["c", "b"]);
+    }
+
+    #[test]
+    fn rapid_backspaces_remain_ordered_across_separate_presentations() {
+        use crate::presentation::SurfaceId;
+
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 12);
+        view.process_changes(b"abc");
+        view.finalize_changes(0);
+        view.enable_presentation_tracking();
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        view.process_changes(b"\x08\x1b[P");
+        let first = view.capture_live_presentation_frame(SurfaceId(1));
+
+        // The parser has seen the first echo, but accessibility still exposes
+        // the original physical line when the second key arrives.
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        assert!(view.apply_presented_frame(first));
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["c"]);
+
+        view.process_changes(b"\x08\x1b[P");
+        let second = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(second));
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["c", "b"]);
+    }
+
+    #[test]
+    fn ignored_backspace_does_not_block_a_later_confirmed_one() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 12);
+        view.process_changes(b"ab");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        // The application ignores the first deletion and later redraws a
+        // longer input line before accepting another backspace.
+        view.process_changes(b"c");
+        view.finalize_changes(1);
+        sr.record_last_key(b"x");
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        view.process_changes(b"\x08\x1b[P");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["c"]);
+    }
+
+    #[test]
+    fn pending_backspace_is_scoped_to_its_originating_view() {
+        let (mut sr, speaks) = make_sr();
+        let mut origin = View::new(2, 12);
+        origin.process_changes(b"abc");
+        origin.finalize_changes(0);
+        let mut other = View::new(2, 12);
+        other.process_changes(b"xyz");
+        other.finalize_changes(0);
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&origin);
+        other.process_changes(b"\x08\x1b[P");
+
+        assert!(!sr.resolve_pending_delete(&other).unwrap());
+        assert!(speaks.borrow().is_empty());
+
+        origin.process_changes(b"\x08\x1b[P");
+        assert!(sr.resolve_pending_delete(&origin).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["c"]);
+    }
+
+    #[test]
+    fn pending_deletion_intents_have_a_hard_resource_bound() {
+        let (mut sr, _) = make_sr();
+        let mut view = View::new(1, 80);
+        view.process_changes(&[b'x'; MAX_PENDING_DELETE_INTENTS + 1]);
+
+        for _ in 0..=MAX_PENDING_DELETE_INTENTS {
+            sr.record_last_key(b"\x7f");
+            sr.defer_backspace(&view);
+        }
+
+        assert_eq!(sr.pending_deletes.len(), MAX_PENDING_DELETE_INTENTS);
+    }
+
+    #[test]
+    fn unconfirmed_deletion_intent_has_a_bounded_lifetime() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(1, 8);
+        view.process_changes(b"abc");
+        view.finalize_changes(0);
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        for _ in 0..MAX_PENDING_DELETE_PRESENTATIONS {
+            assert!(!sr.resolve_pending_delete(&view).unwrap());
+        }
+
+        assert!(sr.pending_deletes.is_empty());
+        assert!(speaks.borrow().is_empty());
     }
 
     struct StopDriver(Rc<Cell<usize>>);

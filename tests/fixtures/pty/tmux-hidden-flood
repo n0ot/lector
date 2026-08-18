@@ -1,0 +1,26 @@
+#!/bin/bash
+
+set -u
+
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd)
+socket_dir="$repo_root/target/test-tmux"
+socket="$socket_dir/live-hidden-flood-$$.sock"
+session="lector_hidden_flood_$$"
+mkdir -p "$socket_dir"
+
+cleanup() {
+    tmux -S "$socket" kill-server >/dev/null 2>&1 || true
+    rm -f "$socket"
+}
+trap cleanup EXIT HUP INT TERM
+
+# This command is evaluated later by the child Bash process.
+# shellcheck disable=SC2016
+foreground='stty raw -echo; printf LECTOR-TMUX-FOREGROUND-READY; while IFS= read -r -n 1 byte; do case "$byte" in p) printf LECTOR-TMUX-FOREGROUND-ACK;; q) exit 0;; esac; done'
+
+tmux -S "$socket" -f /dev/null new-session -d -s "$session" -n foreground \
+    /bin/bash -c "$foreground"
+tmux -S "$socket" new-window -d -t "$session:1" -n flood \
+    /usr/bin/yes LECTOR-HIDDEN-PANE-FLOOD
+tmux -S "$socket" select-window -t "$session:0"
+tmux -S "$socket" -CC attach-session -t "$session"

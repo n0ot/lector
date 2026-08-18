@@ -90,7 +90,7 @@ fn inventory(connection_id: u64) -> Vec<Vec<Vec<u8>>> {
         vec![format!("C\tclient_name\t/dev/ttys-bell-{connection_id}").into_bytes()],
         vec![b"O\tprefix\tC-a".to_vec()],
         vec![b"O\tprefix2\tNone".to_vec()],
-        vec![b"O\tmode-keys\tvi".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
         vec![b"O\trepeat-time\t500".to_vec()],
         vec![b"B\td\t0\tdetach-client".to_vec()],
     ]
@@ -139,17 +139,25 @@ fn add_ready_connection(
         commands,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
 
     feed(app, sr, &mut router, &reply(2, &[]), physical);
+    feed(
+        app,
+        sr,
+        &mut router,
+        &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()]),
+        physical,
+    );
 
     let groups = inventory(connection_id);
     assert_eq!(groups.len(), INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        feed(app, sr, &mut router, &reply(index + 3, group), physical);
+        feed(app, sr, &mut router, &reply(index + 4, group), physical);
     }
 
     commands.clear();
@@ -205,9 +213,9 @@ fn assert_context(message: &str, connection: u64, window: u64, pane: u64, title:
 }
 
 #[test]
-fn mode_defaults_off_and_parses_only_the_documented_values() {
+fn mode_defaults_audible_and_parses_only_the_documented_values() {
     let (_app, mut sr, _recorder, _clock, _physical) = make_app(false);
-    assert_eq!(sr.tmux_bell_mode(), TmuxBellMode::Off);
+    assert_eq!(sr.tmux_bell_mode(), TmuxBellMode::Audible);
     for (text, mode) in [
         ("off", TmuxBellMode::Off),
         ("spoken", TmuxBellMode::Spoken),
@@ -227,7 +235,8 @@ fn spoken_bells_cover_active_inactive_and_hidden_panes_but_not_unattached_sessio
     let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
     recorder.clear();
 
-    // The default is deliberately quiet.
+    // Explicit off mode remains available even though audible is the default.
+    sr.set_tmux_bell_mode(TmuxBellMode::Off);
     feed(
         &mut app,
         &mut sr,
@@ -509,7 +518,7 @@ fn real_tmux_inactive_pane_bell_reaches_the_spoken_monitor() {
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
-        .expect("Stop 3 integration tests require tmux on PATH");
+        .expect("tmux integration tests require tmux on PATH");
     assert!(tmux.status.success(), "tmux -V failed");
 
     let unique = SystemTime::now()
@@ -541,6 +550,8 @@ fn real_tmux_inactive_pane_bell_reaches_the_spoken_monitor() {
         "/bin/sh -c 'printf ACTIVE_READY; exec /bin/sh'",
     ]);
     command.env("TERM", "xterm-256color");
+    command.env_remove("TMUX");
+    command.env_remove("TMUX_PANE");
     let mut child = pair.slave.spawn_command(command).unwrap();
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().unwrap();

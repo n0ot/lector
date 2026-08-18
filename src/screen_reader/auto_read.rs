@@ -33,12 +33,13 @@ impl ScreenReader {
             return Ok(false);
         }
 
-        let cursor_moves = view.update_summary().cursor_operations;
-        let scrolled = view.update_summary().scroll_operations > 0;
-        let changed_row_ranges = view.update_summary().changed_rows.clone();
+        let cursor_moves = view.accessibility_update_summary().cursor_operations;
+        let scrolled = view.accessibility_update_summary().scroll_operations > 0;
+        let changed_row_ranges = view.accessibility_update_summary().changed_rows.clone();
 
         let mut live_text = std::mem::take(&mut self.auto_read_buffers.live_text);
-        view.update_summary().printed_text_into(&mut live_text);
+        view.accessibility_update_summary()
+            .printed_text_into(&mut live_text);
 
         let mut live_read_result = None;
         {
@@ -50,7 +51,17 @@ impl ScreenReader {
                     && let Some(text) = self.hook_on_live_read(text, cursor_moves, scrolled)?
                     && !text.is_empty()
                 {
+                    crate::diagnostics::event(
+                        "screen-reader",
+                        "auto-read-progress",
+                        &format!("speaking live text bytes={}", text.len()),
+                    );
                     self.speak(&text, false)?;
+                    crate::diagnostics::event(
+                        "screen-reader",
+                        "auto-read-progress",
+                        "finished speaking live text",
+                    );
                     spoken = true;
                 }
                 live_read_result = Some(spoken || !text.is_empty());

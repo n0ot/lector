@@ -1,12 +1,14 @@
 use super::{Result, ViewAction, ViewController, ViewKind};
 use crate::{
-    presentation::{Scene, SurfaceId},
+    presentation::{PresentedViewFrame, Scene, SurfaceId, ViewId},
     screen_reader::ScreenReader,
     terminal::{TerminalGeometry, UpdateSummary},
     terminal_input::KeyInput,
     tmux_control::CommandStatus,
-    tmux_model::{PaneId, TmuxTopology},
-    tmux_panes::{BootstrapRequest, LayoutPane, TmuxLayout, TmuxPaneError, TmuxPaneSet},
+    tmux_model::{PaneCaptureMetadata, PaneId, TmuxTopology},
+    tmux_panes::{
+        BootstrapRequest, LayoutError, LayoutPane, TmuxLayout, TmuxPaneError, TmuxPaneSet,
+    },
     view::View,
 };
 use std::{any::Any, io::Write};
@@ -23,13 +25,96 @@ pub struct TmuxConnectionView {
     portal: View,
     panes: TmuxPaneSet,
     topology: TmuxTopology,
+    active_window: ActiveWindowProjection,
     showing_portal: bool,
+    inventory_error: Option<String>,
 }
 
 pub(crate) struct PaneOutput {
     pub update: UpdateSummary,
-    pub replies: Vec<u8>,
     pub bells: usize,
+}
+
+/// Parsed, topology-validated data for the active tmux window. A topology sync
+/// is the sole invalidation boundary, so output, input, composition, and
+/// accessibility paths can share one layout parse without stale observations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ActiveWindowProjection {
+    MissingActiveWindow,
+    MissingLayout,
+    InvalidLayout(LayoutError),
+    Ready(ActiveWindow),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActiveWindow {
+    layout: TmuxLayout,
+    active_pane: Option<PaneId>,
+    title: String,
+}
+
+impl ActiveWindowProjection {
+    fn from_topology(topology: &TmuxTopology) -> Self {
+        let Some(session) = topology
+            .attached_session()
+            .and_then(|session_id| topology.session(session_id))
+        else {
+            return Self::MissingActiveWindow;
+        };
+        let Some(window) = session
+            .active_window
+            .and_then(|window_id| topology.window(window_id))
+        else {
+            return Self::MissingActiveWindow;
+        };
+        let layout_text = if window.visible_layout.is_empty() {
+            &window.layout
+        } else {
+            &window.visible_layout
+        };
+        if layout_text.is_empty() {
+            return Self::MissingLayout;
+        }
+        let layout = match TmuxLayout::parse(layout_text) {
+            Ok(layout) => layout,
+            Err(error) => return Self::InvalidLayout(error),
+        };
+        let active_pane = window
+            .active_pane
+            .filter(|pane_id| layout.pane(*pane_id).is_some() && topology.pane(*pane_id).is_some())
+            .or_else(|| {
+                layout
+                    .panes()
+                    .iter()
+                    .map(|pane| pane.pane_id)
+                    .find(|pane_id| topology.pane(*pane_id).is_some())
+            });
+        Self::Ready(ActiveWindow {
+            layout,
+            active_pane,
+            title: window.name.clone(),
+        })
+    }
+
+    fn ready(&self) -> Option<&ActiveWindow> {
+        match self {
+            Self::Ready(active) => Some(active),
+            Self::MissingActiveWindow | Self::MissingLayout | Self::InvalidLayout(_) => None,
+        }
+    }
+
+    fn active_pane(&self) -> Option<PaneId> {
+        self.ready().and_then(|active| active.active_pane)
+    }
+
+    fn for_composition(&self) -> std::result::Result<&ActiveWindow, TmuxPaneError> {
+        match self {
+            Self::Ready(active) => Ok(active),
+            Self::MissingActiveWindow => Err(TmuxPaneError::MissingActiveWindow),
+            Self::MissingLayout => Err(TmuxPaneError::MissingLayout),
+            Self::InvalidLayout(error) => Err(TmuxPaneError::Layout(error.clone())),
+        }
+    }
 }
 
 impl TmuxConnectionView {
@@ -45,7 +130,9 @@ impl TmuxConnectionView {
             portal,
             panes: TmuxPaneSet::new(connection_id),
             topology: TmuxTopology::new(connection_id),
+            active_window: ActiveWindowProjection::MissingActiveWindow,
             showing_portal: false,
+            inventory_error: None,
         }
     }
 
@@ -53,8 +140,32 @@ impl TmuxConnectionView {
         &mut self,
         topology: &TmuxTopology,
     ) -> std::result::Result<Vec<BootstrapRequest>, TmuxPaneError> {
-        let requests = self.panes.reconcile(topology)?;
+        let next_active_window = ActiveWindowProjection::from_topology(topology);
+        let previous_active_pane = self.active_window.active_pane();
+        let mut requests = self.panes.reconcile(topology)?;
+        let active_pane = next_active_window.active_pane();
+        let visible_layout = next_active_window.ready().map(|active| &active.layout);
+        requests.sort_by_key(|request| {
+            if Some(request.pane_id) == active_pane {
+                0
+            } else if visible_layout
+                .as_ref()
+                .is_some_and(|layout| layout.pane(request.pane_id).is_some())
+            {
+                1
+            } else {
+                2
+            }
+        });
+        if previous_active_pane != active_pane {
+            // A pane handoff is announced from the new pane's complete model.
+            // Neither the old pane's unfinalized speech metadata nor metadata
+            // retained from an earlier visit belongs to that announcement.
+            self.panes.clear_update_summaries();
+        }
         self.topology.clone_from(topology);
+        self.active_window = next_active_window;
+        self.inventory_error = None;
         self.render_placeholder();
         Ok(requests)
     }
@@ -63,18 +174,15 @@ impl TmuxConnectionView {
         &mut self,
         pane_id: PaneId,
         bytes: &[u8],
+        retain_for_accessibility: bool,
     ) -> std::result::Result<Option<PaneOutput>, TmuxPaneError> {
-        let update_before = self.panes.pending_update(pane_id);
-        let replies_before = update_before.map_or(0, |update| update.pty_replies.len());
-        let bells_before = update_before.map_or(0, |update| update.effects.bells);
-        let update = self.panes.process_output(pane_id, bytes)?;
+        let update = self.panes.process_output_with_summary_retention(
+            pane_id,
+            bytes,
+            retain_for_accessibility,
+        )?;
         Ok(update.map(|update| PaneOutput {
-            replies: update
-                .pty_replies
-                .get(replies_before..)
-                .unwrap_or_default()
-                .to_vec(),
-            bells: update.effects.bells.saturating_sub(bells_before),
+            bells: update.effects.bells,
             update,
         }))
     }
@@ -89,23 +197,54 @@ impl TmuxConnectionView {
         self.panes.apply_bootstrap(pane_id, status, output, now_ms)
     }
 
+    pub fn apply_resync_capture(
+        &mut self,
+        metadata: &PaneCaptureMetadata,
+        output: &[Vec<u8>],
+        pending_escape: &[u8],
+        now_ms: u128,
+    ) -> std::result::Result<(), TmuxPaneError> {
+        self.topology
+            .update_pane_capture_metadata(metadata)
+            .map_err(|_| TmuxPaneError::UnknownPane(metadata.pane_id.0))?;
+        self.panes
+            .apply_resync_capture(metadata, output, pending_escape, now_ms)
+    }
+
     pub fn composed_scene(
         &mut self,
         geometry: TerminalGeometry,
     ) -> std::result::Result<Scene, TmuxPaneError> {
-        self.panes.compose(&self.topology, geometry)
+        let active = self.active_window.for_composition()?;
+        self.panes
+            .compose_layout(&active.layout, active.active_pane, &active.title, geometry)
+    }
+
+    pub(crate) fn composed_committed_scene(
+        &mut self,
+        geometry: TerminalGeometry,
+    ) -> std::result::Result<Scene, TmuxPaneError> {
+        let active = self.active_window.for_composition()?;
+        self.panes.compose_committed_layout(
+            &active.layout,
+            active.active_pane,
+            &active.title,
+            geometry,
+        )
+    }
+
+    pub(crate) fn visible_holds_synchronized_output(&self) -> bool {
+        !self.showing_portal
+            && self
+                .active_window
+                .ready()
+                .is_some_and(|active| self.panes.visible_holds_synchronized_output(&active.layout))
     }
 
     pub(crate) fn resource_usage(
         &mut self,
     ) -> std::result::Result<crate::tmux_panes::TmuxResourceUsage, TmuxPaneError> {
         self.panes.resource_usage()
-    }
-
-    pub(crate) fn pane_capture_command(&self, pane_id: PaneId) -> Option<Vec<u8>> {
-        self.topology
-            .pane(pane_id)
-            .map(crate::tmux_panes::capture_command)
     }
 
     pub(crate) fn set_pane_portal(
@@ -133,8 +272,55 @@ impl TmuxConnectionView {
     }
 
     #[must_use]
+    pub(crate) fn pane_pending_update_batch_count(&self, pane_id: PaneId) -> Option<usize> {
+        self.panes
+            .pending_update(pane_id)
+            .map(|update| update.batch_count)
+    }
+
+    #[must_use]
     pub fn surface_id(&self, pane_id: PaneId) -> Option<SurfaceId> {
         self.panes.surface_id(pane_id)
+    }
+
+    pub(crate) fn capture_live_presentation_frames(
+        &mut self,
+    ) -> (Option<ViewId>, Vec<PresentedViewFrame>) {
+        let Some(active) = self.active_window.ready() else {
+            return (Some(self.model().view_id()), Vec::new());
+        };
+        self.panes
+            .capture_live_presentation_frames(&active.layout, active.active_pane)
+    }
+
+    pub(crate) fn capture_committed_presentation_frames(
+        &mut self,
+    ) -> (Option<ViewId>, Vec<PresentedViewFrame>) {
+        let Some(active) = self.active_window.ready() else {
+            return (Some(self.model().view_id()), Vec::new());
+        };
+        self.panes
+            .capture_committed_presentation_frames(&active.layout, active.active_pane)
+    }
+
+    pub(crate) fn apply_presented_frame(&mut self, frame: &PresentedViewFrame) -> bool {
+        self.placeholder.apply_presented_frame(frame.clone())
+            || self.portal.apply_presented_frame(frame.clone())
+            || self.panes.apply_presented_frame(frame)
+    }
+
+    pub(crate) fn model_by_id_mut(&mut self, view_id: ViewId) -> Option<&mut View> {
+        if self.placeholder.view_id() == view_id {
+            return Some(&mut self.placeholder);
+        }
+        if self.portal.view_id() == view_id {
+            return Some(&mut self.portal);
+        }
+        self.panes.model_by_id_mut(view_id)
+    }
+
+    pub(crate) fn retain_accessibility_views(&mut self, retained: &[ViewId]) {
+        self.panes.retain_accessibility_views(retained);
     }
 
     #[must_use]
@@ -144,15 +330,14 @@ impl TmuxConnectionView {
 
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.panes.all_bootstrapped()
-            && active_layout(&self.topology).is_some_and(|layout| {
-                !layout.panes().is_empty()
-                    && layout.panes().iter().all(|pane| {
-                        self.topology.pane(pane.pane_id).is_some()
-                            && self.panes.pane_view(pane.pane_id).is_some()
-                    })
-                    && active_pane(&self.topology).is_some()
-            })
+        self.active_window.ready().is_some_and(|active| {
+            !active.layout.panes().is_empty()
+                && active.layout.panes().iter().all(|pane| {
+                    self.topology.pane(pane.pane_id).is_some()
+                        && self.panes.pane_is_bootstrapped(pane.pane_id)
+                })
+                && active.active_pane.is_some()
+        })
     }
 
     #[must_use]
@@ -160,11 +345,36 @@ impl TmuxConnectionView {
         self.showing_portal || self.active_pane_portal_target().is_some()
     }
 
+    /// A connection-level portal replaces the entire connection. A pane
+    /// portal replaces only that pane, so the parent tmux key tables remain
+    /// active for changing panes, windows, sessions, and running commands.
+    #[must_use]
+    pub fn is_showing_connection_portal(&self) -> bool {
+        self.showing_portal
+    }
+
+    #[must_use]
+    pub(crate) fn active_input_pane(&self) -> Option<PaneId> {
+        if self.showing_portal || !self.is_ready() || self.active_pane_portal_target().is_some() {
+            return None;
+        }
+        self.active_window.active_pane()
+    }
+
+    pub fn set_inventory_error(&mut self, detail: &str) {
+        self.inventory_error = Some(detail.to_owned());
+        self.render_placeholder();
+    }
+
     pub fn show_portal(&mut self) {
+        self.panes.clear_update_summaries();
         self.showing_portal = true;
     }
 
     pub fn show_connection(&mut self) {
+        // Re-entering a connection is a full accessibility handoff even when
+        // its tmux topology did not change while it was in the background.
+        self.panes.clear_update_summaries();
         self.showing_portal = false;
     }
 
@@ -173,45 +383,22 @@ impl TmuxConnectionView {
         if self.is_showing_portal() {
             return "tmux portal".to_owned();
         }
-        let window_name = self
-            .topology
-            .attached_session()
-            .and_then(|session_id| self.topology.session(session_id))
-            .and_then(|session| session.active_window)
-            .and_then(|window_id| self.topology.window(window_id))
-            .map(|window| window.name.as_str())
-            .unwrap_or("no active window");
-        format!("tmux, {}, {window_name}", self.topology.label())
+        self.topology.attached_location().map_or_else(
+            || format!("tmux, {}, no active window", self.topology.label()),
+            |location| location.accessible_title(),
+        )
     }
 
     #[must_use]
     pub fn is_active_pane(&self, pane_id: PaneId) -> bool {
-        active_pane(&self.topology) == Some(pane_id)
+        self.active_window.active_pane() == Some(pane_id)
     }
 
     #[must_use]
     pub fn is_pane_visible(&self, pane_id: PaneId) -> bool {
-        let Some(session) = self
-            .topology
-            .attached_session()
-            .and_then(|id| self.topology.session(id))
-        else {
-            return false;
-        };
-        let Some(window) = session
-            .active_window
-            .and_then(|id| self.topology.window(id))
-        else {
-            return false;
-        };
-        let layout_text = if window.visible_layout.is_empty() {
-            &window.layout
-        } else {
-            &window.visible_layout
-        };
-        TmuxLayout::parse(layout_text)
-            .ok()
-            .is_some_and(|layout| layout.pane(pane_id).is_some())
+        self.active_window
+            .ready()
+            .is_some_and(|active| active.layout.pane(pane_id).is_some())
     }
 
     #[must_use]
@@ -220,7 +407,7 @@ impl TmuxConnectionView {
             return None;
         }
         let pane = self.active_layout_pane()?;
-        let screen = self.panes.pane_view(pane.pane_id)?.screen();
+        let screen = self.panes.pane_view(pane.pane_id)?.live_screen();
         let bytes = crate::tmux_input::translate_mouse(
             event,
             pane,
@@ -231,19 +418,13 @@ impl TmuxConnectionView {
     }
 
     fn active_layout_pane(&self) -> Option<LayoutPane> {
-        let pane_id = active_pane(&self.topology)?;
-        let session = self.topology.session(self.topology.attached_session()?)?;
-        let window = self.topology.window(session.active_window?)?;
-        let layout_text = if window.visible_layout.is_empty() {
-            &window.layout
-        } else {
-            &window.visible_layout
-        };
-        TmuxLayout::parse(layout_text).ok()?.pane(pane_id).copied()
+        let active = self.active_window.ready()?;
+        active.layout.pane(active.active_pane?).copied()
     }
 
     fn active_pane_portal_target(&self) -> Option<u64> {
-        self.panes.pane_portal_target(active_pane(&self.topology)?)
+        self.panes
+            .pane_portal_target(self.active_window.active_pane()?)
     }
 
     fn input_action(&self, pane_id: PaneId, bytes: Vec<u8>) -> ViewAction {
@@ -258,13 +439,19 @@ impl TmuxConnectionView {
         if self.is_showing_portal() || !self.is_ready() || bytes.is_empty() {
             return ViewAction::None;
         }
-        active_pane(&self.topology).map_or(ViewAction::None, |pane_id| {
-            self.input_action(pane_id, bytes.to_vec())
-        })
+        self.active_window
+            .active_pane()
+            .map_or(ViewAction::None, |pane_id| {
+                self.input_action(pane_id, bytes.to_vec())
+            })
     }
 
     fn render_placeholder(&mut self) {
-        let text = if let Some(session) = self
+        let text = if let Some(detail) = &self.inventory_error {
+            format!(
+                "tmux connection could not become ready.\r\n{detail}\r\nUse Lector's connection commands to switch away or close this connection."
+            )
+        } else if let Some(session) = self
             .topology
             .attached_session()
             .and_then(|session_id| self.topology.session(session_id))
@@ -277,7 +464,7 @@ impl TmuxConnectionView {
                     "tmux connection is active.\r\nsession ${} {} has no active window.\r\nWaiting for tmux to create or select a window.",
                     session.id.0, session.name
                 ),
-                Some(window) if active_pane(&self.topology).is_none() => format!(
+                Some(window) if self.active_window.active_pane().is_none() => format!(
                     "tmux connection is active.\r\nwindow @{} {} in session ${} {} has no active pane.\r\nWaiting for tmux pane inventory.",
                     window.id.0, window.name, session.id.0, session.name
                 ),
@@ -307,7 +494,7 @@ impl ViewController for TmuxConnectionView {
             return &mut self.portal;
         }
         if self.is_ready() {
-            let pane_id = active_pane(&self.topology);
+            let pane_id = self.active_window.active_pane();
             if let Some(pane_id) = pane_id {
                 if self.panes.pane_portal_target(pane_id).is_some() {
                     return self
@@ -321,6 +508,12 @@ impl ViewController for TmuxConnectionView {
             }
         }
         &mut self.placeholder
+    }
+
+    fn enable_presentation_tracking(&mut self) {
+        self.placeholder.enable_presentation_tracking();
+        self.portal.enable_presentation_tracking();
+        self.panes.enable_presentation_tracking();
     }
 
     fn title(&self) -> &str {
@@ -396,14 +589,14 @@ impl ViewController for TmuxConnectionView {
         if self.is_showing_portal() || !self.is_ready() {
             return Ok(ViewAction::None);
         }
-        let Some(pane_id) = active_pane(&self.topology) else {
+        let Some(pane_id) = self.active_window.active_pane() else {
             return Ok(ViewAction::None);
         };
         let Some(view) = self.panes.pane_view(pane_id) else {
             return Ok(ViewAction::None);
         };
         let mut bytes = Vec::with_capacity(contents.len().saturating_add(12));
-        if view.screen().bracketed_paste() {
+        if view.live_screen().bracketed_paste() {
             bytes.extend_from_slice(b"\x1b[200~");
             bytes.extend_from_slice(contents.as_bytes());
             bytes.extend_from_slice(b"\x1b[201~");
@@ -422,36 +615,185 @@ impl ViewController for TmuxConnectionView {
     }
 }
 
-fn active_pane(topology: &TmuxTopology) -> Option<PaneId> {
-    let session = topology.session(topology.attached_session()?)?;
-    let window = topology.window(session.active_window?)?;
-    let layout = active_layout(topology)?;
-    window
-        .active_pane
-        .filter(|pane_id| layout.pane(*pane_id).is_some() && topology.pane(*pane_id).is_some())
-        .or_else(|| {
-            layout
-                .panes()
-                .iter()
-                .map(|pane| pane.pane_id)
-                .find(|pane_id| topology.pane(*pane_id).is_some())
-        })
-}
-
-fn active_layout(topology: &TmuxTopology) -> Option<TmuxLayout> {
-    let session = topology.session(topology.attached_session()?)?;
-    let window = topology.window(session.active_window?)?;
-    let layout_text = if window.visible_layout.is_empty() {
-        &window.layout
-    } else {
-        &window.visible_layout
-    };
-    TmuxLayout::parse(layout_text).ok()
-}
-
 fn render_text(view: &mut View, text: &str) {
     view.clear_update_summary();
     let mut bytes = b"\x1b[2J\x1b[H".to_vec();
     bytes.extend_from_slice(text.as_bytes());
     view.process_changes(&bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TmuxConnectionView;
+    use crate::{
+        presentation::CursorOwner,
+        terminal::TerminalGeometry,
+        tmux_control::CommandStatus,
+        tmux_model::{PaneId, TmuxTopology},
+    };
+
+    const SPLIT_LAYOUT: &str = "abcd,20x4,0,0{10x4,0,0,20,9x4,11,0,21}";
+
+    fn topology_with_layout(
+        layout: &str,
+        visible_layout: &str,
+        active_pane: Option<PaneId>,
+        title: &str,
+    ) -> TmuxTopology {
+        let lines = [
+            b"S\t$1\twork".to_vec(),
+            format!("W\t$1\t@10\t1\t1\t{layout}\t{visible_layout}\t*\t{title}").into_bytes(),
+            format!(
+                "P\t@10\t%20\t1\t{}\t0\t0\t10\t4\t0\t0\t0\t1\t0\t0\t0\t0\tleft",
+                usize::from(active_pane == Some(PaneId(20)))
+            )
+            .into_bytes(),
+            format!(
+                "P\t@10\t%21\t2\t{}\t11\t0\t9\t4\t0\t0\t0\t1\t0\t0\t0\t0\tright",
+                usize::from(active_pane == Some(PaneId(21)))
+            )
+            .into_bytes(),
+            b"A\t$1".to_vec(),
+        ];
+        let mut topology = TmuxTopology::new(1);
+        topology.replace_inventory(&lines).expect("topology");
+        topology
+    }
+
+    fn ready_connection() -> TmuxConnectionView {
+        let topology = topology_with_layout(SPLIT_LAYOUT, SPLIT_LAYOUT, Some(PaneId(20)), "editor");
+        let mut connection = TmuxConnectionView::new(4, 20, 1);
+        for request in connection.sync_topology(&topology).expect("sync topology") {
+            connection
+                .apply_bootstrap(
+                    request.pane_id,
+                    CommandStatus::Success,
+                    &[format!("pane {}", request.pane_id.0).into_bytes()],
+                    0,
+                )
+                .expect("bootstrap");
+        }
+        connection
+    }
+
+    #[test]
+    fn switching_away_and_back_drops_stale_active_update_metadata() {
+        let mut connection = ready_connection();
+        connection
+            .process_output(PaneId(20), b"old", true)
+            .expect("old output");
+        assert_eq!(
+            connection
+                .panes
+                .pending_update(PaneId(20))
+                .unwrap()
+                .printed_text(),
+            "old"
+        );
+
+        connection.show_portal();
+        connection.show_connection();
+        assert_eq!(
+            connection
+                .panes
+                .pending_update(PaneId(20))
+                .unwrap()
+                .batch_count,
+            0
+        );
+
+        let fresh = connection
+            .process_output(PaneId(20), b"new", true)
+            .expect("fresh output")
+            .expect("bootstrapped pane update");
+        assert_eq!(fresh.update.printed_text(), "new");
+        assert_eq!(
+            connection
+                .panes
+                .pending_update(PaneId(20))
+                .unwrap()
+                .printed_text(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn cached_active_window_matches_direct_composition_and_invalidates_on_sync() {
+        let mut connection = ready_connection();
+        let geometry = TerminalGeometry::from_cells(4, 20);
+        let direct = connection
+            .panes
+            .compose(&connection.topology, geometry)
+            .expect("direct split composition");
+        let cached = connection
+            .composed_scene(geometry)
+            .expect("cached split composition");
+        assert_eq!(cached, direct);
+        assert!(connection.is_ready());
+        assert!(connection.is_active_pane(PaneId(20)));
+        assert!(connection.is_pane_visible(PaneId(20)));
+        assert!(connection.is_pane_visible(PaneId(21)));
+
+        let zoomed_layout = "beef,20x4,0,0,21";
+        let replacement =
+            topology_with_layout(SPLIT_LAYOUT, zoomed_layout, Some(PaneId(21)), "zoomed");
+        assert!(
+            connection
+                .sync_topology(&replacement)
+                .expect("sync replacement topology")
+                .is_empty(),
+            "surviving panes should not need another bootstrap"
+        );
+
+        assert!(connection.is_ready());
+        assert!(connection.is_active_pane(PaneId(21)));
+        assert!(!connection.is_pane_visible(PaneId(20)));
+        assert!(connection.is_pane_visible(PaneId(21)));
+        assert_eq!(connection.active_input_pane(), Some(PaneId(21)));
+        let direct = connection
+            .panes
+            .compose(&connection.topology, geometry)
+            .expect("direct zoomed composition");
+        let cached = connection
+            .composed_scene(geometry)
+            .expect("cached zoomed composition");
+        assert_eq!(cached, direct);
+        assert_eq!(cached.effects.title.as_deref(), Some("zoomed"));
+        assert_eq!(cached.panes.len(), 2, "border plus one visible pane");
+        assert_eq!(
+            cached.cursor_owner,
+            CursorOwner::Pane(connection.surface_id(PaneId(21)).expect("right surface"))
+        );
+    }
+
+    #[test]
+    fn cached_active_window_preserves_composition_error_parity() {
+        let geometry = TerminalGeometry::from_cells(4, 20);
+        let cases = [
+            topology_with_layout("", "", Some(PaneId(20)), "missing"),
+            topology_with_layout("not-a-layout", "not-a-layout", Some(PaneId(20)), "invalid"),
+            TmuxTopology::new(1),
+        ];
+
+        for topology in cases {
+            let mut connection = ready_connection();
+            connection
+                .sync_topology(&topology)
+                .expect("sync non-renderable topology");
+            assert!(!connection.is_ready());
+            assert!(!connection.is_pane_visible(PaneId(20)));
+            assert_eq!(connection.active_input_pane(), None);
+
+            let direct = connection
+                .panes
+                .compose(&connection.topology, geometry)
+                .expect_err("direct composition should fail")
+                .to_string();
+            let cached = connection
+                .composed_scene(geometry)
+                .expect_err("cached composition should fail")
+                .to_string();
+            assert_eq!(cached, direct);
+        }
+    }
 }

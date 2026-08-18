@@ -141,7 +141,7 @@ mod tests {
             &path,
             r#"
                 assert(lector.o.suppress_key_echo == false)
-                assert(lector.o.tmux_bells == "off")
+                assert(lector.o.tmux_bells == "audible")
                 lector.o.auto_read = false
                 lector.o.suppress_key_echo = true
                 lector.o.tmux_bells = "spoken"

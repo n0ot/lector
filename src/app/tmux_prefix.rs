@@ -7,10 +7,13 @@ impl App {
         key: &KeyInput,
         term_out: &mut dyn Write,
     ) -> Result<bool> {
+        if self.view_stack.has_overlay() {
+            return Ok(false);
+        }
         let Some(connection_id) = self
             .view_stack
             .active_tmux_connection_mut()
-            .filter(|view| view.is_ready() && !view.is_showing_portal())
+            .filter(|view| view.is_ready() && !view.is_showing_connection_portal())
             .map(|view| view.connection_id())
         else {
             return Ok(false);
@@ -22,48 +25,53 @@ impl App {
             .iter_mut()
             .find(|connection| connection.id == connection_id)
             .and_then(|connection| connection.prefix_state.take())
-            .filter(|state| now_ms <= state.expires_at_ms);
+            .filter(|state| match &state.phase {
+                TmuxPrefixPhase::Awaiting { .. } => true,
+                TmuxPrefixPhase::Repeating { expires_at_ms, .. } => now_ms <= *expires_at_ms,
+            });
 
         if let Some(state) = previous {
             match state.phase {
-                TmuxPrefixPhase::Awaiting => {
+                TmuxPrefixPhase::Awaiting { table } => {
                     let Some(key_name) = key_name else {
-                        sr.speak("tmux prefix key unbound", false)?;
-                        return Ok(true);
+                        return self.unbound_tmux_table_key(sr, &table);
                     };
-                    if key_name == "Escape" {
+                    if table == "prefix" && key_name == "Escape" {
                         return Ok(true);
                     }
-                    let binding = self.tmux_binding(connection_id, &key_name);
+                    let binding = self.tmux_binding(connection_id, &table, &key_name);
                     let Some(binding) = binding else {
-                        sr.speak("tmux prefix key unbound", false)?;
-                        return Ok(true);
+                        return self.unbound_tmux_table_key(sr, &table);
                     };
                     self.execute_tmux_binding(sr, connection_id, &binding.command, term_out)?;
                     if binding.repeatable {
                         self.set_tmux_prefix_state(
                             connection_id,
                             TmuxPrefixState {
-                                phase: TmuxPrefixPhase::Repeating,
-                                expires_at_ms: now_ms
-                                    .saturating_add(self.tmux_repeat_time(connection_id)),
+                                phase: TmuxPrefixPhase::Repeating {
+                                    table,
+                                    expires_at_ms: now_ms
+                                        .saturating_add(self.tmux_repeat_time(connection_id)),
+                                },
                             },
                         );
                     }
                     return Ok(true);
                 }
-                TmuxPrefixPhase::Repeating => {
+                TmuxPrefixPhase::Repeating { table, .. } => {
                     if let Some(key_name) = &key_name
-                        && let Some(binding) = self.tmux_binding(connection_id, key_name)
+                        && let Some(binding) = self.tmux_binding(connection_id, &table, key_name)
                         && binding.repeatable
                     {
                         self.execute_tmux_binding(sr, connection_id, &binding.command, term_out)?;
                         self.set_tmux_prefix_state(
                             connection_id,
                             TmuxPrefixState {
-                                phase: TmuxPrefixPhase::Repeating,
-                                expires_at_ms: now_ms
-                                    .saturating_add(self.tmux_repeat_time(connection_id)),
+                                phase: TmuxPrefixPhase::Repeating {
+                                    table,
+                                    expires_at_ms: now_ms
+                                        .saturating_add(self.tmux_repeat_time(connection_id)),
+                                },
                             },
                         );
                         return Ok(true);
@@ -79,13 +87,43 @@ impl App {
             self.set_tmux_prefix_state(
                 connection_id,
                 TmuxPrefixState {
-                    phase: TmuxPrefixPhase::Awaiting,
-                    expires_at_ms: now_ms.saturating_add(crate::tmux_prefix::PREFIX_TIMEOUT_MS),
+                    phase: TmuxPrefixPhase::Awaiting {
+                        table: "prefix".to_owned(),
+                    },
                 },
             );
+            sr.speak("tmux", false)?;
+            return Ok(true);
+        }
+        let table = self.tmux_default_key_table(connection_id);
+        if let Some(binding) = self.tmux_binding(connection_id, &table, &key_name) {
+            self.execute_tmux_binding(sr, connection_id, &binding.command, term_out)?;
+            if binding.repeatable {
+                self.set_tmux_prefix_state(
+                    connection_id,
+                    TmuxPrefixState {
+                        phase: TmuxPrefixPhase::Repeating {
+                            table,
+                            expires_at_ms: now_ms
+                                .saturating_add(self.tmux_repeat_time(connection_id)),
+                        },
+                    },
+                );
+            }
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn unbound_tmux_table_key(&self, sr: &mut ScreenReader, table: &str) -> Result<bool> {
+        if table == "prefix" {
+            sr.speak("tmux prefix key unbound", false)?;
+            Ok(true)
+        } else {
+            // tmux sends an unbound root/custom-table key to the pane. Returning
+            // false preserves the original terminal bytes through that path.
+            Ok(false)
+        }
     }
 
     fn set_tmux_prefix_state(&mut self, connection_id: u64, state: TmuxPrefixState) {
@@ -101,14 +139,29 @@ impl App {
     fn tmux_binding(
         &self,
         connection_id: u64,
+        table: &str,
         key: &str,
     ) -> Option<crate::tmux_model::TmuxBinding> {
         self.tmux_connections
             .iter()
             .find(|connection| connection.id == connection_id)?
             .topology
-            .binding(key)
+            .binding_in_table(table, key)
             .cloned()
+    }
+
+    fn tmux_default_key_table(&self, connection_id: u64) -> String {
+        self.tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+            .and_then(|connection| {
+                connection
+                    .key_table_override
+                    .as_deref()
+                    .or_else(|| connection.topology.option("key-table"))
+            })
+            .unwrap_or("root")
+            .to_owned()
     }
 
     fn is_tmux_prefix(&self, connection_id: u64, key: &str) -> bool {
@@ -145,27 +198,23 @@ impl App {
     ) -> Result<()> {
         match crate::tmux_prefix::classify_binding(command)? {
             crate::tmux_prefix::BindingAction::Execute(command) => {
-                self.queue_tmux_user_command(connection_id, &command)
-            }
-            crate::tmux_prefix::BindingAction::Detach => {
-                let client_name = self
+                let command = self
                     .tmux_connections
                     .iter()
                     .find(|connection| connection.id == connection_id)
-                    .and_then(|connection| connection.topology.client_info("client_name"))
-                    .unwrap_or_default();
-                match crate::tmux_lifecycle::ConnectionHierarchy::detach_command(
-                    self.tmux_connections.len(),
-                    client_name,
-                ) {
-                    Ok(command) => self.queue_tmux_user_command(connection_id, &command),
-                    Err(error) => self.show_popup_error(
-                        sr,
-                        "tmux detach unavailable",
-                        &format!("cannot identify the active tmux client: {error}"),
-                        term_out,
-                    ),
-                }
+                    .and_then(|connection| {
+                        crate::tmux_prefix::scope_select_window_command(
+                            &connection.topology,
+                            &command,
+                        )
+                    })
+                    .unwrap_or(command);
+                self.queue_tmux_user_command(connection_id, &command)
+            }
+            crate::tmux_prefix::BindingAction::Detach => {
+                // Commands are queued on the selected control connection, so
+                // tmux already knows which invoking client must be detached.
+                self.queue_tmux_user_command(connection_id, "detach-client")
             }
             crate::tmux_prefix::BindingAction::Confirm { command, .. } => {
                 self.begin_tmux_confirmation(sr, connection_id, &command, term_out)
@@ -211,8 +260,28 @@ impl App {
                 }
                 Ok(())
             }
-            crate::tmux_prefix::BindingAction::UnsupportedKeyTable(table) => {
-                sr.speak(&format!("unsupported tmux key table {table}"), false)?;
+            crate::tmux_prefix::BindingAction::SetKeyTable {
+                command,
+                table,
+                persistent,
+            } => {
+                self.queue_tmux_user_command(connection_id, &command)?;
+                if persistent {
+                    if let Some(connection) = self
+                        .tmux_connections
+                        .iter_mut()
+                        .find(|connection| connection.id == connection_id)
+                    {
+                        connection.key_table_override = Some(table);
+                    }
+                } else {
+                    self.set_tmux_prefix_state(
+                        connection_id,
+                        TmuxPrefixState {
+                            phase: TmuxPrefixPhase::Awaiting { table },
+                        },
+                    );
+                }
                 Ok(())
             }
         }

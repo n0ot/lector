@@ -115,6 +115,7 @@ where
 {
     use crate::platform;
     use mio::{Events, Interest, Poll, Token};
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use std::os::fd::AsRawFd;
     use std::time::Duration;
 
@@ -122,9 +123,22 @@ where
     let mut events = Events::with_capacity(8);
     let mut stdin = io::stdin();
     let mut stdout = io::stdout().lock();
+    let stdin_fd = stdin.as_raw_fd();
+    let flags = fcntl(stdin_fd, FcntlArg::F_GETFL).map_err(|error| Error::Io {
+        operation: "read stdin flags",
+        source: error.into(),
+    })?;
+    fcntl(
+        stdin_fd,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+    )
+    .map_err(|error| Error::Io {
+        operation: "make stdin nonblocking",
+        source: error.into(),
+    })?;
     poll.registry()
         .register(
-            &mut mio::unix::SourceFd(&stdin.as_raw_fd()),
+            &mut mio::unix::SourceFd(&stdin_fd),
             Token(0),
             Interest::READABLE,
         )
@@ -135,23 +149,29 @@ where
             .map_err(io_error("poll stdin"))?;
         for event in events.iter() {
             if event.token() == Token(0) {
-                let mut chunk = [0u8; 4096];
-                let read = stdin.read(&mut chunk).map_err(io_error("read stdin"))?;
-                if read == 0 {
-                    return Ok(());
-                }
-                buffer.extend_from_slice(&chunk[..read]);
-                while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
-                    let consumed = pos + 1;
-                    {
-                        let line = String::from_utf8_lossy(&buffer[..consumed]);
-                        handle_line(
-                            line.trim_end_matches(&['\r', '\n'][..]),
-                            handler,
-                            &mut stdout,
-                        )?;
+                loop {
+                    let mut chunk = [0u8; 4096];
+                    match stdin.read(&mut chunk) {
+                        Ok(0) => return Ok(()),
+                        Ok(read) => {
+                            buffer.extend_from_slice(&chunk[..read]);
+                            while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                                let consumed = pos + 1;
+                                {
+                                    let line = String::from_utf8_lossy(&buffer[..consumed]);
+                                    handle_line(
+                                        line.trim_end_matches(&['\r', '\n'][..]),
+                                        handler,
+                                        &mut stdout,
+                                    )?;
+                                }
+                                buffer.drain(..consumed);
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => return Err(io_error("read stdin")(error)),
                     }
-                    buffer.drain(..consumed);
                 }
             }
         }

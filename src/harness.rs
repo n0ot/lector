@@ -475,6 +475,18 @@ impl Harness {
         self.app.handle_pty(&mut self.sr, bytes, &mut self.term_out)
     }
 
+    /// Finishes the application PTY transport at the same boundary used by
+    /// the live event loop after its final nonblocking read returns EOF.
+    pub fn handle_pty_eof(&mut self) -> Result<()> {
+        self.app.handle_pty_eof(&mut self.sr, &mut self.term_out)
+    }
+
+    /// Sends terminal-protocol replies back to the application at the same
+    /// per-PTY-chunk boundary used by the live event loop.
+    pub fn flush_application_replies(&mut self) -> Result<()> {
+        self.app.flush_application_replies(&mut self.pty_out)
+    }
+
     /// Returns every presentation byte emitted by the application so far.
     pub fn terminal_output(&self) -> &[u8] {
         &self.term_out
@@ -496,6 +508,13 @@ impl Harness {
             .handle_tick(&mut self.sr, &mut self.pty_out, &mut self.term_out)
     }
 
+    /// Advances time without dispatching an application tick. This models
+    /// synchronous work, such as a large terminal render, during which input
+    /// can become readable but cannot yet be handled.
+    pub fn advance_clock(&self, delta_ms: u128) {
+        self.clock.advance_ms(delta_ms);
+    }
+
     /// Drains presentation output at the current fake-clock time. Passing
     /// `writable` resumes a scheduler previously stopped by backpressure.
     pub fn drain_scheduled_output(&mut self, writable: bool) -> Result<DrainReport> {
@@ -503,6 +522,18 @@ impl Harness {
             self.app.notify_scheduled_output_writable();
         }
         self.app.drain_scheduled_output(&mut self.term_out, false)
+    }
+
+    /// Forces scheduled output through the current transaction boundary, as
+    /// the live event loop does immediately before terminal cleanup.
+    pub fn drain_scheduled_output_to_boundary(&mut self) -> Result<()> {
+        loop {
+            let report = self.app.drain_scheduled_output(&mut self.term_out, true)?;
+            if !report.blocked && !report.write_budget_exhausted {
+                return Ok(());
+            }
+            self.app.notify_scheduled_output_writable();
+        }
     }
 
     /// Returns bytes routed back to the application PTY.
@@ -548,6 +579,20 @@ impl Harness {
 
     pub fn shutdown_physical_terminal(&mut self) -> Result<()> {
         self.app.shutdown_physical_terminal(&mut self.term_out)
+    }
+
+    /// Emits physical mode cleanup followed by the DA1 shutdown fence while
+    /// retaining Lector's alternate-screen ownership.
+    pub fn begin_physical_terminal_shutdown_fence(&mut self) -> Result<()> {
+        self.app
+            .begin_physical_terminal_shutdown_fence(&mut self.term_out)
+    }
+
+    /// Releases the physical alternate screen after a matched DA1 reply or a
+    /// bounded shutdown timeout.
+    pub fn finish_physical_terminal_shutdown_fence(&mut self) -> Result<()> {
+        self.app
+            .finish_physical_terminal_shutdown_fence(&mut self.term_out)
     }
 
     pub fn resize_with_geometry(

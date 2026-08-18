@@ -142,6 +142,48 @@ fn marker_lookalikes_round_trip_to_the_direct_terminal_without_loss() {
 }
 
 #[test]
+fn captured_terminal_escapes_at_the_start_of_command_lines_stay_in_control_mode() {
+    let styled = b"\x1b[2mcaptured pane\x1b[0m".to_vec();
+    let hyperlink = b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\".to_vec();
+    let stream = [
+        b"\x1bP1000p%begin 7 9 0\n".as_slice(),
+        styled.as_slice(),
+        b"\n".as_slice(),
+        hyperlink.as_slice(),
+        b"\n%end 7 9 0\n%exit\n\x1b\\after".as_slice(),
+    ]
+    .concat();
+
+    let expected = NormalizedRoute {
+        direct: b"after".to_vec(),
+        started: vec![1],
+        control: vec![
+            (1, ControlEvent::Started),
+            (
+                1,
+                ControlEvent::Command {
+                    timestamp: 7,
+                    number: 9,
+                    flags: 0,
+                    status: CommandStatus::Success,
+                    output: vec![styled, hyperlink],
+                },
+            ),
+            (1, ControlEvent::Exit { reason: None }),
+            (1, ControlEvent::Ended),
+        ],
+        ended: vec![1],
+        failed: Vec::new(),
+    };
+
+    assert_eq!(route_chunks([stream.as_slice()]), expected);
+    assert_eq!(
+        route_chunks(stream.iter().map(std::slice::from_ref)),
+        expected
+    );
+}
+
+#[test]
 fn application_harness_keeps_control_protocol_out_of_both_terminal_engines() {
     let (mut app, mut sr) = app_harness();
     let mut pty_out = Vec::new();
@@ -263,7 +305,7 @@ fn real_local_tmux_control_client_crosses_the_pty_gateway_harness() {
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
-        .expect("Stop 3 integration tests require tmux on PATH");
+        .expect("tmux integration tests require tmux on PATH");
     assert!(tmux.status.success(), "tmux -V failed");
 
     let unique = LIVE_TMUX_ID.fetch_add(1, Ordering::Relaxed);
@@ -290,7 +332,7 @@ fn real_local_tmux_control_client_crosses_the_pty_gateway_harness() {
         "new-session",
         "-s",
         &session,
-        "printf 'live tmux smoke\\n'",
+        "printf 'live tmux smoke\\n'; sleep 0.2",
     ]);
     command.env("TERM", "xterm-256color");
     let mut child = pair.slave.spawn_command(command).unwrap();

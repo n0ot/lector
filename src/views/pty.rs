@@ -57,7 +57,7 @@ impl ViewController for PtyView {
         contents: &str,
         pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
-        if self.view.screen().bracketed_paste() {
+        if self.view.live_screen().bracketed_paste() {
             write!(pty_stream, "\x1B[200~{}\x1B[201~", contents)?;
         } else {
             write!(pty_stream, "{}", contents)?;

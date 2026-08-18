@@ -8,9 +8,12 @@ use crate::{
 
 pub(super) fn report_move(
     sr: &mut ScreenReader,
-    view: &View,
+    view: &mut View,
     old_position: (u16, u16),
 ) -> Result<()> {
+    if old_position != view.review_cursor_position() {
+        view.cancel_pending_screen_transition_follow();
+    }
     sr.hook_on_review_cursor_move(old_position, view.review_cursor_position())?;
     Ok(())
 }
@@ -255,7 +258,8 @@ pub(super) fn read_attributes(sr: &mut ScreenReader, view: &View) -> Result<Comm
 mod tests {
     use super::{
         bottom, character_next, character_previous, character_read_phonetic, first, last,
-        line_next, line_previous, phonetic_name, read_attributes, top, word_next, word_previous,
+        line_next, line_previous, line_read, phonetic_name, read_attributes, top, word_next,
+        word_previous,
     };
     use crate::{
         commands::Error,
@@ -290,6 +294,17 @@ mod tests {
         let output = Rc::new(RefCell::new(Vec::new()));
         let speech = speech::Speech::new(Box::new(RecordingDriver(Rc::clone(&output))));
         (ScreenReader::new(speech), output)
+    }
+
+    #[test]
+    fn line_read_preserves_renderer_padding_as_silence() {
+        let (mut sr, output) = screen_reader();
+        let mut view = View::new(1, 8);
+        view.process_changes(b"        ");
+
+        line_read(&mut sr, &mut view).unwrap();
+
+        assert_eq!(output.borrow().as_slice(), ["        "]);
     }
 
     #[test]

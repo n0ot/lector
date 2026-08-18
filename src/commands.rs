@@ -49,6 +49,58 @@ macro_rules! define_actions {
             pub fn help_text(&self) -> &'static str {
                 self.metadata().help
             }
+
+            /// Whether this command observes or navigates terminal contents.
+            /// These commands use the last physically completed view; raw
+            /// input and coordinate-dependent UI actions intentionally keep
+            /// targeting the current logical view.
+            pub(crate) fn uses_presented_view(self) -> bool {
+                matches!(
+                    self,
+                    Action::SayOverlay
+                        | Action::ToggleReviewCursorFollowsScreenCursor
+                        | Action::OpenReview
+                        | Action::RevLinePrev
+                        | Action::RevLineNext
+                        | Action::RevLinePrevNonBlank
+                        | Action::RevLineNextNonBlank
+                        | Action::RevLineRead
+                        | Action::RevCharPrev
+                        | Action::RevCharNext
+                        | Action::RevCharRead
+                        | Action::RevCharReadPhonetic
+                        | Action::RevWordPrev
+                        | Action::RevWordNext
+                        | Action::RevWordRead
+                        | Action::RevTop
+                        | Action::RevBottom
+                        | Action::RevFirst
+                        | Action::RevLast
+                        | Action::RevReadAttributes
+                        | Action::SetMark
+                        | Action::Copy
+                        | Action::ToggleTableMode
+                        | Action::StartTableSetupMode
+                        | Action::CommitTableSetupMode
+                        | Action::ToggleTableSetupTabstop
+                        | Action::TableRowPrev
+                        | Action::TableRowNext
+                        | Action::TableRowTop
+                        | Action::TableRowBottom
+                        | Action::TableColPrev
+                        | Action::TableColNext
+                        | Action::TableColFirst
+                        | Action::TableColLast
+                        | Action::TableCellRead
+                        | Action::TableHeaderRead
+                        | Action::TableWordPrev
+                        | Action::TableWordNext
+                        | Action::TableWordRead
+                        | Action::TableCharPrev
+                        | Action::TableCharNext
+                        | Action::TableCharRead
+                )
+            }
         }
 
         pub fn builtin_action_from_name(name: &str) -> Option<Action> {
@@ -81,10 +133,7 @@ define_actions! {
     OpenTmuxPaneChooser => ("open tmux pane chooser", "open_tmux_pane_chooser"),
     OpenTmuxCommandPrompt => ("open tmux command prompt", "open_tmux_command_prompt"),
     DetachTmuxConnection => ("gracefully detach the active tmux connection", "detach_tmux_connection"),
-    InterruptTmuxGateway => ("interrupt the active tmux gateway transport", "interrupt_tmux_gateway"),
-    ForceCloseTmuxGateway => ("force close the active tmux gateway transport", "force_close_tmux_gateway"),
-    SendTmuxSshEscapeDisconnect => ("send the SSH disconnect escape to the active tmux gateway", "send_tmux_ssh_escape_disconnect"),
-    SendTmuxSshEscapeHelp => ("send the SSH escape help sequence to the active tmux gateway", "send_tmux_ssh_escape_help"),
+    ForceAbandonTmuxGateway => ("expose a stuck active tmux gateway as raw terminal input", "force_abandon_tmux_gateway"),
     PassNextKey => ("forward next key press", "pass_next_key"),
     StopSpeaking => ("stop speaking", "stop_speaking"),
     RevLinePrev => ("previous line", "review_line_prev"),
@@ -243,10 +292,7 @@ pub fn handle(
         | Action::OpenTmuxPaneChooser
         | Action::OpenTmuxCommandPrompt
         | Action::DetachTmuxConnection
-        | Action::InterruptTmuxGateway
-        | Action::ForceCloseTmuxGateway
-        | Action::SendTmuxSshEscapeDisconnect
-        | Action::SendTmuxSshEscapeHelp => {
+        | Action::ForceAbandonTmuxGateway => {
             sr.speak("not implemented", false)?;
             Ok(CommandResult::Handled)
         }
@@ -275,16 +321,13 @@ mod tests {
     }
 
     #[test]
-    fn exceptional_tmux_gateway_actions_have_stable_configuration_names() {
+    fn tmux_gateway_actions_have_stable_configuration_names() {
         for (name, action) in [
             ("detach_tmux_connection", Action::DetachTmuxConnection),
-            ("interrupt_tmux_gateway", Action::InterruptTmuxGateway),
-            ("force_close_tmux_gateway", Action::ForceCloseTmuxGateway),
             (
-                "send_tmux_ssh_escape_disconnect",
-                Action::SendTmuxSshEscapeDisconnect,
+                "force_abandon_tmux_gateway",
+                Action::ForceAbandonTmuxGateway,
             ),
-            ("send_tmux_ssh_escape_help", Action::SendTmuxSshEscapeHelp),
         ] {
             assert_eq!(builtin_action_from_name(name), Some(action));
             assert_eq!(builtin_action_name(action), name);

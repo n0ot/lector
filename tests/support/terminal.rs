@@ -268,8 +268,7 @@ fn normalize_cell(cell: &TerminalCell) -> NormalizedCell {
             underline: cell.underline(),
             inverse: cell.inverse(),
         },
-        // vt100 0.16 does not expose OSC 8 links. Keeping the field explicit
-        // makes that current limitation visible when the engine is replaced.
+        // The legacy fixture schema does not model OSC 8 link targets.
         hyperlink: None,
     }
 }

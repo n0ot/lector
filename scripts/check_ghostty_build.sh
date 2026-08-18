@@ -6,22 +6,26 @@ cd "$repo_dir"
 
 cargo_bin=${CARGO:-cargo}
 host_target=$(rustc -vV | sed -n 's/^host: //p')
-zig_bin=$(scripts/bootstrap_zig.sh)
-PATH="$(dirname "$zig_bin"):$PATH"
-export PATH
+prebuilt_root=${GHOSTTY_PREBUILT_ROOT:-"$repo_dir/target/ghostty-prebuilt"}
 
-scripts/bootstrap_ghostty.sh --target "$host_target" --optimize Debug
-scripts/bootstrap_ghostty.sh --target "$host_target" --optimize ReleaseFast
+debug_lector=$(LECTOR_GHOSTTY_OPTIMIZE=Debug \
+    "$cargo_bin" build --locked --features ghostty-vt --bin lector \
+        --message-format=json-render-diagnostics | \
+    "$repo_dir/scripts/cargo-artifact" lector bin)
+LECTOR_GHOSTTY_OPTIMIZE=Debug \
+    "$cargo_bin" test --locked --features ghostty-vt --test ghostty_build
+release_lector=$("$cargo_bin" build --locked --release --features ghostty-vt --bin lector \
+    --message-format=json-render-diagnostics | \
+    "$repo_dir/scripts/cargo-artifact" lector bin)
+ghostty_test_binary=$("$cargo_bin" test --locked --release --features ghostty-vt \
+    --test ghostty_build --no-run --message-format=json-render-diagnostics | \
+    "$repo_dir/scripts/cargo-artifact" ghostty_build test)
+"$ghostty_test_binary"
 
-"$cargo_bin" build --locked --features ghostty-vt
-"$cargo_bin" test --locked --features ghostty-vt --test ghostty_build
-"$cargo_bin" build --locked --release --features ghostty-vt
-"$cargo_bin" test --locked --release --features ghostty-vt --test ghostty_build
+"$debug_lector" --version
+"$release_lector" --version
 
-target/debug/lector --version
-target/release/lector --version
-
-ghostty_archive="target/ghostty-prebuilt/$host_target/ReleaseFast/static-lib/libghostty-vt.a"
+ghostty_archive="$prebuilt_root/$host_target/ReleaseFast/static-lib/libghostty-vt.a"
 if [[ ! -f "$ghostty_archive" ]]; then
     echo "release build did not produce the expected static libghostty-vt archive" >&2
     exit 1
@@ -31,16 +35,9 @@ if ! file "$ghostty_archive" | grep -q 'ar archive'; then
     exit 1
 fi
 
-ghostty_test_binary=$(find target/release/build/lector \
-    -type f -name 'ghostty_build-*' -perm -111 -print -quit)
-if [[ -z "$ghostty_test_binary" ]]; then
-    echo "could not locate the release Ghostty smoke-test binary" >&2
-    exit 1
-fi
-
 case "$(uname -s)" in
     Darwin)
-        if otool -L target/release/lector "$ghostty_test_binary" | grep -q 'libghostty-vt'; then
+        if otool -L "$release_lector" "$ghostty_test_binary" | grep -q 'libghostty-vt'; then
             echo "release artifacts unexpectedly depend on a shared libghostty-vt" >&2
             exit 1
         fi
@@ -50,7 +47,7 @@ case "$(uname -s)" in
         fi
         ;;
     Linux)
-        if ldd target/release/lector "$ghostty_test_binary" | grep -q 'libghostty-vt'; then
+        if ldd "$release_lector" "$ghostty_test_binary" | grep -q 'libghostty-vt'; then
             echo "release artifacts unexpectedly depend on a shared libghostty-vt" >&2
             exit 1
         fi

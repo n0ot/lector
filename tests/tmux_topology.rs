@@ -28,15 +28,16 @@ fn complete_inventory() -> Vec<Vec<u8>> {
         "P\t@10\t%20\t1\t1\t0\t0\t80\t24\t0\tvim",
         "P\t@10\t%21\t2\t0\t80\t0\t80\t24\t0\ttests",
         "P\t@11\t%22\t1\t1\t0\t0\t160\t24\t0\tbash",
-        "A\t$1",
+        "A\t$1\tworkstation.example",
         "O\tbase-index\t1",
         "O\tpane-base-index\t1",
         "C\tclient_name\t/dev/ttys001",
         "O\tprefix\tC-a",
         "O\tprefix2\tNone",
-        "O\tmode-keys\tvi",
+        "O\tkey-table\troot",
         "O\trepeat-time\t500",
         "B\tn\t0\tnext-window",
+        "B\tbypass\tq\t0\tdisplay-message bypass",
     ]
     .into_iter()
     .map(|line| line.as_bytes().to_vec())
@@ -49,6 +50,7 @@ fn inventory_preserves_stable_ids_duplicate_names_indexes_and_links() {
     topology.replace_inventory(&complete_inventory()).unwrap();
 
     assert_eq!(topology.connection_id(), 7);
+    assert_eq!(topology.host(), Some("workstation.example"));
     assert_eq!(topology.attached_session(), Some(SessionId(1)));
     assert_eq!(topology.sessions().len(), 2);
     assert_eq!(topology.session(SessionId(1)).unwrap().name, "work");
@@ -70,6 +72,12 @@ fn inventory_preserves_stable_ids_duplicate_names_indexes_and_links() {
     assert_eq!(topology.pane(PaneId(21)).unwrap().index, 2);
     assert_eq!(topology.option("base-index"), Some("1"));
     assert_eq!(topology.client_info("client_name"), Some("/dev/ttys001"));
+    assert_eq!(topology.binding("n").unwrap().table, "prefix");
+    assert_eq!(
+        topology.binding_in_table("bypass", "q").unwrap().command,
+        "display-message bypass"
+    );
+    assert!(topology.has_key_table("bypass"));
     assert!(!topology.needs_resync());
 }
 
@@ -254,7 +262,7 @@ fn layout_pane_exit_unknown_notifications_and_server_restart_are_coherent() {
 }
 
 #[test]
-fn inventory_command_uses_explicit_machine_formats_for_every_model_layer() {
+fn inventory_command_uses_machine_formats_and_the_backward_compatible_key_listing() {
     for command in [
         "list-sessions -F",
         "list-windows -a -F",
@@ -272,20 +280,61 @@ fn inventory_command_uses_explicit_machine_formats_for_every_model_layer() {
         "#{window_layout}",
         "#{window_visible_layout}",
         "#{client_name}",
+        "#{host}",
         "#{base-index}",
         "#{pane-base-index}",
         "#{prefix}",
         "#{prefix2}",
-        "#{mode-keys}",
+        "#{key-table}",
         "#{repeat-time}",
-        "list-keys -T prefix -F",
-        "#{key_string}",
-        "#{key_repeat}",
-        "#{key_command}",
+        "list-keys -a\n",
     ] {
         assert!(INVENTORY_COMMAND.contains(command), "missing {command:?}");
     }
+    assert!(!INVENTORY_COMMAND.contains("list-keys -a -F"));
+    assert_eq!(
+        INVENTORY_COMMAND,
+        lector::tmux_model::INVENTORY_COMMANDS.concat()
+    );
     assert!(INVENTORY_COMMAND.ends_with('\n'));
+}
+
+#[test]
+fn legacy_list_keys_syntax_preserves_tables_repeat_flags_escapes_and_commands() {
+    let mut inventory = complete_inventory();
+    inventory.retain(|line| !line.starts_with(b"B\t"));
+    inventory.extend([
+        b"bind-key -r -T prefix Up select-pane -U".to_vec(),
+        b"bind-key    -T prefix \\; last-pane".to_vec(),
+        b"bind-key    -T custom \"M-{\" display-message -p \"two words\"".to_vec(),
+        b"bind-key    -T root C-l send-keys C-l".to_vec(),
+    ]);
+
+    let mut topology = TmuxTopology::new(1);
+    topology.replace_inventory(&inventory).unwrap();
+    let up = topology.binding_in_table("prefix", "Up").unwrap();
+    assert!(up.repeatable);
+    assert_eq!(up.command, "select-pane -U");
+    assert_eq!(
+        topology.binding_in_table("prefix", ";").unwrap().command,
+        "last-pane"
+    );
+    assert_eq!(
+        topology.binding_in_table("custom", "M-{").unwrap().command,
+        "display-message -p \"two words\""
+    );
+    assert_eq!(
+        topology.binding_in_table("root", "C-l").unwrap().command,
+        "send-keys C-l"
+    );
+
+    let valid = topology.clone();
+    inventory.push(b"bind-key -T prefix \"unterminated next-window".to_vec());
+    assert!(topology.replace_inventory(&inventory).is_err());
+    assert_eq!(
+        topology, valid,
+        "malformed legacy output partially committed"
+    );
 }
 
 #[derive(Default)]
@@ -329,12 +378,19 @@ fn app_queues_inventory_after_handshake_and_exposes_accessible_debug_dump() {
         control_input,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
     app.handle_pty(&mut sr, b"%begin 2 2 0\n%end 2 2 0\n", &mut physical)
         .unwrap();
+    app.handle_pty(
+        &mut sr,
+        b"%begin 3 3 0\nattached,control-mode,pause-after=1\n%end 3 3 0\n",
+        &mut physical,
+    )
+    .unwrap();
 
     let inventory = complete_inventory();
     let groups = [
@@ -359,10 +415,10 @@ fn app_queues_inventory_after_handshake_and_exposes_accessible_debug_dump() {
             .join("\n");
         let response = format!(
             "%begin {} {} 0\n{output}\n%end {} {} 0\n",
-            index + 3,
-            index + 3,
-            index + 3,
-            index + 3
+            index + 4,
+            index + 4,
+            index + 4,
+            index + 4
         );
         app.handle_pty(&mut sr, response.as_bytes(), &mut physical)
             .unwrap();
@@ -476,6 +532,7 @@ fn failed_inventory_batch_retries_once_without_publishing_partial_topology() {
         control_input,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -483,8 +540,14 @@ fn failed_inventory_batch_retries_once_without_publishing_partial_topology() {
     control_input.clear();
     app.handle_pty(&mut sr, b"%begin 2 2 0\n%end 2 2 0\n", &mut physical)
         .unwrap();
+    app.handle_pty(
+        &mut sr,
+        b"%begin 3 3 0\nattached,control-mode,pause-after=1\n%end 3 3 0\n",
+        &mut physical,
+    )
+    .unwrap();
 
-    for number in 3..(3 + INVENTORY_REPLY_COUNT) {
+    for number in 4..(4 + INVENTORY_REPLY_COUNT) {
         let response = format!("%begin {number} {number} 0\nfailed\n%error {number} {number} 0\n");
         app.handle_pty(&mut sr, response.as_bytes(), &mut physical)
             .unwrap();
@@ -510,14 +573,19 @@ fn failed_inventory_batch_retries_once_without_publishing_partial_topology() {
         control_input.is_empty(),
         "persistent inventory error retried forever"
     );
+    assert!(
+        app.debug_active_view_contents()
+            .contains("tmux connection could not become ready"),
+        "persistent inventory error remained an indefinite readiness screen"
+    );
 }
 
 #[test]
-fn real_tmux_inventory_formats_parse_without_human_output_assumptions() {
+fn real_tmux_inventory_parses_backward_compatible_key_syntax() {
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
-        .expect("Stop 3 integration tests require tmux on PATH");
+        .expect("tmux integration tests require tmux on PATH");
     assert!(tmux.status.success(), "tmux -V failed");
 
     let socket_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-tmux");

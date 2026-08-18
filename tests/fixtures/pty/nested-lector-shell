@@ -1,0 +1,15 @@
+#!/bin/bash
+
+stty raw -echo
+printf 'LECTOR-OUTER-SHELL-READY'
+# End at the same application-cursor coordinate as bell-shell's first line.
+# A nested full repaint must still re-align a following review cursor even
+# when the final application cursor itself did not move.
+printf '\033[1;43H'
+IFS= read -r -n 1 launch
+[[ $launch == n ]] || exit 64
+
+LECTOR_PROC_STUB_LOG="$LECTOR_TEST_INNER_SPEECH_LOG" exec "$LECTOR_TEST_BINARY" \
+    --shell "$LECTOR_TEST_CHILD_SHELL" \
+    --speech-driver proc \
+    --speech-server "$LECTOR_TEST_SPEECH_SERVER"

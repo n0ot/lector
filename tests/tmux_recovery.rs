@@ -168,7 +168,7 @@ fn eof_at_every_protocol_byte_is_bounded_idempotent_and_never_poisoned() {
 }
 
 #[test]
-fn malformed_control_replays_the_revealing_shell_line_and_resumes_routing() {
+fn malformed_control_replays_shell_returns_but_quarantines_live_protocol_channels() {
     let mut router = TmuxGatewayRouter::new();
     let events = router
         .push(b"\x1bP1000pConnection to host closed.\r\nshell$ ready\r\n")
@@ -201,10 +201,71 @@ fn malformed_control_replays_the_revealing_shell_line_and_resumes_routing() {
         event,
         GatewayEvent::DirectOutput(bytes) if bytes.starts_with(b"%output")
     )));
-    assert!(events.iter().any(|event| matches!(
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GatewayEvent::DirectOutput(_)))
+    );
+    assert_eq!(
+        invalid_protocol.lifecycle_state(),
+        GatewayLifecycleState::Recovering
+    );
+    let recovered = invalid_protocol
+        .push(b"discarded control output\r\n\x1b\\shell$ after\r\n")
+        .unwrap();
+    assert!(
+        recovered
+            .iter()
+            .any(|event| matches!(event, GatewayEvent::ConnectionEnded { connection_id: 1 }))
+    );
+    assert!(recovered.iter().any(|event| matches!(
         event,
         GatewayEvent::DirectOutput(bytes) if bytes == b"shell$ after\r\n"
     )));
+    assert_eq!(
+        invalid_protocol.lifecycle_state(),
+        GatewayLifecycleState::Direct
+    );
+}
+
+#[test]
+fn app_terminates_a_live_control_channel_after_a_protocol_error() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = app_with_clock();
+    start_connection(&mut app, &mut sr, &mut physical);
+    let mut transport = Vec::new();
+    app.handle_tick(&mut sr, &mut transport, &mut physical)
+        .unwrap();
+    transport.clear();
+
+    app.handle_pty(&mut sr, b"%output invalid\n", &mut physical)
+        .unwrap();
+    assert_eq!(app.tmux_connection_count(), 1);
+    assert!(app.has_overlay(), "protocol recovery was not presented");
+
+    app.handle_tick(&mut sr, &mut transport, &mut physical)
+        .unwrap();
+    assert_eq!(transport, b"\x1c");
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|message| message.contains("terminating the control client"))
+    );
+
+    app.handle_pty(
+        &mut sr,
+        b"discarded control bytes\r\n\x1b\\shell$ recovered\r\n",
+        &mut physical,
+    )
+    .unwrap();
+    assert_eq!(app.tmux_connection_count(), 0);
+    assert_eq!(app.active_tmux_connection(), None);
+    assert!(
+        app.debug_active_view_contents()
+            .contains("shell$ recovered"),
+        "shell output after the terminated DCS was not restored"
+    );
 }
 
 fn app_with_clock() -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
@@ -257,11 +318,18 @@ fn ready_parent(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) {
         transport,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
     app.handle_pty(sr, &reply(2, &[]), physical).unwrap();
+    app.handle_pty(
+        sr,
+        &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()]),
+        physical,
+    )
+    .unwrap();
     let groups = [
         vec![b"S\t$1\tparent".to_vec()],
         vec![b"W\t$1\t@10\t1\t1\tb25f,80x24,0,0,20\tb25f,80x24,0,0,20\t*\tparent".to_vec()],
@@ -272,18 +340,18 @@ fn ready_parent(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) {
         vec![b"C\tclient_name\t/dev/ttys-parent".to_vec()],
         vec![b"O\tprefix\tC-a".to_vec()],
         vec![b"O\tprefix2\tNone".to_vec()],
-        vec![b"O\tmode-keys\tvi".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
         vec![b"O\trepeat-time\t500".to_vec()],
         vec![b"B\td\t0\tdetach-client".to_vec()],
     ];
     assert_eq!(groups.len(), lector::tmux_model::INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        app.handle_pty(sr, &reply(index + 3, group), physical)
+        app.handle_pty(sr, &reply(index + 4, group), physical)
             .unwrap();
     }
     transport.clear();
     app.handle_tick(sr, &mut transport, physical).unwrap();
-    assert_eq!(transport, b"capture-pane -p -e -J -S - -t %20\n");
+    assert_eq!(transport, b"capture-pane -p -e -F -J -S - -t %20\n");
     app.handle_pty(sr, &reply(30, &[b"PARENT READY".to_vec()]), physical)
         .unwrap();
 }
@@ -357,47 +425,61 @@ fn nested_ssh_death_reconstructs_parent_pane_and_parent_exit_cleans_once() {
 }
 
 #[test]
-fn nested_gateway_controls_target_only_the_parent_transport_pane() {
-    let (mut app, mut sr, _recorder, _clock, mut physical) = app_with_clock();
+fn nested_force_abandon_targets_the_parent_pane_then_exposes_its_raw_channel() {
+    let (mut app, mut sr, _recorder, clock, mut physical) = app_with_clock();
     ready_parent(&mut app, &mut sr, &mut physical);
     start_nested(&mut app, &mut sr, &mut physical);
     let child = app.active_tmux_connection().unwrap();
-    let before = app.debug_active_view_contents();
-
-    assert!(
-        app.request_tmux_gateway_action(&mut sr, GatewayControlAction::Interrupt, &mut physical,)
-            .unwrap()
-    );
-    let mut root = Vec::new();
-    app.handle_tick(&mut sr, &mut root, &mut physical).unwrap();
-    let routed = String::from_utf8(root).unwrap();
-    assert!(routed.contains("send-keys -H -t %20 03\n"), "{routed:?}");
-    assert_eq!(app.tmux_connection_count(), 2);
-    assert_eq!(app.active_tmux_connection(), Some(child));
-    assert_eq!(app.debug_active_view_contents(), before);
 
     assert!(
         app.request_tmux_gateway_action(
             &mut sr,
-            GatewayControlAction::SshEscapeDisconnect,
+            GatewayControlAction::ForceAbandon,
             &mut physical,
         )
-        .unwrap()
+            .unwrap()
     );
     assert!(app.has_overlay());
-    let mut ignored = Vec::new();
-    app.handle_stdin(&mut sr, b"\r", &mut ignored, &mut physical)
+    let mut root = Vec::new();
+    app.handle_stdin(&mut sr, b"\r", &mut root, &mut physical)
         .unwrap();
-    root = ignored;
+    root.clear();
+    app.handle_tick(&mut sr, &mut root, &mut physical).unwrap();
+    let routed = String::from_utf8(root).unwrap();
+    assert!(routed.contains("send-keys -H -t %20 1c\n"), "{routed:?}");
+    assert_eq!(app.tmux_connection_count(), 2);
+    assert_eq!(app.active_tmux_connection(), Some(child));
+
+    clock.advance(751);
+    let mut root = Vec::new();
+    app.handle_tick(&mut sr, &mut root, &mut physical).unwrap();
+    assert_eq!(app.tmux_connection_count(), 1);
+    assert_eq!(app.active_tmux_connection(), Some(1));
+    assert_eq!(app.debug_tmux_pane_portal_target(1, 20), None);
+
+    app.handle_pty(
+        &mut sr,
+        &pane_output(20, b"%output %20 RAW-CONTROL\r\n"),
+        &mut physical,
+    )
+    .unwrap();
+    assert!(
+        app.debug_tmux_pane_contents(1, 20)
+            .unwrap()
+            .contains("RAW-CONTROL")
+    );
+
+    let mut raw_input = Vec::new();
+    app.handle_stdin(&mut sr, b"\r~.", &mut raw_input, &mut physical)
+        .unwrap();
+    raw_input.clear();
+    let mut root = Vec::new();
     app.handle_tick(&mut sr, &mut root, &mut physical).unwrap();
     let routed = String::from_utf8(root).unwrap();
     assert!(
         routed.contains("send-keys -H -t %20 0d 7e 2e\n"),
         "{routed:?}"
     );
-    assert!(!app.has_overlay());
-    assert_eq!(app.tmux_connection_count(), 2);
-    assert_eq!(app.active_tmux_connection(), Some(child));
 }
 
 #[test]
@@ -440,7 +522,7 @@ fn app_timeout_and_eof_return_to_terminal_once_and_announce_why() {
 }
 
 #[test]
-fn accessible_gateway_controls_are_scoped_and_dangerous_bytes_are_confirmed() {
+fn graceful_detach_and_force_abandon_are_the_only_gateway_controls() {
     let (mut app, mut sr, _recorder, _clock, mut physical) = app_with_clock();
     start_connection(&mut app, &mut sr, &mut physical);
     let mut transport = Vec::new();
@@ -459,40 +541,75 @@ fn accessible_gateway_controls_are_scoped_and_dangerous_bytes_are_confirmed() {
     transport.clear();
 
     assert!(
-        app.request_tmux_gateway_action(&mut sr, GatewayControlAction::Interrupt, &mut physical,)
-            .unwrap()
+        app.request_tmux_gateway_action(
+            &mut sr,
+            GatewayControlAction::ForceAbandon,
+            &mut physical,
+        )
+        .unwrap()
     );
+    assert!(app.has_overlay());
     app.handle_tick(&mut sr, &mut transport, &mut physical)
         .unwrap();
-    assert_eq!(transport, b"\x03");
+    assert!(transport.is_empty(), "force abandon escaped confirmation");
+    app.handle_stdin(&mut sr, b"\r", &mut transport, &mut physical)
+        .unwrap();
+    transport.clear();
+    app.handle_tick(&mut sr, &mut transport, &mut physical)
+        .unwrap();
+    assert_eq!(transport, b"\x1c");
+    assert!(!app.has_overlay());
+    assert_eq!(app.tmux_connection_count(), 1);
+}
+
+#[test]
+fn confirmed_root_force_abandon_exposes_raw_transport_without_killing_it() {
+    let (mut app, mut sr, _recorder, clock, mut physical) = app_with_clock();
+    start_connection(&mut app, &mut sr, &mut physical);
+    let mut transport = Vec::new();
+    app.handle_tick(&mut sr, &mut transport, &mut physical)
+        .unwrap();
     transport.clear();
 
-    for (action, expected) in [
-        (GatewayControlAction::ForceClose, b"\x1c".as_slice()),
-        (
-            GatewayControlAction::SshEscapeDisconnect,
-            b"\r~.".as_slice(),
-        ),
-        (GatewayControlAction::SshEscapeHelp, b"\r~?".as_slice()),
-    ] {
-        assert!(
-            app.request_tmux_gateway_action(&mut sr, action, &mut physical)
-                .unwrap()
-        );
-        assert!(app.has_overlay());
-        app.handle_tick(&mut sr, &mut transport, &mut physical)
-            .unwrap();
-        assert!(transport.is_empty(), "{action:?} escaped confirmation");
-        app.handle_stdin(&mut sr, b"\r", &mut transport, &mut physical)
-            .unwrap();
-        transport.clear();
-        app.handle_tick(&mut sr, &mut transport, &mut physical)
-            .unwrap();
-        assert_eq!(transport, expected, "{action:?}");
-        transport.clear();
-        assert!(!app.has_overlay());
-        assert_eq!(app.tmux_connection_count(), 1);
-    }
+    assert!(
+        app.request_tmux_gateway_action(
+            &mut sr,
+            GatewayControlAction::ForceAbandon,
+            &mut physical,
+        )
+        .unwrap()
+    );
+    app.handle_stdin(&mut sr, b"\r", &mut transport, &mut physical)
+        .unwrap();
+    app.handle_tick(&mut sr, &mut transport, &mut physical)
+        .unwrap();
+    assert!(transport.contains(&b'\x1c'));
+    clock.advance(749);
+    transport.clear();
+    app.handle_tick(&mut sr, &mut transport, &mut physical)
+        .unwrap();
+    assert_eq!(app.tmux_connection_count(), 1);
+    clock.advance(2);
+    app.handle_tick(&mut sr, &mut transport, &mut physical)
+        .unwrap();
+    assert_eq!(app.tmux_connection_count(), 0);
+    assert_eq!(app.active_tmux_connection(), None);
+    assert!(!app.has_overlay());
+
+    app.handle_pty(
+        &mut sr,
+        b"%output %20 raw control stream\r\n",
+        &mut physical,
+    )
+    .unwrap();
+    assert!(
+        app.debug_active_view_contents()
+            .contains("raw control stream")
+    );
+    transport.clear();
+    app.handle_stdin(&mut sr, b"\r~.", &mut transport, &mut physical)
+        .unwrap();
+    assert_eq!(transport, b"\r~.");
 }
 
 #[test]
@@ -525,7 +642,10 @@ fn writes_that_fail_do_not_duplicate_exceptional_gateway_bytes() {
     let mut initial_commands = Vec::new();
     app.handle_tick(&mut sr, &mut initial_commands, &mut physical)
         .unwrap();
-    app.request_tmux_gateway_action(&mut sr, GatewayControlAction::Interrupt, &mut physical)
+    app.request_tmux_gateway_action(&mut sr, GatewayControlAction::ForceAbandon, &mut physical)
+        .unwrap();
+    let mut confirmation_output = Vec::new();
+    app.handle_stdin(&mut sr, b"\r", &mut confirmation_output, &mut physical)
         .unwrap();
     let mut writer = FailOnce {
         failed: false,

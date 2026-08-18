@@ -4,12 +4,15 @@ use lector::{
     output_scheduler::{
         EnqueueOutcome, OutputScheduler, OutputSchedulerConfig, ScheduledOutputClass,
     },
-    presentation::{OutputTransaction, PresentedScene, RenderBatch, SurfaceId},
+    presentation::{
+        OutputTransaction, PresentedAccessibilityBundle, PresentedScene, PresentedViewFrame,
+        RenderBatch, SurfaceId, ViewId, ViewRevision,
+    },
     screen_reader::ScreenReader,
     speech,
     terminal::{
         ClipboardContent, ClipboardLocation, GhosttyEngine, ProgressState, TerminalEvent,
-        TerminalGeometry,
+        TerminalGeometry, TerminalSnapshot,
     },
     terminal_protocol::PhysicalTerminalProfile,
     views,
@@ -29,6 +32,7 @@ fn config() -> OutputSchedulerConfig {
     OutputSchedulerConfig {
         latency_budget_ms: 4,
         synchronization_timeout_ms: 40,
+        synchronization_hard_timeout_ms: 200,
         write_budget_bytes: 64,
         maximum_pending_bytes: 256,
     }
@@ -38,6 +42,24 @@ fn batch(bytes: &[u8], marker: u16) -> RenderBatch {
     RenderBatch::new(
         vec![OutputTransaction::new(bytes)],
         PresentedScene::blank(TerminalGeometry::from_cells(3, marker)),
+    )
+}
+
+fn accessibility_bundle(marker: u64) -> PresentedAccessibilityBundle {
+    PresentedAccessibilityBundle::new(
+        Some(ViewId(7)),
+        vec![PresentedViewFrame {
+            view_id: ViewId(7),
+            revision: ViewRevision(marker),
+            surface_id: SurfaceId(1),
+            snapshot: TerminalSnapshot {
+                geometry: TerminalGeometry::from_cells(3, marker as u16),
+                title: Some(format!("frame-{marker}")),
+                ..TerminalSnapshot::default()
+            },
+            history_revision: 0,
+            history: None,
+        }],
     )
 }
 
@@ -76,34 +98,272 @@ fn event_boundary_coalescing_keeps_only_the_newest_unstarted_scene_and_preserves
 }
 
 #[test]
-fn application_synchronization_defers_one_outer_transaction_but_times_out_abandoned_intent() {
+fn replacing_an_unstarted_render_replaces_its_accessibility_bundle() {
+    let mut scheduler = OutputScheduler::new(config(), false);
+    let obsolete = accessibility_bundle(10);
+    let current = accessibility_bundle(20);
+    assert_eq!(
+        scheduler.enqueue_render_with_accessibility(batch(b"obsolete", 10), obsolete, 0),
+        EnqueueOutcome::Queued
+    );
+    assert_eq!(
+        scheduler.enqueue_render_with_accessibility(batch(b"current", 20), current.clone(), 1),
+        EnqueueOutcome::ReplacedObsoleteRender
+    );
+
+    let mut output = Vec::new();
+    let report = scheduler
+        .drain_ready(4, false, &mut output)
+        .expect("drain replacement");
+
+    assert_eq!(output, b"current");
+    assert_eq!(report.completed_renders.len(), 1);
+    assert_eq!(report.completed_renders[0].accessibility, current);
+}
+
+#[test]
+fn active_application_synchronization_refreshes_its_idle_deadline_until_close() {
     let mut scheduler = OutputScheduler::new(config(), true);
     scheduler.set_application_synchronized(true, 10);
     scheduler.enqueue_render(batch(b"partial-one", 10), 10);
-    scheduler.enqueue_render(batch(b"partial-two", 11), 20);
+    scheduler.set_application_synchronized(true, 40);
+    scheduler.enqueue_render(batch(b"partial-two", 11), 40);
 
     let mut output = Vec::new();
     let held = scheduler
-        .drain_ready(30, false, &mut output)
+        .drain_ready(50, false, &mut output)
         .expect("held synchronized output");
     assert_eq!(held.bytes_written, 0);
     assert!(output.is_empty());
-    assert_eq!(scheduler.next_deadline_ms(), Some(50));
+    assert_eq!(scheduler.next_deadline_ms(), Some(80));
 
+    scheduler.set_application_synchronized(true, 70);
+    scheduler.enqueue_render(batch(b"complete", 12), 70);
+    let still_active = scheduler
+        .drain_ready(80, false, &mut output)
+        .expect("active synchronized output");
+    assert_eq!(still_active.bytes_written, 0);
+    assert!(!still_active.synchronization_timed_out);
+    assert!(output.is_empty());
+    assert_eq!(scheduler.next_deadline_ms(), Some(110));
+
+    scheduler.set_application_synchronized(false, 90);
+    scheduler
+        .drain_ready(90, false, &mut output)
+        .expect("closed synchronized output");
+    assert_eq!(output, [SYNC_START, b"complete", SYNC_END].concat());
+}
+
+#[test]
+fn abandoned_application_synchronization_times_out_once_and_is_ignored_until_close() {
+    let mut scheduler = OutputScheduler::new(config(), true);
+    scheduler.set_application_synchronized(true, 10);
+    scheduler.enqueue_render(batch(b"partial-one", 10), 10);
+
+    let mut output = Vec::new();
     let timed_out = scheduler
         .drain_ready(50, false, &mut output)
-        .expect("timed-out synchronization");
+        .expect("time out idle synchronized output");
     assert!(timed_out.synchronization_timed_out);
-    assert_eq!(output, [SYNC_START, b"partial-two", SYNC_END].concat());
+    assert_eq!(output, [SYNC_START, b"partial-one", SYNC_END].concat());
 
     output.clear();
     scheduler.set_application_synchronized(true, 60);
-    scheduler.enqueue_render(batch(b"complete", 12), 60);
-    scheduler.set_application_synchronized(false, 61);
-    scheduler
+    scheduler.enqueue_render(batch(b"partial-two", 11), 60);
+    assert_eq!(scheduler.next_deadline_ms(), Some(64));
+    let continued = scheduler
         .drain_ready(64, false, &mut output)
-        .expect("closed synchronized output");
-    assert_eq!(output, [SYNC_START, b"complete", SYNC_END].concat());
+        .expect("continue an already timed-out synchronization epoch");
+    assert!(!continued.synchronization_timed_out);
+    assert_eq!(output, [SYNC_START, b"partial-two", SYNC_END].concat());
+
+    scheduler.set_application_synchronization(true, true, 65);
+    scheduler.enqueue_render(batch(b"same-batch-reopened", 12), 65);
+    output.clear();
+    let restarted = scheduler
+        .drain_ready(69, false, &mut output)
+        .expect("a close/reopen boundary starts a fresh held epoch");
+    assert_eq!(restarted.bytes_written, 0);
+    assert!(output.is_empty());
+
+    scheduler.set_application_synchronized(false, 69);
+    scheduler.set_application_synchronized(true, 70);
+    scheduler.enqueue_render(batch(b"next-epoch", 12), 70);
+    output.clear();
+    let held = scheduler
+        .drain_ready(74, false, &mut output)
+        .expect("a closed transaction permits a new synchronized epoch");
+    assert_eq!(held.bytes_written, 0);
+    assert!(output.is_empty());
+    assert_eq!(scheduler.next_deadline_ms(), Some(110));
+}
+
+#[test]
+fn synchronization_timeout_publishes_only_after_the_released_render_is_flushed() {
+    let mut scheduler = OutputScheduler::new(config(), true);
+    scheduler.set_application_synchronized(true, 0);
+    scheduler.enqueue_render(batch(b"partial", 10), 0);
+    let mut writer = ScriptedWriter::new([WriteStep::Error(io::ErrorKind::WouldBlock)]);
+
+    let blocked = scheduler
+        .drain_ready(40, false, &mut writer)
+        .expect("attempt timed-out render");
+    assert!(blocked.blocked);
+    assert!(!blocked.synchronization_timed_out);
+    assert!(blocked.completed_renders.is_empty());
+
+    scheduler.notify_writable();
+    let completed = scheduler
+        .drain_ready(40, false, &mut writer)
+        .expect("flush timed-out render");
+    assert!(completed.synchronization_timed_out);
+    assert_eq!(completed.completed_renders.len(), 1);
+}
+
+#[test]
+fn synchronization_timeout_waits_for_the_newest_render_behind_an_older_partial_write() {
+    let mut scheduler = OutputScheduler::new(config(), true);
+    scheduler.enqueue_render(batch(b"old", 9), 0);
+    let mut writer = ScriptedWriter::new([
+        WriteStep::Count(1),
+        WriteStep::Error(io::ErrorKind::WouldBlock),
+    ]);
+
+    let old_blocked = scheduler
+        .drain_ready(4, false, &mut writer)
+        .expect("partially write the older render");
+    assert!(old_blocked.blocked);
+
+    scheduler.set_application_synchronized(true, 5);
+    scheduler.enqueue_render(batch(b"released-partial", 10), 5);
+    scheduler.notify_writable();
+    let old_completed = scheduler
+        .drain_ready(45, false, &mut writer)
+        .expect("finish the render which predates the timeout target");
+    assert_eq!(old_completed.completed_renders.len(), 1);
+    assert_eq!(old_completed.completed_renders[0].geometry.cols, 9);
+    assert!(!old_completed.synchronization_timed_out);
+    assert!(old_completed.write_budget_exhausted);
+
+    let released = scheduler
+        .drain_ready(45, false, &mut writer)
+        .expect("flush the newest render released by the timeout");
+    assert_eq!(released.completed_renders.len(), 1);
+    assert_eq!(released.completed_renders[0].geometry.cols, 10);
+    assert!(released.synchronization_timed_out);
+}
+
+#[test]
+fn continuously_active_application_synchronization_has_an_absolute_hard_cap() {
+    let mut scheduler = OutputScheduler::new(config(), true);
+    scheduler.set_application_synchronized(true, 10);
+    scheduler.enqueue_render(batch(b"partial-one", 10), 10);
+    for now_ms in [40, 70, 100, 130] {
+        scheduler.set_application_synchronized(true, now_ms);
+        scheduler.enqueue_render(batch(b"latest-partial", 11), now_ms);
+    }
+
+    let mut output = Vec::new();
+    let held = scheduler
+        .drain_ready(139, false, &mut output)
+        .expect("activity keeps the idle deadline open");
+    assert_eq!(held.bytes_written, 0);
+    assert!(!held.synchronization_timed_out);
+    assert!(output.is_empty());
+    assert_eq!(scheduler.next_deadline_ms(), Some(170));
+
+    scheduler.set_application_synchronized(true, 160);
+    assert_eq!(scheduler.next_deadline_ms(), Some(200));
+    scheduler.set_application_synchronized(true, 190);
+    assert_eq!(scheduler.next_deadline_ms(), Some(210));
+    let hard_timed_out = scheduler
+        .drain_ready(210, false, &mut output)
+        .expect("hard-cap synchronized output");
+    assert!(hard_timed_out.synchronization_timed_out);
+    assert_eq!(output, [SYNC_START, b"latest-partial", SYNC_END].concat());
+}
+
+#[test]
+fn synchronization_bypass_is_owned_by_one_render_until_its_flush() {
+    let mut scheduler = OutputScheduler::new(config(), true);
+    scheduler.set_application_synchronized(true, 0);
+    scheduler.set_application_synchronization_bypassed(true);
+    scheduler.enqueue_render(batch(b"overlay", 10), 0);
+    scheduler.enqueue_bell(1, 0);
+    scheduler.set_application_synchronization_bypassed(false);
+
+    let mut writer = FlushScriptedWriter {
+        bytes: Vec::new(),
+        flushes: VecDeque::from([io::ErrorKind::WouldBlock]),
+    };
+    let blocked = scheduler
+        .drain_ready(4, false, &mut writer)
+        .expect("write the bypass render before its flush blocks");
+    assert!(blocked.blocked);
+    assert!(blocked.completed_renders.is_empty());
+    assert_eq!(writer.bytes, [SYNC_START, b"overlay", SYNC_END].concat());
+
+    scheduler.enqueue_render(batch(b"application", 20), 5);
+    scheduler.notify_writable();
+    let flushed = scheduler
+        .drain_ready(5, false, &mut writer)
+        .expect("confirm the bypass render and restore the application hold");
+    assert_eq!(flushed.completed_renders.len(), 1);
+    assert_eq!(flushed.completed_renders[0].geometry.cols, 10);
+    assert_eq!(flushed.bytes_written, 0);
+    assert_eq!(writer.bytes, [SYNC_START, b"overlay", SYNC_END].concat());
+    assert_eq!(scheduler.next_deadline_ms(), Some(40));
+}
+
+#[test]
+fn replacing_an_unstarted_bypass_render_transfers_its_release_boundary() {
+    let mut scheduler = OutputScheduler::new(config(), true);
+    scheduler.set_application_synchronized(true, 0);
+    scheduler.set_application_synchronization_bypassed(true);
+    scheduler.enqueue_render(batch(b"obsolete-overlay", 10), 0);
+    assert_eq!(
+        scheduler.enqueue_render(batch(b"current-overlay", 20), 1),
+        EnqueueOutcome::ReplacedObsoleteRender
+    );
+
+    let mut output = Vec::new();
+    let report = scheduler
+        .drain_ready(4, false, &mut output)
+        .expect("present the replacement through the inherited bypass");
+
+    assert_eq!(report.completed_renders.len(), 1);
+    assert_eq!(report.completed_renders[0].geometry.cols, 20);
+    assert_eq!(output, [SYNC_START, b"current-overlay", SYNC_END].concat());
+    assert!(!contains(&output, b"obsolete-overlay"));
+    assert_eq!(scheduler.next_deadline_ms(), Some(40));
+}
+
+#[test]
+fn a_capacity_dropped_bypass_render_does_not_release_older_held_work() {
+    let mut scheduler = OutputScheduler::new(
+        OutputSchedulerConfig {
+            maximum_pending_bytes: 32,
+            ..config()
+        },
+        true,
+    );
+    scheduler.set_application_synchronized(true, 0);
+    scheduler.enqueue_render(batch(b"held", 10), 0);
+    scheduler.set_application_synchronization_bypassed(true);
+    assert_eq!(
+        scheduler.enqueue_render(batch(&[b'x'; 17], 20), 1),
+        EnqueueOutcome::DroppedForCapacity
+    );
+
+    let mut output = Vec::new();
+    let held = scheduler
+        .drain_ready(4, false, &mut output)
+        .expect("a rejected compositor render cannot arm a global bypass");
+
+    assert_eq!(held.bytes_written, 0);
+    assert!(held.completed_renders.is_empty());
+    assert!(output.is_empty());
+    assert_eq!(scheduler.next_deadline_ms(), Some(40));
 }
 
 #[test]
@@ -189,6 +449,10 @@ fn a_partially_written_render_finishes_before_the_newest_scene_starts() {
     assert_eq!(writer.bytes, b"first-render");
     assert_eq!(first_complete.completed_renders.len(), 1);
     assert_eq!(first_complete.completed_renders[0].geometry.cols, 10);
+    assert!(
+        first_complete.write_budget_exhausted,
+        "a boundary drain must keep going when a newer scene is queued behind the completed one"
+    );
 
     let latest_complete = scheduler
         .drain_ready(9, false, &mut writer)
@@ -197,6 +461,57 @@ fn a_partially_written_render_finishes_before_the_newest_scene_starts() {
     assert_eq!(writer.bytes, b"first-renderlatest-render");
     assert_eq!(latest_complete.completed_renders.len(), 1);
     assert_eq!(latest_complete.completed_renders[0].geometry.cols, 20);
+}
+
+#[test]
+fn backpressured_renders_complete_with_their_exact_accessibility_bundles_in_order() {
+    let mut scheduler = OutputScheduler::new(config(), false);
+    let first_accessibility = accessibility_bundle(10);
+    let second_accessibility = accessibility_bundle(20);
+    scheduler.enqueue_render_with_accessibility(
+        batch(b"first-render", 10),
+        first_accessibility.clone(),
+        0,
+    );
+    let mut writer = ScriptedWriter::new([
+        WriteStep::Count(5),
+        WriteStep::Error(io::ErrorKind::WouldBlock),
+    ]);
+
+    let blocked = scheduler
+        .drain_ready(4, false, &mut writer)
+        .expect("partially write first render");
+    assert!(blocked.blocked);
+    assert!(blocked.completed_renders.is_empty());
+    assert_eq!(
+        scheduler.enqueue_render_with_accessibility(
+            batch(b"second-render", 20),
+            second_accessibility.clone(),
+            5,
+        ),
+        EnqueueOutcome::Queued,
+        "a started render and its accessibility bundle cannot be replaced"
+    );
+
+    scheduler.notify_writable();
+    let first = scheduler
+        .drain_ready(5, false, &mut writer)
+        .expect("finish first render");
+    assert_eq!(first.completed_renders.len(), 1);
+    assert_eq!(
+        first.completed_renders[0].accessibility,
+        first_accessibility
+    );
+
+    let second = scheduler
+        .drain_ready(9, false, &mut writer)
+        .expect("finish second render");
+    assert_eq!(second.completed_renders.len(), 1);
+    assert_eq!(
+        second.completed_renders[0].accessibility,
+        second_accessibility
+    );
+    assert_eq!(writer.bytes, b"first-rendersecond-render");
 }
 
 #[test]
@@ -251,6 +566,32 @@ fn render_confirmation_waits_for_a_successful_flush_after_flush_backpressure_and
     assert_eq!(confirmed.completed_renders.len(), 1);
     assert_eq!(confirmed.completed_renders[0].geometry.cols, 20);
     assert_eq!(writer.bytes, b"render", "accepted bytes must not be resent");
+}
+
+#[test]
+fn lifecycle_cleanup_discards_a_render_receipt_which_terminal_restore_will_supersede() {
+    let mut scheduler = OutputScheduler::new(config(), false);
+    scheduler.enqueue_render_with_accessibility(batch(b"render", 20), accessibility_bundle(20), 0);
+    let mut writer = FlushScriptedWriter {
+        bytes: Vec::new(),
+        flushes: VecDeque::from([io::ErrorKind::WouldBlock]),
+    };
+
+    let blocked = scheduler
+        .drain_ready(4, false, &mut writer)
+        .expect("write the render before its flush blocks");
+    assert!(blocked.blocked);
+    assert!(blocked.completed_renders.is_empty());
+
+    scheduler.prepare_for_lifecycle_cleanup();
+    scheduler.enqueue_bytes(ScheduledOutputClass::Control, b"restore".to_vec(), 5);
+    let restored = scheduler
+        .drain_ready(5, true, &mut writer)
+        .expect("flush prior bytes and complete terminal restoration");
+
+    assert_eq!(writer.bytes, b"renderrestore");
+    assert!(restored.completed_renders.is_empty());
+    assert!(!scheduler.has_render_work());
 }
 
 #[test]
@@ -324,6 +665,55 @@ fn typed_terminal_effects_are_ordered_bounded_and_never_replay_unsafe_payloads()
             .collect::<Vec<_>>(),
         effects
     );
+}
+
+#[test]
+fn compositor_bypass_replaces_unstarted_working_frame_model_effects() {
+    let mut scheduler = OutputScheduler::new(
+        OutputSchedulerConfig {
+            write_budget_bytes: 1024,
+            ..config()
+        },
+        true,
+    );
+    scheduler.set_application_synchronized(true, 0);
+    scheduler.enqueue_terminal_effect(
+        SurfaceId(1),
+        TerminalEvent::TitleChanged("working title".into()),
+        0,
+    );
+    scheduler.enqueue_terminal_effect(
+        SurfaceId(1),
+        TerminalEvent::WorkingDirectoryChanged("file://localhost/working".into()),
+        0,
+    );
+    scheduler.enqueue_render(batch(b"working frame", 10), 0);
+
+    scheduler.enqueue_terminal_effect(
+        SurfaceId(1),
+        TerminalEvent::TitleChanged("committed title".into()),
+        1,
+    );
+    scheduler.enqueue_terminal_effect(
+        SurfaceId(1),
+        TerminalEvent::WorkingDirectoryChanged("file://localhost/committed".into()),
+        1,
+    );
+    scheduler.set_application_synchronization_bypassed(true);
+    scheduler.enqueue_render(batch(b"committed frame", 20), 1);
+
+    let mut output = Vec::new();
+    let report = scheduler
+        .drain_ready(4, false, &mut output)
+        .expect("present committed compositor transition");
+
+    assert!(contains(&output, b"committed title"));
+    assert!(contains(&output, b"file://localhost/committed"));
+    assert!(contains(&output, b"committed frame"));
+    assert!(!contains(&output, b"working title"));
+    assert!(!contains(&output, b"file://localhost/working"));
+    assert!(!contains(&output, b"working frame"));
+    assert!(report.application_synchronization_bypass_completed);
 }
 
 #[test]
@@ -458,6 +848,53 @@ fn bounded_backlog_discards_obsolete_visual_work_without_dropping_control_or_bel
         .drain_ready(4, false, &mut output)
         .expect("bounded drain");
     assert_eq!(output, b"controllatest-render\x07");
+}
+
+#[test]
+fn bell_flood_is_capped_before_it_can_materialize_an_unbounded_transaction() {
+    let mut scheduler = OutputScheduler::new(
+        OutputSchedulerConfig {
+            maximum_pending_bytes: 96,
+            write_budget_bytes: 256,
+            ..config()
+        },
+        false,
+    );
+    scheduler.enqueue_bell(usize::MAX, 0);
+    assert_eq!(scheduler.pending_bytes(), 96);
+
+    let mut output = Vec::new();
+    scheduler
+        .drain_ready(4, false, &mut output)
+        .expect("drain bounded bell flood");
+    assert_eq!(output, vec![b'\x07'; 96]);
+    assert_eq!(scheduler.pending_bytes(), 0);
+}
+
+#[test]
+fn oversized_render_is_dropped_and_does_not_poison_a_later_bounded_scene() {
+    let mut scheduler = OutputScheduler::new(
+        OutputSchedulerConfig {
+            maximum_pending_bytes: 32,
+            ..config()
+        },
+        false,
+    );
+    assert_eq!(
+        scheduler.enqueue_render(batch(&[b'x'; 33], 10), 0),
+        EnqueueOutcome::DroppedForCapacity
+    );
+    assert_eq!(scheduler.pending_bytes(), 0);
+    assert_eq!(
+        scheduler.enqueue_render(batch(b"recovered", 20), 1),
+        EnqueueOutcome::Queued
+    );
+
+    let mut output = Vec::new();
+    scheduler
+        .drain_ready(5, false, &mut output)
+        .expect("drain render after capacity rejection");
+    assert_eq!(output, b"recovered");
 }
 
 #[test]
@@ -603,6 +1040,17 @@ fn lector_overlay_is_not_frozen_by_application_synchronization_intent() {
     oracle.advance(&physical).expect("parse overlay frame");
     let contents = oracle.normalized_snapshot().contents();
     assert!(contents.contains("responsive overlay"), "{contents:?}");
+
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        Some(std::time::Duration::from_millis(36)),
+        "the compositor bypass must retain the application's timeout epoch"
+    );
+    clock.advance_ms(36);
+    let timeout = app
+        .drain_scheduled_output(&mut physical, false)
+        .expect("time out the still-open application frame behind the overlay");
+    assert!(timeout.synchronization_timed_out);
 }
 
 #[test]

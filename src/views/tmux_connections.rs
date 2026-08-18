@@ -8,23 +8,18 @@ use crate::{
 use std::{any::Any, io::Write};
 use terminput::KeyCode;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TmuxConnectionTarget {
-    Terminal,
-    Connection(u64),
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TmuxConnectionItem {
     pub connection_id: u64,
     pub label: String,
+    pub host: Option<String>,
 }
 
 pub struct TmuxConnectionChooserView {
     view: View,
     items: Vec<TmuxConnectionItem>,
-    selected: TmuxConnectionTarget,
-    editor: LineEditor,
+    active_connection_id: Option<u64>,
+    selected_connection_id: Option<u64>,
     viewport_start: usize,
 }
 
@@ -39,11 +34,8 @@ impl TmuxConnectionChooserView {
         let mut chooser = Self {
             view: View::new(rows, cols),
             items,
-            selected: active_connection.map_or(
-                TmuxConnectionTarget::Terminal,
-                TmuxConnectionTarget::Connection,
-            ),
-            editor: LineEditor::new(),
+            active_connection_id: active_connection,
+            selected_connection_id: active_connection,
             viewport_start: 0,
         };
         chooser.reconcile_selection(active_connection);
@@ -53,46 +45,57 @@ impl TmuxConnectionChooserView {
 
     pub fn sync(&mut self, items: Vec<TmuxConnectionItem>, active_connection: Option<u64>) {
         self.items = items;
+        self.active_connection_id = active_connection;
         self.reconcile_selection(active_connection);
         self.render();
     }
 
-    fn targets(&self) -> Vec<(TmuxConnectionTarget, String)> {
-        let mut targets = vec![(TmuxConnectionTarget::Terminal, "terminal".to_owned())];
-        targets.extend(self.items.iter().map(|item| {
-            (
-                TmuxConnectionTarget::Connection(item.connection_id),
-                format!("connection {} {}", item.connection_id, item.label),
-            )
-        }));
-        let query = self.editor.input().to_lowercase();
-        targets
-            .into_iter()
-            .filter(|(_, label)| query.is_empty() || label.to_lowercase().contains(&query))
+    fn targets(&self) -> Vec<(u64, String)> {
+        self.items
+            .iter()
+            .map(|item| {
+                let active_marker = if Some(item.connection_id) == self.active_connection_id {
+                    "* "
+                } else {
+                    "  "
+                };
+                let default_label = format!("tmux {}", item.connection_id);
+                let mut fields = vec![item.connection_id.to_string()];
+                if item.label != default_label {
+                    fields.push(item.label.clone());
+                }
+                if let Some(host) = item.host.as_deref() {
+                    fields.push(host.to_owned());
+                }
+                (
+                    item.connection_id,
+                    format!("{active_marker}{}", fields.join(", ")),
+                )
+            })
             .collect()
     }
 
     fn reconcile_selection(&mut self, active_connection: Option<u64>) {
         let targets = self.targets();
-        if targets.iter().any(|(target, _)| *target == self.selected) {
+        if self.selected_connection_id.is_some_and(|selected| {
+            targets
+                .iter()
+                .any(|(connection_id, _)| *connection_id == selected)
+        }) {
             return;
         }
-        let active = active_connection.map_or(
-            TmuxConnectionTarget::Terminal,
-            TmuxConnectionTarget::Connection,
-        );
-        self.selected = targets
+        self.selected_connection_id = targets
             .iter()
-            .find(|(target, _)| *target == active)
+            .find(|(connection_id, _)| Some(*connection_id) == active_connection)
             .or_else(|| targets.first())
-            .map_or(TmuxConnectionTarget::Terminal, |(target, _)| *target);
+            .map(|(connection_id, _)| *connection_id);
     }
 
     fn move_selection(&mut self, delta: isize) -> bool {
         let targets = self.targets();
         let Some(index) = targets
             .iter()
-            .position(|(target, _)| *target == self.selected)
+            .position(|(connection_id, _)| Some(*connection_id) == self.selected_connection_id)
         else {
             return false;
         };
@@ -100,40 +103,39 @@ impl TmuxConnectionChooserView {
         if next >= targets.len() || next == index {
             return false;
         }
-        self.selected = targets[next].0;
+        self.selected_connection_id = Some(targets[next].0);
         true
     }
 
     fn selected_label(&self) -> Option<String> {
         self.targets()
             .into_iter()
-            .find(|(target, _)| *target == self.selected)
+            .find(|(connection_id, _)| Some(*connection_id) == self.selected_connection_id)
             .map(|(_, label)| label)
     }
 
     fn choose(&self) -> ViewAction {
-        match self.selected {
-            TmuxConnectionTarget::Terminal => ViewAction::ActivateTerminal,
-            TmuxConnectionTarget::Connection(connection_id) => {
-                ViewAction::ActivateTmuxConnection(connection_id)
-            }
-        }
+        self.selected_connection_id
+            .map_or(ViewAction::Bell, ViewAction::ActivateTmuxConnection)
     }
 
-    fn edit(&mut self, sr: &mut ScreenReader, action: EditorAction) -> Result<ViewAction> {
-        match action {
-            EditorAction::Changed => {
-                self.reconcile_selection(None);
-                self.render();
-                if let Some(label) = self.selected_label() {
-                    sr.speak(&label, false)?;
+    fn control(&self, action: crate::tmux_lifecycle::GatewayControlAction) -> ViewAction {
+        self.selected_connection_id
+            .map_or(ViewAction::Bell, |connection_id| {
+                ViewAction::TmuxConnectionControl {
+                    connection_id,
+                    action,
                 }
-                Ok(ViewAction::Redraw)
-            }
-            EditorAction::Submit => Ok(self.choose()),
-            EditorAction::Bell => Ok(ViewAction::Bell),
-            EditorAction::None => Ok(ViewAction::None),
-        }
+            })
+    }
+
+    fn key_action(&self, character: u8) -> Option<ViewAction> {
+        use crate::tmux_lifecycle::GatewayControlAction;
+        Some(match character {
+            b'd' => self.control(GatewayControlAction::GracefulDetach),
+            b'D' => self.control(GatewayControlAction::ForceAbandon),
+            _ => return None,
+        })
     }
 
     fn move_and_announce(&mut self, sr: &mut ScreenReader, delta: isize) -> Result<ViewAction> {
@@ -144,17 +146,20 @@ impl TmuxConnectionChooserView {
         if let Some(label) = self.selected_label() {
             sr.speak(&label, false)?;
         }
-        Ok(ViewAction::Redraw)
+        // The row was announced explicitly above. Normal redraw autoread also
+        // reports the indentation change between an active `* ` row and an
+        // inactive row's two leading spaces.
+        Ok(ViewAction::RedrawSilently)
     }
 
     fn render(&mut self) {
         let (rows, cols) = self.view.size();
-        let mut lines = vec![format!("search: {}", self.editor.input())];
-        let capacity = usize::from(rows).saturating_sub(2);
+        let mut lines = Vec::new();
+        let capacity = usize::from(rows).saturating_sub(1);
         let targets = self.targets();
         let selected_index = targets
             .iter()
-            .position(|(target, _)| *target == self.selected);
+            .position(|(connection_id, _)| Some(*connection_id) == self.selected_connection_id);
         let max_start = targets.len().saturating_sub(capacity);
         self.viewport_start = self.viewport_start.min(max_start);
         if let Some(selected_index) = selected_index {
@@ -168,25 +173,36 @@ impl TmuxConnectionChooserView {
             }
         }
         if targets.is_empty() && capacity > 0 {
-            lines.push("no matching connections".to_owned());
+            lines.push("no tmux connections".to_owned());
         } else {
             lines.extend(
                 targets
                     .into_iter()
                     .skip(self.viewport_start)
                     .take(capacity)
-                    .map(|(target, label)| {
-                        format!(
-                            "{} {label}",
-                            if target == self.selected { ">" } else { " " }
-                        )
-                    }),
+                    .map(|(_, label)| label),
             );
         }
         if rows > 1 {
-            lines.push("Up/Down select, Enter choose, Escape cancel".to_owned());
+            lines.push(
+                "Up/Down select, Enter switch, d detach, D expose raw transport, Escape cancel"
+                    .to_owned(),
+            );
         }
-        render_lines(&mut self.view, &lines, cols);
+        let cursor = selected_index
+            .filter(|index| {
+                *index >= self.viewport_start
+                    && *index < self.viewport_start.saturating_add(capacity)
+            })
+            .map(|index| {
+                (
+                    index.saturating_sub(self.viewport_start).saturating_add(1),
+                    // Keep the cursor on the selected row without covering the
+                    // active connection's leading `*` with a block cursor.
+                    2,
+                )
+            });
+        render_lines(&mut self.view, &lines, cols, cursor);
     }
 }
 
@@ -222,10 +238,10 @@ impl ViewController for TmuxConnectionChooserView {
             b"\r" | b"\n" => Ok(self.choose()),
             b"\x1b[A" => self.move_and_announce(sr, -1),
             b"\x1b[B" => self.move_and_announce(sr, 1),
-            _ => {
-                let action = self.editor.handle_bytes(input);
-                self.edit(sr, action)
+            [character] if self.key_action(*character).is_some() => {
+                Ok(self.key_action(*character).expect("checked manager action"))
             }
+            _ => Ok(ViewAction::Bell),
         }
     }
 
@@ -244,10 +260,10 @@ impl ViewController for TmuxConnectionChooserView {
             KeyCode::Enter => Ok(self.choose()),
             KeyCode::Up => self.move_and_announce(sr, -1),
             KeyCode::Down => self.move_and_announce(sr, 1),
-            _ => {
-                let action = self.editor.handle_key_input(key);
-                self.edit(sr, action)
+            KeyCode::Char(character) if character.is_ascii() => {
+                Ok(self.key_action(character as u8).unwrap_or(ViewAction::Bell))
             }
+            _ => Ok(ViewAction::Bell),
         }
     }
 
@@ -257,8 +273,8 @@ impl ViewController for TmuxConnectionChooserView {
         contents: &str,
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
-        let action = self.editor.handle_text(contents);
-        self.edit(sr, action)
+        let _ = (sr, contents);
+        Ok(ViewAction::Bell)
     }
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
@@ -309,6 +325,7 @@ impl TmuxConnectionRenameView {
                 "Enter rename, Escape cancel".to_owned(),
             ],
             cols,
+            None,
         );
     }
 }
@@ -383,7 +400,7 @@ impl ViewController for TmuxConnectionRenameView {
     }
 }
 
-fn render_lines(view: &mut View, lines: &[String], cols: u16) {
+fn render_lines(view: &mut View, lines: &[String], cols: u16, cursor: Option<(usize, usize)>) {
     let mut bytes = b"\x1b[2J\x1b[H".to_vec();
     for (index, line) in lines.iter().enumerate() {
         if index > 0 {
@@ -392,6 +409,9 @@ fn render_lines(view: &mut View, lines: &[String], cols: u16) {
         bytes.extend_from_slice(
             super::text_input::truncate_display_width(line, usize::from(cols)).as_bytes(),
         );
+    }
+    if let Some((row, col)) = cursor {
+        bytes.extend_from_slice(format!("\x1b[{};{}H", row.max(1), col.max(1)).as_bytes());
     }
     view.clear_update_summary();
     view.process_changes(&bytes);
@@ -435,10 +455,12 @@ mod tests {
             TmuxConnectionItem {
                 connection_id: 1,
                 label: "shared".to_owned(),
+                host: Some("local.example".to_owned()),
             },
             TmuxConnectionItem {
                 connection_id: 2,
                 label: "shared".to_owned(),
+                host: Some("remote.example".to_owned()),
             },
         ]
     }
@@ -449,18 +471,54 @@ mod tests {
         let mut sr = screen_reader();
         let mut output = Vec::new();
         let contents = chooser.model().contents_full();
-        assert!(contents.contains("connection 1 shared"), "{contents:?}");
-        assert!(contents.contains("connection 2 shared"), "{contents:?}");
+        assert!(
+            contents.contains("1, shared, local.example"),
+            "{contents:?}"
+        );
+        assert!(
+            contents.contains("2, shared, remote.example"),
+            "{contents:?}"
+        );
+        assert!(
+            contents.contains("* 2, shared, remote.example"),
+            "{contents:?}"
+        );
+        assert!(
+            !contents.contains("> "),
+            "selector marker remained: {contents:?}"
+        );
+        let cursor_row = chooser.model().screen().cursor_position().0;
+        assert_eq!(chooser.model().screen().cursor_position().1, 1);
+        assert!(
+            chooser
+                .model()
+                .line(cursor_row)
+                .contains("2, shared, remote.example")
+        );
 
         assert!(matches!(
             chooser
                 .handle_input(&mut sr, b"\x1b[A", &mut output)
                 .unwrap(),
-            ViewAction::Redraw
+            ViewAction::RedrawSilently
         ));
+        let cursor_row = chooser.model().screen().cursor_position().0;
+        assert!(
+            chooser
+                .model()
+                .line(cursor_row)
+                .contains("1, shared, local.example")
+        );
         assert!(matches!(
             chooser.handle_input(&mut sr, b"\r", &mut output).unwrap(),
             ViewAction::ActivateTmuxConnection(1)
+        ));
+        assert!(matches!(
+            chooser.handle_input(&mut sr, b"d", &mut output).unwrap(),
+            ViewAction::TmuxConnectionControl {
+                connection_id: 1,
+                action: crate::tmux_lifecycle::GatewayControlAction::GracefulDetach,
+            }
         ));
 
         chooser.sync(items().into_iter().skip(1).collect(), Some(2));
@@ -468,10 +526,12 @@ mod tests {
             chooser.handle_input(&mut sr, b"\r", &mut output).unwrap(),
             ViewAction::ActivateTmuxConnection(2)
         ));
-        chooser.handle_input(&mut sr, b"term", &mut output).unwrap();
         assert!(matches!(
-            chooser.handle_input(&mut sr, b"\r", &mut output).unwrap(),
-            ViewAction::ActivateTerminal
+            chooser.handle_input(&mut sr, b"D", &mut output).unwrap(),
+            ViewAction::TmuxConnectionControl {
+                connection_id: 2,
+                action: crate::tmux_lifecycle::GatewayControlAction::ForceAbandon,
+            }
         ));
     }
 

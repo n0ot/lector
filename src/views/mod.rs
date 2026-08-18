@@ -21,7 +21,7 @@ pub use tmux_chooser::{TmuxChooserTarget, TmuxChooserView};
 pub use tmux_command::TmuxCommandView;
 pub use tmux_connection::TmuxConnectionView;
 pub use tmux_connections::{
-    TmuxConnectionChooserView, TmuxConnectionItem, TmuxConnectionRenameView, TmuxConnectionTarget,
+    TmuxConnectionChooserView, TmuxConnectionItem, TmuxConnectionRenameView,
 };
 pub use tmux_portal::TmuxPortalView;
 
@@ -58,7 +58,10 @@ pub enum ViewAction {
     Pop,
     PopupResponse(PopupResponse),
     ActivateTmuxConnection(u64),
-    ActivateTerminal,
+    TmuxConnectionControl {
+        connection_id: u64,
+        action: crate::tmux_lifecycle::GatewayControlAction,
+    },
     TmuxConnectionRename {
         connection_id: u64,
         label: String,
@@ -77,6 +80,8 @@ pub enum ViewAction {
         bytes: Vec<u8>,
     },
     Redraw,
+    /// Present and finalize a view that already announced its own interaction.
+    RedrawSilently,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -100,6 +105,11 @@ pub trait ViewController {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn model(&mut self) -> &mut View;
+    /// Makes screen-derived accessibility state advance only after the
+    /// corresponding physical render has completed its flush.
+    fn enable_presentation_tracking(&mut self) {
+        self.model().enable_presentation_tracking();
+    }
     fn title(&self) -> &str;
     fn kind(&self) -> ViewKind {
         ViewKind::Other

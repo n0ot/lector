@@ -5,8 +5,8 @@ use lector::{
     speech,
     terminal::{MouseEncoding, MouseProtocol, TerminalGeometry},
     tmux_input::{
-        MAX_SEND_KEYS_COMMAND_BYTES, continue_pane_command, encode_send_keys,
-        refresh_client_command, translate_mouse,
+        MAX_SEND_KEYS_COMMAND_BYTES, continue_pane_command, encode_send_keys, pause_pane_command,
+        refresh_client_command, refresh_client_report_commands, translate_mouse,
     },
     tmux_model::PaneId,
     tmux_panes::LayoutPane,
@@ -68,6 +68,22 @@ fn hexadecimal_send_keys_is_binary_safe_bounded_ordered_and_injection_proof() {
 }
 
 #[test]
+fn only_complete_osc_10_and_11_replies_become_control_client_reports() {
+    let replies = b"\x1b[?64;22c\x1b]10;rgb:ffff/ffff/ffff\x1b\\\
+                    ignored\x1b]11;rgb:0000/0000/0000\x07\
+                    \x1b]12;rgb:1111/2222/3333\x1b\\\
+                    \x1b]10;unsafe'quote\x1b\\\
+                    \x1b]11;incomplete";
+    assert_eq!(
+        refresh_client_report_commands(PaneId(7), replies),
+        vec![
+            b"refresh-client -r '%7:\x1b]10;rgb:ffff/ffff/ffff\x1b\\'\n".to_vec(),
+            b"refresh-client -r '%7:\x1b]11;rgb:0000/0000/0000\x07'\n".to_vec(),
+        ]
+    );
+}
+
+#[test]
 fn resize_and_mouse_encoding_preserve_tmux_and_pane_coordinate_authority() {
     assert_eq!(
         refresh_client_command(TerminalGeometry::from_cells(40, 120)),
@@ -75,7 +91,11 @@ fn resize_and_mouse_encoding_preserve_tmux_and_pane_coordinate_authority() {
     );
     assert_eq!(
         continue_pane_command(PaneId(21)),
-        b"refresh-client -A %21:continue\n"
+        b"refresh-client -A '%21:continue'\n"
+    );
+    assert_eq!(
+        pause_pane_command(PaneId(21)),
+        b"refresh-client -A '%21:pause'\n"
     );
     let pane = LayoutPane {
         pane_id: PaneId(21),
@@ -242,12 +262,19 @@ fn ready_split_app() -> (App, ScreenReader, Vec<u8>) {
         control,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
     app.handle_pty(&mut sr, &command_reply(2, &[]), &mut physical)
         .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &command_reply(3, &["attached,control-mode,pause-after=1"]),
+        &mut physical,
+    )
+    .unwrap();
     let window = format!("W\t$1\t@10\t1\t1\t{SPLIT}\t{SPLIT}\t*\tinput");
     let groups = [
         vec!["S\t$1\twork"],
@@ -262,12 +289,12 @@ fn ready_split_app() -> (App, ScreenReader, Vec<u8>) {
         vec!["C\tclient_name\ttest"],
         vec!["O\tprefix\tC-a"],
         vec!["O\tprefix2\tNone"],
-        vec!["O\tmode-keys\tvi"],
+        vec!["O\tkey-table\troot"],
         vec!["O\trepeat-time\t500"],
         vec!["B\tn\t0\tnext-window"],
     ];
     for (index, lines) in groups.iter().enumerate() {
-        app.handle_pty(&mut sr, &command_reply(index + 3, lines), &mut physical)
+        app.handle_pty(&mut sr, &command_reply(index + 4, lines), &mut physical)
             .unwrap();
     }
     control.clear();
@@ -352,16 +379,16 @@ fn application_harness_routes_keyboard_paste_focus_mouse_queries_and_latest_size
 
     app.handle_pty(&mut sr, b"%output %21 \\033[6n\n", &mut physical)
         .unwrap();
-    let reply = decode_send_keys(&tick_commands(&mut app, &mut sr, &mut physical), PaneId(21));
-    assert!(reply.starts_with(b"\x1b["));
-    assert!(reply.ends_with(b"R"));
+    assert!(
+        tick_commands(&mut app, &mut sr, &mut physical).is_empty(),
+        "Lector duplicated the tmux server's terminal reply into the active pane"
+    );
 
     app.handle_pty(&mut sr, b"%output %20 \\033[6n\n", &mut physical)
         .unwrap();
-    let inactive_reply = tick_commands(&mut app, &mut sr, &mut physical);
     assert!(
-        !decode_send_keys(&inactive_reply, PaneId(20)).is_empty(),
-        "a hidden pane's terminal query reply was sent to a different pane"
+        tick_commands(&mut app, &mut sr, &mut physical).is_empty(),
+        "Lector duplicated the tmux server's terminal reply into a hidden pane"
     );
 
     for cols in 81..=180 {
@@ -406,6 +433,30 @@ fn large_bracketed_paste_is_batched_without_quoting_or_command_size_failures() {
 }
 
 #[test]
+fn pathological_input_route_amplification_is_discarded_without_wedging_later_input() {
+    let (mut app, mut sr, mut physical) = ready_split_app();
+    let mut event = b"\x1b[200~".to_vec();
+    event.extend(std::iter::repeat_n(b'x', 400 * 1024));
+    event.extend_from_slice(b"\x1b[201~");
+
+    app.handle_stdin(&mut sr, &event, &mut Vec::new(), &mut physical)
+        .unwrap();
+    assert!(
+        tick_commands(&mut app, &mut sr, &mut physical).is_empty(),
+        "an amplified command larger than the route budget was emitted"
+    );
+    assert_eq!(app.debug_tmux_pending_command_bytes(), 0);
+
+    app.handle_stdin(&mut sr, b"z", &mut Vec::new(), &mut physical)
+        .unwrap();
+    assert_eq!(
+        decode_send_keys(&tick_commands(&mut app, &mut sr, &mut physical), PaneId(21)),
+        b"z",
+        "discarding one pathological command poisoned later input"
+    );
+}
+
+#[test]
 fn input_command_replies_do_not_steal_later_inventory_correlation() {
     let (mut app, mut sr, mut physical) = ready_split_app();
     app.handle_stdin(&mut sr, &vec![b'x'; 5000], &mut Vec::new(), &mut physical)
@@ -428,6 +479,35 @@ fn input_command_replies_do_not_steal_later_inventory_correlation() {
         lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         "ignored send-keys replies consumed or displaced the resync transaction"
     );
+}
+
+#[test]
+fn missing_command_replies_hit_a_hard_backlog_limit_and_recover_when_replies_resume() {
+    let (mut app, mut sr, mut physical) = ready_split_app();
+    let mut saturated = false;
+    for _ in 0..800 {
+        app.handle_stdin(&mut sr, b"x", &mut Vec::new(), &mut physical)
+            .unwrap();
+        if tick_commands(&mut app, &mut sr, &mut physical).is_empty() {
+            saturated = true;
+            break;
+        }
+    }
+    assert!(saturated, "a silent peer left the reply backlog unbounded");
+    let capped = app.debug_tmux_expected_reply_count(1).unwrap();
+    assert!(capped > 0);
+
+    for serial in 10_000..10_016 {
+        app.handle_pty(&mut sr, &command_reply(serial, &[]), &mut physical)
+            .unwrap();
+    }
+    app.handle_stdin(&mut sr, b"recovered", &mut Vec::new(), &mut physical)
+        .unwrap();
+    assert!(
+        !tick_commands(&mut app, &mut sr, &mut physical).is_empty(),
+        "reply flow resumed but the command path stayed wedged"
+    );
+    assert!(app.debug_tmux_expected_reply_count(1).unwrap() < capped);
 }
 
 #[test]
@@ -491,7 +571,7 @@ fn input_stays_ordered_during_partial_sequences_pane_switch_and_tmux_flow_contro
     app.handle_stdin(&mut sr, b"after-pause", &mut Vec::new(), &mut physical)
         .unwrap();
     let commands = tick_commands(&mut app, &mut sr, &mut physical);
-    assert_eq!(commands[0], b"refresh-client -A %20:continue\n");
+    assert_eq!(commands[0], b"refresh-client -A '%20:continue'\n");
     assert_eq!(
         decode_send_keys(&commands[1..], PaneId(20)),
         b"\x1b[120;5:1uafter-pause"
@@ -562,7 +642,7 @@ fn real_tmux_byte_echo_paste_mouse_resize_and_output_flood_harness() {
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
-        .expect("Stop 3 integration tests require tmux on PATH");
+        .expect("tmux integration tests require tmux on PATH");
     assert!(tmux.status.success(), "tmux -V failed");
 
     let unique = SystemTime::now()

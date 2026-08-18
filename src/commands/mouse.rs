@@ -12,7 +12,11 @@ pub(super) enum Button {
 }
 
 pub(super) fn click(sr: &mut ScreenReader, view: &View, button: Button) -> Result<CommandResult> {
-    let screen = view.screen();
+    // The coordinate comes from the user's presented review cursor, but the
+    // protocol belongs to the mutable application endpoint. A mode change
+    // immediately before the click has the same ordinary UI race as an
+    // element moving immediately before a physical mouse press.
+    let screen = view.live_screen();
     if screen.mouse_protocol_mode() == MouseProtocol::None {
         sr.speak("mouse input unavailable", false)?;
         return Ok(CommandResult::Handled);

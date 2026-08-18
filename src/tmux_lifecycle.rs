@@ -14,6 +14,7 @@ pub enum GatewayOrigin {
     /// A nested control marker arrived in a pane owned by another connection.
     Pane {
         parent_connection_id: u64,
+        session_id: u64,
         window_id: u64,
         pane_id: u64,
     },
@@ -25,29 +26,20 @@ pub enum GatewayOrigin {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GatewayControlAction {
     GracefulDetach,
-    Interrupt,
-    ForceClose,
-    SshEscapeDisconnect,
-    SshEscapeHelp,
+    ForceAbandon,
 }
 
 impl GatewayControlAction {
     #[must_use]
     pub const fn requires_confirmation(self) -> bool {
-        matches!(
-            self,
-            Self::ForceClose | Self::SshEscapeDisconnect | Self::SshEscapeHelp
-        )
+        matches!(self, Self::ForceAbandon)
     }
 
     #[must_use]
     pub const fn transport_bytes(self) -> Option<&'static [u8]> {
         match self {
             Self::GracefulDetach => None,
-            Self::Interrupt => Some(b"\x03"),
-            Self::ForceClose => Some(b"\x1c"),
-            Self::SshEscapeDisconnect => Some(b"\r~."),
-            Self::SshEscapeHelp => Some(b"\r~?"),
+            Self::ForceAbandon => Some(b"\x1c"),
         }
     }
 }
@@ -62,8 +54,6 @@ pub enum LifecycleError {
     TooManyConnections,
     #[error("tmux connection hierarchy exceeds its nesting-depth bound")]
     TooDeep,
-    #[error("tmux client identity is unavailable or unsafe")]
-    UnsafeClientIdentity,
 }
 
 /// Tracks gateway ownership so destroying an outer pane cannot orphan children.
@@ -142,6 +132,20 @@ impl ConnectionHierarchy {
         self.origins.get(&connection_id).copied()
     }
 
+    /// Return a stable, deepest-first teardown order without changing the
+    /// hierarchy. A graceful cascade waits for each connection in this order
+    /// to actually leave control mode before asking its parent to detach.
+    #[must_use]
+    pub fn teardown_order(&self, connection_id: u64) -> Vec<u64> {
+        if !self.origins.contains_key(&connection_id) {
+            return Vec::new();
+        }
+        let mut ordered = Vec::new();
+        self.collect_descendants(connection_id, &mut ordered);
+        ordered.push(connection_id);
+        ordered
+    }
+
     /// Remove a connection and all descendants, deepest descendants first.
     pub fn remove_connection(&mut self, connection_id: u64) -> Vec<u64> {
         if !self.origins.contains_key(&connection_id) {
@@ -188,26 +192,6 @@ impl ConnectionHierarchy {
             })
             .collect::<Vec<_>>();
         self.remove_roots(&roots)
-    }
-
-    /// Select an unambiguous detach command for the number of live connections.
-    pub fn detach_command(
-        connection_count: usize,
-        client_name: &str,
-    ) -> Result<String, LifecycleError> {
-        if connection_count <= 1 {
-            return Ok("detach-client".to_owned());
-        }
-        if client_name.is_empty()
-            || client_name.len() > 4_096
-            || client_name.bytes().any(|byte| {
-                !byte.is_ascii_graphic()
-                    || matches!(byte, b'\0' | b'\r' | b'\n' | b'\'' | b'"' | b'\\' | b';')
-            })
-        {
-            return Err(LifecycleError::UnsafeClientIdentity);
-        }
-        Ok(format!("detach-client -t ={client_name}"))
     }
 
     fn remove_roots(&mut self, roots: &[u64]) -> Vec<u64> {
@@ -263,6 +247,7 @@ mod tests {
                 2,
                 GatewayOrigin::Pane {
                     parent_connection_id: 99,
+                    session_id: 1,
                     window_id: 1,
                     pane_id: 1,
                 }
@@ -280,6 +265,7 @@ mod tests {
                 2,
                 GatewayOrigin::Pane {
                     parent_connection_id: 1,
+                    session_id: 1,
                     window_id: 10,
                     pane_id: 20,
                 },
@@ -290,14 +276,17 @@ mod tests {
                 3,
                 GatewayOrigin::Pane {
                     parent_connection_id: 2,
+                    session_id: 1,
                     window_id: 30,
                     pane_id: 40,
                 },
             )
             .unwrap();
 
+        assert_eq!(hierarchy.teardown_order(1), vec![3, 2, 1]);
         assert_eq!(hierarchy.remove_connection(1), vec![3, 2, 1]);
         assert!(hierarchy.remove_connection(1).is_empty());
+        assert!(hierarchy.teardown_order(1).is_empty());
         assert!(hierarchy.is_empty());
     }
 }

@@ -5,6 +5,7 @@ use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -33,6 +34,8 @@ pub enum Error {
     Closed,
     #[error("parse RPC response")]
     Parse(#[source] serde_json::Error),
+    #[error("proc driver returned unsupported JSON-RPC version {0:?}")]
+    ProtocolVersion(String),
     #[error("proc driver RPC error {code}: {message}{data}")]
     Rpc {
         code: i64,
@@ -56,11 +59,8 @@ struct JsonRpcRequest<'a> {
 
 #[derive(Deserialize)]
 struct JsonRpcResponse {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
+    jsonrpc: String,
     id: Option<u64>,
-    #[allow(dead_code)]
-    result: Option<serde_json::Value>,
     error: Option<JsonRpcError>,
 }
 
@@ -72,13 +72,25 @@ struct JsonRpcError {
 }
 
 pub struct ProcDriver {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     request_buf: Vec<u8>,
     response_buf: String,
     next_id: u64,
     rate: f32,
+}
+
+#[derive(Clone)]
+pub struct TerminationHandle(Arc<Mutex<Child>>);
+
+impl TerminationHandle {
+    /// Interrupts a driver blocked in pipe I/O without waiting for its worker.
+    pub fn terminate(&self) {
+        if let Ok(mut child) = self.0.lock() {
+            let _ = child.kill();
+        }
+    }
 }
 
 impl ProcDriver {
@@ -94,7 +106,7 @@ impl ProcDriver {
         let stdin = child.stdin.take().ok_or(Error::MissingStdin)?;
         let stdout = child.stdout.take().ok_or(Error::MissingStdout)?;
         Ok(ProcDriver {
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdin,
             stdout: BufReader::new(stdout),
             request_buf: Vec::with_capacity(256),
@@ -102,6 +114,11 @@ impl ProcDriver {
             next_id: 1,
             rate: 1.0,
         })
+    }
+
+    #[must_use]
+    pub fn termination_handle(&self) -> TerminationHandle {
+        TerminationHandle(Arc::clone(&self.child))
     }
 
     fn call(&mut self, method: &str, params: Option<serde_json::Value>) -> Result<()> {
@@ -134,6 +151,9 @@ impl ProcDriver {
                 serde_json::from_str(self.response_buf.trim()).map_err(Error::Parse)?;
             if response.id != Some(id) {
                 continue;
+            }
+            if response.jsonrpc != "2.0" {
+                return Err(Error::ProtocolVersion(response.jsonrpc));
             }
             if let Some(err) = response.error {
                 return Err(Error::Rpc {
@@ -173,7 +193,9 @@ impl Driver for ProcDriver {
 
 impl Drop for ProcDriver {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }

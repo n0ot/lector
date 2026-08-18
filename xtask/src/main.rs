@@ -2,7 +2,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Stdio},
+    process::{Command, ExitCode},
 };
 
 fn main() -> ExitCode {
@@ -25,25 +25,6 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
         Some("ghostty-bootstrap") => {
             validate_bootstrap_args(task_args)?;
             bootstrap_ghostty(&root, task_args)
-        }
-        Some("ghostty-debug") => {
-            reject_args(task_args, "ghostty-debug")?;
-            bootstrap_ghostty(
-                &root,
-                &[OsString::from("--optimize"), OsString::from("Debug")],
-            )?;
-            cargo(&root, ["build", "--locked", "--features", "ghostty-vt"])
-        }
-        Some("ghostty-release") => {
-            reject_args(task_args, "ghostty-release")?;
-            bootstrap_ghostty(
-                &root,
-                &[OsString::from("--optimize"), OsString::from("ReleaseFast")],
-            )?;
-            cargo(
-                &root,
-                ["build", "--locked", "--release", "--features", "ghostty-vt"],
-            )
         }
         Some("ghostty-check") => {
             reject_args(task_args, "ghostty-check")?;
@@ -87,44 +68,12 @@ fn workspace_root() -> PathBuf {
 }
 
 fn bootstrap_ghostty(root: &Path, args: &[OsString]) -> Result<(), String> {
-    let zig = bootstrap_zig(root)?;
-    let zig_dir = zig
-        .parent()
-        .ok_or_else(|| format!("Zig path has no parent directory: {}", zig.display()))?;
-    let path = env::join_paths(
-        std::iter::once(zig_dir.to_owned())
-            .chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
-    )
-    .map_err(|error| format!("could not add the pinned Zig directory to PATH: {error}"))?;
-
     command(
         Command::new(root.join("scripts/bootstrap_ghostty.sh"))
             .args(args)
-            .env("PATH", path)
             .current_dir(root),
         "Ghostty bootstrap",
     )
-}
-
-fn bootstrap_zig(root: &Path) -> Result<PathBuf, String> {
-    let output = Command::new(root.join("scripts/bootstrap_zig.sh"))
-        .current_dir(root)
-        .stderr(Stdio::inherit())
-        .output()
-        .map_err(|error| format!("could not start Zig bootstrap: {error}"))?;
-    if !output.status.success() {
-        return Err(format!("Zig bootstrap failed with {}", output.status));
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|error| format!("Zig bootstrap returned a non-UTF-8 path: {error}"))?;
-    let path = PathBuf::from(stdout.trim());
-    if !path.is_file() {
-        return Err(format!(
-            "Zig bootstrap returned a missing executable: {}",
-            path.display()
-        ));
-    }
-    Ok(path)
 }
 
 fn cargo<I, S>(root: &Path, args: I) -> Result<(), String>
@@ -175,7 +124,7 @@ fn reject_args(args: &[OsString], task: &str) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "Repository tasks:\n  cargo ghostty-release\n  cargo ghostty-debug\n  cargo ghostty-bootstrap [--target TARGET] [--optimize MODE]\n  cargo ghostty-check\n  cargo ghostty-bench [--self-test] [--output PATH] [--check-baseline PATH]"
+    "Repository maintenance tasks:\n  cargo ghostty-bootstrap [--target TARGET] [--optimize MODE]\n  cargo ghostty-check\n  cargo ghostty-bench [--self-test] [--output PATH] [--check-baseline PATH]"
         .to_owned()
 }
 

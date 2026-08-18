@@ -29,10 +29,13 @@ fn linked_build_matches_the_pinned_source_and_feature_contract() {
 
 #[test]
 fn linked_build_uses_the_cargo_profile_and_supported_architecture() {
-    let expected_mode = if cfg!(debug_assertions) {
-        OptimizeMode::Debug
-    } else {
-        OptimizeMode::ReleaseFast
+    let configured_mode = std::env::var("LECTOR_GHOSTTY_OPTIMIZE").ok();
+    let expected_mode = match configured_mode.as_deref().unwrap_or("ReleaseFast") {
+        "Debug" => OptimizeMode::Debug,
+        "ReleaseSafe" => OptimizeMode::ReleaseSafe,
+        "ReleaseSmall" => OptimizeMode::ReleaseSmall,
+        "ReleaseFast" => OptimizeMode::ReleaseFast,
+        mode => panic!("unexpected linked Ghostty optimization mode {mode:?}"),
     };
     assert_eq!(build_info::optimize_mode().unwrap(), expected_mode);
     assert!(ghostty::validate_target(env!("LECTOR_GHOSTTY_TARGET")).is_ok());

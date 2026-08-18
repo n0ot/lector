@@ -1,9 +1,17 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+struct TmuxGatewayHop {
+    parent_connection_id: u64,
+    session_id: crate::tmux_model::SessionId,
+    window_id: crate::tmux_model::WindowId,
+    pane_id: crate::tmux_model::PaneId,
+}
+
 impl App {
-    /// Requests an accessible control for the transport which owns the
-    /// currently selected tmux connection. Potentially destructive byte
-    /// sequences are staged behind the normal confirmation popup.
+    /// Requests lifecycle control for the currently selected tmux connection.
+    /// Graceful teardown is ordered by the connection hierarchy. Abandoning a
+    /// transport is staged behind the normal confirmation popup.
     pub fn request_tmux_gateway_action(
         &mut self,
         sr: &mut ScreenReader,
@@ -18,36 +26,51 @@ impl App {
             return Ok(false);
         };
 
-        if action == crate::tmux_lifecycle::GatewayControlAction::GracefulDetach {
-            self.queue_accessible_tmux_detach(connection_id, sr, term_out)?;
-            return Ok(true);
+        self.request_tmux_gateway_action_for(connection_id, sr, action, term_out)
+    }
+
+    pub(super) fn request_tmux_gateway_action_for(
+        &mut self,
+        connection_id: u64,
+        sr: &mut ScreenReader,
+        action: crate::tmux_lifecycle::GatewayControlAction,
+        term_out: &mut dyn Write,
+    ) -> Result<bool> {
+        if !self
+            .tmux_connections
+            .iter()
+            .any(|connection| connection.id == connection_id)
+        {
+            return Ok(false);
         }
-        if !action.requires_confirmation() {
-            self.queue_gateway_transport_input(connection_id, action)?;
+
+        if action == crate::tmux_lifecycle::GatewayControlAction::GracefulDetach {
+            self.begin_graceful_tmux_teardown(connection_id, sr, term_out)?;
             return Ok(true);
         }
 
+        // If a deepest-first cascade is waiting on a descendant, uppercase D
+        // must address the connection which is actually stuck, not merely the
+        // ancestor row from which the cascade was started.
+        let connection_id = self
+            .pending_graceful_teardown
+            .as_ref()
+            .and_then(|pending| pending.awaiting)
+            .filter(|awaiting| {
+                self.tmux_hierarchy
+                    .teardown_order(connection_id)
+                    .contains(awaiting)
+            })
+            .unwrap_or(connection_id);
+
         let (title, message) = match action {
-            crate::tmux_lifecycle::GatewayControlAction::ForceClose => (
-                "force close tmux gateway",
+            crate::tmux_lifecycle::GatewayControlAction::ForceAbandon => (
+                "expose raw tmux transport",
                 format!(
-                    "Send Control-backslash to the transport for tmux connection {connection_id}?"
+                    "Send Control-backslash to the transport for tmux connection {connection_id}? If it does not exit within {TMUX_FORCE_ABANDON_GRACE_MS} milliseconds, Lector will stop interpreting that transport as tmux control and expose its raw channel."
                 ),
             ),
-            crate::tmux_lifecycle::GatewayControlAction::SshEscapeDisconnect => (
-                "disconnect SSH tmux gateway",
-                format!(
-                    "Send the SSH line-start escape ~. to the transport for tmux connection {connection_id}?"
-                ),
-            ),
-            crate::tmux_lifecycle::GatewayControlAction::SshEscapeHelp => (
-                "show SSH gateway escapes",
-                format!(
-                    "Send the SSH line-start escape ~? to the transport for tmux connection {connection_id}?"
-                ),
-            ),
-            crate::tmux_lifecycle::GatewayControlAction::GracefulDetach
-            | crate::tmux_lifecycle::GatewayControlAction::Interrupt => unreachable!(),
+            crate::tmux_lifecycle::GatewayControlAction::GracefulDetach => unreachable!(),
         };
         self.pending_tmux_confirmation = None;
         self.pending_gateway_confirmation = Some(PendingGatewayConfirmation {
@@ -65,37 +88,224 @@ impl App {
         if !self.tmux_hierarchy.contains(confirmation.connection_id) {
             return Ok(false);
         }
+        self.pending_graceful_teardown = None;
         self.queue_gateway_transport_input(confirmation.connection_id, confirmation.action)?;
+        self.pending_force_abandon = Some(PendingForceAbandon {
+            connection_id: confirmation.connection_id,
+            deadline_ms: self
+                .clock
+                .now_ms()
+                .saturating_add(TMUX_FORCE_ABANDON_GRACE_MS),
+        });
+        self.log_event(&format!(
+            "armed tmux raw-transport fallback for connection {}",
+            confirmation.connection_id
+        ));
         Ok(true)
     }
 
-    fn queue_accessible_tmux_detach(
+    fn begin_graceful_tmux_teardown(
         &mut self,
         connection_id: u64,
         sr: &mut ScreenReader,
         term_out: &mut dyn Write,
     ) -> Result<()> {
-        let client_name = self
-            .tmux_connections
-            .iter()
-            .find(|connection| connection.id == connection_id)
-            .and_then(|connection| connection.topology.client_info("client_name"))
-            .unwrap_or_default();
-        match crate::tmux_lifecycle::ConnectionHierarchy::detach_command(
-            self.tmux_connections.len(),
-            client_name,
-        ) {
-            Ok(command) => self.queue_tmux_user_command(connection_id, &command),
-            Err(error) => self.show_popup_error(
-                sr,
-                "tmux detach unavailable",
-                &format!("cannot identify the active tmux client: {error}"),
-                term_out,
-            ),
-        }
+        let remaining = self.tmux_hierarchy.teardown_order(connection_id).into();
+        self.pending_force_abandon = None;
+        self.pending_graceful_teardown = Some(PendingGracefulTeardown {
+            remaining,
+            awaiting: None,
+        });
+        self.advance_graceful_tmux_teardown(sr, term_out)
     }
 
-    fn queue_gateway_transport_input(
+    pub(super) fn advance_graceful_tmux_teardown(
+        &mut self,
+        sr: &mut ScreenReader,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        if self
+            .pending_graceful_teardown
+            .as_ref()
+            .and_then(|pending| pending.awaiting)
+            .is_some_and(|connection_id| self.tmux_hierarchy.contains(connection_id))
+        {
+            return Ok(());
+        }
+        if let Some(pending) = self.pending_graceful_teardown.as_mut() {
+            pending.awaiting = None;
+        }
+
+        let next = loop {
+            let Some(pending) = self.pending_graceful_teardown.as_mut() else {
+                return Ok(());
+            };
+            let Some(connection_id) = pending.remaining.pop_front() else {
+                self.pending_graceful_teardown = None;
+                self.log_event("completed graceful tmux connection teardown");
+                return Ok(());
+            };
+            if self.tmux_hierarchy.contains(connection_id) {
+                break connection_id;
+            }
+        };
+
+        if self.queue_accessible_tmux_detach(next, sr, term_out)? {
+            if let Some(pending) = self.pending_graceful_teardown.as_mut() {
+                pending.awaiting = Some(next);
+            }
+            self.log_event(&format!(
+                "requested graceful tmux detach for connection {next}"
+            ));
+        } else {
+            self.pending_graceful_teardown = None;
+        }
+        Ok(())
+    }
+
+    fn queue_accessible_tmux_detach(
+        &mut self,
+        connection_id: u64,
+        _sr: &mut ScreenReader,
+        _term_out: &mut dyn Write,
+    ) -> Result<bool> {
+        // A nested control stream is carried as pane output by every ancestor.
+        // The connection chooser can cover those panes long enough for tmux's
+        // pause-after flow control to stop delivery. Resume the route from the
+        // outside in so the child's `%exit` reaches Lector and the graceful
+        // cascade can advance to its parent.
+        if !self.queue_tmux_gateway_path_resumes(connection_id) {
+            return Ok(false);
+        }
+
+        // The selected Lector connection already identifies one control-mode
+        // client. An unqualified command on that channel detaches that client;
+        // retargeting by a client name from another server is both redundant
+        // and can make tmux report that the client does not exist.
+        self.queue_tmux_user_command(connection_id, "detach-client")?;
+        Ok(true)
+    }
+
+    fn tmux_gateway_path(&self, connection_id: u64) -> Option<Vec<TmuxGatewayHop>> {
+        let mut gateway_path = Vec::new();
+        let mut routed_connection_id = connection_id;
+        for _ in 0..=64 {
+            match self.tmux_hierarchy.origin(routed_connection_id) {
+                Some(GatewayOrigin::Direct) => break,
+                Some(GatewayOrigin::Pane {
+                    parent_connection_id,
+                    session_id,
+                    window_id,
+                    pane_id,
+                }) => {
+                    gateway_path.push(TmuxGatewayHop {
+                        parent_connection_id,
+                        session_id: crate::tmux_model::SessionId(session_id),
+                        window_id: crate::tmux_model::WindowId(window_id),
+                        pane_id: crate::tmux_model::PaneId(pane_id),
+                    });
+                    routed_connection_id = parent_connection_id;
+                }
+                None => return None,
+            }
+        }
+        gateway_path.reverse();
+        Some(gateway_path)
+    }
+
+    pub(super) fn active_tmux_gateway_path(&self) -> Vec<(u64, crate::tmux_model::PaneId)> {
+        self.active_tmux_connection
+            .and_then(|connection_id| self.tmux_gateway_path(connection_id))
+            .map(|path| {
+                path.into_iter()
+                    .map(|hop| (hop.parent_connection_id, hop.pane_id))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(super) fn queue_tmux_gateway_path_resumes(&mut self, connection_id: u64) -> bool {
+        let Some(gateway_path) = self.tmux_gateway_path(connection_id) else {
+            return false;
+        };
+        let mut restore_commands = Vec::new();
+        for hop in &gateway_path {
+            let Some(connection) = self
+                .tmux_connections
+                .iter()
+                .find(|connection| connection.id == hop.parent_connection_id)
+            else {
+                return false;
+            };
+            let topology = &connection.topology;
+            let Some(session) = topology.session(hop.session_id) else {
+                return false;
+            };
+            let Some(window) = topology.window(hop.window_id) else {
+                return false;
+            };
+            let Some(pane) = topology.pane(hop.pane_id) else {
+                return false;
+            };
+            if pane.window_id != hop.window_id
+                || !session
+                    .windows
+                    .values()
+                    .any(|window_id| *window_id == hop.window_id)
+            {
+                return false;
+            }
+            if topology.attached_session() != Some(hop.session_id) {
+                restore_commands.push((
+                    hop.parent_connection_id,
+                    format!("switch-client -t ${}", hop.session_id.0),
+                ));
+            }
+            if session.active_window != Some(hop.window_id) {
+                restore_commands.push((
+                    hop.parent_connection_id,
+                    format!("select-window -t @{}", hop.window_id.0),
+                ));
+            }
+            if window.active_pane != Some(hop.pane_id) {
+                restore_commands.push((
+                    hop.parent_connection_id,
+                    format!("select-pane -t %{}", hop.pane_id.0),
+                ));
+            }
+        }
+        for (parent_connection_id, command) in restore_commands {
+            let mut bytes = command.into_bytes();
+            bytes.push(b'\n');
+            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+                connection_id: parent_connection_id,
+                bytes,
+                expected_replies: vec![ExpectedTmuxReply::Ignored],
+                kind: PendingTmuxCommandKind::Ordinary,
+            });
+        }
+        for hop in gateway_path {
+            let parent_connection_id = hop.parent_connection_id;
+            let pane_id = hop.pane_id;
+            if let Some(flow) = self
+                .tmux_connections
+                .iter_mut()
+                .find(|connection| connection.id == parent_connection_id)
+                .and_then(|connection| connection.pane_flow.get_mut(&pane_id))
+            {
+                flow.resume_requested = true;
+            }
+            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+                connection_id: parent_connection_id,
+                bytes: crate::tmux_input::continue_pane_command(pane_id),
+                expected_replies: vec![ExpectedTmuxReply::PaneContinue(pane_id)],
+                kind: PendingTmuxCommandKind::Ordinary,
+            });
+        }
+        true
+    }
+
+    pub(super) fn queue_gateway_transport_input(
         &mut self,
         connection_id: u64,
         action: crate::tmux_lifecycle::GatewayControlAction,
@@ -131,6 +341,7 @@ impl App {
             .map(|connection| views::TmuxConnectionItem {
                 connection_id: connection.id,
                 label: connection.topology.label().to_owned(),
+                host: connection.topology.host().map(str::to_owned),
             })
             .collect()
     }
@@ -149,7 +360,7 @@ impl App {
         let connection_id = self
             .view_stack
             .active_tmux_connection_mut()
-            .filter(|view| view.is_ready() && !view.is_showing_portal())
+            .filter(|view| view.is_ready() && !view.is_showing_connection_portal())
             .map(|view| view.connection_id())?;
         let topology = self
             .tmux_connections
@@ -168,7 +379,15 @@ impl App {
         if self.tmux_connections.is_empty() {
             return Ok(false);
         }
-        let (rows, cols) = self.view_stack.root_mut().model().size();
+        if let Some(connection_id) = self.active_tmux_connection
+            && let Some(connection) = self
+                .tmux_connections
+                .iter_mut()
+                .find(|connection| connection.id == connection_id)
+        {
+            connection.prefix_state = None;
+        }
+        let (rows, cols) = self.view_stack.root_mut().model().live_size();
         let chooser = views::TmuxConnectionChooserView::new(
             rows,
             cols,
@@ -190,7 +409,7 @@ impl App {
         else {
             return Ok(false);
         };
-        let (rows, cols) = self.view_stack.root_mut().model().size();
+        let (rows, cols) = self.view_stack.root_mut().model().live_size();
         self.handle_view_action(
             sr,
             views::ViewAction::Push(Box::new(views::TmuxConnectionRenameView::new(
@@ -273,7 +492,7 @@ impl App {
         let Some((connection_id, topology)) = self.active_visible_tmux_snapshot() else {
             return Ok(false);
         };
-        let (rows, cols) = self.view_stack.root_mut().model().size();
+        let (rows, cols) = self.view_stack.root_mut().model().live_size();
         let chooser = create(rows, cols, connection_id, &topology);
         self.handle_view_action(sr, views::ViewAction::Push(Box::new(chooser)), term_out)?;
         Ok(true)
@@ -293,7 +512,7 @@ impl App {
             .find(|connection| connection.id == connection_id)
             .map(|connection| connection.command_history.clone())
             .unwrap_or_default();
-        let (rows, cols) = self.view_stack.root_mut().model().size();
+        let (rows, cols) = self.view_stack.root_mut().model().live_size();
         self.handle_view_action(
             sr,
             views::ViewAction::Push(Box::new(views::TmuxCommandView::new(

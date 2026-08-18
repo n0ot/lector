@@ -40,19 +40,20 @@ jobs:
           = "${{ matrix.target }}"
       - name: Build and test linked Ghostty metadata
         run: cargo ghostty-check
+      - name: Check Rust formatting
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo fmt --all -- --check
+      - name: Lint workspace
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Check shell scripts
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: >-
+          git grep -Il -E '^#!.*(ba)?sh' -- scripts tests/fixtures/pty
+          | xargs shellcheck -x
       - name: Run complete suite
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --locked --all-targets --features ghostty-vt
-      - name: Run authoritative Ghostty corpus and harnesses
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          cargo test --locked --features ghostty-vt --test ghostty_authoritative
-          cargo test --locked --features ghostty-vt --test ghostty_differential
-          cargo test --locked --features ghostty-vt --test ghostty_engine
-          cargo test --locked --features ghostty-vt --test semantic_history
-          cargo test --locked --features ghostty-vt --test terminal_effects
-          cargo test --locked --features ghostty-vt --test terminal_resize
-          cargo test --locked --features ghostty-vt --test harness
+        run: cargo test --locked --workspace --all-targets --all-features
 
   tier-two-compile:
     name: ${{ matrix.target }} compile check
@@ -69,10 +70,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Bootstrap pinned Ghostty archive
-        run: >-
-          cargo ghostty-bootstrap --target "${{ matrix.target }}"
-          --optimize Debug
       - name: Compile authoritative Ghostty path
         run: >-
           cargo check --locked --target "${{ matrix.target }}"

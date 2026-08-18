@@ -273,6 +273,51 @@ fn full_renderer_reconstructs_cursor_shapes_visibility_and_screen_selection() {
 }
 
 #[test]
+fn full_renderer_keeps_child_screen_transitions_inside_the_owned_outer_alternate() {
+    let geometry = TerminalGeometry::from_cells(3, 12);
+    let mut renderer = FullSceneVtRenderer::new(RenderCapabilities::default());
+    let mut previous = PresentedScene::blank(geometry);
+    let mut physical = GhosttyEngine::new(geometry.rows, geometry.cols).expect("physical engine");
+    physical
+        .advance(b"\x1b[?1049h")
+        .expect("enter Lector-owned alternate screen");
+
+    for (name, source, expected) in [
+        ("child-primary", b"shell".as_slice(), "shell"),
+        ("child-alternate", b"\x1b[?1049heditor".as_slice(), "editor"),
+        (
+            "child-primary-restored",
+            b"shell-returned".as_slice(),
+            "shell-returned",
+        ),
+    ] {
+        let (scene, _) = scene_from_bytes(geometry, source);
+        let batch = renderer
+            .render(&scene, &SceneDamage::Full, &previous)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let emitted = batch
+            .transactions
+            .iter()
+            .flat_map(|transaction| transaction.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(
+            !contains(&emitted, b"\x1b[?1049h") && !contains(&emitted, b"\x1b[?1049l"),
+            "{name}: renderer changed the physical screen: {emitted:?}"
+        );
+        physical
+            .advance(&emitted)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let snapshot = physical.normalized_snapshot();
+        assert!(
+            snapshot.alternate_screen(),
+            "{name}: renderer escaped Lector's owned alternate screen"
+        );
+        assert!(snapshot.contents().contains(expected), "{name}");
+        previous = batch.predicted;
+    }
+}
+
+#[test]
 fn full_renderer_clears_prior_cells_images_and_unknown_physical_state() {
     let geometry = TerminalGeometry::new(3, 8, 10, 20);
     let image = b"\x1b_Ga=T,f=32,s=1,v=1,i=7,p=9,c=1,r=1,q=2;/wAA/w==\x1b\\";

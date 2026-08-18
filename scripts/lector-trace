@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+
+"""Run Lector through a transparent, bidirectional PTY trace."""
+
+import argparse
+import errno
+import fcntl
+import json
+import os
+from pathlib import Path
+import pty
+import selectors
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import tty
+
+
+def escaped(data: bytes) -> str:
+    result = []
+    for byte in data:
+        if byte == 0x1B:
+            result.append("\\e")
+        elif byte == 0x0D:
+            result.append("\\r")
+        elif byte == 0x0A:
+            result.append("\\n")
+        elif byte == 0x09:
+            result.append("\\t")
+        elif 0x20 <= byte <= 0x7E:
+            result.append(chr(byte))
+        else:
+            result.append(f"\\x{byte:02x}")
+    return "".join(result)
+
+
+def write_all(fd: int, data: bytes) -> None:
+    while data:
+        written = os.write(fd, data)
+        data = data[written:]
+
+
+def executable(name: str, option: str, sibling_directory: Path) -> str:
+    sibling = sibling_directory / name
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+    found = shutil.which(name)
+    if found is None:
+        raise SystemExit(f"cannot find {name}; use {option}")
+    return found
+
+
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run Lector normally while recording terminal bytes, internal diagnostics, "
+            "and spoken-text RPCs. Unrecognized arguments are passed to Lector."
+        ),
+        epilog='example: lector-trace --shell "$SHELL"',
+    )
+    parser.add_argument(
+        "--trace-dir",
+        type=Path,
+        help="new directory for this trace (default: a timestamped system temp directory)",
+    )
+    parser.add_argument("--lector", type=Path, help="Lector executable")
+    parser.add_argument("--speech-server", type=Path, help="lector-tts executable")
+    return parser.parse_known_args()
+
+
+def main() -> int:
+    args, lector_args = parse_args()
+    script_directory = Path(__file__).resolve().parent
+    lector = (
+        str(args.lector)
+        if args.lector
+        else executable("lector", "--lector", script_directory)
+    )
+    speech_server = (
+        str(args.speech_server)
+        if args.speech_server
+        else executable("lector-tts", "--speech-server", script_directory)
+    )
+    if not lector_args:
+        shell = os.environ.get("SHELL")
+        if not shell:
+            raise SystemExit("SHELL is not set; pass --shell /path/to/shell")
+        lector_args = ["--shell", shell]
+
+    if args.trace_dir:
+        trace_directory = args.trace_dir.expanduser().resolve()
+        trace_directory.mkdir(parents=True, exist_ok=False)
+    else:
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        trace_directory = Path(
+            tempfile.mkdtemp(prefix=f"lector-trace-{timestamp}-", dir=tempfile.gettempdir())
+        ).resolve()
+
+    terminal_log_path = trace_directory / "terminal-bytes.log"
+    lector_log_path = trace_directory / "lector.log"
+    speech_log_path = trace_directory / "speech.jsonl"
+    metadata_path = trace_directory / "metadata.json"
+    command = [
+        lector,
+        "--speech-driver",
+        "proc",
+        "--speech-server",
+        speech_server,
+        "--log",
+        *lector_args,
+    ]
+
+    outer_input = sys.stdin.fileno()
+    outer_output = sys.stdout.fileno()
+    if not os.isatty(outer_input) or not os.isatty(outer_output):
+        raise SystemExit("lector-trace must be run directly in a terminal")
+
+    outer_attributes = termios.tcgetattr(outer_input)
+    window_size = fcntl.ioctl(outer_input, termios.TIOCGWINSZ, b"\0" * 8)
+    rows, columns, _xpixels, _ypixels = struct.unpack("HHHH", window_size)
+    metadata = {
+        "started_unix_us": time.time_ns() // 1_000,
+        "working_directory": os.getcwd(),
+        "command": command,
+        "term": os.environ.get("TERM"),
+        "colorterm": os.environ.get("COLORTERM"),
+        "terminal_program": os.environ.get("TERM_PROGRAM"),
+        "rows": rows,
+        "columns": columns,
+        "terminal_log": str(terminal_log_path),
+        "lector_log": str(lector_log_path),
+        "speech_log": str(speech_log_path),
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+    master, slave = pty.openpty()
+    termios.tcsetattr(slave, termios.TCSANOW, outer_attributes)
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, window_size)
+
+    def establish_controlling_terminal() -> None:
+        os.setsid()
+        fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+    environment = os.environ.copy()
+    environment["LECTOR_SPEECH_RPC_LOG"] = str(speech_log_path)
+    lector_log = lector_log_path.open("wb", buffering=0)
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=slave,
+            stdout=slave,
+            stderr=lector_log,
+            env=environment,
+            close_fds=True,
+            preexec_fn=establish_controlling_terminal,
+        )
+    except BaseException:
+        os.close(master)
+        os.close(slave)
+        lector_log.close()
+        raise
+    os.close(slave)
+
+    def copy_window_size() -> None:
+        try:
+            size = fcntl.ioctl(outer_input, termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(master, termios.TIOCSWINSZ, size)
+        except OSError:
+            pass
+
+    def resize(_signal_number: int, _frame: object) -> None:
+        copy_window_size()
+        try:
+            os.killpg(child.pid, signal.SIGWINCH)
+        except ProcessLookupError:
+            pass
+
+    signal.signal(signal.SIGWINCH, resize)
+    selector = selectors.DefaultSelector()
+    selector.register(outer_input, selectors.EVENT_READ, "terminal-to-lector")
+    selector.register(master, selectors.EVENT_READ, "lector-to-terminal")
+    started = time.monotonic_ns()
+    started_unix_us = time.time_ns() // 1_000
+
+    print(
+        f"Recording Lector trace in {trace_directory}\n"
+        "Warning: it contains everything typed, displayed, and sent to speech.",
+        file=sys.stderr,
+        flush=True,
+    )
+    with terminal_log_path.open("w", encoding="utf-8", buffering=1) as terminal_log:
+        terminal_log.write(
+            f"0 START unix_us={started_unix_us} pid={child.pid} command={command!r}\n"
+        )
+        tty.setraw(outer_input)
+        try:
+            while selector.get_map():
+                for key, _mask in selector.select(timeout=0.1):
+                    try:
+                        data = os.read(key.fd, 4096)
+                    except OSError as error:
+                        if key.fd == master and error.errno == errno.EIO:
+                            data = b""
+                        else:
+                            raise
+                    elapsed_us = (time.monotonic_ns() - started) // 1_000
+                    if not data:
+                        selector.unregister(key.fd)
+                        terminal_log.write(f"{elapsed_us} EOF {key.data}\n")
+                        continue
+                    terminal_log.write(
+                        f"{elapsed_us} {key.data} {len(data)} "
+                        f"hex={data.hex()} text={escaped(data)}\n"
+                    )
+                    if key.fd == outer_input:
+                        write_all(master, data)
+                    else:
+                        write_all(outer_output, data)
+                if child.poll() is not None and master not in selector.get_map():
+                    break
+        finally:
+            termios.tcsetattr(outer_input, termios.TCSADRAIN, outer_attributes)
+            elapsed_us = (time.monotonic_ns() - started) // 1_000
+            status = child.wait()
+            terminal_log.write(f"{elapsed_us} EXIT status={status}\n")
+            lector_log.close()
+
+    print(f"Lector trace saved in {trace_directory}", file=sys.stderr, flush=True)
+    return child.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

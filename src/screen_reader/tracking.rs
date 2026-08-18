@@ -1,5 +1,9 @@
 use super::{Result, ScreenReader};
-use crate::{ext::ScreenExt, view::View};
+use crate::{
+    ext::ScreenExt,
+    presentation::{ViewId, ViewRevision},
+    view::View,
+};
 use std::collections::HashSet;
 
 pub(super) enum CursorTrackingMode {
@@ -7,9 +11,28 @@ pub(super) enum CursorTrackingMode {
     OffOnce,
 }
 
-pub(super) enum PendingDelete {
-    Backspace { cursor: (u16, u16), text: String },
-    Delete { text: String },
+pub(super) struct PendingDelete {
+    view_id: ViewId,
+    /// The newest parser revision which already existed when the input was
+    /// sent. A physical frame at or before this boundary cannot be the
+    /// application's response to the deletion.
+    revision_boundary: Option<ViewRevision>,
+    last_evaluated_revision: Option<ViewRevision>,
+    evaluations: u8,
+    input_sequence: u64,
+    kind: PendingDeleteKind,
+}
+
+pub(super) enum PendingDeleteKind {
+    Backspace {
+        cursor: (u16, u16),
+        text: String,
+    },
+    Delete {
+        cursor: (u16, u16),
+        text: String,
+        line_before: String,
+    },
 }
 
 impl ScreenReader {
@@ -57,64 +80,167 @@ impl ScreenReader {
     }
 
     pub fn clear_pending_delete(&mut self) {
-        self.pending_delete = None;
+        self.pending_deletes.clear();
     }
 
     pub fn defer_backspace(&mut self, view: &View) {
         let (row, col) = view.screen().cursor_position();
-        let text = if col > 0 {
+        let view_id = view.view_id();
+        let revision_boundary = view.input_intent_revision_boundary();
+        let virtual_offset = self
+            .pending_deletes
+            .back()
+            .filter(|pending| {
+                pending.view_id == view_id
+                    && pending.input_sequence.wrapping_add(1) == self.input_sequence
+                    && matches!(pending.kind, PendingDeleteKind::Backspace { .. })
+            })
+            .and_then(|pending| match pending.kind {
+                PendingDeleteKind::Backspace {
+                    cursor: (pending_row, pending_col),
+                    ..
+                } if pending_row == row && pending_col <= col => Some(col - pending_col + 1),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let virtual_col = col.saturating_sub(virtual_offset);
+        let text = if virtual_col > 0 {
             view.screen()
-                .cell(row, col - 1)
+                .cell(row, virtual_col - 1)
                 .map(|cell| cell.contents().to_string())
                 .unwrap_or_default()
         } else {
             String::new()
         };
-        self.pending_delete = Some(PendingDelete::Backspace {
-            cursor: (row, col),
-            text,
+        if text.is_empty() {
+            return;
+        }
+        self.push_pending_delete(PendingDelete {
+            view_id,
+            revision_boundary,
+            last_evaluated_revision: None,
+            evaluations: 0,
+            input_sequence: self.input_sequence,
+            kind: PendingDeleteKind::Backspace {
+                cursor: (row, virtual_col),
+                text,
+            },
         });
     }
 
     pub fn defer_delete(&mut self, view: &View) {
         let (row, col) = view.screen().cursor_position();
+        let view_id = view.view_id();
+        let revision_boundary = view.input_intent_revision_boundary();
+        let virtual_offset = self
+            .pending_deletes
+            .back()
+            .filter(|pending| {
+                pending.view_id == view_id
+                    && pending.input_sequence.wrapping_add(1) == self.input_sequence
+                    && matches!(pending.kind, PendingDeleteKind::Delete { .. })
+            })
+            .and_then(|pending| match pending.kind {
+                PendingDeleteKind::Delete {
+                    cursor: (pending_row, pending_col),
+                    ..
+                } if pending_row == row && pending_col >= col => Some(pending_col - col + 1),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let virtual_col = col.saturating_add(virtual_offset);
         let text = view
             .screen()
-            .cell(row, col)
+            .cell(row, virtual_col)
             .map(|cell| cell.contents().to_string())
             .unwrap_or_default();
-        self.pending_delete = Some(PendingDelete::Delete { text });
+        if text.is_empty() {
+            return;
+        }
+        self.push_pending_delete(PendingDelete {
+            view_id,
+            revision_boundary,
+            last_evaluated_revision: None,
+            evaluations: 0,
+            input_sequence: self.input_sequence,
+            kind: PendingDeleteKind::Delete {
+                cursor: (row, virtual_col),
+                text,
+                line_before: view.line(row),
+            },
+        });
     }
 
     pub fn resolve_pending_delete(&mut self, view: &View) -> Result<bool> {
-        let Some(pending) = self.pending_delete.take() else {
+        if self.pending_deletes.is_empty() {
             return Ok(false);
-        };
+        }
 
-        let prev_cursor = view.prev_screen().cursor_position();
+        let view_id = view.view_id();
+        let accessibility_revision = view.accessibility_revision();
         let cursor = view.screen().cursor_position();
-        let screen_changed =
-            view.screen().contents() != view.prev_screen().contents() || cursor != prev_cursor;
+        let mut pending = std::mem::take(&mut self.pending_deletes);
+        let mut retained = std::collections::VecDeque::with_capacity(pending.len());
+        let mut spoken = Vec::new();
 
-        match pending {
-            PendingDelete::Backspace {
-                cursor: old_cursor,
-                text,
-            } => {
-                if !text.is_empty() && cursor.0 == old_cursor.0 && cursor.1 < old_cursor.1 {
-                    self.speak(&text, false)?;
-                    return Ok(true);
-                }
+        while let Some(mut intent) = pending.pop_front() {
+            if intent.view_id != view_id {
+                retained.push_back(intent);
+                continue;
             }
-            PendingDelete::Delete { text } => {
-                if !text.is_empty() && screen_changed {
-                    self.speak(&text, false)?;
-                    return Ok(true);
+            if !revision_passed(intent.revision_boundary, accessibility_revision) {
+                retained.push_back(intent);
+                continue;
+            }
+            if accessibility_revision.is_some()
+                && intent.last_evaluated_revision == accessibility_revision
+            {
+                retained.push_back(intent);
+                continue;
+            }
+
+            let confirmed = match &intent.kind {
+                PendingDeleteKind::Backspace {
+                    cursor: old_cursor, ..
+                } => cursor.0 == old_cursor.0 && cursor.1 < old_cursor.1,
+                PendingDeleteKind::Delete {
+                    cursor: (row, _),
+                    line_before,
+                    ..
+                } => view.line(*row) != *line_before,
+            };
+            if confirmed {
+                spoken.push(match intent.kind {
+                    PendingDeleteKind::Backspace { text, .. }
+                    | PendingDeleteKind::Delete { text, .. } => text,
+                });
+            } else {
+                // The first post-input presentation can be unrelated output.
+                // Keep this intent until a frame actually exhibits its
+                // deletion, subject to the global resource bound enforced at
+                // insertion. It must not block an independently confirmable
+                // later intent: an application may ignore one deletion while
+                // handling the next.
+                intent.last_evaluated_revision = accessibility_revision;
+                intent.evaluations = intent.evaluations.saturating_add(1);
+                if intent.evaluations < super::MAX_PENDING_DELETE_PRESENTATIONS {
+                    retained.push_back(intent);
                 }
             }
         }
+        self.pending_deletes = retained;
 
-        Ok(false)
+        for text in &spoken {
+            self.speak(text, false)?;
+        }
+        Ok(!spoken.is_empty())
+    }
+
+    fn push_pending_delete(&mut self, pending: PendingDelete) {
+        if self.pending_deletes.len() >= super::MAX_PENDING_DELETE_INTENTS {
+            self.pending_deletes.pop_front();
+        }
+        self.pending_deletes.push_back(pending);
     }
 
     pub fn track_highlighting(&mut self, view: &mut View) -> Result<()> {
@@ -146,5 +272,19 @@ impl ScreenReader {
             self.speak(&format!("indent {indent_level}"), false)?;
         }
         Ok(())
+    }
+}
+
+fn revision_passed(
+    boundary: Option<ViewRevision>,
+    accessibility_revision: Option<ViewRevision>,
+) -> bool {
+    match (boundary, accessibility_revision) {
+        (Some(boundary), Some(current)) => current > boundary,
+        (None, None) => true,
+        // Presentation tracking cannot normally change during an intent. If
+        // it ever does, retaining is safer than announcing against a model
+        // governed by a different publication contract.
+        _ => false,
     }
 }

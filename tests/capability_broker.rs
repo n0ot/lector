@@ -1,17 +1,14 @@
 use lector::{
     harness::Harness,
-    pty::install_lector_terminfo,
     terminal::{
         ClipboardContent, ClipboardLocation, GhosttyEngine, TerminalEvent, TerminalGeometry,
     },
     terminal_protocol::{
         ApplicationReplyBroker, CapabilityOverrides, ColorScheme, EffectDisposition,
-        PhysicalTerminalProfile, ProbePolicy, ProbeReport, StartupProbeBroker,
+        PhysicalTerminalProfile, ProbePolicy, ProbeReport, ShutdownFenceBroker, StartupProbeBroker,
         TerminalEffectPolicy, TerminfoCapabilities, VirtualTerminalProfile,
     },
 };
-use portable_pty::CommandBuilder;
-use std::process::Command;
 
 fn geometry() -> TerminalGeometry {
     TerminalGeometry::new(24, 80, 9, 18)
@@ -93,47 +90,15 @@ fn terminfo_and_explicit_overrides_have_bounded_stable_parsers() {
 }
 
 #[test]
-fn bundled_lector_terminfo_is_materialized_and_applied_to_child_commands() {
-    let root = std::path::PathBuf::from("target/test-artifacts/lector-terminfo");
-    let environment = install_lector_terminfo(&root).expect("install bundled terminfo");
-    assert_eq!(environment.term, "lector");
-    assert!(root.join("6c/lector").is_file());
-    assert!(root.join("l/lector").is_file());
-
-    let output = Command::new("infocmp")
-        .args(["-A", root.to_str().expect("UTF-8 test path"), "lector"])
-        .output()
-        .expect("run infocmp against bundled entry");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let decoded = String::from_utf8(output.stdout).expect("UTF-8 infocmp output");
-    assert!(decoded.contains("colors#0x100") || decoded.contains("colors#256"));
-
-    let mut command = CommandBuilder::new("/bin/sh");
-    command.env("COLORTERM", "truecolor");
-    environment.apply(&mut command);
-    assert_eq!(
-        command.get_env("TERM"),
-        Some(std::ffi::OsStr::new("lector"))
-    );
-    assert_eq!(
-        command.get_env("TERMINFO"),
-        Some(environment.terminfo_dir.as_os_str())
-    );
-    assert_eq!(
-        command.get_env("COLORTERM"),
-        Some(std::ffi::OsStr::new("truecolor"))
-    );
-}
-
-#[test]
 fn startup_probe_replies_are_fragment_safe_out_of_order_and_never_become_input() {
     let profile = PhysicalTerminalProfile::conservative(geometry());
     let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 10);
     let queries = broker.startup_queries();
+    assert_eq!(broker.outstanding_primary_device_attributes_replies(), 1);
+    assert!(
+        queries.ends_with(b"\x1b[c"),
+        "DA1 must fence every earlier probe"
+    );
     for expected in [
         b"\x1b[c".as_slice(),
         b"\x1b[>c",
@@ -153,12 +118,14 @@ fn startup_probe_replies_are_fragment_safe_out_of_order_and_never_become_input()
 
     // Deliberately place replies in a different order from their requests and
     // split every byte. Ordinary user input around them must survive exactly.
-    let replies = b"a\x1b[?2026;1$y\x1b[?0u\x1b[8;30;100t\x1b[6;20;10t\x1b[4;600;1000t\x1b[?64;22c\x1b[>41;301;0c\x1b[?1004;2$y\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\z";
+    let replies = b"a\x1b[?2026;1$y\x1b[?0u\x1b[8;30;100t\x1b[6;20;10t\x1b[4;600;1000t\x1b[>41;301;0c\x1b[?1004;2$y\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?64;22cz";
     let mut user_input = Vec::new();
     for byte in replies {
         user_input.extend(broker.ingest(&[*byte], 11));
     }
     assert_eq!(user_input, b"az");
+    assert_eq!(broker.outstanding_primary_device_attributes_replies(), 0);
+    assert!(broker.is_finished());
     assert_eq!(broker.malformed_replies(), 0);
     assert!(broker.profile().synchronized_output);
     assert!(!broker.profile().focus_reporting);
@@ -168,6 +135,29 @@ fn startup_probe_replies_are_fragment_safe_out_of_order_and_never_become_input()
         TerminalGeometry::new(30, 100, 10, 20)
     );
     assert_eq!(broker.profile().color_scheme, Some(ColorScheme::Dark));
+}
+
+#[test]
+fn shutdown_fence_is_fragment_safe_and_matches_only_the_fresh_primary_da_reply() {
+    let mut broker = ShutdownFenceBroker::new(1);
+    let replies = b"text\x1b[I\x1b[>41;301;0c\x1b[?6c\x1b[O\x1b[?62;22;52cafter";
+    let mut matched_at = None;
+    for (index, byte) in replies.iter().copied().enumerate() {
+        if broker.ingest_byte(byte) {
+            matched_at = Some(index);
+            break;
+        }
+    }
+
+    assert_eq!(broker.observed_replies(), 2);
+    assert!(broker.is_matched());
+    assert_eq!(matched_at, Some(replies.len() - b"after".len() - 1));
+
+    let mut c1 = ShutdownFenceBroker::new(0);
+    assert!(!c1.ingest_byte(0x9b));
+    assert!(!c1.ingest_byte(b'?'));
+    assert!(!c1.ingest_byte(b'6'));
+    assert!(c1.ingest_byte(b'c'));
 }
 
 #[test]
@@ -190,6 +180,7 @@ fn startup_probe_bounds_malicious_replies_and_releases_unrelated_input_on_timeou
     let profile = PhysicalTerminalProfile::conservative(geometry());
     let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 100);
     let _ = broker.startup_queries();
+    assert_eq!(broker.next_deadline_ms(), Some(151));
 
     let mut malicious = b"\x1b]10;rgb:".to_vec();
     malicious.extend(std::iter::repeat_n(b'f', 8_192));
@@ -199,8 +190,47 @@ fn startup_probe_bounds_malicious_replies_and_releases_unrelated_input_on_timeou
     assert_eq!(broker.ingest(b"\x1b\\key", 102), b"key");
 
     assert!(broker.ingest(b"\x1b[?2026;", 103).is_empty());
-    assert_eq!(broker.finish_if_timed_out(151), b"\x1b[?2026;");
+    assert_eq!(broker.next_deadline_ms(), Some(154));
+    assert_eq!(broker.finish_if_timed_out(154), b"\x1b[?2026;");
     assert!(broker.is_finished());
+    assert_eq!(broker.next_deadline_ms(), None);
+}
+
+#[test]
+fn readable_probe_batch_wins_the_timeout_race_and_is_still_consumed() {
+    let profile = PhysicalTerminalProfile::conservative(geometry());
+    let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 0);
+    let _ = broker.startup_queries();
+    assert_eq!(broker.outstanding_primary_device_attributes_replies(), 1);
+
+    let late_reply = b"\x1b[?62;22;52c";
+    for (index, chunk) in late_reply.chunks(2).enumerate() {
+        assert!(broker.ingest(chunk, 100 + index as u128).is_empty());
+    }
+    assert_eq!(broker.outstanding_primary_device_attributes_replies(), 0);
+    assert!(broker.is_finished());
+}
+
+#[test]
+fn timed_out_probe_broker_still_owns_delayed_terminal_replies() {
+    let profile = PhysicalTerminalProfile::conservative(geometry());
+    let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 0);
+    let _ = broker.startup_queries();
+
+    assert!(broker.finish_if_timed_out(100).is_empty());
+    assert!(broker.is_finished());
+
+    let delayed = b"c\x1b[>41;301;0c\x1b[?0u\x1b[8;24;80t\x1b[?64;22cz";
+    let mut application_input = Vec::new();
+    for byte in delayed {
+        application_input.extend(broker.ingest(&[*byte], 101));
+    }
+    assert_eq!(application_input, b"cz");
+    assert!(broker.profile().kitty_keyboard);
+
+    assert!(broker.ingest(b"\x1b", 102).is_empty());
+    assert_eq!(broker.next_deadline_ms(), Some(153));
+    assert_eq!(broker.finish_if_timed_out(153), b"\x1b");
 }
 
 #[test]
@@ -210,7 +240,7 @@ fn virtual_profile_drives_every_ghostty_generated_application_reply() {
         .expect("create engine with Lector virtual profile");
     let update = engine
         .advance(
-            b"\x05\x1b[>q\x1b[14t\x1b[16t\x1b[18t\x1b[?996n\x1b[c\x1b[>c\x1b[=c\x1b[?1004$p\x1b[?2026$p\x1b[?u\x1b]52;c;?\x1b\\",
+            b"\x05\x1b[>q\x1b[14t\x1b[16t\x1b[18t\x1b[?996n\x1b[c\x1b[>c\x1b[=c\x1b[?1004$p\x1b[?2026$p\x1b[?u\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b]52;c;?\x1b\\",
         )
         .expect("advance virtual queries");
     let replies = update.pty_replies;
@@ -228,6 +258,8 @@ fn virtual_profile_drives_every_ghostty_generated_application_reply() {
         b"\x1b[?1004;2$y",
         b"\x1b[?2026;2$y",
         b"\x1b[?0u",
+        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\",
+        b"\x1b]11;rgb:0000/0000/0000\x1b\\",
         b"\x1b]52;c;\x1b\\",
     ] {
         assert!(
@@ -322,12 +354,14 @@ fn effect_policy_is_explicit_for_every_modeled_terminal_effect() {
 }
 
 #[test]
-fn real_application_harness_routes_virtual_replies_only_to_pty_stdin() {
+fn real_application_harness_flushes_virtual_replies_at_the_pty_chunk_boundary() {
     let mut harness = Harness::new(24, 80).expect("create compositor harness");
     harness
         .handle_pty_output(b"before\x1b[18t\x1b[c\x1b[?uafter")
         .expect("handle application queries");
-    harness.tick(0).expect("flush reply broker");
+    harness
+        .flush_application_replies()
+        .expect("flush reply broker at PTY chunk boundary");
 
     let application_input = harness.application_input();
     assert!(contains(application_input, b"\x1b[8;24;80t"));
@@ -372,4 +406,57 @@ fn live_harness_consumes_outer_probe_replies_before_input_dispatch() {
     assert_eq!(harness.application_input(), b"x");
     assert!(harness.physical_profile().synchronized_output);
     assert!(harness.physical_profile().kitty_keyboard);
+}
+
+#[test]
+fn delayed_outer_probe_replies_cannot_pollute_a_new_tmux_control_connection() {
+    let mut harness = Harness::new(24, 80).expect("create probe harness");
+    harness
+        .start_capability_probes()
+        .expect("write startup probe transaction");
+
+    // Model a large initial Ghostty render: the terminal has queued its
+    // replies, but Lector cannot read them until the original 50 ms fallback
+    // deadline has passed. Meanwhile the child starts tmux control mode.
+    harness.advance_clock(100);
+    harness
+        .handle_pty_output(b"\x1bP1000p%begin 1 1 0\n%end 1 1 0\n")
+        .expect("start tmux gateway");
+    harness
+        .handle_terminal_input(
+            b"\x1b[>41;301;0c\x1b[?0u\x1b[8;24;80t\x1b[6;18;9t\x1b[4;432;720t\x1b[?1004;2$y\x1b[?2026;1$y\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?64;22c",
+        )
+        .expect("consume delayed Ghostty replies");
+    harness.tick(0).expect("drain tmux bootstrap commands");
+
+    assert_eq!(
+        harness.application_input(),
+        [
+            lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
+        ]
+        .concat(),
+        "only Lector's tmux commands may reach tmux -CC",
+    );
+}
+
+#[test]
+fn delayed_outer_probe_replies_after_timeout_cannot_become_application_keys() {
+    let mut harness = Harness::new(24, 80).expect("create probe harness");
+    harness
+        .start_capability_probes()
+        .expect("write startup probe transaction");
+
+    harness.advance_clock(100);
+    harness
+        .tick(0)
+        .expect("expire startup probe readiness wait");
+    harness
+        .handle_terminal_input(
+            b"\x1b[>41;301;0c\x1b[?0u\x1b[8;24;80t\x1b[6;18;9t\x1b[4;432;720t\x1b[?1004;2$y\x1b[?2026;1$y\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?64;22ccodex",
+        )
+        .expect("consume delayed physical replies after readiness timeout");
+
+    assert_eq!(harness.application_input(), b"codex");
 }

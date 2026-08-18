@@ -190,7 +190,6 @@ fn rejects_malformed_framing_ids_tags_and_octal_data() {
         b"no marker".as_slice(),
         b"\x1bP1000p%begin nope 1 0\n".as_slice(),
         b"\x1bP1000p%begin 1 18446744073709551616 0\n".as_slice(),
-        b"\x1bP1000p%begin 1 2 0\n%end 1 3 0\n".as_slice(),
         b"\x1bP1000p%output nope value\n".as_slice(),
         b"\x1bP1000p%output %1 \\12x\n".as_slice(),
         b"\x1bP1000p%output %1 \\400\n".as_slice(),
@@ -211,6 +210,32 @@ fn rejects_malformed_framing_ids_tags_and_octal_data() {
             "expected a classified malformed-stream error for {stream:?}"
         );
     }
+}
+
+#[test]
+fn command_payload_may_contain_complete_control_looking_blocks() {
+    let stream = b"\x1bP1000p%begin 1 2 0\n%begin 10 20 0\nnested output\n%end 10 20 0\n%error 30 40 0\n%end not framing\n%error neither is this\n%end 1 2 0\n\x1b\\";
+    assert_eq!(
+        parse_chunks(stream.iter().map(std::slice::from_ref)),
+        vec![
+            ControlEvent::Started,
+            ControlEvent::Command {
+                timestamp: 1,
+                number: 2,
+                flags: 0,
+                status: CommandStatus::Success,
+                output: vec![
+                    b"%begin 10 20 0".to_vec(),
+                    b"nested output".to_vec(),
+                    b"%end 10 20 0".to_vec(),
+                    b"%error 30 40 0".to_vec(),
+                    b"%end not framing".to_vec(),
+                    b"%error neither is this".to_vec(),
+                ],
+            },
+            ControlEvent::Ended,
+        ]
+    );
 }
 
 #[test]
@@ -304,6 +329,36 @@ fn command_output_is_not_misclassified_as_an_async_notification() {
             },
             ControlEvent::Ended,
         ]
+    );
+}
+
+#[test]
+fn command_output_may_begin_with_terminal_escape_sequences() {
+    let first = b"\x1b[2mstyled capture\x1b[0m".to_vec();
+    let second = b"\x1b]8;;https://example.com\x1b\\linked\x1b]8;;\x1b\\".to_vec();
+    let stream = [
+        b"\x1bP1000p%begin 5 8 0\n".as_slice(),
+        first.as_slice(),
+        b"\n".as_slice(),
+        second.as_slice(),
+        b"\n%end 5 8 0\n%exit\n\x1b\\".as_slice(),
+    ]
+    .concat();
+
+    assert_all_fragmentations(
+        &stream,
+        &[
+            ControlEvent::Started,
+            ControlEvent::Command {
+                timestamp: 5,
+                number: 8,
+                flags: 0,
+                status: CommandStatus::Success,
+                output: vec![first, second],
+            },
+            ControlEvent::Exit { reason: None },
+            ControlEvent::Ended,
+        ],
     );
 }
 

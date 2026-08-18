@@ -255,6 +255,7 @@ fn corrupted_renderer_output_always_preserves_a_reproducible_artifact() {
 fn physical_terminal_suspend_resume_and_shutdown_are_explicit_and_idempotent() {
     let mut lifecycle = PhysicalTerminalLifecycle::new(Some(false));
     let activation = lifecycle.activate();
+    assert!(activation.bytes.starts_with(b"\x1b[?1049h"));
     assert!(
         activation
             .bytes
@@ -271,16 +272,40 @@ fn physical_terminal_suspend_resume_and_shutdown_are_explicit_and_idempotent() {
             .any(|part| part == b"\x1b[?1004l")
     );
     assert!(suspended.bytes.windows(6).any(|part| part == b"\x1b[?25h"));
+    assert!(suspended.bytes.ends_with(b"\x1b[?1049l"));
 
     let resumed = lifecycle.resume();
     assert_eq!(resumed.damage, SceneDamage::Full);
+    assert!(resumed.bytes.starts_with(b"\x1b[?1049h"));
     assert!(resumed.bytes.windows(8).any(|part| part == b"\x1b[?1004h"));
 
     let shutdown = lifecycle.shutdown();
     assert_eq!(shutdown.damage, SceneDamage::None);
     assert!(shutdown.bytes.windows(8).any(|part| part == b"\x1b[?1004l"));
+    assert!(shutdown.bytes.ends_with(b"\x1b[?1049l"));
     assert!(lifecycle.shutdown().bytes.is_empty());
     assert!(lifecycle.resume().bytes.is_empty());
+}
+
+#[test]
+fn orderly_shutdown_keeps_alternate_screen_until_after_da1_fence() {
+    let mut lifecycle = PhysicalTerminalLifecycle::new(Some(false));
+    let _ = lifecycle.activate();
+
+    let before_fence = lifecycle.begin_shutdown_fence();
+    assert!(before_fence.bytes.ends_with(b"\x1b[?1004l\x1b[c"));
+    assert!(
+        !before_fence
+            .bytes
+            .windows(b"\x1b[?1049l".len())
+            .any(|window| window == b"\x1b[?1049l")
+    );
+    assert!(lifecycle.begin_shutdown_fence().bytes.is_empty());
+
+    let after_fence = lifecycle.finish_shutdown_fence();
+    assert_eq!(after_fence.bytes, b"\x1b[?1049l");
+    assert!(lifecycle.finish_shutdown_fence().bytes.is_empty());
+    assert!(lifecycle.shutdown().bytes.is_empty());
 }
 
 #[test]

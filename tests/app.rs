@@ -1,5 +1,6 @@
 use lector::{
-    app::{App, Clock, DIFF_DELAY, MAX_DIFF_DELAY},
+    app::{App, Clock, DIFF_DELAY, MAX_DIFF_DELAY, MAX_PENDING_TERMINAL_INPUT_BYTES},
+    output_scheduler::OutputSchedulerConfig,
     presentation::PresentedScene,
     screen_reader::ScreenReader,
     speech,
@@ -7,7 +8,11 @@ use lector::{
     terminal_protocol::PhysicalTerminalProfile,
     views,
 };
-use std::{cell::Cell, cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    io::{self, Write},
+    rc::Rc,
+};
 
 #[derive(Default)]
 struct RecorderState {
@@ -64,6 +69,31 @@ impl FakeClock {
 impl Clock for FakeClock {
     fn now_ms(&self) -> u128 {
         self.now.get()
+    }
+}
+
+#[derive(Default)]
+struct FlushGateWriter {
+    bytes: Vec<u8>,
+    block_writes: bool,
+    block_flush: bool,
+}
+
+impl Write for FlushGateWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.block_writes {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.block_flush {
+            Err(io::Error::from(io::ErrorKind::WouldBlock))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -606,6 +636,9 @@ fn popping_review_restores_hidden_alternate_screen_transitions() {
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
     let mut terminal = GhosttyEngine::new_with_scrollback(24, 80, 0).expect("create render oracle");
+    terminal
+        .advance(b"\x1b[?1049h")
+        .expect("enter Lector-owned alternate screen");
 
     app.handle_pty(&mut sr, b"primary\x1B[H", &mut term_out)
         .expect("draw primary screen");
@@ -637,7 +670,7 @@ fn popping_review_restores_hidden_alternate_screen_transitions() {
         .expect("close review onto primary screen");
     terminal.advance(&term_out).expect("advance render oracle");
 
-    assert!(!terminal.snapshot().alternate_screen());
+    assert!(terminal.snapshot().alternate_screen());
     assert_eq!(terminal.snapshot().contents().trim(), "shell");
     assert!(pty_out.is_empty());
 }
@@ -958,6 +991,25 @@ fn click_actions_write_mouse_events_at_review_cursor() {
 }
 
 #[test]
+fn coordinate_clicks_use_the_live_application_protocol_during_a_held_frame() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[?2026h\x1B[?1000h\x1B[?1006h\x1B[5;8Hpartial",
+        &mut term_out,
+    )
+    .expect("open a working frame which enables mouse reporting");
+    app.handle_stdin(&mut sr, b"\x1B{", &mut pty_out, &mut term_out)
+        .expect("send a coordinate-dependent click");
+
+    assert_eq!(pty_out, b"\x1B[<0;1;1M\x1B[<0;1;1m");
+}
+
+#[test]
 fn left_click_action_places_the_review_overlay_application_cursor_locally() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
@@ -1158,6 +1210,126 @@ fn fragmented_cursor_update_survives_auto_read_toggle_between_fragments() {
 }
 
 #[test]
+fn stationary_application_repaint_preserves_a_manually_moved_review_cursor() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"review target\r\nactive prompt\x1B[2;14H",
+        &mut term_out,
+    )
+    .expect("draw output above an active prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize initial prompt")
+    );
+    app.handle_stdin(&mut sr, b"\x1Bu", &mut pty_out, &mut term_out)
+        .expect("move review cursor above the application cursor");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[2;1Hactive prompt .\x1B[K\x1B[2;14H",
+        &mut term_out,
+    )
+    .expect("redraw activity in place without moving the application cursor");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize stationary prompt repaint")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1Bi", &mut pty_out, &mut term_out)
+        .expect("read manually selected line after stationary repaint");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("review target".into(), false)]
+    );
+}
+
+#[test]
+fn alternate_screen_transition_realigns_review_cursor_even_at_the_same_position() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"outer screen\x1B[1;43H", &mut term_out)
+        .expect("draw outer screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize outer screen")
+    );
+    app.handle_stdin(&mut sr, b"\x1Bo", &mut pty_out, &mut term_out)
+        .expect("move review cursor to a blank row");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[?1049h\x1B[2J\x1B[Hnested screen\x1B[1;43H",
+        &mut term_out,
+    )
+    .expect("enter an alternate screen without changing the final cursor position");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize alternate-screen transition")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1Bi", &mut pty_out, &mut term_out)
+        .expect("read the new alternate screen");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("nested screen".into(), false)]
+    );
+}
+
+#[test]
+fn pending_repaint_realigns_a_following_review_cursor_before_review_input() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"outer prompt\r\n", &mut term_out)
+        .expect("draw and leave the outer prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize outer prompt")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[2J\x1B[Hnested prompt\r\nreview target\x1B[H",
+        &mut term_out,
+    )
+    .expect("render nested prompt without waiting for stabilization");
+    app.handle_stdin(&mut sr, b"\x1Bi", &mut pty_out, &mut term_out)
+        .expect("read nested prompt immediately");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("nested prompt".into(), false))
+    );
+
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1Bo", &mut pty_out, &mut term_out)
+        .expect("move away after consuming pending follow");
+    app.handle_stdin(&mut sr, b"\x1Bi", &mut pty_out, &mut term_out)
+        .expect("read the manually selected line without snapping again");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("review target".into(), false))
+    );
+}
+
+#[test]
 fn synchronized_output_waits_for_the_complete_screen_update_before_speaking() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut term_out = Vec::new();
@@ -1181,6 +1353,1057 @@ fn synchronized_output_waits_for_the_complete_screen_update_before_speaking() {
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         [("partial complete".into(), false)]
+    );
+}
+
+#[test]
+fn synchronized_output_auto_read_never_speaks_overwritten_transaction_text() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"before", &mut term_out)
+        .expect("draw the previous committed frame");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the previous frame")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?2026h\r\x1b[2Ktransient\r\x1b[2Kfinal\x1b[?2026l",
+        &mut term_out,
+    )
+    .expect("draw and commit an atomic replacement");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the committed replacement")
+    );
+
+    let spoken = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        spoken.iter().any(|text| text.contains("final")),
+        "{spoken:?}"
+    );
+    assert!(
+        spoken.iter().all(|text| !text.contains("transient")),
+        "{spoken:?}"
+    );
+}
+
+#[test]
+fn review_reads_the_committed_screen_while_synchronized_output_is_open() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"outer prompt", &mut term_out)
+        .expect("draw committed prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize prompt")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    term_out.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?2026h\x1b[2J\x1b[10;1Hpartial",
+        &mut term_out,
+    )
+    .expect("open a partial synchronized frame");
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read from the committed frame");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("outer prompt".into(), false))
+    );
+    assert!(pty_out.is_empty());
+    clock.advance_ms(100);
+    let timed_out = app
+        .drain_scheduled_output(&mut term_out, false)
+        .expect("release the physical partial frame after its idle timeout");
+    assert!(timed_out.synchronization_timed_out);
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the partial frame after its timeout render flushed");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("partial".into(), false))
+    );
+
+    app.handle_stdin(&mut sr, b"x", &mut pty_out, &mut term_out)
+        .expect("forward raw input while the frame remains open");
+    assert_eq!(pty_out, b"x");
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the same physically presented partial frame after raw input");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("partial".into(), false))
+    );
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[2J\x1b[Hinner prompt\x1b[?2026l",
+        &mut term_out,
+    )
+    .expect("commit the complete frame");
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("keep reading the old physical frame until the close render flushes");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("partial".into(), false))
+    );
+
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("flush the closed application frame");
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read from the physically presented closed frame");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("inner prompt".into(), false))
+    );
+}
+
+#[test]
+fn synchronized_close_becomes_readable_only_after_its_render_flushes() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"old", &mut term_out)
+        .expect("queue the original frame");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the original frame");
+    term_out.clear();
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?2026h\r\x1b[2Kfinal\x1b[?2026l",
+        &mut term_out,
+    )
+    .expect("queue a closed synchronized frame");
+    clock.advance_ms(4);
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    let blocked = app
+        .drain_scheduled_output(&mut writer, false)
+        .expect("write the render up to its blocked flush fence");
+    assert!(blocked.blocked);
+    assert!(blocked.completed_renders.is_empty());
+
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read while the close render is not yet presented");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("old".into(), false))
+    );
+
+    writer.block_flush = false;
+    let completed = app
+        .drain_scheduled_output(&mut writer, true)
+        .expect("complete the physical flush fence");
+    assert_eq!(completed.completed_renders.len(), 1);
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the newly presented frame");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("final".into(), false))
+    );
+
+    let mut oracle = GhosttyEngine::new(24, 80).expect("physical oracle");
+    oracle
+        .advance(&writer.bytes)
+        .expect("parse the completed physical frame");
+    assert!(oracle.normalized_snapshot().contents().starts_with("final"));
+}
+
+#[test]
+fn timeout_flush_publishes_its_exact_generation_not_a_newer_parser_frame() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let mut physical = GhosttyEngine::new(24, 80).expect("physical oracle");
+
+    app.handle_pty(&mut sr, b"old", &mut term_out)
+        .expect("queue the original frame");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the original frame");
+    physical
+        .advance(&term_out)
+        .expect("parse the original physical frame");
+    term_out.clear();
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(&mut sr, b"\x1b[?2026h\r\x1b[2Kpartial-a", &mut term_out)
+        .expect("open the first partial frame");
+    clock.advance_ms(100);
+    let mut first_writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    let blocked = app
+        .drain_scheduled_output(&mut first_writer, false)
+        .expect("write the timed-out frame but block its flush");
+    assert!(blocked.blocked);
+    assert!(blocked.completed_renders.is_empty());
+
+    app.handle_pty(&mut sr, b"\r\x1b[2Kpartial-b", &mut term_out)
+        .expect("parse a newer frame while the old render is backpressured");
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read before either partial frame is presented");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("old".into(), false))
+    );
+
+    first_writer.block_flush = false;
+    first_writer.block_writes = true;
+    let first_completed = app
+        .drain_scheduled_output(&mut first_writer, true)
+        .expect("flush only the first timed-out generation");
+    assert_eq!(first_completed.completed_renders.len(), 1);
+    physical
+        .advance(&first_writer.bytes)
+        .expect("parse the first timed-out physical generation");
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the exact first physical generation");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("partial-a".into(), false))
+    );
+    assert!(
+        physical
+            .normalized_snapshot()
+            .contents()
+            .starts_with("partial-a")
+    );
+
+    clock.advance_ms(4);
+    let mut second_bytes = Vec::new();
+    let second_completed = app
+        .drain_scheduled_output(&mut second_bytes, true)
+        .expect("flush the newer partial generation");
+    assert_eq!(second_completed.completed_renders.len(), 1);
+    physical
+        .advance(&second_bytes)
+        .expect("parse the newer physical generation");
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the newer physical generation");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("partial-b".into(), false))
+    );
+    assert!(
+        physical
+            .normalized_snapshot()
+            .contents()
+            .starts_with("partial-b")
+    );
+}
+
+#[test]
+fn auto_read_advances_to_a_presented_frame_while_the_parser_is_newer() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"old", &mut term_out)
+        .expect("queue the original frame");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the original frame");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize old"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(&mut sr, b"\r\x1b[2Kfirst", &mut term_out)
+        .expect("queue the first new frame");
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    let blocked = app
+        .drain_scheduled_output(&mut writer, false)
+        .expect("write the first frame up to its flush fence");
+    assert!(blocked.blocked);
+
+    app.handle_pty(&mut sr, b"\r\x1b[2Ksecond", &mut term_out)
+        .expect("parse a newer frame before the first flush completes");
+    writer.block_flush = false;
+    writer.block_writes = true;
+    let completed = app
+        .drain_scheduled_output(&mut writer, true)
+        .expect("flush only the first frame");
+    assert_eq!(completed.completed_renders.len(), 1);
+
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("auto-read the completed physical frame"),
+        "a newer parser frame must not indefinitely defer an older completed presentation"
+    );
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text.contains("first")),
+        "speaks={:?}",
+        recorder.inner.borrow().speaks
+    );
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .all(|(text, _)| !text.contains("second")),
+        "unpresented text leaked into speech: {:?}",
+        recorder.inner.borrow().speaks
+    );
+
+    writer.block_writes = false;
+    app.drain_scheduled_output(&mut writer, true)
+        .expect("present the newer frame");
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("preserve the next frame's stabilization window"),
+        "continuous output must not bypass the per-presentation debounce"
+    );
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        Some(std::time::Duration::from_millis(u64::from(DIFF_DELAY)))
+    );
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("auto-read the newer completed frame")
+    );
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text.contains("second")),
+        "speaks={:?}",
+        recorder.inner.borrow().speaks
+    );
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        None,
+        "finalizing the newest presented revision must disarm its wakeup"
+    );
+    assert!(
+        !app.wants_tick(),
+        "finalization left an immediate tick armed"
+    );
+}
+
+#[test]
+fn lagged_presented_auto_read_uses_live_viewport_and_preserves_scrolled_review_selection() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    let initial = (0..30)
+        .map(|line| format!("history-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    app.handle_pty(&mut sr, initial.as_bytes(), &mut term_out)
+        .expect("queue the initial frame and its scrollback");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the initial frame");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the initial frame")
+    );
+
+    // Move one row into history and explicitly leave cursor following off.
+    // Presentation-time diffing may temporarily inspect the live viewport,
+    // but it must restore this user-selected historical viewport afterward.
+    for _ in 0..24 {
+        app.handle_stdin(&mut sr, b"\x1bu", &mut pty_out, &mut term_out)
+            .expect("move the review cursor into scrollback");
+    }
+    sr.set_review_follows_screen_cursor(false);
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the selected historical row");
+    let selected_history = recorder
+        .inner
+        .borrow()
+        .speaks
+        .last()
+        .expect("selected history was spoken")
+        .0
+        .clone();
+    assert!(selected_history.starts_with("history-"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[1;1H\x1b[2Kphysical first\x1b[24;1H",
+        &mut term_out,
+    )
+    .expect("queue the first visible replacement");
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    let blocked = app
+        .drain_scheduled_output(&mut writer, false)
+        .expect("write the first replacement up to its flush fence");
+    assert!(blocked.blocked);
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[1;1H\x1b[2Knewer live frame\x1b[24;1H",
+        &mut term_out,
+    )
+    .expect("parse a newer replacement while the first is backpressured");
+    writer.block_flush = false;
+    writer.block_writes = true;
+    let completed = app
+        .drain_scheduled_output(&mut writer, true)
+        .expect("flush only the first replacement");
+    assert_eq!(completed.completed_renders.len(), 1);
+
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("auto-read the lagged physical frame")
+    );
+    let auto_read = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        auto_read.iter().any(|text| text.contains("physical first")),
+        "the physical live viewport was not read: {auto_read:?}"
+    );
+    assert!(
+        auto_read
+            .iter()
+            .all(|text| !text.contains("newer live frame")),
+        "unpresented parser text leaked into speech: {auto_read:?}"
+    );
+
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the preserved historical selection");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&(selected_history, false)),
+        "presentation-time live inspection changed the review selection"
+    );
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn scheduled_synchronized_frame_auto_reads_only_its_final_pixels() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"before", &mut term_out)
+        .expect("queue the baseline frame");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the baseline frame");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize baseline")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?2026h\r\x1b[2Ktransient pixels\r\x1b[2Kfinal pixels\x1b[?2026l",
+        &mut term_out,
+    )
+    .expect("queue one synchronized replacement frame");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the synchronized replacement frame");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("auto-read the synchronized replacement")
+    );
+
+    let spoken = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        spoken.iter().any(|text| text.contains("final pixels")),
+        "the committed pixels were not spoken: {spoken:?}"
+    );
+    assert!(
+        spoken.iter().all(|text| !text.contains("transient pixels")),
+        "overwritten synchronized text leaked into speech: {spoken:?}"
+    );
+}
+
+#[test]
+fn lagged_presented_cursor_follow_uses_the_presented_cursor() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"baseline", &mut term_out)
+        .expect("queue the baseline frame");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the baseline frame");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize baseline")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(&mut sr, b"\x1b[2;1Hpresented cursor", &mut term_out)
+        .expect("queue a frame whose cursor is on row two");
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    let blocked = app
+        .drain_scheduled_output(&mut writer, false)
+        .expect("write the row-two frame up to its flush fence");
+    assert!(blocked.blocked);
+
+    app.handle_pty(&mut sr, b"\x1b[3;1Hnewer live cursor", &mut term_out)
+        .expect("move the newer parser cursor to row three");
+    writer.block_flush = false;
+    writer.block_writes = true;
+    let completed = app
+        .drain_scheduled_output(&mut writer, true)
+        .expect("flush only the row-two frame");
+    assert_eq!(completed.completed_renders.len(), 1);
+
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the lagged presented cursor")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read at the followed review cursor");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("presented cursor".into(), false)),
+        "review cursor followed the newer parser cursor instead of the physical cursor"
+    );
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn backspace_resolves_on_a_presented_frame_while_the_parser_is_newer() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"abc", &mut term_out)
+        .expect("queue the original input line");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the original input line");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize abc"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x7f", &mut pty_out, &mut term_out)
+        .expect("forward and defer backspace");
+    app.handle_pty(&mut sr, b"\x08\x1b[P", &mut term_out)
+        .expect("queue the application echo of the deletion");
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    app.drain_scheduled_output(&mut writer, false)
+        .expect("write the deletion up to its flush fence");
+
+    app.handle_pty(&mut sr, b"\x1b[2;1Hstatus\x1b[1;3H", &mut term_out)
+        .expect("parse a newer status redraw");
+    writer.block_flush = false;
+    writer.block_writes = true;
+    app.drain_scheduled_output(&mut writer, true)
+        .expect("flush only the deletion frame");
+
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("resolve the deletion against the completed frame")
+    );
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "c"),
+        "speaks={:?}",
+        recorder.inner.borrow().speaks
+    );
+}
+
+#[test]
+fn backspace_survives_a_pre_input_receipt_and_later_typeahead() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"abc", &mut term_out)
+        .expect("queue the original input line");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the original input line");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize abc"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    // This repaint began before Backspace and therefore cannot confirm it,
+    // even though its receipt completes afterward.
+    app.handle_pty(&mut sr, b"\x1b7\x1b[2;1Hstatus\x1b8", &mut term_out)
+        .expect("queue a pre-input status repaint");
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    app.drain_scheduled_output(&mut writer, false)
+        .expect("write the status repaint up to its flush fence");
+
+    app.handle_stdin(&mut sr, b"\x7f", &mut pty_out, &mut term_out)
+        .expect("forward and defer backspace");
+    app.handle_pty(&mut sr, b"\x08\x1b[P", &mut term_out)
+        .expect("queue the application's deletion echo");
+    app.handle_stdin(&mut sr, b"x", &mut pty_out, &mut term_out)
+        .expect("type ahead before either receipt completes");
+
+    writer.block_flush = false;
+    writer.block_writes = true;
+    app.drain_scheduled_output(&mut writer, true)
+        .expect("flush only the pre-input repaint");
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the pre-input repaint")
+    );
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .all(|(text, _)| text != "c"),
+        "the pre-input receipt consumed the deletion intent"
+    );
+
+    recorder.inner.borrow_mut().speaks.clear();
+    writer.block_writes = false;
+    app.drain_scheduled_output(&mut writer, true)
+        .expect("present the deletion echo");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("resolve deletion on its causally later receipt")
+    );
+    assert_eq!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .filter(|(text, _)| text == "c")
+            .count(),
+        1,
+        "speaks={:?}",
+        recorder.inner.borrow().speaks
+    );
+    assert_eq!(pty_out, b"\x7fx");
+}
+
+#[test]
+fn review_commands_follow_the_physically_presented_view_across_overlay_backpressure() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"base", &mut term_out)
+        .expect("queue the base scene");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the base scene");
+    term_out.clear();
+
+    recorder.inner.borrow_mut().speaks.clear();
+    app.show_message(&mut sr, "Notice", "foreground", &mut term_out)
+        .expect("queue an overlay without presenting it yet");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read while the base remains physical");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("base".into(), false))
+    );
+
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the overlay");
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("announce the overlay only after it is physical");
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text.contains("foreground"))
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the presented overlay");
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .last()
+            .is_some_and(|(text, _)| {
+                text.contains("foreground") || text.contains("Press Enter")
+            })
+    );
+
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("logically dismiss the overlay");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("keep reading the retired overlay until its replacement flushes");
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .last()
+            .is_some_and(|(text, _)| {
+                text.contains("foreground") || text.contains("Press Enter")
+            })
+    );
+
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the revealed base");
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("announce the base only after it is physical");
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text.contains("base"))
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the physically revealed base");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("base".into(), false))
+    );
+}
+
+#[test]
+fn overlay_redraw_auto_read_waits_for_the_matching_physical_frame() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"base", &mut term_out)
+        .expect("queue the base scene");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the base scene");
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open the Lua REPL");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the Lua REPL");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("announce the presented Lua REPL");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"physically gated", &mut pty_out, &mut term_out)
+        .expect("edit the logical REPL before its redraw is presented");
+    assert!(
+        recorder.inner.borrow().speaks.is_empty(),
+        "a logical redraw was auto-read before its physical frame completed"
+    );
+    assert!(
+        !app.wants_tick(),
+        "a deferred read must not spin while its render is not ready"
+    );
+
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the edited REPL");
+    assert!(
+        app.wants_tick(),
+        "the deferred read should become runnable after presentation"
+    );
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("auto-read the physically presented edit");
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text.contains("physically gated")),
+        "the matching physical redraw was not auto-read: {:?}",
+        recorder.inner.borrow().speaks
+    );
+}
+
+#[test]
+fn terminal_finalization_waits_while_an_unpresented_overlay_is_logically_active() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"old base", &mut term_out)
+        .expect("queue the initial base frame");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the initial base frame");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the initial base frame")
+    );
+
+    app.show_message(&mut sr, "Notice", "logical overlay", &mut term_out)
+        .expect("queue an overlay without presenting it");
+    app.handle_pty(&mut sr, b"\r\nnew hidden base", &mut term_out)
+        .expect("update the hidden base");
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
+
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("defer finalization across the view transition"),
+        "hidden base output was finalized through the logical overlay"
+    );
+}
+
+#[test]
+fn dismissing_an_overlay_reveals_the_committed_underlay_during_a_synchronized_frame() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let mut physical = GhosttyEngine::new(24, 80).expect("create physical oracle");
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b]2;committed title\x1b\\committed base",
+        &mut term_out,
+    )
+    .expect("queue committed base");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present committed base");
+    physical
+        .advance(&term_out)
+        .expect("apply committed base to oracle");
+    term_out.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?2026h\x1b]2;working title\x1b\\\x1b[2J\x1b[Hpartial frame",
+        &mut term_out,
+    )
+    .expect("open working frame");
+    app.show_message(&mut sr, "Notice", "foreground overlay", &mut term_out)
+        .expect("open overlay");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present overlay");
+    physical
+        .advance(&term_out)
+        .expect("apply overlay to oracle");
+    assert!(
+        physical
+            .normalized_snapshot()
+            .contents()
+            .contains("foreground overlay")
+    );
+    assert_eq!(
+        physical.normalized_snapshot().title.as_deref(),
+        Some("committed title"),
+        "the overlay bypass must not release a working-frame title effect"
+    );
+    term_out.clear();
+
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("dismiss overlay");
+    assert!(!app.has_overlay());
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("reveal committed underlay");
+    physical
+        .advance(&term_out)
+        .expect("apply committed underlay to oracle");
+    let revealed = physical.normalized_snapshot().contents();
+    assert!(revealed.contains("committed base"), "{revealed:?}");
+    assert!(!revealed.contains("partial frame"), "{revealed:?}");
+    assert!(!revealed.contains("foreground overlay"), "{revealed:?}");
+    assert_eq!(
+        physical.normalized_snapshot().title.as_deref(),
+        Some("committed title")
+    );
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        Some(std::time::Duration::from_millis(22)),
+        "the revealed committed frame must wake accessibility before the application timeout"
+    );
+    clock.advance_ms(22);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the physically revealed committed frame")
+    );
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        Some(std::time::Duration::from_millis(70)),
+        "the earlier accessibility wake must preserve the application's original timeout epoch"
+    );
+    assert!(pty_out.is_empty());
+
+    term_out.clear();
+    app.handle_pty(
+        &mut sr,
+        b"\x1b]2;final title\x1b\\\x1b[2J\x1b[Hcommitted frame\x1b[?2026l",
+        &mut term_out,
+    )
+    .expect("close application frame");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present committed frame");
+    physical
+        .advance(&term_out)
+        .expect("apply committed frame to oracle");
+    let committed = physical.normalized_snapshot().contents();
+    assert!(committed.contains("committed frame"), "{committed:?}");
+    assert_eq!(
+        physical.normalized_snapshot().title.as_deref(),
+        Some("final title")
+    );
+}
+
+#[test]
+fn overlay_pop_preserves_the_open_frames_maximum_stabilization_deadline() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?2026h\x1b[2J\x1b[Hworking frame",
+        &mut term_out,
+    )
+    .expect("open working frame");
+    app.show_message(&mut sr, "Notice", "foreground", &mut term_out)
+        .expect("open overlay");
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
+
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("dismiss overlay");
+    app.handle_pty(&mut sr, b"\x1b[?2026l", &mut term_out)
+        .expect("close working frame");
+
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize at the original maximum deadline"),
+        "popping the overlay must not restart the open frame's stabilization window"
+    );
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn overlay_uses_live_geometry_while_accessibility_keeps_the_old_frame_geometry() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"old\x1b[?2026hpartial", &mut term_out)
+        .expect("open working frame");
+    app.on_resize(30, 100, &mut term_out)
+        .expect("resize live terminal");
+    app.show_message(&mut sr, "Notice", "full-size overlay", &mut term_out)
+        .expect("open overlay at live geometry");
+
+    let scene = app.composed_scene().expect("compose resized overlay");
+    assert_eq!((scene.geometry.rows, scene.geometry.cols), (30, 100));
+    assert_eq!(
+        scene
+            .overlays
+            .last()
+            .expect("message overlay")
+            .surface
+            .snapshot
+            .size(),
+        (30, 100)
     );
 }
 
@@ -1527,6 +2750,99 @@ fn kitty_unbound_press_and_release_are_forwarded() {
 }
 
 #[test]
+fn kitty_release_from_an_exited_full_screen_app_does_not_reach_the_resumed_shell() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let press = b"\x1B[99;5:1u";
+    let release = b"\x1B[99;5:3u";
+
+    app.handle_pty(&mut sr, b"\x1B[>7u", &mut term_out)
+        .expect("enable child Kitty keyboard mode");
+    app.handle_stdin(
+        &mut sr,
+        &[press.as_slice(), release.as_slice()].concat(),
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("handle one contiguous Ctrl-c press and release read");
+    assert_eq!(pty_out, press);
+
+    pty_out.clear();
+    app.handle_pty(&mut sr, b"\x1B[<u\r\nshell$ ", &mut term_out)
+        .expect("full-screen app exits and restores its shell");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("reconcile deferred release after child output");
+    assert!(
+        pty_out.is_empty(),
+        "late Kitty release leaked to resumed shell: {pty_out:?}"
+    );
+
+    app.handle_stdin(&mut sr, b"x", &mut pty_out, &mut term_out)
+        .expect("forward later shell input");
+    assert_eq!(pty_out, b"x");
+}
+
+#[test]
+fn rapid_second_kitty_ctrl_c_cycle_does_not_reach_shell_after_mode_reset() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let press = b"\x1B[99;5:1u";
+    let release = b"\x1B[99;5:3u";
+    let cycle = [press.as_slice(), release.as_slice()].concat();
+
+    app.handle_pty(&mut sr, b"\x1B[>7u", &mut term_out)
+        .expect("enable child Kitty keyboard mode");
+    app.handle_stdin(&mut sr, &cycle, &mut pty_out, &mut term_out)
+        .expect("deliver the Ctrl-c cycle which exits the application");
+    assert_eq!(pty_out, press);
+
+    pty_out.clear();
+    app.handle_pty(&mut sr, b"\x1B[<u\r\nshell$ ", &mut term_out)
+        .expect("application exits before the second physical Ctrl-c arrives");
+    app.handle_stdin(&mut sr, &cycle, &mut pty_out, &mut term_out)
+        .expect("deliver a second cycle encoded under the outgoing mode");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("reconcile the first cycle's deferred release");
+    assert!(
+        pty_out.is_empty(),
+        "rapid second Kitty Ctrl-c cycle leaked to resumed shell: {pty_out:?}"
+    );
+
+    clock.advance_ms(501);
+    let later_input = b"\x1B[97;1:1u\x1B[97;1:3u";
+    app.handle_stdin(&mut sr, later_input, &mut pty_out, &mut term_out)
+        .expect("forward Kitty input after the bounded handoff window");
+    assert_eq!(pty_out, later_input);
+}
+
+#[test]
+fn deferred_kitty_ctrl_c_release_reaches_an_application_that_stays_active() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let press = b"\x1B[99;5:1u";
+    let release = b"\x1B[99;5:3u";
+
+    app.handle_pty(&mut sr, b"\x1B[>7u", &mut term_out)
+        .expect("enable child Kitty keyboard mode");
+    app.handle_stdin(
+        &mut sr,
+        &[press.as_slice(), release.as_slice()].concat(),
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("handle Ctrl-c press and release");
+    assert_eq!(pty_out, press);
+
+    clock.advance_ms(1_000);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("release deferred Ctrl-c key-up");
+    assert_eq!(pty_out, [press.as_slice(), release.as_slice()].concat());
+}
+
+#[test]
 fn kitty_passed_through_binding_forwards_press_and_release() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
@@ -1784,6 +3100,109 @@ fn say_overlay_hotkey_speaks_terminal_mode_and_current_title() {
             .any(|(text, _)| text == "terminal, Build status"),
         "speaks={speaks:?}"
     );
+}
+
+#[test]
+fn say_overlay_follows_the_completed_overlay_identity_across_backpressure() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1b]2;Base title\x1b\\base", &mut term_out)
+        .expect("present the initial terminal");
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    term_out.clear();
+
+    app.show_message(&mut sr, "Notice", "foreground", &mut term_out)
+        .expect("queue the overlay");
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
+        .expect("say the still-presented terminal");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("terminal, Base title".into(), false))
+    );
+
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the overlay");
+    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
+        .expect("say the presented overlay");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("Notice".into(), false))
+    );
+
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("queue overlay dismissal");
+    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
+        .expect("keep saying the physical overlay");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("Notice".into(), false))
+    );
+
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the revealed terminal");
+    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
+        .expect("say the revealed terminal");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("terminal, Base title".into(), false))
+    );
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn say_overlay_tracks_a_flushed_title_effect_before_its_cell_render() {
+    const TITLE_EFFECT_BYTES: usize = b"\x1b]2;working\x1b\\".len();
+
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1b]2;committed\x1b\\old content", &mut term_out)
+        .expect("present the initial terminal");
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        write_budget_bytes: TITLE_EFFECT_BYTES,
+        ..OutputSchedulerConfig::default()
+    });
+    term_out.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b]2;working\x1b\\\r\x1b[2Knew content",
+        &mut term_out,
+    )
+    .expect("queue a title and cell update");
+    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
+        .expect("say the title before either transaction flushes");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("terminal, committed".into(), false))
+    );
+
+    let report = app
+        .drain_scheduled_output(&mut term_out, false)
+        .expect("flush exactly the title effect");
+    assert_eq!(report.completed_effects.len(), 1);
+    assert!(report.completed_renders.is_empty());
+
+    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
+        .expect("say the physically applied title");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("terminal, working".into(), false))
+    );
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read the still-presented cells");
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("old content".into(), false))
+    );
+    assert!(pty_out.is_empty());
 }
 
 #[test]
@@ -2197,7 +3616,15 @@ fn lone_escape_flushes_at_the_exact_timeout_boundary() {
 
     app.handle_stdin(&mut sr, b"\x1B", &mut pty_out, &mut term_out)
         .unwrap();
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        Some(std::time::Duration::from_millis(50))
+    );
     clock.advance_ms(49);
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        Some(std::time::Duration::from_millis(1))
+    );
     app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
         .unwrap();
     assert!(pty_out.is_empty());
@@ -2207,6 +3634,7 @@ fn lone_escape_flushes_at_the_exact_timeout_boundary() {
         .unwrap();
 
     assert_eq!(pty_out, b"\x1B");
+    assert_eq!(app.scheduled_output_timeout(), None);
     assert_eq!(sr.last_key(), b"\x1B");
     assert_eq!(recorder.inner.borrow().stops, 1);
 }
@@ -2228,6 +3656,24 @@ fn unterminated_control_sequence_flushes_as_raw_input_after_timeout() {
     assert_eq!(pty_out, input);
     assert_eq!(sr.last_key(), input);
     assert_eq!(recorder.inner.borrow().stops, 1);
+}
+
+#[test]
+fn unterminated_terminal_input_sequence_has_a_hard_memory_bound() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let mut input = b"\x1B]".to_vec();
+    input.extend(std::iter::repeat_n(
+        b'x',
+        MAX_PENDING_TERMINAL_INPUT_BYTES * 2,
+    ));
+
+    app.handle_stdin(&mut sr, &input, &mut pty_out, &mut term_out)
+        .unwrap();
+
+    assert!(app.debug_pending_terminal_input_bytes() < MAX_PENDING_TERMINAL_INPUT_BYTES);
+    assert!(pty_out.len() >= MAX_PENDING_TERMINAL_INPUT_BYTES);
 }
 
 #[test]
@@ -2307,6 +3753,9 @@ fn resize_and_alternate_screen_transition_remain_live_behind_overlay() {
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
     let mut physical = GhosttyEngine::new(24, 80).expect("physical oracle");
+    physical
+        .advance(b"\x1b[?1049h")
+        .expect("enter Lector-owned alternate screen");
     app.show_message(&mut sr, "Notice", "foreground", &mut term_out)
         .unwrap();
     physical.advance(&term_out).expect("parse initial overlay");

@@ -40,7 +40,7 @@ fn multi_inventory() -> Vec<Vec<Vec<u8>>> {
         vec![b"C\tclient_name\t/dev/ttys-life".to_vec()],
         vec![b"O\tprefix\tC-a".to_vec()],
         vec![b"O\tprefix2\tNone".to_vec()],
-        vec![b"O\tmode-keys\tvi".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
         vec![b"O\trepeat-time\t500".to_vec()],
         vec![
             b"B\tc\t0\tnew-window".to_vec(),
@@ -68,7 +68,7 @@ fn single_inventory(window_id: u64, pane_id: u64, name: &str) -> Vec<Vec<Vec<u8>
         vec![b"C\tclient_name\t/dev/ttys-only".to_vec()],
         vec![b"O\tprefix\tC-a".to_vec()],
         vec![b"O\tprefix2\tNone".to_vec()],
-        vec![b"O\tmode-keys\tvi".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
         vec![b"O\trepeat-time\t500".to_vec()],
         vec![
             b"B\tc\t0\tnew-window".to_vec(),
@@ -136,15 +136,22 @@ fn ready_app(groups: Vec<Vec<Vec<u8>>>) -> (App, ScreenReader, Recorder, Vec<u8>
         commands,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
     app.handle_pty(&mut sr, &reply(2, &[], true), &mut physical)
         .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
     assert_eq!(groups.len(), lector::tmux_model::INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        app.handle_pty(&mut sr, &reply(index + 3, group, true), &mut physical)
+        app.handle_pty(&mut sr, &reply(index + 4, group, true), &mut physical)
             .unwrap();
     }
     commands.clear();
@@ -185,21 +192,10 @@ fn tick(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) -> Vec<u8>
 }
 
 #[test]
-fn one_connection_detaches_immediately_but_multiple_connections_are_explicitly_scoped() {
+fn prefix_detach_uses_the_invoking_control_channel() {
     let (mut app, mut sr, _recorder, mut physical) = ready_app(multi_inventory());
     input(&mut app, &mut sr, &mut physical, b"\x01d");
     assert_eq!(tick(&mut app, &mut sr, &mut physical), b"detach-client\n");
-
-    assert_eq!(
-        ConnectionHierarchy::detach_command(1, "/dev/ttys-life").unwrap(),
-        "detach-client"
-    );
-    assert_eq!(
-        ConnectionHierarchy::detach_command(2, "/dev/ttys-life").unwrap(),
-        "detach-client -t =/dev/ttys-life"
-    );
-    assert!(ConnectionHierarchy::detach_command(2, "").is_err());
-    assert!(ConnectionHierarchy::detach_command(2, "bad\nclient").is_err());
 }
 
 #[test]
@@ -316,7 +312,7 @@ fn only_window_destruction_renders_an_understandable_waiting_scene_and_can_recov
     }
     assert_eq!(
         tick(&mut app, &mut sr, &mut physical),
-        b"capture-pane -p -e -J -S - -t %40\n"
+        b"capture-pane -p -e -F -J -S - -t %40\n"
     );
     app.handle_pty(
         &mut sr,
@@ -373,6 +369,7 @@ fn gateway_hierarchy_recursively_resolves_destroyed_parent_panes_and_windows_onc
             3,
             GatewayOrigin::Pane {
                 parent_connection_id: 1,
+                session_id: 1,
                 window_id: 10,
                 pane_id: 20,
             },
@@ -383,6 +380,7 @@ fn gateway_hierarchy_recursively_resolves_destroyed_parent_panes_and_windows_onc
             4,
             GatewayOrigin::Pane {
                 parent_connection_id: 3,
+                session_id: 1,
                 window_id: 30,
                 pane_id: 40,
             },
@@ -401,6 +399,7 @@ fn gateway_hierarchy_recursively_resolves_destroyed_parent_panes_and_windows_onc
             5,
             GatewayOrigin::Pane {
                 parent_connection_id: 1,
+                session_id: 1,
                 window_id: 11,
                 pane_id: 21,
             },
@@ -480,7 +479,7 @@ fn real_tmux_create_split_kill_window_and_detach_use_only_a_disposable_server() 
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
-        .expect("Stop 3 integration tests require tmux on PATH");
+        .expect("tmux integration tests require tmux on PATH");
     assert!(tmux.status.success(), "tmux -V failed");
     let unique = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

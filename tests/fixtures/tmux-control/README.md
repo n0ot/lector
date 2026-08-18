@@ -5,8 +5,8 @@ JSON string decodes to the exact bytes supplied to `TmuxControlParser`, includin
 the opening DCS marker and closing ST marker.
 
 - `documented.json` starts with the `%begin` example from the tmux 3.7b
-  `CONTROL MODE` manual and adds one instance of each typed record handled at
-  Stop 3.1. Its `%output` payload covers NUL-adjacent bytes, backslash, and
+  `CONTROL MODE` manual and adds one instance of each typed record handled by
+  the parser. Its `%output` payload covers NUL-adjacent bytes, backslash, and
   `0xff` after octal decoding.
 - `local-tmux-3.7b.json` was captured on macOS on 2026-08-14 from an isolated
   local `tmux -CC` client running under a PTY. It preserves the PTY's CRLF line

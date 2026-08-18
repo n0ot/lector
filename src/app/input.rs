@@ -1,4 +1,5 @@
 use super::*;
+use crate::views::ViewController;
 
 impl App {
     pub fn handle_stdin(
@@ -15,7 +16,20 @@ impl App {
             input.to_vec()
         };
         self.refresh_probed_profile();
-        for byte in input {
+        self.handle_filtered_terminal_input(sr, &input, pty_out, term_out)
+    }
+
+    /// Dispatches bytes whose physical-terminal ownership has already been
+    /// resolved. Timeout-released probe prefixes must enter here rather than
+    /// being offered to the probe broker a second time.
+    pub(super) fn handle_filtered_terminal_input(
+        &mut self,
+        sr: &mut ScreenReader,
+        input: &[u8],
+        pty_out: &mut dyn Write,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        for &byte in input {
             self.pending_input_last_at = Some(self.clock.now_ms());
             self.pending_input.push_back(byte);
 
@@ -24,6 +38,15 @@ impl App {
             }
 
             self.parse_pending_input(sr, pty_out, term_out)?;
+            if self.pending_input.len() >= MAX_PENDING_TERMINAL_INPUT_BYTES {
+                let raw = self.pending_input.drain(..).collect::<Vec<_>>();
+                self.pending_input_last_at = None;
+                self.log_event(&format!(
+                    "flushing oversized incomplete terminal input sequence: {} bytes",
+                    raw.len()
+                ));
+                self.handle_raw_bytes(sr, &raw, pty_out, term_out)?;
+            }
         }
         Ok(())
     }
@@ -145,14 +168,14 @@ impl App {
             .view_stack
             .active_mut()
             .model()
-            .screen()
+            .live_screen()
             .focus_reporting();
         if self.log_enabled {
-            eprintln!(
+            self.log_event(&format!(
                 "focus event: {} (forward_to_app={})",
                 if focused { "in" } else { "out" },
                 forward_to_app,
-            );
+            ));
         }
         sr.set_terminal_focused(focused)?;
         if forward_to_app {
@@ -241,11 +264,62 @@ impl App {
     ) -> Result<()> {
         let key_event = key.event();
         let key_id = (key_event.code, key_event.modifiers, key_event.state);
+        if key.control_code() == Some(3)
+            && raw.starts_with(b"\x1b[")
+            && raw.ends_with(b"u")
+            && self.should_quarantine_kitty_ctrl_c()
+        {
+            self.forwarded_key_presses.remove(&key_id);
+            self.consumed_key_presses.remove(&key_id);
+            self.view_transition_key_presses.remove(&key_id);
+            self.log_event("swallowing stale Ctrl-C during Kitty input handoff");
+            return Ok(());
+        }
         if key_event.kind == KeyEventKind::Release {
+            let forwarded_press = self.forwarded_key_presses.remove(&key_id);
             let command_consumed = self.consumed_key_presses.remove(&key_id);
             let transition_consumed = self.view_transition_key_presses.remove(&key_id);
             if command_consumed || transition_consumed {
                 self.log_event("swallowing release for consumed key press");
+                return Ok(());
+            }
+            let current_target = self.active_forwarded_input_target();
+            if forwarded_press.is_some_and(|press| {
+                current_target != Some((press.target, press.kitty_keyboard_flags))
+            }) {
+                // A full-screen application can exit in response to the key
+                // press and restore a shell which no longer owns Kitty input.
+                // The physical terminal may deliver the matching release one
+                // scheduling turn later; forwarding it would type CSI-u text
+                // into the new input owner.
+                self.log_event("swallowing release after application input owner changed");
+                return Ok(());
+            }
+            if let Some(press) = forwarded_press
+                && key.control_code() == Some(3)
+                && raw.starts_with(b"\x1b[")
+                && raw.ends_with(b"u")
+            {
+                // Ctrl-C commonly tears down a full-screen program. A real
+                // terminal can put its press and release in the same read, so
+                // the child cannot report its mode reset before this branch.
+                // Hold only this control-key release for a short handoff
+                // window; ordinary key-up events retain their normal latency.
+                if self.deferred_kitty_releases.len() == MAX_DEFERRED_KITTY_RELEASES {
+                    self.deferred_kitty_releases.pop_front();
+                    self.log_event("dropping oldest deferred Kitty release at resource bound");
+                }
+                self.deferred_kitty_releases
+                    .push_back(DeferredKittyRelease {
+                        target: press.target,
+                        kitty_keyboard_flags: press.kitty_keyboard_flags,
+                        bytes: raw.to_vec(),
+                        release_at_ms: self
+                            .clock
+                            .now_ms()
+                            .saturating_add(KITTY_CTRL_C_RELEASE_HANDOFF_MS),
+                    });
+                self.log_event("deferring Ctrl-C release across possible application handoff");
                 return Ok(());
             }
             return self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out);
@@ -258,23 +332,36 @@ impl App {
             return self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out);
         }
 
-        if self.handle_tmux_prefix_key(sr, &key, term_out)? {
+        let binding_name = self.key_event_binding_name(key_event);
+        let preempts_tmux_prefix = binding_name
+            .as_deref()
+            .and_then(|name| sr.key_bindings().binding_for_mode(sr.input_mode(), name))
+            .is_some_and(|binding| {
+                matches!(
+                    binding,
+                    Binding::Builtin(
+                        commands::Action::OpenTmuxConnectionChooser
+                            | commands::Action::DetachTmuxConnection
+                            | commands::Action::ForceAbandonTmuxGateway
+                    )
+                )
+            });
+        if !preempts_tmux_prefix && self.handle_tmux_prefix_key(sr, &key, term_out)? {
             self.consumed_key_presses.insert(key_id);
             return Ok(());
         }
 
-        let binding_name = self.key_event_binding_name(key_event);
-        if self.log_enabled {
-            eprintln!(
-                "parsed key event: binding={} raw={}",
-                binding_name.as_deref().unwrap_or("<none>"),
-                Self::format_bytes(raw)
-            );
-        }
         let binding = binding_name.as_ref().and_then(|name| {
             sr.key_bindings()
                 .binding_for_mode(sr.input_mode(), name.as_str())
         });
+        if self.log_enabled && binding.is_some() {
+            self.log_event(&format!(
+                "parsed bound key event: binding={} raw_length={}",
+                binding_name.as_deref().unwrap_or("<none>"),
+                raw.len()
+            ));
+        }
         if let Some(binding) = binding {
             if sr.help_mode() {
                 if matches!(binding, Binding::Builtin(commands::Action::ToggleHelp)) {
@@ -293,10 +380,8 @@ impl App {
                         if self.view_stack.active_mut().kind() == views::ViewKind::Review {
                             sr.speak("Review already open", false)?;
                         } else {
-                            let review = {
-                                let active = self.view_stack.active_mut();
-                                views::ReviewView::new(active.model())
-                            };
+                            let review =
+                                views::ReviewView::new(self.presented_accessibility_model_mut());
                             self.handle_view_action(
                                 sr,
                                 views::ViewAction::Push(Box::new(review)),
@@ -312,7 +397,7 @@ impl App {
                             self.consumed_key_presses.insert(key_id);
                             return Ok(());
                         }
-                        let (rows, cols) = self.view_stack.active_mut().model().size();
+                        let (rows, cols) = self.view_stack.active_mut().model().live_size();
                         let repl =
                             views::LuaReplView::new(rows, cols, self.lua_repl_history.clone())?;
                         self.handle_view_action(
@@ -349,31 +434,10 @@ impl App {
                                 term_out,
                             )?)
                         }
-                        commands::Action::InterruptTmuxGateway => {
+                        commands::Action::ForceAbandonTmuxGateway => {
                             Some(self.request_tmux_gateway_action(
                                 sr,
-                                crate::tmux_lifecycle::GatewayControlAction::Interrupt,
-                                term_out,
-                            )?)
-                        }
-                        commands::Action::ForceCloseTmuxGateway => {
-                            Some(self.request_tmux_gateway_action(
-                                sr,
-                                crate::tmux_lifecycle::GatewayControlAction::ForceClose,
-                                term_out,
-                            )?)
-                        }
-                        commands::Action::SendTmuxSshEscapeDisconnect => {
-                            Some(self.request_tmux_gateway_action(
-                                sr,
-                                crate::tmux_lifecycle::GatewayControlAction::SshEscapeDisconnect,
-                                term_out,
-                            )?)
-                        }
-                        commands::Action::SendTmuxSshEscapeHelp => {
-                            Some(self.request_tmux_gateway_action(
-                                sr,
-                                crate::tmux_lifecycle::GatewayControlAction::SshEscapeHelp,
+                                crate::tmux_lifecycle::GatewayControlAction::ForceAbandon,
                                 term_out,
                             )?)
                         }
@@ -381,6 +445,10 @@ impl App {
                     };
                     if tmux_overlay_opened.is_some() {
                         if tmux_overlay_opened == Some(false) {
+                            if action == commands::Action::OpenTmuxConnectionChooser {
+                                self.consumed_key_presses.remove(&key_id);
+                                return self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out);
+                            }
                             self.emit_physical_bells(term_out, 1)?;
                         }
                         self.consumed_key_presses.insert(key_id);
@@ -398,7 +466,21 @@ impl App {
                         return Ok(());
                     }
                     let mode_before = sr.input_mode();
-                    let title = {
+                    if matches!(action, commands::Action::RevLineRead) {
+                        let view = if action.uses_presented_view() {
+                            self.presented_accessibility_model_mut()
+                        } else {
+                            self.view_stack.active_mut().model()
+                        };
+                        synchronize_pending_review_cursor(sr, view)?;
+                    }
+                    let title = if matches!(action, commands::Action::SayOverlay)
+                        && self.output_scheduler.is_some()
+                    {
+                        self.presented_accessibility_label
+                            .clone()
+                            .unwrap_or_else(|| "terminal".to_owned())
+                    } else {
                         let active = self.view_stack.active_mut();
                         if let Some(tmux) =
                             active.as_any().downcast_ref::<views::TmuxConnectionView>()
@@ -419,12 +501,17 @@ impl App {
                             active.title().to_string()
                         }
                     };
-                    let consumed = match commands::handle(
-                        sr,
-                        &title,
-                        self.view_stack.active_mut().model(),
-                        action,
-                    )? {
+                    let command_result = if action.uses_presented_view() {
+                        commands::handle(
+                            sr,
+                            &title,
+                            self.presented_accessibility_model_mut(),
+                            action,
+                        )?
+                    } else {
+                        commands::handle(sr, &title, self.view_stack.active_mut().model(), action)?
+                    };
+                    let consumed = match command_result {
                         commands::CommandResult::Handled => true,
                         commands::CommandResult::ForwardInput => {
                             self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out)?;
@@ -491,6 +578,16 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         let event = key.event();
+        let kitty_press_mode = (!key.is_release()
+            && input.starts_with(b"\x1b[")
+            && input.ends_with(b"u"))
+        .then(|| {
+            self.view_stack
+                .active_mut()
+                .model()
+                .live_screen()
+                .kitty_keyboard_flags()
+        });
         if !key.is_release()
             && event.modifiers.is_empty()
             && matches!(event.code, KeyCode::Up | KeyCode::Down)
@@ -510,15 +607,110 @@ impl App {
             .view_stack
             .active_mut()
             .handle_key_input(sr, key, input, pty_out)?;
+        if let Some(mode) = kitty_press_mode {
+            let target = match &action {
+                views::ViewAction::PtyInput => Some(ForwardedInputTarget::RootPty),
+                views::ViewAction::TmuxInput {
+                    connection_id,
+                    pane_id,
+                    ..
+                } => Some(ForwardedInputTarget::TmuxPane {
+                    connection_id: *connection_id,
+                    pane_id: *pane_id,
+                }),
+                _ => None,
+            };
+            if let Some(target) = target {
+                self.forwarded_key_presses.insert(
+                    (event.code, event.modifiers, event.state),
+                    ForwardedKeyPress {
+                        target,
+                        kitty_keyboard_flags: mode,
+                    },
+                );
+            }
+        }
         if matches!(
-            action,
-            views::ViewAction::Pop | views::ViewAction::PopupResponse(_)
+            &action,
+            views::ViewAction::Pop
+                | views::ViewAction::PopupResponse(_)
+                | views::ViewAction::ActivateTmuxConnection(_)
         ) {
-            let event = key.event();
             self.view_transition_key_presses
                 .insert((event.code, event.modifiers, event.state));
         }
         self.handle_view_action(sr, action, term_out)
+    }
+
+    fn active_forwarded_input_target(&mut self) -> Option<(ForwardedInputTarget, u8)> {
+        if self.view_stack.active_mut().kind() == views::ViewKind::Terminal {
+            let mode = self
+                .view_stack
+                .active_mut()
+                .model()
+                .live_screen()
+                .kitty_keyboard_flags();
+            return Some((ForwardedInputTarget::RootPty, mode));
+        }
+        let view = self.view_stack.active_tmux_connection_mut()?;
+        let connection_id = view.connection_id();
+        let pane_id = view.active_input_pane()?;
+        let mode = view.model().live_screen().kitty_keyboard_flags();
+        Some((
+            ForwardedInputTarget::TmuxPane {
+                connection_id,
+                pane_id,
+            },
+            mode,
+        ))
+    }
+
+    fn should_quarantine_kitty_ctrl_c(&mut self) -> bool {
+        let Some(handoff) = self.kitty_ctrl_c_input_handoff else {
+            return false;
+        };
+        if self.clock.now_ms() > handoff.deadline_ms {
+            self.kitty_ctrl_c_input_handoff = None;
+            return false;
+        }
+        self.active_forwarded_input_target() == Some((handoff.target, 0))
+    }
+
+    pub(super) fn flush_deferred_kitty_releases(&mut self, pty_out: &mut dyn Write) -> Result<()> {
+        let now_ms = self.clock.now_ms();
+        let queued = self.deferred_kitty_releases.len();
+        let mut wrote_root_pty = false;
+        for _ in 0..queued {
+            let Some(release) = self.deferred_kitty_releases.pop_front() else {
+                break;
+            };
+            if self.active_forwarded_input_target()
+                != Some((release.target, release.kitty_keyboard_flags))
+            {
+                self.log_event("discarding deferred release after application handoff");
+                continue;
+            }
+            if now_ms < release.release_at_ms {
+                self.deferred_kitty_releases.push_back(release);
+                continue;
+            }
+            self.log_bytes("forwarding deferred Kitty release", &release.bytes);
+            match release.target {
+                ForwardedInputTarget::RootPty => {
+                    pty_out.write_all(&release.bytes)?;
+                    wrote_root_pty = true;
+                }
+                ForwardedInputTarget::TmuxPane {
+                    connection_id,
+                    pane_id,
+                } => self.queue_tmux_input(connection_id, pane_id, &release.bytes)?,
+            }
+            self.last_stdin_update = Some(now_ms);
+        }
+        if wrote_root_pty {
+            pty_out.flush()?;
+        }
+        Ok(())
     }
 
     fn handle_raw_bytes(
@@ -540,7 +732,6 @@ impl App {
         raw: &[u8],
         decoded_key_event: bool,
     ) -> Result<()> {
-        sr.clear_pending_delete();
         sr.clear_pending_history_navigation();
         // A decoded key press should always interrupt speech. In particular, Kitty's
         // keyboard protocol encodes Control and Meta keys as CSI-u sequences, which

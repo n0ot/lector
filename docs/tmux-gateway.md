@@ -1,7 +1,7 @@
 # Direct tmux gateway routing
 
-Stop 3.2 introduces `TmuxGatewayRouter`, the source boundary between an ordinary
-direct PTY and one top-level `tmux -CC` control stream. Lector still does not
+`TmuxGatewayRouter` is the source boundary between an ordinary direct PTY and
+one top-level `tmux -CC` control stream. Lector still does not
 launch or configure tmux. A user may run `tmux -CC` directly or through any
 shell function or script.
 
@@ -31,16 +31,16 @@ cleanup calls are idempotent.
 ## Connection and portal surfaces
 
 The first detected top-level connection is assigned ID 1 and focused
-automatically. Until topology and pane rendering arrive in Stops 3.3 and 3.4,
-its active surface explicitly says that the tmux connection is active and pane
-presentation is unavailable.
+automatically. During the short interval before topology and pane rendering
+are available, its active surface explicitly says that the tmux connection is
+active and pane presentation is unavailable.
 
 The gateway is retained behind that surface as a read-only portal. It never
 contains protocol records, never writes input to the control PTY, and offers no
 action for reviewing the pre-tmux gateway screen. Its text explains that tmux
 control mode is running and that Enter returns to the active connection.
-`App::show_tmux_gateway` supplies the navigation boundary future connection
-choosers will use; Enter reconstructs and focuses the connection surface.
+`App::show_tmux_gateway` supplies the navigation boundary used by connection
+management; Enter reconstructs and focuses the connection surface.
 
 On clean `%exit` plus ST, Lector removes the connection and both temporary
 surfaces, then resumes the original gateway engine before processing any bytes

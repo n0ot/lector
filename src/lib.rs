@@ -2,6 +2,7 @@ pub mod app;
 mod attributes;
 mod clipboard;
 mod commands;
+pub mod diagnostics;
 mod ext;
 pub mod harness;
 mod keymap;

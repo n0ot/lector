@@ -54,6 +54,7 @@ pub enum GatewayLifecycleState {
     Direct,
     Control,
     AwaitingTerminator,
+    Recovering,
 }
 
 #[derive(Debug, Error)]
@@ -81,6 +82,7 @@ struct ActiveControl {
     current_record: Vec<u8>,
     saw_exit: bool,
     terminator_escape_seen: bool,
+    recovering: bool,
 }
 
 #[derive(Debug)]
@@ -124,6 +126,7 @@ impl TmuxGatewayRouter {
     pub fn lifecycle_state(&self) -> GatewayLifecycleState {
         match self.active.as_ref() {
             None => GatewayLifecycleState::Direct,
+            Some(active) if active.recovering => GatewayLifecycleState::Recovering,
             Some(active) if active.saw_exit => GatewayLifecycleState::AwaitingTerminator,
             Some(_) => GatewayLifecycleState::Control,
         }
@@ -143,6 +146,23 @@ impl TmuxGatewayRouter {
         let mut index = 0;
 
         while index < bytes.len() {
+            if self.active.as_ref().is_some_and(|active| active.recovering) {
+                let byte = bytes[index];
+                index += 1;
+                let active = self
+                    .active
+                    .as_mut()
+                    .expect("recovering connection checked above");
+                if active.terminator_escape_seen && byte == b'\\' {
+                    let connection_id = active.connection_id;
+                    self.active = None;
+                    events.push(GatewayEvent::ConnectionEnded { connection_id });
+                } else {
+                    active.terminator_escape_seen = byte == b'\x1b';
+                }
+                continue;
+            }
+
             if self
                 .active
                 .as_ref()
@@ -172,7 +192,7 @@ impl TmuxGatewayRouter {
                 let parsed = match active.parser.push(&bytes[index..index + 1]) {
                     Ok(parsed) => parsed,
                     Err(source) => {
-                        let failed = self.active.take().expect("active parser failed");
+                        let mut failed = self.active.take().expect("active parser failed");
                         index += 1;
                         events.push(GatewayEvent::ConnectionFailed {
                             connection_id,
@@ -182,13 +202,24 @@ impl TmuxGatewayRouter {
                                 GatewayFailure::Protocol(source.to_string())
                             },
                         });
-                        if failed.saw_exit
+                        let returned_to_direct_transport = failed.saw_exit
                             || failed
                                 .current_record
                                 .first()
-                                .is_some_and(|byte| *byte != b'%' && *byte != b'\x1b')
-                        {
+                                .is_some_and(|byte| *byte != b'%' && *byte != b'\x1b');
+                        if returned_to_direct_transport {
                             direct.extend_from_slice(&failed.current_record);
+                        } else {
+                            // A protocol-looking record failed while the DCS
+                            // transport is still live. Do not expose the rest
+                            // of that control channel as terminal text. The
+                            // application will terminate the client while this
+                            // bounded recovery state drains through DCS ST.
+                            failed.current_record.clear();
+                            failed.recovering = true;
+                            failed.saw_exit = false;
+                            failed.terminator_escape_seen = false;
+                            self.active = Some(failed);
                         }
                         continue;
                     }
@@ -255,6 +286,12 @@ impl TmuxGatewayRouter {
     pub fn finish_direct(&mut self) -> Result<Vec<u8>, GatewayError> {
         if let Some(active) = self.active.as_mut() {
             let connection_id = active.connection_id;
+            if active.recovering {
+                return Err(GatewayError::UnterminatedControl {
+                    connection_id,
+                    source: ControlParseError::ParserPoisoned,
+                });
+            }
             return active
                 .parser
                 .finish()
@@ -273,14 +310,20 @@ impl TmuxGatewayRouter {
     pub fn finish_transport(&mut self) -> Vec<GatewayEvent> {
         let mut events = Vec::new();
         if let Some(active) = self.active.take() {
-            events.push(GatewayEvent::ConnectionFailed {
-                connection_id: active.connection_id,
-                reason: if active.saw_exit {
-                    GatewayFailure::MissingTerminator
-                } else {
-                    GatewayFailure::TransportEof
-                },
-            });
+            if active.recovering {
+                events.push(GatewayEvent::ConnectionEnded {
+                    connection_id: active.connection_id,
+                });
+            } else {
+                events.push(GatewayEvent::ConnectionFailed {
+                    connection_id: active.connection_id,
+                    reason: if active.saw_exit {
+                        GatewayFailure::MissingTerminator
+                    } else {
+                        GatewayFailure::TransportEof
+                    },
+                });
+            }
         } else if !self.marker_prefix.is_empty() {
             events.push(GatewayEvent::DirectOutput(std::mem::take(
                 &mut self.marker_prefix,
@@ -331,6 +374,7 @@ impl TmuxGatewayRouter {
             current_record: Vec::new(),
             saw_exit: false,
             terminator_escape_seen: false,
+            recovering: false,
         });
         Ok(())
     }

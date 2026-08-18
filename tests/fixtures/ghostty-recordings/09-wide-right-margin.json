@@ -1,6 +1,6 @@
 {
   "name": "wide-grapheme-right-margin",
-  "source": "regression captured during Stop 1.2 strict shadow review",
+  "source": "strict terminal-shadow regression",
   "rows": 2,
   "cols": 6,
   "scrollback": 16,

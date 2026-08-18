@@ -65,6 +65,97 @@ fn bootstrap_all(panes: &mut TmuxPaneSet, requests: &[lector::tmux_panes::Bootst
 }
 
 #[test]
+fn active_pane_bootstraps_first_and_background_sessions_do_not_delay_readiness() {
+    let background_layout = "b25f,80x24,0,0,20";
+    let active_layout = "b260,80x24,0,0,99";
+    let lines = [
+        b"S\t$1\tbackground".to_vec(),
+        b"S\t$2\tactive".to_vec(),
+        format!("W\t$1\t@10\t1\t1\t{background_layout}\t{background_layout}\t*\tbackground")
+            .into_bytes(),
+        format!("W\t$2\t@11\t1\t1\t{active_layout}\t{active_layout}\t*\tactive").into_bytes(),
+        b"P\t@10\t%20\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tbackground".to_vec(),
+        b"P\t@11\t%99\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tactive".to_vec(),
+        b"A\t$2".to_vec(),
+    ];
+    let mut topology = TmuxTopology::new(1);
+    topology.replace_inventory(&lines).unwrap();
+    let mut view = views::TmuxConnectionView::new(24, 80, 1);
+
+    let requests = view.sync_topology(&topology).unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.pane_id)
+            .collect::<Vec<_>>(),
+        vec![PaneId(99), PaneId(20)]
+    );
+    assert!(!view.is_ready());
+
+    view.apply_bootstrap(
+        PaneId(99),
+        CommandStatus::Success,
+        &[b"ncarpenter:~$".to_vec()],
+        100,
+    )
+    .unwrap();
+    assert!(view.is_ready());
+    let contents = views::ViewController::model(&mut view).contents_full();
+    assert!(contents.contains("ncarpenter:~$"));
+    assert!(!contents.contains("background"));
+}
+
+#[test]
+fn tmux_pane_engines_discard_shadow_terminal_replies_before_and_after_bootstrap() {
+    let topology = topology_with_layout(LEFT_RIGHT, LEFT_RIGHT);
+    let mut panes = TmuxPaneSet::new(1);
+    panes.reconcile(&topology).unwrap();
+
+    assert!(
+        panes
+            .process_output(PaneId(20), b"\x1b[c\x1b[>q")
+            .unwrap()
+            .is_none()
+    );
+    panes
+        .apply_bootstrap(PaneId(20), CommandStatus::Error, &[], 100)
+        .unwrap();
+    panes
+        .apply_bootstrap(
+            PaneId(21),
+            CommandStatus::Success,
+            &[b"right pane".to_vec()],
+            100,
+        )
+        .unwrap();
+    assert!(
+        panes
+            .pending_update(PaneId(20))
+            .unwrap()
+            .pty_replies
+            .is_empty(),
+        "prebootstrap shadow replies remained pending"
+    );
+
+    let update = panes
+        .process_output(PaneId(20), b"\x1b[c\x1b[>c\x1b[>q")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !update.pty_replies.is_empty(),
+        "the controller needs this batch's replies to extract OSC 10/11 reports"
+    );
+    assert!(
+        panes
+            .pending_update(PaneId(20))
+            .unwrap()
+            .pty_replies
+            .is_empty(),
+        "a tmux pane shadow retained duplicate replies after bootstrap"
+    );
+}
+
+#[test]
 fn parses_one_split_nested_and_zoom_layouts_with_internal_borders() {
     let one = TmuxLayout::parse("b25f,80x24,0,0,20").unwrap();
     assert_eq!(one.panes().len(), 1);
@@ -98,6 +189,32 @@ fn parses_one_split_nested_and_zoom_layouts_with_internal_borders() {
         "overlapping split children were accepted"
     );
     assert!(TmuxLayout::parse(&format!("beef,1x1,0,0{}", "[".repeat(200))).is_err());
+}
+
+#[test]
+fn parses_floating_panes_and_orders_them_bottom_to_top() {
+    let layout = TmuxLayout::parse(
+        "511d,100x30,0,0[100x30,0,0,20,40x10,5,4,21,20x5,20,2,22]<40x10,5,4,21,20x5,20,2,22>",
+    )
+    .unwrap();
+    assert_eq!(
+        layout
+            .panes()
+            .iter()
+            .map(|pane| pane.pane_id)
+            .collect::<Vec<_>>(),
+        vec![PaneId(20), PaneId(22), PaneId(21)],
+        "the `<...>` suffix is top-to-bottom while scene composition is bottom-to-top"
+    );
+    assert_eq!(layout.pane(PaneId(21)).unwrap().origin.col, 5);
+    assert_eq!(layout.pane(PaneId(22)).unwrap().origin.row, 2);
+    let borders = layout.border_snapshot(TerminalGeometry::from_cells(30, 100));
+    assert!(
+        borders
+            .rows
+            .iter()
+            .all(|row| { row.cells.iter().all(|cell| cell.contents().is_empty()) })
+    );
 }
 
 #[test]
@@ -170,7 +287,10 @@ fn bootstrap_seeds_history_cursor_screen_and_starts_accessibility_quiet() {
     let mut panes = TmuxPaneSet::new(1);
     let requests = panes.reconcile(&topology).unwrap();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].command.windows(3).any(|bytes| bytes == b" -a"));
+    assert_eq!(
+        requests[0].command, b"capture-pane -p -e -F -J -t %20\n",
+        "the default grid is the displayed alternate screen; -a selects tmux's saved grid"
+    );
 
     panes
         .process_output(PaneId(20), b"pre-capture duplicate")
@@ -229,6 +349,36 @@ fn bootstrap_seeds_history_cursor_screen_and_starts_accessibility_quiet() {
             .unwrap()
             .scrollback_len()
             >= 2
+    );
+}
+
+#[test]
+fn empty_bootstrap_capture_preserves_output_that_arrived_during_bootstrap() {
+    let layout = "cafe,20x4,0,0,20";
+    let lines = [
+        b"S\t$1\tdev".to_vec(),
+        format!("W\t$1\t@10\t1\t1\t{layout}\t{layout}\t*\tbash").into_bytes(),
+        b"P\t@10\t%20\t1\t1\t0\t0\t20\t4\t0\t0\t0\t1\t0\t0\t0\t0\tbash".to_vec(),
+        b"A\t$1".to_vec(),
+    ];
+    let mut topology = TmuxTopology::new(1);
+    topology.replace_inventory(&lines).unwrap();
+    let mut panes = TmuxPaneSet::new(1);
+    let request = panes.reconcile(&topology).unwrap().remove(0);
+
+    panes
+        .process_output(request.pane_id, b"ncarpenter:~$ ")
+        .unwrap();
+    panes
+        .apply_bootstrap(request.pane_id, CommandStatus::Success, &[], 200)
+        .unwrap();
+
+    assert!(
+        panes
+            .pane_view(request.pane_id)
+            .unwrap()
+            .contents_full()
+            .contains("ncarpenter:~$")
     );
 }
 
@@ -460,12 +610,19 @@ fn application_harness_bootstraps_and_incrementally_renders_real_control_records
         control_input,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
     app.handle_pty(&mut sr, b"%begin 2 2 0\n%end 2 2 0\n", &mut physical)
         .unwrap();
+    app.handle_pty(
+        &mut sr,
+        b"%begin 3 3 0\nattached,control-mode,pause-after=1\n%end 3 3 0\n",
+        &mut physical,
+    )
+    .unwrap();
 
     let inventory_groups = [
         vec![b"S\t$1\twork".to_vec()],
@@ -480,7 +637,7 @@ fn application_harness_bootstraps_and_incrementally_renders_real_control_records
         vec![b"C\tclient_name\t/dev/ttys001".to_vec()],
         vec![b"O\tprefix\tC-a".to_vec()],
         vec![b"O\tprefix2\tNone".to_vec()],
-        vec![b"O\tmode-keys\tvi".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
         vec![b"O\trepeat-time\t500".to_vec()],
         vec![b"B\tn\t0\tnext-window".to_vec()],
     ];
@@ -492,10 +649,10 @@ fn application_harness_bootstraps_and_incrementally_renders_real_control_records
             .join("\n");
         let response = format!(
             "%begin {} {} 0\n{output}\n%end {} {} 0\n",
-            index + 3,
-            index + 3,
-            index + 3,
-            index + 3
+            index + 4,
+            index + 4,
+            index + 4,
+            index + 4
         );
         app.handle_pty(&mut sr, response.as_bytes(), &mut physical)
             .unwrap();
@@ -506,8 +663,8 @@ fn application_harness_bootstraps_and_incrementally_renders_real_control_records
         .unwrap();
     assert_eq!(
         String::from_utf8(control_input.clone()).unwrap(),
-        "capture-pane -p -e -J -S - -t %20\n\
-         capture-pane -p -e -J -S - -t %21\n"
+        "capture-pane -p -e -F -J -S - -t %20\n\
+         capture-pane -p -e -F -J -S - -t %21\n"
     );
 
     app.handle_pty(
@@ -682,7 +839,7 @@ fn real_tmux_split_resize_zoom_close_and_bootstrap_match_the_render_oracle() {
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
-        .expect("Stop 3 integration tests require tmux on PATH");
+        .expect("tmux integration tests require tmux on PATH");
     assert!(tmux.status.success(), "tmux -V failed");
 
     let socket_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-tmux");

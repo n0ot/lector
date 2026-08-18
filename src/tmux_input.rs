@@ -66,7 +66,61 @@ pub fn refresh_client_command(geometry: TerminalGeometry) -> Vec<u8> {
 
 #[must_use]
 pub fn continue_pane_command(pane_id: PaneId) -> Vec<u8> {
-    format!("refresh-client -A %{}:continue\n", pane_id.0).into_bytes()
+    // Control-mode stdin is parsed as tmux command language, where the
+    // pane:state argument must remain one token. Unlike argv passed to the
+    // tmux executable, the colon-bearing value therefore needs quoting.
+    format!("refresh-client -A '%{}:continue'\n", pane_id.0).into_bytes()
+}
+
+#[must_use]
+pub fn pause_pane_command(pane_id: PaneId) -> Vec<u8> {
+    format!("refresh-client -A '%{}:pause'\n", pane_id.0).into_bytes()
+}
+
+/// Convert only OSC 10/11 replies produced by a pane's shadow terminal into
+/// control-client reports. Other shadow replies still belong to tmux and are
+/// deliberately discarded rather than injected into the pane as input.
+#[must_use]
+pub fn refresh_client_report_commands(pane_id: PaneId, replies: &[u8]) -> Vec<Vec<u8>> {
+    let mut commands = Vec::new();
+    let mut offset = 0;
+    while offset < replies.len() {
+        let Some(relative_start) = replies[offset..]
+            .windows(2)
+            .position(|window| window == b"\x1b]")
+        else {
+            break;
+        };
+        let start = offset + relative_start;
+        let mut cursor = start + 2;
+        let end = loop {
+            let Some(byte) = replies.get(cursor).copied() else {
+                return commands;
+            };
+            if byte == b'\x07' {
+                break cursor + 1;
+            }
+            if byte == b'\x1b' && replies.get(cursor + 1) == Some(&b'\\') {
+                break cursor + 2;
+            }
+            cursor += 1;
+        };
+        let report = &replies[start..end];
+        let eligible = report.starts_with(b"\x1b]10;") || report.starts_with(b"\x1b]11;");
+        if eligible
+            && report.len() <= 256
+            && !report
+                .iter()
+                .any(|byte| matches!(byte, b'\'' | b'\n' | b'\r'))
+        {
+            let mut command = format!("refresh-client -r '%{}:", pane_id.0).into_bytes();
+            command.extend_from_slice(report);
+            command.extend_from_slice(b"'\n");
+            commands.push(command);
+        }
+        offset = end;
+    }
+    commands
 }
 
 /// Translate a physical-terminal mouse event into the active pane's local

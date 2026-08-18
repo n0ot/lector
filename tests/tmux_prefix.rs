@@ -4,8 +4,8 @@ use lector::{
     speech,
     tmux_model::TmuxTopology,
     tmux_prefix::{
-        BindingAction, PREFIX_TIMEOUT_MS, classify_binding, command_may_change_key_configuration,
-        tmux_key_name,
+        BindingAction, classify_binding, command_may_change_key_configuration,
+        scope_select_window_command, tmux_key_name,
     },
     views,
 };
@@ -23,14 +23,12 @@ use terminput::{KeyCode, KeyEvent, KeyModifiers};
 
 const ONE_PANE: &str = "b25f,80x24,0,0,21";
 
-// Representative machine-format records captured from the user's actual
-// prefix table on 2026-08-14. These include the user's C-a prefix workflow,
-// passthrough-table toggles, repeatable directions, command chains, quoted
-// formats, confirmations, and tmux's default everyday actions.
+// Representative machine-format records supplied by tmux at runtime. They
+// cover a custom prefix and key table without reading a configuration file.
 const USER_PREFIX_FIXTURE: &[&[u8]] = &[
     b"O\tprefix\tC-a",
     b"O\tprefix2\tNone",
-    b"O\tmode-keys\tvi",
+    b"O\tkey-table\troot",
     b"O\trepeat-time\t500",
     b"B\t1\t0\tselect-window -t :=1",
     b"B\tn\t0\tnext-window",
@@ -57,6 +55,7 @@ const USER_PREFIX_FIXTURE: &[&[u8]] = &[
     b"B\t\\\t0\tset-option -g key-table passthrough \\; set-option -g status-right \"#W.#P#{?client_prefix, PR,} PASS\"",
     b"B\tZ\t0\tdisplay-message -p -F \"#{session_name}:#{window_index}:#{pane_index}\"",
     b"B\tr\t0\tsource-file ~/.tmux.conf \\; display-message Reloaded!",
+    b"B\tpassthrough\tq\t0\tdisplay-message passthrough-key",
 ];
 
 fn topology_with_user_prefix() -> TmuxTopology {
@@ -86,7 +85,7 @@ fn inventory_groups() -> Vec<Vec<Vec<u8>>> {
         vec![b"C\tclient_name\ttest".to_vec()],
         vec![b"O\tprefix\tC-a".to_vec()],
         vec![b"O\tprefix2\tNone".to_vec()],
-        vec![b"O\tmode-keys\tvi".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
         vec![b"O\trepeat-time\t500".to_vec()],
         USER_PREFIX_FIXTURE[4..]
             .iter()
@@ -100,7 +99,7 @@ fn user_prefix_fixture_preserves_options_repeatability_commands_and_quotes() {
     let topology = topology_with_user_prefix();
     assert_eq!(topology.option("prefix"), Some("C-a"));
     assert_eq!(topology.option("prefix2"), Some("None"));
-    assert_eq!(topology.option("mode-keys"), Some("vi"));
+    assert_eq!(topology.option("key-table"), Some("root"));
     assert_eq!(topology.option("repeat-time"), Some("500"));
     assert_eq!(topology.bindings().len(), 25);
     assert!(topology.binding("Left").unwrap().repeatable);
@@ -160,14 +159,22 @@ fn binding_classifier_recognizes_accessible_and_safe_passthrough_actions() {
             "set-option -g key-table passthrough \\; set-option -g status-right \"PASS\""
         )
         .unwrap(),
-        BindingAction::UnsupportedKeyTable(ref table) if table == "passthrough"
+        BindingAction::SetKeyTable {
+            ref table,
+            persistent: true,
+            ..
+        } if table == "passthrough"
     ));
     assert!(matches!(
         classify_binding(
             "set-option -g key-table root \\; set-option -g status-right \"normal\""
         )
         .unwrap(),
-        BindingAction::UnsupportedKeyTable(ref table) if table == "root"
+        BindingAction::SetKeyTable {
+            ref table,
+            persistent: true,
+            ..
+        } if table == "root"
     ));
     assert!(matches!(
         classify_binding("select-window -t :=2").unwrap(),
@@ -183,6 +190,32 @@ fn binding_classifier_recognizes_accessible_and_safe_passthrough_actions() {
     ));
     assert!(command_may_change_key_configuration("set -g prefix C-a"));
     assert!(!command_may_change_key_configuration("next-window"));
+}
+
+#[test]
+fn numeric_window_bindings_are_scoped_to_the_attached_session_by_stable_id() {
+    let layout = "b25f,80x24,0,0,110";
+    let records = [
+        b"S\t$1\tdev".to_vec(),
+        format!("W\t$1\t@110\t10\t1\t{layout}\t{layout}\t*\tcodex").into_bytes(),
+        b"P\t@110\t%110\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tcodex".to_vec(),
+        b"A\t$1".to_vec(),
+    ];
+    let mut topology = TmuxTopology::new(1);
+    topology.replace_inventory(&records).unwrap();
+
+    assert_eq!(
+        scope_select_window_command(&topology, "select-window -t 10").as_deref(),
+        Some("select-window -t @110")
+    );
+    assert_eq!(
+        scope_select_window_command(&topology, "select-window -t :=10").as_deref(),
+        Some("select-window -t @110")
+    );
+    assert_eq!(
+        scope_select_window_command(&topology, "select-window -t 9"),
+        None
+    );
 }
 
 #[test]
@@ -263,6 +296,13 @@ fn reply(serial: usize, lines: &[Vec<u8>], success: bool) -> Vec<u8> {
 }
 
 fn ready_app() -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
+    ready_app_with_bootstrap(None, &[b"ready".to_vec()])
+}
+
+fn ready_app_with_bootstrap(
+    prebootstrap_output: Option<&[u8]>,
+    capture: &[Vec<u8>],
+) -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
     let clock = TestClock::default();
     let recorder = Recorder::default();
     let stack = views::ViewStack::new(Box::new(views::PtyView::new(24, 80)));
@@ -282,29 +322,39 @@ fn ready_app() -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
         commands,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
     app.handle_pty(&mut sr, &reply(2, &[], true), &mut physical)
         .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
 
     let groups = inventory_groups();
     assert_eq!(groups.len(), lector::tmux_model::INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        app.handle_pty(&mut sr, &reply(index + 3, group, true), &mut physical)
+        app.handle_pty(&mut sr, &reply(index + 4, group, true), &mut physical)
             .unwrap();
     }
     commands.clear();
     app.handle_tick(&mut sr, &mut commands, &mut physical)
         .unwrap();
-    assert_eq!(commands, b"capture-pane -p -e -J -S - -t %21\n");
-    app.handle_pty(
-        &mut sr,
-        &reply(20, &[b"ready".to_vec()], true),
-        &mut physical,
-    )
-    .unwrap();
+    assert_eq!(commands, b"capture-pane -p -e -F -J -S - -t %21\n");
+    if let Some(output) = prebootstrap_output {
+        let mut notification = b"%output %21 ".to_vec();
+        notification.extend_from_slice(output);
+        notification.push(b'\n');
+        app.handle_pty(&mut sr, &notification, &mut physical)
+            .unwrap();
+    }
+    app.handle_pty(&mut sr, &reply(20, capture, true), &mut physical)
+        .unwrap();
     (app, sr, recorder, clock, physical)
 }
 
@@ -341,7 +391,7 @@ fn terminal_mode_keeps_ctrl_a_verbatim_but_tmux_mode_owns_the_configured_prefix(
 }
 
 #[test]
-fn prefix_repeat_timeout_cancel_send_prefix_and_unbound_keys_are_deterministic() {
+fn prefix_waits_indefinitely_but_repeat_timeout_cancel_and_unbound_keys_are_deterministic() {
     let (mut app, mut sr, recorder, clock, mut physical) = ready_app();
 
     input(&mut app, &mut sr, &mut physical, b"\x01\x1b[D");
@@ -353,13 +403,16 @@ fn prefix_repeat_timeout_cancel_send_prefix_and_unbound_keys_are_deterministic()
     let raw_left = tick(&mut app, &mut sr, &mut physical);
     assert!(String::from_utf8_lossy(&raw_left).contains("1b 5b 44"));
 
+    recorder.0.borrow_mut().clear();
     input(&mut app, &mut sr, &mut physical, b"\x01");
-    clock.advance(PREFIX_TIMEOUT_MS + 1);
+    assert_eq!(&*recorder.0.borrow(), &["tmux"]);
+    clock.advance(60_000);
     input(&mut app, &mut sr, &mut physical, b"n");
-    assert!(String::from_utf8_lossy(&tick(&mut app, &mut sr, &mut physical)).contains(" 6e\n"));
+    assert_eq!(tick(&mut app, &mut sr, &mut physical), b"next-window\n");
 
     input(&mut app, &mut sr, &mut physical, b"\x01\x1b[27;1u");
-    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    input(&mut app, &mut sr, &mut physical, b"n");
+    assert!(String::from_utf8_lossy(&tick(&mut app, &mut sr, &mut physical)).contains(" 6e\n"));
 
     input(&mut app, &mut sr, &mut physical, b"\x01\x01");
     assert!(
@@ -367,7 +420,9 @@ fn prefix_repeat_timeout_cancel_send_prefix_and_unbound_keys_are_deterministic()
             .contains("send-keys -H -t %21 01")
     );
 
-    input(&mut app, &mut sr, &mut physical, b"\x01v");
+    input(&mut app, &mut sr, &mut physical, b"\x01");
+    clock.advance(60_000);
+    input(&mut app, &mut sr, &mut physical, b"v");
     assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
     assert!(
         recorder
@@ -379,8 +434,30 @@ fn prefix_repeat_timeout_cancel_send_prefix_and_unbound_keys_are_deterministic()
 }
 
 #[test]
-fn confirmations_unsupported_tables_and_command_failures_are_accessible() {
-    let (mut app, mut sr, recorder, _clock, mut physical) = ready_app();
+fn connection_bootstrap_speaks_only_the_short_entry_cue_and_ready_pane() {
+    let (_app, _sr, recorder, _clock, _physical) = ready_app();
+    let messages = recorder.0.borrow();
+    assert_eq!(&*messages, &["tmux", "1: input", "ready"]);
+    assert!(messages.iter().all(|message| {
+        !message.contains("connection is active")
+            && !message.contains("Waiting for tmux")
+            && !message.contains("becoming ready")
+    }));
+}
+
+#[test]
+fn empty_initial_capture_uses_live_prompt_and_never_announces_blank_screen() {
+    let (mut app, _sr, recorder, _clock, _physical) =
+        ready_app_with_bootstrap(Some(b"ncarpenter:~$"), &[]);
+    assert!(app.debug_active_view_contents().contains("ncarpenter:~$"));
+    let messages = recorder.0.borrow();
+    assert_eq!(&*messages, &["tmux", "1: input", "ncarpenter:~$"]);
+    assert!(messages.iter().all(|message| message != "blank screen"));
+}
+
+#[test]
+fn confirmations_and_command_failures_are_accessible() {
+    let (mut app, mut sr, _recorder, _clock, mut physical) = ready_app();
 
     input(&mut app, &mut sr, &mut physical, b"\x01x");
     assert!(app.has_overlay());
@@ -392,26 +469,6 @@ fn confirmations_unsupported_tables_and_command_failures_are_accessible() {
     );
     app.handle_pty(&mut sr, &reply(80, &[], true), &mut physical)
         .unwrap();
-
-    input(&mut app, &mut sr, &mut physical, b"\x01\\");
-    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
-    assert!(
-        recorder
-            .0
-            .borrow()
-            .iter()
-            .any(|message| message.contains("passthrough") && message.contains("unsupported"))
-    );
-
-    input(&mut app, &mut sr, &mut physical, b"\x01/");
-    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
-    assert!(
-        recorder
-            .0
-            .borrow()
-            .iter()
-            .any(|message| message.contains("root") && message.contains("unsupported"))
-    );
 
     input(&mut app, &mut sr, &mut physical, b"\x01Z");
     assert!(
@@ -437,10 +494,30 @@ fn confirmations_unsupported_tables_and_command_failures_are_accessible() {
 }
 
 #[test]
+fn discovered_custom_key_table_is_entered_without_local_configuration_knowledge() {
+    let (mut app, mut sr, _recorder, _clock, mut physical) = ready_app();
+
+    input(&mut app, &mut sr, &mut physical, b"\x01\\");
+    let transition = tick(&mut app, &mut sr, &mut physical);
+    assert!(
+        String::from_utf8_lossy(&transition).starts_with("set-option -g key-table passthrough"),
+        "transition={transition:?}"
+    );
+
+    // The runtime-discovered table takes effect immediately, even before the
+    // server replies and Lector refreshes its transactional inventory.
+    input(&mut app, &mut sr, &mut physical, b"q");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"display-message passthrough-key\n"
+    );
+}
+
+#[test]
 fn everyday_discovered_bindings_execute_their_exact_tmux_commands() {
     let (mut app, mut sr, _recorder, _clock, mut physical) = ready_app();
     let cases: &[(&[u8], &[u8])] = &[
-        (b"1", b"select-window -t :=1\n"),
+        (b"1", b"select-window -t @10\n"),
         (b"p", b"previous-window\n"),
         (b"n", b"next-window\n"),
         (b"l", b"last-window\n"),
@@ -604,7 +681,7 @@ fn real_tmux_discovers_c_a_and_executes_next_window_through_control_mode() {
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
-        .expect("Stop 3 integration tests require tmux on PATH");
+        .expect("tmux integration tests require tmux on PATH");
     assert!(tmux.status.success(), "tmux -V failed");
 
     let unique = SystemTime::now()
@@ -661,8 +738,10 @@ fn real_tmux_discovers_c_a_and_executes_next_window_through_control_mode() {
     });
 
     let stack = views::ViewStack::new(Box::new(views::PtyView::new(24, 80)));
-    let mut app = App::new(stack).unwrap();
-    let mut sr = ScreenReader::new(speech::Speech::new(Box::new(Recorder::default())));
+    let clock = TestClock::default();
+    let recorder = Recorder::default();
+    let mut app = App::new_with_clock(stack, Box::new(clock.clone())).unwrap();
+    let mut sr = ScreenReader::new(speech::Speech::new(Box::new(recorder.clone())));
     let mut physical = Vec::new();
     drive_real_tmux(
         "prefix bootstrap",
@@ -675,7 +754,10 @@ fn real_tmux_discovers_c_a_and_executes_next_window_through_control_mode() {
     );
 
     writer
-        .write_all(b"new-window -d -n second \"/bin/sh -c 'printf SECOND; exec cat'\"\n")
+        .write_all(
+            b"new-window -d -n second \"/bin/sh -c 'printf SECOND; exec cat'\"\n\
+new-window -d -t :10 -n tenth \"/bin/sh -c 'printf TENTH; exec cat'\"\n",
+        )
         .unwrap();
     writer.flush().unwrap();
     drive_real_tmux(
@@ -686,8 +768,9 @@ fn real_tmux_discovers_c_a_and_executes_next_window_through_control_mode() {
         writer.as_mut(),
         &mut physical,
         |app| {
-            app.debug_tmux_topology(1)
-                .is_some_and(|topology| topology.contains(": second"))
+            app.debug_tmux_topology(1).is_some_and(|topology| {
+                topology.contains(": second") && topology.contains("index 10: tenth")
+            })
         },
     );
 
@@ -717,7 +800,11 @@ fn real_tmux_discovers_c_a_and_executes_next_window_through_control_mode() {
         |app| app.debug_active_view_contents().contains("FIRST"),
     );
 
-    input(&mut app, &mut sr, &mut physical, b"\x01n");
+    recorder.0.borrow_mut().clear();
+    input(&mut app, &mut sr, &mut physical, b"\x01");
+    assert_eq!(&*recorder.0.borrow(), &["tmux"]);
+    clock.advance(60_000);
+    input(&mut app, &mut sr, &mut physical, b"n");
     let commands = write_real_commands(&mut app, &mut sr, writer.as_mut(), &mut physical);
     assert_eq!(commands, b"next-window\n");
     drive_real_tmux(
@@ -728,6 +815,40 @@ fn real_tmux_discovers_c_a_and_executes_next_window_through_control_mode() {
         writer.as_mut(),
         &mut physical,
         |app| app.debug_active_view_contents().contains("SECOND"),
+    );
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|message| message == "1: second"),
+        "the newly active window title was not announced"
+    );
+
+    recorder.0.borrow_mut().clear();
+    input(&mut app, &mut sr, &mut physical, b"\x010");
+    let commands = write_real_commands(&mut app, &mut sr, writer.as_mut(), &mut physical);
+    assert!(
+        String::from_utf8_lossy(&commands).starts_with("select-window -t @"),
+        "numeric binding was not resolved to a stable window ID: {:?}",
+        String::from_utf8_lossy(&commands)
+    );
+    drive_real_tmux(
+        "window ten binding",
+        &mut app,
+        &mut sr,
+        &receiver,
+        writer.as_mut(),
+        &mut physical,
+        |app| app.debug_active_view_contents().contains("TENTH"),
+    );
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|message| message == "10: tenth"),
+        "window ten was selected but its title was not announced"
     );
 
     writer.write_all(b"kill-server\n").unwrap();

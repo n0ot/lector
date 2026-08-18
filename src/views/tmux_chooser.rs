@@ -309,12 +309,7 @@ impl TmuxChooserView {
                 .skip(self.viewport_start)
                 .take(item_capacity)
             {
-                let marker = if Some(item.target) == self.selected {
-                    ">"
-                } else {
-                    " "
-                };
-                lines.push(format!("{marker} {}", item.label));
+                lines.push(item.label.clone());
             }
         }
         if rows > 1 {
@@ -327,8 +322,25 @@ impl TmuxChooserView {
             }
             bytes.extend_from_slice(truncate_display_width(&line, usize::from(cols)).as_bytes());
         }
-        let cursor_col = query_cursor_width.saturating_add(9).min(usize::from(cols));
-        bytes.extend_from_slice(format!("\x1b[1;{}H", cursor_col.max(1)).as_bytes());
+        let selected_cursor_row = selected_index
+            .filter(|index| {
+                *index >= self.viewport_start
+                    && *index < self.viewport_start.saturating_add(item_capacity)
+            })
+            .map(|index| index.saturating_sub(self.viewport_start).saturating_add(2));
+        let (cursor_row, cursor_col) = selected_cursor_row.map_or_else(
+            || {
+                (
+                    1,
+                    query_cursor_width
+                        .saturating_add(9)
+                        .min(usize::from(cols))
+                        .max(1),
+                )
+            },
+            |row| (row, 1),
+        );
+        bytes.extend_from_slice(format!("\x1b[{cursor_row};{cursor_col}H").as_bytes());
         self.view.clear_update_summary();
         self.view.process_changes(&bytes);
         self.view.clear_update_summary();

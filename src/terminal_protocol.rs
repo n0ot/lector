@@ -8,8 +8,13 @@
 use crate::terminal::{TerminalEvent, TerminalGeometry};
 use std::collections::BTreeMap;
 
-const PROBE_TIMEOUT_MS: u128 = 50;
+const PROBE_INACTIVITY_TIMEOUT_MS: u128 = 50;
 const MAX_PROBE_REPLY_BYTES: usize = 4_096;
+
+/// A terminal-processing fence used after Lector's final physical output.
+/// The matching primary device-attributes response is consumed locally and
+/// never becomes input for the shell that regains the terminal after Lector.
+pub const SHUTDOWN_FENCE_QUERY: &[u8] = b"\x1b[c";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ColorScheme {
@@ -236,13 +241,19 @@ impl ProbePolicy {
     }
 }
 
-/// Consumes only bounded replies to Lector-owned startup probes. All bytes
-/// which are not recognized as such a reply are returned as ordinary input.
+/// Consumes only bounded replies to Lector-owned physical-terminal probes. All
+/// bytes which are not recognized as such a reply are returned as ordinary
+/// input.
+///
+/// Reaching the DA1 fence or the startup timeout makes ordinary input ready;
+/// it does not transfer ownership of delayed probe replies to the application.
+/// Lector never forwards application queries to the physical terminal, so a
+/// later reply in this probe vocabulary still belongs to this broker.
 pub struct StartupProbeBroker {
     profile: PhysicalTerminalProfile,
     report: ProbeReport,
     policy: ProbePolicy,
-    started_at_ms: u128,
+    last_activity_at_ms: u128,
     started: bool,
     finished: bool,
     pending: Vec<u8>,
@@ -252,6 +263,7 @@ pub struct StartupProbeBroker {
     pixel_height: Option<u32>,
     foreground_luminance: Option<u32>,
     background_luminance: Option<u32>,
+    primary_device_attributes_received: bool,
 }
 
 impl StartupProbeBroker {
@@ -260,7 +272,7 @@ impl StartupProbeBroker {
             profile,
             report: ProbeReport::default(),
             policy,
-            started_at_ms,
+            last_activity_at_ms: started_at_ms,
             started: false,
             finished: false,
             pending: Vec::new(),
@@ -270,6 +282,7 @@ impl StartupProbeBroker {
             pixel_height: None,
             foreground_luminance: None,
             background_luminance: None,
+            primary_device_attributes_received: false,
         }
     }
 
@@ -278,19 +291,26 @@ impl StartupProbeBroker {
             return Vec::new();
         }
         self.started = true;
-        let mut queries = b"\x1b[c\x1b[>c\x1b[=c\x1b[14t\x1b[16t\x1b[18t\x1b[?1004$p\x1b[?2026$p\x1b[?u\x1b]10;?\x1b\\\x1b]11;?\x1b\\".to_vec();
+        let mut queries = b"\x1b[>c\x1b[=c\x1b[14t\x1b[16t\x1b[18t\x1b[?1004$p\x1b[?2026$p\x1b[?u\x1b]10;?\x1b\\\x1b]11;?\x1b\\".to_vec();
         if self.policy.clipboard_read {
             queries.extend_from_slice(b"\x1b]52;c;?\x1b\\");
         }
+        // DA1 is a processing fence, not just another capability query. A
+        // terminal's DA1 reply cannot precede replies to any of the probes
+        // above, so consuming through it gives the application a clean input
+        // boundary before its own terminal traffic begins.
+        queries.extend_from_slice(b"\x1b[c");
         queries
     }
 
     pub fn ingest(&mut self, input: &[u8], now_ms: u128) -> Vec<u8> {
-        if self.finished || now_ms.saturating_sub(self.started_at_ms) > PROBE_TIMEOUT_MS {
-            let mut output = std::mem::take(&mut self.pending);
-            output.extend_from_slice(input);
-            self.finished = true;
-            return output;
+        // Readable input wins a race with the fallback deadline. A large
+        // initial render can make an immediate terminal reply reach this
+        // method after the inactivity deadline has elapsed even though it was
+        // already queued. Parse the entire readable batch before considering
+        // timeout; otherwise Lector-owned replies can leak into a shell or tmux -CC.
+        if !input.is_empty() {
+            self.last_activity_at_ms = now_ms;
         }
         let mut output = Vec::new();
         for &byte in input {
@@ -333,11 +353,26 @@ impl StartupProbeBroker {
     }
 
     pub fn finish_if_timed_out(&mut self, now_ms: u128) -> Vec<u8> {
-        if self.finished || now_ms.saturating_sub(self.started_at_ms) <= PROBE_TIMEOUT_MS {
+        if now_ms.saturating_sub(self.last_activity_at_ms) <= PROBE_INACTIVITY_TIMEOUT_MS {
+            return Vec::new();
+        }
+        if self.finished && self.pending.is_empty() && self.discarding_oversized.is_none() {
             return Vec::new();
         }
         self.finished = true;
+        self.discarding_oversized = None;
         std::mem::take(&mut self.pending)
+    }
+
+    pub const fn next_deadline_ms(&self) -> Option<u128> {
+        if self.finished && self.pending.is_empty() && self.discarding_oversized.is_none() {
+            None
+        } else {
+            Some(
+                self.last_activity_at_ms
+                    .saturating_add(PROBE_INACTIVITY_TIMEOUT_MS + 1),
+            )
+        }
     }
 
     pub const fn is_finished(&self) -> bool {
@@ -354,6 +389,19 @@ impl StartupProbeBroker {
 
     pub fn profile(&self) -> &PhysicalTerminalProfile {
         &self.profile
+    }
+
+    /// The startup probe sends one DA1 request. If its response has not been
+    /// observed, an orderly-shutdown fence must ignore one DA1 response before
+    /// accepting the response to its fresh request. Terminal replies are
+    /// ordered, but the startup response may still be queued when a child exits
+    /// immediately.
+    pub const fn outstanding_primary_device_attributes_replies(&self) -> usize {
+        if self.started && !self.primary_device_attributes_received {
+            1
+        } else {
+            0
+        }
     }
 
     fn consume_reply(&mut self, sequence: &[u8]) -> bool {
@@ -412,7 +460,12 @@ impl StartupProbeBroker {
             }
             return true;
         }
-        if is_device_attributes_reply(sequence) {
+        if is_primary_device_attributes_reply(sequence) {
+            self.primary_device_attributes_received = true;
+            self.finished = true;
+            return true;
+        }
+        if is_other_device_attributes_reply(sequence) {
             return true;
         }
         if self.policy.clipboard_read && is_clipboard_reply(sequence) {
@@ -547,9 +600,110 @@ fn parse_color_report(sequence: &[u8]) -> Option<(u8, u16, u16, u16)> {
     Some((slot.parse().ok()?, red, green, blue))
 }
 
-fn is_device_attributes_reply(sequence: &[u8]) -> bool {
-    (sequence.starts_with(b"\x1b[?") || sequence.starts_with(b"\x1b[>")) && sequence.ends_with(b"c")
+fn is_primary_device_attributes_reply(sequence: &[u8]) -> bool {
+    let body = sequence
+        .strip_prefix(b"\x1b[?")
+        .or_else(|| sequence.strip_prefix(b"\x9b?"));
+    let Some(body) = body.and_then(|body| body.strip_suffix(b"c")) else {
+        return false;
+    };
+    !body.is_empty()
+        && body
+            .split(|byte| *byte == b';')
+            .all(|parameter| !parameter.is_empty() && parameter.iter().all(u8::is_ascii_digit))
+}
+
+fn is_other_device_attributes_reply(sequence: &[u8]) -> bool {
+    sequence.starts_with(b"\x1b[>") && sequence.ends_with(b"c")
         || sequence.starts_with(b"\x1bP!|") && sequence.ends_with(b"\x1b\\")
+}
+
+/// Fragment-safe recognizer for the response to the final DA1 fence.
+///
+/// Shutdown reads one byte at a time so it cannot consume input following the
+/// matching response. Everything before that response, including focus events
+/// generated by the final render, remains owned and consumed by Lector.
+pub struct ShutdownFenceBroker {
+    pending: Vec<u8>,
+    replies_to_ignore: usize,
+    observed_replies: usize,
+    matched: bool,
+}
+
+impl ShutdownFenceBroker {
+    pub fn new(replies_to_ignore: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            replies_to_ignore,
+            observed_replies: 0,
+            matched: false,
+        }
+    }
+
+    pub fn ingest_byte(&mut self, byte: u8) -> bool {
+        if self.matched {
+            return true;
+        }
+
+        if self.pending.is_empty() {
+            if matches!(byte, b'\x1b' | b'\x9b') {
+                self.pending.push(byte);
+            }
+            return false;
+        }
+
+        self.pending.push(byte);
+        if self.pending == b"\x1b" {
+            return false;
+        }
+        if self.pending.starts_with(b"\x1b") && self.pending.get(1) != Some(&b'[') {
+            self.restart_after_invalid_sequence(byte);
+            return false;
+        }
+
+        let parameter_start = if self.pending.starts_with(b"\x1b[") {
+            2
+        } else {
+            1
+        };
+        if self.pending.len() <= parameter_start {
+            return false;
+        }
+
+        if self.pending.len() > MAX_PROBE_REPLY_BYTES {
+            self.restart_after_invalid_sequence(byte);
+            return false;
+        }
+
+        let final_byte = *self.pending.last().expect("pending fence sequence");
+        if !(0x40..=0x7e).contains(&final_byte) {
+            return false;
+        }
+
+        if is_primary_device_attributes_reply(&self.pending) {
+            self.observed_replies = self.observed_replies.saturating_add(1);
+            if self.observed_replies > self.replies_to_ignore {
+                self.matched = true;
+            }
+        }
+        self.pending.clear();
+        self.matched
+    }
+
+    pub const fn is_matched(&self) -> bool {
+        self.matched
+    }
+
+    pub const fn observed_replies(&self) -> usize {
+        self.observed_replies
+    }
+
+    fn restart_after_invalid_sequence(&mut self, byte: u8) {
+        self.pending.clear();
+        if matches!(byte, b'\x1b' | b'\x9b') {
+            self.pending.push(byte);
+        }
+    }
 }
 
 fn is_clipboard_reply(sequence: &[u8]) -> bool {

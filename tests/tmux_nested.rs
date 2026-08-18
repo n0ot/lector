@@ -2,14 +2,16 @@ use lector::{
     app::App,
     screen_reader::ScreenReader,
     speech,
-    tmux_lifecycle::{ConnectionHierarchy, GatewayOrigin, LifecycleError},
+    tmux_lifecycle::{ConnectionHierarchy, GatewayControlAction, GatewayOrigin, LifecycleError},
     tmux_model::INVENTORY_REPLY_COUNT,
     views,
 };
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
+    cell::RefCell,
     io::{Read, Write},
     path::{Path, PathBuf},
+    rc::Rc,
     sync::mpsc,
     thread,
     time::{Duration, SystemTime},
@@ -39,11 +41,41 @@ impl speech::Driver for SilentDriver {
     }
 }
 
+#[derive(Clone, Default)]
+struct Recorder(Rc<RefCell<Vec<String>>>);
+
+impl speech::Driver for Recorder {
+    fn speak(&mut self, text: &str, _interrupt: bool) -> anyhow::Result<()> {
+        self.0.borrow_mut().push(text.to_owned());
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn get_rate(&self) -> f32 {
+        1.0
+    }
+
+    fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 fn app() -> (App, ScreenReader, Vec<u8>) {
     let stack = views::ViewStack::new(Box::new(views::PtyView::new(24, 80)));
     let app = App::new(stack).unwrap();
     let sr = ScreenReader::new(speech::Speech::new(Box::<SilentDriver>::default()));
     (app, sr, Vec::new())
+}
+
+fn recording_app() -> (App, ScreenReader, Recorder, Vec<u8>) {
+    let stack = views::ViewStack::new(Box::new(views::PtyView::new(24, 80)));
+    let app = App::new(stack).unwrap();
+    let recorder = Recorder::default();
+    let sr = ScreenReader::new(speech::Speech::new(Box::new(recorder.clone())));
+    (app, sr, recorder, Vec::new())
 }
 
 fn inventory(split: bool, name: &str, client: &str) -> Vec<Vec<Vec<u8>>> {
@@ -66,7 +98,7 @@ fn inventory(split: bool, name: &str, client: &str) -> Vec<Vec<Vec<u8>>> {
         vec![format!("C\tclient_name\t{client}").into_bytes()],
         vec![b"O\tprefix\tC-a".to_vec()],
         vec![b"O\tprefix2\tNone".to_vec()],
-        vec![b"O\tmode-keys\tvi".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
         vec![b"O\trepeat-time\t500".to_vec()],
         vec![
             b"B\tn\t0\tnext-window".to_vec(),
@@ -151,6 +183,15 @@ fn decode_send_keys(stream: &[u8], pane_id: u64) -> Vec<u8> {
     decoded
 }
 
+fn split_first_command(stream: &[u8]) -> (&[u8], &[u8]) {
+    let end = stream
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .expect("routed command must end with a newline");
+    stream.split_at(end)
+}
+
 fn ready_root(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) {
     app.handle_pty(
         sr,
@@ -162,20 +203,27 @@ fn ready_root(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) {
         drain_root(app),
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
     );
     app.handle_pty(sr, &reply(2, &[], true), physical).unwrap();
+    app.handle_pty(
+        sr,
+        &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()], true),
+        physical,
+    )
+    .unwrap();
     let groups = inventory(true, "outer", "/dev/ttys-outer");
     assert_eq!(groups.len(), INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        app.handle_pty(sr, &reply(index + 3, group, true), physical)
+        app.handle_pty(sr, &reply(index + 4, group, true), physical)
             .unwrap();
     }
     assert_eq!(
         drain_root(app),
-        b"capture-pane -p -e -J -S - -t %20\ncapture-pane -p -e -J -S - -t %21\n"
+        b"capture-pane -p -e -F -J -S - -t %20\ncapture-pane -p -e -F -J -S - -t %21\n"
     );
     app.handle_pty(sr, &reply(30, &[b"PARENT".to_vec()], true), physical)
         .unwrap();
@@ -207,6 +255,7 @@ fn ready_nested(
         decoded,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -214,15 +263,22 @@ fn ready_nested(
 
     let groups = inventory(false, name, client);
     feed_at_depth(app, sr, physical, depth, &reply(49, &[], true));
+    feed_at_depth(
+        app,
+        sr,
+        physical,
+        depth,
+        &reply(50, &[b"attached,control-mode,pause-after=1".to_vec()], true),
+    );
     for (index, group) in groups.iter().enumerate() {
-        feed_at_depth(app, sr, physical, depth, &reply(50 + index, group, true));
+        feed_at_depth(app, sr, physical, depth, &reply(51 + index, group, true));
     }
     let routed_capture = drain_root(app);
     let mut decoded = routed_capture;
     for _ in 0..depth {
         decoded = decode_send_keys(&decoded, 20);
     }
-    assert_eq!(decoded, b"capture-pane -p -e -J -S - -t %20\n");
+    assert_eq!(decoded, b"capture-pane -p -e -F -J -S - -t %20\n");
     feed_at_depth(
         app,
         sr,
@@ -279,6 +335,7 @@ fn nested_connection_routes_commands_through_its_parent_portal_and_preserves_sib
         app.debug_tmux_gateway_origin(2),
         Some(GatewayOrigin::Pane {
             parent_connection_id: 1,
+            session_id: 1,
             window_id: 10,
             pane_id: 20,
         })
@@ -316,6 +373,14 @@ fn nested_connection_routes_commands_through_its_parent_portal_and_preserves_sib
         app.debug_active_view_contents()
             .contains("tmux control mode is running")
     );
+    input(&mut app, &mut sr, &mut physical, b"\x01n");
+    assert_eq!(
+        drain_root(&mut app),
+        b"next-window\n",
+        "the active pane portal disabled its parent tmux key table"
+    );
+    app.handle_pty(&mut sr, &reply(90, &[], true), &mut physical)
+        .unwrap();
     app.handle_pty(&mut sr, b"%window-pane-changed @10 %21\n", &mut physical)
         .unwrap();
     assert!(app.debug_active_view_contents().contains("SIBLING"));
@@ -329,6 +394,13 @@ fn nested_connection_routes_commands_through_its_parent_portal_and_preserves_sib
     );
     input(&mut app, &mut sr, &mut physical, b"\r");
     assert_eq!(app.active_tmux_connection(), Some(2));
+    assert_eq!(
+        drain_root(&mut app),
+        b"refresh-client -A '%20:continue'\n",
+        "activating the nested connection must resume its parent carrier"
+    );
+    app.handle_pty(&mut sr, &reply(91, &[], true), &mut physical)
+        .unwrap();
 
     input(&mut app, &mut sr, &mut physical, b"Z");
     let child_command = decode_send_keys(&drain_root(&mut app), 20);
@@ -374,6 +446,99 @@ fn nested_connection_routes_commands_through_its_parent_portal_and_preserves_sib
 }
 
 #[test]
+fn parent_controls_render_and_announce_when_focus_returns_to_a_nested_pane_portal() {
+    let (mut app, mut sr, recorder, mut physical) = recording_app();
+    ready_root(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    assert!(
+        app.activate_tmux_connection(1, &mut sr, &mut physical)
+            .unwrap()
+    );
+
+    assert!(
+        app.show_tmux_session_chooser(&mut sr, &mut physical)
+            .unwrap(),
+        "the parent session chooser was disabled by its active pane portal"
+    );
+    assert!(app.debug_active_view_contents().contains("outer"));
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+
+    app.handle_pty(&mut sr, b"%window-pane-changed @10 %21\n", &mut physical)
+        .unwrap();
+    physical.clear();
+    recorder.0.borrow_mut().clear();
+    app.handle_pty(&mut sr, b"%window-pane-changed @10 %20\n", &mut physical)
+        .unwrap();
+
+    assert!(
+        !physical.is_empty(),
+        "switching back to the portal produced no physical update"
+    );
+    assert!(
+        app.debug_active_view_contents()
+            .contains("tmux control mode is running")
+    );
+    assert_eq!(&*recorder.0.borrow(), &["1.1: outer"]);
+}
+
+#[test]
+fn manager_activation_keeps_every_nested_gateway_carrier_resumed() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+
+    assert!(
+        app.activate_tmux_connection(1, &mut sr, &mut physical)
+            .unwrap()
+    );
+    let _ = drain_root(&mut app);
+
+    assert!(
+        app.show_tmux_connection_chooser(&mut sr, &mut physical)
+            .unwrap()
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    assert_eq!(app.active_tmux_connection(), Some(2));
+    assert_eq!(
+        drain_root(&mut app),
+        b"refresh-client -A '%20:continue'\n",
+        "manager activation did not resume the parent carrier"
+    );
+
+    app.handle_pty(&mut sr, b"%continue %20\n", &mut physical)
+        .unwrap();
+    app.handle_pty(&mut sr, b"%pause %20\n", &mut physical)
+        .unwrap();
+    assert_eq!(
+        drain_root(&mut app),
+        b"refresh-client -A '%20:continue'\n",
+        "an active descendant did not keep its carrier flowing"
+    );
+
+    input(&mut app, &mut sr, &mut physical, b"Z");
+    assert_eq!(
+        decode_send_keys(&drain_root(&mut app), 20),
+        b"send-keys -H -t %20 5a\n"
+    );
+}
+
+#[test]
 fn two_nested_levels_keep_identical_ids_separate_and_route_recursively() {
     let (mut app, mut sr, mut physical) = app();
     ready_root(&mut app, &mut sr, &mut physical);
@@ -394,6 +559,7 @@ fn two_nested_levels_keep_identical_ids_separate_and_route_recursively() {
         app.debug_tmux_gateway_origin(3),
         Some(GatewayOrigin::Pane {
             parent_connection_id: 2,
+            session_id: 1,
             window_id: 10,
             pane_id: 20,
         })
@@ -405,6 +571,7 @@ fn two_nested_levels_keep_identical_ids_separate_and_route_recursively() {
         grandchild_command,
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
+            lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -438,6 +605,124 @@ fn two_nested_levels_keep_identical_ids_separate_and_route_recursively() {
 }
 
 #[test]
+fn graceful_root_teardown_waits_for_each_descendant_deepest_first() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    start_nested(&mut app, &mut sr, &mut physical, 2);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        2,
+        "grandchild",
+        "/dev/ttys-grandchild",
+    );
+    assert!(
+        app.activate_tmux_connection(1, &mut sr, &mut physical)
+            .unwrap()
+    );
+
+    assert!(
+        app.request_tmux_gateway_action(
+            &mut sr,
+            GatewayControlAction::GracefulDetach,
+            &mut physical,
+        )
+        .unwrap()
+    );
+    let routed = drain_root(&mut app);
+    let (root_resume, routed) = split_first_command(&routed);
+    assert_eq!(root_resume, b"refresh-client -A '%20:continue'\n");
+    let routed = decode_send_keys(routed, 20);
+    let (inner_resume, routed) = split_first_command(&routed);
+    assert_eq!(inner_resume, b"refresh-client -A '%20:continue'\n");
+    let routed = decode_send_keys(routed, 20);
+    assert_eq!(
+        routed, b"detach-client\n",
+        "the deepest connection must detach first"
+    );
+    assert_eq!(app.tmux_connection_count(), 3);
+
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        2,
+        b"%exit grandchild detached\n\x1b\\",
+    );
+    let routed = drain_root(&mut app);
+    let (root_resume, routed) = split_first_command(&routed);
+    assert_eq!(root_resume, b"refresh-client -A '%20:continue'\n");
+    let routed = decode_send_keys(routed, 20);
+    assert_eq!(routed, b"detach-client\n");
+    assert_eq!(app.tmux_connection_count(), 2);
+
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        b"%exit inner detached\n\x1b\\",
+    );
+    assert_eq!(drain_root(&mut app), b"detach-client\n");
+    assert_eq!(app.tmux_connection_count(), 1);
+
+    app.handle_pty(&mut sr, b"%exit outer detached\n\x1b\\", &mut physical)
+        .unwrap();
+    assert_eq!(app.tmux_connection_count(), 0);
+    assert_eq!(app.active_tmux_connection(), None);
+    assert!(!app.has_overlay());
+}
+
+#[test]
+fn force_abandon_during_a_cascade_targets_the_descendant_that_is_stuck() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    start_nested(&mut app, &mut sr, &mut physical, 2);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        2,
+        "grandchild",
+        "/dev/ttys-grandchild",
+    );
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    app.request_tmux_gateway_action(&mut sr, GatewayControlAction::GracefulDetach, &mut physical)
+        .unwrap();
+    let _detach = drain_root(&mut app);
+
+    app.request_tmux_gateway_action(&mut sr, GatewayControlAction::ForceAbandon, &mut physical)
+        .unwrap();
+    let mut ignored = Vec::new();
+    app.handle_stdin(&mut sr, b"\r", &mut ignored, &mut physical)
+        .unwrap();
+    let mut routed = drain_root(&mut app);
+    routed = decode_send_keys(&routed, 20);
+    routed = decode_send_keys(&routed, 20);
+    assert_eq!(routed, b"\x1c");
+}
+
+#[test]
 fn hierarchy_rejects_nesting_beyond_the_explicit_depth_limit() {
     let mut hierarchy = ConnectionHierarchy::new();
     hierarchy.insert(1, GatewayOrigin::Direct).unwrap();
@@ -447,6 +732,7 @@ fn hierarchy_rejects_nesting_beyond_the_explicit_depth_limit() {
                 connection_id,
                 GatewayOrigin::Pane {
                     parent_connection_id: connection_id - 1,
+                    session_id: 1,
                     window_id: 10,
                     pane_id: 20,
                 },
@@ -458,6 +744,7 @@ fn hierarchy_rejects_nesting_beyond_the_explicit_depth_limit() {
             65,
             GatewayOrigin::Pane {
                 parent_connection_id: 64,
+                session_id: 1,
                 window_id: 10,
                 pane_id: 20,
             }
@@ -732,6 +1019,62 @@ fn real_tmux_nested_loopback_routes_control_and_child_input() {
     };
     assert_eq!(parent_connection_id, 1);
     assert_eq!(app.debug_tmux_pane_portal_target(1, pane_id), Some(2));
+
+    assert!(
+        app.activate_tmux_connection(1, &mut sr, &mut physical)
+            .unwrap()
+    );
+    harness
+        .writer
+        .write_all(b"new-session -d -s nested-away /bin/sh\n")
+        .unwrap();
+    harness.writer.flush().unwrap();
+    harness.drive(
+        "outer alternate-session discovery",
+        &mut app,
+        &mut sr,
+        &mut physical,
+        |app| {
+            app.debug_tmux_topology(1)
+                .is_some_and(|dump| dump.contains("nested-away"))
+                && app.debug_tmux_expected_reply_count(1) == Some(0)
+        },
+    );
+    harness
+        .writer
+        .write_all(b"switch-client -t nested-away\n")
+        .unwrap();
+    harness.writer.flush().unwrap();
+    harness.drive(
+        "outer alternate-session switch",
+        &mut app,
+        &mut sr,
+        &mut physical,
+        |app| {
+            app.debug_tmux_topology(1)
+                .is_some_and(|dump| dump.contains("[attached]: nested-away"))
+        },
+    );
+
+    assert!(
+        app.show_tmux_connection_chooser(&mut sr, &mut physical)
+            .unwrap()
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    assert_eq!(app.active_tmux_connection(), Some(2));
+    app.drain_tmux_commands_for(1, harness.writer.as_mut())
+        .unwrap();
+    harness.writer.flush().unwrap();
+    harness.drive(
+        "restore nested carrier session",
+        &mut app,
+        &mut sr,
+        &mut physical,
+        |app| {
+            app.debug_tmux_topology(1)
+                .is_some_and(|dump| dump.contains("[attached]: nested-outer"))
+        },
+    );
 
     input(&mut app, &mut sr, &mut physical, b"X");
     app.drain_tmux_commands_for(1, harness.writer.as_mut())

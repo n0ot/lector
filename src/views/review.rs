@@ -521,11 +521,12 @@ impl ReviewView {
                 | ViewAction::Push(_)
                 | ViewAction::PopupResponse(_)
                 | ViewAction::ActivateTmuxConnection(_)
-                | ViewAction::ActivateTerminal
+                | ViewAction::TmuxConnectionControl { .. }
                 | ViewAction::TmuxConnectionRename { .. }
                 | ViewAction::TmuxChooserSelect { .. }
                 | ViewAction::TmuxCommandSubmit { .. }
-                | ViewAction::TmuxInput { .. } => {
+                | ViewAction::TmuxInput { .. }
+                | ViewAction::RedrawSilently => {
                     unreachable!()
                 }
             }

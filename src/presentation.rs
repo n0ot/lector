@@ -6,8 +6,8 @@
 
 use crate::terminal::{
     Cell, Color, Cursor, CursorShape, GhosttyEngine, Row, ScreenIdentity, Style, TerminalDamage,
-    TerminalGeometry, TerminalModes, TerminalOperation, TerminalSnapshot, UnderlineStyle,
-    UpdateSummary,
+    TerminalEvent, TerminalGeometry, TerminalModes, TerminalOperation, TerminalSnapshot,
+    UnderlineStyle, UpdateSummary,
 };
 use serde::Serialize;
 use std::{
@@ -19,6 +19,74 @@ use std::{
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct SurfaceId(pub u64);
+
+/// Stable identity of a logical view whose accessibility state can outlive a
+/// particular scene composition.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ViewId(pub u64);
+
+/// Monotonic version of a view's authoritative terminal model.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ViewRevision(pub u64);
+
+/// The exact view state represented by one physically presented surface.
+///
+/// Visible state is retained with the render transaction. Scrollback is
+/// revisioned separately and shared only when it changed, so accessibility
+/// remains generation-exact without copying the full history every frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresentedViewFrame {
+    pub view_id: ViewId,
+    pub revision: ViewRevision,
+    pub surface_id: SurfaceId,
+    /// Visible state for this render generation. Scrollback rows are carried
+    /// separately so unchanged history can be shared instead of copied for
+    /// every frame.
+    pub snapshot: TerminalSnapshot,
+    pub history_revision: u64,
+    pub history: Option<Arc<[Row]>>,
+}
+
+/// Accessibility frames committed atomically with a physical render flush.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PresentedAccessibilityBundle {
+    /// View which owns screen-relative accessibility commands for this scene.
+    pub active_view: Option<ViewId>,
+    /// Exact user-facing identity of the active view in this scene. Controller
+    /// titles (notably tmux locations) can change without changing `ViewId`, so
+    /// this label must cross the same flush boundary as the view frames.
+    pub active_label: Option<String>,
+    /// Terminal views derive their spoken label from the outer terminal's OSC
+    /// title. That effect has its own flush receipt and may complete before the
+    /// associated cell render under backpressure.
+    pub active_label_tracks_terminal_title: bool,
+    pub frames: Vec<PresentedViewFrame>,
+}
+
+impl PresentedAccessibilityBundle {
+    pub fn new(active_view: Option<ViewId>, frames: Vec<PresentedViewFrame>) -> Self {
+        Self {
+            active_view,
+            active_label: None,
+            active_label_tracks_terminal_title: false,
+            frames,
+        }
+    }
+
+    pub fn with_active_label(
+        mut self,
+        active_label: impl Into<String>,
+        tracks_terminal_title: bool,
+    ) -> Self {
+        self.active_label = Some(active_label.into());
+        self.active_label_tracks_terminal_title = tracks_terminal_title;
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.active_view.is_none() && self.active_label.is_none() && self.frames.is_empty()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct GridPoint {
@@ -600,6 +668,25 @@ impl PresentedScene {
         self.working_directory.as_deref()
     }
 
+    /// Advances terminal-wide state which was flushed independently of a
+    /// cell render. Keeping this shadow current prevents later scene diffs
+    /// from treating an already-visible OSC effect as unpresented.
+    pub(crate) fn apply_terminal_effect(&mut self, event: &TerminalEvent) {
+        match event {
+            TerminalEvent::TitleChanged(title) => self.title = Some(title.clone()),
+            TerminalEvent::WorkingDirectoryChanged(directory) => {
+                self.working_directory = Some(directory.clone());
+            }
+            TerminalEvent::Bell
+            | TerminalEvent::ClipboardWrite { .. }
+            | TerminalEvent::DesktopNotification { .. }
+            | TerminalEvent::ProgressReport { .. }
+            | TerminalEvent::Query(_)
+            | TerminalEvent::PtyReply(_)
+            | TerminalEvent::UnknownSequence { .. } => {}
+        }
+    }
+
     pub fn images(&self) -> &[PresentedImage] {
         &self.images
     }
@@ -626,10 +713,17 @@ impl PresentedScene {
     }
 
     fn physically_matches(&self, other: &Self) -> bool {
+        self.screen == other.screen && self.physical_fields_match(other)
+    }
+
+    fn physically_matches_in_owned_alternate(&self, other: &Self) -> bool {
+        self.screen == ScreenIdentity::Alternate && self.physical_fields_match(other)
+    }
+
+    fn physical_fields_match(&self, other: &Self) -> bool {
         self.geometry == other.geometry
             && rows_physically_match(&self.rows, &other.rows)
             && self.cursor == other.cursor
-            && self.screen == other.screen
             && self.modes == other.modes
             && terminal_string_matches(&self.title, &other.title)
             && terminal_string_matches(&self.working_directory, &other.working_directory)
@@ -1470,11 +1564,10 @@ impl FullSceneVtRenderer {
             bytes.extend_from_slice(b"\x1b[?2026h");
         }
 
-        bytes.extend_from_slice(match intended.screen {
-            ScreenIdentity::Primary => b"\x1b[?1049l",
-            ScreenIdentity::Alternate => b"\x1b[?1049h",
-        });
-
+        // The physical lifecycle owns one outer alternate screen for the
+        // entire Lector session. `intended.screen` remains the active child
+        // screen identity; changing it reconstructs that logical state here
+        // without ever switching the host terminal's screen.
         // Establish a complete, capability-safe baseline. Horizontal margins
         // are reset while DECLRMM is enabled and then disabled again, avoiding
         // CSI s's save-cursor meaning outside that mode.
@@ -2693,6 +2786,7 @@ impl RenderOracle {
     pub fn new(geometry: TerminalGeometry) -> Result<Self, PresentationError> {
         let mut terminal = GhosttyEngine::new(geometry.rows, geometry.cols)?;
         terminal.resize_with_geometry(geometry)?;
+        terminal.advance(b"\x1b[?1049h")?;
         Ok(Self { terminal })
     }
 
@@ -2750,7 +2844,7 @@ impl RenderOracle {
         if &batch.predicted != intended {
             mismatches.push("renderer prediction differs from intended scene".to_string());
         }
-        if !resulting.physically_matches(intended) {
+        if !resulting.physically_matches_in_owned_alternate(intended) {
             mismatches.push("outer terminal state differs from intended scene".to_string());
         }
         if mismatches.is_empty() {
@@ -2878,6 +2972,7 @@ enum LifecycleState {
     Inactive,
     Active,
     Suspended,
+    ShutdownFence,
     Shutdown,
 }
 
@@ -2887,9 +2982,9 @@ pub struct LifecycleTransaction {
     pub damage: SceneDamage,
 }
 
-/// Models physical-terminal ownership without changing the Stop 2.1 runtime.
-/// Later stop points use these complete setup/cleanup boundaries when the
-/// renderer becomes authoritative.
+/// Owns the host terminal's alternate screen and global modes for the complete
+/// active Lector session. Child primary/alternate screens remain modeled state
+/// and never change this physical container.
 pub struct PhysicalTerminalLifecycle {
     state: LifecycleState,
     focus_was_enabled: Option<bool>,
@@ -2909,7 +3004,7 @@ impl PhysicalTerminalLifecycle {
         }
         self.state = LifecycleState::Active;
         LifecycleTransaction {
-            bytes: b"\x1b[?1004h".to_vec(),
+            bytes: b"\x1b[?1049h\x1b[?1004h".to_vec(),
             damage: SceneDamage::Full,
         }
     }
@@ -2931,7 +3026,7 @@ impl PhysicalTerminalLifecycle {
         }
         self.state = LifecycleState::Active;
         LifecycleTransaction {
-            bytes: b"\x1b[?1004h".to_vec(),
+            bytes: b"\x1b[?1049h\x1b[?1004h".to_vec(),
             damage: SceneDamage::Full,
         }
     }
@@ -2940,10 +3035,12 @@ impl PhysicalTerminalLifecycle {
         if self.state == LifecycleState::Shutdown {
             return LifecycleTransaction::default();
         }
-        let bytes = if self.state == LifecycleState::Active {
-            self.cleanup_bytes()
-        } else {
-            Vec::new()
+        let bytes = match self.state {
+            LifecycleState::Active => self.cleanup_bytes(),
+            LifecycleState::ShutdownFence => b"\x1b[?1049l".to_vec(),
+            LifecycleState::Inactive | LifecycleState::Suspended | LifecycleState::Shutdown => {
+                Vec::new()
+            }
         };
         self.state = LifecycleState::Shutdown;
         LifecycleTransaction {
@@ -2952,7 +3049,42 @@ impl PhysicalTerminalLifecycle {
         }
     }
 
+    /// Reset every owned mode and place DA1 after all output which may cause a
+    /// terminal reply. The alternate screen remains active until the caller
+    /// has consumed that reply or reached its bounded timeout.
+    pub fn begin_shutdown_fence(&mut self) -> LifecycleTransaction {
+        if self.state != LifecycleState::Active {
+            return LifecycleTransaction::default();
+        }
+        self.state = LifecycleState::ShutdownFence;
+        let mut bytes = self.cleanup_modes_bytes();
+        bytes.extend_from_slice(crate::terminal_protocol::SHUTDOWN_FENCE_QUERY);
+        LifecycleTransaction {
+            bytes,
+            damage: SceneDamage::None,
+        }
+    }
+
+    /// Release the alternate screen only after the shutdown fence has
+    /// completed. Nothing emitted here is allowed to request another reply.
+    pub fn finish_shutdown_fence(&mut self) -> LifecycleTransaction {
+        if self.state != LifecycleState::ShutdownFence {
+            return LifecycleTransaction::default();
+        }
+        self.state = LifecycleState::Shutdown;
+        LifecycleTransaction {
+            bytes: b"\x1b[?1049l".to_vec(),
+            damage: SceneDamage::None,
+        }
+    }
+
     fn cleanup_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.cleanup_modes_bytes();
+        bytes.extend_from_slice(b"\x1b[?1049l");
+        bytes
+    }
+
+    fn cleanup_modes_bytes(&self) -> Vec<u8> {
         let mut bytes = b"\x1b[?2026l\x1b[0m\x1b]8;;\x1b\\\x1b>\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[=0u\x1b[?25h".to_vec();
         if !matches!(self.focus_was_enabled, Some(true)) {
             bytes.extend_from_slice(b"\x1b[?1004l");

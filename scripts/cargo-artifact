@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+
+"""Select one executable from Cargo's JSON message stream."""
+
+import argparse
+import json
+import sys
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("target", help="Cargo target name")
+    parser.add_argument("kind", help="Cargo target kind, such as bin or test")
+    args = parser.parse_args()
+    executables = set()
+
+    for raw_line in sys.stdin:
+        try:
+            message = json.loads(raw_line)
+        except json.JSONDecodeError:
+            print(raw_line, end="", file=sys.stderr)
+            continue
+
+        if message.get("reason") == "compiler-message":
+            rendered = message.get("message", {}).get("rendered")
+            if rendered:
+                print(rendered, end="", file=sys.stderr)
+            continue
+
+        target = message.get("target", {})
+        executable = message.get("executable")
+        if (
+            message.get("reason") == "compiler-artifact"
+            and target.get("name") == args.target
+            and args.kind in target.get("kind", [])
+            and executable
+        ):
+            executables.add(executable)
+
+    if len(executables) != 1:
+        print(
+            f"expected one {args.kind} executable for Cargo target "
+            f"{args.target!r}, found {len(executables)}",
+            file=sys.stderr,
+        )
+        return 1
+    print(executables.pop())
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

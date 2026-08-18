@@ -21,7 +21,7 @@ impl Default for Options {
             highlight_tracking: false,
             table_header_auto: true,
             stop_speech_on_focus_loss: true,
-            tmux_bell_mode: TmuxBellMode::Off,
+            tmux_bell_mode: TmuxBellMode::Audible,
         }
     }
 }
@@ -127,7 +127,7 @@ mod tests {
         assert!(!options.highlight_tracking());
         assert!(options.table_header_auto());
         assert!(options.stop_speech_on_focus_loss());
-        assert_eq!(options.tmux_bell_mode(), TmuxBellMode::Off);
+        assert_eq!(options.tmux_bell_mode(), TmuxBellMode::Audible);
     }
 
     #[test]

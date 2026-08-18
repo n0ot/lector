@@ -26,10 +26,11 @@ The event mapping is:
 | ST marker | `Ended` |
 
 tmux guarantees that asynchronous notifications do not occur inside a command
-output block. Accordingly, a line that resembles `%output` while a command is
-open remains command output; notifications between consecutive command blocks
-remain independent events. The opening and closing timestamp, command number,
-and flags must match exactly.
+output block. Accordingly, every line remains command output until an `%end`
+or `%error` whose timestamp, command number, and flags match the opening
+`%begin`. A block-looking line with any other tag is payload, which is required
+when `capture-pane` contains the transcript of a nested control client.
+Notifications between consecutive command blocks remain independent events.
 
 Pane output is decoded from tmux's three-digit octal escapes into `Vec<u8>`.
 Neither pane bytes, command output, notification arguments, nor exit reasons are
@@ -47,12 +48,13 @@ Default retained-memory limits are:
   metadata.
 
 All limits are configurable through `ParserLimits`. Numeric overflow, malformed
-pane IDs, mismatched command tags, invalid or out-of-range octal escapes,
-missing required fields, over-limit input, malformed framing, and every
-unterminated state return a classified `ControlParseError`. An error poisons the
-parser so partially retained state cannot be reused accidentally. `reset`
-explicitly discards that state and returns to the start-marker boundary.
+pane IDs, unexpected terminators outside a command, invalid or out-of-range
+octal escapes, missing required fields, over-limit input, malformed framing,
+and every unterminated state return a classified `ControlParseError`. An error
+poisons the parser so partially retained state cannot be reused accidentally.
+`reset` explicitly discards that state and returns to the start-marker boundary.
 
 The parser intentionally does not detect the marker inside an ordinary PTY byte
 stream or preserve bytes before and after a connection. Those source-boundary
-responsibilities belong to the Stop 3.2 connection detector.
+responsibilities belong to `TmuxGatewayRouter`, documented in
+[`tmux-gateway.md`](tmux-gateway.md).

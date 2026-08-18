@@ -141,6 +141,7 @@ fn ghostty_update_facts_merge_across_every_fragment() {
     assert_eq!(merged.screen_before, ScreenIdentity::Primary);
     assert_eq!(merged.screen_after, ScreenIdentity::Primary);
     assert!(!merged.synchronized_output);
+    assert!(merged.synchronized_output_opened);
     assert!(!merged.changed_rows.is_empty());
 }
 
@@ -151,6 +152,7 @@ fn ghostty_update_reports_actual_screen_transition_and_synchronized_output() {
         .advance(b"\x1B[?2026hworking")
         .expect("enable synchronized output");
     assert!(synchronized.synchronized_output);
+    assert!(synchronized.synchronized_output_opened);
     assert_eq!(synchronized.printed_text(), "working");
 
     let alternate = ghostty
@@ -159,7 +161,143 @@ fn ghostty_update_reports_actual_screen_transition_and_synchronized_output() {
     assert_eq!(alternate.screen_before, ScreenIdentity::Primary);
     assert_eq!(alternate.screen_after, ScreenIdentity::Alternate);
     assert!(!alternate.synchronized_output);
+    assert!(!alternate.synchronized_output_opened);
     assert_eq!(alternate.printed_text(), "alt");
+
+    let reopened = ghostty
+        .advance(b"\x1B[?2026hfirst\x1B[?2026l\x1B[?2026hsecond")
+        .expect("close and reopen synchronized output in one batch");
+    assert!(reopened.synchronized_output);
+    assert!(reopened.synchronized_output_opened);
+}
+
+#[test]
+fn synchronized_open_captures_dirty_history_then_reuses_it_until_it_changes() {
+    let seed = b"one\r\ntwo\r\nthree\r\nfour";
+
+    let mut unchanged =
+        GhosttyEngine::new_with_scrollback(2, 12, 2).expect("create unchanged-history engine");
+    unchanged.advance(seed).expect("seed retained history");
+    unchanged
+        .advance(b"\x1b[?2026hpartial")
+        .expect("open after history changed");
+    let first_open = unchanged
+        .take_synchronized_output_open_snapshot()
+        .expect("first opening checkpoint");
+    assert_eq!(first_open.scrollback.len(), 2);
+    unchanged
+        .advance(b"\x1b[?2026l\x1b[?2026hmore")
+        .expect("reopen without changing history");
+    let unchanged_open = unchanged
+        .take_synchronized_output_open_snapshot()
+        .expect("unchanged-history opening checkpoint");
+    assert_eq!(unchanged_open.scrollback_extent, 2);
+    assert!(
+        unchanged_open.scrollback.is_empty(),
+        "unchanged history should be reused by View instead of cloned per frame"
+    );
+
+    let mut scrolled =
+        GhosttyEngine::new_with_scrollback(2, 12, 2).expect("create prefix-scroll engine");
+    scrolled.advance(seed).expect("seed retained history");
+    let update = scrolled
+        .advance(b"\r\nbefore\x1b[?2026h\x1b[2Jpartial")
+        .expect("scroll before opening synchronized output");
+    assert!(update.history_changed);
+    let scrolled_open = scrolled
+        .take_synchronized_output_open_snapshot()
+        .expect("history-bearing opening checkpoint");
+    assert_eq!(scrolled_open.scrollback.len(), 2);
+    assert_eq!(scrolled_open.scrollback[0].contents(), "two");
+    assert_eq!(scrolled_open.scrollback[1].contents(), "three");
+    assert_eq!(scrolled_open.rows[0].contents(), "four");
+    assert_eq!(scrolled_open.rows[1].contents(), "before");
+}
+
+#[test]
+fn synchronized_reopen_captures_history_changed_in_the_previous_chunk() {
+    let mut engine =
+        GhosttyEngine::new_with_scrollback(2, 12, 2).expect("create synchronized engine");
+    engine.advance(b"one\r\ntwo").expect("seed the screen");
+    engine
+        .advance(b"\x1b[?2026h\r\nthree")
+        .expect("scroll while the first frame is open");
+
+    engine
+        .advance(b"\x1b[?2026l\x1b[?2026hpartial")
+        .expect("commit and reopen in a later chunk");
+    let reopened = engine
+        .take_synchronized_output_open_snapshot()
+        .expect("reopened checkpoint");
+
+    assert_eq!(reopened.scrollback.len(), 1);
+    assert_eq!(reopened.scrollback[0].contents(), "one");
+    assert_eq!(reopened.rows[0].contents(), "two");
+    assert_eq!(reopened.rows[1].contents(), "three");
+}
+
+#[test]
+fn synchronized_reopen_carries_the_capped_history_lineage() {
+    let mut engine =
+        GhosttyEngine::new_with_scrollback(2, 12, 2).expect("create synchronized engine");
+    engine
+        .advance(b"one\r\ntwo\r\nthree\r\nfour")
+        .expect("fill bounded history");
+    engine
+        .advance(b"\x1b[?2026h\r\nfive")
+        .expect("open and scroll the working frame");
+
+    engine
+        .advance(b"\x1b[?2026l\x1b[?2026hpartial")
+        .expect("commit and reopen after capped eviction");
+    let reopened = engine
+        .take_synchronized_output_open_snapshot()
+        .expect("reopened checkpoint");
+
+    assert_eq!(reopened.history_origin, 1);
+    assert_eq!(reopened.scrollback_extent, 2);
+    assert_eq!(
+        reopened
+            .scrollback
+            .iter()
+            .map(|row| row.contents())
+            .collect::<Vec<_>>(),
+        ["two", "three"]
+    );
+}
+
+#[test]
+fn alternate_opener_preserves_dirty_primary_history_for_the_next_checkpoint() {
+    let mut engine =
+        GhosttyEngine::new_with_scrollback(2, 12, 2).expect("create synchronized engine");
+    engine
+        .advance(b"one\r\ntwo\r\nthree\r\nfour")
+        .expect("fill bounded history");
+    engine
+        .advance(b"\r\nfive\x1b[?1049h\x1b[?2026h")
+        .expect("scroll primary, enter alternate, and open");
+    let alternate = engine
+        .take_synchronized_output_open_snapshot()
+        .expect("alternate opening checkpoint");
+    assert!(alternate.alternate_screen());
+    assert!(alternate.scrollback.is_empty());
+
+    engine
+        .advance(b"\x1b[?2026l\x1b[?1049l\x1b[?2026h")
+        .expect("return to primary and reopen");
+    let primary = engine
+        .take_synchronized_output_open_snapshot()
+        .expect("primary opening checkpoint");
+    assert!(!primary.alternate_screen());
+    assert_eq!(primary.history_origin, 1);
+    assert_eq!(
+        primary
+            .scrollback
+            .iter()
+            .map(|row| row.contents())
+            .collect::<Vec<_>>(),
+        ["two", "three"]
+    );
 }
 
 #[test]
@@ -400,4 +538,40 @@ fn ghostty_resize_reflows_primary_and_alternate_screens_without_mixing_history()
             .chain(&restored.rows)
             .all(|row| !row.contents().contains("alt"))
     );
+}
+
+#[test]
+fn logical_history_origin_advances_at_the_cap_and_survives_alternate_screen() {
+    let mut engine =
+        GhosttyEngine::new_with_scrollback(2, 8, 2).expect("create history probe engine");
+    engine.advance(b"one\r\ntwo\r\nthree").unwrap();
+    let primary = engine.normalized_snapshot_with_history().unwrap();
+    engine.advance(b"\x1b[?1049h").unwrap();
+    let alternate = engine.normalized_snapshot_with_history().unwrap();
+    assert_eq!((primary.scrollback_extent, primary.history_origin), (1, 0));
+    assert_eq!(alternate.scrollback_extent, 0);
+    assert_eq!(alternate.history_origin, primary.history_origin);
+    assert!(alternate.scrollback.is_empty());
+
+    engine.advance(b"\x1b[?1049l").unwrap();
+    let updates: &[(&[u8], usize, &[&str])] = &[
+        (b"\r\nfour", 0, &["one", "two"]),
+        (b"\r\nfive", 1, &["two", "three"]),
+        (b"\r\nsix", 2, &["three", "four"]),
+        (b"\r\nseven", 3, &["four", "five"]),
+    ];
+    for (line, expected_origin, expected_history) in updates {
+        engine.advance(line).unwrap();
+        let snapshot = engine.normalized_snapshot_with_history().unwrap();
+        assert_eq!(snapshot.scrollback_extent, 2);
+        assert_eq!(snapshot.history_origin, *expected_origin);
+        assert_eq!(
+            snapshot
+                .scrollback
+                .iter()
+                .map(|row| row.contents())
+                .collect::<Vec<_>>(),
+            *expected_history
+        );
+    }
 }

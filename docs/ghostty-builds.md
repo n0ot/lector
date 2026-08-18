@@ -6,8 +6,8 @@ semantic anchors, and effects drive accessibility. Lector no longer depends on
 the `vt100` crate or a second production grid parser. The mandatory compositor
 renders from Ghostty state and never replays source application bytes.
 
-Once a verified Ghostty archive has been prepared, ordinary builds are
-network-free and require neither Zig nor an installed Ghostty application:
+Use ordinary Cargo commands. On a cache miss, the adapter build automatically
+downloads and verifies the pinned build inputs and prepares the native archive:
 
 ```sh
 cargo build --locked
@@ -15,10 +15,16 @@ cargo build --locked --release
 cargo build --locked --no-default-features # compatibility feature off; engine is unchanged
 ```
 
+Ordinary development and test builds link the `ReleaseFast` Ghostty archive
+even when Rust itself uses its debuggable development profile. Terminal
+parsing is on the interactive hot path, and Ghostty's Zig `Debug` mode is too
+slow to remain responsive during sustained output such as `yes`. Set
+`LECTOR_GHOSTTY_OPTIMIZE=Debug` only when debugging the Ghostty core itself.
+
 Lector does not depend on a third-party Rust wrapper. The local
 `crates/lector-ghostty` crate is a deliberately small safe boundary around the
 official Ghostty C API. Its raw declarations are private and its C ABI layout is
-checked against Ghostty's installed headers during the explicit bootstrap.
+checked against Ghostty's installed headers during the automatic bootstrap.
 
 ## Authoritative engine
 
@@ -54,7 +60,14 @@ Auto-read consumes an engine-neutral `UpdateSummary` produced by the same
 advance call that mutates terminal state. It records printable runs, cursor and
 explicit-scroll operation counts, Ghostty's official full/partial render
 damage, normalized changed-row ranges, cursor and screen identity before and
-after the write, and synchronized-output mode.
+after the write, synchronized-output mode, and whether the batch crossed an
+actual false-to-true DEC private mode 2026 boundary. At that boundary the
+adapter splits processing at the marker and captures a full screen-and-history
+snapshot. Clearing the marker's mode bit yields the exact committed model from
+immediately before the frame: preceding bytes in the same input slice are
+included and following bytes are excluded, even when the escape sequence was
+fragmented across reads.
+
 Ghostty exposes the final cursor, screen, mode, and render state but does not
 currently expose printable or cursor-operation callbacks. The owned adapter's
 narrow `vte` stream observer therefore collects operation hints, OSC 133
@@ -112,21 +125,42 @@ flags are restored before terminal lifecycle cleanup. Scheduler writes retry
 predicted `PresentedScene` only after its bytes flush successfully. Fatal
 writer errors invalidate renderer state for an authoritative reconstruction.
 
+Physical input and child PTY output are also nonblocking. Each drain turn is
+limited to 32 KiB or 4 ms, with the time and byte limits checked between
+reads of at most 8 KiB. Hitting a limit schedules an immediate continuation so an
+edge-triggered readiness notification is not lost, while returning control to
+input, presentation, and other ready sources. An open DEC 2026 frame receives
+no larger PTY budget.
+
 Modeled visual updates have a 4 ms event-boundary latency budget and a 64 KiB
 per-drain write budget. An unstarted render can be replaced by the newest
 authoritative scene, while started transactions, lifecycle/control bytes, and
 bells are retained. This bounds obsolete incremental visual work
 without delaying terminal replies or input sent to the application PTY.
-Application mode 2026 is treated as pane-local batching intent: Lector owns at
-most one physical synchronized-output wrapper, strips nested renderer wrappers,
-and releases abandoned intent after 100 ms. Lector-owned overlays and resizes
-remain responsive rather than inheriting a pane's synchronization hold. Bells
-are emitted only after the visual transaction and its global synchronization
-boundary. Title, working-directory, progress, clipboard, and notification
-events remain typed scheduler work until activation; output policy is applied
-at that boundary instead of retaining raw escape strings. Pending effect
-payloads are bounded and UTF-8-safe, zero-byte secure-policy effects complete
-normally, and backpressured work counts against the same retention cap.
+Application mode 2026 is pane-local batching intent: Lector owns at most one
+physical synchronized-output wrapper and strips nested renderer wrappers. Each
+render carries stable view identities, model revisions, visible snapshots, and
+shared changed-history generations. Replacement drops bytes and accessibility
+state together; started renders retain both through their successful flush.
+Raw application input and terminal replies are not held behind presentation.
+This does not eliminate the normal coordinate time-of-check to time-of-use race
+between reading a cell and sending input to an application that remains live.
+
+A real close makes its render eligible but publishes nothing to accessibility
+until that exact render flushes. Activity refreshes a 100 ms idle timeout, while
+a 2-second hard cap bounds a continuously updating transaction. On timeout the
+scheduler may release a partial render and ignores further holds in the epoch
+until its real close. The old frame remains readable during backpressure; after
+flush, the exact released generation becomes readable, never newer parser
+state. Lector-owned overlays and resizes remain responsive, and their active
+accessibility owner changes at the same completed scene boundary. Bells are
+emitted only after the visual transaction and its global synchronization
+boundary. Title,
+working-directory, progress, clipboard, and notification events remain typed
+scheduler work until activation; output policy is applied at that boundary
+instead of retaining raw escape strings. Pending effect payloads are bounded
+and UTF-8-safe, zero-byte secure-policy effects complete normally, and
+backpressured work counts against the same retention cap.
 
 The modeled compositor keeps the root terminal and every stacked Lector view as
 separate, stable-z scene surfaces. Source engines continue parsing while an
@@ -160,14 +194,19 @@ pane's PTY. A narrow observer fills
 the one current public-C-API gap for OSC 52 clipboard reads and generates the
 secure empty local reply; reads never reach the physical terminal.
 
-The child receives `TERM=lector` and a bundled compiled terminfo entry
-materialized in Lector's cache directory. Lector derives a separate physical
-profile from conservative defaults, outer terminfo, bounded startup probes, and
-explicit overrides. Probe replies are consumed before input parsing. Clipboard
-writes enter Lector's local clipboard history; desktop notifications and
-unknown APC effects are dropped; title, working directory, progress, hyperlink,
-and bell state remain modeled. This separation keeps application promises
-independent of the outer terminal's identity and capabilities.
+The child receives `TERM=xterm-256color`, and Lector removes inherited
+`TERMINFO` so a nested instance cannot accidentally pair that public name with
+its parent's private database. Lector does not inherit an outer vendor identity
+or advertise `xterm-ghostty`; the Ghostty engine supplies parsing and terminal
+state, not Ghostty's complete application-facing protocol contract. Lector
+derives a separate physical profile from conservative defaults, outer
+terminfo, bounded startup probes, and explicit overrides. DA1 is the final
+physical query, and probe replies are consumed through its processing fence
+before input parsing. Clipboard writes enter Lector's local clipboard
+history; desktop notifications and unknown APC effects are dropped; title,
+working directory, progress, hyperlink, and bell state remain modeled. This
+separation keeps application promises independent of the outer terminal's
+identity and capabilities.
 
 Resize handling reads the outer terminal's complete Unix `winsize`, derives
 per-cell pixel dimensions from its cell and grid-pixel fields, and routes the
@@ -208,41 +247,39 @@ Install a stable Rust toolchain plus `curl`, `tar`, and either `shasum` or
 `sha256sum`. Then a complete release build is one command:
 
 ```sh
-cargo ghostty-release
+cargo build --locked --release
 ```
 
-For a debug build:
+To build both Rust and the Ghostty core in debug mode for engine debugging:
 
 ```sh
-cargo ghostty-debug
+LECTOR_GHOSTTY_OPTIMIZE=Debug cargo build --locked
 ```
 
-These targets download the official Zig 0.16.0 binary for the host, verify its
-published SHA-256 checksum, and cache it under
-`target/toolchains/zig/0.16.0`. They then download and verify the pinned
-official Ghostty source, build the required static archive, and invoke Cargo.
-Everything under `target` is ignored, so subsequent invocations validate and
-reuse the cached toolchain, source, Zig packages, and build outputs.
+On a cache miss, Cargo downloads the official Zig 0.16.0 binary for the host,
+verifies its published SHA-256 checksum, and caches it under
+`target/toolchains/zig/0.16.0`. It then downloads and verifies the pinned
+official Ghostty source and builds the required static archive. Everything
+under `target` is ignored. Subsequent Rust development and release builds both
+select `ReleaseFast`, validate the archive checksum and build metadata, and
+reuse that one native artifact without entering Zig. The separate `Debug`
+archive is created and reused only when `LECTOR_GHOSTTY_OPTIMIZE=Debug` is set.
 
 `cargo ghostty-check` bootstraps and verifies both native profiles, runs the
 linked build-information tests, and checks the resulting runtime linkage.
 
-The aliases are defined by this repository in `.cargo/config.toml`; they compile
-and run the dependency-free `lector-xtask` workspace utility, so no global Cargo
-plugin or Make installation is required. The bootstrap remains intentionally
-separate from Cargo build scripts. On its first run,
-`scripts/bootstrap_zig.sh` downloads Zig, and
-`scripts/bootstrap_ghostty.sh` may download the pinned official source archive
-while Zig fetches packages pinned by Ghostty's `build.zig.zon`. Neither
-Lector's root `build.rs` nor the adapter's `build.rs` executes Zig, Git, curl,
-or any network operation. Cargo consumes only the verified output under:
+The adapter's build script runs `scripts/bootstrap_ghostty.sh`; that script
+returns immediately for a verified cache hit. On its first run,
+`scripts/bootstrap_zig.sh` downloads Zig, and the Ghostty bootstrap downloads
+the pinned official source archive while Zig fetches packages pinned by
+Ghostty's `build.zig.zon`. Cargo consumes the verified output under:
 
 ```text
 target/ghostty-prebuilt/<rust-target>/<Debug|ReleaseFast>/
 ```
 
-If Zig 0.16.0 is already managed externally, the lower-level Ghostty bootstrap
-still accepts it on `PATH`:
+Maintainers can still invoke the lower-level bootstrap directly. It accepts a
+matching Zig 0.16.0 on `PATH` and otherwise obtains the pinned toolchain:
 
 ```sh
 scripts/bootstrap_ghostty.sh --optimize ReleaseFast
@@ -268,11 +305,12 @@ GHOSTTY_PREBUILT_ROOT=/opt/lector/ghostty-prebuilt \
 
 Each profile directory must contain `static-lib/libghostty-vt.a` and the
 `lector-ghostty-build.txt` metadata written by the bootstrap. The adapter build
-script rejects missing or mismatched commit, Zig, target, optimization,
-headless-runtime, Kitty-graphics, or C-header ABI metadata. Copying an
-unverified system library into place is unsupported. The dedicated
-`static-lib` directory prevents an identically named shared library emitted by
-Ghostty's install step from being selected by a platform linker.
+script rejects or rebuilds missing and mismatched commit, Zig, target,
+optimization, headless-runtime, Kitty-graphics, C-header ABI, ABI-probe hash,
+or archive checksum state. Copying an unverified system library into place is
+unsupported. The dedicated `static-lib` directory prevents an identically
+named shared library emitted by Ghostty's install step from being selected by
+a platform linker.
 
 Release builders use the same pinned source and exact Zig version. Released
 Lector binaries do not require Zig, the Ghostty application, or a shared
@@ -317,16 +355,15 @@ input independently.
 
 ## Troubleshooting
 
-- “verified archive not found” means an ordinary Cargo command ran before the
-  matching profile was bootstrapped. Run `cargo ghostty-debug` or
-  `cargo ghostty-release` from the repository root.
+- A bootstrap failure on a fresh build reports the failed download, checksum,
+  toolchain, or Zig build directly. Re-run the same ordinary Cargo command
+  after correcting that underlying problem.
 - A metadata mismatch means the cached archive was built for another commit,
-  Zig version, Rust target, or optimization profile. Re-run the corresponding
-  project alias; do not copy in a system library.
+  Zig version, Rust target, or optimization profile. The next ordinary Cargo
+  build regenerates it; do not copy in a system library.
 - A checksum failure is fatal by design. Remove only the named cached download
   under `target/toolchains` or `target/ghostty-source`, then retry on a
   trusted network. Do not bypass verification.
-- Cross-target builds need a prebuilt archive for that exact Rust target. Use
-  `cargo ghostty-bootstrap --target <triple> --optimize <profile>` first.
+- Cross-target builds prepare and cache an archive for the exact Rust target.
 - Released binaries should show no `libghostty-vt` dependency in `otool -L` or
   `ldd`. `cargo ghostty-check` verifies this automatically.

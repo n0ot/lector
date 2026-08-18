@@ -1,2 +1,5 @@
 /target
+/nvim.log
 .aider*
+__pycache__/
+*.pyc
