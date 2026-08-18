@@ -110,24 +110,44 @@ pub fn command_may_change_key_configuration(command: &str) -> bool {
         })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelectWindowScope {
+    NotApplicable,
+    Resolved(String),
+    Missing(u32),
+}
+
 /// Resolve a simple numeric `select-window` binding against the session to
 /// which this control client is attached. The stable window ID avoids tmux
 /// interpreting an unqualified number in some other client/session context.
 #[must_use]
-pub fn scope_select_window_command(topology: &TmuxTopology, command: &str) -> Option<String> {
+pub fn scope_select_window_command(topology: &TmuxTopology, command: &str) -> SelectWindowScope {
     let mut words = command.split_ascii_whitespace();
-    if words.next()? != "select-window" || words.next()? != "-t" {
-        return None;
+    if words.next() != Some("select-window") || words.next() != Some("-t") {
+        return SelectWindowScope::NotApplicable;
     }
-    let raw_target = words.next()?;
+    let Some(raw_target) = words.next() else {
+        return SelectWindowScope::NotApplicable;
+    };
     if words.next().is_some() {
-        return None;
+        return SelectWindowScope::NotApplicable;
     }
     let target = raw_target.trim_matches(|character| matches!(character, '\'' | '"'));
-    let index = target.strip_prefix(":=").unwrap_or(target).parse().ok()?;
-    let session = topology.session(topology.attached_session()?)?;
-    let window_id = session.windows.get(&index)?;
-    Some(format!("select-window -t @{}", window_id.0))
+    let Ok(index) = target.strip_prefix(":=").unwrap_or(target).parse() else {
+        return SelectWindowScope::NotApplicable;
+    };
+    let Some(session) = topology
+        .attached_session()
+        .and_then(|session_id| topology.session(session_id))
+    else {
+        return SelectWindowScope::NotApplicable;
+    };
+    match session.windows.get(&index) {
+        Some(window_id) => {
+            SelectWindowScope::Resolved(format!("select-window -t @{}", window_id.0))
+        }
+        None => SelectWindowScope::Missing(index),
+    }
 }
 
 fn configured_key_table(command: &str) -> Option<(String, bool)> {

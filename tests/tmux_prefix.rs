@@ -4,7 +4,7 @@ use lector::{
     speech,
     tmux_model::TmuxTopology,
     tmux_prefix::{
-        BindingAction, classify_binding, command_may_change_key_configuration,
+        BindingAction, SelectWindowScope, classify_binding, command_may_change_key_configuration,
         scope_select_window_command, tmux_key_name,
     },
     views,
@@ -31,6 +31,7 @@ const USER_PREFIX_FIXTURE: &[&[u8]] = &[
     b"O\tkey-table\troot",
     b"O\trepeat-time\t500",
     b"B\t1\t0\tselect-window -t :=1",
+    b"B\t9\t0\tselect-window -t :=9",
     b"B\tn\t0\tnext-window",
     b"B\tp\t0\tprevious-window",
     b"B\tl\t0\tlast-window",
@@ -101,7 +102,7 @@ fn user_prefix_fixture_preserves_options_repeatability_commands_and_quotes() {
     assert_eq!(topology.option("prefix2"), Some("None"));
     assert_eq!(topology.option("key-table"), Some("root"));
     assert_eq!(topology.option("repeat-time"), Some("500"));
-    assert_eq!(topology.bindings().len(), 25);
+    assert_eq!(topology.bindings().len(), 26);
     assert!(topology.binding("Left").unwrap().repeatable);
     assert_eq!(
         topology.binding("Z").unwrap().command,
@@ -205,16 +206,20 @@ fn numeric_window_bindings_are_scoped_to_the_attached_session_by_stable_id() {
     topology.replace_inventory(&records).unwrap();
 
     assert_eq!(
-        scope_select_window_command(&topology, "select-window -t 10").as_deref(),
-        Some("select-window -t @110")
+        scope_select_window_command(&topology, "select-window -t 10"),
+        SelectWindowScope::Resolved("select-window -t @110".to_owned())
     );
     assert_eq!(
-        scope_select_window_command(&topology, "select-window -t :=10").as_deref(),
-        Some("select-window -t @110")
+        scope_select_window_command(&topology, "select-window -t :=10"),
+        SelectWindowScope::Resolved("select-window -t @110".to_owned())
     );
     assert_eq!(
         scope_select_window_command(&topology, "select-window -t 9"),
-        None
+        SelectWindowScope::Missing(9)
+    );
+    assert_eq!(
+        scope_select_window_command(&topology, "next-window"),
+        SelectWindowScope::NotApplicable
     );
 }
 
@@ -536,6 +541,18 @@ fn everyday_discovered_bindings_execute_their_exact_tmux_commands() {
         input(&mut app, &mut sr, &mut physical, key);
         assert_eq!(tick(&mut app, &mut sr, &mut physical), *expected);
     }
+}
+
+#[test]
+fn missing_numeric_window_binding_is_spoken_without_a_command_or_overlay() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = ready_app();
+    recorder.0.borrow_mut().clear();
+
+    input(&mut app, &mut sr, &mut physical, b"\x019");
+
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    assert!(!app.has_overlay());
+    assert_eq!(&*recorder.0.borrow(), &["tmux", "can't find window: 9"]);
 }
 
 #[test]

@@ -198,18 +198,31 @@ impl App {
     ) -> Result<()> {
         match crate::tmux_prefix::classify_binding(command)? {
             crate::tmux_prefix::BindingAction::Execute(command) => {
-                let command = self
+                let scope = self
                     .tmux_connections
                     .iter()
                     .find(|connection| connection.id == connection_id)
-                    .and_then(|connection| {
-                        crate::tmux_prefix::scope_select_window_command(
-                            &connection.topology,
-                            &command,
-                        )
-                    })
-                    .unwrap_or(command);
-                self.queue_tmux_user_command(connection_id, &command)
+                    .map_or(
+                        crate::tmux_prefix::SelectWindowScope::NotApplicable,
+                        |connection| {
+                            crate::tmux_prefix::scope_select_window_command(
+                                &connection.topology,
+                                &command,
+                            )
+                        },
+                    );
+                match scope {
+                    crate::tmux_prefix::SelectWindowScope::NotApplicable => {
+                        self.queue_tmux_user_command(connection_id, &command)
+                    }
+                    crate::tmux_prefix::SelectWindowScope::Resolved(command) => {
+                        self.queue_tmux_user_command(connection_id, &command)
+                    }
+                    crate::tmux_prefix::SelectWindowScope::Missing(index) => {
+                        sr.speak(&format!("can't find window: {index}"), false)?;
+                        Ok(())
+                    }
+                }
             }
             crate::tmux_prefix::BindingAction::Detach => {
                 // Commands are queued on the selected control connection, so

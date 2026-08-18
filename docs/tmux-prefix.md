@@ -52,7 +52,9 @@ formats, is sent through the connection's ordered control FIFO. A simple
 numeric `select-window -t N` or `select-window -t :=N` is the deliberate
 exception: Lector resolves `N` in the attached session and sends its stable
 `@window` ID, preventing another client or session context from changing what
-the number means.
+the number means. If that attached session has no window at index `N`, Lector
+speaks `can't find window: N` without sending the command or opening an error
+popup.
 Bindings containing a NUL, carriage return, or newline are rejected before a
 newline terminator is added, preventing one discovered record from injecting a
 second control command. Command replies retain an explicit type; an error opens
