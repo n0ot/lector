@@ -173,7 +173,7 @@ impl TmuxConnectionChooserView {
             }
         }
         if targets.is_empty() && capacity > 0 {
-            lines.push("no tmux connections".to_owned());
+            lines.push("no tmux connections active".to_owned());
         } else {
             lines.extend(
                 targets

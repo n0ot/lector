@@ -104,10 +104,8 @@ impl TmuxGatewayRouter {
         Self::with_first_connection_id(1)
     }
 
-    /// Creates an independent source router in a caller-assigned ID range.
-    ///
-    /// This is useful when more than one transport feeds the same application;
-    /// connection IDs must remain unique across those routers.
+    /// Creates a source router with a caller-assigned first connection ID.
+    /// The ID becomes available again after that connection fully ends.
     #[must_use]
     pub fn with_first_connection_id(first_connection_id: u64) -> Self {
         Self {
@@ -132,14 +130,6 @@ impl TmuxGatewayRouter {
         }
     }
 
-    /// Advances this router's allocator past IDs assigned by another gateway.
-    ///
-    /// App-level nested gateways share one global connection namespace even
-    /// though each byte-stream parser owns its own local allocator.
-    pub fn ensure_next_connection_id_at_least(&mut self, next_connection_id: u64) {
-        self.next_connection_id = self.next_connection_id.max(next_connection_id);
-    }
-
     pub fn push(&mut self, bytes: &[u8]) -> Result<Vec<GatewayEvent>, GatewayError> {
         let mut events = Vec::new();
         let mut direct = Vec::new();
@@ -156,6 +146,7 @@ impl TmuxGatewayRouter {
                 if active.terminator_escape_seen && byte == b'\\' {
                     let connection_id = active.connection_id;
                     self.active = None;
+                    self.next_connection_id = connection_id;
                     events.push(GatewayEvent::ConnectionEnded { connection_id });
                 } else {
                     active.terminator_escape_seen = byte == b'\x1b';
@@ -174,6 +165,7 @@ impl TmuxGatewayRouter {
                     .take()
                     .expect("active connection checked above")
                     .connection_id;
+                self.next_connection_id = connection_id;
                 events.push(GatewayEvent::ConnectionFailed {
                     connection_id,
                     reason: GatewayFailure::MissingTerminator,
@@ -208,6 +200,7 @@ impl TmuxGatewayRouter {
                                 .first()
                                 .is_some_and(|byte| *byte != b'%' && *byte != b'\x1b');
                         if returned_to_direct_transport {
+                            self.next_connection_id = connection_id;
                             direct.extend_from_slice(&failed.current_record);
                         } else {
                             // A protocol-looking record failed while the DCS
@@ -243,6 +236,7 @@ impl TmuxGatewayRouter {
                 }));
                 if ended {
                     let active = self.active.take().expect("parser just ended");
+                    self.next_connection_id = connection_id;
                     if active.saw_exit {
                         events.push(GatewayEvent::ConnectionEnded { connection_id });
                     } else {
@@ -310,6 +304,7 @@ impl TmuxGatewayRouter {
     pub fn finish_transport(&mut self) -> Vec<GatewayEvent> {
         let mut events = Vec::new();
         if let Some(active) = self.active.take() {
+            self.next_connection_id = active.connection_id;
             if active.recovering {
                 events.push(GatewayEvent::ConnectionEnded {
                     connection_id: active.connection_id,
@@ -343,6 +338,7 @@ impl TmuxGatewayRouter {
         }
         let connection_id = active.connection_id;
         self.active = None;
+        self.next_connection_id = connection_id;
         vec![GatewayEvent::ConnectionFailed {
             connection_id,
             reason: GatewayFailure::TerminatorTimeout,

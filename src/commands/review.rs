@@ -50,7 +50,9 @@ pub(super) fn line_read(sr: &mut ScreenReader, view: &mut View) -> Result<Comman
     let row = view.review_cursor_position().0;
     sr.report_review_cursor_indentation_changes(view)?;
     let line = view.line(row);
-    sr.speak(if line.is_empty() { "blank" } else { &line }, false)?;
+    if !line.trim().is_empty() {
+        sr.speak(&line, false)?;
+    }
     Ok(CommandResult::Handled)
 }
 
@@ -103,21 +105,18 @@ pub(super) fn character_next(sr: &mut ScreenReader, view: &mut View) -> Result<C
 pub(super) fn character_read(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> {
     let (row, col) = view.review_cursor_position();
     let character = view.character(row, col);
-    sr.speak(
-        if character.is_empty() {
-            "blank"
-        } else {
-            &character
-        },
-        false,
-    )?;
+    if !character.trim().is_empty() {
+        sr.speak(&character, false)?;
+    }
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn character_read_phonetic(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> {
     let (row, col) = view.review_cursor_position();
     let character = view.character(row, col);
-    sr.speak(phonetic_name(&character).unwrap_or(&character), false)?;
+    if !character.trim().is_empty() {
+        sr.speak(phonetic_name(&character).unwrap_or(&character), false)?;
+    }
     Ok(CommandResult::Handled)
 }
 
@@ -257,8 +256,8 @@ pub(super) fn read_attributes(sr: &mut ScreenReader, view: &View) -> Result<Comm
 #[cfg(test)]
 mod tests {
     use super::{
-        bottom, character_next, character_previous, character_read_phonetic, first, last,
-        line_next, line_previous, line_read, phonetic_name, read_attributes, top, word_next,
+        bottom, character_next, character_previous, character_read, character_read_phonetic, first,
+        last, line_next, line_previous, line_read, phonetic_name, read_attributes, top, word_next,
         word_previous,
     };
     use crate::{
@@ -304,7 +303,7 @@ mod tests {
 
         line_read(&mut sr, &mut view).unwrap();
 
-        assert_eq!(output.borrow().as_slice(), ["        "]);
+        assert!(output.borrow().is_empty());
     }
 
     #[test]
@@ -333,6 +332,12 @@ mod tests {
             output.borrow().as_slice(),
             ["top", "top", "bottom", "bottom", "bottom"]
         );
+
+        output.borrow_mut().clear();
+        view.set_review_cursor_position((0, 0));
+        line_next(&mut sr, &mut view, false).unwrap();
+        assert_eq!(view.review_cursor_position(), (1, 0));
+        assert!(output.borrow().is_empty());
     }
 
     #[test]
@@ -348,13 +353,13 @@ mod tests {
         character_previous(&mut sr, &mut view).unwrap();
         character_next(&mut sr, &mut view).unwrap();
         character_read_phonetic(&mut sr, &view).unwrap();
+        view.set_review_cursor_col(9);
+        character_read(&mut sr, &view).unwrap();
 
-        assert_eq!(view.review_cursor_position(), (0, 1));
+        assert_eq!(view.review_cursor_position(), (0, 9));
         assert_eq!(
             output.borrow().as_slice(),
-            [
-                "left", "a", "beta", "right", "beta", "left", "a", " space ", " space "
-            ]
+            ["left", "a", "beta", "right", "beta", "left", "a"]
         );
     }
 

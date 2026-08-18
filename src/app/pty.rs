@@ -1,6 +1,20 @@
 use super::*;
 
 impl App {
+    fn next_available_tmux_connection_id(&self) -> Result<u64> {
+        let mut candidate = 1_u64;
+        while self
+            .tmux_connections
+            .iter()
+            .any(|connection| connection.id == candidate)
+        {
+            candidate = candidate
+                .checked_add(1)
+                .context("tmux connection id space is exhausted")?;
+        }
+        Ok(candidate)
+    }
+
     /// Starts one bounded PTY-drain presentation transaction. Control records
     /// are still parsed and applied in order; visible pane damage is composed
     /// only when the drain turn finishes.
@@ -142,8 +156,6 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.log_bytes("pty output from source", buf);
-        self.tmux_gateway
-            .ensure_next_connection_id_at_least(self.next_tmux_connection_id);
         let events = self.tmux_gateway.push(buf)?;
         self.sync_root_tmux_termination_deadline();
         for event in events {
@@ -495,9 +507,6 @@ impl App {
                 return Err(error).context("create nested tmux pane portal");
             }
         }
-        self.next_tmux_connection_id = self
-            .next_tmux_connection_id
-            .max(connection_id.saturating_add(1));
         self.tmux_connections.push(TmuxConnectionState {
             id: connection_id,
             topology: crate::tmux_model::TmuxTopology::new(connection_id),
@@ -1891,11 +1900,7 @@ impl App {
                 crate::tmux_gateway::GatewayEvent::ConnectionStarted {
                     connection_id: local_connection_id,
                 } => {
-                    let connection_id = self.next_tmux_connection_id;
-                    self.next_tmux_connection_id = self
-                        .next_tmux_connection_id
-                        .checked_add(1)
-                        .context("tmux connection id space is exhausted")?;
+                    let connection_id = self.next_available_tmux_connection_id()?;
                     if let Some(gateway) = self.nested_tmux_gateways.get_mut(&key) {
                         gateway.active_local_connection_id = Some(local_connection_id);
                         gateway.active_global_connection_id = Some(connection_id);
@@ -2555,8 +2560,7 @@ impl App {
         ));
         match origin {
             GatewayOrigin::Direct => {
-                self.tmux_gateway =
-                    TmuxGatewayRouter::with_first_connection_id(self.next_tmux_connection_id);
+                self.tmux_gateway = TmuxGatewayRouter::new();
                 self.tmux_termination_deadline_ms = None;
             }
             GatewayOrigin::Pane {

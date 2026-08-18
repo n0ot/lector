@@ -80,7 +80,8 @@ Press `M-C` while any tmux connection exists to open Lector's connection
 manager. It can switch to another local, nested, or remote connection even
 when the selected control process is silent or flooding. Its active row starts
 with `*`; compact rows show the stable ID, optional custom label, and tmux
-server host without repeating `connection` or `tmux`. Press `d` to
+server host without repeating `connection` or `tmux`. With no tmux connections,
+`M-C` announces `no tmux connections active`. Press `d` to
 detach the selected connection tree gracefully, deepest child first. Confirmed `D`
 first sends Control-backslash; if the transport remains stuck, Lector stops
 parsing that stream as tmux control and exposes the underlying terminal or

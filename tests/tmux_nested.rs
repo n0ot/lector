@@ -770,7 +770,8 @@ fn repeated_nested_attach_bootstrap_and_detach_releases_every_child_resource() {
         assert_eq!(app.tmux_connection_count(), 2, "attach cycle {cycle}");
         assert_eq!(
             app.debug_tmux_pane_portal_target(1, 20),
-            Some(cycle as u64 + 2)
+            Some(2),
+            "connection number was not reused on attach cycle {cycle}"
         );
         feed_at_depth(
             &mut app,

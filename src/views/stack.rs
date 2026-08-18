@@ -404,18 +404,19 @@ impl ViewStack {
         view_id: crate::presentation::ViewId,
     ) -> Option<&mut crate::view::View> {
         for view in self.views.iter_mut().chain(&mut self.retired_views) {
-            if let Some(connection) = view
-                .as_any_mut()
-                .downcast_mut::<crate::views::TmuxConnectionView>()
-            {
+            if view.kind() == crate::views::ViewKind::TmuxConnection {
+                let connection = view
+                    .as_any_mut()
+                    .downcast_mut::<crate::views::TmuxConnectionView>()
+                    .expect("tmux connection view kind must match its controller type");
                 if let Some(model) = connection.model_by_id_mut(view_id) {
                     return Some(model);
                 }
-            } else {
-                let model = view.model();
-                if model.view_id() == view_id {
-                    return Some(model);
-                }
+                continue;
+            }
+            let model = view.model();
+            if model.view_id() == view_id {
+                return Some(model);
             }
         }
         None

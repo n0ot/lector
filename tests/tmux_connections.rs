@@ -603,10 +603,27 @@ fn manager_shortcut_preempts_an_incomplete_prefix() {
 }
 
 #[test]
-fn manager_shortcut_remains_application_input_when_no_tmux_connection_exists() {
-    let (mut app, mut sr, _recorder, mut physical) = app();
-    assert_eq!(input(&mut app, &mut sr, &mut physical, b"\x1bC"), b"\x1bC");
+fn manager_shortcut_reports_when_no_tmux_connection_exists() {
+    let (mut app, mut sr, recorder, mut physical) = app();
+    assert!(input(&mut app, &mut sr, &mut physical, b"\x1bC").is_empty());
     assert!(!app.has_overlay());
+    assert_eq!(
+        recorder.0.borrow().as_slice(),
+        ["no tmux connections active"]
+    );
+}
+
+#[test]
+fn direct_connection_number_returns_to_one_after_all_connections_end() {
+    let (mut app, mut sr, _recorder, mut physical) = app();
+    app.handle_pty(&mut sr, b"\x1bP1000p%exit detached\n\x1b\\", &mut physical)
+        .unwrap();
+    assert_eq!(app.tmux_connection_count(), 0);
+
+    app.handle_pty(&mut sr, b"\x1bP1000p", &mut physical)
+        .unwrap();
+    assert_eq!(app.tmux_connection_count(), 1);
+    assert_eq!(app.active_tmux_connection(), Some(1));
 }
 
 #[test]
@@ -859,18 +876,23 @@ fn connection_labels_are_stable_distinguish_duplicates_and_do_not_leak_to_new_id
         b"%exit old identity\n\x1b\\",
         &mut physical,
     );
-    let _third = add_ready_connection(
+    let _replacement = add_ready_connection(
         &mut app,
         &mut sr,
         &mut physical,
-        3,
-        inventory("three", "three", "three", "/dev/ttys-three"),
-        "THREE",
+        2,
+        inventory(
+            "replacement",
+            "replacement",
+            "replacement",
+            "/dev/ttys-replacement",
+        ),
+        "REPLACEMENT",
     );
     assert!(
-        app.debug_tmux_topology(3)
+        app.debug_tmux_topology(2)
             .unwrap()
-            .starts_with("connection 3: tmux 3")
+            .starts_with("connection 2: tmux 2")
     );
     assert!(
         app.show_tmux_connection_chooser(&mut sr, &mut physical)
@@ -882,7 +904,10 @@ fn connection_labels_are_stable_distinguish_duplicates_and_do_not_leak_to_new_id
         "{restarted:?}"
     );
     assert!(!restarted.contains("2, two.example"), "{restarted:?}");
-    assert!(restarted.contains("* 3, three.example"), "{restarted:?}");
+    assert!(
+        restarted.contains("* 2, replacement.example"),
+        "{restarted:?}"
+    );
 }
 
 struct DisposableServer {

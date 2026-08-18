@@ -109,11 +109,10 @@ responsive.
 Manager rows begin with `*` for the active connection and include the tmux
 server's `#{host}` value when it is available. They omit redundant
 `connection` and default `tmux` wording; for example, the default active row is
-`* 3, build.example`. Connection numbers are monotonic runtime identities
-rather than live-list positions: an ended connection's
-number is not reused, so rows `1` and `3` can legitimately be the only two
-live connections. This prevents delayed control records from an old transport
-from being mistaken for a newly attached connection.
+`* 3, build.example`. A connection keeps its number for its lifetime. After it
+ends and its parser and queued state are discarded, its number is available
+again; new connections take the lowest available positive number. In
+particular, after all tmux connections end, the next connection is `1`.
 
 Graceful detach is sent as an unqualified `detach-client` on the selected
 connection's own control channel. The channel already identifies the invoking
@@ -137,7 +136,7 @@ control connection is live: that would only reveal an uninterpreted control
 stream without resolving its ownership. Enter switches among live connections;
 Escape closes the manager. Entering it cancels an incomplete tmux prefix, and
 it remains responsive while child output is paused, silent, or flooding. With
-no tmux connections, `M-C` remains ordinary application input.
+no tmux connections, `M-C` announces `no tmux connections active`.
 
 The corresponding configurable Lector actions are:
 

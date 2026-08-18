@@ -262,7 +262,6 @@ pub(super) fn word_previous(sr: &mut ScreenReader, view: &mut View) -> Result<Co
         return Ok(CommandResult::Handled);
     }
     let Some((start, _)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
         return Ok(CommandResult::Handled);
     };
     let old_position = view.review_cursor_position();
@@ -292,7 +291,6 @@ pub(super) fn word_next(sr: &mut ScreenReader, view: &mut View) -> Result<Comman
         return Ok(CommandResult::Handled);
     }
     let Some((start, end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
         return Ok(CommandResult::Handled);
     };
     let old_position = view.review_cursor_position();
@@ -324,19 +322,19 @@ pub(super) fn word_read(sr: &mut ScreenReader, view: &mut View) -> Result<Comman
         return Ok(CommandResult::Handled);
     }
     let Some((start, end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
         return Ok(CommandResult::Handled);
     };
     let (row, col) = view.review_cursor_position();
     let Some((word_start, word_end)) = word_bounds_at(view, row, col, start, end) else {
-        sr.speak("blank", false)?;
         return Ok(CommandResult::Handled);
     };
     let text = view
         .screen()
         .contents_between(row, word_start, row, word_end + 1);
     let spoken = text.trim();
-    sr.speak(if spoken.is_empty() { "blank" } else { spoken }, false)?;
+    if !spoken.is_empty() {
+        sr.speak(spoken, false)?;
+    }
     Ok(CommandResult::Handled)
 }
 
@@ -392,7 +390,6 @@ pub(super) fn character_previous(sr: &mut ScreenReader, view: &mut View) -> Resu
         return Ok(CommandResult::Handled);
     }
     let Some((start, _)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
         return Ok(CommandResult::Handled);
     };
     let old_position = view.review_cursor_position();
@@ -413,7 +410,6 @@ pub(super) fn character_next(sr: &mut ScreenReader, view: &mut View) -> Result<C
         return Ok(CommandResult::Handled);
     }
     let Some((_, end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
         return Ok(CommandResult::Handled);
     };
     let old_position = view.review_cursor_position();
@@ -434,20 +430,14 @@ pub(super) fn character_read(sr: &mut ScreenReader, view: &mut View) -> Result<C
         return Ok(CommandResult::Handled);
     }
     let Some((start, end)) = current_cell_text_bounds(sr, view) else {
-        sr.speak("blank", false)?;
         return Ok(CommandResult::Handled);
     };
     let (row, col) = view.review_cursor_position();
     let col = col.clamp(start, end);
     let character = view.screen().contents_between(row, col, row, col + 1);
-    sr.speak(
-        if character.trim().is_empty() {
-            "space"
-        } else {
-            &character
-        },
-        false,
-    )?;
+    if !character.trim().is_empty() {
+        sr.speak(&character, false)?;
+    }
     Ok(CommandResult::Handled)
 }
 
@@ -535,15 +525,18 @@ fn speak_cell(
         sr.speak(&text, false)?;
     }
     let text = state.model().cell_text(view, row, state.current_col());
-    sr.speak(if text.is_empty() { "blank" } else { &text }, false)?;
+    if !text.trim().is_empty() {
+        sr.speak(&text, false)?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        character_next, character_previous, character_read, first_text_col, last_text_col,
-        toggle_mode, word_bounds_at, word_end_from_or_left, word_next, word_previous, word_read,
+        RowMove, character_next, character_previous, character_read, first_text_col, last_text_col,
+        row_move, toggle_mode, word_bounds_at, word_end_from_or_left, word_next, word_previous,
+        word_read,
     };
     use crate::{screen_reader::ScreenReader, speech, view::View};
     use std::{cell::RefCell, rc::Rc};
@@ -619,8 +612,10 @@ mod tests {
         character_previous(&mut sr, &mut view).unwrap();
         character_next(&mut sr, &mut view).unwrap();
         character_read(&mut sr, &mut view).unwrap();
+        view.set_review_cursor_col(8);
+        character_read(&mut sr, &mut view).unwrap();
 
-        assert_eq!(view.review_cursor_position(), (1, 5));
+        assert_eq!(view.review_cursor_position(), (1, 8));
         assert_eq!(
             output.borrow().as_slice(),
             [
@@ -639,5 +634,22 @@ mod tests {
                 "a",
             ]
         );
+    }
+
+    #[test]
+    fn blank_table_cells_are_silent_for_navigation_and_explicit_reads() {
+        let (mut sr, output) = screen_reader();
+        let mut view = View::new(3, 20);
+        view.process_changes(b"A   VALUE   END\r\nx   data    yes\r\ny           no");
+        view.set_review_cursor_position((1, 4));
+        toggle_mode(&mut sr, &mut view).unwrap();
+        output.borrow_mut().clear();
+
+        row_move(&mut sr, &mut view, RowMove::Next).unwrap();
+        word_read(&mut sr, &mut view).unwrap();
+        character_read(&mut sr, &mut view).unwrap();
+
+        assert_eq!(view.review_cursor_position().0, 2);
+        assert!(output.borrow().is_empty());
     }
 }

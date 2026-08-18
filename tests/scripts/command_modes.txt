@@ -29,7 +29,6 @@ And expect-speak: one two
 And expect-speak: three four
 And expect-speak: t
 And expect-speak: mark set
-And expect-speak: blank
 And expect-speak: copied
 And expect-speak: pasted
 And expect-pty-stdin: three four

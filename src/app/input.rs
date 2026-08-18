@@ -446,10 +446,10 @@ impl App {
                     if tmux_overlay_opened.is_some() {
                         if tmux_overlay_opened == Some(false) {
                             if action == commands::Action::OpenTmuxConnectionChooser {
-                                self.consumed_key_presses.remove(&key_id);
-                                return self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out);
+                                sr.speak("no tmux connections active", false)?;
+                            } else {
+                                self.emit_physical_bells(term_out, 1)?;
                             }
-                            self.emit_physical_bells(term_out, 1)?;
                         }
                         self.consumed_key_presses.insert(key_id);
                         return Ok(());
