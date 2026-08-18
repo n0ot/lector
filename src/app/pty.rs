@@ -1690,7 +1690,7 @@ impl App {
         if bytes.is_empty() {
             return Ok(());
         }
-        let Some(window_id) = self
+        let Some(_) = self
             .tmux_connections
             .iter()
             .find(|connection| connection.id == connection_id)
@@ -1708,15 +1708,9 @@ impl App {
         else {
             return Ok(());
         };
-        if !self
-            .tmux_background_activity_windows
-            .insert((connection_id, window_id))
-        {
-            return Ok(());
-        }
-        // A literal pane bell already presents this record. Still latch the
-        // window so ordinary output in the same background episode does not
-        // immediately produce a second notice.
+        // A literal pane bell is presented by the pane terminal update. Let
+        // that path claim the shared window-level activity latch so later
+        // bells and ordinary output in this background episode stay quiet.
         if bytes.contains(&b'\x07') {
             return Ok(());
         }

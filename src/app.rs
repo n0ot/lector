@@ -642,6 +642,38 @@ impl App {
         })
     }
 
+    fn tmux_bell_concise_announcement(
+        &self,
+        source: &TmuxBellSource,
+        reason: TmuxBellReason,
+    ) -> Option<String> {
+        let topology = &self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == source.connection_id)?
+            .topology;
+        let session = topology.session(source.session_id)?;
+        let window_index = session
+            .windows
+            .iter()
+            .find_map(|(index, window_id)| (*window_id == source.window_id).then_some(*index))?;
+        let pane = topology.pane(source.pane_id)?;
+        let pane_count = topology
+            .panes()
+            .values()
+            .filter(|candidate| candidate.window_id == source.window_id)
+            .count();
+        Some(if pane_count > 1 {
+            format!(
+                "{} in pane {window_index}.{}",
+                reason.spoken_label(),
+                pane.index
+            )
+        } else {
+            format!("{} in window {window_index}", reason.spoken_label())
+        })
+    }
+
     fn present_tmux_bell(
         &mut self,
         sr: &mut ScreenReader,
@@ -667,6 +699,19 @@ impl App {
         {
             return Ok(0);
         }
+        let window_is_background = self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+            .and_then(|connection| connection.topology.session(source.session_id))
+            .is_some_and(|session| session.active_window != Some(source.window_id));
+        if window_is_background
+            && !self
+                .tmux_background_activity_windows
+                .insert((connection_id, source.window_id))
+        {
+            return Ok(0);
+        }
         self.recent_tmux_bells.insert(key, now_ms);
         self.last_tmux_bell_source = Some(source.clone());
         match mode {
@@ -689,10 +734,16 @@ impl App {
                 )?;
                 Ok(0)
             }
-            TmuxBellMode::Audible if pane_is_visible => Ok(1),
             TmuxBellMode::Audible => {
-                self.emit_physical_bells(term_out, 1)?;
-                Ok(0)
+                if let Some(announcement) = self.tmux_bell_concise_announcement(&source, reason) {
+                    sr.speak(&announcement, false)?;
+                }
+                if pane_is_visible {
+                    Ok(1)
+                } else {
+                    self.emit_physical_bells(term_out, 1)?;
+                    Ok(0)
+                }
             }
         }
     }

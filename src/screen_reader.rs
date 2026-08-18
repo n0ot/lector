@@ -30,7 +30,8 @@ pub enum TmuxBellMode {
     Off,
     /// Speak stable connection, session, window, and pane context.
     Spoken,
-    /// Emit one physical BEL at a scheduler transaction boundary.
+    /// Speak concise tmux context and emit one physical BEL at a scheduler
+    /// transaction boundary.
     #[default]
     Audible,
 }

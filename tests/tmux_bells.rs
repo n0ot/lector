@@ -485,6 +485,87 @@ fn background_window_activity_bells_once_until_the_window_is_visited() {
 }
 
 #[test]
+fn audible_bells_speak_tmux_indexes_and_latch_for_a_background_window() {
+    let (mut app, mut sr, recorder, clock, mut physical) = make_app(true);
+    let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
+    sr.set_tmux_bell_mode(TmuxBellMode::Audible);
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%session-window-changed $1 @11\n",
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    physical.clear();
+    recorder.clear();
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(21, "\\007"),
+        &mut physical,
+    );
+    clock.advance_ms(10);
+    app.drain_scheduled_output(&mut physical, false).unwrap();
+    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 1);
+    assert_eq!(recorder.messages(), ["bell in window 2"]);
+
+    physical.clear();
+    recorder.clear();
+    clock.advance_ms(500);
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(20, "\\007"),
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 1);
+    assert_eq!(recorder.messages(), ["bell in pane 1.1"]);
+
+    physical.clear();
+    recorder.clear();
+    clock.advance_ms(4_000);
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(20, "\\007"),
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    assert!(physical.is_empty(), "background window replayed its bell");
+    assert!(recorder.messages().is_empty());
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%session-window-changed $1 @10\n%session-window-changed $1 @11\n",
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    physical.clear();
+    recorder.clear();
+    clock.advance_ms(500);
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(23, "\\007"),
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 1);
+    assert_eq!(recorder.messages(), ["bell in pane 1.2"]);
+}
+
+#[test]
 fn bells_are_scoped_by_connection_even_when_the_source_connection_is_not_presented() {
     let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
     let mut first = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
