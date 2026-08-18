@@ -1,8 +1,8 @@
 # Direct tmux gateway routing
 
 `TmuxGatewayRouter` is the source boundary between an ordinary direct PTY and
-one top-level `tmux -CC` control stream. Lector still does not
-launch or configure tmux. A user may run `tmux -CC` directly or through any
+one top-level `tmux -CC` control stream. Lector does not launch or configure
+tmux. A user may run `tmux -CC` directly or through any
 shell function or script.
 
 ## Exact byte ownership

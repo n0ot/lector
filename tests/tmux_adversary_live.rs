@@ -380,7 +380,7 @@ fn silent_and_unread_peers_can_expose_raw_transport_without_killing_lector() {
         if scenario == "silent" {
             // Control-backslash was delivered as a raw byte because this peer
             // deliberately disabled ISIG. Terminate that partial line, then
-            // use the now-exposed raw control channel exactly as a user would.
+            // use the exposed raw control channel exactly as a user would.
             live.send(b"\ndetach-client\n");
             assert!(
                 live.finish(Duration::from_secs(4)),
@@ -494,9 +494,9 @@ fn nested_control_session_accepts_input_and_gracefully_cascades_deepest_first() 
         String::from_utf8_lossy(&live.output)
     );
 
-    // Exercise the asymmetric route that used to strand the nested control
-    // stream: child -> parent correctly showed the portal, but parent -> child
-    // left the hidden parent carrier paused and made the child appear frozen.
+    // Exercise asymmetric child -> parent and parent -> child routing. The
+    // parent -> child path must resume the hidden parent carrier so the child
+    // stays responsive.
     live.send(b"\x1bC");
     assert!(
         live.wait_for_screen("Up/Down select", Duration::from_secs(1)),

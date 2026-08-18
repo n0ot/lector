@@ -18,8 +18,8 @@ pub const INVENTORY_COMMANDS: [&str; 12] = [
     "display-message -p -F 'O\tprefix2\t#{prefix2}'\n",
     "display-message -p -F 'O\tkey-table\t#{key-table}'\n",
     "display-message -p -F 'O\trepeat-time\t#{repeat-time}'\n",
-    // `list-keys -F` was added after tmux 3.7b. The no-format form has
-    // emitted canonical, reloadable `bind-key` syntax for much longer.
+    // The no-format form works with tmux 3.7b and emits canonical, reloadable
+    // `bind-key` syntax.
     "list-keys -a\n",
 ];
 
@@ -785,7 +785,7 @@ impl TmuxTopology {
         }
         let table = match token.as_slice() {
             b"-T" => lexer.next()?.ok_or(TopologyError::MalformedInventory)?,
-            // Very old tmux represented root-table bindings with `-n`.
+            // Treat the `-n` form as a root-table binding.
             b"-n" => b"root".to_vec(),
             _ => return Err(TopologyError::MalformedInventory),
         };

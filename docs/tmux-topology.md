@@ -18,10 +18,9 @@ Lector sends twelve independently parsed commands: machine-oriented `-F`
 queries for sessions, windows, panes, attached session, the two base-index
 options, attached server host and client name, and four key options, followed
 by `list-keys -a`.
-`list-keys -F` is newer than the rest of the inventory API, so Lector parses the
-older command's canonical, reloadable `bind-key` syntax, including quoting,
-escapes, tables, and repeat flags. This keeps key discovery compatible with
-older tmux releases without falling back to whitespace parsing.
+For tmux 3.7b compatibility, Lector parses `list-keys -a`'s canonical,
+reloadable `bind-key` syntax, including quoting, escapes, tables, and repeat
+flags, without falling back to whitespace parsing.
 
 Each command receives its own `%begin`/`%end` or `%error` block. Lector
 accumulates all twelve and validates them as one transaction before replacing

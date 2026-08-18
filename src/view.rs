@@ -457,8 +457,8 @@ impl View {
     }
 
     /// Revision currently visible on the physical terminal. Standalone Views
-    /// do not use presentation receipts, so their legacy immediate behavior
-    /// deliberately has no revision gate.
+    /// do not use presentation receipts and deliberately have no revision
+    /// gate.
     pub(crate) fn accessibility_revision(&self) -> Option<ViewRevision> {
         self.presentation_tracking
             .then_some(self.presented_revision)

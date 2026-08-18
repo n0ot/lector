@@ -2,9 +2,9 @@
 
 Ghostty is Lector's mandatory and sole terminal engine. Every PTY byte is
 parsed by `GhosttyEngine`, and its normalized cells, cursor, history, modes,
-semantic anchors, and effects drive accessibility. Lector no longer depends on
-the `vt100` crate or a second production grid parser. The mandatory compositor
-renders from Ghostty state and never replays source application bytes.
+semantic anchors, and effects drive accessibility. Lector has no `vt100`
+dependency or second production grid parser. The mandatory compositor renders
+from Ghostty state and never replays source application bytes.
 
 Use ordinary Cargo commands. On a cache miss, the adapter build automatically
 downloads and verifies the pinned build inputs and prepares the native archive:
@@ -28,19 +28,17 @@ checked against Ghostty's installed headers during the automatic bootstrap.
 
 ## Authoritative engine
 
-The `ghostty-vt` Cargo feature remains as an empty, default compatibility flag
-for existing project commands and benchmark target selection. It does not
-toggle the dependency or runtime engine: `lector-ghostty` is mandatory with or
-without default features. The former `LECTOR_GHOSTTY_SHADOW*` variables and
-dual-feeding path have been removed.
+The `ghostty-vt` Cargo feature is an empty, default flag accepted by project
+commands and benchmark target selection. It does not toggle the dependency or
+runtime engine: `lector-ghostty` is mandatory with or without default features.
 
 CI runs the complete authoritative suite, recording corpus, fragmentation
-tests, accessibility harnesses, and debug/release static-link checks. Historical
-differential recordings remain versioned because they are valuable regression
-inputs; their old classification fields are documentation, not runtime policy.
+tests, accessibility harnesses, and debug/release static-link checks. Checked-in
+differential recordings are regression inputs; their classification fields are
+documentation, not runtime policy.
 
 The adapter normalizes Ghostty cells into Lector's grapheme, width, style,
-hyperlink, wrapping, and history model. Lector still exposes at most 10,000
+hyperlink, wrapping, and history model. Lector exposes at most 10,000
 scrollback rows. Ghostty's allocator prunes complete pages and therefore may
 physically retain additional rows; the adapter disables the independent byte
 cap, configures 20,000 lines of physical headroom, and clips its public model
@@ -69,7 +67,7 @@ included and following bytes are excluded, even when the escape sequence was
 fragmented across reads.
 
 Ghostty exposes the final cursor, screen, mode, and render state but does not
-currently expose printable or cursor-operation callbacks. The owned adapter's
+expose printable or cursor-operation callbacks. The owned adapter's
 narrow `vte` stream observer therefore collects operation hints, OSC 133
 boundaries, and the active OSC 8 URI needed to annotate semantic operation
 hints. For semantic rendering it speculatively tracks only the
@@ -220,9 +218,9 @@ The adapter enables a bounded 64 KiB replay continuation and exposes an
 explicitly diagnostic Ghostty snapshot round-trip. Automated tests encode and
 restore visible state, scrollback, geometry, modes, styles, and unfinished
 UTF-8 and CSI input. This is not used by live Lector behavior or presented as a
-stable persistence format: Ghostty snapshot format version 1 remains a
-work-in-progress, and Lector's auxiliary historical OSC 133 anchors are not
-yet serialized by this diagnostic path.
+stable persistence format: Ghostty snapshot format version 1 is unstable, and
+Lector's auxiliary OSC 133 history anchors are not serialized by this
+diagnostic path.
 
 ## Pinned inputs
 
@@ -278,7 +276,7 @@ Ghostty's `build.zig.zon`. Cargo consumes the verified output under:
 target/ghostty-prebuilt/<rust-target>/<Debug|ReleaseFast>/
 ```
 
-Maintainers can still invoke the lower-level bootstrap directly. It accepts a
+Maintainers can invoke the lower-level bootstrap directly. It accepts a
 matching Zig 0.16.0 on `PATH` and otherwise obtains the pinned toolchain:
 
 ```sh
@@ -286,9 +284,7 @@ scripts/bootstrap_ghostty.sh --optimize ReleaseFast
 cargo build --locked --release --features ghostty-vt
 ```
 
-On macOS, Zig uses the SDK reported by `xcrun --sdk macosx`. Zig 0.16.0 can
-consume the current macOS 26 SDK, so Lector no longer carries the SDK-selection
-shim that the older toolchain required.
+On macOS, Zig 0.16.0 uses the macOS 26 SDK reported by `xcrun --sdk macosx`.
 
 ## Offline, packaging, and release builds
 

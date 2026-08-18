@@ -41,8 +41,8 @@ impl TestTerminalSize {
         PtySize {
             rows: self.rows,
             cols: self.columns,
-            // Match the 16x34 cell geometry reported by the Ghostty session
-            // used to reproduce this nested-terminal failure.
+            // Match the 16x34 cell geometry required by this nested-terminal
+            // regression.
             pixel_width: self.columns * 16,
             pixel_height: self.rows * 34,
         }

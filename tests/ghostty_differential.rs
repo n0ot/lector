@@ -14,9 +14,8 @@ struct Recording {
     cols: u16,
     scrollback: usize,
     operations: Vec<Operation>,
-    /// Historical review metadata retained with the reusable corpus. These
-    /// names document why a fixture was added; they no longer alter behavior
-    /// now that Ghostty is authoritative.
+    /// Descriptive classification labels stored with the reusable corpus.
+    /// Runtime behavior does not depend on them.
     expected_difference_classes: Vec<String>,
 }
 

@@ -1036,8 +1036,7 @@ impl GhosttyEngine {
     }
 
     /// Replies are drained into `UpdateSummary` and routed by the owning
-    /// application's capability broker rather than exposed through this
-    /// historical compatibility accessor.
+    /// application's capability broker. This accessor is always empty.
     pub fn pty_replies(&self) -> &[u8] {
         &[]
     }

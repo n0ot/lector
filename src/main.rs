@@ -1344,8 +1344,8 @@ fn do_events(
                 if pty.is_eof() {
                     app.handle_pty_eof(sr, &mut stdout)?;
                     // Present the last complete child frame before lifecycle cleanup
-                    // discards obsolete queued work. In particular, this prevents a
-                    // previously stranded BEL from appearing to belong to shutdown.
+                    // discards obsolete queued work. This keeps a BEL in that work
+                    // associated with the child frame instead of shutdown.
                     drain_scheduled_output_to_boundary(app, &mut stdout)?;
                     return Ok(());
                 }

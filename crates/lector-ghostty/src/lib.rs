@@ -478,8 +478,8 @@ pub struct TerminalSnapshot {
 /// for a diagnostic round-trip.
 ///
 /// This is intentionally opaque and is not a persistence or compatibility
-/// promise. Ghostty snapshot format version 1 is still work in progress, and
-/// Lector does not use this path for live runtime correctness.
+/// promise. Ghostty snapshot format version 1 is unstable, and Lector does not
+/// use this path for live runtime correctness.
 pub struct DiagnosticSnapshot {
     bytes: Vec<u8>,
     observer_continuation: Vec<u8>,
@@ -1915,8 +1915,8 @@ impl Terminal {
         // Ghostty prunes complete pages when its physical line limit is
         // crossed. Keep one logical window of line headroom so a page prune
         // cannot undershoot Lector's requested window; the byte limit is
-        // disabled above so it cannot preempt this policy. Lector still
-        // exposes and anchors only the newest requested rows.
+        // disabled above so it cannot preempt this policy. Lector exposes and
+        // anchors only the newest requested rows.
         terminal.set_scrollback_capacity(scrollback_capacity.saturating_mul(2))?;
         terminal.set_option(
             ffi::TERMINAL_OPT_CONTINUATION_MAX_BYTES,

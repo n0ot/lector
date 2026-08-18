@@ -268,7 +268,7 @@ fn normalize_cell(cell: &TerminalCell) -> NormalizedCell {
             underline: cell.underline(),
             inverse: cell.inverse(),
         },
-        // The legacy fixture schema does not model OSC 8 link targets.
+        // Fixture snapshots do not model OSC 8 link targets.
         hyperlink: None,
     }
 }

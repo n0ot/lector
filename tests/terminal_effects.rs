@@ -172,8 +172,7 @@ fn malformed_and_incomplete_effects_do_not_escape_as_partial_events() {
     assert_eq!(clipboard_query.pty_replies, b"\x1B]52;c;\x1B\\");
 
     // OSC 9 is also Ghostty's desktop-notification protocol. An invalid
-    // progress subcommand therefore remains a complete notification rather
-    // than being dropped by Lector's former observer.
+    // progress subcommand is a complete notification and must not be dropped.
     assert_eq!(
         engine.advance(b"\x1B]9;4;9;50\x1B\\").effects.events,
         [TerminalEvent::DesktopNotification {

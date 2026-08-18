@@ -133,8 +133,8 @@ Audible bells follow the completed visual transaction.
 ### Virtual terminal capabilities
 
 Lector launches the child with `TERM=xterm-256color` and removes any inherited
-`TERMINFO`. This is the widely installed compatibility contract the compositor
-currently implements. Lector deliberately does not inherit the physical
+`TERMINFO`. This is the widely installed compatibility contract implemented by
+the compositor. Lector deliberately does not inherit the physical
 terminal's vendor identity or advertise `xterm-ghostty`: using Ghostty's parser
 does not mean Lector implements every Ghostty extension. Device, mode,
 geometry, pixel-size, color-scheme, keyboard, focus, and clipboard queries from
@@ -293,16 +293,15 @@ commands (`M-u`/`M-o`, `M-j`/`M-l`, and so on) remain available in the overlay
 and are bounded by its currently displayed page.
 
 Lector retains up to 10,000 primary-screen rows. `M-r` works through both the
-long-established xterm Meta encoding used by non-Kitty terminals and Kitty
-keyboard events. The former `M-PageUp`/`M-PageDown` and `M-Up`/`M-Down`
-shortcuts are no longer claimed and pass through to the running application.
+xterm Meta encoding used by non-Kitty terminals and Kitty keyboard events.
+`M-PageUp`/`M-PageDown` and `M-Up`/`M-Down` pass through to the running
+application.
 
 When a shell emits the OSC 133 `B` input-boundary marker, ordinary unmodified
 Up/Down history navigation speaks the recalled editable input without the
 primary prompt. Readline does not emit a fresh marker for every history item;
 Lector correlates the forwarded arrow with the redraw after the existing `B`
-marker. Without OSC 133 integration, the existing cursor/diff behavior is
-unchanged.
+marker. Without OSC 133 integration, speech uses cursor/diff behavior.
 
 ### Copy/paste and clipboard history
 
@@ -315,7 +314,7 @@ unchanged.
 
 ### Supported table types
 
-Lector table mode currently supports:
+Lector table mode supports:
 
 - Pipe tables with `|` separators (with or without leading/trailing `|`), including separator/banner rows.
 - Fixed-width terminal tables where columns are separated by vertical blank gutters.

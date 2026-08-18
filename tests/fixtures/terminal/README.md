@@ -6,9 +6,9 @@ cursor state, primary/alternate screen identity, retained scrollback, exposed
 input modes, title metadata, and OSC 133 semantic marks. Trailing default cells
 are omitted; the declared terminal size preserves their extent.
 
-The legacy normalized fixture schema records hyperlinks as `null`. Separate
-compositor characterization verifies titles, OSC 8 links, Kitty keyboard and
-mouse modes, semantic marks, and bells through the modeled render path.
+Normalized fixture snapshots record hyperlinks as `null`. Separate compositor
+characterization verifies titles, OSC 8 links, Kitty keyboard and mouse modes,
+semantic marks, and bells through the modeled render path.
 
 Every snapshot comparison and compositor-oracle assertion writes a JSON
 failure artifact under `target/terminal-test-artifacts/`. An artifact contains

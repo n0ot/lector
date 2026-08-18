@@ -43,7 +43,7 @@ not loop forever on a persistent tmux error.
 tmux cannot export a byte-for-byte copy of an existing terminal and media
 store. `capture-pane -F` lets Lector rebuild the prompt/output line flags and
 hyperlinks tmux retained, and `capture-pane -P` restores a pending escape
-sequence. Captures still cannot faithfully reconstruct preexisting Kitty or
+sequence. Captures cannot faithfully reconstruct preexisting Kitty or
 Sixel media, semantic state tmux did not retain, the complete mode save/restore
 stack, or exact historical wrap-cell representation. Lector seeds the state
 tmux does expose and treats subsequent live bytes as authoritative.

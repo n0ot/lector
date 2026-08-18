@@ -31,7 +31,7 @@ impl VirtualTerminalEnvironment {
     }
 }
 
-/// The application-facing contract Lector currently implements. Inheriting a
+/// The application-facing contract implemented by Lector. Inheriting a
 /// vendor TERM (including xterm-ghostty) would promise protocols owned by the
 /// physical terminal rather than by Lector's compositor.
 #[must_use]

@@ -1628,14 +1628,12 @@ impl App {
             return Ok(());
         }
 
-        // The outer PTY drain already bounds foreground work by bytes and
-        // wall-clock time, and the presentation batch composes its final
-        // state only once. Applying another, much smaller pane-local budget
-        // here used to discard ordinary foreground output and proactively
-        // pause the pane. A successful pause has no reason to emit a second
-        // notification, so that pane could remain paused until a window
-        // switch happened to run topology synchronization. Visible bytes must
-        // therefore be modeled immediately within the outer bounded turn.
+        // The outer PTY drain bounds foreground work by bytes and wall-clock
+        // time, and the presentation batch composes its final state only once.
+        // A second, smaller pane-local budget can discard ordinary foreground
+        // output and pause the pane without a notification that guarantees a
+        // matching resume. Model visible bytes immediately within the outer
+        // bounded turn.
         if pane_is_visible {
             return self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out);
         }
