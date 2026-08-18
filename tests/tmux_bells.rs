@@ -485,11 +485,30 @@ fn background_window_activity_bells_once_until_the_window_is_visited() {
 }
 
 #[test]
-fn audible_bells_speak_tmux_indexes_and_latch_for_a_background_window() {
+fn audible_bells_speak_only_background_tmux_indexes_and_latch_that_window() {
     let (mut app, mut sr, recorder, clock, mut physical) = make_app(true);
     let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
     sr.set_tmux_bell_mode(TmuxBellMode::Audible);
     app.drain_scheduled_output(&mut physical, true).unwrap();
+    physical.clear();
+    recorder.clear();
+
+    // An inactive pane in the active split window still belongs to the active
+    // window, so its physical bell must not receive a spoken location.
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(23, "\\007"),
+        &mut physical,
+    );
+    clock.advance_ms(10);
+    app.drain_scheduled_output(&mut physical, false).unwrap();
+    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 1);
+    assert!(recorder.messages().is_empty());
+
+    physical.clear();
+    clock.advance_ms(500);
 
     feed(
         &mut app,
@@ -512,7 +531,7 @@ fn audible_bells_speak_tmux_indexes_and_latch_for_a_background_window() {
     clock.advance_ms(10);
     app.drain_scheduled_output(&mut physical, false).unwrap();
     assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 1);
-    assert_eq!(recorder.messages(), ["bell in window 2"]);
+    assert!(recorder.messages().is_empty());
 
     physical.clear();
     recorder.clear();

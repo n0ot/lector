@@ -735,7 +735,9 @@ impl App {
                 Ok(0)
             }
             TmuxBellMode::Audible => {
-                if let Some(announcement) = self.tmux_bell_concise_announcement(&source, reason) {
+                if window_is_background
+                    && let Some(announcement) = self.tmux_bell_concise_announcement(&source, reason)
+                {
                     sr.speak(&announcement, false)?;
                 }
                 if pane_is_visible {

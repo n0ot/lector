@@ -19,11 +19,12 @@ The Lua option `lector.o.tmux_bells` accepts exactly three values:
 - `"off"` discards tmux pane bells.
 - `"spoken"` announces the connection, attached session, window, and pane
   using tmux's stable numeric IDs together with their current names or title.
-- `"audible"` is the default. It speaks concise tmux context such as `bell in
-  window 1` for an unsplit window or `bell in pane 1.2` for a split, then
-  schedules one physical BEL after the complete compositor transaction for a
-  visible pane. Bells from a pane that is not currently presented still use
-  the same sole physical-output scheduler.
+- `"audible"` is the default. For a background window, it speaks concise tmux
+  context such as `bell in window 1` for an unsplit window or `bell in pane
+  1.2` for a split. The active window's bells remain silent. It schedules one
+  physical BEL after the complete compositor transaction for a visible pane.
+  Bells from a pane that is not currently presented still use the same sole
+  physical-output scheduler.
 
 One pane-output record containing multiple BEL bytes produces one notice.
 Repeated notices from a current window's same connection and pane within 250
