@@ -419,6 +419,72 @@ fn audible_bells_follow_complete_visible_transactions_and_hidden_panes_use_the_s
 }
 
 #[test]
+fn background_window_activity_bells_once_until_the_window_is_visited() {
+    let (mut app, mut sr, _recorder, clock, mut physical) = make_app(true);
+    let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
+    sr.set_tmux_bell_mode(TmuxBellMode::Audible);
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    physical.clear();
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%session-window-changed $1 @11\n",
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    physical.clear();
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(20, "prompt-returned"),
+        &mut physical,
+    );
+    clock.advance_ms(10);
+    app.drain_scheduled_output(&mut physical, false).unwrap();
+    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 1);
+
+    physical.clear();
+    clock.advance_ms(500);
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(20, "more-background-output"),
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    assert_eq!(
+        physical.iter().filter(|byte| **byte == b'\x07').count(),
+        0,
+        "one background activity episode became a bell flood"
+    );
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%session-window-changed $1 @10\n%session-window-changed $1 @11\n",
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    physical.clear();
+    clock.advance_ms(500);
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(20, "next-background-episode"),
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 1);
+}
+
+#[test]
 fn bells_are_scoped_by_connection_even_when_the_source_connection_is_not_presented() {
     let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
     let mut first = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
@@ -514,7 +580,7 @@ fn pane_id_at_index(topology: &str, wanted_index: u64) -> Option<u64> {
 }
 
 #[test]
-fn real_tmux_inactive_pane_bell_reaches_the_spoken_monitor() {
+fn real_tmux_background_window_activity_reaches_the_spoken_monitor() {
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
@@ -579,7 +645,7 @@ fn real_tmux_inactive_pane_bell_reaches_the_spoken_monitor() {
     let mut sr = ScreenReader::new(speech::Speech::new(Box::new(recorder.clone())));
     let mut physical = Vec::new();
     drive_real_tmux(
-        "initial bell pane bootstrap",
+        "initial activity pane bootstrap",
         &mut app,
         &mut sr,
         &receiver,
@@ -587,45 +653,42 @@ fn real_tmux_inactive_pane_bell_reaches_the_spoken_monitor() {
         &mut physical,
         |app| app.debug_active_view_contents().contains("ACTIVE_READY"),
     );
+    let topology = app.debug_tmux_topology(1).unwrap();
+    let background_pane = pane_id_at_index(&topology, 0).expect("background pane id");
 
     writer
         .write_all(
             format!(
-                "split-window -d -t {session}:0 \"/bin/sh -c 'printf INACTIVE_READY; exec /bin/sh'\"\n"
+                "new-window -t {session} -n foreground \"/bin/sh -c 'printf FOREGROUND_READY; exec /bin/sh'\"\n"
             )
             .as_bytes(),
         )
         .unwrap();
     writer.flush().unwrap();
     drive_real_tmux(
-        "inactive bell pane bootstrap",
+        "foreground window bootstrap",
         &mut app,
         &mut sr,
         &receiver,
         writer.as_mut(),
         &mut physical,
         |app| {
-            let Some(topology) = app.debug_tmux_topology(1) else {
-                return false;
-            };
-            let Some(pane_id) = pane_id_at_index(&topology, 1) else {
-                return false;
-            };
-            app.debug_tmux_pane_contents(1, pane_id)
-                .is_some_and(|contents| contents.contains("INACTIVE_READY"))
+            app.debug_active_view_contents()
+                .contains("FOREGROUND_READY")
         },
     );
-    let topology = app.debug_tmux_topology(1).unwrap();
-    let inactive_pane = pane_id_at_index(&topology, 1).expect("inactive pane id");
 
     sr.set_tmux_bell_mode(TmuxBellMode::Spoken);
     recorder.clear();
     writer
-        .write_all(format!("send-keys -t {session}:0.1 \"printf '\\\\a'\" Enter\n").as_bytes())
+        .write_all(
+            format!("send-keys -t %{background_pane} \"printf BACKGROUND_DONE\" Enter\n")
+                .as_bytes(),
+        )
         .unwrap();
     writer.flush().unwrap();
     drive_real_tmux(
-        "inactive pane bell",
+        "background window activity",
         &mut app,
         &mut sr,
         &receiver,
@@ -633,12 +696,17 @@ fn real_tmux_inactive_pane_bell_reaches_the_spoken_monitor() {
         &mut physical,
         |_| !recorder.messages().is_empty(),
     );
-    let source = app.last_tmux_bell_source().expect("real bell source");
+    let source = app.last_tmux_bell_source().expect("real activity source");
     assert_eq!(source.connection_id, 1);
-    assert_eq!(source.pane_id, PaneId(inactive_pane));
+    assert_eq!(source.pane_id, PaneId(background_pane));
     assert_eq!(source.session_name, session);
     assert!(
-        recorder.messages()[0].contains(&format!("pane {inactive_pane}")),
+        recorder.messages()[0].starts_with("activity in tmux connection"),
+        "speech={:?}",
+        recorder.messages()
+    );
+    assert!(
+        recorder.messages()[0].contains(&format!("pane {background_pane}")),
         "speech={:?}",
         recorder.messages()
     );

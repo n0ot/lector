@@ -2737,7 +2737,7 @@ fn kitty_repeat_repeats_lector_binding_but_release_does_not() {
 }
 
 #[test]
-fn kitty_unbound_press_and_release_are_forwarded() {
+fn kitty_unbound_press_is_transcoded_and_release_is_dropped_for_legacy_child() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -2746,7 +2746,24 @@ fn kitty_unbound_press_and_release_are_forwarded() {
     app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
         .expect("handle Kitty a press and release");
 
-    assert_eq!(pty_out, input);
+    assert_eq!(pty_out, b"a");
+}
+
+#[test]
+fn kitty_special_key_event_types_are_transcoded_for_legacy_child() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(
+        &mut sr,
+        b"\x1B[1;1:1D\x1B[1;1:2D\x1B[1;1:3D",
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("handle Kitty Left press, repeat, and release");
+
+    assert_eq!(pty_out, b"\x1B[D\x1B[D");
 }
 
 #[test]
@@ -2814,7 +2831,7 @@ fn rapid_second_kitty_ctrl_c_cycle_does_not_reach_shell_after_mode_reset() {
     let later_input = b"\x1B[97;1:1u\x1B[97;1:3u";
     app.handle_stdin(&mut sr, later_input, &mut pty_out, &mut term_out)
         .expect("forward Kitty input after the bounded handoff window");
-    assert_eq!(pty_out, later_input);
+    assert_eq!(pty_out, b"a");
 }
 
 #[test]
@@ -2854,7 +2871,7 @@ fn kitty_passed_through_binding_forwards_press_and_release() {
     app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
         .expect("pass through Kitty Meta-apostrophe press and release");
 
-    assert_eq!(pty_out, input);
+    assert_eq!(pty_out, b"\x1B'");
     assert!(sr.auto_read_enabled());
 }
 
@@ -2868,7 +2885,7 @@ fn kitty_forwarding_binding_forwards_press_and_release() {
     app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
         .expect("handle Kitty Backspace press and release");
 
-    assert_eq!(pty_out, input);
+    assert_eq!(pty_out, b"\x7F");
 }
 
 #[test]
@@ -3504,7 +3521,7 @@ fn repl_lifecycle_on_kitty_terminal_with_kitty_app() {
 }
 
 #[test]
-fn kitty_associated_text_is_forwarded_verbatim_outside_overlays() {
+fn kitty_associated_text_is_transcoded_for_legacy_child() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -3513,7 +3530,7 @@ fn kitty_associated_text_is_forwarded_verbatim_outside_overlays() {
     app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
         .expect("forward Kitty associated-text event");
 
-    assert_eq!(pty_out, input);
+    assert_eq!(pty_out, b"_");
 }
 
 #[test]
@@ -3525,6 +3542,35 @@ fn legacy_console_input_is_forwarded_verbatim_outside_overlays() {
 
     app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
         .expect("forward legacy console input");
+
+    assert_eq!(pty_out, input);
+}
+
+#[test]
+fn extended_shift_enter_becomes_enter_for_legacy_child() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    for input in [b"\x1B[27;2;13~".as_slice(), b"\x1B[13;2u"] {
+        app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+            .expect("forward Shift-Enter to a legacy child");
+        assert_eq!(pty_out, b"\r", "input={input:?}");
+        pty_out.clear();
+    }
+}
+
+#[test]
+fn modify_other_keys_shift_enter_is_preserved_for_extended_keyboard_child() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let input = b"\x1B[27;2;13~";
+    app.handle_pty(&mut sr, b"\x1B[>1u", &mut term_out)
+        .expect("enable child Kitty keyboard mode");
+
+    app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+        .expect("forward Shift-Enter to an extended-keyboard child");
 
     assert_eq!(pty_out, input);
 }

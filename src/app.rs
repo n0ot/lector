@@ -22,6 +22,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io::Write,
     sync::LazyLock,
@@ -106,6 +107,21 @@ pub struct TmuxBellSource {
     pub window_name: String,
     pub pane_id: crate::tmux_model::PaneId,
     pub pane_title: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxBellReason {
+    PaneBell,
+    BackgroundActivity,
+}
+
+impl TmuxBellReason {
+    fn spoken_label(self) -> &'static str {
+        match self {
+            Self::PaneBell => "bell",
+            Self::BackgroundActivity => "activity",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -231,6 +247,7 @@ pub struct App {
     pending_force_abandon: Option<PendingForceAbandon>,
     last_tmux_bell_source: Option<TmuxBellSource>,
     recent_tmux_bells: BTreeMap<(u64, crate::tmux_model::PaneId), u128>,
+    tmux_background_activity_windows: BTreeSet<(u64, crate::tmux_model::WindowId)>,
     pending_tmux_background_output: BTreeMap<(u64, crate::tmux_model::PaneId), VecDeque<u8>>,
     pending_tmux_background_order: VecDeque<(u64, crate::tmux_model::PaneId)>,
     pending_tmux_background_bytes: usize,
@@ -508,6 +525,7 @@ impl App {
             pending_force_abandon: None,
             last_tmux_bell_source: None,
             recent_tmux_bells: BTreeMap::new(),
+            tmux_background_activity_windows: BTreeSet::new(),
             pending_tmux_background_output: BTreeMap::new(),
             pending_tmux_background_order: VecDeque::new(),
             pending_tmux_background_bytes: 0,
@@ -630,6 +648,7 @@ impl App {
         connection_id: u64,
         pane_id: crate::tmux_model::PaneId,
         pane_is_visible: bool,
+        reason: TmuxBellReason,
         term_out: &mut dyn Write,
     ) -> Result<usize> {
         let mode = sr.tmux_bell_mode();
@@ -655,7 +674,8 @@ impl App {
             TmuxBellMode::Spoken => {
                 sr.speak(
                     &format!(
-                        "bell in tmux connection {} {}, session {} {}, window {} {}, pane {} {}",
+                        "{} in tmux connection {} {}, session {} {}, window {} {}, pane {} {}",
+                        reason.spoken_label(),
                         source.connection_id,
                         source.connection_label,
                         source.session_id.0,

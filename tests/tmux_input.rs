@@ -327,19 +327,19 @@ fn tick_commands(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) -
 #[test]
 fn application_harness_routes_keyboard_paste_focus_mouse_queries_and_latest_size() {
     let (mut app, mut sr, mut physical) = ready_split_app();
-    let protocols: &[&[u8]] = &[
-        b"x",
-        "é".as_bytes(),
-        b"\xff",
-        b"\x03",
-        b"\x1bz",
-        b"\x1b[120;5:1u",
+    let protocols: &[(&[u8], &[u8])] = &[
+        (b"x", b"x"),
+        ("é".as_bytes(), "é".as_bytes()),
+        (b"\xff", b"\xff"),
+        (b"\x03", b"\x03"),
+        (b"\x1bz", b"\x1bz"),
+        (b"\x1b[120;5:1u", b"\x18"),
     ];
     let mut expected = Vec::new();
-    for input in protocols {
+    for (input, legacy) in protocols {
         app.handle_stdin(&mut sr, input, &mut Vec::new(), &mut physical)
             .unwrap();
-        expected.extend_from_slice(input);
+        expected.extend_from_slice(legacy);
     }
     let commands = tick_commands(&mut app, &mut sr, &mut physical);
     assert_eq!(commands.len(), 1, "adjacent key input was not batched");
@@ -574,7 +574,7 @@ fn input_stays_ordered_during_partial_sequences_pane_switch_and_tmux_flow_contro
     assert_eq!(commands[0], b"refresh-client -A '%20:continue'\n");
     assert_eq!(
         decode_send_keys(&commands[1..], PaneId(20)),
-        b"\x1b[120;5:1uafter-pause"
+        b"\x18after-pause"
     );
 }
 
@@ -727,19 +727,19 @@ fn real_tmux_byte_echo_paste_mouse_resize_and_output_flood_harness() {
         |app| app.debug_active_view_contents().contains("MODES"),
     );
 
-    let protocols: &[&[u8]] = &[
-        b"\0",
-        "é".as_bytes(),
-        b"\xff",
-        b"\x03",
-        b"\x1bz",
-        b"\x1b[120;5:1u",
+    let protocols: &[(&[u8], &[u8])] = &[
+        (b"\0", b"\0"),
+        ("é".as_bytes(), "é".as_bytes()),
+        (b"\xff", b"\xff"),
+        (b"\x03", b"\x03"),
+        (b"\x1bz", b"\x1bz"),
+        (b"\x1b[120;5:1u", b"\x18"),
     ];
     let mut protocol_bytes = Vec::new();
-    for protocol in protocols {
+    for (protocol, legacy) in protocols {
         app.handle_stdin(&mut sr, protocol, &mut Vec::new(), &mut physical)
             .unwrap();
-        protocol_bytes.extend_from_slice(protocol);
+        protocol_bytes.extend_from_slice(legacy);
     }
     let commands = write_pending_real_commands(&mut app, &mut sr, writer.as_mut(), &mut physical);
     assert_eq!(
@@ -807,7 +807,12 @@ fn real_tmux_byte_echo_paste_mouse_resize_and_output_flood_harness() {
             &receiver,
             writer.as_mut(),
             &mut physical,
-            |app| app.debug_active_view_contents().contains(&expected),
+            |app| {
+                app.debug_active_view_contents()
+                    .split_whitespace()
+                    .collect::<String>()
+                    .contains(&expected)
+            },
         );
     }
 

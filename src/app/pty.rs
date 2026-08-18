@@ -610,6 +610,8 @@ impl App {
             .retain(|connection| !removed_connections.contains(&connection.id));
         self.recent_tmux_bells
             .retain(|(connection_id, _), _| !removed_connections.contains(connection_id));
+        self.tmux_background_activity_windows
+            .retain(|(connection_id, _)| !removed_connections.contains(connection_id));
         if self
             .last_tmux_bell_source
             .as_ref()
@@ -1125,6 +1127,18 @@ impl App {
             location_changed =
                 sync_topology && previous_location != connection.topology.attached_location();
         }
+        if let Some(window_id) = self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+            .and_then(|connection| connection.topology.attached_location())
+            .map(|location| location.window_id)
+        {
+            // Selecting a window acknowledges its previous activity notice.
+            // Leaving it again therefore rearms the first background update.
+            self.tmux_background_activity_windows
+                .remove(&(connection_id, window_id));
+        }
         let mut announce_tmux_location = location_changed;
 
         if request_resync {
@@ -1590,6 +1604,7 @@ impl App {
                     && !view.is_showing_portal()
                     && view.is_pane_visible(pane_id)
             });
+        self.present_tmux_background_activity(sr, connection_id, pane_id, bytes, term_out)?;
         let pane_needs_resync = self
             .tmux_connections
             .iter_mut()
@@ -1664,6 +1679,58 @@ impl App {
         Ok(())
     }
 
+    fn present_tmux_background_activity(
+        &mut self,
+        sr: &mut ScreenReader,
+        connection_id: u64,
+        pane_id: crate::tmux_model::PaneId,
+        bytes: &[u8],
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let Some(window_id) = self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+            .and_then(|connection| {
+                let session_id = connection.topology.attached_session()?;
+                let session = connection.topology.session(session_id)?;
+                let pane = connection.topology.pane(pane_id)?;
+                (Some(pane.window_id) != session.active_window
+                    && session
+                        .windows
+                        .values()
+                        .any(|window_id| *window_id == pane.window_id))
+                .then_some(pane.window_id)
+            })
+        else {
+            return Ok(());
+        };
+        if !self
+            .tmux_background_activity_windows
+            .insert((connection_id, window_id))
+        {
+            return Ok(());
+        }
+        // A literal pane bell already presents this record. Still latch the
+        // window so ordinary output in the same background episode does not
+        // immediately produce a second notice.
+        if bytes.contains(&b'\x07') {
+            return Ok(());
+        }
+        self.present_tmux_bell(
+            sr,
+            connection_id,
+            pane_id,
+            false,
+            TmuxBellReason::BackgroundActivity,
+            term_out,
+        )?;
+        Ok(())
+    }
+
     fn present_bell_from_skipped_tmux_output(
         &mut self,
         sr: &mut ScreenReader,
@@ -1676,8 +1743,14 @@ impl App {
         if !bytes.contains(&b'\x07') {
             return Ok(());
         }
-        let audible =
-            self.present_tmux_bell(sr, connection_id, pane_id, pane_is_visible, term_out)?;
+        let audible = self.present_tmux_bell(
+            sr,
+            connection_id,
+            pane_id,
+            pane_is_visible,
+            TmuxBellReason::PaneBell,
+            term_out,
+        )?;
         if audible != 0 {
             self.emit_physical_bells(term_out, audible)?;
         }
@@ -2053,7 +2126,14 @@ impl App {
         }
         let bells = outcome.as_ref().map_or(0, |outcome| outcome.bells);
         let presented_bells = if bells > 0 {
-            self.present_tmux_bell(sr, connection_id, pane_id, is_visible, term_out)?
+            self.present_tmux_bell(
+                sr,
+                connection_id,
+                pane_id,
+                is_visible,
+                TmuxBellReason::PaneBell,
+                term_out,
+            )?
         } else {
             0
         };
@@ -2265,6 +2345,10 @@ impl App {
         self.recent_tmux_bells
             .retain(|(source_connection, pane_id), _| {
                 *source_connection != connection_id || topology.pane(*pane_id).is_some()
+            });
+        self.tmux_background_activity_windows
+            .retain(|(source_connection, window_id)| {
+                *source_connection != connection_id || topology.window(*window_id).is_some()
             });
         if self.last_tmux_bell_source.as_ref().is_some_and(|source| {
             source.connection_id == connection_id && topology.pane(source.pane_id).is_none()

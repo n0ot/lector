@@ -578,16 +578,17 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         let event = key.event();
-        let kitty_press_mode = (!key.is_release()
-            && input.starts_with(b"\x1b[")
-            && input.ends_with(b"u"))
-        .then(|| {
-            self.view_stack
-                .active_mut()
-                .model()
-                .live_screen()
-                .kitty_keyboard_flags()
-        });
+        let (child_kitty_keyboard_flags, application_cursor, application_keypad) = {
+            let screen = self.view_stack.active_mut().model().live_screen();
+            (
+                screen.kitty_keyboard_flags(),
+                screen.application_cursor(),
+                screen.application_keypad(),
+            )
+        };
+        let kitty_press_mode =
+            (!key.is_release() && input.starts_with(b"\x1b[") && input.ends_with(b"u"))
+                .then_some(child_kitty_keyboard_flags);
         if !key.is_release()
             && event.modifiers.is_empty()
             && matches!(event.code, KeyCode::Up | KeyCode::Down)
@@ -601,12 +602,17 @@ impl App {
                 sr.record_forwarded_character(character);
             }
         }
-        self.log_bytes("dispatching decoded key to active view", input);
+        let input = if child_kitty_keyboard_flags == 0 {
+            key.legacy_child_bytes(input, application_cursor, application_keypad)
+        } else {
+            Cow::Borrowed(input)
+        };
+        self.log_bytes("dispatching decoded key to active view", &input);
         self.last_stdin_update = Some(self.clock.now_ms());
         let action = self
             .view_stack
             .active_mut()
-            .handle_key_input(sr, key, input, pty_out)?;
+            .handle_key_input(sr, key, &input, pty_out)?;
         if let Some(mode) = kitty_press_mode {
             let target = match &action {
                 views::ViewAction::PtyInput => Some(ForwardedInputTarget::RootPty),

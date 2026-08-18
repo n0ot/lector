@@ -1,11 +1,18 @@
-# tmux pane bell monitoring
+# tmux pane bell and background activity monitoring
 
 Lector observes BEL as a terminal effect in every pane-output stream delivered
-by each tmux control connection. Monitoring covers every pane in every window
-of that connection's currently attached session, including inactive panes,
-hidden windows, inactive connections, and output received while a Lector
-overlay is open. tmux normally does not deliver pane streams for unattached
-sessions to one control client, so Lector does not claim that broader scope.
+by each tmux control connection. It also rings once when a window produces its
+first output after becoming inactive. Further output from that background
+window stays quiet until the window is visited, which acknowledges and rearms
+the activity notice. This makes a command that finishes after switching to a
+new window noticeable without turning a continuously updating window into a
+bell flood.
+
+Monitoring covers every pane in every window of that connection's currently
+attached session, including inactive panes, hidden windows, inactive
+connections, and output received while a Lector overlay is open. tmux normally
+does not deliver pane streams for unattached sessions to one control client, so
+Lector does not claim that broader scope.
 
 The Lua option `lector.o.tmux_bells` accepts exactly three values:
 
@@ -24,11 +31,12 @@ labels. That state is discarded if its connection or pane disappears, so it
 cannot point at a stale target.
 
 `tests/tmux_bells.rs` covers active and inactive split panes, hidden windows,
+one-shot background activity and rearming after a window visit,
 synthetic output from an unattached session, multiple and inactive
 connections, overlays, synchronized-output spans, a 10,000-BEL flood,
 source-local duplicate coalescing, Lua configuration, stale-source cleanup,
 and scheduler transaction order. The audible render is replayed through a
 second headless Ghostty terminal and produces an oracle failure artifact on a
-mismatch. Its non-ignored real-server harness creates an isolated split tmux
-session, emits BEL from the inactive shell pane, and checks the stable source
+mismatch. Its non-ignored real-server harness creates a second tmux window,
+causes ordinary shell output in the first window, and checks the stable source
 reported by Lector without timing sleeps.

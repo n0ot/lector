@@ -386,7 +386,7 @@ lector.o.suppress_key_echo = false
 -- interrupt speech immediately when terminal focus is lost
 lector.o.stop_speech_on_focus_loss = true
 
--- tmux pane bells: "audible" (default), "spoken", or "off"
+-- tmux pane bells and background-window activity: "audible" (default), "spoken", or "off"
 lector.o.tmux_bells = "spoken"
 ```
 
