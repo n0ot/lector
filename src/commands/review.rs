@@ -341,6 +341,24 @@ mod tests {
     }
 
     #[test]
+    fn previous_line_announces_visible_top_without_entering_scrollback() {
+        let (mut sr, output) = screen_reader();
+        let mut view = View::new(3, 12);
+        view.process_changes(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert_eq!(view.scrollback_len(), 2);
+        assert_eq!(view.line(0), "three");
+
+        top(&mut sr, &mut view).unwrap();
+        output.borrow_mut().clear();
+        line_previous(&mut sr, &mut view, false).unwrap();
+
+        assert_eq!(view.review_cursor_position(), (0, 0));
+        assert_eq!(view.scrollback(), 0);
+        assert_eq!(view.line(0), "three");
+        assert_eq!(output.borrow().as_slice(), ["top", "three"]);
+    }
+
+    #[test]
     fn word_and_character_navigation_cover_edges_and_phonetics() {
         let (mut sr, output) = screen_reader();
         let mut view = View::new(1, 10);

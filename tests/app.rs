@@ -498,6 +498,37 @@ fn legacy_alt_page_keys_are_forwarded_even_when_scrollback_exists() {
 }
 
 #[test]
+fn review_previous_line_stops_at_visible_top_when_scrollback_exists() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let output = (0..30)
+        .map(|line| format!("history-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    app.handle_pty(&mut sr, output.as_bytes(), &mut term_out)
+        .expect("render enough output to create scrollback");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize"));
+
+    app.handle_stdin(&mut sr, b"\x1by", &mut pty_out, &mut term_out)
+        .expect("move review cursor to visible top");
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bu", &mut pty_out, &mut term_out)
+        .expect("try to move above visible top");
+
+    let spoken = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(spoken, ["top", "history-06"]);
+    assert!(pty_out.is_empty());
+}
+
+#[test]
 fn legacy_review_overlay_freezes_output_bells_on_errors_and_restores_the_root() {
     let (mut app, mut sr, _recorder, clock) = make_app();
     let mut pty_out = Vec::new();
@@ -1723,7 +1754,7 @@ fn auto_read_advances_to_a_presented_frame_while_the_parser_is_newer() {
 }
 
 #[test]
-fn lagged_presented_auto_read_uses_live_viewport_and_preserves_scrolled_review_selection() {
+fn lagged_presented_auto_read_uses_live_viewport_and_preserves_review_cursor_row() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig {
         latency_budget_ms: 0,
@@ -1746,26 +1777,25 @@ fn lagged_presented_auto_read_uses_live_viewport_and_preserves_scrolled_review_s
             .expect("finalize the initial frame")
     );
 
-    // Move one row into history and explicitly leave cursor following off.
-    // Presentation-time diffing may temporarily inspect the live viewport,
-    // but it must restore this user-selected historical viewport afterward.
+    // Move to the top of the visible page and explicitly leave cursor
+    // following off. Review commands must not select a historical viewport.
     for _ in 0..24 {
         app.handle_stdin(&mut sr, b"\x1bu", &mut pty_out, &mut term_out)
-            .expect("move the review cursor into scrollback");
+            .expect("move the review cursor to the visible top");
     }
     sr.set_review_follows_screen_cursor(false);
     recorder.inner.borrow_mut().speaks.clear();
     app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
-        .expect("read the selected historical row");
-    let selected_history = recorder
+        .expect("read the selected visible row");
+    let selected_line = recorder
         .inner
         .borrow()
         .speaks
         .last()
-        .expect("selected history was spoken")
+        .expect("selected line was spoken")
         .0
         .clone();
-    assert!(selected_history.starts_with("history-"));
+    assert!(selected_line.starts_with("history-"));
     recorder.inner.borrow_mut().speaks.clear();
 
     app.handle_pty(
@@ -1821,11 +1851,11 @@ fn lagged_presented_auto_read_uses_live_viewport_and_preserves_scrolled_review_s
 
     recorder.inner.borrow_mut().speaks.clear();
     app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
-        .expect("read the preserved historical selection");
+        .expect("read the preserved review cursor row");
     assert_eq!(
         recorder.inner.borrow().speaks.last(),
-        Some(&(selected_history, false)),
-        "presentation-time live inspection changed the review selection"
+        Some(&("physical first".to_owned(), false)),
+        "the review cursor left the visible row or exposed unpresented text"
     );
     assert!(pty_out.is_empty());
 }

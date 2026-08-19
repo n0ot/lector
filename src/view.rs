@@ -1,5 +1,5 @@
 use super::{
-    ext::ScreenExt,
+    ext::{CellExt, ScreenExt},
     presentation::{
         PaneMediaStore, PresentationError, PresentedViewFrame, SurfaceId, ViewId, ViewRevision,
     },
@@ -888,6 +888,7 @@ impl View {
         self.committed_snapshot = live_snapshot;
     }
 
+    #[cfg(test)]
     fn set_accessible_scrollback(&mut self, scrollback: usize) {
         if let AccessibilityReadState::Frozen {
             review_scrollback, ..
@@ -1050,6 +1051,7 @@ impl View {
         self.review_history_position()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_review_history_position(&mut self, position: HistoryPosition) {
         let history_len = self.scrollback_len();
         let last_row = usize::from(self.size().0.saturating_sub(1));
@@ -1284,60 +1286,57 @@ impl View {
         (indent_level, changed)
     }
 
-    /// Moves the review cursor up a line.
+    /// Moves the review cursor up a line within the currently visible viewport.
+    /// Review commands never select a different scrollback viewport; the frozen
+    /// Review overlay owns document-level history navigation.
     /// If skip_blank_lines is true,
     /// the review cursor will move up to the previous non blank line,
     /// or remain in place if this is the first non blank line.
     /// This method will return true only if the cursor moved.
     pub fn review_cursor_up(&mut self, skip_blank_lines: bool) -> bool {
+        if self.review_cursor_position.0 == 0 {
+            return false;
+        }
         if !skip_blank_lines {
-            if self.review_cursor_position.0 > 0 {
-                self.review_cursor_position.0 -= 1;
-                return true;
-            }
-            let history_len = self.scrollback_len();
-            if self.scrollback() >= history_len {
-                return false;
-            }
-            self.set_accessible_scrollback(self.scrollback().saturating_add(1));
+            self.review_cursor_position.0 -= 1;
             return true;
         }
-        let original = self.current_history_position();
-        while self.review_cursor_up(false) {
-            if !self.line(self.review_cursor_position.0).trim().is_empty() {
-                return true;
-            }
-        }
-        self.set_review_history_position(original);
-        false
+
+        let row = self.review_cursor_position.0;
+        let last_col = self.size().1 - 1;
+        self.review_cursor_position.0 = self
+            .screen()
+            .rfind_cell(CellExt::is_in_word, 0, 0, row - 1, last_col)
+            .map_or(row, |(row, _)| row);
+
+        self.review_cursor_position.0 != row
     }
 
-    /// Moves the review cursor down a line.
+    /// Moves the review cursor down a line within the currently visible viewport.
+    /// Review commands never select a different scrollback viewport; the frozen
+    /// Review overlay owns document-level history navigation.
     /// If skip_blank_lines is true,
     /// the review cursor will move down to the next non blank line,
     /// or remain in place if this is the last non blank line.
     /// This method will return true only if the cursor moved.
     pub fn review_cursor_down(&mut self, skip_blank_lines: bool) -> bool {
         let last_row = self.size().0 - 1;
+        if self.review_cursor_position.0 == last_row {
+            return false;
+        }
         if !skip_blank_lines {
-            if self.review_cursor_position.0 < last_row {
-                self.review_cursor_position.0 += 1;
-                return true;
-            }
-            if self.scrollback() == 0 {
-                return false;
-            }
-            self.set_accessible_scrollback(self.scrollback().saturating_sub(1));
+            self.review_cursor_position.0 += 1;
             return true;
         }
-        let original = self.current_history_position();
-        while self.review_cursor_down(false) {
-            if !self.line(self.review_cursor_position.0).trim().is_empty() {
-                return true;
-            }
-        }
-        self.set_review_history_position(original);
-        false
+
+        let row = self.review_cursor_position.0;
+        let last_col = self.size().1 - 1;
+        self.review_cursor_position.0 = self
+            .screen()
+            .find_cell(CellExt::is_in_word, row + 1, 0, last_row, last_col)
+            .map_or(row, |(row, _)| row);
+
+        self.review_cursor_position.0 != row
     }
 
     pub fn osc133_marks(&self) -> &[Osc133Mark] {
@@ -2200,7 +2199,7 @@ mod tests {
 
         assert!(view.holds_synchronized_output());
         assert_eq!(view.line(0), "two");
-        assert!(view.review_cursor_up(false));
+        view.set_accessible_scrollback(1);
         assert_eq!(view.line(0), "one");
         let snapshot = view.snapshot_with_history();
         assert_eq!(snapshot.scrollback[0].contents(), "one");
@@ -2213,13 +2212,13 @@ mod tests {
     }
 
     #[test]
-    fn frozen_scrollback_navigation_invalidates_the_visible_content_cache() {
+    fn selecting_frozen_scrollback_invalidates_the_visible_content_cache() {
         let mut view = View::new(2, 12);
         view.process_changes(b"one\r\ntwo\r\nthree");
         view.process_changes(b"\x1b[?2026h\x1b[2J\x1b[Hpartial");
 
         assert_eq!(view.contents_full(), "two\nthree\n");
-        assert!(view.review_cursor_up(false));
+        view.set_accessible_scrollback(1);
         assert_eq!(view.contents_full(), "one\ntwo\n");
     }
 
@@ -2396,19 +2395,21 @@ mod tests {
     }
 
     #[test]
-    fn line_navigation_crosses_the_live_viewport_into_scrollback() {
+    fn line_navigation_stops_at_visible_viewport_boundaries() {
         let mut view = View::new(3, 12);
         view.process_changes(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
         assert_eq!(view.scrollback_len(), 2);
         assert_eq!(view.line(0), "three");
 
-        assert!(view.review_cursor_up(false));
-        assert_eq!(view.scrollback(), 1);
-        assert_eq!(view.line(0), "two");
-        assert!(view.review_cursor_up(false));
-        assert_eq!(view.scrollback(), 2);
-        assert_eq!(view.line(0), "one");
         assert!(!view.review_cursor_up(false));
+        assert_eq!(view.review_cursor_position(), (0, 0));
+        assert_eq!(view.scrollback(), 0);
+        assert_eq!(view.line(0), "three");
+
+        assert!(!view.review_cursor_up(true));
+        assert_eq!(view.review_cursor_position(), (0, 0));
+        assert_eq!(view.scrollback(), 0);
+        assert_eq!(view.line(0), "three");
     }
 
     #[test]
@@ -2432,8 +2433,7 @@ mod tests {
     fn review_copy_can_span_retained_history_and_the_live_screen() {
         let mut view = View::new(2, 8);
         view.process_changes(b"one\r\ntwo\r\nthree");
-        view.set_review_cursor_position((0, 0));
-        assert!(view.review_cursor_up(false));
+        view.set_review_history_position(HistoryPosition { row: 0, col: 0 });
         view.set_review_mark();
         view.follow_application_cursor();
         view.set_review_cursor_col(4);
