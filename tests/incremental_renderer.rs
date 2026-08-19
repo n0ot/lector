@@ -102,6 +102,25 @@ impl IncrementalSession {
         self.presented = batch.predicted;
         (incremental_bytes, full_bytes)
     }
+
+    fn update_with_operations(&mut self, name: &str, bytes: &[u8]) -> (usize, usize) {
+        let update = self.source.advance(bytes).expect("advance source");
+        let scene = scene_for(&self.source);
+        let damage = SceneDamage::from_terminal_update(&scene.panes[0], &update, scene.geometry);
+        let full_bytes = full_byte_len(&scene, &self.presented);
+        let batch = self
+            .renderer
+            .render(&scene, &damage, &self.presented)
+            .expect("incremental render");
+        let intended = PresentedScene::compose(&scene).expect("compose updated scene");
+        self.oracle
+            .verify(name, &intended, &batch)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let incremental_bytes = byte_len(&batch);
+        self.renderer.confirm(&batch.predicted);
+        self.presented = batch.predicted;
+        (incremental_bytes, full_bytes)
+    }
 }
 
 #[test]
@@ -273,6 +292,32 @@ fn scrolling_and_overlay_damage_match_the_full_redraw_oracle() {
         .verify("incremental-overlay-close", &root_intended, &close_batch)
         .expect("verify overlay close");
     assert!(byte_len(&close_batch) < full_byte_len(&root_scene, &overlay_batch.predicted));
+}
+
+#[test]
+fn scrolling_preserves_wrapped_rows_without_a_full_reconstruction() {
+    let geometry = TerminalGeometry::from_cells(6, 24);
+    let mut session = IncrementalSession::new(
+        geometry,
+        b"header\r\na line long enough to wrap across the viewport\r\nthree\r\nfour\r\nfive",
+    );
+
+    let (scroll_bytes, scroll_full) =
+        session.update_with_operations("wrapped-scrolling-output", b"\r\nsix\r\n");
+
+    assert_eq!(
+        session.renderer.last_strategy(),
+        RenderStrategy::SemanticFastPath
+    );
+    assert!(
+        scroll_bytes * 4 < scroll_full,
+        "wrapped scroll emitted {scroll_bytes} bytes versus {scroll_full} for a full reconstruction"
+    );
+    assert!(
+        session.renderer.last_stats().cells_compared
+            < usize::from(geometry.rows) * usize::from(geometry.cols),
+        "wrapped scroll validation must remain narrower than the full viewport"
+    );
 }
 
 #[test]

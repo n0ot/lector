@@ -157,11 +157,22 @@ impl View {
         if self.presentation_tracking {
             self.freeze_current_accessibility();
         }
-        let old_live_snapshot = self.engine.snapshot().clone();
         let old_review_scrollback = self.review_scrollback;
+        let needs_live_snapshot_copy = !self.presentation_tracking || old_review_scrollback != 0;
+        let old_history_origin = self.engine.snapshot().history_origin;
+        let old_scrollback_extent = self.engine.snapshot().scrollback_extent;
+        let old_live_snapshot = needs_live_snapshot_copy.then(|| self.engine.snapshot().clone());
         let was_synchronized = self.engine.snapshot().modes.synchronized_output;
-        let accessible_scrollback_before = self.scrollback();
-        let review_mark_before = self.review_mark_position();
+        let accessible_scrollback_before = if self.presentation_tracking {
+            0
+        } else {
+            self.scrollback()
+        };
+        let review_mark_before = if self.presentation_tracking {
+            None
+        } else {
+            self.review_mark_position()
+        };
 
         // Output is always interpreted against the live drawing screen. The
         // selected review viewport is restored afterward.
@@ -173,10 +184,12 @@ impl View {
         self.application_transaction_open = synchronized;
         let synchronized_transaction_activity =
             was_synchronized || synchronized || update.synchronized_output_opened;
-        let live_snapshot = self.engine.snapshot().clone();
+        let live_history_origin = self.engine.snapshot().history_origin;
+        let live_scrollback_extent = self.engine.snapshot().scrollback_extent;
+        let live_snapshot = needs_live_snapshot_copy.then(|| self.engine.snapshot().clone());
         let batch_history_changed = update.history_changed
-            || live_snapshot.scrollback_extent != old_live_snapshot.scrollback_extent
-            || live_snapshot.history_origin != old_live_snapshot.history_origin;
+            || live_scrollback_extent != old_scrollback_extent
+            || live_history_origin != old_history_origin;
         if self.presentation_tracking && batch_history_changed {
             self.live_history_revision = self
                 .live_history_revision
@@ -225,8 +238,19 @@ impl View {
         }
         let history_len = self.engine.scrollback_extent();
         self.retained_history_len = history_len;
-        self.review_scrollback =
-            translate_scrollback_offset(old_review_scrollback, &old_live_snapshot, &live_snapshot);
+        self.review_scrollback = if old_review_scrollback == 0 {
+            0
+        } else {
+            translate_scrollback_offset(
+                old_review_scrollback,
+                old_live_snapshot
+                    .as_ref()
+                    .expect("review translation captured the old viewport"),
+                live_snapshot
+                    .as_ref()
+                    .expect("review translation captured the live viewport"),
+            )
+        };
         self.engine
             .select_viewport(Viewport::Scrollback(self.review_scrollback));
 
@@ -312,7 +336,10 @@ impl View {
                 *history_changed |= batch_history_changed;
             }
         } else if !matches!(self.accessibility_read_state, AccessibilityReadState::Live) {
-            self.publish_synchronized_output(live_snapshot, batch_history_changed);
+            self.publish_synchronized_output(
+                live_snapshot.expect("standalone view captured its live snapshot"),
+                batch_history_changed,
+            );
             if let Some(update) = &mut batch_update {
                 // Match the pending-summary contract: once an atomic update
                 // closes, transient writes from inside it are not eligible for
@@ -320,6 +347,7 @@ impl View {
                 update.printed_runs.clear();
             }
         } else {
+            let live_snapshot = live_snapshot.expect("standalone view captured its live snapshot");
             let (review_scrollback, review_cursor_position) = translate_review_selection(
                 old_review_scrollback,
                 self.review_cursor_position,

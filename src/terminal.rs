@@ -882,9 +882,9 @@ impl GhosttyEngine {
             .synchronized_output_open_snapshot
             .take()
             .map(|snapshot| normalize_ghostty_snapshot(&snapshot));
+        self.refresh_snapshot_after_update(&update.damage)?;
         let mut update = normalize_ghostty_update(update);
         update.synchronized_output_opened = synchronized_output_opened;
-        self.refresh_snapshot()?;
         Ok(update)
     }
 
@@ -1086,6 +1086,56 @@ impl GhosttyEngine {
         Ok(())
     }
 
+    fn refresh_snapshot_after_update(
+        &mut self,
+        damage: &GhosttyDamage,
+    ) -> Result<(), lector_ghostty::Error> {
+        if self.viewport != Viewport::Live {
+            return self.refresh_snapshot();
+        }
+        #[cfg(test)]
+        {
+            self.snapshot_refresh_count = self.snapshot_refresh_count.saturating_add(1);
+        }
+
+        let source = self.terminal.snapshot();
+        let (rows, cols) = source.size();
+        let geometry_matches = self.snapshot.geometry.rows == rows
+            && self.snapshot.geometry.cols == cols
+            && self.snapshot.rows.len() == usize::from(rows)
+            && self
+                .snapshot
+                .rows
+                .iter()
+                .all(|row| row.cells.len() == usize::from(cols));
+        let partial_ranges = match damage {
+            GhosttyDamage::None if geometry_matches => Some(&[][..]),
+            GhosttyDamage::Rows(ranges)
+                if geometry_matches
+                    && ranges
+                        .iter()
+                        .all(|range| range.start() <= range.end() && *range.end() < rows) =>
+            {
+                Some(ranges.as_slice())
+            }
+            GhosttyDamage::None | GhosttyDamage::Rows(_) | GhosttyDamage::Full => None,
+        };
+
+        let Some(ranges) = partial_ranges else {
+            self.snapshot = normalize_ghostty_snapshot(source);
+            return Ok(());
+        };
+        for range in ranges {
+            for row in range.clone() {
+                self.snapshot.rows[usize::from(row)] =
+                    normalize_ghostty_row(&source.rows[usize::from(row)]);
+            }
+        }
+        self.snapshot.scrollback.clear();
+        refresh_normalized_ghostty_metadata(&mut self.snapshot, source);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn reset_snapshot_refresh_counts(&mut self) {
         self.snapshot_refresh_count = 0;
@@ -1175,71 +1225,63 @@ impl TerminalEngine for GhosttyEngine {
 }
 
 fn normalize_ghostty_snapshot(snapshot: &GhosttySnapshot) -> TerminalSnapshot {
-    let (rows, cols) = snapshot.size();
-    TerminalSnapshot {
+    let mut normalized = TerminalSnapshot {
         rows: snapshot.rows.iter().map(normalize_ghostty_row).collect(),
         scrollback: snapshot
             .scrollback
             .iter()
             .map(normalize_ghostty_row)
             .collect(),
-        cursor: Cursor {
-            row: snapshot.cursor.row,
-            col: snapshot.cursor.col,
-            visible: snapshot.cursor.visible,
-            shape: match snapshot.cursor.shape {
-                lector_ghostty::CursorShapeSnapshot::Bar => CursorShape::Bar,
-                lector_ghostty::CursorShapeSnapshot::Block => CursorShape::Block,
-                lector_ghostty::CursorShapeSnapshot::Underline => CursorShape::Underline,
-                lector_ghostty::CursorShapeSnapshot::BlockHollow => CursorShape::BlockHollow,
+        ..TerminalSnapshot::default()
+    };
+    refresh_normalized_ghostty_metadata(&mut normalized, snapshot);
+    normalized
+}
+
+fn refresh_normalized_ghostty_metadata(
+    normalized: &mut TerminalSnapshot,
+    snapshot: &GhosttySnapshot,
+) {
+    let (rows, cols) = snapshot.size();
+    normalized.cursor = normalize_ghostty_cursor(snapshot.cursor);
+    normalized.geometry =
+        TerminalGeometry::from_grid_pixels(rows, cols, snapshot.width_px, snapshot.height_px);
+    normalized.screen = ghostty_screen_identity(snapshot.alternate_screen);
+    normalized.modes = TerminalModes {
+        application_keypad: snapshot.modes.application_keypad,
+        application_cursor: snapshot.modes.application_cursor,
+        bracketed_paste: snapshot.modes.bracketed_paste,
+        synchronized_output: snapshot.modes.synchronized_output,
+        focus_reporting: snapshot.modes.focus_reporting,
+        kitty_keyboard_flags: snapshot.modes.kitty_keyboard_flags,
+        mouse_protocol: normalize_ghostty_mouse_protocol(snapshot.modes.mouse_protocol),
+        mouse_encoding: normalize_ghostty_mouse_encoding(snapshot.modes.mouse_encoding),
+    };
+    normalized.title.clone_from(&snapshot.title);
+    normalized
+        .working_directory
+        .clone_from(&snapshot.working_directory);
+    normalized.semantic_marks.clear();
+    normalized
+        .semantic_marks
+        .extend(snapshot.semantic_marks.iter().map(|mark| SemanticMark {
+            kind: match mark.kind {
+                GhosttySemanticKind::PromptStart => SemanticKind::PromptStart,
+                GhosttySemanticKind::InputStart => SemanticKind::InputStart,
+                GhosttySemanticKind::CommandStart => SemanticKind::CommandStart,
+                GhosttySemanticKind::CommandFinished { exit_code } => {
+                    SemanticKind::CommandFinished { exit_code }
+                }
             },
-        },
-        geometry: TerminalGeometry::from_grid_pixels(
-            rows,
-            cols,
-            snapshot.width_px,
-            snapshot.height_px,
-        ),
-        screen: if snapshot.alternate_screen {
-            ScreenIdentity::Alternate
-        } else {
-            ScreenIdentity::Primary
-        },
-        modes: TerminalModes {
-            application_keypad: snapshot.modes.application_keypad,
-            application_cursor: snapshot.modes.application_cursor,
-            bracketed_paste: snapshot.modes.bracketed_paste,
-            synchronized_output: snapshot.modes.synchronized_output,
-            focus_reporting: snapshot.modes.focus_reporting,
-            kitty_keyboard_flags: snapshot.modes.kitty_keyboard_flags,
-            mouse_protocol: normalize_ghostty_mouse_protocol(snapshot.modes.mouse_protocol),
-            mouse_encoding: normalize_ghostty_mouse_encoding(snapshot.modes.mouse_encoding),
-        },
-        title: snapshot.title.clone(),
-        working_directory: snapshot.working_directory.clone(),
-        semantic_marks: snapshot
-            .semantic_marks
-            .iter()
-            .map(|mark| SemanticMark {
-                kind: match mark.kind {
-                    GhosttySemanticKind::PromptStart => SemanticKind::PromptStart,
-                    GhosttySemanticKind::InputStart => SemanticKind::InputStart,
-                    GhosttySemanticKind::CommandStart => SemanticKind::CommandStart,
-                    GhosttySemanticKind::CommandFinished { exit_code } => {
-                        SemanticKind::CommandFinished { exit_code }
-                    }
-                },
-                position: HistoryPosition {
-                    row: mark.row,
-                    col: mark.col,
-                },
-                alternate_screen: mark.alternate_screen,
-            })
-            .collect(),
-        history_origin: snapshot.history_origin,
-        scrollback_extent: snapshot.scrollback_extent,
-        viewport: Viewport::Live,
-    }
+            position: HistoryPosition {
+                row: mark.row,
+                col: mark.col,
+            },
+            alternate_screen: mark.alternate_screen,
+        }));
+    normalized.history_origin = snapshot.history_origin;
+    normalized.scrollback_extent = snapshot.scrollback_extent;
+    normalized.viewport = Viewport::Live;
 }
 
 fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {

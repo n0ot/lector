@@ -45,6 +45,22 @@ no-op, and `Scrollback(0)` never materializes retained history. A lossy tmux
 pause marks the affected pane stale; visibility resumes it and obtains an
 authoritative capture instead of pretending the missing bytes were buffered.
 
+Ghostty's render damage also bounds snapshot work. An ordinary partial update
+re-reads and normalizes only rows Ghostty marked dirty, moving unchanged owned
+rows forward without copying their cells, graphemes, styles, or hyperlinks.
+Lector applies the same row ranges to its normalized live snapshot and avoids
+pre/post full-screen copies for presentation-tracked views at the live
+viewport. Full damage, geometry changes, selected scrollback, screen
+transitions, and inconsistent damage metadata retain the authoritative
+full-reconstruction fallback.
+
+The incremental renderer keeps ordinary viewport scrolling structural even
+when visible rows contain soft wraps or one parser batch interleaves a write
+between two scrolls, as line-oriented programs commonly do. It scrolls the
+physical region, explicitly clears wrap metadata on newly introduced rows,
+then validates and repairs the complete affected region against Ghostty's
+authoritative final scene. Any mismatch still falls back to a full render.
+
 ## Synchronized-output consistency
 
 Each terminal view maintains a live Ghostty model and a physically presented

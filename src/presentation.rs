@@ -2069,9 +2069,13 @@ fn apply_scene_operation(
                 return false;
             }
             let count = usize::from(*count).min(bottom.saturating_sub(top));
-            if count == 0 || working.rows[top..bottom].iter().any(|row| row.wrapped) {
+            if count == 0
+                || (matches!(operation, SceneOperation::DeleteLines { .. })
+                    && working.rows[top..bottom].iter().any(|row| row.wrapped))
+            {
                 return false;
             }
+            shift_repair_rows(repairs, top, bottom, count, true);
             write_vertical_region(bytes, top, bottom);
             if matches!(operation, SceneOperation::DeleteLines { .. }) {
                 write_absolute_cursor(bytes, top, 0);
@@ -2080,6 +2084,15 @@ fn apply_scene_operation(
                 bytes.extend_from_slice(format!("\x1b[{}S", count).as_bytes());
             }
             reset_vertical_region(bytes);
+            if matches!(operation, SceneOperation::ScrollUp { .. }) {
+                // Some terminals leave a soft-wrap marker on rows introduced
+                // by SU. Clear those new rows explicitly before repairing
+                // their cells; rows moved by the scroll retain their markers.
+                for row in bottom - count..bottom {
+                    write_absolute_cursor(bytes, row, 0);
+                    bytes.extend_from_slice(b"\x1b[2K");
+                }
+            }
             working.rows[top..bottom].rotate_left(count);
             for row in &mut working.rows[bottom - count..bottom] {
                 *row = blank_row(geometry.cols);
@@ -2100,9 +2113,13 @@ fn apply_scene_operation(
                 return false;
             }
             let count = usize::from(*count).min(bottom.saturating_sub(top));
-            if count == 0 || working.rows[top..bottom].iter().any(|row| row.wrapped) {
+            if count == 0
+                || (matches!(operation, SceneOperation::InsertLines { .. })
+                    && working.rows[top..bottom].iter().any(|row| row.wrapped))
+            {
                 return false;
             }
+            shift_repair_rows(repairs, top, bottom, count, false);
             write_vertical_region(bytes, top, bottom);
             if matches!(operation, SceneOperation::InsertLines { .. }) {
                 write_absolute_cursor(bytes, top, 0);
@@ -2111,6 +2128,13 @@ fn apply_scene_operation(
                 bytes.extend_from_slice(format!("\x1b[{}T", count).as_bytes());
             }
             reset_vertical_region(bytes);
+            if matches!(operation, SceneOperation::ScrollDown { .. }) {
+                // Match the SU path above for rows introduced by SD.
+                for row in top..top + count {
+                    write_absolute_cursor(bytes, row, 0);
+                    bytes.extend_from_slice(b"\x1b[2K");
+                }
+            }
             working.rows[top..bottom].rotate_right(count);
             for row in &mut working.rows[top..top + count] {
                 *row = blank_row(geometry.cols);
@@ -2180,13 +2204,29 @@ fn apply_scene_operation(
             true
         }
         SceneOperation::WriteRun { origin, text } => {
-            if !text.is_ascii() || origin.row < 0 || origin.col < 0 {
+            if !text
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+                || origin.row < 0
+                || origin.col < 0
+            {
                 return false;
             }
             let cols = text.chars().count().try_into().unwrap_or(u16::MAX);
             let region = GridRect::new(*origin, 1, cols);
-            if exact_region(region, geometry).is_none() {
+            let Some((top, _bottom, left, right)) = exact_region(region, geometry) else {
                 return false;
+            };
+            write_absolute_cursor(bytes, top, left);
+            bytes.extend_from_slice(text.as_bytes());
+            for (cell, character) in working.rows[top].cells[left..right]
+                .iter_mut()
+                .zip(text.chars())
+            {
+                *cell = Cell {
+                    grapheme: character.to_string(),
+                    ..Cell::default()
+                };
             }
             repairs.push(region);
             true
@@ -2209,6 +2249,39 @@ fn exact_region(
         left,
         left.saturating_add(usize::from(region.cols)),
     ))
+}
+
+fn shift_repair_rows(
+    repairs: &mut Vec<GridRect>,
+    top: usize,
+    bottom: usize,
+    count: usize,
+    upward: bool,
+) {
+    let pending = std::mem::take(repairs);
+    for repair in pending {
+        for offset in 0..repair.rows {
+            let row = repair.origin.row.saturating_add(i32::from(offset));
+            let Ok(row_index) = usize::try_from(row) else {
+                continue;
+            };
+            let shifted = if row_index < top || row_index >= bottom {
+                Some(row_index)
+            } else if upward {
+                (row_index >= top.saturating_add(count)).then(|| row_index - count)
+            } else {
+                (row_index < bottom.saturating_sub(count)).then(|| row_index + count)
+            };
+            let Some(row_index) = shifted else {
+                continue;
+            };
+            repairs.push(GridRect::new(
+                GridPoint::new(row_index.try_into().unwrap_or(i32::MAX), repair.origin.col),
+                1,
+                repair.cols,
+            ));
+        }
+    }
 }
 
 fn blank_row(cols: u16) -> Row {

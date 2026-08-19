@@ -1874,6 +1874,8 @@ pub struct Terminal {
     /// request the expensive bounded-history copy only at an actual opener.
     history_changed_since_open_checkpoint: bool,
     semantic_marks: Vec<TrackedSemanticMark>,
+    #[cfg(test)]
+    snapshot_row_reads: usize,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
@@ -1945,6 +1947,8 @@ impl Terminal {
             primary_history_anchor: None,
             history_changed_since_open_checkpoint: false,
             semantic_marks: Vec::new(),
+            #[cfg(test)]
+            snapshot_row_reads: 0,
             _thread_bound: PhantomData,
         };
         result.refresh_snapshot()?;
@@ -1952,12 +1956,15 @@ impl Terminal {
     }
 
     pub fn advance(&mut self, bytes: &[u8]) -> Result<UpdateSnapshot, Error> {
-        let before = self.snapshot.clone();
-        self.stream_observer.begin_update(&before);
+        let cursor_before = self.snapshot.cursor;
+        let alternate_screen_before = self.snapshot.alternate_screen;
+        let scrollback_extent_before = self.snapshot.scrollback_extent;
+        let history_origin_before = self.snapshot.history_origin;
+        self.stream_observer.begin_update(&self.snapshot);
         let mut render_damage = RenderDamageSnapshot::None;
         let mut synchronized_output_open_snapshot = None;
-        let mut history_extent_at_latest_checkpoint = before.scrollback_extent;
-        let mut history_origin_at_latest_checkpoint = before.history_origin;
+        let mut history_extent_at_latest_checkpoint = scrollback_extent_before;
+        let mut history_origin_at_latest_checkpoint = history_origin_before;
         let mut history_changed_before_latest_checkpoint = false;
         let new_semantic_start = self.semantic_marks.len();
         let mut segment_start = 0;
@@ -1972,7 +1979,7 @@ impl Terminal {
             self.answer_clipboard_queries();
             self.answer_default_color_queries();
             render_damage.merge(self.refresh_snapshot()?);
-            self.anchor_semantic_events(before.scrollback_extent)?;
+            self.anchor_semantic_events(scrollback_extent_before)?;
             let synchronization_boundary = self.stream_observer.take_synchronized_output_boundary();
             if synchronization_boundary == Some(true)
                 && !synchronized_before
@@ -2050,9 +2057,9 @@ impl Terminal {
             history_changed: stream.history_changed,
             damage: render_damage,
             changed_rows,
-            cursor_before: before.cursor,
+            cursor_before,
             cursor_after: self.snapshot.cursor,
-            alternate_screen_before: before.alternate_screen,
+            alternate_screen_before,
             alternate_screen_after: self.snapshot.alternate_screen,
             synchronized_output: self.snapshot.modes.synchronized_output,
             synchronized_output_open_snapshot,
@@ -2227,6 +2234,8 @@ impl Terminal {
             // OSC 133 grid references are deliberately not part of this
             // diagnostic path yet. Runtime correctness never restores here.
             semantic_marks: Vec::new(),
+            #[cfg(test)]
+            snapshot_row_reads: 0,
             _thread_bound: PhantomData,
         };
         result.refresh_snapshot()?;
@@ -2575,7 +2584,15 @@ impl Terminal {
             return Err(Error::InvalidValue);
         }
 
+        let mut can_reuse_rows = global_dirty != ffi::RENDER_STATE_DIRTY_FULL
+            && self.snapshot.rows.len() == usize::from(rows)
+            && self
+                .snapshot
+                .rows
+                .iter()
+                .all(|row| row.cells.len() == usize::from(cols));
         let mut normalized_rows = Vec::with_capacity(usize::from(rows));
+        let mut replacement_rows = Vec::new();
         let mut dirty_ranges = Vec::new();
         for row in 0..rows {
             // SAFETY: the iterator was populated from the current render
@@ -2583,10 +2600,18 @@ impl Terminal {
             if !unsafe { ffi::ghostty_render_state_row_iterator_next(self.row_iterator.as_ptr()) } {
                 return Err(Error::NoValue);
             }
-            if row_iterator_query::<bool>(&self.row_iterator, ffi::RENDER_STATE_ROW_DATA_DIRTY)? {
+            let dirty =
+                row_iterator_query::<bool>(&self.row_iterator, ffi::RENDER_STATE_ROW_DATA_DIRTY)?;
+            if dirty {
                 append_dirty_row(&mut dirty_ranges, row);
             }
-            normalized_rows.push(self.read_row(row, cols)?);
+            if can_reuse_rows {
+                if dirty {
+                    replacement_rows.push((usize::from(row), self.read_row(row, cols)?));
+                }
+            } else {
+                normalized_rows.push(self.read_row(row, cols)?);
+            }
             let clean = false;
             // SAFETY: the iterator is positioned on the current live row and
             // the option's documented value type is `bool`.
@@ -2603,6 +2628,42 @@ impl Terminal {
         // SAFETY: same iterator validity as above.
         if unsafe { ffi::ghostty_render_state_row_iterator_next(self.row_iterator.as_ptr()) } {
             return Err(Error::InvalidValue);
+        }
+        if global_dirty == ffi::RENDER_STATE_DIRTY_PARTIAL && dirty_ranges.is_empty() {
+            // A partial frame without row flags violates Ghostty's two-layer
+            // contract. Re-read the full viewport so the safe full-damage
+            // interpretation below also has an authoritative snapshot.
+            let mut iterator = self.row_iterator.as_ptr();
+            render_query_into(
+                &self.render_state,
+                ffi::RENDER_STATE_DATA_ROW_ITERATOR,
+                &mut iterator,
+            )?;
+            if iterator != self.row_iterator.as_ptr() {
+                return Err(Error::InvalidValue);
+            }
+            can_reuse_rows = false;
+            normalized_rows.clear();
+            for row in 0..rows {
+                // SAFETY: the iterator was reset from the current render
+                // state and remains valid until its next state update.
+                if !unsafe {
+                    ffi::ghostty_render_state_row_iterator_next(self.row_iterator.as_ptr())
+                } {
+                    return Err(Error::NoValue);
+                }
+                normalized_rows.push(self.read_row(row, cols)?);
+            }
+            // SAFETY: same iterator validity as above.
+            if unsafe { ffi::ghostty_render_state_row_iterator_next(self.row_iterator.as_ptr()) } {
+                return Err(Error::InvalidValue);
+            }
+        }
+        if can_reuse_rows {
+            normalized_rows = std::mem::take(&mut self.snapshot.rows);
+            for (row, replacement) in replacement_rows {
+                normalized_rows[row] = replacement;
+            }
         }
         let clean = ffi::RENDER_STATE_DIRTY_FALSE;
         // SAFETY: the render state is live and the option's documented value
@@ -2683,6 +2744,10 @@ impl Terminal {
     }
 
     fn read_row(&mut self, row: u16, cols: u16) -> Result<RowSnapshot, Error> {
+        #[cfg(test)]
+        {
+            self.snapshot_row_reads = self.snapshot_row_reads.saturating_add(1);
+        }
         let raw_row =
             row_iterator_query::<ffi::Row>(&self.row_iterator, ffi::RENDER_STATE_ROW_DATA_RAW)?;
         let wrapped = row_query::<bool>(raw_row, ffi::ROW_DATA_WRAP)?;
@@ -3490,3 +3555,25 @@ static FAILING_VTABLE: ffi::AllocatorVtable = ffi::AllocatorVtable {
     remap: fail_remap,
     free: no_op_free,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::{RenderDamageSnapshot, Terminal};
+
+    #[test]
+    fn partial_snapshot_refresh_reads_only_ghostty_dirty_rows() {
+        let mut terminal = Terminal::new(24, 80).expect("create terminal");
+        terminal.snapshot_row_reads = 0;
+
+        let update = terminal
+            .advance(b"one line")
+            .expect("advance one dirty row");
+
+        assert_eq!(update.damage, RenderDamageSnapshot::Rows(vec![0..=0]));
+        assert_eq!(
+            terminal.snapshot_row_reads, 1,
+            "an ordinary one-line update must not re-read the other 23 rows"
+        );
+        assert_eq!(terminal.snapshot().rows[0].text(), "one line");
+    }
+}
