@@ -419,12 +419,13 @@ fn audible_bells_follow_complete_visible_transactions_and_hidden_panes_use_the_s
 }
 
 #[test]
-fn background_window_activity_bells_once_until_the_window_is_visited() {
-    let (mut app, mut sr, _recorder, clock, mut physical) = make_app(true);
+fn ordinary_background_window_activity_is_silent() {
+    let (mut app, mut sr, recorder, clock, mut physical) = make_app(true);
     let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
     sr.set_tmux_bell_mode(TmuxBellMode::Audible);
     app.drain_scheduled_output(&mut physical, true).unwrap();
     physical.clear();
+    recorder.clear();
 
     feed(
         &mut app,
@@ -440,48 +441,32 @@ fn background_window_activity_bells_once_until_the_window_is_visited() {
         &mut app,
         &mut sr,
         &mut router,
-        &pane_output(20, "prompt-returned"),
+        &pane_output(20, "ordinary-background-output"),
         &mut physical,
     );
     clock.advance_ms(10);
-    app.drain_scheduled_output(&mut physical, false).unwrap();
-    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 1);
-
-    physical.clear();
-    clock.advance_ms(500);
-    feed(
-        &mut app,
-        &mut sr,
-        &mut router,
-        &pane_output(20, "more-background-output"),
-        &mut physical,
-    );
     app.drain_scheduled_output(&mut physical, true).unwrap();
     assert_eq!(
         physical.iter().filter(|byte| **byte == b'\x07').count(),
         0,
-        "one background activity episode became a bell flood"
+        "ordinary output in a background window became a bell"
     );
+    assert!(recorder.messages().is_empty());
 
-    feed(
-        &mut app,
-        &mut sr,
-        &mut router,
-        b"%session-window-changed $1 @10\n%session-window-changed $1 @11\n",
-        &mut physical,
-    );
-    app.drain_scheduled_output(&mut physical, true).unwrap();
+    sr.set_tmux_bell_mode(TmuxBellMode::Spoken);
     physical.clear();
+    recorder.clear();
     clock.advance_ms(500);
     feed(
         &mut app,
         &mut sr,
         &mut router,
-        &pane_output(20, "next-background-episode"),
+        &pane_output(20, "more-ordinary-background-output"),
         &mut physical,
     );
     app.drain_scheduled_output(&mut physical, true).unwrap();
-    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 1);
+    assert!(physical.is_empty());
+    assert!(recorder.messages().is_empty());
 }
 
 #[test]
@@ -680,7 +665,7 @@ fn pane_id_at_index(topology: &str, wanted_index: u64) -> Option<u64> {
 }
 
 #[test]
-fn real_tmux_background_window_activity_reaches_the_spoken_monitor() {
+fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()
@@ -794,14 +779,39 @@ fn real_tmux_background_window_activity_reaches_the_spoken_monitor() {
         &receiver,
         writer.as_mut(),
         &mut physical,
+        |app| {
+            app.debug_tmux_pane_contents(1, background_pane)
+                .is_some_and(|contents| contents.contains("BACKGROUND_DONE"))
+        },
+    );
+    assert!(
+        recorder.messages().is_empty(),
+        "ordinary background activity was announced: {:?}",
+        recorder.messages()
+    );
+    assert!(app.last_tmux_bell_source().is_none());
+
+    writer
+        .write_all(
+            format!("send-keys -t %{background_pane} \"printf '\\\\007'\" Enter\n").as_bytes(),
+        )
+        .unwrap();
+    writer.flush().unwrap();
+    drive_real_tmux(
+        "background pane bell",
+        &mut app,
+        &mut sr,
+        &receiver,
+        writer.as_mut(),
+        &mut physical,
         |_| !recorder.messages().is_empty(),
     );
-    let source = app.last_tmux_bell_source().expect("real activity source");
+    let source = app.last_tmux_bell_source().expect("real pane bell source");
     assert_eq!(source.connection_id, 1);
     assert_eq!(source.pane_id, PaneId(background_pane));
     assert_eq!(source.session_name, session);
     assert!(
-        recorder.messages()[0].starts_with("activity in tmux connection"),
+        recorder.messages()[0].starts_with("bell in tmux connection"),
         "speech={:?}",
         recorder.messages()
     );

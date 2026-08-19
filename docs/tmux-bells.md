@@ -1,12 +1,11 @@
-# tmux pane bell and background activity monitoring
+# tmux pane bell monitoring
 
 Lector observes BEL as a terminal effect in every pane-output stream delivered
-by each tmux control connection. It also alerts once when a window produces its
-first output after becoming inactive. Further output and literal BEL bytes from
-that background window stay quiet until the window is visited, which
-acknowledges and rearms the alert. This makes a command that finishes after
-switching to a new window noticeable without turning a continuously updating
-window or a repeatedly ringing program into a bell flood.
+by each tmux control connection. Ordinary output from a background window is
+silent. A background window's first literal BEL is reported; further BEL bytes
+from that window stay quiet until the window is visited, which acknowledges and
+rearms the alert. This keeps a repeatedly ringing program from becoming a bell
+flood without conflating tmux activity monitoring with pane bells.
 
 Monitoring covers every pane in every window of that connection's currently
 attached session, including inactive panes, hidden windows, inactive
@@ -35,7 +34,7 @@ connection, session, window, and pane IDs and labels. That state is discarded
 if its connection or pane disappears, so it cannot point at a stale target.
 
 `tests/tmux_bells.rs` covers active and inactive split panes, hidden windows,
-one-shot background activity, repeated BEL suppression, audible index speech,
+silent background activity, repeated BEL suppression, audible index speech,
 and rearming after a window visit,
 synthetic output from an unattached session, multiple and inactive
 connections, overlays, synchronized-output spans, a 10,000-BEL flood,

@@ -110,21 +110,6 @@ pub struct TmuxBellSource {
     pub pane_title: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TmuxBellReason {
-    PaneBell,
-    BackgroundActivity,
-}
-
-impl TmuxBellReason {
-    fn spoken_label(self) -> &'static str {
-        match self {
-            Self::PaneBell => "bell",
-            Self::BackgroundActivity => "activity",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TmuxFlowStatus {
     #[default]
@@ -344,7 +329,7 @@ pub struct App {
     pending_force_abandon: Option<PendingForceAbandon>,
     last_tmux_bell_source: Option<TmuxBellSource>,
     recent_tmux_bells: BTreeMap<(u64, crate::tmux_model::PaneId), u128>,
-    tmux_background_activity_windows: BTreeSet<(u64, crate::tmux_model::WindowId)>,
+    tmux_background_bell_windows: BTreeSet<(u64, crate::tmux_model::WindowId)>,
     pending_tmux_background_output: BTreeMap<(u64, crate::tmux_model::PaneId), VecDeque<u8>>,
     pending_tmux_background_order: VecDeque<(u64, crate::tmux_model::PaneId)>,
     pending_tmux_background_bytes: usize,
@@ -622,7 +607,7 @@ impl App {
             pending_force_abandon: None,
             last_tmux_bell_source: None,
             recent_tmux_bells: BTreeMap::new(),
-            tmux_background_activity_windows: BTreeSet::new(),
+            tmux_background_bell_windows: BTreeSet::new(),
             pending_tmux_background_output: BTreeMap::new(),
             pending_tmux_background_order: VecDeque::new(),
             pending_tmux_background_bytes: 0,
@@ -739,11 +724,7 @@ impl App {
         })
     }
 
-    fn tmux_bell_concise_announcement(
-        &self,
-        source: &TmuxBellSource,
-        reason: TmuxBellReason,
-    ) -> Option<String> {
+    fn tmux_bell_concise_announcement(&self, source: &TmuxBellSource) -> Option<String> {
         let topology = &self
             .tmux_connections
             .iter()
@@ -761,13 +742,9 @@ impl App {
             .filter(|candidate| candidate.window_id == source.window_id)
             .count();
         Some(if pane_count > 1 {
-            format!(
-                "{} in pane {window_index}.{}",
-                reason.spoken_label(),
-                pane.index
-            )
+            format!("bell in pane {window_index}.{}", pane.index)
         } else {
-            format!("{} in window {window_index}", reason.spoken_label())
+            format!("bell in window {window_index}")
         })
     }
 
@@ -777,7 +754,6 @@ impl App {
         connection_id: u64,
         pane_id: crate::tmux_model::PaneId,
         pane_is_visible: bool,
-        reason: TmuxBellReason,
         term_out: &mut dyn Write,
     ) -> Result<usize> {
         let mode = sr.tmux_bell_mode();
@@ -804,7 +780,7 @@ impl App {
             .is_some_and(|session| session.active_window != Some(source.window_id));
         if window_is_background
             && !self
-                .tmux_background_activity_windows
+                .tmux_background_bell_windows
                 .insert((connection_id, source.window_id))
         {
             return Ok(0);
@@ -816,8 +792,7 @@ impl App {
             TmuxBellMode::Spoken => {
                 sr.speak(
                     &format!(
-                        "{} in tmux connection {} {}, session {} {}, window {} {}, pane {} {}",
-                        reason.spoken_label(),
+                        "bell in tmux connection {} {}, session {} {}, window {} {}, pane {} {}",
                         source.connection_id,
                         source.connection_label,
                         source.session_id.0,
@@ -833,7 +808,7 @@ impl App {
             }
             TmuxBellMode::Audible => {
                 if window_is_background
-                    && let Some(announcement) = self.tmux_bell_concise_announcement(&source, reason)
+                    && let Some(announcement) = self.tmux_bell_concise_announcement(&source)
                 {
                     sr.speak(&announcement, false)?;
                 }

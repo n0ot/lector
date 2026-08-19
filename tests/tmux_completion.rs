@@ -688,23 +688,11 @@ fn scheduled_active_tmux_pane_finalization_wakes_once_without_spinning() {
     .expect("model hidden-pane output");
     assert_eq!(
         app.scheduled_output_timeout(),
-        Some(Duration::from_millis(4)),
-        "first background-window activity must schedule its audible notice"
-    );
-    assert!(
-        !app.wants_tick(),
-        "a future background-activity bell must not busy-spin"
-    );
-    clock.advance(4);
-    app.drain_scheduled_output(&mut physical, false)
-        .expect("present the background-window activity bell");
-    assert_eq!(physical.last(), Some(&b'\x07'));
-    assert_eq!(
-        app.scheduled_output_timeout(),
         None,
-        "the activity bell must not arm an accessibility polling loop"
+        "ordinary background-window activity must remain silent"
     );
-    assert!(!app.wants_tick(), "activity bell left a spin source armed");
+    assert!(!app.wants_tick());
+    assert!(!physical.contains(&b'\x07'));
 }
 
 #[test]
