@@ -200,8 +200,10 @@ state, not Ghostty's complete application-facing protocol contract. Lector
 derives a separate physical profile from conservative defaults, outer
 terminfo, bounded startup probes, and explicit overrides. DA1 is the final
 physical query, and probe replies are consumed through its processing fence
-before input parsing. Clipboard writes enter Lector's local clipboard
-history; desktop notifications and unknown APC effects are dropped; title,
+before input parsing. Application-originated OSC 52 writes enter Lector's
+internal clipboard history regardless of its configured default register or
+system-clipboard provider; they never reach the host or outer-terminal
+clipboard. Desktop notifications and unknown APC effects are dropped; title,
 working directory, progress, hyperlink, and bell state remain modeled. This
 separation keeps application promises independent of the outer terminal's
 identity and capabilities.

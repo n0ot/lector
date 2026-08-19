@@ -1,5 +1,5 @@
 use super::{
-    clipboard::Clipboard,
+    clipboard::{Clipboard, ClipboardRegister, SystemClipboard, SystemClipboardProvider},
     keymap::{InputMode, KeyBindings},
     speech::{self, Speech},
     table::Session as TableSession,
@@ -76,6 +76,8 @@ pub enum Error {
     InvalidLuaHookContext,
     #[error("on_live_read must return a string or nil")]
     InvalidLiveReadResult,
+    #[error("clipboard: {0}")]
+    Clipboard(String),
 }
 
 impl Error {
@@ -91,6 +93,7 @@ pub struct ScreenReader {
     pending_key_echo: VecDeque<char>,
     cursor_tracking_mode: CursorTrackingMode,
     clipboard: Clipboard,
+    system_clipboard: SystemClipboard,
     pass_through: bool,
     key_bindings: KeyBindings,
     table_session: TableSession,
@@ -120,6 +123,7 @@ impl ScreenReader {
             pending_key_echo: VecDeque::new(),
             cursor_tracking_mode: CursorTrackingMode::On,
             clipboard: Default::default(),
+            system_clipboard: Default::default(),
             pass_through: false,
             key_bindings: KeyBindings::new(),
             table_session: TableSession::default(),
@@ -230,6 +234,81 @@ impl ScreenReader {
     pub fn push_clipboard(&mut self, text: String) -> Result<()> {
         self.clipboard.put(text);
         self.hook_on_clipboard_change("push", self.clipboard.get())
+    }
+
+    pub(crate) fn read_clipboard(&mut self, register: ClipboardRegister) -> Result<Option<String>> {
+        match register {
+            ClipboardRegister::Internal => Ok(self.clipboard.get().map(str::to_owned)),
+            ClipboardRegister::System => self
+                .system_clipboard
+                .read(self.options.system_clipboard_provider())
+                .map_err(|error| Error::Clipboard(error.to_string())),
+        }
+    }
+
+    pub(crate) fn write_clipboard(
+        &mut self,
+        register: ClipboardRegister,
+        text: String,
+    ) -> Result<()> {
+        match register {
+            ClipboardRegister::Internal => self.push_clipboard(text),
+            ClipboardRegister::System => self
+                .system_clipboard
+                .write(self.options.system_clipboard_provider(), text)
+                .map_err(|error| Error::Clipboard(error.to_string())),
+        }
+    }
+
+    pub(crate) fn clear_clipboard(&mut self, register: ClipboardRegister) -> Result<()> {
+        match register {
+            ClipboardRegister::Internal => {
+                self.clipboard.clear();
+                self.hook_on_clipboard_change("clear", None)
+            }
+            ClipboardRegister::System => self
+                .system_clipboard
+                .clear(self.options.system_clipboard_provider())
+                .map_err(|error| Error::Clipboard(error.to_string())),
+        }
+    }
+
+    pub(crate) fn internal_clipboard_entries(&self) -> Vec<String> {
+        self.clipboard.entries()
+    }
+
+    pub(crate) fn internal_clipboard_index(&self) -> Option<usize> {
+        self.clipboard.selected_index()
+    }
+
+    pub(crate) fn select_internal_clipboard(&mut self, index: usize) -> Result<()> {
+        if !self.clipboard.select_index(index) {
+            return Err(Error::Clipboard(format!(
+                "internal clipboard index must be between 1 and {}",
+                self.clipboard.size()
+            )));
+        }
+        self.hook_on_clipboard_change("select", self.clipboard.get())
+    }
+
+    pub(crate) fn take_terminal_clipboard_writes(&mut self) -> Vec<Vec<u8>> {
+        self.system_clipboard.take_terminal_writes()
+    }
+
+    pub(crate) fn clipboard_default_register(&self) -> ClipboardRegister {
+        self.options.clipboard_default_register()
+    }
+
+    pub(crate) fn set_clipboard_default_register(&mut self, value: ClipboardRegister) {
+        self.options.set_clipboard_default_register(value);
+    }
+
+    pub(crate) fn system_clipboard_provider(&self) -> SystemClipboardProvider {
+        self.options.system_clipboard_provider()
+    }
+
+    pub(crate) fn set_system_clipboard_provider(&mut self, value: SystemClipboardProvider) {
+        self.options.set_system_clipboard_provider(value);
     }
 
     pub(crate) fn previous_clipboard(&mut self) -> Result<ClipboardMove> {

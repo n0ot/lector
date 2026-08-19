@@ -72,7 +72,13 @@ refresh-client -C 120x40
 
 Pane engines change size only after tmux supplies authoritative layout and
 pane geometry. The size update still reaches the control client while a Lector
-review overlay or portal is visible.
+Review overlay or portal is visible. An open Review layer separately retains
+its frozen document and creates a viewport for the new geometry. It preserves
+the cursor's screen row and column where possible, fills newly available space
+with surrounding content at document boundaries, pans horizontally when
+needed, and immediately uses the new height for page motions. Closing Review
+therefore reveals a tmux view that has already adopted tmux's authoritative
+post-resize layout.
 
 At connection startup Lector requests `pause-after=1`. tmux discards pane
 output while a control client is paused, so `%pause %N` also marks Lector's

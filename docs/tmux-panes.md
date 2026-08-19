@@ -16,6 +16,12 @@ attributes, line flags, and all available tmux history. Alternate screens use
 visibility, named cursor shape, alternate-screen state, tmux-mode state, and
 reported history size.
 
+Native tmux copy mode is the exception: Lector predictively leaves it with a
+targeted `copy-mode -q` and opens its own Review overlay for the active pane.
+Discovered `copy-mode` prefix bindings are intercepted before tmux enters the
+mode. This makes Review navigation, resizing, speech, and clipboard registers
+behave consistently in control mode.
+
 Captures are queued with the attached active pane first, followed by its other
 visible split panes and then hidden windows or unattached sessions. The
 connection becomes interactive as soon as every pane in the visible layout is

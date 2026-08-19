@@ -1,4 +1,5 @@
 use super::TmuxBellMode;
+use crate::clipboard::{ClipboardRegister, SystemClipboardProvider};
 
 pub(super) struct Options {
     help_mode: bool,
@@ -9,6 +10,8 @@ pub(super) struct Options {
     table_header_auto: bool,
     stop_speech_on_focus_loss: bool,
     tmux_bell_mode: TmuxBellMode,
+    clipboard_default_register: ClipboardRegister,
+    system_clipboard_provider: SystemClipboardProvider,
 }
 
 impl Default for Options {
@@ -22,6 +25,8 @@ impl Default for Options {
             table_header_auto: true,
             stop_speech_on_focus_loss: true,
             tmux_bell_mode: TmuxBellMode::Audible,
+            clipboard_default_register: ClipboardRegister::Internal,
+            system_clipboard_provider: SystemClipboardProvider::Native,
         }
     }
 }
@@ -111,11 +116,28 @@ impl Options {
     pub(super) fn set_tmux_bell_mode(&mut self, value: TmuxBellMode) {
         self.tmux_bell_mode = value;
     }
+
+    pub(super) fn clipboard_default_register(&self) -> ClipboardRegister {
+        self.clipboard_default_register
+    }
+
+    pub(super) fn set_clipboard_default_register(&mut self, value: ClipboardRegister) {
+        self.clipboard_default_register = value;
+    }
+
+    pub(super) fn system_clipboard_provider(&self) -> SystemClipboardProvider {
+        self.system_clipboard_provider
+    }
+
+    pub(super) fn set_system_clipboard_provider(&mut self, value: SystemClipboardProvider) {
+        self.system_clipboard_provider = value;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Options, TmuxBellMode};
+    use crate::clipboard::{ClipboardRegister, SystemClipboardProvider};
 
     #[test]
     fn defaults_match_the_user_facing_configuration() {
@@ -128,6 +150,14 @@ mod tests {
         assert!(options.table_header_auto());
         assert!(options.stop_speech_on_focus_loss());
         assert_eq!(options.tmux_bell_mode(), TmuxBellMode::Audible);
+        assert_eq!(
+            options.clipboard_default_register(),
+            ClipboardRegister::Internal
+        );
+        assert_eq!(
+            options.system_clipboard_provider(),
+            SystemClipboardProvider::Native
+        );
     }
 
     #[test]

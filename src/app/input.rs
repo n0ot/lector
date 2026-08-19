@@ -16,7 +16,8 @@ impl App {
             input.to_vec()
         };
         self.refresh_probed_profile();
-        self.handle_filtered_terminal_input(sr, &input, pty_out, term_out)
+        self.handle_filtered_terminal_input(sr, &input, pty_out, term_out)?;
+        self.flush_pending_clipboard_writes(sr, term_out)
     }
 
     /// Dispatches bytes whose physical-terminal ownership has already been
@@ -377,17 +378,7 @@ impl App {
                 Binding::Builtin(action) => {
                     let action = *action;
                     if matches!(action, commands::Action::OpenReview) {
-                        if self.view_stack.active_mut().kind() == views::ViewKind::Review {
-                            sr.speak("Review already open", false)?;
-                        } else {
-                            let review =
-                                views::ReviewView::new(self.presented_accessibility_model_mut());
-                            self.handle_view_action(
-                                sr,
-                                views::ViewAction::Push(Box::new(review)),
-                                term_out,
-                            )?;
-                        }
+                        self.open_review(sr, false, term_out)?;
                         self.consumed_key_presses.insert(key_id);
                         return Ok(());
                     }

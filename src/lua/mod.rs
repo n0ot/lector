@@ -142,9 +142,13 @@ mod tests {
             r#"
                 assert(lector.o.suppress_key_echo == false)
                 assert(lector.o.tmux_bells == "audible")
+                assert(lector.o.clipboard.default_register == '"')
+                assert(lector.o.clipboard.system_provider == "native")
                 lector.o.auto_read = false
                 lector.o.suppress_key_echo = true
                 lector.o.tmux_bells = "spoken"
+                lector.o.clipboard.default_register = "+"
+                lector.o.clipboard.system_provider = "osc52"
                 lector.o.symbol_level = "all"
                 lector.symbols = { ["?"] = {"query", "all", "never", false} }
                 lector.bindings["M-z"] = "lector.stop_speaking"
@@ -166,6 +170,19 @@ mod tests {
                 lector.hooks.on_key_unhandled = function(key, mode)
                     return key == "q" and mode == "table"
                 end
+                lector.clipboard.internal.text = "older"
+                lector.clipboard.internal.text = "newer"
+                assert(lector.clipboard.internal.text == "newer")
+                local entries = lector.clipboard.internal.entries
+                assert(#entries == 2 and entries[1] == "newer" and entries[2] == "older")
+                assert(lector.clipboard.internal.index == 1)
+                lector.clipboard.internal.index = 2
+                assert(lector.clipboard.internal.text == "older")
+                lector.clipboard.system.text = "remote"
+                local readable = pcall(function() return lector.clipboard.system.text end)
+                assert(readable == false)
+                lector.clipboard.system.text = nil
+                lector.o.auto_read = false
             "#,
         )
         .unwrap();
@@ -175,6 +192,16 @@ mod tests {
             assert!(!sr.auto_read_enabled());
             assert!(sr.suppress_key_echo());
             assert_eq!(sr.tmux_bell_mode().to_string(), "spoken");
+            assert_eq!(sr.clipboard_default_register().to_string(), "+");
+            assert_eq!(sr.system_clipboard_provider().to_string(), "osc52");
+            assert_eq!(sr.clipboard_text(), Some("older"));
+            assert_eq!(
+                sr.take_terminal_clipboard_writes(),
+                [
+                    b"\x1b]52;c;cmVtb3Rl\x1b\\".to_vec(),
+                    b"\x1b]52;c;\x1b\\".to_vec(),
+                ]
+            );
             assert!(sr.speech().symbol_level() == Level::All);
             assert!(matches!(
                 sr.key_bindings().binding_for_mode(InputMode::Normal, "M-z"),

@@ -1209,6 +1209,7 @@ fn do_events(
     let mut events = mio::Events::with_capacity(1024);
     app.configure_physical_terminal(focus_was_enabled);
     app.activate_physical_terminal(&mut stdout)?;
+    app.flush_pending_clipboard_writes(sr, &mut stdout)?;
     let mut termination_signal = None;
 
     let event_result = (|| -> Result<()> {

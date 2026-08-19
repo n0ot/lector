@@ -1148,6 +1148,22 @@ impl App {
         term_out.flush().with_context(|| context)
     }
 
+    pub fn flush_pending_clipboard_writes(
+        &mut self,
+        sr: &mut ScreenReader,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        for bytes in sr.take_terminal_clipboard_writes() {
+            self.emit_physical_bytes(
+                term_out,
+                ScheduledOutputClass::Control,
+                &bytes,
+                "write OSC 52 system clipboard",
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn emit_physical_bells(
         &mut self,
         term_out: &mut dyn Write,

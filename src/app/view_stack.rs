@@ -14,6 +14,24 @@ struct RenderSynchronization {
 }
 
 impl App {
+    pub(super) fn open_review(
+        &mut self,
+        sr: &mut ScreenReader,
+        page_up: bool,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        if self.view_stack.active_mut().kind() == views::ViewKind::Review {
+            sr.speak("Review already open", false)?;
+            return Ok(());
+        }
+        let review = if page_up {
+            views::ReviewView::new_page_up(self.presented_accessibility_model_mut())
+        } else {
+            views::ReviewView::new(self.presented_accessibility_model_mut())
+        };
+        self.handle_view_action(sr, views::ViewAction::Push(Box::new(review)), term_out)
+    }
+
     pub(super) fn sync_table_setup_layer(
         &mut self,
         mode_before: crate::keymap::InputMode,

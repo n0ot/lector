@@ -63,16 +63,88 @@ local tbl_lector_bindings_mt = {
 }
 local tbl_lector_bindings = setmetatable({}, tbl_lector_bindings_mt)
 
+local function clipboard_namespace(name, internal)
+    local namespace = {}
+    return setmetatable(namespace, {
+        __index = function(_, k)
+            if k == 'text' then
+                return callbacks.get_clipboard_text(name)
+            elseif internal and k == 'entries' then
+                return callbacks.get_clipboard_entries()
+            elseif internal and k == 'index' then
+                return callbacks.get_clipboard_index()
+            end
+            error("unknown " .. name .. " clipboard property: " .. tostring(k), 2)
+        end,
+        __newindex = function(_, k, v)
+            if k == 'text' then
+                if v == nil then
+                    callbacks.clear_clipboard(name)
+                elseif type(v) == 'string' then
+                    callbacks.set_clipboard_text(name, v)
+                else
+                    error("clipboard text must be a string or nil", 2)
+                end
+                return
+            elseif internal and k == 'index' then
+                if type(v) ~= 'number' or v % 1 ~= 0 then
+                    error("internal clipboard index must be an integer", 2)
+                end
+                callbacks.set_clipboard_index(v)
+                return
+            end
+            error("cannot assign " .. name .. " clipboard property: " .. tostring(k), 2)
+        end,
+    })
+end
+
+local tbl_lector_clipboard_internal = clipboard_namespace('internal', true)
+local tbl_lector_clipboard_system = clipboard_namespace('system', false)
+local tbl_lector_clipboard = setmetatable({}, {
+    __index = function(_, k)
+        if k == 'internal' then
+            return tbl_lector_clipboard_internal
+        elseif k == 'system' then
+            return tbl_lector_clipboard_system
+        end
+        error("unknown clipboard namespace: " .. tostring(k), 2)
+    end,
+    __newindex = function(_, k, _)
+        error("assign clipboard text via lector.clipboard." .. tostring(k) .. ".text", 2)
+    end,
+})
+
+local tbl_lector_o_clipboard = setmetatable({}, {
+    __index = function(_, k)
+        if k ~= 'default_register' and k ~= 'system_provider' then
+            error("unknown clipboard option: " .. tostring(k), 2)
+        end
+        return callbacks.get_option('clipboard.' .. k)
+    end,
+    __newindex = function(_, k, v)
+        if k ~= 'default_register' and k ~= 'system_provider' then
+            error("unknown clipboard option: " .. tostring(k), 2)
+        end
+        callbacks.set_option('clipboard.' .. k, v)
+    end,
+})
+
 local tbl_lector_o_mt = {
     __index = function(_, k)
         if type(k) ~= "string" then
             error("option name must be a string for indexing", 2)
+        end
+        if k == 'clipboard' then
+            return tbl_lector_o_clipboard
         end
         return callbacks.get_option(k)
     end,
     __newindex = function(_, k, v)
         if type(k) ~= "string" then
             error("option name must be a string for assignment", 2)
+        end
+        if k == 'clipboard' then
+            error("assign individual clipboard options via lector.o.clipboard[name] = value", 2)
         end
         callbacks.set_option(k, v)
     end,
@@ -112,6 +184,8 @@ local tbl_lector_mt = {
             return tbl_lector_bindings
         elseif k == 'hooks' then
             return tbl_lector_hooks
+        elseif k == 'clipboard' then
+            return tbl_lector_clipboard
         else
             return rawget(t, k)
         end
@@ -144,6 +218,8 @@ local tbl_lector_mt = {
             error("assign individual bindings via lector.bindings[key] = value", 2)
         elseif k == "hooks" then
             error("assign individual hooks via lector.hooks[name] = value", 2)
+        elseif k == "clipboard" then
+            error("assign clipboard contents through the internal or system namespace", 2)
         else
             error("cannot assign to arbitrary keys on the lector table", 2)
         end

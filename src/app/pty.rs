@@ -183,7 +183,7 @@ impl App {
                 self.handle_tmux_gateway_event(sr, event, term_out)?;
             }
         }
-        Ok(())
+        self.flush_pending_clipboard_writes(sr, term_out)
     }
 
     /// Resolves any active control connection when the root PTY transport
@@ -198,7 +198,7 @@ impl App {
         for event in events {
             self.handle_tmux_gateway_event(sr, event, term_out)?;
         }
-        Ok(())
+        self.flush_pending_clipboard_writes(sr, term_out)
     }
 
     /// Applies one already-routed control event from any independent transport.
@@ -713,6 +713,8 @@ impl App {
         let location_changed;
         let mut destroyed_gateway_panes = Vec::new();
         let mut destroyed_gateway_windows = Vec::new();
+        let mut native_copy_mode_panes = Vec::new();
+        let mut open_review_for_native_copy_mode = false;
         {
             let Some(connection) = self
                 .tmux_connections
@@ -775,6 +777,22 @@ impl App {
                                     }
                                 } else {
                                     connection.key_table_override = None;
+                                    let active_pane = connection.topology.attached_active_pane();
+                                    native_copy_mode_panes.extend(
+                                        connection
+                                            .topology
+                                            .panes()
+                                            .values()
+                                            .filter(|pane| pane.mode == "copy-mode")
+                                            .map(|pane| pane.id),
+                                    );
+                                    open_review_for_native_copy_mode = connection_is_presented
+                                        && active_pane.is_some_and(|active| {
+                                            native_copy_mode_panes.contains(&active)
+                                        });
+                                    for pane_id in &native_copy_mode_panes {
+                                        connection.topology.clear_native_copy_mode(*pane_id);
+                                    }
                                     destroyed_gateway_panes.extend(
                                         previous_panes.into_iter().filter(|pane_id| {
                                             connection.topology.pane(*pane_id).is_none()
@@ -1166,6 +1184,14 @@ impl App {
         if request_resync {
             self.queue_tmux_inventory(connection_id);
         }
+        for pane_id in native_copy_mode_panes {
+            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+                connection_id,
+                bytes: format!("copy-mode -q -t %{}\n", pane_id.0).into_bytes(),
+                expected_replies: vec![ExpectedTmuxReply::Ignored],
+                kind: PendingTmuxCommandKind::Ordinary,
+            });
+        }
         if let Some(metadata) = pane_resync_probe {
             let pane_id = metadata.pane_id;
             let resume_before_capture = self
@@ -1254,6 +1280,16 @@ impl App {
             &destroyed_gateway_windows,
         )?;
         let chooser_updated = sync_topology && self.sync_tmux_panes(connection_id)?;
+        let tmux_review_source_ready = self
+            .view_stack
+            .active_tmux_connection_mut()
+            .is_some_and(|view| view.connection_id() == connection_id && view.is_ready());
+        if open_review_for_native_copy_mode
+            && tmux_review_source_ready
+            && !self.view_stack.has_overlay()
+        {
+            self.open_review(sr, false, term_out)?;
+        }
         if let Some((pane_id, status, output)) = bootstrap_reply {
             self.discard_deferred_tmux_pane_output((connection_id, pane_id));
             if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
@@ -2631,7 +2667,7 @@ impl App {
             }
         }
         self.tmux_hidden_output_bytes_this_turn = 0;
-        Ok(())
+        self.flush_pending_clipboard_writes(sr, term_out)
     }
 
     fn expire_tmux_force_abandon(

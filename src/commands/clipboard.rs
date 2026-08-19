@@ -2,6 +2,7 @@ use super::{CommandResult, Result};
 #[cfg(test)]
 use crate::ext::ScreenExt;
 use crate::{
+    clipboard::ClipboardRegister,
     screen_reader::{ClipboardMove, ScreenReader},
     view::View,
 };
@@ -22,8 +23,12 @@ pub(super) fn copy(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResu
         return Ok(CommandResult::Handled);
     };
 
-    sr.push_clipboard(contents)?;
-    sr.speak("copied", false)?;
+    let register = sr.clipboard_default_register();
+    if let Err(error) = sr.write_clipboard(register, contents) {
+        sr.speak(&error.to_string(), false)?;
+    } else {
+        sr.speak("copied", false)?;
+    }
     Ok(CommandResult::Handled)
 }
 
@@ -70,10 +75,26 @@ fn copy_selection(
 }
 
 pub(super) fn paste(sr: &mut ScreenReader) -> Result<CommandResult> {
-    match sr.clipboard_text() {
-        Some(contents) => Ok(CommandResult::Paste(contents.to_owned())),
-        None => {
+    paste_from(sr, sr.clipboard_default_register())
+}
+
+pub(super) fn paste_internal(sr: &mut ScreenReader) -> Result<CommandResult> {
+    paste_from(sr, ClipboardRegister::Internal)
+}
+
+pub(super) fn paste_system(sr: &mut ScreenReader) -> Result<CommandResult> {
+    paste_from(sr, ClipboardRegister::System)
+}
+
+fn paste_from(sr: &mut ScreenReader, register: ClipboardRegister) -> Result<CommandResult> {
+    match sr.read_clipboard(register) {
+        Ok(Some(contents)) => Ok(CommandResult::Paste(contents)),
+        Ok(None) => {
             sr.speak("no clipboard", false)?;
+            Ok(CommandResult::Handled)
+        }
+        Err(error) => {
+            sr.speak(&error.to_string(), false)?;
             Ok(CommandResult::Handled)
         }
     }
@@ -102,7 +123,25 @@ pub(super) fn next(sr: &mut ScreenReader) -> Result<CommandResult> {
 }
 
 pub(super) fn say(sr: &mut ScreenReader) -> Result<CommandResult> {
-    let contents = sr.clipboard_text().map(str::to_owned);
+    say_from(sr, sr.clipboard_default_register())
+}
+
+pub(super) fn say_internal(sr: &mut ScreenReader) -> Result<CommandResult> {
+    say_from(sr, ClipboardRegister::Internal)
+}
+
+pub(super) fn say_system(sr: &mut ScreenReader) -> Result<CommandResult> {
+    say_from(sr, ClipboardRegister::System)
+}
+
+fn say_from(sr: &mut ScreenReader, register: ClipboardRegister) -> Result<CommandResult> {
+    let contents = match sr.read_clipboard(register) {
+        Ok(contents) => contents,
+        Err(error) => {
+            sr.speak(&error.to_string(), false)?;
+            return Ok(CommandResult::Handled);
+        }
+    };
     sr.speak(contents.as_deref().unwrap_or("no clipboard"), false)?;
     Ok(CommandResult::Handled)
 }

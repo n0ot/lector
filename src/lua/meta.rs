@@ -1,5 +1,10 @@
 use super::ext::LuaResultExt;
-use crate::{keymap::KeyBindings, screen_reader::ScreenReader, speech::symbols};
+use crate::{
+    clipboard::{ClipboardRegister, SystemClipboardProvider},
+    keymap::KeyBindings,
+    screen_reader::ScreenReader,
+    speech::symbols,
+};
 use anyhow::{Context as AnyhowContext, anyhow};
 use mlua::{Error, Function, IntoLua, Lua, Result, Table, Value};
 use std::{cell::RefCell, rc::Rc};
@@ -14,7 +19,13 @@ macro_rules! add_callbacks_common {
         get_symbol = $get_symbol:expr,
         clear_symbols = $clear_symbols:expr,
         set_hook = $set_hook:expr,
-        get_hook = $get_hook:expr $(,)?
+        get_hook = $get_hook:expr,
+        get_clipboard_text = $get_clipboard_text:expr,
+        set_clipboard_text = $set_clipboard_text:expr,
+        clear_clipboard = $clear_clipboard:expr,
+        get_clipboard_entries = $get_clipboard_entries:expr,
+        get_clipboard_index = $get_clipboard_index:expr,
+        set_clipboard_index = $set_clipboard_index:expr $(,)?
     ) => {{
         $tbl.set("set_option", $set_option)?;
         $tbl.set("get_option", $get_option)?;
@@ -25,6 +36,12 @@ macro_rules! add_callbacks_common {
         $tbl.set("clear_symbols", $clear_symbols)?;
         $tbl.set("set_hook", $set_hook)?;
         $tbl.set("get_hook", $get_hook)?;
+        $tbl.set("get_clipboard_text", $get_clipboard_text)?;
+        $tbl.set("set_clipboard_text", $set_clipboard_text)?;
+        $tbl.set("clear_clipboard", $clear_clipboard)?;
+        $tbl.set("get_clipboard_entries", $get_clipboard_entries)?;
+        $tbl.set("get_clipboard_index", $get_clipboard_index)?;
+        $tbl.set("set_clipboard_index", $set_clipboard_index)?;
         Ok(())
     }};
 }
@@ -150,6 +167,55 @@ fn add_callbacks_static(
             })
         }
     })?;
+    let get_clipboard_text = lua.create_function_mut({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, name: String| {
+            with_screen_reader_mut(&sr_ptr, |sr| {
+                let register = clipboard_register(&name).map_err(Error::external)?;
+                sr.read_clipboard(register)
+                    .map_err(Error::external)?
+                    .into_lua(lua)
+            })
+        }
+    })?;
+    let set_clipboard_text = lua.create_function_mut({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |_, (name, text): (String, String)| {
+            with_screen_reader_mut(&sr_ptr, |sr| {
+                let register = clipboard_register(&name).map_err(Error::external)?;
+                sr.write_clipboard(register, text).map_err(Error::external)
+            })
+        }
+    })?;
+    let clear_clipboard = lua.create_function_mut({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |_, name: String| {
+            with_screen_reader_mut(&sr_ptr, |sr| {
+                let register = clipboard_register(&name).map_err(Error::external)?;
+                sr.clear_clipboard(register).map_err(Error::external)
+            })
+        }
+    })?;
+    let get_clipboard_entries = lua.create_function({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, ()| {
+            with_screen_reader(&sr_ptr, |sr| {
+                lua.create_sequence_from(sr.internal_clipboard_entries())
+            })
+        }
+    })?;
+    let get_clipboard_index = lua.create_function({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, ()| with_screen_reader(&sr_ptr, |sr| sr.internal_clipboard_index().into_lua(lua))
+    })?;
+    let set_clipboard_index = lua.create_function_mut({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |_, index: usize| {
+            with_screen_reader_mut(&sr_ptr, |sr| {
+                sr.select_internal_clipboard(index).map_err(Error::external)
+            })
+        }
+    })?;
 
     add_callbacks_common!(
         tbl_callbacks,
@@ -162,7 +228,21 @@ fn add_callbacks_static(
         clear_symbols = clear_symbols,
         set_hook = set_hook,
         get_hook = get_hook,
+        get_clipboard_text = get_clipboard_text,
+        set_clipboard_text = set_clipboard_text,
+        clear_clipboard = clear_clipboard,
+        get_clipboard_entries = get_clipboard_entries,
+        get_clipboard_index = get_clipboard_index,
+        set_clipboard_index = set_clipboard_index,
     )
+}
+
+fn clipboard_register(name: &str) -> anyhow::Result<ClipboardRegister> {
+    match name {
+        "internal" => Ok(ClipboardRegister::Internal),
+        "system" => Ok(ClipboardRegister::System),
+        _ => Err(anyhow!("clipboard namespace must be internal or system")),
+    }
 }
 
 fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua::Value> {
@@ -178,6 +258,8 @@ fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua
         "highlight_tracking" => sr.highlight_tracking_enabled().into_lua(lua),
         "stop_speech_on_focus_loss" => sr.stop_speech_on_focus_loss().into_lua(lua),
         "tmux_bells" => sr.tmux_bell_mode().to_string().into_lua(lua),
+        "clipboard.default_register" => sr.clipboard_default_register().to_string().into_lua(lua),
+        "clipboard.system_provider" => sr.system_clipboard_provider().to_string().into_lua(lua),
         _ => Err(Error::external(anyhow!("unknown option"))),
     }
     .map_err(|e| anyhow!("{}", e))
@@ -308,6 +390,28 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
                     .map_err(|e| anyhow!(e.to_string()))?
                     .parse::<crate::screen_reader::TmuxBellMode>()?;
                 sr.set_tmux_bell_mode(mode);
+                Ok(())
+            }
+            _ => Err(anyhow!("value must be a string")),
+        },
+        "clipboard.default_register" => match value {
+            String(v) => {
+                let register = v
+                    .to_str()
+                    .map_err(|e| anyhow!(e.to_string()))?
+                    .parse::<ClipboardRegister>()?;
+                sr.set_clipboard_default_register(register);
+                Ok(())
+            }
+            _ => Err(anyhow!("value must be a string")),
+        },
+        "clipboard.system_provider" => match value {
+            String(v) => {
+                let provider = v
+                    .to_str()
+                    .map_err(|e| anyhow!(e.to_string()))?
+                    .parse::<SystemClipboardProvider>()?;
+                sr.set_system_clipboard_provider(provider);
                 Ok(())
             }
             _ => Err(anyhow!("value must be a string")),

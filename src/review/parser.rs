@@ -1,4 +1,5 @@
 use super::document::{SearchDirection, WordMove, WordStyle};
+use crate::clipboard::ClipboardRegister;
 
 const MAX_COUNT: usize = 10_000;
 
@@ -67,13 +68,13 @@ pub(crate) enum Command {
         line: Option<usize>,
         first_nonblank: bool,
     },
-    YankMotion(Motion, usize),
-    YankLine(usize),
-    YankTextObject(TextObject, usize),
+    YankMotion(Motion, usize, Option<ClipboardRegister>),
+    YankLine(usize, Option<ClipboardRegister>),
+    YankTextObject(TextObject, usize, Option<ClipboardRegister>),
     StartVisual(VisualKind),
     CancelVisual,
     MoveVisual(Motion, usize),
-    YankVisual,
+    YankVisual(Option<ClipboardRegister>),
     StartSearch(SearchDirection),
     RepeatSearch {
         reverse: bool,
@@ -114,6 +115,7 @@ enum OperatorState {
     None,
     Yank {
         count: usize,
+        register: Option<ClipboardRegister>,
         prefix: Prefix,
         motion_count: Option<usize>,
         text_object_around: Option<bool>,
@@ -125,6 +127,8 @@ pub(crate) struct Parser {
     prefix: Prefix,
     operator: OperatorState,
     visual: Option<VisualKind>,
+    register: Option<ClipboardRegister>,
+    awaiting_register: bool,
 }
 
 impl Default for Parser {
@@ -134,6 +138,8 @@ impl Default for Parser {
             prefix: Prefix::None,
             operator: OperatorState::None,
             visual: None,
+            register: None,
+            awaiting_register: false,
         }
     }
 }
@@ -142,6 +148,9 @@ impl Parser {
     pub(crate) fn feed(&mut self, key: Key) -> Command {
         if key == Key::Escape {
             return self.escape();
+        }
+        if self.awaiting_register {
+            return self.feed_register(key);
         }
         if !matches!(self.operator, OperatorState::None) {
             return self.feed_operator(key);
@@ -163,6 +172,8 @@ impl Parser {
         if self.count.is_some()
             || self.prefix != Prefix::None
             || !matches!(self.operator, OperatorState::None)
+            || self.register.is_some()
+            || self.awaiting_register
         {
             self.reset_pending();
             return Command::None;
@@ -180,10 +191,15 @@ impl Parser {
 
         match key {
             Key::Char('q') => self.finish(Command::Exit),
+            Key::Char('"') => {
+                self.awaiting_register = true;
+                Command::None
+            }
             Key::Char('y') => {
                 let count = self.take_count();
                 self.operator = OperatorState::Yank {
                     count,
+                    register: self.register.take(),
                     prefix: Prefix::None,
                     motion_count: None,
                     text_object_around: None,
@@ -264,7 +280,11 @@ impl Parser {
         match key {
             Key::Char('y') => {
                 self.visual = None;
-                self.finish(Command::YankVisual)
+                self.finish(Command::YankVisual(self.register))
+            }
+            Key::Char('"') => {
+                self.awaiting_register = true;
+                Command::None
             }
             Key::Char('v') | Key::Char('V') => {
                 self.visual = None;
@@ -348,6 +368,7 @@ impl Parser {
     fn feed_operator(&mut self, key: Key) -> Command {
         let OperatorState::Yank {
             count,
+            register,
             mut prefix,
             mut motion_count,
             mut text_object_around,
@@ -369,6 +390,7 @@ impl Parser {
             );
             self.operator = OperatorState::Yank {
                 count,
+                register,
                 prefix,
                 motion_count,
                 text_object_around,
@@ -390,6 +412,7 @@ impl Parser {
             return self.finish(Command::YankTextObject(
                 TextObject::Word { style, around },
                 count,
+                register,
             ));
         }
 
@@ -410,18 +433,19 @@ impl Parser {
                 return Command::Bell;
             };
             let count = multiply_counts(count, motion_count.unwrap_or(1));
-            return self.finish(Command::YankMotion(motion, count));
+            return self.finish(Command::YankMotion(motion, count, register));
         }
 
         match key {
             Key::Char('y') => {
                 let count = multiply_counts(count, motion_count.unwrap_or(1));
-                self.finish(Command::YankLine(count))
+                self.finish(Command::YankLine(count, register))
             }
             Key::Char('i') => {
                 text_object_around = Some(false);
                 self.operator = OperatorState::Yank {
                     count,
+                    register,
                     prefix,
                     motion_count,
                     text_object_around,
@@ -432,6 +456,7 @@ impl Parser {
                 text_object_around = Some(true);
                 self.operator = OperatorState::Yank {
                     count,
+                    register,
                     prefix,
                     motion_count,
                     text_object_around,
@@ -442,6 +467,7 @@ impl Parser {
                 prefix = Prefix::G;
                 self.operator = OperatorState::Yank {
                     count,
+                    register,
                     prefix,
                     motion_count,
                     text_object_around,
@@ -452,6 +478,7 @@ impl Parser {
                 prefix = Prefix::Bracket { forward: false };
                 self.operator = OperatorState::Yank {
                     count,
+                    register,
                     prefix,
                     motion_count,
                     text_object_around,
@@ -462,6 +489,7 @@ impl Parser {
                 prefix = Prefix::Bracket { forward: true };
                 self.operator = OperatorState::Yank {
                     count,
+                    register,
                     prefix,
                     motion_count,
                     text_object_around,
@@ -478,6 +506,7 @@ impl Parser {
                 prefix = Prefix::Find { direction, till };
                 self.operator = OperatorState::Yank {
                     count,
+                    register,
                     prefix,
                     motion_count,
                     text_object_around,
@@ -490,9 +519,22 @@ impl Parser {
                     return Command::Bell;
                 };
                 let count = multiply_counts(count, motion_count.unwrap_or(1));
-                self.finish(Command::YankMotion(motion, count))
+                self.finish(Command::YankMotion(motion, count, register))
             }
         }
+    }
+
+    fn feed_register(&mut self, key: Key) -> Command {
+        self.awaiting_register = false;
+        self.register = match key {
+            Key::Char('"') => Some(ClipboardRegister::Internal),
+            Key::Char('+') => Some(ClipboardRegister::System),
+            _ => {
+                self.reset_pending();
+                return Command::Bell;
+            }
+        };
+        Command::None
     }
 
     fn start_find(&mut self, direction: FindDirection, till: bool) -> Command {
@@ -524,6 +566,8 @@ impl Parser {
         self.count = None;
         self.prefix = Prefix::None;
         self.operator = OperatorState::None;
+        self.register = None;
+        self.awaiting_register = false;
         command
     }
 
@@ -531,6 +575,8 @@ impl Parser {
         self.count = None;
         self.prefix = Prefix::None;
         self.operator = OperatorState::None;
+        self.register = None;
+        self.awaiting_register = false;
     }
 }
 
@@ -566,6 +612,7 @@ mod tests {
     use super::{
         Command, FindDirection, Key, Motion, Parser, TextObject, ViewportPlacement, VisualKind,
     };
+    use crate::clipboard::ClipboardRegister;
     use crate::review::document::{SearchDirection, WordMove, WordStyle};
 
     fn feed(parser: &mut Parser, keys: &[Key]) -> Vec<Command> {
@@ -662,7 +709,11 @@ mod tests {
                 Command::None,
                 Command::None,
                 Command::None,
-                Command::YankMotion(Motion::Word(WordMove::ForwardStart, WordStyle::Word), 6)
+                Command::YankMotion(
+                    Motion::Word(WordMove::ForwardStart, WordStyle::Word),
+                    6,
+                    None
+                )
             ]
         );
         assert_eq!(
@@ -678,13 +729,14 @@ mod tests {
                         style: WordStyle::Word,
                         around: false
                     },
-                    1
+                    1,
+                    None
                 )
             ]
         );
         assert_eq!(
             feed(&mut parser, &[Key::Char('y'), Key::Char('y')]),
-            vec![Command::None, Command::YankLine(1)]
+            vec![Command::None, Command::YankLine(1, None)]
         );
     }
 
@@ -699,12 +751,54 @@ mod tests {
             parser.feed(Key::Char('w')),
             Command::MoveVisual(Motion::Word(WordMove::ForwardStart, WordStyle::Word), 1)
         );
-        assert_eq!(parser.feed(Key::Char('y')), Command::YankVisual);
+        assert_eq!(parser.feed(Key::Char('y')), Command::YankVisual(None));
         assert_eq!(
             parser.feed(Key::Char('V')),
             Command::StartVisual(VisualKind::Line)
         );
         assert_eq!(parser.feed(Key::Escape), Command::CancelVisual);
+    }
+
+    #[test]
+    fn parses_internal_and_system_register_prefixes() {
+        let mut parser = Parser::default();
+        assert_eq!(
+            feed(
+                &mut parser,
+                &[
+                    Key::Char('"'),
+                    Key::Char('+'),
+                    Key::Char('y'),
+                    Key::Char('i'),
+                    Key::Char('w')
+                ]
+            ),
+            vec![
+                Command::None,
+                Command::None,
+                Command::None,
+                Command::None,
+                Command::YankTextObject(
+                    TextObject::Word {
+                        style: WordStyle::Word,
+                        around: false,
+                    },
+                    1,
+                    Some(ClipboardRegister::System)
+                )
+            ]
+        );
+
+        assert_eq!(
+            parser.feed(Key::Char('v')),
+            Command::StartVisual(VisualKind::Character)
+        );
+        assert_eq!(parser.feed(Key::Char('"')), Command::None);
+        assert_eq!(parser.feed(Key::Char('"')), Command::None);
+        assert_eq!(
+            parser.feed(Key::Char('y')),
+            Command::YankVisual(Some(ClipboardRegister::Internal))
+        );
     }
 
     #[test]

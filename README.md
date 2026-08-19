@@ -147,10 +147,14 @@ the application.
 
 The virtual terminal implements 256 colors, true color, OSC 8 hyperlinks, and
 the ordinary `xterm-256color` contract, so an inherited `COLORTERM` remains
-valid. Clipboard reads return an empty local reply by default, clipboard writes
-go to Lector's clipboard history, and desktop notifications and unknown APC
-effects are dropped. Titles, working directories, progress, hyperlinks, and
-bells remain modeled Lector state. In the live scheduler, title,
+valid. Application-originated OSC 52 clipboard reads return an empty local
+reply by default, while application-originated writes always enter Lector's
+internal clipboard history. This terminal-effect policy is independent of
+`lector.o.clipboard.default_register` and
+`lector.o.clipboard.system_provider`; it never writes the host or
+outer-terminal clipboard. Desktop notifications and unknown APC effects are
+dropped. Titles, working directories, progress, hyperlinks, and bells remain
+modeled Lector state. In the live scheduler, title,
 working-directory, progress, clipboard, and notification events remain typed
 until the scheduler applies their explicit output policy; sensitive clipboard
 and notification payloads are never replayed as raw terminal bytes.
@@ -285,7 +289,10 @@ Review has its own dependency-free vi command parser:
   searches wrap at the ends.
 - `y` supports motions and counts, `yy` yanks lines, `yiw`/`yaw` (and the `W`
   variants) yank text objects, and `v`/`V` start character/line selections.
-  Yanked text is placed in Lector's clipboard history and is ready for `F7`.
+  Yanked text is placed in the configured default register and is ready for
+  `F7`. Prefix a yank with `""` for Lector's internal history or `"+` for the
+  system clipboard; for example, `"+yiw` copies the inner word to the system
+  clipboard.
 
 Invalid chords, unavailable prompt/search/find targets, unmatched `%` braces,
 and motions past a boundary ring the terminal bell. Ordinary Lector review
@@ -297,6 +304,13 @@ xterm Meta encoding used by non-Kitty terminals and Kitty keyboard events.
 `M-PageUp`/`M-PageDown` and `M-Up`/`M-Down` pass through to the running
 application.
 
+Resizing keeps the captured Review document frozen but creates a new viewport
+for the new terminal geometry. Lector keeps the cursor at the same screen row
+and column when possible. At the top, bottom, or horizontal content boundary,
+it shifts the viewport to show additional surrounding content instead; a
+narrower viewport pans without changing the cursor's logical position. Page
+motions use the new height immediately.
+
 When a shell emits the OSC 133 `B` input-boundary marker, ordinary unmodified
 Up/Down history navigation speaks the recalled editable input without the
 primary prompt. Readline does not emit a fresh marker for every history item;
@@ -306,9 +320,17 @@ marker. Without OSC 133 integration, speech uses cursor/diff behavior.
 ### Copy/paste and clipboard history
 
 - Set a mark with `F5`, move the review cursor, then copy with `F6`.
-- Paste the current clipboard entry with `F7`.
-- Speak the current clipboard with `M-c`.
+- Paste the configured default clipboard register with `F7`.
+- Speak the configured default clipboard register with `M-c`.
 - Cycle clipboard history with `M-[` (previous) and `M-]` (next).
+
+The default register is `"`, Lector's ten-entry internal history. The `+`
+register is the system clipboard. Native system clipboard access works on
+macOS, Windows, Wayland, and X11 hosts supported by `arboard`. The optional
+`osc52` provider writes through the outer terminal instead, which is useful
+when Lector is running remotely; OSC 52 cannot read the terminal's clipboard,
+so system-register paste and read operations report that the provider is
+write-only.
 
 ## Table navigation
 
@@ -388,7 +410,36 @@ lector.o.stop_speech_on_focus_loss = true
 
 -- tmux pane bells and background-window activity: "audible" (default), "spoken", or "off"
 lector.o.tmux_bells = "spoken"
+
+-- `"` uses Lector's history; `+` uses the system clipboard
+lector.o.clipboard.default_register = '"'
+
+-- "native" (default) uses arboard; "osc52" writes through the outer terminal
+lector.o.clipboard.system_provider = "native"
 ```
+
+### Clipboard API
+
+The internal ring and system clipboard have separate namespaces. `entries` is
+a newest-first snapshot and `index` is one-based.
+
+```lua
+local current = lector.clipboard.internal.text
+local history = lector.clipboard.internal.entries
+local selected = lector.clipboard.internal.index
+
+lector.clipboard.internal.text = "save in Lector's history"
+lector.clipboard.internal.index = 2
+lector.clipboard.internal.text = nil -- clear all internal entries
+
+local system_text = lector.clipboard.system.text -- native provider only
+lector.clipboard.system.text = "copy outside Lector"
+lector.clipboard.system.text = nil -- clear the system clipboard
+```
+
+Explicit binding actions `lector.paste_internal`, `lector.paste_system`,
+`lector.say_internal_clipboard`, and `lector.say_system_clipboard` bypass the
+configured default register.
 
 ### Simple key customization
 
@@ -453,8 +504,11 @@ lector.hooks.on_mode_change = function(old, new) end     -- "normal" | "table" |
 lector.hooks.on_table_mode_enter = function(meta) end    -- meta: { top, bottom, columns, header_row, current_col }
 lector.hooks.on_table_mode_exit = function() end
 
--- clipboard + input
-lector.hooks.on_clipboard_change = function(entry, meta) end -- meta: { op, index, size }, op: "push" | "prev" | "next"
+-- Internal clipboard ring only. System clipboard changes do not call this hook.
+-- meta: { op, index, size }
+-- op: "push" | "prev" | "next" | "select" | "clear"
+-- entry is nil after clear; otherwise it is the selected internal entry.
+lector.hooks.on_clipboard_change = function(entry, meta) end
 lector.hooks.on_key_unhandled = function(key, mode)          -- return true to consume
   return false
 end

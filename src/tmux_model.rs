@@ -9,7 +9,7 @@ use thiserror::Error;
 pub const INVENTORY_COMMANDS: [&str; 12] = [
     "list-sessions -F 'S\t#{session_id}\t#{session_name}'\n",
     "list-windows -a -F 'W\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}'\n",
-    "list-panes -a -F 'P\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{history_size}\t#{pane_title}'\n",
+    "list-panes -a -F 'P\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
     "display-message -p -F 'A\t#{session_id}\t#{host}'\n",
     "display-message -p -F 'O\tbase-index\t#{base-index}'\n",
     "display-message -p -F 'O\tpane-base-index\t#{pane-base-index}'\n",
@@ -29,7 +29,7 @@ pub const INVENTORY_REPLY_COUNT: usize = INVENTORY_COMMANDS.len();
 pub const INVENTORY_COMMAND: &str = concat!(
     "list-sessions -F 'S\t#{session_id}\t#{session_name}'\n",
     "list-windows -a -F 'W\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}'\n",
-    "list-panes -a -F 'P\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{history_size}\t#{pane_title}'\n",
+    "list-panes -a -F 'P\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
     "display-message -p -F 'A\t#{session_id}\t#{host}'\n",
     "display-message -p -F 'O\tbase-index\t#{base-index}'\n",
     "display-message -p -F 'O\tpane-base-index\t#{pane-base-index}'\n",
@@ -92,6 +92,7 @@ pub struct Pane {
     pub cursor_shape: String,
     pub alternate_on: bool,
     pub pane_in_mode: u32,
+    pub mode: String,
     pub history_size: u32,
 }
 
@@ -358,6 +359,18 @@ impl TmuxTopology {
 
     pub fn mark_resync_required(&mut self) {
         self.needs_resync = true;
+    }
+
+    /// Predict the state after Lector's targeted `copy-mode -q`. This keeps
+    /// bootstrap capture commands behind that queued exit from using tmux's
+    /// mode-only `capture-pane -M` path.
+    pub fn clear_native_copy_mode(&mut self, pane_id: PaneId) {
+        if let Some(pane) = self.panes.get_mut(&pane_id)
+            && pane.mode == "copy-mode"
+        {
+            pane.pane_in_mode = 0;
+            pane.mode.clear();
+        }
     }
 
     pub fn update_pane_capture_metadata(
@@ -639,8 +652,19 @@ impl TmuxTopology {
     }
 
     fn inventory_pane(&mut self, line: &[u8]) -> Result<(), TopologyError> {
-        let extended = line.iter().filter(|byte| **byte == b'\t').count() >= 17;
-        let fields = split_inventory(line, if extended { 18 } else { 11 })?;
+        let tab_count = line.iter().filter(|byte| **byte == b'\t').count();
+        let named_mode = tab_count >= 18;
+        let extended = tab_count >= 17;
+        let fields = split_inventory(
+            line,
+            if named_mode {
+                19
+            } else if extended {
+                18
+            } else {
+                11
+            },
+        )?;
         let window_id = parse_window_id(fields[1])?;
         let pane_id = parse_pane_id(fields[2])?;
         let pane = Pane {
@@ -682,12 +706,27 @@ impl TmuxTopology {
             } else {
                 0
             },
+            mode: if named_mode {
+                text(fields[16], "pane mode name")?.to_owned()
+            } else {
+                String::new()
+            },
             history_size: if extended {
-                number(fields[16], "history size")?
+                number(fields[if named_mode { 17 } else { 16 }], "history size")?
             } else {
                 0
             },
-            title: text(fields[if extended { 17 } else { 10 }], "pane title")?.to_owned(),
+            title: text(
+                fields[if named_mode {
+                    18
+                } else if extended {
+                    17
+                } else {
+                    10
+                }],
+                "pane title",
+            )?
+            .to_owned(),
         };
         let active = boolean(fields[4], "pane active")?;
         let window =
@@ -1047,6 +1086,7 @@ fn empty_pane(id: PaneId, window_id: WindowId) -> Pane {
         cursor_shape: "default".to_owned(),
         alternate_on: false,
         pane_in_mode: 0,
+        mode: String::new(),
         history_size: 0,
     }
 }

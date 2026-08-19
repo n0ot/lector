@@ -129,12 +129,18 @@ impl ReviewDocument {
         self.rows.len()
     }
 
-    pub(crate) fn capture_cols(&self) -> u16 {
-        self.capture_cols
-    }
-
     pub(crate) fn max_viewport_top(&self, height: usize) -> usize {
         self.row_count().saturating_sub(height.max(1))
+    }
+
+    pub(crate) fn max_viewport_left(&self, width: u16) -> u16 {
+        self.rows
+            .iter()
+            .map(|row| row.end)
+            .max()
+            .unwrap_or(0)
+            .max(1)
+            .saturating_sub(width.max(1))
     }
 
     pub(crate) fn clamp(&self, mut position: HistoryPosition) -> HistoryPosition {
@@ -730,18 +736,27 @@ impl ReviewDocument {
             .and_then(|index| self.positions.get(index).copied())
     }
 
-    pub(crate) fn formatted_row(&self, absolute_row: usize, width: u16) -> Vec<u8> {
+    pub(crate) fn formatted_row(&self, absolute_row: usize, first_col: u16, width: u16) -> Vec<u8> {
         let Some(row) = self.rows.get(absolute_row) else {
             return Vec::new();
         };
         let mut bytes = Vec::new();
         let mut style = Style::default();
-        for cell in row
+        for (index, cell) in row
             .cells
             .iter()
-            .take(usize::from(width.min(self.capture_cols)))
+            .enumerate()
+            .skip(usize::from(first_col.min(self.capture_cols)))
+            .take(usize::from(
+                width.min(self.capture_cols.saturating_sub(first_col)),
+            ))
         {
             if cell.wide_continuation {
+                // If a horizontal viewport begins on the trailing half of a
+                // wide cell, keep the remaining columns aligned.
+                if index == usize::from(first_col) {
+                    bytes.push(b' ');
+                }
                 continue;
             }
             if cell.style != style {
@@ -946,7 +961,7 @@ mod tests {
         );
         assert!(
             document
-                .formatted_row(1, 12)
+                .formatted_row(1, 0, 12)
                 .starts_with(b"\x1b[0;38;5;1mwide")
         );
 

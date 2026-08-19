@@ -7,6 +7,9 @@ use thiserror::Error;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BindingAction {
     Execute(String),
+    OpenReview {
+        page_up: bool,
+    },
     Detach,
     Confirm {
         prompt: String,
@@ -44,6 +47,12 @@ pub fn classify_binding(command: &str) -> Result<BindingAction, PrefixError> {
     }
     if command == "detach-client" {
         return Ok(BindingAction::Detach);
+    }
+    if command == "copy-mode" {
+        return Ok(BindingAction::OpenReview { page_up: false });
+    }
+    if command == "copy-mode -u" {
+        return Ok(BindingAction::OpenReview { page_up: true });
     }
     if command.starts_with("choose-tree ") {
         if command

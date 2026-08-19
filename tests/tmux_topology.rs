@@ -276,6 +276,7 @@ fn inventory_command_uses_machine_formats_and_the_backward_compatible_key_listin
         "#{cursor_shape}",
         "#{alternate_on}",
         "#{pane_in_mode}",
+        "#{pane_mode}",
         "#{history_size}",
         "#{window_layout}",
         "#{window_visible_layout}",
@@ -297,6 +298,23 @@ fn inventory_command_uses_machine_formats_and_the_backward_compatible_key_listin
         lector::tmux_model::INVENTORY_COMMANDS.concat()
     );
     assert!(INVENTORY_COMMAND.ends_with('\n'));
+}
+
+#[test]
+fn named_pane_mode_is_parsed_and_can_be_predicted_closed() {
+    let records = [
+        b"S\t$1\twork".to_vec(),
+        b"W\t$1\t@10\t1\t1\tlayout\tlayout\t*\tmain".to_vec(),
+        b"P\t@10\t%20\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t1\tcopy-mode\t12\tshell".to_vec(),
+        b"A\t$1\thost".to_vec(),
+    ];
+    let mut topology = TmuxTopology::new(1);
+    topology.replace_inventory(&records).unwrap();
+
+    assert_eq!(topology.pane(PaneId(20)).unwrap().mode, "copy-mode");
+    topology.clear_native_copy_mode(PaneId(20));
+    assert_eq!(topology.pane(PaneId(20)).unwrap().mode, "");
+    assert_eq!(topology.pane(PaneId(20)).unwrap().pane_in_mode, 0);
 }
 
 #[test]

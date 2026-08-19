@@ -197,6 +197,9 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         match crate::tmux_prefix::classify_binding(command)? {
+            crate::tmux_prefix::BindingAction::OpenReview { page_up } => {
+                self.open_review(sr, page_up, term_out)
+            }
             crate::tmux_prefix::BindingAction::Execute(command) => {
                 let scope = self
                     .tmux_connections

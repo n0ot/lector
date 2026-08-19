@@ -49,6 +49,7 @@ const USER_PREFIX_FIXTURE: &[&[u8]] = &[
     b"B\tx\t0\tconfirm-before -p \"kill-pane #P? (y/n)\" kill-pane",
     b"B\t&\t0\tconfirm-before -p \"kill-window #W? (y/n)\" kill-window",
     b"B\tC-a\t0\tsend-prefix",
+    b"B\t[\t0\tcopy-mode",
     b"B\ts\t0\tchoose-tree -Zs",
     b"B\tw\t0\tchoose-tree -Zw",
     b"B\t:\t0\tcommand-prompt",
@@ -102,7 +103,7 @@ fn user_prefix_fixture_preserves_options_repeatability_commands_and_quotes() {
     assert_eq!(topology.option("prefix2"), Some("None"));
     assert_eq!(topology.option("key-table"), Some("root"));
     assert_eq!(topology.option("repeat-time"), Some("500"));
-    assert_eq!(topology.bindings().len(), 26);
+    assert_eq!(topology.bindings().len(), 27);
     assert!(topology.binding("Left").unwrap().repeatable);
     assert_eq!(
         topology.binding("Z").unwrap().command,
@@ -142,6 +143,14 @@ fn binding_classifier_recognizes_accessible_and_safe_passthrough_actions() {
     assert_eq!(
         classify_binding("detach-client").unwrap(),
         BindingAction::Detach
+    );
+    assert_eq!(
+        classify_binding("copy-mode").unwrap(),
+        BindingAction::OpenReview { page_up: false }
+    );
+    assert_eq!(
+        classify_binding("copy-mode -u").unwrap(),
+        BindingAction::OpenReview { page_up: true }
     );
     assert!(matches!(
         classify_binding("choose-tree -Zs").unwrap(),
@@ -541,6 +550,58 @@ fn everyday_discovered_bindings_execute_their_exact_tmux_commands() {
         input(&mut app, &mut sr, &mut physical, key);
         assert_eq!(tick(&mut app, &mut sr, &mut physical), *expected);
     }
+}
+
+#[test]
+fn discovered_copy_mode_binding_opens_review_without_entering_tmux_mode() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = ready_app();
+    recorder.0.borrow_mut().clear();
+
+    input(&mut app, &mut sr, &mut physical, b"\x01[");
+
+    assert!(app.has_overlay());
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|message| message == "Review")
+    );
+}
+
+#[test]
+fn externally_entered_native_copy_mode_is_closed_and_replaced_with_review() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = ready_app();
+    recorder.0.borrow_mut().clear();
+
+    app.handle_pty(&mut sr, b"%pane-mode-changed %21\n", &mut physical)
+        .unwrap();
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+
+    let mut groups = inventory_groups();
+    groups[2] =
+        vec![b"P\t@10\t%21\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t1\tcopy-mode\t0\tright".to_vec()];
+    for (index, group) in groups.iter().enumerate() {
+        app.handle_pty(&mut sr, &reply(100 + index, group, true), &mut physical)
+            .unwrap();
+    }
+
+    assert!(app.has_overlay());
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"copy-mode -q -t %21\n"
+    );
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|message| message == "Review")
+    );
 }
 
 #[test]

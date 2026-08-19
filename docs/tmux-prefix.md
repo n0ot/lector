@@ -62,6 +62,11 @@ a reviewable Lector popup and cannot be mistaken for inventory or pane capture.
 
 Lector classifies commands that require local accessible interaction:
 
+- `copy-mode` and `copy-mode -u` open Lector's Review overlay, with `-u`
+  opening one page above the current position. No tmux copy-mode command is
+  sent. If another tmux client puts a pane into native copy mode, Lector exits
+  that mode and opens Review when the affected pane is active, keeping one
+  accessible review model instead of two competing input modes.
 - `confirm-before` for pane and window destruction becomes a Lector-owned
   Enter/Escape confirmation. The prompt names the actual stable `%pane` or
   `@window` ID, title, window, and session captured when it opens. Acceptance

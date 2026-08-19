@@ -43,6 +43,7 @@ pub struct ReviewView {
     parser: Parser,
     cursor: HistoryPosition,
     viewport_top: usize,
+    viewport_left: u16,
     rows: u16,
     cols: u16,
     visual_anchor: Option<HistoryPosition>,
@@ -55,6 +56,12 @@ pub struct ReviewView {
 impl ReviewView {
     pub fn new(source: &mut View) -> Self {
         Self::new_with_identity(source, "Review", ViewKind::Review)
+    }
+
+    pub fn new_page_up(source: &mut View) -> Self {
+        let mut review = Self::new(source);
+        let _ = review.scroll_page(false, 1);
+        review
     }
 
     pub(crate) fn new_table_setup(source: &mut View, title: impl Into<String>) -> Self {
@@ -75,6 +82,7 @@ impl ReviewView {
             parser: Parser::default(),
             cursor,
             viewport_top,
+            viewport_left: 0,
             rows,
             cols,
             visual_anchor: None,
@@ -102,6 +110,16 @@ impl ReviewView {
         self.viewport_top = self
             .viewport_top
             .min(self.document.row_count().saturating_sub(1));
+
+        let width = self.cols.max(1);
+        if self.cursor.col < self.viewport_left {
+            self.viewport_left = self.cursor.col;
+        } else if self.cursor.col >= self.viewport_left.saturating_add(width) {
+            self.viewport_left = self.cursor.col.saturating_add(1).saturating_sub(width);
+        }
+        self.viewport_left = self
+            .viewport_left
+            .min(self.document.max_viewport_left(width));
     }
 
     fn render(&mut self) {
@@ -115,7 +133,11 @@ impl ReviewView {
                 break;
             }
             bytes.extend_from_slice(format!("\x1B[{};1H", screen_row.saturating_add(1)).as_bytes());
-            bytes.extend_from_slice(&self.document.formatted_row(absolute_row, self.cols));
+            bytes.extend_from_slice(&self.document.formatted_row(
+                absolute_row,
+                self.viewport_left,
+                self.cols,
+            ));
             bytes.extend_from_slice(b"\x1B[0m");
         }
 
@@ -138,7 +160,7 @@ impl ReviewView {
                 .saturating_sub(self.viewport_top)
                 .saturating_add(1)
                 .min(usize::from(self.rows).max(1));
-            let col = usize::from(self.cursor.col)
+            let col = usize::from(self.cursor.col.saturating_sub(self.viewport_left))
                 .saturating_add(1)
                 .min(usize::from(self.cols).max(1));
             bytes.extend_from_slice(format!("\x1B[{row};{col}H\x1B[?25h").as_bytes());
@@ -244,16 +266,16 @@ impl ReviewView {
                 line,
                 first_nonblank,
             } => Ok(self.reposition_viewport(placement, line, first_nonblank)),
-            Command::YankMotion(motion, count) => {
+            Command::YankMotion(motion, count, register) => {
                 let Some(target) = self.motion_target(motion, count) else {
                     return Ok(ViewAction::Bell);
                 };
                 let Some(text) = self.yank_motion_text(motion, target) else {
                     return Ok(ViewAction::Bell);
                 };
-                self.yank(sr, text)
+                self.yank(sr, register, text)
             }
-            Command::YankLine(count) => {
+            Command::YankLine(count, register) => {
                 let last_row = self
                     .cursor
                     .row
@@ -269,9 +291,9 @@ impl ReviewView {
                 ) else {
                     return Ok(ViewAction::Bell);
                 };
-                self.yank(sr, text)
+                self.yank(sr, register, text)
             }
-            Command::YankTextObject(TextObject::Word { style, around }, count) => {
+            Command::YankTextObject(TextObject::Word { style, around }, count, register) => {
                 let Some((first, last)) =
                     self.document
                         .inner_word_range(self.cursor, style, around, count)
@@ -281,9 +303,9 @@ impl ReviewView {
                 let Some(text) = self.document.yank_range(first, last, false) else {
                     return Ok(ViewAction::Bell);
                 };
-                self.yank(sr, text)
+                self.yank(sr, register, text)
             }
-            Command::YankVisual => {
+            Command::YankVisual(register) => {
                 let Some(anchor) = self.visual_anchor.take() else {
                     return Ok(ViewAction::Bell);
                 };
@@ -294,7 +316,7 @@ impl ReviewView {
                 ) else {
                     return Ok(ViewAction::Bell);
                 };
-                self.yank(sr, text)
+                self.yank(sr, register, text)
             }
             Command::StartSearch(direction) => {
                 self.search_prompt = Some(SearchPrompt {
@@ -420,11 +442,22 @@ impl ReviewView {
 
     fn scroll_page(&mut self, forward: bool, count: usize) -> ViewAction {
         let distance = self.document_height().max(1).saturating_mul(count);
-        let target = self.document.move_vertical(self.cursor, forward, distance);
-        let Some(target) = target else {
-            return ViewAction::Bell;
+        let max_top = self.document.max_viewport_top(self.document_height());
+        let target_top = if forward {
+            self.viewport_top.saturating_add(distance).min(max_top)
+        } else {
+            self.viewport_top.saturating_sub(distance)
         };
-        self.move_to(target)
+        let target_cursor = self.document.move_vertical(self.cursor, forward, distance);
+        if target_top == self.viewport_top && target_cursor.is_none() {
+            return ViewAction::Bell;
+        }
+        self.viewport_top = target_top;
+        if let Some(target) = target_cursor {
+            self.cursor = self.document.clamp(target);
+        }
+        self.render();
+        ViewAction::Redraw
     }
 
     fn reposition_viewport(
@@ -489,8 +522,17 @@ impl ReviewView {
         ViewAction::Redraw
     }
 
-    fn yank(&mut self, sr: &mut ScreenReader, text: String) -> Result<ViewAction> {
-        sr.push_clipboard(text)?;
+    fn yank(
+        &mut self,
+        sr: &mut ScreenReader,
+        register: Option<crate::clipboard::ClipboardRegister>,
+        text: String,
+    ) -> Result<ViewAction> {
+        let register = register.unwrap_or_else(|| sr.clipboard_default_register());
+        if let Err(error) = sr.write_clipboard(register, text) {
+            sr.speak(&error.to_string(), false)?;
+            return Ok(ViewAction::Bell);
+        }
         sr.speak("copied", false)?;
         self.visual_anchor = None;
         Ok(ViewAction::None)
@@ -560,7 +602,7 @@ impl ViewController for ReviewView {
         let (row, col) = self.view.review_cursor_position();
         let target = HistoryPosition {
             row: self.viewport_top.saturating_add(usize::from(row)),
-            col,
+            col: self.viewport_left.saturating_add(col),
         };
         Some(self.move_to(target))
     }
@@ -585,10 +627,17 @@ impl ViewController for ReviewView {
         if key.is_release() {
             return Ok(ViewAction::None);
         }
-        if let Some(text) = key.text() {
-            return self.handle_keys(sr, text.chars().map(Key::Char));
+        let semantic = semantic_key(key);
+        if semantic != Key::Unknown {
+            return self.handle_review_key(sr, semantic);
         }
-        self.handle_review_key(sr, semantic_key(key))
+        if let Some(text) = key.text() {
+            return self.handle_keys(
+                sr,
+                text.chars().filter(|ch| !ch.is_control()).map(Key::Char),
+            );
+        }
+        self.handle_review_key(sr, Key::Unknown)
     }
 
     fn handle_paste(
@@ -608,13 +657,27 @@ impl ViewController for ReviewView {
     }
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
+        let cursor_screen_row = self.cursor.row.saturating_sub(self.viewport_top);
+        let cursor_screen_col = self.cursor.col.saturating_sub(self.viewport_left);
         self.rows = rows;
         self.cols = cols;
         self.view.set_size(rows, cols);
-        self.cursor.col = self
+
+        let height = self.document_height().max(1);
+        let desired_screen_row = cursor_screen_row.min(height.saturating_sub(1));
+        self.viewport_top = self
+            .cursor
+            .row
+            .saturating_sub(desired_screen_row)
+            .min(self.document.max_viewport_top(height));
+
+        let width = self.cols.max(1);
+        let desired_screen_col = cursor_screen_col.min(width.saturating_sub(1));
+        self.viewport_left = self
             .cursor
             .col
-            .min(self.document.capture_cols().min(cols).saturating_sub(1));
+            .saturating_sub(desired_screen_col)
+            .min(self.document.max_viewport_left(width));
         self.ensure_cursor_visible();
         self.render();
     }
@@ -672,13 +735,16 @@ fn raw_key(byte: u8) -> Key {
 mod tests {
     use super::ReviewView;
     use crate::{
+        clipboard::{ClipboardRegister, SystemClipboardProvider},
         screen_reader::ScreenReader,
         speech,
         terminal::HistoryPosition,
+        terminal_input::KeyInput,
         view::View,
         views::{ViewAction, ViewController, ViewKind},
     };
     use std::{cell::RefCell, rc::Rc};
+    use terminput::{KeyCode, KeyEvent, KeyModifiers};
 
     struct RecordingDriver(Rc<RefCell<Vec<String>>>);
 
@@ -887,6 +953,32 @@ mod tests {
     }
 
     #[test]
+    fn explicit_and_default_system_registers_write_through_osc52() {
+        let (mut view, mut sr, _) = setup(b"alpha beta");
+        sr.set_system_clipboard_provider(SystemClipboardProvider::Osc52);
+
+        assert!(matches!(
+            input(&mut view, &mut sr, b"\"+yiw"),
+            ViewAction::None
+        ));
+        assert_eq!(sr.clipboard_text(), None);
+        assert_eq!(
+            sr.take_terminal_clipboard_writes(),
+            [b"\x1b]52;c;YWxwaGE=\x1b\\".to_vec()]
+        );
+
+        sr.set_clipboard_default_register(ClipboardRegister::System);
+        assert!(matches!(
+            input(&mut view, &mut sr, b"wyiw"),
+            ViewAction::Redraw
+        ));
+        assert_eq!(
+            sr.take_terminal_clipboard_writes(),
+            [b"\x1b]52;c;YmV0YQ==\x1b\\".to_vec()]
+        );
+    }
+
+    #[test]
     fn yank_motions_counts_lines_and_visual_ranges_use_vi_boundaries() {
         let (mut view, mut sr, _) = setup(b"alpha beta\r\ngamma");
         assert!(matches!(
@@ -928,7 +1020,8 @@ mod tests {
             input(&mut view, &mut sr, b"\x02"),
             ViewAction::Redraw
         ));
-        assert!(view.viewport_top < source.scrollback_len());
+        assert_eq!(view.viewport_top, 0);
+        assert_eq!(view.cursor.row, 2);
         assert!(view.model().contents_full().contains("two"));
 
         assert!(matches!(
@@ -936,6 +1029,7 @@ mod tests {
             ViewAction::Redraw
         ));
         assert_eq!(view.cursor.row, view.document.row_count() - 1);
+        assert_eq!(view.viewport_top, source.scrollback_len());
 
         source.set_review_history_position(HistoryPosition {
             row: source.scrollback_len(),
@@ -1016,15 +1110,94 @@ mod tests {
     }
 
     #[test]
-    fn resize_crops_the_snapshot_without_reflowing_or_reopening_it() {
+    fn resize_keeps_the_logical_cursor_and_pans_the_frozen_snapshot() {
         let (mut view, _sr, _) = setup(b"abcdefghij\r\nsecond");
         view.cursor.col = 9;
 
         view.on_resize(2, 5);
 
         assert_eq!(view.model().size(), (2, 5));
-        assert_eq!(view.cursor.col, 4);
-        assert!(view.model().contents_full().contains("abcde"));
-        assert!(!view.model().contents_full().contains("fghij"));
+        assert_eq!(view.cursor.col, 9);
+        assert_eq!(view.viewport_left, 5);
+        assert_eq!(view.model().screen().cursor_position(), (0, 4));
+        assert!(view.model().contents_full().contains("fghij"));
+
+        view.on_resize(2, 8);
+        assert_eq!(view.cursor.col, 9);
+        assert_eq!(view.viewport_left, 2);
+        assert_eq!(view.model().screen().cursor_position(), (0, 7));
+        assert!(view.model().contents_full().contains("cdefghij"));
+    }
+
+    #[test]
+    fn resize_changes_page_distance_and_clamps_the_viewport() {
+        let mut source = View::new(3, 20);
+        source.process_changes(b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
+        source.follow_application_cursor();
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(RecordingDriver(output))));
+        let mut view = ReviewView::new(&mut source);
+
+        view.on_resize(2, 20);
+        let old_top = view.viewport_top;
+        assert!(matches!(
+            input(&mut view, &mut sr, b"\x02"),
+            ViewAction::Redraw
+        ));
+        assert_eq!(view.viewport_top, old_top.saturating_sub(2));
+
+        view.on_resize(6, 20);
+        assert_eq!(view.viewport_top, 0);
+        assert_eq!(view.model().size(), (6, 20));
+    }
+
+    #[test]
+    fn resize_preserves_the_cursor_screen_row_until_a_boundary_requires_more_context() {
+        let mut source = View::new(4, 20);
+        source.process_changes(b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven");
+        let mut view = ReviewView::new(&mut source);
+
+        view.cursor = HistoryPosition { row: 4, col: 0 };
+        view.viewport_top = 2;
+        view.render();
+        view.on_resize(3, 20);
+        assert_eq!(view.viewport_top, 2);
+        assert_eq!(view.model().screen().cursor_position().0, 2);
+
+        view.on_resize(5, 20);
+        assert_eq!(view.viewport_top, 2);
+        assert_eq!(view.model().screen().cursor_position().0, 2);
+
+        view.cursor.row = view.document.row_count() - 1;
+        view.viewport_top = view.document.max_viewport_top(5);
+        view.render();
+        view.on_resize(7, 20);
+        assert_eq!(view.viewport_top, view.document.max_viewport_top(7));
+        assert_eq!(view.model().screen().cursor_position().0, 6);
+
+        view.on_resize(3, 20);
+        assert_eq!(view.viewport_top, view.document.max_viewport_top(3));
+        assert_eq!(view.model().screen().cursor_position().0, 2);
+    }
+
+    #[test]
+    fn extended_ctrl_page_keys_take_the_semantic_control_path() {
+        let mut source = View::new(3, 20);
+        source.process_changes(b"zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
+        source.follow_application_cursor();
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(RecordingDriver(output))));
+        let mut view = ReviewView::new(&mut source);
+        let key = KeyInput::new(
+            KeyEvent::new(KeyCode::Char('b')).modifiers(KeyModifiers::CTRL),
+            b"\x1b[98;5;2u",
+        );
+
+        assert!(matches!(
+            view.handle_key_input(&mut sr, &key, b"", &mut Vec::new())
+                .unwrap(),
+            ViewAction::Redraw
+        ));
+        assert_eq!(view.viewport_top, 0);
     }
 }
