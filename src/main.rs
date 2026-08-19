@@ -469,7 +469,7 @@ where
     });
     match result {
         Ok(state) => {
-            app.finish_pty_presentation_batch(term_out)?;
+            app.finish_pty_presentation_batch(sr, term_out)?;
             Ok(state)
         }
         Err(error) => {

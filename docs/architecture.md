@@ -33,9 +33,12 @@ scene state.
 tmux control records remain ordered on the event-loop thread. Hidden panes do
 not retain cumulative speech/render summaries: each pane batch is applied as a
 bounded delta, and only the active accessibility pane keeps metadata until its
-next stabilization point. Visible pane records from one bounded PTY drain are
-modeled in order but composed and rendered once at the drain boundary, before
-ready user input is dispatched. The active tmux layout is parsed into one
+next stabilization point. Adjacent ordinary output records for the same pane
+are combined up to 64 KiB within one bounded PTY drain, with control records,
+extended output, and pane changes acting as ordering fences. The first record
+is modeled immediately; its adjacent tail is modeled and the final visible
+state is composed and rendered at the drain boundary, before ready user input
+is dispatched. The active tmux layout is parsed into one
 cached projection when topology changes instead of being reparsed for each
 visibility, input, and composition query. Selecting the live viewport is a
 no-op, and `Scrollback(0)` never materializes retained history. A lossy tmux

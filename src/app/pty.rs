@@ -24,8 +24,9 @@ impl App {
     }
 
     /// Drops presentation bookkeeping after a failed PTY drain. Model changes
-    /// that were already parsed remain valid and will be included in the next
-    /// authoritative render.
+    /// that were already applied remain valid and will be included in the next
+    /// authoritative render; an unprocessed coalesced tail belongs to the
+    /// failed drain and is discarded with it.
     pub fn cancel_pty_presentation_batch(&mut self) {
         self.pending_tmux_presentation_batch = None;
     }
@@ -33,7 +34,18 @@ impl App {
     /// Presents the final modeled state from one bounded PTY drain. The common
     /// single-pane case retains incremental damage; interleaved panes or a
     /// topology transition conservatively produce one full composite.
-    pub fn finish_pty_presentation_batch(&mut self, term_out: &mut dyn Write) -> Result<()> {
+    pub fn finish_pty_presentation_batch(
+        &mut self,
+        sr: &mut ScreenReader,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        let pending = self
+            .pending_tmux_presentation_batch
+            .as_mut()
+            .and_then(PendingTmuxPresentationBatch::take_pending_gateway_event);
+        if let Some(event) = pending {
+            self.handle_tmux_gateway_event(sr, event, term_out)?;
+        }
         let Some(batch) = self.pending_tmux_presentation_batch.take() else {
             return Ok(());
         };
@@ -159,7 +171,17 @@ impl App {
         let events = self.tmux_gateway.push(buf)?;
         self.sync_root_tmux_termination_deadline();
         for event in events {
-            self.handle_tmux_gateway_event(sr, event, term_out)?;
+            let (first, second) = if let Some(batch) = &mut self.pending_tmux_presentation_batch {
+                batch.route_gateway_event(event)
+            } else {
+                (Some(event), None)
+            };
+            if let Some(event) = first {
+                self.handle_tmux_gateway_event(sr, event, term_out)?;
+            }
+            if let Some(event) = second {
+                self.handle_tmux_gateway_event(sr, event, term_out)?;
+            }
         }
         Ok(())
     }

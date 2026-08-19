@@ -741,7 +741,8 @@ fn pty_presentation_batch_models_visible_output_before_finishing_render() {
     assert!(physical.bytes.is_empty());
     assert_eq!(physical.flushes, 0);
 
-    app.finish_pty_presentation_batch(&mut physical).unwrap();
+    app.finish_pty_presentation_batch(&mut sr, &mut physical)
+        .unwrap();
     assert!(!physical.bytes.is_empty());
     assert_eq!(physical.flushes, 1);
     assert!(
@@ -779,12 +780,14 @@ fn pty_presentation_batch_coalesces_same_pane_records_into_one_final_render() {
     assert!(
         app.debug_tmux_pane_contents(1, 20)
             .unwrap()
-            .contains("FINAL")
+            .contains("FIRST"),
+        "the adjacent tail should wait for the PTY-drain boundary"
     );
     assert!(physical.bytes.is_empty());
     assert_eq!(physical.flushes, 0);
 
-    app.finish_pty_presentation_batch(&mut physical).unwrap();
+    app.finish_pty_presentation_batch(&mut sr, &mut physical)
+        .unwrap();
     assert_eq!(
         physical.flushes, 1,
         "same-pane records rendered more than once"
@@ -796,6 +799,44 @@ fn pty_presentation_batch_coalesces_same_pane_records_into_one_final_render() {
         .contents_full();
     assert!(presented.contains("FINAL"), "presented={presented:?}");
     assert!(!presented.contains("FIRST"), "presented={presented:?}");
+}
+
+#[test]
+fn pty_presentation_batch_advances_ghostty_twice_for_a_fragmented_same_pane_burst() {
+    const RECORDS: usize = 512;
+    let (mut app, mut sr, _recorder, _initial_physical) = ready_app(false);
+    let mut physical = PresentationOutput::default();
+
+    app.begin_pty_presentation_batch();
+    for index in 0..RECORDS {
+        let payload = format!("\r\x1b[2Krecord-{index:03}");
+        app.handle_pty(
+            &mut sr,
+            &pane_output_record(20, payload.as_bytes()),
+            &mut physical,
+        )
+        .unwrap();
+    }
+
+    assert_eq!(
+        app.debug_tmux_pane_pending_update_batch_count(1, 20),
+        Some(1),
+        "adjacent tmux records reached Ghostty before the drain boundary"
+    );
+    app.finish_pty_presentation_batch(&mut sr, &mut physical)
+        .unwrap();
+    assert_eq!(
+        app.debug_tmux_pane_pending_update_batch_count(1, 20),
+        Some(2),
+        "a fragmented same-pane burst should require only the immediate and coalesced advances"
+    );
+    let contents = app.debug_tmux_pane_contents(1, 20).unwrap();
+    let compact = contents
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(compact.contains("record-511"), "contents={contents:?}");
+    assert_eq!(physical.flushes, 1);
 }
 
 #[test]
@@ -818,7 +859,8 @@ fn canceling_pty_presentation_batch_cannot_leave_a_stale_deferred_render() {
     );
     app.cancel_pty_presentation_batch();
     app.cancel_pty_presentation_batch();
-    app.finish_pty_presentation_batch(&mut physical).unwrap();
+    app.finish_pty_presentation_batch(&mut sr, &mut physical)
+        .unwrap();
     assert!(physical.bytes.is_empty());
     assert_eq!(physical.flushes, 0);
     assert_eq!(app.presented_scene(), &before);
@@ -830,7 +872,8 @@ fn canceling_pty_presentation_batch_cannot_leave_a_stale_deferred_render() {
         &mut physical,
     )
     .unwrap();
-    app.finish_pty_presentation_batch(&mut physical).unwrap();
+    app.finish_pty_presentation_batch(&mut sr, &mut physical)
+        .unwrap();
     assert_eq!(physical.flushes, 1);
     let presented = app
         .presented_scene()
@@ -1068,7 +1111,7 @@ fn bounded_foreground_bursts_do_not_pause_and_input_runs_between_turns() {
     app.begin_pty_presentation_batch();
     app.handle_pty(&mut sr, &pane_output_record(20, &first_turn), &mut physical)
         .expect("process one bounded foreground-output turn");
-    app.finish_pty_presentation_batch(&mut physical)
+    app.finish_pty_presentation_batch(&mut sr, &mut physical)
         .expect("present the final foreground state");
 
     let contents = app.debug_tmux_pane_contents(1, 20).unwrap();
@@ -1102,7 +1145,7 @@ fn bounded_foreground_bursts_do_not_pause_and_input_runs_between_turns() {
         &mut physical,
     )
     .expect("process the next bounded foreground-output turn");
-    app.finish_pty_presentation_batch(&mut physical)
+    app.finish_pty_presentation_batch(&mut sr, &mut physical)
         .expect("present the second foreground state");
     let contents = app.debug_tmux_pane_contents(1, 20).unwrap();
     let compact = contents

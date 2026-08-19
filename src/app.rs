@@ -55,6 +55,7 @@ const TMUX_HIDDEN_IMMEDIATE_BUDGET_BYTES: usize = 4 * 1024;
 const TMUX_BACKGROUND_DRAIN_BUDGET_BYTES: usize = 4 * 1024;
 const TMUX_BACKGROUND_PAUSE_THRESHOLD_BYTES: usize = 16 * 1024;
 const TMUX_BACKGROUND_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+const TMUX_PANE_OUTPUT_COALESCE_LIMIT_BYTES: usize = 64 * 1024;
 const TMUX_EXPECTED_REPLY_LIMIT: usize = 512;
 const TMUX_ROUTED_COMMAND_LIMIT_BYTES: usize = 1024 * 1024;
 const TMUX_ROUTED_COMMAND_LIMIT_COUNT: usize = 4_096;
@@ -163,9 +164,65 @@ pub struct TmuxPaneFlowState {
 struct PendingTmuxPresentationBatch {
     updates: BTreeMap<(u64, crate::tmux_model::PaneId), UpdateSummary>,
     bell_count: usize,
+    last_ordinary_output: Option<(u64, u64)>,
+    pending_ordinary_output: Option<crate::tmux_gateway::GatewayEvent>,
 }
 
 impl PendingTmuxPresentationBatch {
+    /// Keeps the first pane update observable immediately, then combines the
+    /// rest of an adjacent same-pane run until the bounded PTY drain reaches
+    /// an ordering fence. This avoids paying Ghostty's snapshot cost once per
+    /// tmux record while preserving control-record and cross-pane order.
+    fn route_gateway_event(
+        &mut self,
+        event: crate::tmux_gateway::GatewayEvent,
+    ) -> (
+        Option<crate::tmux_gateway::GatewayEvent>,
+        Option<crate::tmux_gateway::GatewayEvent>,
+    ) {
+        let output_key = match &event {
+            crate::tmux_gateway::GatewayEvent::Control {
+                connection_id,
+                event: crate::tmux_control::ControlEvent::Output { pane_id, .. },
+            } => Some((*connection_id, *pane_id)),
+            _ => None,
+        };
+
+        if let Some(key) = output_key
+            && self.last_ordinary_output == Some(key)
+        {
+            let incoming_len = ordinary_tmux_output_len(&event).unwrap_or(0);
+            if let Some(pending) = &mut self.pending_ordinary_output {
+                let pending_len = ordinary_tmux_output_len(pending).unwrap_or(0);
+                if pending_len.saturating_add(incoming_len) <= TMUX_PANE_OUTPUT_COALESCE_LIMIT_BYTES
+                {
+                    append_ordinary_tmux_output(pending, event);
+                    return (None, None);
+                }
+                let ready = self.pending_ordinary_output.replace(event);
+                return (ready, None);
+            }
+            if incoming_len <= TMUX_PANE_OUTPUT_COALESCE_LIMIT_BYTES {
+                self.pending_ordinary_output = Some(event);
+                return (None, None);
+            }
+            return (Some(event), None);
+        }
+
+        let pending = self.pending_ordinary_output.take();
+        self.last_ordinary_output = output_key;
+        if pending.is_some() {
+            (pending, Some(event))
+        } else {
+            (Some(event), None)
+        }
+    }
+
+    fn take_pending_gateway_event(&mut self) -> Option<crate::tmux_gateway::GatewayEvent> {
+        self.last_ordinary_output = None;
+        self.pending_ordinary_output.take()
+    }
+
     fn push(
         &mut self,
         connection_id: u64,
@@ -179,6 +236,46 @@ impl PendingTmuxPresentationBatch {
             .or_default()
             .merge(update);
     }
+}
+
+fn ordinary_tmux_output_len(event: &crate::tmux_gateway::GatewayEvent) -> Option<usize> {
+    match event {
+        crate::tmux_gateway::GatewayEvent::Control {
+            event: crate::tmux_control::ControlEvent::Output { bytes, .. },
+            ..
+        } => Some(bytes.len()),
+        _ => None,
+    }
+}
+
+fn append_ordinary_tmux_output(
+    pending: &mut crate::tmux_gateway::GatewayEvent,
+    incoming: crate::tmux_gateway::GatewayEvent,
+) {
+    let (
+        crate::tmux_gateway::GatewayEvent::Control {
+            connection_id: pending_connection,
+            event:
+                crate::tmux_control::ControlEvent::Output {
+                    pane_id: pending_pane,
+                    bytes: pending_bytes,
+                },
+        },
+        crate::tmux_gateway::GatewayEvent::Control {
+            connection_id: incoming_connection,
+            event:
+                crate::tmux_control::ControlEvent::Output {
+                    pane_id: incoming_pane,
+                    bytes: incoming_bytes,
+                },
+        },
+    ) = (pending, incoming)
+    else {
+        unreachable!("only matching ordinary tmux output events are coalesced");
+    };
+    debug_assert_eq!(*pending_connection, incoming_connection);
+    debug_assert_eq!(*pending_pane, incoming_pane);
+    pending_bytes.extend(incoming_bytes);
 }
 
 pub struct StdClock {
