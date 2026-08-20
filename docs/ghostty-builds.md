@@ -245,7 +245,10 @@ library.
 ## Fresh-clone developer build
 
 Install a stable Rust toolchain plus `curl`, `tar`, and either `shasum` or
-`sha256sum`. Then a complete release build is one command:
+`sha256sum`. Linux builders also need a C compiler and the target libc's static
+development archives (`build-essential` plus `libc6-dev` on Debian-family
+glibc systems, or `build-base` on Alpine). Then a complete release build is one
+command:
 
 ```sh
 cargo build --locked --release
@@ -313,8 +316,22 @@ a platform linker.
 
 Release builders use the same pinned source and exact Zig version. Released
 Lector binaries do not require Zig, the Ghostty application, or a shared
-`libghostty-vt` at runtime. Platform runtime libraries supplied by the OS may
-still be dynamically linked normally.
+`libghostty-vt` at runtime. All Linux targets enable Rust's `crt-static` target
+feature for the final Lector crate. Musl targets use Rust's native static-PIE
+link, while glibc targets use a small compiler-driver wrapper to select glibc's
+working `-static-pie` mode without rustc's conflicting `-static -no-pie`
+combination. The resulting ELF is position-independent and has neither a
+dynamic interpreter nor `DT_NEEDED` entries. Libc is resolved by the final Rust
+link; it is deliberately not copied into `libghostty-vt.a`. macOS remains
+dynamically linked to Apple's system libraries, which are not available as
+supported static archives.
+
+A glibc ELF with no declared shared dependencies may still ask glibc to load
+matching NSS modules when account or network-name lookup falls back to those
+services. Optional facilities such as Wayland clipboard integration and Lua C
+modules can also load their own platform modules explicitly. Use a musl target
+for the most hermetic distributable executable; these runtime integrations are
+not link-time dependencies of Lector itself.
 
 ## Supported targets
 
@@ -330,9 +347,15 @@ claimed until their compile/package checks pass:
 
 - `aarch64-unknown-linux-musl`
 - `x86_64-unknown-linux-musl`
+- `aarch64-alpine-linux-musl`
+- `x86_64-alpine-linux-musl`
 
-Other targets fail early with the supported list. Run `cargo ghostty-check` for
-the native debug/release ABI and static-link checks. After both verified
+The `*-alpine-linux-musl` names are used by Alpine's packaged Rust toolchains
+and map to the same Zig musl targets as their `*-unknown-linux-musl`
+counterparts. Other targets fail early with the supported list. Run
+`cargo ghostty-check` for the native debug/release ABI and static-link checks.
+On Linux, that check also rejects a release artifact that is not PIE or has an
+ELF interpreter or `DT_NEEDED` entry. After both verified
 profiles exist, `scripts/check_build_paths.sh` confirms that ordinary Cargo
 commands reuse them without bootstrapping or network access.
 

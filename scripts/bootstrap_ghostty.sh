@@ -70,6 +70,8 @@ case "$target" in
     x86_64-unknown-linux-gnu) zig_target=x86_64-linux-gnu ;;
     aarch64-unknown-linux-musl) zig_target=aarch64-linux-musl ;;
     x86_64-unknown-linux-musl) zig_target=x86_64-linux-musl ;;
+    aarch64-alpine-linux-musl) zig_target=aarch64-linux-musl ;;
+    x86_64-alpine-linux-musl) zig_target=x86_64-linux-musl ;;
     *)
         echo "unsupported Ghostty target: $target" >&2
         exit 2

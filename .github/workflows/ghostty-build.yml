@@ -55,15 +55,17 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo test --locked --workspace --all-targets --all-features
 
-  tier-two-compile:
-    name: ${{ matrix.target }} compile check
-    runs-on: ubuntu-24.04
+  tier-two-static:
+    name: ${{ matrix.target }} static link
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - aarch64-unknown-linux-musl
-          - x86_64-unknown-linux-musl
+        include:
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -74,3 +76,32 @@ jobs:
         run: >-
           cargo check --locked --target "${{ matrix.target }}"
           --features ghostty-vt
+      - name: Link and inspect static Lector executable
+        run: |
+          artifact=$(
+            cargo build --locked --release --target "${{ matrix.target }}" \
+              --features ghostty-vt --bin lector \
+              --message-format=json-render-diagnostics \
+            | scripts/cargo-artifact lector bin
+          )
+          scripts/check-static-pie "$artifact"
+          "$artifact" --version
+
+  alpine-static:
+    name: Alpine native static PIE
+    runs-on: ubuntu-24.04
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Build and inspect with Alpine's packaged Rust
+        run: |
+          docker run --rm --dns 1.1.1.1 \
+            --volume "$GITHUB_WORKSPACE:/work" --workdir /work \
+            alpine:3.24 sh -lc '
+              set -eu
+              apk add --no-cache bash binutils build-base ca-certificates \
+                cargo curl file git pkgconf rust tar xz
+              cargo build --locked --release --bin lector
+              scripts/check-static-pie target/release/lector
+              target/release/lector --version
+            '

@@ -11,6 +11,8 @@ pub const SUPPORTED_TARGETS: &[&str] = &[
     "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",
+    "aarch64-alpine-linux-musl",
+    "x86_64-alpine-linux-musl",
 ];
 
 pub fn validate_target(target: &str) -> Result<(), String> {

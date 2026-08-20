@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 1 ]]; then
+    echo "usage: $0 ELF_EXECUTABLE" >&2
+    exit 2
+fi
+
+artifact=$1
+if [[ ! -f "$artifact" ]]; then
+    echo "static PIE artifact does not exist: $artifact" >&2
+    exit 1
+fi
+if ! command -v readelf >/dev/null 2>&1; then
+    echo "static PIE verification requires readelf" >&2
+    exit 1
+fi
+if readelf -l "$artifact" | grep -q 'Requesting program interpreter'; then
+    echo "static PIE artifact unexpectedly has a dynamic interpreter: $artifact" >&2
+    exit 1
+fi
+if readelf -d "$artifact" 2>&1 | grep -q '(NEEDED)'; then
+    echo "static PIE artifact unexpectedly has shared-library dependencies: $artifact" >&2
+    exit 1
+fi
+if ! readelf -h "$artifact" | grep -Eq 'Type:[[:space:]]+DYN'; then
+    echo "static artifact is not position-independent: $artifact" >&2
+    exit 1
+fi
+
+printf 'verified static PIE: %s\n' "$artifact"

@@ -47,6 +47,7 @@ case "$(uname -s)" in
         fi
         ;;
     Linux)
+        "$repo_dir/scripts/check-static-pie" "$release_lector"
         if ldd "$release_lector" "$ghostty_test_binary" | grep -q 'libghostty-vt'; then
             echo "release artifacts unexpectedly depend on a shared libghostty-vt" >&2
             exit 1

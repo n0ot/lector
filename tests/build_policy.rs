@@ -83,6 +83,25 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(!cargo_config.contains("ghostty-debug"));
     assert!(cargo_config.contains("ghostty-bench"));
     assert!(cargo_config.contains("--package lector-xtask"));
+    assert!(cargo_config.contains("rustc-workspace-wrapper"));
+    assert!(cargo_config.contains("scripts/rustc-static-linux"));
+
+    let static_wrapper = include_str!("../scripts/rustc-static-linux");
+    assert!(static_wrapper.contains("*-linux-musl"));
+    assert!(static_wrapper.contains("*-linux-gnu"));
+    assert!(static_wrapper.contains("target-feature=+crt-static"));
+    assert!(static_wrapper.contains("relocation-model=pic"));
+    assert!(static_wrapper.contains("static-pie-cc"));
+    assert!(static_wrapper.contains("is_test"));
+
+    let static_linker = include_str!("../scripts/static-pie-cc");
+    assert!(static_linker.contains("-static|-no-pie|-pie|-static-pie"));
+    assert!(static_linker.contains("-static-pie"));
+
+    let static_check = include_str!("../scripts/check-static-pie");
+    assert!(static_check.contains("Requesting program interpreter"));
+    assert!(static_check.contains("(NEEDED)"));
+    assert!(static_check.contains("Type:[[:space:]]+DYN"));
 
     let xtask = include_str!("../xtask/src/main.rs");
     assert!(xtask.contains("scripts/bootstrap_ghostty.sh"));
@@ -125,6 +144,9 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(ci.contains("cargo ghostty-check"));
     assert!(!ci.contains("cargo ghostty-bootstrap"));
     assert!(ci.contains("cargo check --locked --target"));
+    assert!(ci.contains("cargo build --locked --release --target"));
+    assert!(ci.contains("scripts/check-static-pie"));
+    assert!(ci.contains("alpine:3.24"));
 }
 
 #[test]
@@ -171,6 +193,8 @@ fn target_policy_matches_the_documented_tier_one_and_tier_two_matrix() {
             "x86_64-unknown-linux-gnu",
             "aarch64-unknown-linux-musl",
             "x86_64-unknown-linux-musl",
+            "aarch64-alpine-linux-musl",
+            "x86_64-alpine-linux-musl",
         ]
     );
     for target in ghostty::SUPPORTED_TARGETS {

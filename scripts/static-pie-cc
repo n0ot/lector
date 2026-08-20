@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+linker_args=()
+for argument in "$@"; do
+    case "$argument" in
+        -static|-no-pie|-pie|-static-pie) ;;
+        *) linker_args+=("$argument") ;;
+    esac
+done
+
+cc_bin=${LECTOR_STATIC_PIE_CC:-cc}
+exec "$cc_bin" "${linker_args[@]}" -static-pie

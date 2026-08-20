@@ -2,3 +2,6 @@
 ghostty-bootstrap = "run --locked --package lector-xtask -- ghostty-bootstrap"
 ghostty-check = "run --locked --package lector-xtask -- ghostty-check"
 ghostty-bench = "run --locked --package lector-xtask -- ghostty-bench"
+
+[build]
+rustc-workspace-wrapper = "scripts/rustc-static-linux"
