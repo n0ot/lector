@@ -839,6 +839,7 @@ dependencies = [
  "dirs",
  "emojis",
  "lector-ghostty",
+ "lector-tts-backend",
  "mio",
  "mlua",
  "nix",
@@ -852,7 +853,6 @@ dependencies = [
  "similar",
  "terminput",
  "thiserror 2.0.17",
- "tts",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -863,6 +863,34 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "vte",
+]
+
+[[package]]
+name = "lector-tts-backend"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "dyn-clonable",
+ "hound",
+ "jni",
+ "libloading",
+ "ndk-context",
+ "objc2",
+ "objc2-avf-audio",
+ "objc2-foundation",
+ "oxilangtag",
+ "parking_lot",
+ "serde",
+ "ssip",
+ "ssip-client-async",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tolk",
+ "tracing",
+ "wasm-bindgen",
+ "web-sys",
+ "windows",
+ "zbus",
 ]
 
 [[package]]
@@ -1719,6 +1747,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "tolk"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b359314c4735e67890cee739535ad0ee5bc3345940fc19e936b30426c54e00c6"
+dependencies = [
+ "lazy_static",
+ "tolk-sys",
+ "widestring",
+]
+
+[[package]]
+name = "tolk-sys"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0509d35ae72bba1f84d92ffbe3504265a1702b71e8769503954b2254404e4c76"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1788,33 +1837,6 @@ dependencies = [
  "memchr",
  "nom",
  "petgraph",
-]
-
-[[package]]
-name = "tts"
-version = "0.27.0"
-source = "git+https://github.com/ndarilek/tts-rs?rev=8fbcb720cb86c5166a9ed46272e3777f742da18e#8fbcb720cb86c5166a9ed46272e3777f742da18e"
-dependencies = [
- "block2",
- "dyn-clonable",
- "hound",
- "jni",
- "libloading",
- "ndk-context",
- "objc2",
- "objc2-avf-audio",
- "objc2-foundation",
- "oxilangtag",
- "parking_lot",
- "ssip",
- "ssip-client-async",
- "tempfile",
- "thiserror 2.0.17",
- "tracing",
- "wasm-bindgen",
- "web-sys",
- "windows",
- "zbus",
 ]
 
 [[package]]
@@ -2024,6 +2046,12 @@ dependencies = [
  "rustix",
  "winsafe",
 ]
+
+[[package]]
+name = "widestring"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c168940144dd21fd8046987c16a46a33d5fc84eec29ef9dcddc2ac9e31526b7c"
 
 [[package]]
 name = "winapi"

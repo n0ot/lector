@@ -10,26 +10,42 @@ const REQUIRED_ZIG_VERSION: &str = "0.16.0";
 fn main() {
     println!("cargo:rerun-if-env-changed=GHOSTTY_PREBUILT_ROOT");
     println!("cargo:rerun-if-env-changed=LECTOR_GHOSTTY_OPTIMIZE");
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
     println!("cargo:rerun-if-env-changed=TARGET");
 
+    // docs.rs cannot fetch or build the pinned native archive, and rustdoc
+    // only needs the Rust declarations rather than a linked executable.
+    if env::var_os("DOCS_RS").is_some() {
+        return;
+    }
+
     let target = env::var("TARGET").expect("Cargo must set TARGET for build scripts");
     let optimize = optimize_mode();
-    let root = prebuilt_root();
+    let build_root = build_root();
+    let root = prebuilt_root(&build_root);
     let prefix = root.join(&target).join(optimize);
     let metadata_path = prefix.join("lector-ghostty-build.txt");
     let library_path = prefix.join("static-lib").join(static_library_name(&target));
-    let repository_root = repository_root();
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bootstrap_script = bootstrap_script(&crate_root);
 
-    for path in [
-        repository_root.join("scripts/bootstrap_ghostty.sh"),
-        repository_root.join("scripts/bootstrap_zig.sh"),
-        repository_root.join("crates/lector-ghostty/abi/build_info_probe.c"),
-    ] {
+    let mut watched_paths = vec![
+        bootstrap_script.clone(),
+        crate_root.join("bootstrap/bootstrap_zig.sh"),
+        crate_root.join("bootstrap/lock.sh"),
+        crate_root.join("abi/build_info_probe.c"),
+    ];
+    let workspace_root = workspace_root(&crate_root);
+    if bootstrap_script.starts_with(&workspace_root) {
+        watched_paths.push(workspace_root.join("scripts/bootstrap_zig.sh"));
+        watched_paths.push(workspace_root.join("scripts/lib/lock.sh"));
+    }
+    for path in watched_paths {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
-    ensure_verified_archive(&repository_root, &target, optimize);
+    ensure_verified_archive(&bootstrap_script, &build_root, &target, optimize);
 
     let metadata = fs::read_to_string(&metadata_path).unwrap_or_else(|error| {
         panic!(
@@ -54,18 +70,27 @@ fn main() {
     println!("cargo:rustc-link-lib=static=ghostty-vt");
 }
 
-fn repository_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+fn workspace_root(crate_root: &Path) -> PathBuf {
+    crate_root.join("../..")
 }
 
-fn ensure_verified_archive(repository_root: &Path, target: &str, optimize: &str) {
-    let script = repository_root.join("scripts/bootstrap_ghostty.sh");
-    let status = Command::new(&script)
+fn bootstrap_script(crate_root: &Path) -> PathBuf {
+    let workspace_script = workspace_root(crate_root).join("scripts/bootstrap_ghostty.sh");
+    if workspace_script.is_file() {
+        workspace_script
+    } else {
+        crate_root.join("bootstrap/bootstrap_ghostty.sh")
+    }
+}
+
+fn ensure_verified_archive(script: &Path, build_root: &Path, target: &str, optimize: &str) {
+    let status = Command::new("bash")
+        .arg(script)
         .arg("--target")
         .arg(target)
         .arg("--optimize")
         .arg(optimize)
-        .current_dir(repository_root)
+        .env("LECTOR_GHOSTTY_BUILD_ROOT", build_root)
         .status()
         .unwrap_or_else(|error| {
             panic!(
@@ -79,14 +104,29 @@ fn ensure_verified_archive(repository_root: &Path, target: &str, optimize: &str)
     );
 }
 
-fn prebuilt_root() -> PathBuf {
+fn build_root() -> PathBuf {
+    if let Some(path) = env::var_os("LECTOR_GHOSTTY_BUILD_ROOT") {
+        return PathBuf::from(path);
+    }
+
+    let crate_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = workspace_root(&crate_root);
+    if workspace_root
+        .join("scripts/bootstrap_ghostty.sh")
+        .is_file()
+    {
+        workspace_root.join("target")
+    } else {
+        PathBuf::from(env::var_os("OUT_DIR").expect("Cargo must set OUT_DIR")).join("bootstrap")
+    }
+}
+
+fn prebuilt_root(build_root: &Path) -> PathBuf {
     if let Some(path) = env::var_os("GHOSTTY_PREBUILT_ROOT") {
         return PathBuf::from(path);
     }
 
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("target/ghostty-prebuilt")
+    build_root.join("ghostty-prebuilt")
 }
 
 fn optimize_mode() -> &'static str {

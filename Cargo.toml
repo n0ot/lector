@@ -4,13 +4,12 @@ version = "0.4.0"
 edition = "2024"
 autobins = false
 default-run = "lector"
-publish = false
 description = "A terminal screen reader"
 license = "MIT"
 repository = "https://github.com/n0ot/lector"
 
 [workspace]
-members = ["crates/lector-ghostty", "xtask"]
+members = ["crates/lector-ghostty", "crates/lector-tts-backend", "xtask"]
 resolver = "3"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -39,10 +38,10 @@ similar = { version = "2.5.0", features = ["unicode"] }
 unicode-segmentation = "1.11.0"
 unicode-width = "0.2.2"
 mlua = { version = "0.11", features = ["luajit", "vendored"] }
-tts = { git = "https://github.com/ndarilek/tts-rs", rev = "8fbcb720cb86c5166a9ed46272e3777f742da18e" }
+tts = { package = "lector-tts-backend", version = "0.1.0", path = "crates/lector-tts-backend" }
 terminput = "0.5.12"
 thiserror = "2.0.17"
-lector-ghostty = { path = "crates/lector-ghostty" }
+lector-ghostty = { version = "0.1.0", path = "crates/lector-ghostty" }
 
 [features]
 default = ["ghostty-vt"]

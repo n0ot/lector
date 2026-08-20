@@ -16,7 +16,10 @@ fn ghostty_dependency_and_source_revisions_are_exactly_pinned() {
     let manifest = include_str!("../Cargo.toml");
     assert!(manifest.contains("default = [\"ghostty-vt\"]"));
     assert!(manifest.contains("ghostty-vt = []"));
-    assert!(manifest.contains("lector-ghostty = { path = \"crates/lector-ghostty\" }"));
+    assert!(
+        manifest
+            .contains("lector-ghostty = { version = \"0.1.0\", path = \"crates/lector-ghostty\" }")
+    );
     assert!(!manifest.contains("optional = true"));
     assert!(!include_str!("../build.rs").contains("CARGO_FEATURE_GHOSTTY_VT"));
     assert!(!manifest.contains("libghostty-vt ="));
@@ -25,6 +28,22 @@ fn ghostty_dependency_and_source_revisions_are_exactly_pinned() {
     assert!(lockfile.contains("name = \"lector-ghostty\""));
     assert!(!lockfile.contains("name = \"libghostty-vt\""));
     assert!(!lockfile.contains("name = \"libghostty-vt-sys\""));
+}
+
+#[test]
+fn tts_backend_is_registry_publishable_and_matches_the_pinned_upstream() {
+    let root_manifest = include_str!("../Cargo.toml");
+    assert!(root_manifest.contains(
+        "tts = { package = \"lector-tts-backend\", version = \"0.1.0\", path = \"crates/lector-tts-backend\" }"
+    ));
+    assert!(!root_manifest.contains("git = \"https://github.com/ndarilek/tts-rs\""));
+
+    let backend_manifest = include_str!("../crates/lector-tts-backend/Cargo.toml");
+    assert!(backend_manifest.contains("name = \"lector-tts-backend\""));
+    assert!(backend_manifest.contains("name = \"tts\""));
+    assert!(backend_manifest.contains("version = \"0.27.0\""));
+    assert!(backend_manifest.contains("revision = \"8fbcb720cb86c5166a9ed46272e3777f742da18e\""));
+    assert!(!backend_manifest.contains("publish = false"));
 }
 
 #[test]
@@ -61,7 +80,7 @@ fn cargo_build_automatically_bootstraps_and_validates_the_native_cache() {
     assert!(wrapper_build.contains(ghostty::REQUIRED_ZIG_VERSION));
     assert!(wrapper_build.contains("join(\"static-lib\")"));
     assert!(wrapper_build.contains("ensure_verified_archive"));
-    assert!(wrapper_build.contains("scripts/bootstrap_ghostty.sh"));
+    assert!(wrapper_build.contains("bootstrap/bootstrap_ghostty.sh"));
     assert!(!wrapper_build.contains("git clone"));
     assert!(!wrapper_build.contains("curl"));
 
@@ -74,6 +93,15 @@ fn cargo_build_automatically_bootstraps_and_validates_the_native_cache() {
     assert!(bootstrap.contains("reusing verified Ghostty archive"));
     assert!(bootstrap.contains("abi_probe_sha256="));
     assert!(bootstrap.contains("archive_sha256="));
+
+    let adapter_manifest = include_str!("../crates/lector-ghostty/Cargo.toml");
+    assert!(!adapter_manifest.contains("publish = false"));
+    let packaged_bootstrap =
+        include_str!("../crates/lector-ghostty/bootstrap/bootstrap_ghostty.sh");
+    assert!(packaged_bootstrap.contains(ghostty::GHOSTTY_COMMIT));
+    assert!(packaged_bootstrap.contains(ghostty::GHOSTTY_ARCHIVE_SHA256));
+    assert!(packaged_bootstrap.contains("$crate_dir/abi/build_info_probe.c"));
+    assert!(packaged_bootstrap.contains("$bootstrap_dir/bootstrap_zig.sh"));
 }
 
 #[test]
@@ -210,7 +238,10 @@ fn ghostty_is_the_only_production_terminal_engine() {
     let manifest = include_str!("../Cargo.toml");
     assert!(!manifest.lines().any(|line| line.starts_with("vt100 =")));
     assert!(!manifest.lines().any(|line| line.starts_with("vte =")));
-    assert!(manifest.contains("lector-ghostty = { path = \"crates/lector-ghostty\" }"));
+    assert!(
+        manifest
+            .contains("lector-ghostty = { version = \"0.1.0\", path = \"crates/lector-ghostty\" }")
+    );
 
     let terminal = include_str!("../src/terminal.rs");
     let view = include_str!("../src/view.rs");
@@ -228,6 +259,10 @@ fn every_workspace_package_declares_its_license() {
         (
             "lector-ghostty",
             include_str!("../crates/lector-ghostty/Cargo.toml"),
+        ),
+        (
+            "lector-tts-backend",
+            include_str!("../crates/lector-tts-backend/Cargo.toml"),
         ),
         ("lector-xtask", include_str!("../xtask/Cargo.toml")),
     ] {

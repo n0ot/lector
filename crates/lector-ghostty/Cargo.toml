@@ -3,7 +3,8 @@ name = "lector-ghostty"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-publish = false
+description = "Lector's safe Rust adapter for Ghostty's pinned terminal C API"
+repository = "https://github.com/n0ot/lector"
 links = "ghostty-vt"
 build = "build.rs"
 
