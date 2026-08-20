@@ -14,9 +14,9 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     rc::Rc,
-    sync::mpsc,
+    sync::mpsc::{self, RecvTimeoutError},
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 const SPLIT: &str = "b25f,80x24,0,0{40x24,0,0,20,39x24,41,0,23}";
@@ -737,21 +737,36 @@ fn drive_real_tmux(
     physical: &mut Vec<u8>,
     mut done: impl FnMut(&mut App) -> bool,
 ) {
+    let mut idle_deadline = Instant::now() + Duration::from_secs(5);
     for _ in 0..800 {
         if done(app) {
             return;
         }
-        let chunk = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|error| {
-                panic!(
-                    "timed out in {case}: {error}; contents={:?}; topology={:?}",
-                    app.debug_active_view_contents(),
-                    app.debug_tmux_topology(1)
-                )
-            });
-        app.handle_pty(sr, &chunk, physical).unwrap();
         write_real_commands(app, sr, writer, physical);
+        let remaining = idle_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "timed out in {case}; contents={:?}; topology={:?}",
+                app.debug_active_view_contents(),
+                app.debug_tmux_topology(1)
+            );
+        }
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(chunk) => {
+                idle_deadline = Instant::now() + Duration::from_secs(5);
+                app.handle_pty(sr, &chunk, physical).unwrap();
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // A pane update can race an authoritative capture and schedule
+                // a quiet recapture while the tmux control channel is idle.
+                // Keep driving Lector's timers until data arrives.
+            }
+            Err(error) => panic!(
+                "tmux channel failed in {case}: {error}; contents={:?}; topology={:?}",
+                app.debug_active_view_contents(),
+                app.debug_tmux_topology(1)
+            ),
+        }
     }
     panic!("real tmux interaction fixture exceeded its bounded event count in {case}");
 }
@@ -834,7 +849,7 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
     writer
         .write_all(
             format!(
-                "new-session -d -s {second_session} \"/bin/sh -c 'printf SECOND; exec cat'\"\n"
+                "new-session -d -s {second_session} \"/bin/sh -c 'read ready; printf SECOND; exec cat'\"\n"
             )
             .as_bytes(),
         )
@@ -853,7 +868,13 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         },
     );
     writer
-        .write_all(format!("switch-client -t {second_session}\n").as_bytes())
+        .write_all(
+            format!(
+                "switch-client -t {second_session}\n\
+                 send-keys -t {second_session} Enter\n"
+            )
+            .as_bytes(),
+        )
         .unwrap();
     writer.flush().unwrap();
     drive_real_tmux(
