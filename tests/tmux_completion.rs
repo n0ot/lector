@@ -334,6 +334,7 @@ fn start_app_with_bootstraps_in_flight(
     let expected = [
         b"refresh-client -f pause-after=1\n".as_slice(),
         TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+        b"refresh-client -C 10x4\n",
         INVENTORY_COMMAND.as_bytes(),
     ]
     .concat();
@@ -346,10 +347,12 @@ fn start_app_with_bootstraps_in_flight(
         &mut physical,
     )
     .unwrap();
+    app.handle_pty(&mut sr, &reply(4, &[]), &mut physical)
+        .unwrap();
     let groups = inventory();
     assert_eq!(groups.len(), INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        app.handle_pty(&mut sr, &reply(index + 4, group), &mut physical)
+        app.handle_pty(&mut sr, &reply(index + 5, group), &mut physical)
             .unwrap();
     }
     commands.clear();
@@ -531,6 +534,7 @@ fn unsupported_flow_policy_reply_does_not_steal_inventory_or_bootstrap_correlati
         [
             TMUX_FLOW_CONTROL_COMMAND,
             TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 10x4\n",
             INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -548,8 +552,10 @@ fn unsupported_flow_policy_reply_does_not_steal_inventory_or_bootstrap_correlati
         &mut physical,
     )
     .unwrap();
+    app.handle_pty(&mut sr, &reply(4, &[]), &mut physical)
+        .unwrap();
     for (index, group) in inventory().iter().enumerate() {
-        app.handle_pty(&mut sr, &reply(index + 4, group), &mut physical)
+        app.handle_pty(&mut sr, &reply(index + 5, group), &mut physical)
             .unwrap();
     }
     let captures = drain(&mut app, &mut sr, &mut physical);

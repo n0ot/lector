@@ -120,6 +120,7 @@ fn add_ready_connection(
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -132,13 +133,14 @@ fn add_ready_connection(
         &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()], true),
         physical,
     );
+    feed(app, sr, &mut router, &reply(4, &[], true), physical);
     assert_eq!(groups.len(), INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
         feed(
             app,
             sr,
             &mut router,
-            &reply(index + 4, group, true),
+            &reply(index + 5, group, true),
             physical,
         );
     }
@@ -479,6 +481,7 @@ fn connection_chooser_switches_connections_and_survives_selected_removal() {
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -497,6 +500,13 @@ fn connection_chooser_switches_connections_and_survives_selected_removal() {
         &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()], true),
         &mut physical,
     );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut first,
+        &reply(4, &[], true),
+        &mut physical,
+    );
     for (index, group) in inventory("one", "one-window", "one-pane", "/dev/ttys-one")
         .iter()
         .enumerate()
@@ -505,7 +515,7 @@ fn connection_chooser_switches_connections_and_survives_selected_removal() {
             &mut app,
             &mut sr,
             &mut first,
-            &reply(index + 4, group, true),
+            &reply(index + 5, group, true),
             &mut physical,
         );
     }

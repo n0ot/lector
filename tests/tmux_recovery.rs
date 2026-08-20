@@ -319,6 +319,7 @@ fn ready_parent(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) {
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -330,6 +331,7 @@ fn ready_parent(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) {
         physical,
     )
     .unwrap();
+    app.handle_pty(sr, &reply(4, &[]), physical).unwrap();
     let groups = [
         vec![b"S\t$1\tparent".to_vec()],
         vec![b"W\t$1\t@10\t1\t1\tb25f,80x24,0,0,20\tb25f,80x24,0,0,20\t*\tparent".to_vec()],
@@ -346,7 +348,7 @@ fn ready_parent(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) {
     ];
     assert_eq!(groups.len(), lector::tmux_model::INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        app.handle_pty(sr, &reply(index + 4, group), physical)
+        app.handle_pty(sr, &reply(index + 5, group), physical)
             .unwrap();
     }
     transport.clear();

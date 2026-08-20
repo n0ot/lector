@@ -434,6 +434,7 @@ fn delayed_outer_probe_replies_cannot_pollute_a_new_tmux_control_connection() {
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat(),

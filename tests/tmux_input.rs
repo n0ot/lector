@@ -263,6 +263,7 @@ fn ready_split_app() -> (App, ScreenReader, Vec<u8>) {
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -275,6 +276,8 @@ fn ready_split_app() -> (App, ScreenReader, Vec<u8>) {
         &mut physical,
     )
     .unwrap();
+    app.handle_pty(&mut sr, &command_reply(4, &[]), &mut physical)
+        .unwrap();
     let window = format!("W\t$1\t@10\t1\t1\t{SPLIT}\t{SPLIT}\t*\tinput");
     let groups = [
         vec!["S\t$1\twork"],
@@ -294,7 +297,7 @@ fn ready_split_app() -> (App, ScreenReader, Vec<u8>) {
         vec!["B\tn\t0\tnext-window"],
     ];
     for (index, lines) in groups.iter().enumerate() {
-        app.handle_pty(&mut sr, &command_reply(index + 4, lines), &mut physical)
+        app.handle_pty(&mut sr, &command_reply(index + 5, lines), &mut physical)
             .unwrap();
     }
     control.clear();

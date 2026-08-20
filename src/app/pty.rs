@@ -514,6 +514,11 @@ impl App {
             expected_replies: vec![ExpectedTmuxReply::FlowControlVerification],
             kind: PendingTmuxCommandKind::Ordinary,
         });
+        // Control-mode clients do not inherit their size from the PTY. Tell
+        // tmux the current outer geometry before inventory so the initial
+        // layouts and pane captures are produced at the displayed size.
+        let geometry = self.view_stack.root_mut().model().live_screen().geometry;
+        self.queue_tmux_resize(connection_id, geometry);
         self.queue_tmux_inventory(connection_id);
         self.active_tmux_connection = Some(connection_id);
         self.first_pty_update = None;
@@ -2465,9 +2470,12 @@ impl App {
         connection_id: u64,
         geometry: crate::terminal::TerminalGeometry,
     ) {
-        self.pending_tmux_commands.retain(|command| {
-            command.connection_id != connection_id || command.kind != PendingTmuxCommandKind::Resize
-        });
+        if let Some(command) = self.pending_tmux_commands.iter_mut().find(|command| {
+            command.connection_id == connection_id && command.kind == PendingTmuxCommandKind::Resize
+        }) {
+            command.bytes = crate::tmux_input::refresh_client_command(geometry);
+            return;
+        }
         self.pending_tmux_commands.push_back(PendingTmuxCommand {
             connection_id,
             bytes: crate::tmux_input::refresh_client_command(geometry),

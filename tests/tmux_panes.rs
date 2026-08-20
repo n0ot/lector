@@ -611,6 +611,7 @@ fn application_harness_bootstraps_and_incrementally_renders_real_control_records
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -623,6 +624,8 @@ fn application_harness_bootstraps_and_incrementally_renders_real_control_records
         &mut physical,
     )
     .unwrap();
+    app.handle_pty(&mut sr, b"%begin 4 4 0\n%end 4 4 0\n", &mut physical)
+        .unwrap();
 
     let inventory_groups = [
         vec![b"S\t$1\twork".to_vec()],
@@ -649,10 +652,10 @@ fn application_harness_bootstraps_and_incrementally_renders_real_control_records
             .join("\n");
         let response = format!(
             "%begin {} {} 0\n{output}\n%end {} {} 0\n",
-            index + 4,
-            index + 4,
-            index + 4,
-            index + 4
+            index + 5,
+            index + 5,
+            index + 5,
+            index + 5
         );
         app.handle_pty(&mut sr, response.as_bytes(), &mut physical)
             .unwrap();

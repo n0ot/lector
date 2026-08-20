@@ -140,6 +140,7 @@ fn add_ready_connection(
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -153,11 +154,12 @@ fn add_ready_connection(
         &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()]),
         physical,
     );
+    feed(app, sr, &mut router, &reply(4, &[]), physical);
 
     let groups = inventory(connection_id);
     assert_eq!(groups.len(), INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        feed(app, sr, &mut router, &reply(index + 4, group), physical);
+        feed(app, sr, &mut router, &reply(index + 5, group), physical);
     }
 
     commands.clear();

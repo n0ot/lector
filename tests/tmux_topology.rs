@@ -397,6 +397,7 @@ fn app_queues_inventory_after_handshake_and_exposes_accessible_debug_dump() {
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x8\n",
             INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -409,6 +410,8 @@ fn app_queues_inventory_after_handshake_and_exposes_accessible_debug_dump() {
         &mut physical,
     )
     .unwrap();
+    app.handle_pty(&mut sr, b"%begin 4 4 0\n%end 4 4 0\n", &mut physical)
+        .unwrap();
 
     let inventory = complete_inventory();
     let groups = [
@@ -433,10 +436,10 @@ fn app_queues_inventory_after_handshake_and_exposes_accessible_debug_dump() {
             .join("\n");
         let response = format!(
             "%begin {} {} 0\n{output}\n%end {} {} 0\n",
-            index + 4,
-            index + 4,
-            index + 4,
-            index + 4
+            index + 5,
+            index + 5,
+            index + 5,
+            index + 5
         );
         app.handle_pty(&mut sr, response.as_bytes(), &mut physical)
             .unwrap();
@@ -551,6 +554,7 @@ fn failed_inventory_batch_retries_once_without_publishing_partial_topology() {
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x8\n",
             INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -564,8 +568,10 @@ fn failed_inventory_batch_retries_once_without_publishing_partial_topology() {
         &mut physical,
     )
     .unwrap();
+    app.handle_pty(&mut sr, b"%begin 4 4 0\n%end 4 4 0\n", &mut physical)
+        .unwrap();
 
-    for number in 4..(4 + INVENTORY_REPLY_COUNT) {
+    for number in 5..(5 + INVENTORY_REPLY_COUNT) {
         let response = format!("%begin {number} {number} 0\nfailed\n%error {number} {number} 0\n");
         app.handle_pty(&mut sr, response.as_bytes(), &mut physical)
             .unwrap();

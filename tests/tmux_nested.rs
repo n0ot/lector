@@ -204,6 +204,7 @@ fn ready_root(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) {
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -215,10 +216,11 @@ fn ready_root(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) {
         physical,
     )
     .unwrap();
+    app.handle_pty(sr, &reply(4, &[], true), physical).unwrap();
     let groups = inventory(true, "outer", "/dev/ttys-outer");
     assert_eq!(groups.len(), INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        app.handle_pty(sr, &reply(index + 4, group, true), physical)
+        app.handle_pty(sr, &reply(index + 5, group, true), physical)
             .unwrap();
     }
     assert_eq!(
@@ -256,6 +258,7 @@ fn ready_nested(
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -270,8 +273,9 @@ fn ready_nested(
         depth,
         &reply(50, &[b"attached,control-mode,pause-after=1".to_vec()], true),
     );
+    feed_at_depth(app, sr, physical, depth, &reply(51, &[], true));
     for (index, group) in groups.iter().enumerate() {
-        feed_at_depth(app, sr, physical, depth, &reply(51 + index, group, true));
+        feed_at_depth(app, sr, physical, depth, &reply(52 + index, group, true));
     }
     let routed_capture = drain_root(app);
     let mut decoded = routed_capture;
@@ -572,6 +576,7 @@ fn two_nested_levels_keep_identical_ids_separate_and_route_recursively() {
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()

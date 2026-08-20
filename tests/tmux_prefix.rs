@@ -337,6 +337,7 @@ fn ready_app_with_bootstrap(
         [
             lector::app::TMUX_FLOW_CONTROL_COMMAND,
             lector::app::TMUX_FLOW_CONTROL_VERIFY_COMMAND,
+            b"refresh-client -C 80x24\n",
             lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
         ]
         .concat()
@@ -349,11 +350,13 @@ fn ready_app_with_bootstrap(
         &mut physical,
     )
     .unwrap();
+    app.handle_pty(&mut sr, &reply(4, &[], true), &mut physical)
+        .unwrap();
 
     let groups = inventory_groups();
     assert_eq!(groups.len(), lector::tmux_model::INVENTORY_REPLY_COUNT);
     for (index, group) in groups.iter().enumerate() {
-        app.handle_pty(&mut sr, &reply(index + 4, group, true), &mut physical)
+        app.handle_pty(&mut sr, &reply(index + 5, group, true), &mut physical)
             .unwrap();
     }
     commands.clear();
