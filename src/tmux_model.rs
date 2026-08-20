@@ -692,7 +692,7 @@ impl TmuxTopology {
                 true
             },
             cursor_shape: if extended {
-                text(fields[13], "cursor shape")?.to_owned()
+                parse_cursor_shape(fields[13])?
             } else {
                 "default".to_owned()
             },
@@ -1138,6 +1138,11 @@ fn boolean(bytes: &[u8], field: &'static str) -> Result<bool, TopologyError> {
     }
 }
 
+fn parse_cursor_shape(bytes: &[u8]) -> Result<String, TopologyError> {
+    let shape = text(bytes, "cursor shape")?;
+    Ok(if shape.is_empty() { "default" } else { shape }.to_owned())
+}
+
 #[must_use]
 pub fn pane_capture_metadata_command(pane_id: PaneId) -> Vec<u8> {
     format!(
@@ -1171,7 +1176,7 @@ pub fn parse_pane_capture_metadata(
         cursor_x: number(fields[7], "cursor x")?,
         cursor_y: number(fields[8], "cursor y")?,
         cursor_visible: boolean(fields[9], "cursor visible")?,
-        cursor_shape: text(fields[10], "cursor shape")?.to_owned(),
+        cursor_shape: parse_cursor_shape(fields[10])?,
         alternate_on: boolean(fields[11], "alternate screen")?,
         pane_in_mode: number(fields[12], "pane mode")?,
         history_size: number(fields[13], "history size")?,

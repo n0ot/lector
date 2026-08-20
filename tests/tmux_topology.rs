@@ -5,7 +5,7 @@ use lector::{
     tmux_gateway::{GatewayEvent, TmuxGatewayRouter},
     tmux_model::{
         INVENTORY_COMMAND, INVENTORY_REPLY_COUNT, PaneId, ReconcileOutcome, SessionId,
-        TmuxTopology, WindowId,
+        TmuxTopology, WindowId, parse_pane_capture_metadata,
     },
     views,
 };
@@ -315,6 +315,24 @@ fn named_pane_mode_is_parsed_and_can_be_predicted_closed() {
     topology.clear_native_copy_mode(PaneId(20));
     assert_eq!(topology.pane(PaneId(20)).unwrap().mode, "");
     assert_eq!(topology.pane(PaneId(20)).unwrap().pane_in_mode, 0);
+}
+
+#[test]
+fn missing_older_tmux_cursor_shape_defaults_in_inventory_and_capture_metadata() {
+    let records = [
+        b"S\t$1\twork".to_vec(),
+        b"W\t$1\t@10\t1\t1\tlayout\tlayout\t*\tmain".to_vec(),
+        b"P\t@10\t%20\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t\t0\t0\t\t0\tshell".to_vec(),
+        b"A\t$1\thost".to_vec(),
+    ];
+    let mut topology = TmuxTopology::new(1);
+    topology.replace_inventory(&records).unwrap();
+    assert_eq!(topology.pane(PaneId(20)).unwrap().cursor_shape, "default");
+
+    let metadata =
+        parse_pane_capture_metadata(b"R\t%20\t0\t0\t80\t24\t0\t0\t0\t1\t\t0\t0\t0", PaneId(20))
+            .unwrap();
+    assert_eq!(metadata.cursor_shape, "default");
 }
 
 #[test]
