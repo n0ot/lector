@@ -926,6 +926,129 @@ fn review_backward_search_and_reverse_repeat_are_motion_commands() {
 }
 
 #[test]
+fn overlay_redraws_keep_the_physical_terminal_in_sync_with_the_composed_scene() {
+    fn assert_physical_scene(app: &mut App, physical: &GhosttyEngine, context: &str) {
+        let intended = PresentedScene::compose(&app.composed_scene().expect("compose scene"))
+            .expect("present scene")
+            .into_terminal_snapshot();
+        let actual = physical.normalized_snapshot();
+        assert_eq!(
+            actual.contents_full(),
+            intended.contents_full(),
+            "{context}"
+        );
+        assert_eq!(actual.cursor, intended.cursor, "{context}");
+        assert_eq!(actual.modes, intended.modes, "{context}");
+    }
+
+    fn present(
+        app: &mut App,
+        clock: &FakeClock,
+        output: &mut Vec<u8>,
+        physical: &mut GhosttyEngine,
+        context: &str,
+    ) {
+        clock.advance_ms(4);
+        let report = app
+            .drain_scheduled_output(output, false)
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+        assert!(!report.blocked, "{context}");
+        physical
+            .advance(output)
+            .unwrap_or_else(|error| panic!("{context}: {error}"));
+        output.clear();
+    }
+
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let mut physical = GhosttyEngine::new(24, 80).expect("create physical oracle");
+
+    app.handle_pty(
+        &mut sr,
+        b"python first\r\nother line\r\npython last\x1b[24;1H",
+        &mut term_out,
+    )
+    .expect("draw source with the application cursor at the bottom");
+    present(
+        &mut app,
+        &clock,
+        &mut term_out,
+        &mut physical,
+        "present source",
+    );
+
+    app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+        .expect("open review");
+    present(
+        &mut app,
+        &clock,
+        &mut term_out,
+        &mut physical,
+        "present review",
+    );
+
+    app.handle_stdin(&mut sr, b"?python\r", &mut pty_out, &mut term_out)
+        .expect("search backward in review");
+    present(
+        &mut app,
+        &clock,
+        &mut term_out,
+        &mut physical,
+        "present search result",
+    );
+    assert_physical_scene(&mut app, &physical, "completed review search");
+    assert!(
+        !physical
+            .normalized_snapshot()
+            .contents_full()
+            .contains("?python"),
+        "the completed prompt remained visible"
+    );
+
+    app.handle_stdin(&mut sr, b"q", &mut pty_out, &mut term_out)
+        .expect("close review");
+    present(
+        &mut app,
+        &clock,
+        &mut term_out,
+        &mut physical,
+        "restore source",
+    );
+    assert_physical_scene(&mut app, &physical, "review dismissal");
+
+    app.handle_stdin(&mut sr, b"\x1bL3 + 3\r", &mut pty_out, &mut term_out)
+        .expect("open the Lua REPL and submit an expression");
+    present(
+        &mut app,
+        &clock,
+        &mut term_out,
+        &mut physical,
+        "present submitted expression",
+    );
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish Lua evaluation");
+    present(
+        &mut app,
+        &clock,
+        &mut term_out,
+        &mut physical,
+        "present Lua result",
+    );
+    assert_physical_scene(&mut app, &physical, "Lua evaluation result");
+    assert!(
+        physical
+            .normalized_snapshot()
+            .contents_full()
+            .lines()
+            .any(|line| line.trim() == "6"),
+        "the Lua result was modeled but not visible"
+    );
+    assert!(pty_out.is_empty());
+}
+
+#[test]
 fn review_prompt_jumps_use_osc133_markers() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();

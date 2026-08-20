@@ -726,6 +726,17 @@ impl TmuxPaneSet {
         output: &[Vec<u8>],
         now_ms: u128,
     ) -> Result<(), TmuxPaneError> {
+        self.apply_bootstrap_with_line_flags(pane_id, status, output, true, now_ms)
+    }
+
+    pub fn apply_bootstrap_with_line_flags(
+        &mut self,
+        pane_id: PaneId,
+        status: CommandStatus,
+        output: &[Vec<u8>],
+        line_flags: bool,
+        now_ms: u128,
+    ) -> Result<(), TmuxPaneError> {
         let state = self
             .panes
             .get_mut(&pane_id)
@@ -752,8 +763,11 @@ impl TmuxPaneSet {
             state.metadata.cursor_y,
             state.metadata.cursor_visible,
             &state.metadata.cursor_shape,
-            output,
-            &[],
+            CaptureOutput {
+                lines: output,
+                pending_escape: &[],
+                line_flags,
+            },
         );
         view.process_changes(&bytes);
         let buffered = std::mem::take(&mut state.prebootstrap_output);
@@ -777,6 +791,17 @@ impl TmuxPaneSet {
         metadata: &PaneCaptureMetadata,
         output: &[Vec<u8>],
         pending_escape: &[u8],
+        now_ms: u128,
+    ) -> Result<(), TmuxPaneError> {
+        self.apply_resync_capture_with_line_flags(metadata, output, pending_escape, true, now_ms)
+    }
+
+    pub fn apply_resync_capture_with_line_flags(
+        &mut self,
+        metadata: &PaneCaptureMetadata,
+        output: &[Vec<u8>],
+        pending_escape: &[u8],
+        line_flags: bool,
         now_ms: u128,
     ) -> Result<(), TmuxPaneError> {
         let state = self
@@ -811,8 +836,11 @@ impl TmuxPaneSet {
             metadata.cursor_y,
             metadata.cursor_visible,
             &metadata.cursor_shape,
-            output,
-            pending_escape,
+            CaptureOutput {
+                lines: output,
+                pending_escape,
+                line_flags,
+            },
         );
         view.process_changes(&bytes);
         view.discard_shadow_pty_replies();
@@ -1217,7 +1245,14 @@ fn dimension(value: u32) -> u16 {
 }
 
 pub fn capture_command(pane: &Pane) -> Vec<u8> {
-    capture_command_for_state(pane.id, pane.alternate_on, pane.pane_in_mode)
+    capture_command_for_state(pane.id, pane.alternate_on, pane.pane_in_mode, true)
+}
+
+/// Builds the portable capture form used when tmux reports that line flags
+/// are unsupported. tmux 3.6 and earlier still provide the complete pane
+/// text, but do not understand `capture-pane -F`.
+pub fn portable_capture_command(pane: &Pane) -> Vec<u8> {
+    capture_command_for_state(pane.id, pane.alternate_on, pane.pane_in_mode, false)
 }
 
 pub fn capture_command_for_metadata(metadata: &PaneCaptureMetadata) -> Vec<u8> {
@@ -1225,15 +1260,34 @@ pub fn capture_command_for_metadata(metadata: &PaneCaptureMetadata) -> Vec<u8> {
         metadata.pane_id,
         metadata.alternate_on,
         metadata.pane_in_mode,
+        true,
     )
 }
 
-fn capture_command_for_state(pane_id: PaneId, alternate_on: bool, pane_in_mode: u32) -> Vec<u8> {
+pub fn portable_capture_command_for_metadata(metadata: &PaneCaptureMetadata) -> Vec<u8> {
+    capture_command_for_state(
+        metadata.pane_id,
+        metadata.alternate_on,
+        metadata.pane_in_mode,
+        false,
+    )
+}
+
+fn capture_command_for_state(
+    pane_id: PaneId,
+    alternate_on: bool,
+    pane_in_mode: u32,
+    line_flags: bool,
+) -> Vec<u8> {
     let mut command = b"capture-pane ".to_vec();
     if pane_in_mode > 0 {
         command.extend_from_slice(b"-M ");
     }
-    command.extend_from_slice(b"-p -e -F -J ");
+    command.extend_from_slice(b"-p -e ");
+    if line_flags {
+        command.extend_from_slice(b"-F ");
+    }
+    command.extend_from_slice(b"-J ");
     if !alternate_on && pane_in_mode == 0 {
         command.extend_from_slice(b"-S - ");
     }
@@ -1246,25 +1300,34 @@ pub fn pending_escape_capture_command(pane_id: PaneId) -> Vec<u8> {
     format!("capture-pane -p -P -t %{}\n", pane_id.0).into_bytes()
 }
 
+struct CaptureOutput<'a> {
+    lines: &'a [Vec<u8>],
+    pending_escape: &'a [u8],
+    line_flags: bool,
+}
+
 fn reconstruction_bytes(
     alternate_on: bool,
     cursor_x: u32,
     cursor_y: u32,
     cursor_visible: bool,
     cursor_shape: &str,
-    output: &[Vec<u8>],
-    pending_escape: &[u8],
+    capture: CaptureOutput<'_>,
 ) -> Vec<u8> {
     let mut bytes = Vec::new();
     if alternate_on {
         bytes.extend_from_slice(b"\x1b[?1049h");
     }
     bytes.extend_from_slice(b"\x1b[2J\x1b[H");
-    for (index, line) in output.iter().enumerate() {
+    for (index, line) in capture.lines.iter().enumerate() {
         if index > 0 {
             bytes.extend_from_slice(b"\r\n");
         }
-        let (flags, contents) = capture_line_flags(line);
+        let (flags, contents) = if capture.line_flags {
+            capture_line_flags(line)
+        } else {
+            (&[][..], line.as_slice())
+        };
         if flags.contains(&b'P') {
             bytes.extend_from_slice(b"\x1b]133;A\x1b\\");
         } else if flags.contains(&b'O') {
@@ -1289,7 +1352,7 @@ fn reconstruction_bytes(
     // `capture-pane -P` returns only an incomplete parser sequence. Appending
     // it last preserves that continuation without allowing cursor restoration
     // sequences to become part of it.
-    bytes.extend_from_slice(pending_escape);
+    bytes.extend_from_slice(capture.pending_escape);
     bytes
 }
 
@@ -1312,6 +1375,7 @@ fn capture_line_flags(line: &[u8]) -> (&[u8], &[u8]) {
 mod synchronization_tests {
     use super::{
         TmuxLayout, TmuxPaneSet, capture_command_for_metadata, pending_escape_capture_command,
+        portable_capture_command_for_metadata,
     };
     use crate::{
         tmux_control::CommandStatus,
@@ -1428,10 +1492,18 @@ mod synchronization_tests {
             capture_command_for_metadata(&metadata),
             b"capture-pane -p -e -F -J -S - -t %20\n"
         );
+        assert_eq!(
+            portable_capture_command_for_metadata(&metadata),
+            b"capture-pane -p -e -J -S - -t %20\n"
+        );
         metadata.alternate_on = true;
         assert_eq!(
             capture_command_for_metadata(&metadata),
             b"capture-pane -p -e -F -J -t %20\n"
+        );
+        assert_eq!(
+            portable_capture_command_for_metadata(&metadata),
+            b"capture-pane -p -e -J -t %20\n"
         );
         metadata.pane_in_mode = 1;
         assert_eq!(
@@ -1442,6 +1514,26 @@ mod synchronization_tests {
             pending_escape_capture_command(PaneId(20)),
             b"capture-pane -p -P -t %20\n"
         );
+    }
+
+    #[test]
+    fn portable_capture_preserves_plain_text_that_resembles_line_flags() {
+        let mut panes = TmuxPaneSet::new(1);
+        panes.reconcile(&split_topology()).expect("reconcile");
+        panes
+            .apply_bootstrap_with_line_flags(
+                PaneId(20),
+                CommandStatus::Success,
+                &[b"P plain".to_vec(), b"O text".to_vec(), b"D data".to_vec()],
+                false,
+                0,
+            )
+            .expect("apply portable capture");
+
+        let contents = panes.pane_view(PaneId(20)).expect("pane").contents_full();
+        assert!(contents.contains("P plain"), "{contents:?}");
+        assert!(contents.contains("O text"), "{contents:?}");
+        assert!(contents.contains("D data"), "{contents:?}");
     }
 
     #[test]

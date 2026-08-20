@@ -109,6 +109,18 @@ impl App {
             .min(TMUX_FLOW_RETRY_MAX_MS)
     }
 
+    fn tmux_capture_line_flags_unsupported(
+        status: crate::tmux_control::CommandStatus,
+        output: &[Vec<u8>],
+    ) -> bool {
+        status == crate::tmux_control::CommandStatus::Error
+            && output.iter().any(|line| {
+                line.windows(b"unknown flag".len())
+                    .any(|window| window == b"unknown flag")
+                    && line.windows(b"-F".len()).any(|window| window == b"-F")
+            })
+    }
+
     fn complete_tmux_pane_resync(flow: &mut TmuxPaneFlowState) {
         flow.status = TmuxFlowStatus::Running;
         flow.is_paused = false;
@@ -500,6 +512,7 @@ impl App {
             flow_control_policy_accepted: None,
             flow_control_verified: None,
             flow_control_warning_announced: false,
+            capture_line_flags_supported: None,
             last_announced_location: None,
         });
         self.pending_tmux_commands.push_back(PendingTmuxCommand {
@@ -654,6 +667,7 @@ impl App {
         let mut sync_topology = false;
         let mut render_topology = false;
         let mut bootstrap_reply = None;
+        let mut bootstrap_retry = None;
         let mut pane_resync_probe = None;
         let mut pane_resync_success = None;
         let mut pane_resync_failure = None;
@@ -792,8 +806,27 @@ impl App {
                                 connection.flow_control_policy_accepted == Some(true) && retained,
                             );
                         }
-                        Some(ExpectedTmuxReply::Bootstrap(pane_id)) => {
-                            bootstrap_reply = Some((pane_id, status, output));
+                        Some(ExpectedTmuxReply::Bootstrap {
+                            pane_id,
+                            line_flags,
+                        }) => {
+                            if line_flags
+                                && Self::tmux_capture_line_flags_unsupported(status, &output)
+                                && let Some(pane) = connection.topology.pane(pane_id)
+                            {
+                                connection.capture_line_flags_supported = Some(false);
+                                bootstrap_retry = Some((
+                                    pane_id,
+                                    crate::tmux_panes::portable_capture_command(pane),
+                                ));
+                            } else {
+                                if line_flags
+                                    && status == crate::tmux_control::CommandStatus::Success
+                                {
+                                    connection.capture_line_flags_supported = Some(true);
+                                }
+                                bootstrap_reply = Some((pane_id, status, output, line_flags));
+                            }
                         }
                         Some(ExpectedTmuxReply::PaneResyncProbe(pane_id)) => {
                             if let Some(flow) = connection.pane_flow.get_mut(&pane_id) {
@@ -815,6 +848,8 @@ impl App {
                                         metadata: metadata.clone(),
                                         output: None,
                                         pending_escape: Vec::new(),
+                                        line_flags: connection.capture_line_flags_supported
+                                            != Some(false),
                                         parser_continuation_available: false,
                                         failed: false,
                                     },
@@ -893,6 +928,7 @@ impl App {
                                             post_metadata,
                                             capture.output.expect("capture output checked above"),
                                             capture.pending_escape,
+                                            capture.line_flags,
                                             capture.parser_continuation_available,
                                         ));
                                     } else {
@@ -1136,6 +1172,17 @@ impl App {
         }
         let mut announce_tmux_location = location_changed;
 
+        if let Some((pane_id, command)) = bootstrap_retry {
+            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+                connection_id,
+                bytes: command,
+                expected_replies: vec![ExpectedTmuxReply::Bootstrap {
+                    pane_id,
+                    line_flags: false,
+                }],
+                kind: PendingTmuxCommandKind::Ordinary,
+            });
+        }
         if request_resync {
             self.queue_tmux_inventory(connection_id);
         }
@@ -1149,13 +1196,20 @@ impl App {
         }
         if let Some(metadata) = pane_resync_probe {
             let pane_id = metadata.pane_id;
-            let resume_before_capture = self
+            let connection = self
                 .tmux_connections
                 .iter()
-                .find(|connection| connection.id == connection_id)
+                .find(|connection| connection.id == connection_id);
+            let resume_before_capture = connection
                 .and_then(|connection| connection.pane_flow.get(&pane_id))
                 .is_some_and(|flow| flow.final_resync_requested && flow.is_paused);
-            let capture_command = crate::tmux_panes::capture_command_for_metadata(&metadata);
+            let capture_line_flags = connection
+                .is_none_or(|connection| connection.capture_line_flags_supported != Some(false));
+            let capture_command = if capture_line_flags {
+                crate::tmux_panes::capture_command_for_metadata(&metadata)
+            } else {
+                crate::tmux_panes::portable_capture_command_for_metadata(&metadata)
+            };
             let pending_escape_command = crate::tmux_panes::pending_escape_capture_command(pane_id);
             let verification_command = crate::tmux_model::pane_capture_metadata_command(pane_id);
             let mut expected_replies = Vec::new();
@@ -1245,11 +1299,17 @@ impl App {
         {
             self.open_review(sr, false, term_out)?;
         }
-        if let Some((pane_id, status, output)) = bootstrap_reply {
+        if let Some((pane_id, status, output, line_flags)) = bootstrap_reply {
             self.discard_deferred_tmux_pane_output((connection_id, pane_id));
             if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
                 let was_ready = view.is_ready();
-                view.apply_bootstrap(pane_id, status, &output, self.clock.now_ms())?;
+                view.apply_bootstrap_with_line_flags(
+                    pane_id,
+                    status,
+                    &output,
+                    line_flags,
+                    self.clock.now_ms(),
+                )?;
                 let is_ready = view.is_ready() && !view.is_showing_portal();
                 render_topology = is_ready && (!was_ready || view.is_pane_visible(pane_id));
                 announce_tmux_location |= !was_ready && is_ready;
@@ -1314,7 +1374,7 @@ impl App {
                 }
             }
         }
-        if let Some((metadata, output, pending_escape, parser_continuation_available)) =
+        if let Some((metadata, output, pending_escape, line_flags, parser_continuation_available)) =
             pane_resync_success
         {
             let pane_id = metadata.pane_id;
@@ -1335,10 +1395,11 @@ impl App {
                 });
             if pane_is_present {
                 if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
-                    view.apply_resync_capture(
+                    view.apply_resync_capture_with_line_flags(
                         &metadata,
                         &output,
                         &pending_escape,
+                        line_flags,
                         self.clock.now_ms(),
                     )?;
                     render_topology = view.is_ready() && !view.is_showing_portal();
@@ -2342,7 +2403,12 @@ impl App {
                 kind: PendingTmuxCommandKind::Ordinary,
             });
         }
-        for request in requests {
+        let capture_line_flags = self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+            .is_none_or(|connection| connection.capture_line_flags_supported != Some(false));
+        for mut request in requests {
             if let Some(flow) = self
                 .tmux_connections
                 .iter_mut()
@@ -2352,10 +2418,16 @@ impl App {
             {
                 flow.resync_requested = true;
             }
+            if !capture_line_flags && let Some(pane) = topology.pane(request.pane_id) {
+                request.command = crate::tmux_panes::portable_capture_command(pane);
+            }
             self.pending_tmux_commands.push_back(PendingTmuxCommand {
                 connection_id,
                 bytes: request.command,
-                expected_replies: vec![ExpectedTmuxReply::Bootstrap(request.pane_id)],
+                expected_replies: vec![ExpectedTmuxReply::Bootstrap {
+                    pane_id: request.pane_id,
+                    line_flags: capture_line_flags,
+                }],
                 kind: PendingTmuxCommandKind::Ordinary,
             });
         }

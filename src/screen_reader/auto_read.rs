@@ -29,10 +29,6 @@ impl ScreenReader {
 
     fn auto_read_impl(&mut self, view: &mut View, prefer_cursor: bool) -> Result<bool> {
         self.report_application_cursor_indentation_changes(view)?;
-        if view.screen().contents() == view.prev_screen().contents() {
-            return Ok(false);
-        }
-
         let cursor_moves = view.accessibility_update_summary().cursor_operations;
         let scrolled = view.accessibility_update_summary().scroll_operations > 0;
         let changed_row_ranges = view.accessibility_update_summary().changed_rows.clone();
@@ -41,13 +37,27 @@ impl ScreenReader {
         view.accessibility_update_summary()
             .printed_text_into(&mut live_text);
 
+        // Printing a separator into an already-blank cell can advance the
+        // application cursor without changing normalized screen contents. It
+        // is still an echo acknowledgement and must consume the corresponding
+        // queued input character before a later word arrives.
+        if view.screen().contents() == view.prev_screen().contents() {
+            let suppressed_echo = self.should_suppress_key_echo(&live_text);
+            self.auto_read_buffers.live_text = live_text;
+            return Ok(suppressed_echo);
+        }
+
         let mut live_read_result = None;
         {
             let text = live_text.trim();
-            if !text.is_empty() && (cursor_moves == 0 || scrolled) {
+            if cursor_moves == 0 || scrolled {
                 let mut spoken = false;
-                let suppress_echo = self.should_suppress_key_echo(text);
+                // Match against the verbatim print stream. Trimming is a
+                // speech concern; dropping spaces here desynchronizes the
+                // input acknowledgement queue at every word boundary.
+                let suppress_echo = self.should_suppress_key_echo(&live_text);
                 if !suppress_echo
+                    && !text.is_empty()
                     && let Some(text) = self.hook_on_live_read(text, cursor_moves, scrolled)?
                     && !text.is_empty()
                 {
@@ -64,7 +74,9 @@ impl ScreenReader {
                     );
                     spoken = true;
                 }
-                live_read_result = Some(spoken || !text.is_empty());
+                if suppress_echo || !text.is_empty() {
+                    live_read_result = Some(suppress_echo || spoken || !text.is_empty());
+                }
             }
         }
 

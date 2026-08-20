@@ -197,6 +197,18 @@ impl TmuxConnectionView {
         self.panes.apply_bootstrap(pane_id, status, output, now_ms)
     }
 
+    pub fn apply_bootstrap_with_line_flags(
+        &mut self,
+        pane_id: PaneId,
+        status: CommandStatus,
+        output: &[Vec<u8>],
+        line_flags: bool,
+        now_ms: u128,
+    ) -> std::result::Result<(), TmuxPaneError> {
+        self.panes
+            .apply_bootstrap_with_line_flags(pane_id, status, output, line_flags, now_ms)
+    }
+
     pub fn apply_resync_capture(
         &mut self,
         metadata: &PaneCaptureMetadata,
@@ -209,6 +221,26 @@ impl TmuxConnectionView {
             .map_err(|_| TmuxPaneError::UnknownPane(metadata.pane_id.0))?;
         self.panes
             .apply_resync_capture(metadata, output, pending_escape, now_ms)
+    }
+
+    pub fn apply_resync_capture_with_line_flags(
+        &mut self,
+        metadata: &PaneCaptureMetadata,
+        output: &[Vec<u8>],
+        pending_escape: &[u8],
+        line_flags: bool,
+        now_ms: u128,
+    ) -> std::result::Result<(), TmuxPaneError> {
+        self.topology
+            .update_pane_capture_metadata(metadata)
+            .map_err(|_| TmuxPaneError::UnknownPane(metadata.pane_id.0))?;
+        self.panes.apply_resync_capture_with_line_flags(
+            metadata,
+            output,
+            pending_escape,
+            line_flags,
+            now_ms,
+        )
     }
 
     pub fn composed_scene(

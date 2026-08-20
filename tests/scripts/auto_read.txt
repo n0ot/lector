@@ -50,6 +50,24 @@ And settled:
 Then expect-pty-stdin: abcdefg
 And expect-no-speak:
 
+Scenario: screen-inert echoed separators do not desynchronize suppression
+Given suppress-key-echo: on
+When stdin: red green blue
+And pty-stdout: r
+And settled:
+And pty-stdout: e
+And settled:
+And pty-stdout: d
+And settled:
+And pty-stdout: \x20
+And settled:
+And pty-stdout: g
+And settled:
+And pty-stdout: reen\x20blue
+And settled:
+Then expect-pty-stdin: red green blue
+And expect-no-speak:
+
 Scenario: backspace speaks the deleted character after terminal confirmation
 Given pty-stdout: abc
 And settled:

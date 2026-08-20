@@ -256,18 +256,22 @@ impl ViewStack {
             .collect()
     }
 
-    /// Snapshots suitable for revealing an application beneath a compositor
-    /// overlay. An open synchronized-output surface contributes its committed
-    /// live viewport, never its mutable working frame or the user's selected
-    /// scrollback viewport.
+    /// Snapshots suitable for a compositor-owned presentation. The hidden
+    /// application contributes its committed live viewport, never its mutable
+    /// working frame or the user's selected scrollback viewport. Overlays are
+    /// themselves the compositor's live drawing surfaces, so their snapshots
+    /// must stay current with the render receipt being constructed.
     pub(crate) fn committed_presentation_snapshots(&mut self) -> Vec<TerminalSnapshot> {
-        let indices = std::iter::once(self.active_base)
-            .chain(self.base_count..self.views.len())
-            .collect::<Vec<_>>();
-        indices
-            .into_iter()
-            .map(|index| self.views[index].model().committed_presentation_snapshot())
-            .collect()
+        let mut snapshots = vec![
+            self.views[self.active_base]
+                .model()
+                .committed_presentation_snapshot(),
+        ];
+        snapshots.extend(self.views[self.base_count..].iter_mut().map(|view| {
+            view.model()
+                .with_live_screen(|model| model.live_screen().clone())
+        }));
+        snapshots
     }
 
     /// Captures the accessibility state represented by the scene currently

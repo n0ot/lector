@@ -180,6 +180,96 @@ fn app() -> (App, ScreenReader, Recorder, Vec<u8>) {
 }
 
 #[test]
+fn unsupported_capture_line_flags_retry_with_the_portable_tmux_command() {
+    let (mut app, mut sr, _recorder, mut physical) = app();
+    let connection_id = 1;
+    let mut router = TmuxGatewayRouter::with_first_connection_id(connection_id);
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"\x1bP1000p%begin 1 1 0\n%end 1 1 0\n",
+        &mut physical,
+    );
+    let mut commands = drain(&mut app, connection_id);
+    assert!(commands.ends_with(lector::tmux_model::INVENTORY_COMMAND.as_bytes()));
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &reply(2, &[], true),
+        &mut physical,
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &reply(3, &[b"attached,control-mode,pause-after=1".to_vec()], true),
+        &mut physical,
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &reply(4, &[], true),
+        &mut physical,
+    );
+    for (index, group) in inventory("old", "shell", "pane", "/dev/ttys-old")
+        .iter()
+        .enumerate()
+    {
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            &reply(index + 5, group, true),
+            &mut physical,
+        );
+    }
+    commands = drain(&mut app, connection_id);
+    assert_eq!(commands, b"capture-pane -p -e -F -J -S - -t %20\n");
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &reply(
+            30,
+            &[b"command capture-pane: unknown flag -F".to_vec()],
+            false,
+        ),
+        &mut physical,
+    );
+    assert!(
+        !app.debug_active_view_contents().contains("unknown flag"),
+        "a feature-negotiation error leaked into the pane"
+    );
+    commands = drain(&mut app, connection_id);
+    assert_eq!(commands, b"capture-pane -p -e -J -S - -t %20\n");
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &reply(
+            31,
+            &[
+                b"P plain pane text".to_vec(),
+                b"O ordinary pane text".to_vec(),
+                b"portable pane contents".to_vec(),
+            ],
+            true,
+        ),
+        &mut physical,
+    );
+    let contents = app.debug_active_view_contents();
+    assert!(contents.contains("P plain pane text"), "{contents:?}");
+    assert!(contents.contains("O ordinary pane text"), "{contents:?}");
+    assert!(contents.contains("portable pane contents"), "{contents:?}");
+}
+
+#[test]
 fn identical_tmux_ids_remain_isolated_across_connections_input_replies_and_speech() {
     let (mut app, mut sr, recorder, mut physical) = app();
     let mut first = add_ready_connection(

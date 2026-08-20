@@ -377,6 +377,7 @@ struct TmuxConnectionState {
     flow_control_policy_accepted: Option<bool>,
     flow_control_verified: Option<bool>,
     flow_control_warning_announced: bool,
+    capture_line_flags_supported: Option<bool>,
     last_announced_location: Option<crate::tmux_model::TmuxLocation>,
 }
 
@@ -384,6 +385,7 @@ struct PendingTmuxPaneCapture {
     metadata: crate::tmux_model::PaneCaptureMetadata,
     output: Option<Vec<Vec<u8>>>,
     pending_escape: Vec<u8>,
+    line_flags: bool,
     parser_continuation_available: bool,
     failed: bool,
 }
@@ -453,7 +455,10 @@ enum ExpectedTmuxReply {
     Inventory,
     FlowControlPolicy,
     FlowControlVerification,
-    Bootstrap(crate::tmux_model::PaneId),
+    Bootstrap {
+        pane_id: crate::tmux_model::PaneId,
+        line_flags: bool,
+    },
     PaneResyncProbe(crate::tmux_model::PaneId),
     PaneResyncCapture(crate::tmux_model::PaneId),
     PaneResyncPendingEscape(crate::tmux_model::PaneId),
