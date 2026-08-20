@@ -36,12 +36,16 @@ if [[ "$crate_name" == lector && "$is_test" == false ]]; then
     fi
     case "$target" in
         *-linux-musl)
-            wrapper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+            if [[ -n "${LECTOR_ZIG_CC_TARGET:-}" ]]; then
+                wrapper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+                exec "$rustc_bin" "${rustc_args[@]}" \
+                    -C target-feature=+crt-static \
+                    -C relocation-model=pic \
+                    -C linker="$wrapper_dir/zig-lld" \
+                    -C linker-flavor=ld.lld
+            fi
             exec "$rustc_bin" "${rustc_args[@]}" \
-                -C target-feature=+crt-static \
-                -C relocation-model=pic \
-                -C linker="$wrapper_dir/zig-lld" \
-                -C linker-flavor=ld.lld
+                -C target-feature=+crt-static
             ;;
         *-linux-gnu)
             wrapper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

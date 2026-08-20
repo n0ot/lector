@@ -318,14 +318,15 @@ Release builders use the same pinned source and exact Zig version. Released
 Lector binaries do not require Zig, the Ghostty application, or a shared
 `libghostty-vt` at runtime. All Linux targets enable Rust's `crt-static` target
 feature for the final Lector crate. Musl targets use Zig's bundled `ld.lld`
-directly so the final link is a static PIE and the AArch64 build retains the
-Cortex-A53 erratum mitigation. Glibc targets use a small compiler-driver wrapper
-to select glibc's working `-static-pie` mode without rustc's conflicting
-`-static -no-pie` combination. The resulting ELF is position-independent and
-has neither a dynamic interpreter nor `DT_NEEDED` entries. Libc is resolved by
-the final Rust link; it is deliberately not copied into `libghostty-vt.a`.
-macOS remains dynamically linked to Apple's system libraries, which are not
-available as supported static archives.
+directly for the Tier 2 cross-target builds so the final link is a static PIE
+and the AArch64 build retains the Cortex-A53 erratum mitigation. The native
+Alpine build uses its packaged musl linker. Glibc targets use a small
+compiler-driver wrapper to select glibc's working `-static-pie` mode without
+rustc's conflicting `-static -no-pie` combination. The resulting ELF is
+position-independent and has neither a dynamic interpreter nor `DT_NEEDED`
+entries. Libc is resolved by the final Rust link; it is deliberately not copied
+into `libghostty-vt.a`. macOS remains dynamically linked to Apple's system
+libraries, which are not available as supported static archives.
 
 A glibc ELF with no declared shared dependencies may still ask glibc to load
 matching NSS modules when account or network-name lookup falls back to those

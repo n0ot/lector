@@ -25,7 +25,21 @@ while (($# > 0)); do
             fi
             ;;
         *)
-            linker_args+=("$1")
+            case "$1" in
+                # rustc's musl fallback objects are selected before our
+                # direct linker adds PIE mode. Use the matching static-PIE
+                # startup and compiler-runtime objects.
+                */self-contained/crt1.o)
+                    linker_args+=("${1%/crt1.o}/rcrt1.o")
+                    ;;
+                */self-contained/crtbegin.o)
+                    linker_args+=("${1%/crtbegin.o}/crtbeginS.o")
+                    ;;
+                */self-contained/crtend.o)
+                    linker_args+=("${1%/crtend.o}/crtendS.o")
+                    ;;
+                *) linker_args+=("$1") ;;
+            esac
             shift
             ;;
     esac

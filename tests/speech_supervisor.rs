@@ -3,11 +3,13 @@ use lector::speech::{
     supervisor::{Supervisor, SupervisorEvent},
 };
 use serde_json::Value;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
