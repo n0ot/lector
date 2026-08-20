@@ -1,5 +1,6 @@
 use lector::terminal::{
     Color, GhosttyEngine, HistoryPosition, MouseEncoding, MouseProtocol, ScreenIdentity,
+    TerminalEngine,
 };
 use lector::view::View;
 use std::sync::Arc;
@@ -351,6 +352,33 @@ fn normalized_snapshots_are_owned_and_cannot_mutate_the_engine() {
     assert_eq!(original.rows[0].contents(), "");
     assert_eq!(engine.normalized_snapshot().cursor.col, 0);
     assert_eq!(engine.normalized_snapshot().rows[0].contents(), "");
+}
+
+#[test]
+fn live_adapter_snapshots_share_ghostty_rows_and_preserve_unchanged_cells() {
+    let mut engine = GhosttyEngine::new(4, 20).expect("create Ghostty engine");
+    assert!(Arc::ptr_eq(
+        &engine.snapshot().rows,
+        &engine.ghostty_snapshot().rows
+    ));
+    let before = engine.snapshot().clone();
+
+    engine.advance(b"one dirty row").expect("advance one row");
+
+    assert!(Arc::ptr_eq(
+        &engine.snapshot().rows,
+        &engine.ghostty_snapshot().rows
+    ));
+    assert!(!Arc::ptr_eq(
+        &before.rows[0].cells,
+        &engine.snapshot().rows[0].cells
+    ));
+    assert!(Arc::ptr_eq(
+        &before.rows[1].cells,
+        &engine.snapshot().rows[1].cells
+    ));
+    assert_eq!(before.rows[0].contents(), "");
+    assert_eq!(engine.snapshot().rows[0].contents(), "one dirty row");
 }
 
 #[test]

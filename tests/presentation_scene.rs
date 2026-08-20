@@ -7,6 +7,7 @@ use lector::{
     },
     terminal::{GhosttyEngine, TerminalGeometry},
 };
+use std::sync::Arc;
 
 struct ContractRenderer {
     observed_damage: Option<SceneDamage>,
@@ -84,6 +85,28 @@ fn empty_one_pane_and_z_ordered_overlay_scenes_compose_without_engine_identity()
     assert_eq!(composed.cursor_owner(), CursorOwner::Overlay(high_id));
     assert_eq!(composed.title(), Some("active overlay"));
     assert_eq!(composed.images().len(), 1);
+}
+
+#[test]
+fn a_covering_pane_is_the_compositor_backing_grid_at_any_terminal_size() {
+    let geometry = TerminalGeometry::new(37, 113, 9, 18);
+    let pane = presented(geometry, b"shared rows").into_terminal_snapshot();
+    let expected_rows = Arc::clone(&pane.rows);
+    let mut scene = Scene::new(geometry);
+    scene
+        .panes
+        .push(SceneSurface::new(SurfaceId(41), GridPoint::new(0, 0), pane));
+
+    let composed = PresentedScene::compose(&scene)
+        .expect("compose covering pane")
+        .into_terminal_snapshot();
+
+    assert_eq!(composed.geometry, geometry);
+    assert_eq!(composed.rows[0].contents(), "shared rows");
+    assert!(
+        Arc::ptr_eq(&composed.rows, &expected_rows),
+        "the common path must not allocate and discard a geometry-sized blank grid"
+    );
 }
 
 #[test]

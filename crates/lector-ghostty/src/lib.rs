@@ -7,9 +7,10 @@
 
 mod ffi;
 
+use serde::{Deserialize, Serialize};
 use std::{
-    borrow::Cow, ffi::c_void, fmt, marker::PhantomData, mem::MaybeUninit, ops::RangeInclusive,
-    ptr::NonNull, rc::Rc,
+    borrow::Cow, cell::RefCell, collections::BTreeMap, ffi::c_void, fmt, marker::PhantomData,
+    mem::MaybeUninit, ops::RangeInclusive, ptr::NonNull, rc::Rc, sync::Arc,
 };
 
 /// An error reported by the Ghostty C ABI or by validation at the Rust boundary.
@@ -105,7 +106,8 @@ pub mod build_info {
 }
 
 /// A color from Ghostty normalized without resolving palette entries.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ColorSnapshot {
     #[default]
     Default,
@@ -113,7 +115,8 @@ pub enum ColorSnapshot {
     Rgb(u8, u8, u8),
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UnderlineSnapshot {
     #[default]
     None,
@@ -125,7 +128,8 @@ pub enum UnderlineSnapshot {
 }
 
 /// The complete presentation-relevant style attributes of a Ghostty cell.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct StyleSnapshot {
     pub foreground: ColorSnapshot,
     pub background: ColorSnapshot,
@@ -160,13 +164,72 @@ pub struct SemanticMarkSnapshot {
 }
 
 /// A normalized cell from Ghostty's current visible viewport.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct CellSnapshot {
     pub grapheme: Cow<'static, str>,
     pub width: u8,
     pub continuation: bool,
     pub style: StyleSnapshot,
     pub hyperlink: Option<String>,
+}
+
+impl Default for CellSnapshot {
+    fn default() -> Self {
+        Self {
+            grapheme: Cow::Borrowed(""),
+            width: 1,
+            continuation: false,
+            style: StyleSnapshot::default(),
+            hyperlink: None,
+        }
+    }
+}
+
+impl CellSnapshot {
+    pub fn contents(&self) -> &str {
+        &self.grapheme
+    }
+
+    pub fn has_contents(&self) -> bool {
+        !self.grapheme.is_empty()
+    }
+
+    pub fn is_wide(&self) -> bool {
+        self.width == 2 && !self.continuation
+    }
+
+    pub fn is_wide_continuation(&self) -> bool {
+        self.continuation
+    }
+
+    pub fn fgcolor(&self) -> ColorSnapshot {
+        self.style.foreground
+    }
+
+    pub fn bgcolor(&self) -> ColorSnapshot {
+        self.style.background
+    }
+
+    pub fn bold(&self) -> bool {
+        self.style.bold
+    }
+
+    pub fn dim(&self) -> bool {
+        self.style.dim
+    }
+
+    pub fn italic(&self) -> bool {
+        self.style.italic
+    }
+
+    pub fn underline(&self) -> bool {
+        self.style.underline != UnderlineSnapshot::None
+    }
+
+    pub fn inverse(&self) -> bool {
+        self.style.inverse
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,7 +253,8 @@ pub struct KittyImagePlacementSnapshot {
     pub rendered_pixel_width: u32,
     pub rendered_pixel_height: u32,
     pub format: KittyImageFormatSnapshot,
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
+    pub data_digest: u64,
     pub x_offset: u32,
     pub y_offset: u32,
     pub viewport_col: i32,
@@ -207,17 +271,22 @@ pub struct KittyImagePlacementSnapshot {
 }
 
 /// A normalized visible row from Ghostty.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct RowSnapshot {
-    pub cells: Vec<CellSnapshot>,
+    pub cells: Arc<Vec<CellSnapshot>>,
     pub wrapped: bool,
 }
 
 impl RowSnapshot {
+    pub fn contents(&self) -> String {
+        self.text()
+    }
+
     pub fn text(&self) -> String {
         let mut output = String::new();
         let mut pending_spaces = 0;
-        for cell in &self.cells {
+        for cell in self.cells.iter() {
             if cell.continuation {
                 continue;
             }
@@ -458,7 +527,7 @@ pub struct UpdateSnapshot {
 /// Ghostty state normalized for Lector's engine-neutral consumers.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TerminalSnapshot {
-    pub rows: Vec<RowSnapshot>,
+    pub rows: Arc<Vec<RowSnapshot>>,
     pub scrollback: Vec<RowSnapshot>,
     pub cursor: CursorSnapshot,
     pub width_px: u32,
@@ -661,6 +730,15 @@ impl Drop for SnapshotDecoderHandle {
 const UNKNOWN_SEQUENCE_MAX_BYTES: usize = 256;
 const CONTINUATION_MAX_BYTES: usize = 64 * 1024;
 const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+fn stable_digest(bytes: &[u8]) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    digest
+}
 
 #[derive(Default)]
 struct EffectSink {
@@ -1272,6 +1350,12 @@ struct HistoryLineageAnchor {
     absolute_row: usize,
 }
 
+#[derive(Clone)]
+struct CachedKittyImage {
+    data: Arc<[u8]>,
+    data_digest: u64,
+}
+
 #[derive(Default)]
 struct StreamObserver {
     events: Vec<SemanticKindSnapshot>,
@@ -1877,6 +1961,10 @@ pub struct Terminal {
     /// request the expensive bounded-history copy only at an actual opener.
     history_changed_since_open_checkpoint: bool,
     semantic_marks: Vec<TrackedSemanticMark>,
+    /// Decoded image bytes copied out of Ghostty once and then shared through
+    /// the presentation pipeline. Each inspection compares Ghostty's borrowed
+    /// bytes before reusing an entry, so in-place image mutation remains exact.
+    kitty_image_cache: RefCell<BTreeMap<u32, CachedKittyImage>>,
     #[cfg(test)]
     snapshot_row_reads: usize,
     _thread_bound: PhantomData<Rc<()>>,
@@ -1950,6 +2038,7 @@ impl Terminal {
             primary_history_anchor: None,
             history_changed_since_open_checkpoint: false,
             semantic_marks: Vec::new(),
+            kitty_image_cache: RefCell::new(BTreeMap::new()),
             #[cfg(test)]
             snapshot_row_reads: 0,
             _thread_bound: PhantomData,
@@ -2246,6 +2335,7 @@ impl Terminal {
             // OSC 133 grid references are deliberately not part of this
             // diagnostic path yet. Runtime correctness never restores here.
             semantic_marks: Vec::new(),
+            kitty_image_cache: RefCell::new(BTreeMap::new()),
             #[cfg(test)]
             snapshot_row_reads: 0,
             _thread_bound: PhantomData,
@@ -2311,6 +2401,8 @@ impl Terminal {
         let mut iterator = KittyPlacementIteratorHandle::new()?;
         iterator.populate(graphics)?;
         let mut placements = Vec::new();
+        let retained_images = self.kitty_image_cache.borrow();
+        let mut current_images = BTreeMap::<u32, CachedKittyImage>::new();
         // SAFETY: the iterator is valid and the terminal remains immutable for
         // this complete traversal.
         while unsafe { ffi::ghostty_kitty_graphics_placement_next(iterator.as_ptr()) } {
@@ -2322,17 +2414,33 @@ impl Terminal {
             if image.is_null() {
                 return Err(Error::NullHandle);
             }
-            let data_len = kitty_image_query::<usize>(image, ffi::KITTY_IMAGE_DATA_DATA_LEN)?;
-            let data_ptr = kitty_image_query::<*const u8>(image, ffi::KITTY_IMAGE_DATA_DATA_PTR)?;
-            if data_len > 0 && data_ptr.is_null() {
-                return Err(Error::NullString);
-            }
-            let data = if data_len == 0 {
-                Vec::new()
+            let image_data = if let Some(current) = current_images.get(&image_id) {
+                current.clone()
             } else {
-                // SAFETY: Ghostty documents exactly `data_len` decoded bytes,
-                // borrowed until the terminal mutates. Copy them immediately.
-                unsafe { std::slice::from_raw_parts(data_ptr, data_len) }.to_vec()
+                let data_len = kitty_image_query::<usize>(image, ffi::KITTY_IMAGE_DATA_DATA_LEN)?;
+                let data_ptr =
+                    kitty_image_query::<*const u8>(image, ffi::KITTY_IMAGE_DATA_DATA_PTR)?;
+                if data_len > 0 && data_ptr.is_null() {
+                    return Err(Error::NullString);
+                }
+                // SAFETY: Ghostty documents exactly `data_len` decoded bytes
+                // borrowed until the terminal mutates. The comparison or Arc
+                // copy completes synchronously inside that lifetime.
+                let borrowed = if data_len == 0 {
+                    &[]
+                } else {
+                    unsafe { std::slice::from_raw_parts(data_ptr, data_len) }
+                };
+                let current = retained_images
+                    .get(&image_id)
+                    .filter(|cached| cached.data.as_ref() == borrowed)
+                    .cloned()
+                    .unwrap_or_else(|| CachedKittyImage {
+                        data: Arc::from(borrowed),
+                        data_digest: stable_digest(borrowed),
+                    });
+                current_images.insert(image_id, current.clone());
+                current
             };
             let format = match kitty_image_query::<ffi::KittyImageFormat>(
                 image,
@@ -2367,7 +2475,8 @@ impl Terminal {
                 rendered_pixel_width: render.pixel_width,
                 rendered_pixel_height: render.pixel_height,
                 format,
-                data,
+                data: Arc::clone(&image_data.data),
+                data_digest: image_data.data_digest,
                 x_offset: kitty_placement_query(&iterator, ffi::KITTY_PLACEMENT_DATA_X_OFFSET)?,
                 y_offset: kitty_placement_query(&iterator, ffi::KITTY_PLACEMENT_DATA_Y_OFFSET)?,
                 viewport_col: render.viewport_col,
@@ -2393,6 +2502,8 @@ impl Terminal {
                 placement.placement_id,
             )
         });
+        drop(retained_images);
+        *self.kitty_image_cache.borrow_mut() = current_images;
         Ok(placements)
     }
 
@@ -2672,7 +2783,7 @@ impl Terminal {
             }
         }
         if can_reuse_rows {
-            normalized_rows = std::mem::take(&mut self.snapshot.rows);
+            normalized_rows = Arc::unwrap_or_clone(std::mem::take(&mut self.snapshot.rows));
             for (row, replacement) in replacement_rows {
                 normalized_rows[row] = replacement;
             }
@@ -2709,7 +2820,7 @@ impl Terminal {
             )?;
         }
         self.snapshot = TerminalSnapshot {
-            rows: normalized_rows,
+            rows: Arc::new(normalized_rows),
             scrollback: Vec::new(),
             cursor: CursorSnapshot {
                 row: terminal_query(&self.terminal, ffi::TERMINAL_DATA_CURSOR_Y)?,
@@ -2787,7 +2898,7 @@ impl Terminal {
             return Err(Error::InvalidValue);
         }
         Ok(RowSnapshot {
-            cells: normalized_cells,
+            cells: Arc::new(normalized_cells),
             wrapped,
         })
     }
@@ -2886,7 +2997,10 @@ impl Terminal {
             let reference = terminal_grid_ref(&self.terminal, ffi::POINT_TAG_HISTORY, col, row)?;
             cells.push(read_grid_cell(&reference)?);
         }
-        Ok(RowSnapshot { cells, wrapped })
+        Ok(RowSnapshot {
+            cells: Arc::new(cells),
+            wrapped,
+        })
     }
 }
 

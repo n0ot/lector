@@ -164,19 +164,46 @@ fn pane_upload_cache_is_shared_across_scene_recomposition_without_copying_pixels
     let geometry = TerminalGeometry::new(3, 8, 10, 20);
     let engine = image_engine(geometry, ONE_PIXEL_RGBA);
     let mut store = PaneMediaStore::new(MediaLimits::default());
-    store
-        .synchronize(&engine.kitty_image_placements().expect("source media"))
-        .expect("cache source media");
+    let source = engine.kitty_image_placements().expect("source media");
+    store.synchronize(&source).expect("cache source media");
 
     let first = scene_with_media(ROOT, GridPoint::new(0, 0), geometry, &engine, &mut store);
     let second = scene_with_media(ROOT, GridPoint::new(0, 0), geometry, &engine, &mut store);
 
     assert_eq!(first.image_uploads.len(), 1);
     assert_eq!(second.image_uploads.len(), 1);
+    assert!(Arc::ptr_eq(&source[0].data, &first.image_uploads[0].data));
     assert!(Arc::ptr_eq(
         &first.image_uploads[0].data,
         &second.image_uploads[0].data
     ));
+}
+
+#[test]
+fn ghostty_media_payloads_are_shared_until_the_image_bytes_change() {
+    let geometry = TerminalGeometry::new(3, 8, 10, 20);
+    let mut engine = image_engine(geometry, ONE_PIXEL_RGBA);
+    let first = engine
+        .kitty_image_placements()
+        .expect("first media snapshot");
+
+    engine.advance(b"text").expect("unrelated text update");
+    let unchanged = engine
+        .kitty_image_placements()
+        .expect("unchanged media snapshot");
+    assert!(Arc::ptr_eq(&first[0].data, &unchanged[0].data));
+    assert_eq!(first[0].data_digest, unchanged[0].data_digest);
+
+    let replacement =
+        b"\x1b_Ga=d,d=A\x1b\\\x1b_Ga=T,f=32,s=1,v=1,i=7,p=9,c=1,r=1,q=2;AAD//w==\x1b\\";
+    engine.advance(replacement).expect("replace image bytes");
+    let changed = engine
+        .kitty_image_placements()
+        .expect("changed media snapshot");
+    assert_eq!(changed.len(), 1);
+    assert!(!Arc::ptr_eq(&first[0].data, &changed[0].data));
+    assert_ne!(first[0].data_digest, changed[0].data_digest);
+    assert_eq!(changed[0].data.as_ref(), [0, 0, 255, 255]);
 }
 
 #[test]

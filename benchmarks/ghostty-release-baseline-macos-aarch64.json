@@ -13,18 +13,18 @@
     {
       "name": "shell-and-semantic-prompts",
       "measured": {
-        "throughput_mib_per_second": 1.1157119352290705,
-        "allocations": 285924,
-        "allocated_bytes": 685773496,
-        "peak_rss_bytes": 14352384,
-        "latency_p95_ns": 17417,
+        "throughput_mib_per_second": 1.32509497182752,
+        "allocations": 255949,
+        "allocated_bytes": 359960504,
+        "peak_rss_bytes": 13860864,
+        "latency_p95_ns": 16583,
         "scrollback_extent": 0
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 0.6,
-        "maximum_latency_p95_ns": 50000,
-        "maximum_allocations": 320000,
-        "maximum_allocated_bytes": 750000000,
+        "minimum_throughput_mib_per_second": 0.8,
+        "maximum_latency_p95_ns": 40000,
+        "maximum_allocations": 275000,
+        "maximum_allocated_bytes": 450000000,
         "maximum_peak_rss_bytes": 33554432,
         "minimum_scrollback_extent": 0
       }
@@ -32,18 +32,18 @@
     {
       "name": "control-heavy-redraw",
       "measured": {
-        "throughput_mib_per_second": 5.354516856850878,
-        "allocations": 189743,
-        "allocated_bytes": 270089264,
-        "peak_rss_bytes": 15515648,
-        "latency_p95_ns": 6333,
+        "throughput_mib_per_second": 6.239307568994854,
+        "allocations": 197908,
+        "allocated_bytes": 142109712,
+        "peak_rss_bytes": 14958592,
+        "latency_p95_ns": 5459,
         "scrollback_extent": 0
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 2.5,
-        "maximum_latency_p95_ns": 20000,
+        "minimum_throughput_mib_per_second": 3.5,
+        "maximum_latency_p95_ns": 15000,
         "maximum_allocations": 220000,
-        "maximum_allocated_bytes": 300000000,
+        "maximum_allocated_bytes": 180000000,
         "maximum_peak_rss_bytes": 33554432,
         "minimum_scrollback_extent": 0
       }
@@ -51,18 +51,18 @@
     {
       "name": "bounded-scrollback",
       "measured": {
-        "throughput_mib_per_second": 0.6381532204859651,
-        "allocations": 1787359,
-        "allocated_bytes": 5606043686,
-        "peak_rss_bytes": 28491776,
-        "latency_p95_ns": 63375,
+        "throughput_mib_per_second": 0.8108531060601755,
+        "allocations": 1265380,
+        "allocated_bytes": 2814112398,
+        "peak_rss_bytes": 27869184,
+        "latency_p95_ns": 49625,
         "scrollback_extent": 10000
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 0.4,
-        "maximum_latency_p95_ns": 150000,
-        "maximum_allocations": 2000000,
-        "maximum_allocated_bytes": 6000000000,
+        "minimum_throughput_mib_per_second": 0.5,
+        "maximum_latency_p95_ns": 120000,
+        "maximum_allocations": 1500000,
+        "maximum_allocated_bytes": 3500000000,
         "maximum_peak_rss_bytes": 41943040,
         "minimum_scrollback_extent": 10000
       }
@@ -194,18 +194,18 @@
     {
       "name": "direct-compositor-pipeline",
       "measured": {
-        "throughput_mib_per_second": 0.4320139080755125,
-        "latency_p95_ns": 19542,
-        "allocations": 1096303,
-        "allocated_bytes": 1743733483,
+        "throughput_mib_per_second": 0.8074770097000066,
+        "latency_p95_ns": 10375,
+        "allocations": 586303,
+        "allocated_bytes": 228213483,
         "output_bytes": 420107,
         "completed_render_percent": 100.0
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 0.2,
-        "maximum_latency_p95_ns": 60000,
-        "maximum_allocations": 1200000,
-        "maximum_allocated_bytes": 2000000000,
+        "minimum_throughput_mib_per_second": 0.5,
+        "maximum_latency_p95_ns": 30000,
+        "maximum_allocations": 700000,
+        "maximum_allocated_bytes": 350000000,
         "maximum_output_bytes": 500000,
         "minimum_completed_render_percent": 99.0
       }
@@ -247,17 +247,17 @@
     {
       "name": "kitty-media-recomposition",
       "measured": {
-        "throughput_mib_per_second": 111.3928111535394,
-        "latency_p95_ns": 140541,
-        "allocated_bytes": 873737346,
+        "throughput_mib_per_second": 2570.4648733019917,
+        "latency_p95_ns": 6167,
+        "allocated_bytes": 14155164,
         "maximum_store_bytes": 16384,
         "maximum_scene_bytes": 16384,
         "upload_transactions": 1
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 60.0,
-        "maximum_latency_p95_ns": 300000,
-        "maximum_allocated_bytes": 1200000000,
+        "minimum_throughput_mib_per_second": 800.0,
+        "maximum_latency_p95_ns": 20000,
+        "maximum_allocated_bytes": 25000000,
         "maximum_store_bytes": 16384,
         "maximum_scene_bytes": 16384,
         "maximum_upload_transactions": 1

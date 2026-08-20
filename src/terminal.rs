@@ -1,126 +1,12 @@
 //! Engine-neutral terminal state and Lector's Ghostty terminal adapter.
 
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, ops::RangeInclusive, sync::Arc};
+use std::{ops::RangeInclusive, sync::Arc};
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Color {
-    #[default]
-    Default,
-    Indexed(u8),
-    Rgb(u8, u8, u8),
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UnderlineStyle {
-    #[default]
-    None,
-    Single,
-    Double,
-    Curly,
-    Dotted,
-    Dashed,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
-pub struct Style {
-    pub foreground: Color,
-    pub background: Color,
-    pub underline_color: Color,
-    pub bold: bool,
-    pub dim: bool,
-    pub italic: bool,
-    pub blink: bool,
-    pub inverse: bool,
-    pub invisible: bool,
-    pub strikethrough: bool,
-    pub overline: bool,
-    pub underline: UnderlineStyle,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
-pub struct Cell {
-    pub grapheme: Cow<'static, str>,
-    pub width: u8,
-    pub continuation: bool,
-    pub style: Style,
-    pub hyperlink: Option<String>,
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            grapheme: Cow::Borrowed(""),
-            width: 1,
-            continuation: false,
-            style: Style::default(),
-            hyperlink: None,
-        }
-    }
-}
-
-impl Cell {
-    pub fn contents(&self) -> &str {
-        &self.grapheme
-    }
-
-    pub fn has_contents(&self) -> bool {
-        !self.grapheme.is_empty()
-    }
-
-    pub fn is_wide(&self) -> bool {
-        self.width == 2 && !self.continuation
-    }
-
-    pub fn is_wide_continuation(&self) -> bool {
-        self.continuation
-    }
-
-    pub fn fgcolor(&self) -> Color {
-        self.style.foreground
-    }
-
-    pub fn bgcolor(&self) -> Color {
-        self.style.background
-    }
-
-    pub fn bold(&self) -> bool {
-        self.style.bold
-    }
-
-    pub fn dim(&self) -> bool {
-        self.style.dim
-    }
-
-    pub fn italic(&self) -> bool {
-        self.style.italic
-    }
-
-    pub fn underline(&self) -> bool {
-        self.style.underline != UnderlineStyle::None
-    }
-
-    pub fn inverse(&self) -> bool {
-        self.style.inverse
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
-pub struct Row {
-    pub cells: Arc<Vec<Cell>>,
-    pub wrapped: bool,
-}
-
-impl Row {
-    pub fn contents(&self) -> String {
-        row_contents(self, 0, self.cells.len() as u16)
-    }
-}
+pub use lector_ghostty::{
+    CellSnapshot as Cell, ColorSnapshot as Color, RowSnapshot as Row, StyleSnapshot as Style,
+    UnderlineSnapshot as UnderlineStyle,
+};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -757,15 +643,13 @@ fn full_row_range(rows: u16) -> Vec<RangeInclusive<u16>> {
 }
 
 pub use lector_ghostty::{
-    CellSnapshot as GhosttyCell, ClipboardContentSnapshot as GhosttyClipboardContent,
-    ClipboardLocationSnapshot as GhosttyClipboardLocation, ColorSnapshot as GhosttyColor,
-    CursorSnapshot as GhosttyCursor, EffectSnapshot as GhosttyEffect,
-    ModesSnapshot as GhosttyModes, OperationSnapshot as GhosttyOperation,
-    PrintBoundarySnapshot as GhosttyPrintBoundary, ProgressStateSnapshot as GhosttyProgressState,
-    QuerySnapshot as GhosttyQuery, RenderDamageSnapshot as GhosttyDamage,
-    RowSnapshot as GhosttyRow, SemanticKindSnapshot as GhosttySemanticKind,
-    StyleSnapshot as GhosttyStyle, TerminalSnapshot as GhosttySnapshot,
-    UpdateSnapshot as GhosttyUpdate,
+    ClipboardContentSnapshot as GhosttyClipboardContent,
+    ClipboardLocationSnapshot as GhosttyClipboardLocation, CursorSnapshot as GhosttyCursor,
+    EffectSnapshot as GhosttyEffect, ModesSnapshot as GhosttyModes,
+    OperationSnapshot as GhosttyOperation, PrintBoundarySnapshot as GhosttyPrintBoundary,
+    ProgressStateSnapshot as GhosttyProgressState, QuerySnapshot as GhosttyQuery,
+    RenderDamageSnapshot as GhosttyDamage, SemanticKindSnapshot as GhosttySemanticKind,
+    TerminalSnapshot as GhosttySnapshot, UpdateSnapshot as GhosttyUpdate,
 };
 
 /// Lector's sole authoritative terminal engine.
@@ -1096,7 +980,7 @@ impl GhosttyEngine {
 
     fn refresh_snapshot_after_update(
         &mut self,
-        damage: &GhosttyDamage,
+        _damage: &GhosttyDamage,
     ) -> Result<(), lector_ghostty::Error> {
         if self.viewport != Viewport::Live {
             return self.refresh_snapshot();
@@ -1107,38 +991,7 @@ impl GhosttyEngine {
         }
 
         let source = self.terminal.snapshot();
-        let (rows, cols) = source.size();
-        let geometry_matches = self.snapshot.geometry.rows == rows
-            && self.snapshot.geometry.cols == cols
-            && self.snapshot.rows.len() == usize::from(rows)
-            && self
-                .snapshot
-                .rows
-                .iter()
-                .all(|row| row.cells.len() == usize::from(cols));
-        let partial_ranges = match damage {
-            GhosttyDamage::None if geometry_matches => Some(&[][..]),
-            GhosttyDamage::Rows(ranges)
-                if geometry_matches
-                    && ranges
-                        .iter()
-                        .all(|range| range.start() <= range.end() && *range.end() < rows) =>
-            {
-                Some(ranges.as_slice())
-            }
-            GhosttyDamage::None | GhosttyDamage::Rows(_) | GhosttyDamage::Full => None,
-        };
-
-        let Some(ranges) = partial_ranges else {
-            self.snapshot = normalize_ghostty_snapshot(source);
-            return Ok(());
-        };
-        for range in ranges {
-            for row in range.clone() {
-                Arc::make_mut(&mut self.snapshot.rows)[usize::from(row)] =
-                    normalize_ghostty_row(&source.rows[usize::from(row)]);
-            }
-        }
+        self.snapshot.rows = Arc::clone(&source.rows);
         self.snapshot.scrollback.clear();
         refresh_normalized_ghostty_metadata(&mut self.snapshot, source);
         Ok(())
@@ -1236,12 +1089,8 @@ impl TerminalEngine for GhosttyEngine {
 
 fn normalize_ghostty_snapshot(snapshot: &GhosttySnapshot) -> TerminalSnapshot {
     let mut normalized = TerminalSnapshot {
-        rows: Arc::new(snapshot.rows.iter().map(normalize_ghostty_row).collect()),
-        scrollback: snapshot
-            .scrollback
-            .iter()
-            .map(normalize_ghostty_row)
-            .collect(),
+        rows: Arc::clone(&snapshot.rows),
+        scrollback: snapshot.scrollback.clone(),
         ..TerminalSnapshot::default()
     };
     refresh_normalized_ghostty_metadata(&mut normalized, snapshot);
@@ -1449,56 +1298,6 @@ fn ghostty_screen_identity(alternate: bool) -> ScreenIdentity {
         ScreenIdentity::Alternate
     } else {
         ScreenIdentity::Primary
-    }
-}
-
-fn normalize_ghostty_row(row: &GhosttyRow) -> Row {
-    Row {
-        cells: row
-            .cells
-            .iter()
-            .map(|cell| Cell {
-                grapheme: cell.grapheme.clone(),
-                width: cell.width,
-                continuation: cell.continuation,
-                style: normalize_ghostty_style(cell.style.clone()),
-                hyperlink: cell.hyperlink.clone(),
-            })
-            .collect::<Vec<_>>()
-            .into(),
-        wrapped: row.wrapped,
-    }
-}
-
-fn normalize_ghostty_style(style: GhosttyStyle) -> Style {
-    Style {
-        foreground: normalize_ghostty_color(style.foreground),
-        background: normalize_ghostty_color(style.background),
-        underline_color: normalize_ghostty_color(style.underline_color),
-        bold: style.bold,
-        dim: style.dim,
-        italic: style.italic,
-        blink: style.blink,
-        inverse: style.inverse,
-        invisible: style.invisible,
-        strikethrough: style.strikethrough,
-        overline: style.overline,
-        underline: match style.underline {
-            lector_ghostty::UnderlineSnapshot::None => UnderlineStyle::None,
-            lector_ghostty::UnderlineSnapshot::Single => UnderlineStyle::Single,
-            lector_ghostty::UnderlineSnapshot::Double => UnderlineStyle::Double,
-            lector_ghostty::UnderlineSnapshot::Curly => UnderlineStyle::Curly,
-            lector_ghostty::UnderlineSnapshot::Dotted => UnderlineStyle::Dotted,
-            lector_ghostty::UnderlineSnapshot::Dashed => UnderlineStyle::Dashed,
-        },
-    }
-}
-
-fn normalize_ghostty_color(color: GhosttyColor) -> Color {
-    match color {
-        GhosttyColor::Default => Color::Default,
-        GhosttyColor::Indexed(index) => Color::Indexed(index),
-        GhosttyColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
     }
 }
 

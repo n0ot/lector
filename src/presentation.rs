@@ -247,6 +247,9 @@ struct PaneImageUpload {
     image_number: u32,
     pixel_width: u32,
     pixel_height: u32,
+    source_format: lector_ghostty::KittyImageFormatSnapshot,
+    source_data_digest: u64,
+    source_data: Arc<[u8]>,
     format: PixelFormat,
     data: Arc<[u8]>,
     data_digest: u64,
@@ -292,50 +295,47 @@ impl PaneMediaStore {
         let mut normalized = Vec::with_capacity(placements.len());
         let mut total_bytes = 0usize;
         for placement in placements {
-            let (format, data) = normalize_pixel_data(placement.format, &placement.data);
-            if data.len() > self.limits.maximum_image_bytes {
-                return Err(PresentationError::MediaLimitExceeded {
-                    resource: "image bytes",
-                    requested: data.len(),
-                    limit: self.limits.maximum_image_bytes,
-                });
-            }
-            let digest = stable_digest(&data);
-            match uploads.entry(placement.image_id) {
+            let (format, digest) = match uploads.entry(placement.image_id) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    total_bytes = total_bytes.saturating_add(data.len());
-                    let data = self
+                    let upload = self
                         .uploads
                         .get(&placement.image_id)
-                        .filter(|existing| {
-                            existing.pixel_width == placement.pixel_width
-                                && existing.pixel_height == placement.pixel_height
-                                && existing.format == format
-                                && existing.data_digest == digest
+                        .filter(|existing| pane_upload_matches_source(existing, placement))
+                        .map(|existing| PaneImageUpload {
+                            image_number: placement.image_number,
+                            pixel_width: placement.pixel_width,
+                            pixel_height: placement.pixel_height,
+                            source_format: placement.format,
+                            source_data_digest: placement.data_digest,
+                            source_data: Arc::clone(&placement.data),
+                            format: existing.format,
+                            data: Arc::clone(&existing.data),
+                            data_digest: existing.data_digest,
                         })
-                        .map_or_else(|| Arc::from(data), |existing| Arc::clone(&existing.data));
-                    entry.insert(PaneImageUpload {
-                        image_number: placement.image_number,
-                        pixel_width: placement.pixel_width,
-                        pixel_height: placement.pixel_height,
-                        format,
-                        data,
-                        data_digest: digest,
-                    });
+                        .unwrap_or_else(|| pane_upload_from_ghostty(placement));
+                    if upload.data.len() > self.limits.maximum_image_bytes {
+                        return Err(PresentationError::MediaLimitExceeded {
+                            resource: "image bytes",
+                            requested: upload.data.len(),
+                            limit: self.limits.maximum_image_bytes,
+                        });
+                    }
+                    let format = upload.format;
+                    let digest = upload.data_digest;
+                    total_bytes = total_bytes.saturating_add(upload.data.len());
+                    entry.insert(upload);
+                    (format, digest)
                 }
                 std::collections::btree_map::Entry::Occupied(entry) => {
                     let existing = entry.get();
-                    if existing.pixel_width != placement.pixel_width
-                        || existing.pixel_height != placement.pixel_height
-                        || existing.format != format
-                        || existing.data_digest != digest
-                    {
+                    if !pane_upload_matches_source(existing, placement) {
                         return Err(PresentationError::InconsistentMediaUpload(
                             placement.image_id,
                         ));
                     }
+                    (existing.format, existing.data_digest)
                 }
-            }
+            };
             normalized.push(presented_image_from_ghostty(placement, format, digest));
         }
         if total_bytes > self.limits.maximum_pane_bytes {
@@ -451,6 +451,35 @@ fn pane_upload_matches(left: &PaneImageUpload, right: &PaneImageUpload) -> bool 
         && left.data_digest == right.data_digest
 }
 
+fn pane_upload_matches_source(
+    upload: &PaneImageUpload,
+    placement: &lector_ghostty::KittyImagePlacementSnapshot,
+) -> bool {
+    upload.pixel_width == placement.pixel_width
+        && upload.pixel_height == placement.pixel_height
+        && upload.source_format == placement.format
+        && upload.source_data_digest == placement.data_digest
+        && Arc::ptr_eq(&upload.source_data, &placement.data)
+}
+
+fn pane_upload_from_ghostty(
+    placement: &lector_ghostty::KittyImagePlacementSnapshot,
+) -> PaneImageUpload {
+    let (format, data, data_digest) =
+        normalize_pixel_data(placement.format, &placement.data, placement.data_digest);
+    PaneImageUpload {
+        image_number: placement.image_number,
+        pixel_width: placement.pixel_width,
+        pixel_height: placement.pixel_height,
+        source_format: placement.format,
+        source_data_digest: placement.data_digest,
+        source_data: Arc::clone(&placement.data),
+        format,
+        data,
+        data_digest,
+    }
+}
+
 /// A pane-scoped image placement in the logical scene. `owner` is retained
 /// even when different panes reuse the same protocol image and placement IDs;
 /// the renderer maps those namespaced IDs into the outer terminal's ID space.
@@ -509,9 +538,13 @@ pub struct PresentedScene {
 
 impl PresentedScene {
     pub fn blank(geometry: TerminalGeometry) -> Self {
+        Self::with_rows(geometry, Arc::new(blank_rows(geometry)))
+    }
+
+    fn with_rows(geometry: TerminalGeometry, rows: Arc<Vec<Row>>) -> Self {
         Self {
             geometry,
-            rows: Arc::new(blank_rows(geometry)),
+            rows,
             cursor: Cursor {
                 visible: false,
                 ..Cursor::default()
@@ -547,7 +580,7 @@ impl PresentedScene {
                     lector_ghostty::KittyImageFormatSnapshot::Gray => PixelFormat::Gray,
                 },
                 data_len: placement.data.len(),
-                data_digest: stable_digest(&placement.data),
+                data_digest: placement.data_digest,
                 grid_rect: GridRect::new(
                     GridPoint::new(placement.viewport_row, placement.viewport_col),
                     u16::try_from(placement.grid_rows).unwrap_or(u16::MAX),
@@ -605,18 +638,28 @@ impl PresentedScene {
     }
 
     pub fn compose(scene: &Scene) -> Result<Self, PresentationError> {
-        let mut presented = Self::blank(scene.geometry);
         let mut panes = scene.panes.iter();
-        if let Some(first) = panes.next() {
-            if first.origin == GridPoint::new(0, 0)
-                && first.snapshot.geometry == scene.geometry
-                && first.snapshot.rows.len() == usize::from(scene.geometry.rows)
-            {
-                presented.rows = first.snapshot.rows.clone();
-            } else {
-                let rows = Arc::make_mut(&mut presented.rows);
-                blit_surface(rows, scene.geometry, first);
-            }
+        let first = panes.next();
+        let first_covers_scene = first.is_some_and(|surface| {
+            surface.origin == GridPoint::new(0, 0)
+                && surface.snapshot.geometry == scene.geometry
+                && surface.snapshot.rows.len() == usize::from(scene.geometry.rows)
+        });
+        let rows = if first_covers_scene {
+            first
+                .expect("a covering first pane exists")
+                .snapshot
+                .rows
+                .clone()
+        } else {
+            Arc::new(blank_rows(scene.geometry))
+        };
+        let mut presented = Self::with_rows(scene.geometry, rows);
+        if let Some(first) = first
+            && !first_covers_scene
+        {
+            let rows = Arc::make_mut(&mut presented.rows);
+            blit_surface(rows, scene.geometry, first);
         }
         for pane in panes {
             let rows = Arc::make_mut(&mut presented.rows);
@@ -790,24 +833,31 @@ fn stable_digest(bytes: &[u8]) -> u64 {
 
 fn normalize_pixel_data(
     format: lector_ghostty::KittyImageFormatSnapshot,
-    data: &[u8],
-) -> (PixelFormat, Vec<u8>) {
+    data: &Arc<[u8]>,
+    source_digest: u64,
+) -> (PixelFormat, Arc<[u8]>, u64) {
     match format {
-        lector_ghostty::KittyImageFormatSnapshot::Rgb => (PixelFormat::Rgb, data.to_vec()),
-        lector_ghostty::KittyImageFormatSnapshot::Rgba => (PixelFormat::Rgba, data.to_vec()),
+        lector_ghostty::KittyImageFormatSnapshot::Rgb => {
+            (PixelFormat::Rgb, Arc::clone(data), source_digest)
+        }
+        lector_ghostty::KittyImageFormatSnapshot::Rgba => {
+            (PixelFormat::Rgba, Arc::clone(data), source_digest)
+        }
         lector_ghostty::KittyImageFormatSnapshot::GrayAlpha => {
             let mut rgba = Vec::with_capacity(data.len().saturating_mul(2));
             for pair in data.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[pair[0], pair[0], pair[0], pair[1]]);
             }
-            (PixelFormat::Rgba, rgba)
+            let digest = stable_digest(&rgba);
+            (PixelFormat::Rgba, Arc::from(rgba), digest)
         }
         lector_ghostty::KittyImageFormatSnapshot::Gray => {
             let mut rgb = Vec::with_capacity(data.len().saturating_mul(3));
-            for &gray in data {
+            for &gray in data.iter() {
                 rgb.extend_from_slice(&[gray, gray, gray]);
             }
-            (PixelFormat::Rgb, rgb)
+            let digest = stable_digest(&rgb);
+            (PixelFormat::Rgb, Arc::from(rgb), digest)
         }
     }
 }
