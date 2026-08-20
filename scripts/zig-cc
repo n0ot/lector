@@ -13,4 +13,21 @@ case "$zig_target" in
 esac
 
 zig_bin=$("$repo_dir/scripts/bootstrap_zig.sh")
-exec "$zig_bin" cc -target "$zig_target" "$@"
+compiler_args=()
+while (($# > 0)); do
+    case "$1" in
+        --target=*|-target=*) shift ;;
+        --target|-target)
+            shift
+            if (($# > 0)); then
+                shift
+            fi
+            ;;
+        *)
+            compiler_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+exec "$zig_bin" cc -target "$zig_target" "${compiler_args[@]}"
