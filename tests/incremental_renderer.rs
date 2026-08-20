@@ -8,7 +8,7 @@ use lector::{
     },
     screen_reader::ScreenReader,
     speech,
-    terminal::{GhosttyEngine, TerminalDamage, TerminalGeometry},
+    terminal::{GhosttyEngine, TerminalDamage, TerminalGeometry, UpdateSummary},
     views,
 };
 use std::io::{self, Write};
@@ -143,6 +143,42 @@ fn pane_local_row_damage_maps_to_clipped_scene_coordinates() {
             TerminalGeometry::from_cells(5, 10),
         ),
         SceneDamage::regions([GridRect::new(GridPoint::new(0, 0), 2, 5)])
+    );
+}
+
+#[test]
+fn multi_pane_damage_preserves_each_surface_region() {
+    let geometry = TerminalGeometry::from_cells(2, 8);
+    let left_engine = GhosttyEngine::new(2, 4).expect("create left pane");
+    let right_engine = GhosttyEngine::new(2, 4).expect("create right pane");
+    let left = SceneSurface::new(
+        ROOT,
+        GridPoint::new(0, 0),
+        left_engine.normalized_snapshot(),
+    );
+    let right = SceneSurface::new(
+        OVERLAY,
+        GridPoint::new(0, 4),
+        right_engine.normalized_snapshot(),
+    );
+    let left_update = UpdateSummary {
+        damage: TerminalDamage::Rows(vec![0..=0]),
+        ..UpdateSummary::default()
+    };
+    let right_update = UpdateSummary {
+        damage: TerminalDamage::Rows(vec![1..=1]),
+        ..UpdateSummary::default()
+    };
+
+    assert_eq!(
+        SceneDamage::from_terminal_updates(
+            [(&left, &left_update), (&right, &right_update)],
+            geometry,
+        ),
+        SceneDamage::regions([
+            GridRect::new(GridPoint::new(0, 0), 1, 4),
+            GridRect::new(GridPoint::new(1, 4), 1, 4),
+        ])
     );
 }
 

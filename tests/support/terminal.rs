@@ -256,7 +256,7 @@ fn normalize_row(row: &TerminalRow) -> NormalizedRow {
 
 fn normalize_cell(cell: &TerminalCell) -> NormalizedCell {
     NormalizedCell {
-        grapheme: cell.grapheme.clone(),
+        grapheme: cell.grapheme.to_string(),
         width: cell.width,
         continuation: cell.continuation,
         style: NormalizedStyle {

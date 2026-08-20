@@ -11,7 +11,10 @@ use super::{
 };
 use std::{
     cmp::min,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// A bounded history avoids unbounded memory growth while retaining enough
@@ -212,8 +215,14 @@ impl View {
         let mut batch_update = if capture_batch {
             if retain_for_accessibility {
                 let batch_update = update.clone();
+                let mut accessibility_update = update;
+                // Structural operations are renderer hints. Accessibility
+                // consumes print, cursor, scroll, effect, and dirty-row facts;
+                // retaining operation strings until speech finalization makes
+                // every physical receipt clone a growing renderer-only log.
+                accessibility_update.operations.clear();
                 self.pending_update.synchronized_output_opened = false;
-                self.pending_update.merge(update);
+                self.pending_update.merge(accessibility_update);
                 Some(batch_update)
             } else {
                 // There is no accessibility consumer for this pane. Move the
@@ -1737,11 +1746,12 @@ fn snapshot_at_scrollback(snapshot: &TerminalSnapshot, scrollback: usize) -> Ter
     let rows = snapshot
         .scrollback
         .iter()
-        .chain(&snapshot.rows)
+        .chain(snapshot.rows.iter())
         .skip(start)
         .take(height)
         .cloned()
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
     let mut cursor = snapshot.cursor;
     if offset != 0 {
         cursor.visible = false;
@@ -1772,18 +1782,18 @@ fn snapshot_at_scrollback(snapshot: &TerminalSnapshot, scrollback: usize) -> Ter
 /// uncovered on the physical terminal.
 fn fit_snapshot_to_geometry(snapshot: &mut TerminalSnapshot, geometry: TerminalGeometry) {
     let cols = usize::from(geometry.cols);
-    for row in &mut snapshot.rows {
-        row.cells.resize(cols, crate::terminal::Cell::default());
-        if row.cells.last().is_some_and(crate::terminal::Cell::is_wide) {
-            *row.cells.last_mut().expect("row has a final cell") = crate::terminal::Cell::default();
+    let rows = Arc::make_mut(&mut snapshot.rows);
+    for row in rows.iter_mut() {
+        let cells = Arc::make_mut(&mut row.cells);
+        cells.resize(cols, crate::terminal::Cell::default());
+        if cells.last().is_some_and(crate::terminal::Cell::is_wide) {
+            *cells.last_mut().expect("row has a final cell") = crate::terminal::Cell::default();
         }
     }
-    snapshot
-        .rows
-        .resize_with(usize::from(geometry.rows), || crate::terminal::Row {
-            cells: vec![crate::terminal::Cell::default(); cols],
-            wrapped: false,
-        });
+    rows.resize_with(usize::from(geometry.rows), || crate::terminal::Row {
+        cells: Arc::new(vec![crate::terminal::Cell::default(); cols]),
+        wrapped: false,
+    });
     snapshot.geometry = geometry;
     snapshot.cursor.row = snapshot.cursor.row.min(geometry.rows.saturating_sub(1));
     snapshot.cursor.col = snapshot.cursor.col.min(geometry.cols.saturating_sub(1));
@@ -1794,7 +1804,7 @@ fn contents_between_snapshot_history(
     start: HistoryPosition,
     end: HistoryPosition,
 ) -> Option<String> {
-    let rows = snapshot.scrollback.iter().chain(&snapshot.rows);
+    let rows = snapshot.scrollback.iter().chain(snapshot.rows.iter());
     let logical_rows = snapshot
         .scrollback
         .len()

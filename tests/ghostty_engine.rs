@@ -2,6 +2,7 @@ use lector::terminal::{
     Color, GhosttyEngine, HistoryPosition, MouseEncoding, MouseProtocol, ScreenIdentity,
 };
 use lector::view::View;
+use std::sync::Arc;
 
 const ROWS: u16 = 4;
 const COLS: u16 = 20;
@@ -340,9 +341,16 @@ fn ghostty_resize_preserves_dimensions_and_cursor() {
 fn normalized_snapshots_are_owned_and_cannot_mutate_the_engine() {
     let engine = GhosttyEngine::new(2, 8).expect("create Ghostty engine");
     let mut changed = engine.normalized_snapshot();
+    let original = changed.clone();
+    assert!(Arc::ptr_eq(&changed.rows, &original.rows));
     changed.cursor.col = 1;
+    let rows = Arc::make_mut(&mut changed.rows);
+    Arc::make_mut(&mut rows[0].cells)[0].grapheme = "x".into();
     assert_eq!(changed.cursor.col, 1);
+    assert_eq!(changed.rows[0].contents(), "x");
+    assert_eq!(original.rows[0].contents(), "");
     assert_eq!(engine.normalized_snapshot().cursor.col, 0);
+    assert_eq!(engine.normalized_snapshot().rows[0].contents(), "");
 }
 
 #[test]
@@ -506,7 +514,7 @@ fn ghostty_tracked_review_mark_follows_scroll_and_resize() {
     let row = snapshot
         .scrollback
         .iter()
-        .chain(&snapshot.rows)
+        .chain(snapshot.rows.iter())
         .nth(position.row)
         .expect("tracked row");
     assert!(row.contents().starts_with("anchor"));
@@ -538,7 +546,7 @@ fn ghostty_resize_reflows_primary_and_alternate_screens_without_mixing_history()
         primary
             .scrollback
             .iter()
-            .chain(&primary.rows)
+            .chain(primary.rows.iter())
             .any(|row| row.contents().contains("primar"))
     );
 
@@ -560,7 +568,7 @@ fn ghostty_resize_reflows_primary_and_alternate_screens_without_mixing_history()
         restored
             .scrollback
             .iter()
-            .chain(&restored.rows)
+            .chain(restored.rows.iter())
             .all(|row| !row.contents().contains("alt"))
     );
 }

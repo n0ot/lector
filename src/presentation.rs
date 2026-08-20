@@ -495,7 +495,7 @@ impl Scene {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PresentedScene {
     geometry: TerminalGeometry,
-    rows: Vec<Row>,
+    rows: Arc<Vec<Row>>,
     cursor: Cursor,
     cursor_owner: CursorOwner,
     screen: ScreenIdentity,
@@ -511,7 +511,7 @@ impl PresentedScene {
     pub fn blank(geometry: TerminalGeometry) -> Self {
         Self {
             geometry,
-            rows: blank_rows(geometry),
+            rows: Arc::new(blank_rows(geometry)),
             cursor: Cursor {
                 visible: false,
                 ..Cursor::default()
@@ -606,14 +606,28 @@ impl PresentedScene {
 
     pub fn compose(scene: &Scene) -> Result<Self, PresentationError> {
         let mut presented = Self::blank(scene.geometry);
-        for pane in &scene.panes {
-            blit_surface(&mut presented.rows, scene.geometry, pane);
+        let mut panes = scene.panes.iter();
+        if let Some(first) = panes.next() {
+            if first.origin == GridPoint::new(0, 0)
+                && first.snapshot.geometry == scene.geometry
+                && first.snapshot.rows.len() == usize::from(scene.geometry.rows)
+            {
+                presented.rows = first.snapshot.rows.clone();
+            } else {
+                let rows = Arc::make_mut(&mut presented.rows);
+                blit_surface(rows, scene.geometry, first);
+            }
+        }
+        for pane in panes {
+            let rows = Arc::make_mut(&mut presented.rows);
+            blit_surface(rows, scene.geometry, pane);
         }
 
         let mut overlays: Vec<(usize, &SceneOverlay)> = scene.overlays.iter().enumerate().collect();
         overlays.sort_by_key(|(order, overlay)| (overlay.z_index, *order));
         for (_, overlay) in overlays {
-            blit_surface(&mut presented.rows, scene.geometry, &overlay.surface);
+            let rows = Arc::make_mut(&mut presented.rows);
+            blit_surface(rows, scene.geometry, &overlay.surface);
         }
 
         presented.cursor_owner = scene.cursor_owner;
@@ -725,7 +739,8 @@ impl PresentedScene {
 
     fn physical_fields_match(&self, other: &Self) -> bool {
         self.geometry == other.geometry
-            && rows_physically_match(&self.rows, &other.rows)
+            && (Arc::ptr_eq(&self.rows, &other.rows)
+                || rows_physically_match(&self.rows, &other.rows))
             && self.cursor == other.cursor
             && self.modes == other.modes
             && terminal_string_matches(&self.title, &other.title)
@@ -746,15 +761,19 @@ fn rows_physically_match(left: &[Row], right: &[Row]) -> bool {
         && left.iter().zip(right).all(|(left, right)| {
             left.wrapped == right.wrapped
                 && left.cells.len() == right.cells.len()
-                && left.cells.iter().zip(&right.cells).all(|(left, right)| {
-                    let left_blank = matches!(left.grapheme.as_str(), "" | " ");
-                    let right_blank = matches!(right.grapheme.as_str(), "" | " ");
-                    (left.grapheme == right.grapheme || left_blank && right_blank)
-                        && left.width == right.width
-                        && left.continuation == right.continuation
-                        && left.style == right.style
-                        && left.hyperlink == right.hyperlink
-                })
+                && left
+                    .cells
+                    .iter()
+                    .zip(right.cells.iter())
+                    .all(|(left, right)| {
+                        let left_blank = matches!(left.grapheme.as_ref(), "" | " ");
+                        let right_blank = matches!(right.grapheme.as_ref(), "" | " ");
+                        (left.grapheme == right.grapheme || left_blank && right_blank)
+                            && left.width == right.width
+                            && left.continuation == right.continuation
+                            && left.style == right.style
+                            && left.hyperlink == right.hyperlink
+                    })
         })
 }
 
@@ -1164,7 +1183,7 @@ fn allocate_outer_id(seed: u64, used: &mut BTreeSet<u32>) -> u32 {
 fn blank_rows(geometry: TerminalGeometry) -> Vec<Row> {
     (0..geometry.rows)
         .map(|_| Row {
-            cells: vec![Cell::default(); usize::from(geometry.cols)],
+            cells: Arc::new(vec![Cell::default(); usize::from(geometry.cols)]),
             wrapped: false,
         })
         .collect()
@@ -1189,7 +1208,7 @@ fn blit_surface(target: &mut [Row], geometry: TerminalGeometry, surface: &SceneS
                 continue;
             }
             let target_col = usize::try_from(target_col).expect("non-negative clipped column");
-            target[target_row].cells[target_col] = cell.clone();
+            Arc::make_mut(&mut target[target_row].cells)[target_col] = cell.clone();
         }
         if surface.origin.col <= 0
             && surface
@@ -1315,20 +1334,7 @@ impl SceneDamage {
             .map(|operation| map_terminal_operation(surface, operation))
             .collect();
         for operation in &operations {
-            let region = match operation {
-                SceneOperation::ScrollUp { region, .. }
-                | SceneOperation::ScrollDown { region, .. }
-                | SceneOperation::InsertLines { region, .. }
-                | SceneOperation::DeleteLines { region, .. }
-                | SceneOperation::InsertChars { region, .. }
-                | SceneOperation::DeleteChars { region, .. }
-                | SceneOperation::EraseChars { region } => *region,
-                SceneOperation::WriteRun { origin, text } => GridRect::new(
-                    *origin,
-                    1,
-                    text.chars().count().try_into().unwrap_or(u16::MAX),
-                ),
-            };
+            let region = scene_operation_region(operation);
             if let Some(region) = clip_grid_rect(region, scene_geometry) {
                 regions.push(region);
             }
@@ -1339,6 +1345,55 @@ impl SceneDamage {
             regions,
             operations,
         }
+    }
+
+    /// Merge pane-local damage from one PTY drain without discarding its
+    /// compositor bounds. Structural operation hints cannot be replayed
+    /// across multiple owners, so their affected regions join the ordinary
+    /// cell diff instead.
+    pub fn from_terminal_updates<'a>(
+        updates: impl IntoIterator<Item = (&'a SceneSurface, &'a UpdateSummary)>,
+        scene_geometry: TerminalGeometry,
+    ) -> Self {
+        let mut regions = Vec::new();
+        for (surface, update) in updates {
+            regions.extend(terminal_damage_regions(
+                surface,
+                &update.damage,
+                scene_geometry,
+            ));
+            for operation in &update.operations {
+                let operation = map_terminal_operation(surface, operation);
+                if let Some(region) =
+                    clip_grid_rect(scene_operation_region(&operation), scene_geometry)
+                {
+                    regions.push(region);
+                }
+            }
+        }
+        normalize_grid_regions(&mut regions);
+        if regions.is_empty() {
+            Self::Cursor
+        } else {
+            Self::Regions(regions)
+        }
+    }
+}
+
+fn scene_operation_region(operation: &SceneOperation) -> GridRect {
+    match operation {
+        SceneOperation::ScrollUp { region, .. }
+        | SceneOperation::ScrollDown { region, .. }
+        | SceneOperation::InsertLines { region, .. }
+        | SceneOperation::DeleteLines { region, .. }
+        | SceneOperation::InsertChars { region, .. }
+        | SceneOperation::DeleteChars { region, .. }
+        | SceneOperation::EraseChars { region } => *region,
+        SceneOperation::WriteRun { origin, text } => GridRect::new(
+            *origin,
+            1,
+            text.chars().count().try_into().unwrap_or(u16::MAX),
+        ),
     }
 }
 
@@ -1665,10 +1720,17 @@ impl RendererBackend for FullSceneVtRenderer {
 }
 
 fn apply_render_capabilities(presented: &mut PresentedScene, capabilities: RenderCapabilities) {
-    if !capabilities.hyperlinks {
-        for row in &mut presented.rows {
-            for cell in &mut row.cells {
-                cell.hyperlink = None;
+    if !capabilities.hyperlinks
+        && presented
+            .rows
+            .iter()
+            .any(|row| row.cells.iter().any(|cell| cell.hyperlink.is_some()))
+    {
+        for row in Arc::make_mut(&mut presented.rows) {
+            if row.cells.iter().any(|cell| cell.hyperlink.is_some()) {
+                for cell in Arc::make_mut(&mut row.cells) {
+                    cell.hyperlink = None;
+                }
             }
         }
     }
@@ -1754,12 +1816,9 @@ impl IncrementalVtRenderer {
         &mut self,
         scene: &Scene,
         presented: &PresentedScene,
+        retain_known_uploads: bool,
     ) -> Result<RenderBatch, PresentationError> {
         self.last_strategy = RenderStrategy::FullFallback;
-        let retain_known_uploads = self.confirmed.as_ref().is_some_and(|confirmed| {
-            confirmed.physically_matches(presented)
-                && confirmed.image_uploads == presented.image_uploads
-        });
         let result = self
             .full
             .render_with_retained_uploads(scene, presented, retain_known_uploads);
@@ -1791,11 +1850,10 @@ impl IncrementalVtRenderer {
         damage: &SceneDamage,
         presented: &PresentedScene,
         intended: &PresentedScene,
+        confirmed_matches_presented: bool,
     ) -> bool {
-        self.confirmed.as_ref().is_some_and(|confirmed| {
-            confirmed.physically_matches(presented)
-                && confirmed.image_uploads == presented.image_uploads
-        }) && presented.geometry == intended.geometry
+        confirmed_matches_presented
+            && presented.geometry == intended.geometry
             && presented.screen == intended.screen
             && presented.image_uploads == intended.image_uploads
             && presented.images == intended.images
@@ -1995,18 +2053,25 @@ impl RendererBackend for IncrementalVtRenderer {
     ) -> Result<RenderBatch, PresentationError> {
         let mut intended = PresentedScene::compose(scene)?;
         apply_render_capabilities(&mut intended, self.capabilities);
-        if self.confirmed.as_ref().is_some_and(|confirmed| {
+        let confirmed_matches_presented = self.confirmed.as_ref().is_some_and(|confirmed| {
             confirmed.physically_matches(presented)
                 && confirmed.image_uploads == presented.image_uploads
-        }) && presented.physically_matches(&intended)
+        });
+        let full_damage = matches!(
+            damage,
+            SceneDamage::Full | SceneDamage::Resize { .. } | SceneDamage::Surfaces(_)
+        );
+        if confirmed_matches_presented
+            && full_damage
+            && presented.physically_matches(&intended)
             && presented.image_uploads == intended.image_uploads
         {
             self.last_stats = RenderStats::default();
             self.last_strategy = RenderStrategy::Noop;
             return Ok(RenderBatch::new(Vec::new(), intended));
         }
-        if !self.can_increment(damage, presented, &intended) {
-            return self.full_fallback(scene, presented);
+        if !self.can_increment(damage, presented, &intended, confirmed_matches_presented) {
+            return self.full_fallback(scene, presented, confirmed_matches_presented);
         }
         if let SceneDamage::Operations {
             owner, operations, ..
@@ -2032,7 +2097,7 @@ impl RendererBackend for IncrementalVtRenderer {
                         }
                         Ok(batch)
                     }
-                    None => self.full_fallback(scene, presented),
+                    None => self.full_fallback(scene, presented, confirmed_matches_presented),
                 };
             }
             match self.semantic_batch(scene, *owner, operations, presented, intended) {
@@ -2040,17 +2105,17 @@ impl RendererBackend for IncrementalVtRenderer {
                 SemanticAttempt::NotApplicable(intended) => {
                     return match self.incremental_batch(damage, presented, intended) {
                         Some(batch) => Ok(batch),
-                        None => self.full_fallback(scene, presented),
+                        None => self.full_fallback(scene, presented, confirmed_matches_presented),
                     };
                 }
                 SemanticAttempt::Inconsistent(_intended) => {
-                    return self.full_fallback(scene, presented);
+                    return self.full_fallback(scene, presented, confirmed_matches_presented);
                 }
             }
         }
         match self.incremental_batch(damage, presented, intended) {
             Some(batch) => Ok(batch),
-            None => self.full_fallback(scene, presented),
+            None => self.full_fallback(scene, presented, confirmed_matches_presented),
         }
     }
 }
@@ -2062,6 +2127,7 @@ fn apply_scene_operation(
     operation: &SceneOperation,
     geometry: TerminalGeometry,
 ) -> bool {
+    let rows = Arc::make_mut(&mut working.rows);
     match operation {
         SceneOperation::ScrollUp { region, count }
         | SceneOperation::DeleteLines { region, count } => {
@@ -2074,7 +2140,7 @@ fn apply_scene_operation(
             let count = usize::from(*count).min(bottom.saturating_sub(top));
             if count == 0
                 || (matches!(operation, SceneOperation::DeleteLines { .. })
-                    && working.rows[top..bottom].iter().any(|row| row.wrapped))
+                    && rows[top..bottom].iter().any(|row| row.wrapped))
             {
                 return false;
             }
@@ -2096,8 +2162,8 @@ fn apply_scene_operation(
                     bytes.extend_from_slice(b"\x1b[2K");
                 }
             }
-            working.rows[top..bottom].rotate_left(count);
-            for row in &mut working.rows[bottom - count..bottom] {
+            rows[top..bottom].rotate_left(count);
+            for row in &mut rows[bottom - count..bottom] {
                 *row = blank_row(geometry.cols);
             }
             repairs.push(GridRect::new(
@@ -2118,7 +2184,7 @@ fn apply_scene_operation(
             let count = usize::from(*count).min(bottom.saturating_sub(top));
             if count == 0
                 || (matches!(operation, SceneOperation::InsertLines { .. })
-                    && working.rows[top..bottom].iter().any(|row| row.wrapped))
+                    && rows[top..bottom].iter().any(|row| row.wrapped))
             {
                 return false;
             }
@@ -2138,8 +2204,8 @@ fn apply_scene_operation(
                     bytes.extend_from_slice(b"\x1b[2K");
                 }
             }
-            working.rows[top..bottom].rotate_right(count);
-            for row in &mut working.rows[top..top + count] {
+            rows[top..bottom].rotate_right(count);
+            for row in &mut rows[top..top + count] {
                 *row = blank_row(geometry.cols);
             }
             repairs.push(GridRect::new(
@@ -2157,7 +2223,7 @@ fn apply_scene_operation(
             if bottom != top + 1 || right != usize::from(geometry.cols) {
                 return false;
             }
-            let row = &mut working.rows[top];
+            let row = &mut rows[top];
             if row.wrapped || row.cells[left..right].iter().any(cell_is_wide) {
                 return false;
             }
@@ -2165,11 +2231,12 @@ fn apply_scene_operation(
             if count == 0 {
                 return false;
             }
+            let cells = Arc::make_mut(&mut row.cells);
             write_absolute_cursor(bytes, top, left);
             if matches!(operation, SceneOperation::InsertChars { .. }) {
                 bytes.extend_from_slice(format!("\x1b[{}@", count).as_bytes());
-                row.cells[left..right].rotate_right(count);
-                row.cells[left..left + count].fill(Cell::default());
+                cells[left..right].rotate_right(count);
+                cells[left..left + count].fill(Cell::default());
                 repairs.push(GridRect::new(
                     GridPoint::new(
                         top.try_into().unwrap_or(i32::MAX),
@@ -2180,8 +2247,8 @@ fn apply_scene_operation(
                 ));
             } else {
                 bytes.extend_from_slice(format!("\x1b[{}P", count).as_bytes());
-                row.cells[left..right].rotate_left(count);
-                row.cells[right - count..right].fill(Cell::default());
+                cells[left..right].rotate_left(count);
+                cells[right - count..right].fill(Cell::default());
                 repairs.push(GridRect::new(
                     GridPoint::new(
                         top.try_into().unwrap_or(i32::MAX),
@@ -2197,12 +2264,12 @@ fn apply_scene_operation(
             let Some((top, bottom, left, right)) = exact_region(*region, geometry) else {
                 return false;
             };
-            if bottom != top + 1 || working.rows[top].wrapped {
+            if bottom != top + 1 || rows[top].wrapped {
                 return false;
             }
             write_absolute_cursor(bytes, top, left);
             bytes.extend_from_slice(format!("\x1b[{}X", right - left).as_bytes());
-            working.rows[top].cells[left..right].fill(Cell::default());
+            Arc::make_mut(&mut rows[top].cells)[left..right].fill(Cell::default());
             repairs.push(*region);
             true
         }
@@ -2222,12 +2289,12 @@ fn apply_scene_operation(
             };
             write_absolute_cursor(bytes, top, left);
             bytes.extend_from_slice(text.as_bytes());
-            for (cell, character) in working.rows[top].cells[left..right]
+            for (cell, character) in Arc::make_mut(&mut rows[top].cells)[left..right]
                 .iter_mut()
                 .zip(text.chars())
             {
                 *cell = Cell {
-                    grapheme: character.to_string(),
+                    grapheme: character.to_string().into(),
                     ..Cell::default()
                 };
             }
@@ -2289,7 +2356,7 @@ fn shift_repair_rows(
 
 fn blank_row(cols: u16) -> Row {
     Row {
-        cells: vec![Cell::default(); usize::from(cols)],
+        cells: Arc::new(vec![Cell::default(); usize::from(cols)]),
         wrapped: false,
     }
 }
@@ -2329,11 +2396,12 @@ fn repair_semantic_regions(
             });
         }
     }
+    let rows = Arc::make_mut(&mut working.rows);
     for (row_index, candidate) in candidates.into_iter().enumerate() {
         let Some((left, right)) = candidate else {
             continue;
         };
-        let Some(previous_row) = working.rows.get(row_index) else {
+        let Some(previous_row) = rows.get(row_index) else {
             return false;
         };
         let Some(intended_row) = intended.rows.get(row_index) else {
@@ -2349,7 +2417,7 @@ fn repair_semantic_regions(
         for (start, end) in ranges {
             write_incremental_run(bytes, row_index, start, end, intended_row);
             stats.cells_emitted = stats.cells_emitted.saturating_add(end - start);
-            working.rows[row_index].cells[start..end]
+            Arc::make_mut(&mut rows[row_index].cells)[start..end]
                 .clone_from_slice(&intended_row.cells[start..end]);
         }
     }
@@ -2422,8 +2490,8 @@ fn expand_and_merge_cell_ranges(ranges: &mut Vec<(usize, usize)>, previous: &Row
 }
 
 fn cells_physically_match(left: &Cell, right: &Cell) -> bool {
-    let left_blank = matches!(left.grapheme.as_str(), "" | " ");
-    let right_blank = matches!(right.grapheme.as_str(), "" | " ");
+    let left_blank = matches!(left.grapheme.as_ref(), "" | " ");
+    let right_blank = matches!(right.grapheme.as_ref(), "" | " ");
     (left.grapheme == right.grapheme || left_blank && right_blank)
         && left.width == right.width
         && left.continuation == right.continuation
@@ -2696,7 +2764,7 @@ fn write_row_at(bytes: &mut Vec<u8>, row_index: usize, row: &Row) {
     bytes.extend_from_slice(b"\x1b[0m");
     let mut active_style = Style::default();
     let mut active_link: Option<&str> = None;
-    for cell in &row.cells {
+    for cell in row.cells.iter() {
         if cell.continuation {
             continue;
         }

@@ -32,8 +32,9 @@ impl App {
     }
 
     /// Presents the final modeled state from one bounded PTY drain. The common
-    /// single-pane case retains incremental damage; interleaved panes or a
-    /// topology transition conservatively produce one full composite.
+    /// single-pane case retains semantic operation hints; interleaved panes
+    /// retain the union of their compositor regions. Topology transitions
+    /// conservatively produce one full composite.
     pub fn finish_pty_presentation_batch(
         &mut self,
         sr: &mut ScreenReader,
@@ -50,8 +51,7 @@ impl App {
             return Ok(());
         };
         let update_count = batch.updates.len();
-        let mut updates = batch.updates.into_iter();
-        let Some(((connection_id, pane_id), update)) = updates.next() else {
+        let Some((&(connection_id, pane_id), update)) = batch.updates.first_key_value() else {
             if batch.bell_count != 0 {
                 self.emit_physical_bells(term_out, batch.bell_count)?;
             }
@@ -67,15 +67,9 @@ impl App {
                         && view.is_pane_visible(pane_id)
                 });
         if one_visible_pane {
-            self.render_tmux_pane_update(term_out, pane_id, batch.bell_count, &update)
+            self.render_tmux_pane_update(term_out, pane_id, batch.bell_count, update)
         } else {
-            let mut opened = update.synchronized_output_opened;
-            let mut activity = update.synchronized_output;
-            for (_, update) in updates {
-                opened |= update.synchronized_output_opened;
-                activity |= update.synchronized_output;
-            }
-            self.render_tmux_batched_update(term_out, batch.bell_count, opened, activity)
+            self.render_tmux_batched_update(term_out, batch.bell_count, batch.updates)
         }
     }
 
@@ -379,29 +373,11 @@ impl App {
             .model()
             .live_screen()
             .kitty_keyboard_flags();
-        let bells_before = self
+        let terminal_update = self
             .view_stack
             .root_mut()
             .model()
-            .update_summary()
-            .effects
-            .bells;
-        let replies_before = self
-            .view_stack
-            .root_mut()
-            .model()
-            .update_summary()
-            .pty_replies
-            .len();
-        let events_before = self
-            .view_stack
-            .root_mut()
-            .model()
-            .update_summary()
-            .effects
-            .events
-            .len();
-        self.view_stack.root_mut().handle_pty_output(buf)?;
+            .process_changes_with_batch(buf, true);
         let kitty_keyboard_flags_after = self
             .view_stack
             .root_mut()
@@ -429,31 +405,12 @@ impl App {
         {
             self.kitty_ctrl_c_input_handoff = None;
         }
-        let terminal_update = self.view_stack.root_mut().model().update_summary().clone();
-        let new_replies = self
-            .view_stack
-            .root_mut()
-            .model()
-            .update_summary()
-            .pty_replies
-            .get(replies_before..)
-            .unwrap_or_default()
-            .to_vec();
+        let new_replies = &terminal_update.pty_replies;
         if !new_replies.is_empty() {
-            self.application_replies.queue(ROOT_SOURCE, &new_replies);
+            self.application_replies.queue(ROOT_SOURCE, new_replies);
         }
-        let new_events = self
-            .view_stack
-            .root_mut()
-            .model()
-            .update_summary()
-            .effects
-            .events
-            .get(events_before..)
-            .unwrap_or_default()
-            .to_vec();
         let effect_time = self.clock.now_ms();
-        for event in &new_events {
+        for event in &terminal_update.effects.events {
             match self.terminal_effect_policy.disposition(event) {
                 crate::terminal_protocol::EffectDisposition::LocalClipboard => {
                     let crate::terminal::TerminalEvent::ClipboardWrite { contents, .. } = event
@@ -482,15 +439,7 @@ impl App {
                 | crate::terminal_protocol::EffectDisposition::Drop => {}
             }
         }
-        let bells_after = self
-            .view_stack
-            .root_mut()
-            .model()
-            .update_summary()
-            .effects
-            .bells;
-        let new_bells = bells_after.saturating_sub(bells_before);
-        self.render_terminal_update(term_out, new_bells, &terminal_update)?;
+        self.render_terminal_update(term_out, terminal_update.effects.bells, &terminal_update)?;
         let now_ms = self.clock.now_ms();
         if self.first_pty_update.is_none() {
             self.first_pty_update = Some(now_ms);

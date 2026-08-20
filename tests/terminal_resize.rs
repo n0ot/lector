@@ -144,7 +144,7 @@ mod ghostty {
             primary
                 .scrollback
                 .iter()
-                .chain(&primary.rows)
+                .chain(primary.rows.iter())
                 .filter(|row| row.wrapped)
                 .count()
                 > 0
@@ -166,7 +166,7 @@ mod ghostty {
             restored
                 .scrollback
                 .iter()
-                .chain(&restored.rows)
+                .chain(restored.rows.iter())
                 .all(|row| !row.contents().contains("alt"))
         );
     }
@@ -192,7 +192,7 @@ mod ghostty {
         let text = snapshot
             .scrollback
             .iter()
-            .chain(&snapshot.rows)
+            .chain(snapshot.rows.iter())
             .map(|row| row.contents())
             .collect::<String>();
         assert!(text.contains("abcdef"));

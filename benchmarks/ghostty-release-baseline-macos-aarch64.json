@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "target": "aarch64-apple-darwin",
-  "recorded_at": "2026-08-14",
+  "recorded_at": "2026-08-20",
   "environment": {
     "ghostty_version": "0.1.0-dev",
     "ghostty_commit": "43fe699071c7dceb161dc3b0c04fce46ade36174",
@@ -13,18 +13,18 @@
     {
       "name": "shell-and-semantic-prompts",
       "measured": {
-        "throughput_mib_per_second": 0.3340898264128878,
-        "allocations": 1175950,
-        "allocated_bytes": 3062996152,
-        "peak_rss_bytes": 12255232,
-        "latency_p95_ns": 180042,
+        "throughput_mib_per_second": 1.1157119352290705,
+        "allocations": 285924,
+        "allocated_bytes": 685773496,
+        "peak_rss_bytes": 14352384,
+        "latency_p95_ns": 17417,
         "scrollback_extent": 0
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 0.19,
-        "maximum_latency_p95_ns": 400000,
-        "maximum_allocations": 1200000,
-        "maximum_allocated_bytes": 3500000000,
+        "minimum_throughput_mib_per_second": 0.6,
+        "maximum_latency_p95_ns": 50000,
+        "maximum_allocations": 320000,
+        "maximum_allocated_bytes": 750000000,
         "maximum_peak_rss_bytes": 33554432,
         "minimum_scrollback_extent": 0
       }
@@ -32,18 +32,18 @@
     {
       "name": "control-heavy-redraw",
       "measured": {
-        "throughput_mib_per_second": 0.45194764590121583,
-        "allocations": 10234429,
-        "allocated_bytes": 4288467920,
-        "peak_rss_bytes": 13320192,
-        "latency_p95_ns": 83166,
+        "throughput_mib_per_second": 5.354516856850878,
+        "allocations": 189743,
+        "allocated_bytes": 270089264,
+        "peak_rss_bytes": 15515648,
+        "latency_p95_ns": 6333,
         "scrollback_extent": 0
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 0.25,
-        "maximum_latency_p95_ns": 200000,
-        "maximum_allocations": 11500000,
-        "maximum_allocated_bytes": 4800000000,
+        "minimum_throughput_mib_per_second": 2.5,
+        "maximum_latency_p95_ns": 20000,
+        "maximum_allocations": 220000,
+        "maximum_allocated_bytes": 300000000,
         "maximum_peak_rss_bytes": 33554432,
         "minimum_scrollback_extent": 0
       }
@@ -51,19 +51,19 @@
     {
       "name": "bounded-scrollback",
       "measured": {
-        "throughput_mib_per_second": 0.3392996287814543,
-        "allocations": 54441307,
-        "allocated_bytes": 8445447722,
-        "peak_rss_bytes": 26247168,
-        "latency_p95_ns": 116000,
+        "throughput_mib_per_second": 0.6381532204859651,
+        "allocations": 1787359,
+        "allocated_bytes": 5606043686,
+        "peak_rss_bytes": 28491776,
+        "latency_p95_ns": 63375,
         "scrollback_extent": 10000
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 0.20,
-        "maximum_latency_p95_ns": 250000,
-        "maximum_allocations": 55000000,
-        "maximum_allocated_bytes": 9000000000,
-        "maximum_peak_rss_bytes": 33554432,
+        "minimum_throughput_mib_per_second": 0.4,
+        "maximum_latency_p95_ns": 150000,
+        "maximum_allocations": 2000000,
+        "maximum_allocated_bytes": 6000000000,
+        "maximum_peak_rss_bytes": 41943040,
         "minimum_scrollback_extent": 10000
       }
     }
@@ -72,16 +72,16 @@
     {
       "name": "single-cell-edits",
       "measured": {
-        "latency_p95_ns": 44666,
-        "pure_diff_latency_p95_ns": 44750,
-        "output_ratio": 0.0177146492901545,
+        "latency_p95_ns": 9625,
+        "pure_diff_latency_p95_ns": 9458,
+        "output_ratio": 0.015631754011714356,
         "cells_compared_per_iteration": 160,
         "semantic_fast_path_percent": 100.0,
         "semantic_to_pure_diff_output_ratio": 1.0,
-        "semantic_to_pure_diff_latency_ratio": 0.998122905027933
+        "semantic_to_pure_diff_latency_ratio": 1.0176570099386764
       },
       "limits": {
-        "maximum_latency_p95_ns": 150000,
+        "maximum_latency_p95_ns": 50000,
         "maximum_output_ratio": 0.05,
         "maximum_cells_compared_per_iteration": 200,
         "minimum_semantic_fast_path_percent": 99.0,
@@ -92,16 +92,16 @@
     {
       "name": "status-line-replacements",
       "measured": {
-        "latency_p95_ns": 33125,
-        "pure_diff_latency_p95_ns": 33042,
-        "output_ratio": 0.02833389544688027,
+        "latency_p95_ns": 9000,
+        "pure_diff_latency_p95_ns": 8875,
+        "output_ratio": 0.02500297619047619,
         "cells_compared_per_iteration": 80,
         "semantic_fast_path_percent": 100.0,
         "semantic_to_pure_diff_output_ratio": 1.0,
-        "semantic_to_pure_diff_latency_ratio": 1.0025119544821741
+        "semantic_to_pure_diff_latency_ratio": 1.0140845070422535
       },
       "limits": {
-        "maximum_latency_p95_ns": 150000,
+        "maximum_latency_p95_ns": 50000,
         "maximum_output_ratio": 0.08,
         "maximum_cells_compared_per_iteration": 100,
         "minimum_semantic_fast_path_percent": 99.0,
@@ -112,16 +112,16 @@
     {
       "name": "cursor-moves",
       "measured": {
-        "latency_p95_ns": 33083,
-        "pure_diff_latency_p95_ns": 33041,
-        "output_ratio": 0.0078060741159164185,
+        "latency_p95_ns": 9250,
+        "pure_diff_latency_p95_ns": 9125,
+        "output_ratio": 0.006888229195759558,
         "cells_compared_per_iteration": 160,
         "semantic_fast_path_percent": 0.0,
         "semantic_to_pure_diff_output_ratio": 1.0,
-        "semantic_to_pure_diff_latency_ratio": 1.0012711479676766
+        "semantic_to_pure_diff_latency_ratio": 1.0136986301369864
       },
       "limits": {
-        "maximum_latency_p95_ns": 150000,
+        "maximum_latency_p95_ns": 50000,
         "maximum_output_ratio": 0.03,
         "maximum_cells_compared_per_iteration": 200,
         "minimum_semantic_fast_path_percent": 0.0,
@@ -132,16 +132,16 @@
     {
       "name": "scrolling-output",
       "measured": {
-        "latency_p95_ns": 63750,
-        "pure_diff_latency_p95_ns": 51375,
-        "output_ratio": 0.06365935919055649,
+        "latency_p95_ns": 20291,
+        "pure_diff_latency_p95_ns": 25000,
+        "output_ratio": 0.03869047619047619,
         "cells_compared_per_iteration": 80,
         "semantic_fast_path_percent": 100.0,
-        "semantic_to_pure_diff_output_ratio": 0.2563351709679199,
-        "semantic_to_pure_diff_latency_ratio": 1.2408759124087592
+        "semantic_to_pure_diff_output_ratio": 0.17654872702426272,
+        "semantic_to_pure_diff_latency_ratio": 0.81164
       },
       "limits": {
-        "maximum_latency_p95_ns": 250000,
+        "maximum_latency_p95_ns": 80000,
         "maximum_output_ratio": 0.15,
         "maximum_cells_compared_per_iteration": 100,
         "minimum_semantic_fast_path_percent": 99.0,
@@ -152,16 +152,16 @@
     {
       "name": "tmux-like-structural-edits",
       "measured": {
-        "latency_p95_ns": 119792,
-        "pure_diff_latency_p95_ns": 66708,
-        "output_ratio": 0.039285103728208294,
+        "latency_p95_ns": 20167,
+        "pure_diff_latency_p95_ns": 28000,
+        "output_ratio": 0.028721207423244105,
         "cells_compared_per_iteration": 81.7136,
         "semantic_fast_path_percent": 100.0,
-        "semantic_to_pure_diff_output_ratio": 0.12372298815280725,
-        "semantic_to_pure_diff_latency_ratio": 1.7957666246926904
+        "semantic_to_pure_diff_output_ratio": 0.0901849964223338,
+        "semantic_to_pure_diff_latency_ratio": 0.72025
       },
       "limits": {
-        "maximum_latency_p95_ns": 200000,
+        "maximum_latency_p95_ns": 80000,
         "maximum_output_ratio": 0.12,
         "maximum_cells_compared_per_iteration": 100,
         "minimum_semantic_fast_path_percent": 99.0,
@@ -172,21 +172,42 @@
     {
       "name": "zellij-like-layered-redraws",
       "measured": {
-        "latency_p95_ns": 123583,
-        "pure_diff_latency_p95_ns": 65916,
-        "output_ratio": 0.03097212405223244,
+        "latency_p95_ns": 19791,
+        "pure_diff_latency_p95_ns": 23458,
+        "output_ratio": 0.02819772221949424,
         "cells_compared_per_iteration": 160,
         "semantic_fast_path_percent": 83.32,
-        "semantic_to_pure_diff_output_ratio": 0.49950222996269666,
-        "semantic_to_pure_diff_latency_ratio": 1.8748558771770132
+        "semantic_to_pure_diff_output_ratio": 0.45343084762117697,
+        "semantic_to_pure_diff_latency_ratio": 0.8436780629209651
       },
       "limits": {
-        "maximum_latency_p95_ns": 300000,
+        "maximum_latency_p95_ns": 80000,
         "maximum_output_ratio": 0.10,
         "maximum_cells_compared_per_iteration": 250,
         "minimum_semantic_fast_path_percent": 80.0,
         "maximum_semantic_to_pure_diff_output_ratio": 0.65,
         "maximum_semantic_to_pure_diff_latency_ratio": 2.5
+      }
+    }
+  ],
+  "compositor_workloads": [
+    {
+      "name": "direct-compositor-pipeline",
+      "measured": {
+        "throughput_mib_per_second": 0.4320139080755125,
+        "latency_p95_ns": 19542,
+        "allocations": 1096303,
+        "allocated_bytes": 1743733483,
+        "output_bytes": 420107,
+        "completed_render_percent": 100.0
+      },
+      "limits": {
+        "minimum_throughput_mib_per_second": 0.2,
+        "maximum_latency_p95_ns": 60000,
+        "maximum_allocations": 1200000,
+        "maximum_allocated_bytes": 2000000000,
+        "maximum_output_bytes": 500000,
+        "minimum_completed_render_percent": 99.0
       }
     }
   ],

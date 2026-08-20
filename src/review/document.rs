@@ -79,7 +79,7 @@ impl ReviewDocument {
         let alternate_screen = snapshot.alternate_screen();
         let marks = snapshot.semantic_marks.clone();
         let mut rows = Vec::with_capacity(snapshot.scrollback.len() + snapshot.rows.len());
-        for source_row in snapshot.scrollback.iter().chain(&snapshot.rows) {
+        for source_row in snapshot.scrollback.iter().chain(snapshot.rows.iter()) {
             let mut cells = Vec::with_capacity(usize::from(capture_cols));
             let mut end = 0;
             for col in 0..capture_cols {

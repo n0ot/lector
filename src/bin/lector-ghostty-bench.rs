@@ -1,11 +1,15 @@
 use lector::{
+    app::App,
     output_scheduler::{EnqueueOutcome, OutputScheduler, OutputSchedulerConfig},
     presentation::{
         CursorOwner, FullSceneVtRenderer, GridPoint, GridRect, IncrementalVtRenderer, MediaLimits,
         OutputTransaction, PaneMediaStore, PresentedScene, RenderBatch, RenderCapabilities,
         RenderStrategy, RendererBackend, Scene, SceneDamage, SceneSurface, SurfaceId,
     },
+    screen_reader::ScreenReader,
+    speech::{Driver, Speech},
     terminal::{GhosttyEngine, TerminalDamage, TerminalGeometry},
+    views::{PtyView, ViewStack},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -60,8 +64,25 @@ struct BenchmarkReport {
     profile: &'static str,
     workloads: Vec<WorkloadReport>,
     renderer_workloads: Vec<RendererWorkloadReport>,
+    compositor_workloads: Vec<CompositorWorkloadReport>,
     scheduler_workloads: Vec<SchedulerWorkloadReport>,
     media_workloads: Vec<MediaWorkloadReport>,
+}
+
+#[derive(Serialize)]
+struct CompositorWorkloadReport {
+    name: &'static str,
+    iterations: usize,
+    input_bytes: u64,
+    elapsed_ns: u64,
+    throughput_mib_per_second: f64,
+    allocations: u64,
+    allocated_bytes: u64,
+    latency_p50_ns: u64,
+    latency_p95_ns: u64,
+    latency_max_ns: u64,
+    output_bytes: u64,
+    completed_renders: usize,
 }
 
 #[derive(Serialize)]
@@ -149,8 +170,25 @@ struct Baseline {
     target: String,
     workloads: Vec<BaselineWorkload>,
     renderer_workloads: Vec<RendererBaselineWorkload>,
+    compositor_workloads: Vec<CompositorBaselineWorkload>,
     scheduler_workloads: Vec<SchedulerBaselineWorkload>,
     media_workloads: Vec<MediaBaselineWorkload>,
+}
+
+#[derive(Deserialize)]
+struct CompositorBaselineWorkload {
+    name: String,
+    limits: CompositorBaselineLimits,
+}
+
+#[derive(Deserialize)]
+struct CompositorBaselineLimits {
+    minimum_throughput_mib_per_second: f64,
+    maximum_latency_p95_ns: u64,
+    maximum_allocations: u64,
+    maximum_allocated_bytes: u64,
+    maximum_output_bytes: u64,
+    minimum_completed_render_percent: f64,
 }
 
 #[derive(Deserialize)]
@@ -308,6 +346,7 @@ fn run() -> Result<(), String> {
             .into_iter()
             .map(run_renderer_workload)
             .collect::<Result<_, _>>()?,
+        compositor_workloads: vec![run_compositor_workload(if self_test { 4 } else { 10_000 })?],
         scheduler_workloads: scheduler_workloads(self_test)
             .into_iter()
             .map(run_scheduler_workload)
@@ -350,6 +389,9 @@ fn load_baseline(path: &PathBuf) -> Result<Baseline, String> {
     }
     if baseline.renderer_workloads.is_empty() {
         return Err("benchmark baseline contains no renderer workloads".to_owned());
+    }
+    if baseline.compositor_workloads.is_empty() {
+        return Err("benchmark baseline contains no compositor workloads".to_owned());
     }
     if baseline.scheduler_workloads.is_empty() {
         return Err("benchmark baseline contains no scheduler workloads".to_owned());
@@ -404,6 +446,30 @@ fn load_baseline(path: &PathBuf) -> Result<Baseline, String> {
         {
             return Err(format!(
                 "benchmark baseline renderer workload {:?} has an invalid zero limit",
+                workload.name
+            ));
+        }
+    }
+    for workload in &baseline.compositor_workloads {
+        if !names.insert(&workload.name) {
+            return Err(format!(
+                "benchmark baseline repeats workload {:?}",
+                workload.name
+            ));
+        }
+        let limits = &workload.limits;
+        if !limits.minimum_throughput_mib_per_second.is_finite()
+            || limits.minimum_throughput_mib_per_second <= 0.0
+            || limits.maximum_latency_p95_ns == 0
+            || limits.maximum_allocations == 0
+            || limits.maximum_allocated_bytes == 0
+            || limits.maximum_output_bytes == 0
+            || !limits.minimum_completed_render_percent.is_finite()
+            || !(0.0..=100.0).contains(&limits.minimum_completed_render_percent)
+            || limits.minimum_completed_render_percent == 0.0
+        {
+            return Err(format!(
+                "benchmark baseline compositor workload {:?} has an invalid limit",
                 workload.name
             ));
         }
@@ -567,6 +633,57 @@ fn check_report(report: &BenchmarkReport, baseline: &Baseline) -> Result<(), Str
             ));
         }
     }
+    for expected in &baseline.compositor_workloads {
+        let Some(actual) = report
+            .compositor_workloads
+            .iter()
+            .find(|workload| workload.name == expected.name)
+        else {
+            failures.push(format!("missing compositor workload {:?}", expected.name));
+            continue;
+        };
+        let limits = &expected.limits;
+        if actual.throughput_mib_per_second < limits.minimum_throughput_mib_per_second {
+            failures.push(format!(
+                "{} compositor throughput {:.3} MiB/s is below {:.3} MiB/s",
+                actual.name,
+                actual.throughput_mib_per_second,
+                limits.minimum_throughput_mib_per_second
+            ));
+        }
+        if actual.latency_p95_ns > limits.maximum_latency_p95_ns {
+            failures.push(format!(
+                "{} compositor p95 latency {} ns exceeds {} ns",
+                actual.name, actual.latency_p95_ns, limits.maximum_latency_p95_ns
+            ));
+        }
+        if actual.allocations > limits.maximum_allocations {
+            failures.push(format!(
+                "{} compositor allocations {} exceed {}",
+                actual.name, actual.allocations, limits.maximum_allocations
+            ));
+        }
+        if actual.allocated_bytes > limits.maximum_allocated_bytes {
+            failures.push(format!(
+                "{} compositor allocated bytes {} exceed {}",
+                actual.name, actual.allocated_bytes, limits.maximum_allocated_bytes
+            ));
+        }
+        if actual.output_bytes > limits.maximum_output_bytes {
+            failures.push(format!(
+                "{} compositor output bytes {} exceed {}",
+                actual.name, actual.output_bytes, limits.maximum_output_bytes
+            ));
+        }
+        let completed_percent =
+            actual.completed_renders as f64 * 100.0 / actual.iterations.max(1) as f64;
+        if completed_percent < limits.minimum_completed_render_percent {
+            failures.push(format!(
+                "{} compositor completion {:.1}% is below {:.1}%",
+                actual.name, completed_percent, limits.minimum_completed_render_percent
+            ));
+        }
+    }
     for expected in &baseline.scheduler_workloads {
         let Some(actual) = report
             .scheduler_workloads
@@ -724,6 +841,108 @@ fn run_workload(workload: Workload) -> Result<WorkloadReport, String> {
         latency_p95_ns: percentile(&latencies, 95),
         latency_max_ns: latencies.last().copied().unwrap_or(0),
         scrollback_extent,
+    })
+}
+
+struct NoopSpeechDriver;
+
+impl Driver for NoopSpeechDriver {
+    fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn get_rate(&self) -> f32 {
+        1.0
+    }
+
+    fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Measures the production direct-output path from one already-read PTY chunk
+/// through Ghostty mutation, scene composition, accessibility receipt capture,
+/// scheduler enqueue, physical write, flush confirmation, and publication.
+/// Unlike the renderer microbenchmarks, this deliberately includes every
+/// allocation and clone owned by the compositor pipeline.
+fn run_compositor_workload(iterations: usize) -> Result<CompositorWorkloadReport, String> {
+    let geometry = TerminalGeometry::from_cells(24, 80);
+    let stack = ViewStack::new(Box::new(PtyView::new(geometry.rows, geometry.cols)));
+    let mut app = App::new(stack).map_err(|error| error.to_string())?;
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut screen_reader = ScreenReader::new(Speech::new(Box::new(NoopSpeechDriver)));
+    let mut writer = BenchmarkWriter::default();
+
+    let mut initial = Vec::new();
+    for row in 1..=geometry.rows {
+        initial.extend_from_slice(format!("\x1b[{row};1Hbaseline row {row:02}").as_bytes());
+    }
+    app.handle_pty(&mut screen_reader, &initial, &mut writer)
+        .map_err(|error| error.to_string())?;
+    let initial_report = app
+        .drain_scheduled_output(&mut writer, true)
+        .map_err(|error| error.to_string())?;
+    if initial_report.completed_renders.len() != 1 {
+        return Err("initial compositor render did not complete".to_owned());
+    }
+
+    let updates = (0..iterations)
+        .map(|iteration| {
+            format!(
+                "\x1b[{};{}H{}",
+                iteration % usize::from(geometry.rows) + 1,
+                iteration % usize::from(geometry.cols - 1) + 1,
+                char::from(b'a' + (iteration % 26) as u8),
+            )
+            .into_bytes()
+        })
+        .collect::<Vec<_>>();
+    let input_bytes = updates
+        .iter()
+        .map(Vec::len)
+        .sum::<usize>()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let mut latencies = Vec::with_capacity(iterations);
+    let output_before = writer.bytes;
+    let mut completed_renders = 0usize;
+
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    let started = Instant::now();
+    for update in &updates {
+        let iteration_started = Instant::now();
+        app.handle_pty(&mut screen_reader, update, &mut writer)
+            .map_err(|error| error.to_string())?;
+        let report = app
+            .drain_scheduled_output(&mut writer, true)
+            .map_err(|error| error.to_string())?;
+        completed_renders = completed_renders.saturating_add(report.completed_renders.len());
+        latencies.push(nanos(iteration_started.elapsed()).max(1));
+    }
+    let elapsed_ns = nanos(started.elapsed()).max(1);
+    let allocations = ALLOCATIONS.load(Ordering::Relaxed);
+    let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    latencies.sort_unstable();
+    let seconds = elapsed_ns as f64 / 1_000_000_000.0;
+
+    Ok(CompositorWorkloadReport {
+        name: "direct-compositor-pipeline",
+        iterations,
+        input_bytes,
+        elapsed_ns,
+        throughput_mib_per_second: input_bytes as f64 / (1024.0 * 1024.0) / seconds,
+        allocations,
+        allocated_bytes,
+        latency_p50_ns: percentile(&latencies, 50),
+        latency_p95_ns: percentile(&latencies, 95),
+        latency_max_ns: latencies.last().copied().unwrap_or(0),
+        output_bytes: writer.bytes.saturating_sub(output_before),
+        completed_renders,
     })
 }
 

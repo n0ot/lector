@@ -1,7 +1,7 @@
 //! Engine-neutral terminal state and Lector's Ghostty terminal adapter.
 
 use serde::{Deserialize, Serialize};
-use std::ops::RangeInclusive;
+use std::{borrow::Cow, ops::RangeInclusive, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,7 +44,7 @@ pub struct Style {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Cell {
-    pub grapheme: String,
+    pub grapheme: Cow<'static, str>,
     pub width: u8,
     pub continuation: bool,
     pub style: Style,
@@ -54,7 +54,7 @@ pub struct Cell {
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            grapheme: String::new(),
+            grapheme: Cow::Borrowed(""),
             width: 1,
             continuation: false,
             style: Style::default(),
@@ -112,7 +112,7 @@ impl Cell {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct Row {
-    pub cells: Vec<Cell>,
+    pub cells: Arc<Vec<Cell>>,
     pub wrapped: bool,
 }
 
@@ -557,7 +557,7 @@ pub enum Viewport {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TerminalSnapshot {
-    pub rows: Vec<Row>,
+    pub rows: Arc<Vec<Row>>,
     pub scrollback: Vec<Row>,
     pub cursor: Cursor,
     pub geometry: TerminalGeometry,
@@ -636,7 +636,7 @@ impl TerminalSnapshot {
     pub fn contents(&self) -> String {
         let mut contents = String::new();
         let mut wrapping = false;
-        for row in &self.rows {
+        for row in self.rows.iter() {
             let text = row.contents();
             if !text.is_empty() {
                 contents.push_str(&text);
@@ -711,7 +711,7 @@ impl TerminalSnapshot {
     pub fn contents_full_into(&self, out: &mut String) {
         out.clear();
         let (_, cols) = self.size();
-        for row in &self.rows {
+        for row in self.rows.iter() {
             out.push_str(row_contents(row, 0, cols).trim_end());
             out.push('\n');
         }
@@ -1075,14 +1075,17 @@ impl GhosttyEngine {
         let visible_rows = live.rows.len();
         let history_rows = full.scrollback.len();
         let mut all_rows = full.scrollback;
-        all_rows.extend(full.rows);
+        all_rows.extend(full.rows.iter().cloned());
         let start = history_rows.saturating_sub(offset);
         let end = start.saturating_add(visible_rows).min(all_rows.len());
         self.snapshot = live;
-        self.snapshot.rows = all_rows[start..end].to_vec();
+        self.snapshot.rows = Arc::new(all_rows[start..end].to_vec());
         while self.snapshot.rows.len() < visible_rows {
-            self.snapshot.rows.push(Row {
-                cells: vec![Cell::default(); usize::from(self.snapshot.geometry.cols)],
+            Arc::make_mut(&mut self.snapshot.rows).push(Row {
+                cells: Arc::new(vec![
+                    Cell::default();
+                    usize::from(self.snapshot.geometry.cols)
+                ]),
                 wrapped: false,
             });
         }
@@ -1132,7 +1135,7 @@ impl GhosttyEngine {
         };
         for range in ranges {
             for row in range.clone() {
-                self.snapshot.rows[usize::from(row)] =
+                Arc::make_mut(&mut self.snapshot.rows)[usize::from(row)] =
                     normalize_ghostty_row(&source.rows[usize::from(row)]);
             }
         }
@@ -1233,7 +1236,7 @@ impl TerminalEngine for GhosttyEngine {
 
 fn normalize_ghostty_snapshot(snapshot: &GhosttySnapshot) -> TerminalSnapshot {
     let mut normalized = TerminalSnapshot {
-        rows: snapshot.rows.iter().map(normalize_ghostty_row).collect(),
+        rows: Arc::new(snapshot.rows.iter().map(normalize_ghostty_row).collect()),
         scrollback: snapshot
             .scrollback
             .iter()
@@ -1461,7 +1464,8 @@ fn normalize_ghostty_row(row: &GhosttyRow) -> Row {
                 style: normalize_ghostty_style(cell.style.clone()),
                 hyperlink: cell.hyperlink.clone(),
             })
-            .collect(),
+            .collect::<Vec<_>>()
+            .into(),
         wrapped: row.wrapped,
     }
 }

@@ -290,7 +290,7 @@ fn failure_artifact_format_is_reproducible_and_complete() {
         size: TerminalSize { rows: 1, cols: 2 },
         rows: vec![NormalizedRow {
             cells: vec![NormalizedCell {
-                grapheme: "x".to_owned(),
+                grapheme: "x".into(),
                 width: 1,
                 continuation: false,
                 style: NormalizedStyle::default(),

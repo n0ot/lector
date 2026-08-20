@@ -333,11 +333,46 @@ impl App {
         &mut self,
         term_out: &mut dyn Write,
         bell_count: usize,
-        synchronized_output_opened: bool,
-        synchronized_output_activity: bool,
+        updates: BTreeMap<(u64, crate::tmux_model::PaneId), UpdateSummary>,
     ) -> Result<()> {
+        let synchronized_output_opened = updates
+            .values()
+            .any(|update| update.synchronized_output_opened);
+        let synchronized_output_activity =
+            updates.values().any(|update| update.synchronized_output);
+        let surface_updates = self
+            .view_stack
+            .active_tmux_connection_mut()
+            .map(|view| {
+                updates
+                    .into_iter()
+                    .filter_map(|((connection_id, pane_id), update)| {
+                        (connection_id == view.connection_id())
+                            .then(|| {
+                                view.surface_id(pane_id)
+                                    .map(|surface_id| (surface_id, update))
+                            })
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let scene = self.composed_scene_with_bells(bell_count)?;
         let compositor_transition = self.view_stack.compositor_transition_pending();
+        let damage = if compositor_transition {
+            SceneDamage::Full
+        } else {
+            SceneDamage::from_terminal_updates(
+                surface_updates.iter().filter_map(|(surface_id, update)| {
+                    scene
+                        .panes
+                        .iter()
+                        .find(|surface| surface.id == *surface_id)
+                        .map(|surface| (surface, update))
+                }),
+                scene.geometry,
+            )
+        };
         self.render_prepared_scene(
             term_out,
             bell_count,
@@ -347,7 +382,7 @@ impl App {
                 compositor_bypass: compositor_transition,
             },
             scene,
-            SceneDamage::Full,
+            damage,
         )
     }
 

@@ -10,7 +10,10 @@ use crate::{
     tmux_model::{Pane, PaneCaptureMetadata, PaneId, TmuxTopology},
     view::View,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 use thiserror::Error;
 
 const MAX_LAYOUT_DEPTH: usize = 64;
@@ -233,15 +236,16 @@ impl TmuxLayout {
                 cells: masks
                     .into_iter()
                     .map(|mask| Cell {
-                        grapheme: border_character(mask).to_owned(),
+                        grapheme: border_character(mask).into(),
                         ..Cell::default()
                     })
-                    .collect(),
+                    .collect::<Vec<_>>()
+                    .into(),
                 wrapped: false,
             })
             .collect();
         TerminalSnapshot {
-            rows,
+            rows: Arc::new(rows),
             cursor: Cursor {
                 visible: false,
                 ..Cursor::default()

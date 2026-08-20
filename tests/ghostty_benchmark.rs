@@ -121,6 +121,37 @@ fn benchmark_runner_emits_a_machine_readable_complete_report() {
         );
     }
 
+    let compositor_workloads = report["compositor_workloads"]
+        .as_array()
+        .expect("compositor workload array");
+    assert!(!compositor_workloads.is_empty());
+    for workload in compositor_workloads {
+        for field in [
+            "name",
+            "iterations",
+            "input_bytes",
+            "elapsed_ns",
+            "throughput_mib_per_second",
+            "allocations",
+            "allocated_bytes",
+            "latency_p50_ns",
+            "latency_p95_ns",
+            "latency_max_ns",
+            "output_bytes",
+            "completed_renders",
+        ] {
+            assert!(
+                !workload[field].is_null(),
+                "missing compositor benchmark field {field}"
+            );
+        }
+        assert!(
+            workload["completed_renders"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+    }
+
     let scheduler_workloads = report["scheduler_workloads"]
         .as_array()
         .expect("scheduler workload array");
@@ -323,6 +354,43 @@ fn checked_in_release_baseline_has_regression_thresholds_for_every_workload() {
             workload["limits"]["maximum_semantic_to_pure_diff_latency_ratio"]
                 .as_f64()
                 .is_some_and(|value| value > 0.0)
+        );
+    }
+
+    let compositor_workloads = baseline["compositor_workloads"]
+        .as_array()
+        .expect("compositor baseline workloads");
+    assert_eq!(compositor_workloads.len(), 1);
+    let compositor = &compositor_workloads[0];
+    assert_eq!(compositor["name"], "direct-compositor-pipeline");
+    for field in [
+        "throughput_mib_per_second",
+        "latency_p95_ns",
+        "allocations",
+        "allocated_bytes",
+        "output_bytes",
+        "completed_render_percent",
+    ] {
+        assert!(
+            compositor["measured"][field]
+                .as_f64()
+                .is_some_and(|value| value > 0.0),
+            "missing measured compositor field {field}"
+        );
+    }
+    for field in [
+        "minimum_throughput_mib_per_second",
+        "maximum_latency_p95_ns",
+        "maximum_allocations",
+        "maximum_allocated_bytes",
+        "maximum_output_bytes",
+        "minimum_completed_render_percent",
+    ] {
+        assert!(
+            compositor["limits"][field]
+                .as_f64()
+                .is_some_and(|value| value > 0.0),
+            "missing compositor limit {field}"
         );
     }
 

@@ -7,6 +7,7 @@ use lector::{
     },
     terminal::{GhosttyEngine, TerminalGeometry, TerminalOperation, TerminalSnapshot},
 };
+use std::sync::Arc;
 
 const ROOT: SurfaceId = SurfaceId(1);
 const OVERLAY: SurfaceId = SurfaceId(2);
@@ -433,7 +434,8 @@ fn an_inconsistent_operation_hint_forces_the_full_correctness_fallback() {
         .advance(b"\x1b[2;4H\x1b[2P")
         .expect("delete chars");
     let mut scene = scene_for(&session.source);
-    scene.panes[0].snapshot.rows[5].cells[0].grapheme = "!".to_owned();
+    let rows = Arc::make_mut(&mut scene.panes[0].snapshot.rows);
+    Arc::make_mut(&mut rows[5].cells)[0].grapheme = "!".into();
     let damage = SceneDamage::from_terminal_update(&scene.panes[0], &update, scene.geometry);
     let batch = session
         .renderer

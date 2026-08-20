@@ -458,7 +458,7 @@ fn hyperlink_lifetime_survives_incremental_transactions_and_has_an_explicit_fall
             .into_terminal_snapshot()
             .rows
             .iter()
-            .flat_map(|row| &row.cells)
+            .flat_map(|row| row.cells.iter())
             .all(|cell| cell.hyperlink.is_none())
     );
     assert!(

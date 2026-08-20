@@ -8,8 +8,8 @@
 mod ffi;
 
 use std::{
-    ffi::c_void, fmt, marker::PhantomData, mem::MaybeUninit, ops::RangeInclusive, ptr::NonNull,
-    rc::Rc,
+    borrow::Cow, ffi::c_void, fmt, marker::PhantomData, mem::MaybeUninit, ops::RangeInclusive,
+    ptr::NonNull, rc::Rc,
 };
 
 /// An error reported by the Ghostty C ABI or by validation at the Rust boundary.
@@ -162,7 +162,7 @@ pub struct SemanticMarkSnapshot {
 /// A normalized cell from Ghostty's current visible viewport.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CellSnapshot {
-    pub grapheme: String,
+    pub grapheme: Cow<'static, str>,
     pub width: u8,
     pub continuation: bool,
     pub style: StyleSnapshot,
@@ -3173,10 +3173,11 @@ fn row_cells_query<T>(
     Ok(unsafe { value.assume_init() })
 }
 
-fn row_cell_grapheme(handle: &RowCellsHandle) -> Result<String, Error> {
+fn row_cell_grapheme(handle: &RowCellsHandle) -> Result<Cow<'static, str>, Error> {
+    let mut inline = [0_u8; 16];
     let mut output = ffi::GhosttyBuffer {
-        ptr: std::ptr::null_mut(),
-        cap: 0,
+        ptr: inline.as_mut_ptr(),
+        cap: inline.len(),
         len: 0,
     };
     // SAFETY: the row-cells handle is positioned and output points to a
@@ -3188,8 +3189,11 @@ fn row_cell_grapheme(handle: &RowCellsHandle) -> Result<String, Error> {
             (&mut output as *mut ffi::GhosttyBuffer).cast(),
         )
     };
-    if first == ffi::SUCCESS && output.len == 0 {
-        return Ok(String::new());
+    if first == ffi::SUCCESS {
+        if output.len > inline.len() {
+            return Err(Error::OutOfSpace);
+        }
+        return compact_utf8_grapheme(&inline[..output.len]);
     }
     if first != ffi::OUT_OF_SPACE {
         result_from_code(first)?;
@@ -3210,7 +3214,9 @@ fn row_cell_grapheme(handle: &RowCellsHandle) -> Result<String, Error> {
         return Err(Error::OutOfSpace);
     }
     bytes.truncate(output.len);
-    String::from_utf8(bytes).map_err(|_| Error::InvalidUtf8)
+    String::from_utf8(bytes)
+        .map(Cow::Owned)
+        .map_err(|_| Error::InvalidUtf8)
 }
 
 fn row_cell_style(handle: &RowCellsHandle) -> Result<ffi::Style, Error> {
@@ -3307,13 +3313,19 @@ fn grid_ref_query_row(reference: &ffi::GridRef) -> Result<ffi::Row, Error> {
     Ok(unsafe { row.assume_init() })
 }
 
-fn grid_ref_grapheme(reference: &ffi::GridRef) -> Result<String, Error> {
+fn grid_ref_grapheme(reference: &ffi::GridRef) -> Result<Cow<'static, str>, Error> {
+    let mut inline = [0_u32; 8];
     let mut len = 0;
-    // SAFETY: null with zero length is Ghostty's documented sizing query.
-    let first =
-        unsafe { ffi::ghostty_grid_ref_graphemes(reference, std::ptr::null_mut(), 0, &mut len) };
-    if first == ffi::SUCCESS && len == 0 {
-        return Ok(String::new());
+    // SAFETY: `inline` contains writable u32 elements and the untracked
+    // reference remains valid throughout this bounded query.
+    let first = unsafe {
+        ffi::ghostty_grid_ref_graphemes(reference, inline.as_mut_ptr(), inline.len(), &mut len)
+    };
+    if first == ffi::SUCCESS {
+        if len > inline.len() {
+            return Err(Error::OutOfSpace);
+        }
+        return grapheme_from_codepoints(&inline[..len]);
     }
     if first != ffi::OUT_OF_SPACE {
         result_from_code(first)?;
@@ -3332,11 +3344,47 @@ fn grid_ref_grapheme(reference: &ffi::GridRef) -> Result<String, Error> {
     if len > codepoints.len() {
         return Err(Error::OutOfSpace);
     }
-    let mut grapheme = String::new();
-    for codepoint in codepoints.into_iter().take(len) {
+    grapheme_from_codepoints(&codepoints[..len])
+}
+
+fn compact_utf8_grapheme(bytes: &[u8]) -> Result<Cow<'static, str>, Error> {
+    if bytes.is_empty() {
+        return Ok(Cow::Borrowed(""));
+    }
+    if let [byte] = bytes
+        && let Some(grapheme) = borrowed_printable_ascii(*byte)
+    {
+        return Ok(Cow::Borrowed(grapheme));
+    }
+    std::str::from_utf8(bytes)
+        .map(|grapheme| Cow::Owned(grapheme.to_owned()))
+        .map_err(|_| Error::InvalidUtf8)
+}
+
+fn grapheme_from_codepoints(codepoints: &[u32]) -> Result<Cow<'static, str>, Error> {
+    if codepoints.is_empty() {
+        return Ok(Cow::Borrowed(""));
+    }
+    if let [codepoint] = codepoints
+        && let Ok(byte) = u8::try_from(*codepoint)
+        && let Some(grapheme) = borrowed_printable_ascii(byte)
+    {
+        return Ok(Cow::Borrowed(grapheme));
+    }
+    let mut grapheme = String::with_capacity(codepoints.len().saturating_mul(4));
+    for &codepoint in codepoints {
         grapheme.push(char::from_u32(codepoint).ok_or(Error::InvalidValue)?);
     }
-    Ok(grapheme)
+    Ok(Cow::Owned(grapheme))
+}
+
+fn borrowed_printable_ascii(byte: u8) -> Option<&'static str> {
+    static PRINTABLE_ASCII: &[u8] =
+        b" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~";
+    let index = usize::from(byte.checked_sub(b' ')?);
+    let bytes = PRINTABLE_ASCII.get(index..=index)?;
+    // Every byte in this static table is printable ASCII and therefore UTF-8.
+    std::str::from_utf8(bytes).ok()
 }
 
 fn grid_ref_hyperlink(reference: &ffi::GridRef) -> Result<Option<String>, Error> {
