@@ -13,6 +13,11 @@ use std::fs::File;
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
+
+const CHILD_TERMINATION_REAP_TIMEOUT: Duration = Duration::from_millis(250);
+const CHILD_TERMINATION_REAP_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VirtualTerminalEnvironment {
@@ -169,16 +174,77 @@ impl Process {
         let Some(mut child) = self.child.take() else {
             return;
         };
-        if let Some(pid) = child.process_id().and_then(|pid| i32::try_from(pid).ok()) {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-        }
-        let _ = child.wait();
+        terminate_child(
+            &mut *child,
+            self.master.process_group_leader(),
+            CHILD_TERMINATION_REAP_TIMEOUT,
+        );
     }
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
         self.terminate();
+    }
+}
+
+fn terminate_child(
+    child: &mut dyn Child,
+    foreground_process_group: Option<nix::libc::pid_t>,
+    reap_timeout: Duration,
+) {
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => break,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+
+    let child_pid = child
+        .process_id()
+        .and_then(|pid| nix::libc::pid_t::try_from(pid).ok());
+
+    // portable-pty makes the direct child a session and process-group leader.
+    // A shell may give the foreground PTY to a different job group, so signal
+    // both groups before falling back to the direct PID. This prevents a job
+    // which inherited the slave PTY from surviving Lector's cleanup.
+    if let Some(group) = foreground_process_group {
+        kill_process_group(group);
+    }
+    if let Some(pid) = child_pid {
+        if Some(pid) != foreground_process_group {
+            kill_process_group(pid);
+        }
+        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+    }
+
+    reap_child_until(child, reap_timeout);
+}
+
+fn kill_process_group(group: nix::libc::pid_t) {
+    if group > 0 && group != nix::unistd::getpgrp().as_raw() {
+        let _ = kill(Pid::from_raw(-group), Signal::SIGKILL);
+    }
+}
+
+fn reap_child_until(child: &mut dyn Child, timeout: Duration) {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return;
+        };
+        thread::sleep(remaining.min(CHILD_TERMINATION_REAP_POLL_INTERVAL));
     }
 }
 
@@ -254,6 +320,7 @@ impl PtyStream {
                 Ok(count) => {
                     self.pending_write.drain(..count);
                     report.bytes_written = report.bytes_written.saturating_add(count);
+                    log_child_pty_write(count, self.pending_write.len());
                 }
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {
@@ -270,8 +337,15 @@ impl PtyStream {
         let _ = self.drain_pending_writes()?;
         if self.pending_write.is_empty() {
             match self.inner.write(bytes) {
-                Ok(count) if count == bytes.len() => return Ok(count),
-                Ok(count) => return Ok(self.queue_remainder(bytes, count)),
+                Ok(count) if count == bytes.len() => {
+                    log_child_pty_write(count, 0);
+                    return Ok(count);
+                }
+                Ok(count) => {
+                    let accepted = self.queue_remainder(bytes, count);
+                    log_child_pty_write(count, self.pending_write.len());
+                    return Ok(accepted);
+                }
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error),
@@ -292,6 +366,16 @@ impl PtyStream {
         // responsive. The event loop observes overflow and terminates only the
         // failed child transport before later protocol commands can overtake it.
         bytes.len()
+    }
+}
+
+fn log_child_pty_write(bytes: usize, pending: usize) {
+    if bytes != 0 && crate::diagnostics::enabled() {
+        crate::diagnostics::event(
+            "latency",
+            "child-pty-write",
+            &format!("bytes={bytes} pending={pending}"),
+        );
     }
 }
 
@@ -347,18 +431,24 @@ pub fn set_raw(fd: RawFd) -> Result<()> {
 mod tests {
     use super::{
         PTY_WRITE_BUFFER_LIMIT, Process, PtyStream, compatible_terminal_environment, set_raw,
-        terminal_geometry,
+        terminal_geometry, terminate_child,
     };
     use crate::terminal::TerminalGeometry;
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::sys::termios::{self, LocalFlags};
     use nix::unistd::pipe;
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+    use portable_pty::{
+        Child, ChildKiller, CommandBuilder, ExitStatus, PtySize, native_pty_system,
+    };
     use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::fd::{AsRawFd, BorrowedFd};
     use std::path::Path;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::{Duration, Instant};
 
     // macOS has a finite system PTY pool. These tests each hold a real PTY
     // while a child runs, and concurrent test processes may already consume
@@ -386,6 +476,69 @@ mod tests {
         let fd = pair.master.as_raw_fd().expect("reference PTY raw fd");
         termios::tcgetattr(unsafe { BorrowedFd::borrow_raw(fd) })
             .expect("read reference terminal attributes")
+    }
+
+    #[derive(Debug)]
+    struct NoopChildKiller;
+
+    impl ChildKiller for NoopChildKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    #[derive(Debug)]
+    struct NeverExitsChild {
+        try_wait_calls: Arc<AtomicUsize>,
+    }
+
+    impl ChildKiller for NeverExitsChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            Box::new(NoopChildKiller)
+        }
+    }
+
+    impl Child for NeverExitsChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+            self.try_wait_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> std::io::Result<ExitStatus> {
+            panic!("bounded PTY cleanup must never call blocking Child::wait")
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+    }
+
+    #[test]
+    fn child_cleanup_never_uses_an_unbounded_wait() {
+        let try_wait_calls = Arc::new(AtomicUsize::new(0));
+        let mut child = NeverExitsChild {
+            try_wait_calls: Arc::clone(&try_wait_calls),
+        };
+        let reap_window = Duration::from_millis(10);
+        let started = Instant::now();
+
+        terminate_child(&mut child, None, reap_window);
+
+        assert!(try_wait_calls.load(Ordering::Relaxed) >= 2);
+        assert!(started.elapsed() >= reap_window);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "short reap window was not bounded: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

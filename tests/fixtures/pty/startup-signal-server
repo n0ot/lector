@@ -1,0 +1,21 @@
+#!/bin/bash
+
+set -u
+
+# Hold both ends of a private FIFO open and block in Bash's read builtin. This
+# survives stdin EOF just like the former builtin spin, without consuming a CPU
+# while the full test suite is running other process-heavy integration tests.
+# Complete every external command before publishing readiness: otherwise a
+# SIGTERM could kill Bash while mkfifo or rm still inherited the RPC pipes,
+# making Lector wait for that descendant instead of observing immediate EOF.
+block_fifo="$1.block"
+mkfifo "$block_fifo"
+exec 3<> "$block_fifo"
+rm -f "$block_fifo"
+
+# Consume the initialize request, but never acknowledge it. Publishing the PID
+# after this point proves initialization is in flight and, because only Bash
+# builtins follow it, proves the direct server has no live descendants.
+IFS= read -r _initialize || exit 0
+printf '%s\n' "$$" > "$1"
+IFS= read -r -u 3 _blocked

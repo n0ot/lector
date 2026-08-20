@@ -1,0 +1,42 @@
+#!/bin/bash
+
+stty raw -echo
+if [[ ${LECTOR_TEST_ATOMIC_STARTUP:-} == 1 ]]; then
+    printf '\033[?2026h\033[2J\033[HLECTOR-ATOMIC-TRANSIENT\033[6n'
+    # A virtual cursor-position reply proves Lector has parsed the open frame,
+    # making this a real split transaction instead of two writes which happen
+    # to be coalesced before its first PTY drain.
+    while IFS= read -r -n 1 atomic_reply; do
+        [[ $atomic_reply == R ]] && break
+    done
+    # Model a valid Neovim transaction, comfortably inside Lector's separate
+    # 100 ms broken-frame safety timeout.
+    sleep 0.04
+    printf '\r\033[2KLECTOR-ATOMIC-FINAL\033[?2026l'
+else
+    printf '\033[2J\033[HLECTOR-LATENCY-READY'
+fi
+counter=0
+while IFS= read -r -n 1 byte; do
+    case "$byte" in
+        p)
+            if [[ -n ${LECTOR_TEST_STARTUP_ORDER_LOG:-} ]]; then
+                printf 'input\n' >> "$LECTOR_TEST_STARTUP_ORDER_LOG"
+            fi
+            counter=$((counter + 1))
+            printf '\r\033[2KLECTOR-LATENCY-ACK-%02d' "$counter"
+            ;;
+        s)
+            printf '\033[2J\033[H'
+            row=0
+            while [[ $row -lt 24 ]]; do
+                printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+                row=$((row + 1))
+                if [[ $row -lt 24 ]]; then
+                    printf '\r\n'
+                fi
+            done
+            ;;
+        q) exit 0 ;;
+    esac
+done

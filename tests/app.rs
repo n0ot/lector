@@ -1,7 +1,7 @@
 use lector::{
     app::{App, Clock, DIFF_DELAY, MAX_DIFF_DELAY, MAX_PENDING_TERMINAL_INPUT_BYTES},
     output_scheduler::OutputSchedulerConfig,
-    presentation::PresentedScene,
+    presentation::{PresentedScene, RenderStrategy},
     screen_reader::ScreenReader,
     speech,
     terminal::{Color, GhosttyEngine, TerminalEngine},
@@ -1566,6 +1566,122 @@ fn synchronized_close_becomes_readable_only_after_its_render_flushes() {
 }
 
 #[test]
+fn replacing_an_unstarted_render_keeps_incremental_rendering_available() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"baseline", &mut term_out)
+        .expect("queue baseline");
+    app.drain_scheduled_output(&mut term_out, true)
+        .expect("confirm baseline");
+
+    app.handle_pty(&mut sr, b"\rfirst", &mut term_out)
+        .expect("queue the first incremental render");
+    assert_ne!(
+        app.debug_last_render_strategy(),
+        RenderStrategy::FullFallback
+    );
+    app.handle_pty(&mut sr, b"\rsecond", &mut term_out)
+        .expect("replace it before either render starts");
+    assert_ne!(
+        app.debug_last_render_strategy(),
+        RenderStrategy::FullFallback,
+        "an unstarted render still shares the confirmed physical shadow"
+    );
+}
+
+#[test]
+fn neovim_atomic_redraw_is_never_read_mid_draw_and_finalizes_on_its_flush() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"old", &mut term_out)
+        .expect("queue the committed baseline");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the committed baseline");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize baseline")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+    term_out.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?2026h\r\x1b[2Kneovim transient one",
+        &mut term_out,
+    )
+    .expect("begin Neovim-style atomic redraw");
+    for partial in [
+        b"\r\x1b[2Kneovim transient two".as_slice(),
+        b"\r\x1b[2Kneovim transient three".as_slice(),
+    ] {
+        clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+        assert!(
+            !app.maybe_finalize_changes(&mut sr)
+                .expect("do not read an unpresented working frame")
+        );
+        assert!(recorder.inner.borrow().speaks.is_empty());
+        assert!(
+            app.drain_scheduled_output(&mut term_out, false)
+                .expect("hold the working frame")
+                .completed_renders
+                .is_empty()
+        );
+        app.handle_pty(&mut sr, partial, &mut term_out)
+            .expect("replace the working frame");
+    }
+    assert!(
+        term_out.is_empty(),
+        "working pixels escaped the atomic draw"
+    );
+
+    app.handle_pty(&mut sr, b"\r\x1b[2Kneovim final\x1b[?2026l", &mut term_out)
+        .expect("commit the final Neovim frame");
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    let blocked = app
+        .drain_scheduled_output(&mut writer, false)
+        .expect("write but do not publish the final frame");
+    assert!(blocked.completed_renders.is_empty());
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("do not read before the physical flush")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    writer.block_flush = false;
+    let completed = app
+        .drain_scheduled_output(&mut writer, true)
+        .expect("flush the exact committed frame");
+    assert_eq!(completed.completed_renders.len(), 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("the explicit commit needs no extra debounce")
+    );
+    let spoken = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        spoken.iter().any(|text| text.contains("neovim final")),
+        "{spoken:?}"
+    );
+    assert!(
+        spoken.iter().all(|text| !text.contains("transient")),
+        "{spoken:?}"
+    );
+}
+
+#[test]
 fn timeout_flush_publishes_its_exact_generation_not_a_newer_parser_frame() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig::default());
@@ -2223,11 +2339,10 @@ fn overlay_redraw_auto_read_waits_for_the_matching_physical_frame() {
         "a logical redraw was auto-read before its physical frame completed"
     );
     assert!(
-        !app.wants_tick(),
-        "a deferred read must not spin while its render is not ready"
+        app.wants_tick(),
+        "the zero-delay render should request an immediate presentation turn"
     );
 
-    clock.advance_ms(4);
     app.drain_scheduled_output(&mut term_out, false)
         .expect("present the edited REPL");
     assert!(

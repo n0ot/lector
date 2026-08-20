@@ -1,0 +1,271 @@
+{
+  "openrpc": "1.4.0",
+  "info": {
+    "title": "Lector speech driver protocol",
+    "description": "The version 1.0 JSON-RPC interface between Lector and a spawned speech server. Messages are UTF-8, newline-delimited JSON objects over the child process's stdin and stdout. See docs/speech-driver-protocol.md for transport, lifecycle, timeout, and recovery requirements.",
+    "license": {
+      "name": "MIT",
+      "url": "https://opensource.org/license/mit"
+    },
+    "version": "1.0.0"
+  },
+  "externalDocs": {
+    "description": "Normative transport and lifecycle specification",
+    "url": "./docs/speech-driver-protocol.md"
+  },
+  "methods": [
+    {
+      "name": "initialize",
+      "summary": "Negotiate the speech protocol and identify both peers",
+      "description": "Lector sends initialize once, as the first call in a new server process. The server must return protocol version 1.0 and all required version 1.0 capabilities before Lector sends speech operations.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "protocol_version",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "enum": [
+              "1.0"
+            ]
+          }
+        },
+        {
+          "name": "client",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/PeerInfo"
+          }
+        }
+      ],
+      "result": {
+        "name": "initialization",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/InitializeResult"
+        }
+      },
+      "errors": [
+        {
+          "code": -32602,
+          "message": "Invalid params"
+        },
+        {
+          "code": -32001,
+          "message": "Unsupported speech protocol version"
+        }
+      ]
+    },
+    {
+      "name": "rpc.discover",
+      "summary": "Return this server's OpenRPC document",
+      "description": "Returns an OpenRPC document describing the speech interface implemented by the running server. It is available before and after initialize.",
+      "params": [],
+      "result": {
+        "name": "openrpc_document",
+        "required": true,
+        "schema": {
+          "type": "object",
+          "description": "An OpenRPC document compatible with the repository's canonical openrpc.json.",
+          "additionalProperties": true
+        }
+      }
+    },
+    {
+      "name": "speak",
+      "summary": "Submit text for speech",
+      "description": "Accept text for asynchronous speech. A successful response means the request was accepted, not that playback completed. When interrupt is true, the server stops current and queued speech before accepting this text.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "text",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "minLength": 1,
+            "description": "UTF-8 text to speak. Lector bounds one announcement to 64 KiB before transport encoding."
+          }
+        },
+        {
+          "name": "interrupt",
+          "required": true,
+          "schema": {
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "accepted",
+        "required": true,
+        "schema": {
+          "type": "null"
+        }
+      },
+      "errors": [
+        {
+          "code": -32600,
+          "message": "Speech server is not initialized"
+        },
+        {
+          "code": -32602,
+          "message": "Invalid params"
+        },
+        {
+          "code": -32603,
+          "message": "Speech backend error"
+        }
+      ]
+    },
+    {
+      "name": "stop",
+      "summary": "Stop current and queued speech",
+      "description": "Stop active playback and discard speech queued by the server.",
+      "params": [],
+      "result": {
+        "name": "stopped",
+        "required": true,
+        "schema": {
+          "type": "null"
+        }
+      },
+      "errors": [
+        {
+          "code": -32600,
+          "message": "Speech server is not initialized"
+        },
+        {
+          "code": -32603,
+          "message": "Speech backend error"
+        }
+      ]
+    },
+    {
+      "name": "set_rate",
+      "summary": "Set the speaking rate",
+      "description": "Set the backend's speaking rate. A server may clamp the requested number to its supported range and returns the effective rate.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "rate",
+          "required": true,
+          "schema": {
+            "type": "number",
+            "description": "Finite backend speaking-rate value requested by Lector."
+          }
+        }
+      ],
+      "result": {
+        "name": "effective_rate",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/SetRateResult"
+        }
+      },
+      "errors": [
+        {
+          "code": -32600,
+          "message": "Speech server is not initialized"
+        },
+        {
+          "code": -32602,
+          "message": "Invalid params"
+        },
+        {
+          "code": -32603,
+          "message": "Speech backend error"
+        }
+      ]
+    }
+  ],
+  "components": {
+    "schemas": {
+      "PeerInfo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "Capabilities": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "speak",
+          "stop",
+          "set_rate",
+          "rpc_discover"
+        ],
+        "properties": {
+          "speak": {
+            "const": true
+          },
+          "stop": {
+            "const": true
+          },
+          "set_rate": {
+            "const": true
+          },
+          "rpc_discover": {
+            "const": true
+          }
+        }
+      },
+      "InitializeResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "protocol_version",
+          "server",
+          "capabilities"
+        ],
+        "properties": {
+          "protocol_version": {
+            "type": "string",
+            "enum": [
+              "1.0"
+            ]
+          },
+          "server": {
+            "$ref": "#/components/schemas/PeerInfo"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/Capabilities"
+          }
+        }
+      },
+      "SetRateResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "rate"
+        ],
+        "properties": {
+          "rate": {
+            "type": "number",
+            "description": "The finite rate actually selected by the backend."
+          }
+        }
+      }
+    }
+  },
+  "x-lector-transport": {
+    "kind": "stdio",
+    "encoding": "utf-8",
+    "framing": "ndjson-lf",
+    "maximumFrameBytes": 1048576,
+    "maximumInFlightRequests": 1,
+    "initializeDeadlineMilliseconds": 5000,
+    "requestDeadlineMilliseconds": 1000
+  }
+}

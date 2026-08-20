@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use lector::{
-    app, diagnostics, lua, platform,
+    app, diagnostics, lua,
     presentation::PhysicalTerminalLifecycle,
     pty,
     screen_reader::ScreenReader,
@@ -18,13 +18,151 @@ use signal_hook_mio::v1_0::Signals;
 use std::{
     io::{ErrorKind, Read, Write},
     os::fd::{AsFd, AsRawFd, RawFd},
-    time,
+    sync::Arc,
+    thread, time,
 };
 
 const FOCUS_EVENTS_QUERY: &[u8] = b"\x1B[?1004$p";
 const STDOUT_WRITABLE_RETRY_INTERVAL: time::Duration = time::Duration::from_millis(10);
 const SHUTDOWN_FENCE_TIMEOUT: time::Duration = time::Duration::from_millis(1_000);
 const SHUTDOWN_INPUT_SETTLE_TIME: time::Duration = time::Duration::from_millis(50);
+
+const STARTUP_SIGNAL_TOKEN: mio::Token = mio::Token(0);
+const STARTUP_SIGNAL_CANCEL_TOKEN: mio::Token = mio::Token(1);
+
+struct StartupSignalMonitor {
+    cancel: Arc<mio::Waker>,
+    worker: thread::JoinHandle<Result<StartupSignalObservation>>,
+}
+
+struct StartupSignalObservation {
+    signals: Signals,
+    termination_signal: Option<i32>,
+}
+
+impl StartupSignalMonitor {
+    fn start(
+        mut signals: Signals,
+        speech_supervisor: speech::supervisor::SupervisorHandle,
+    ) -> Result<Self> {
+        let mut poll = mio::Poll::new().context("create startup-signal poll")?;
+        poll.registry()
+            .register(&mut signals, STARTUP_SIGNAL_TOKEN, mio::Interest::READABLE)
+            .context("register startup signals")?;
+        let cancel = Arc::new(
+            mio::Waker::new(poll.registry(), STARTUP_SIGNAL_CANCEL_TOKEN)
+                .context("create startup-signal cancellation waker")?,
+        );
+        let worker = thread::Builder::new()
+            .name("lector-startup-signals".to_owned())
+            .spawn(move || {
+                let mut events = mio::Events::with_capacity(4);
+                loop {
+                    poll.poll(&mut events, None)
+                        .or_else(|error| {
+                            if error.kind() == ErrorKind::Interrupted {
+                                events.clear();
+                                Ok(())
+                            } else {
+                                Err(error)
+                            }
+                        })
+                        .context("poll startup signals")?;
+
+                    // Signal delivery wins a race with cancellation. This keeps
+                    // a SIGTERM received just as the handshake completes from
+                    // being silently converted into ordinary startup.
+                    if let Some(signal) = signals.pending().find(|signal| {
+                        terminal_signal_action(*signal).is_some_and(|action| {
+                            matches!(action, TerminalSignalAction::Shutdown(_))
+                        })
+                    }) {
+                        speech_supervisor.terminate();
+                        poll.registry()
+                            .deregister(&mut signals)
+                            .context("deregister startup signals after termination")?;
+                        return Ok(StartupSignalObservation {
+                            signals,
+                            termination_signal: Some(signal),
+                        });
+                    }
+                    if events
+                        .iter()
+                        .any(|event| event.token() == STARTUP_SIGNAL_CANCEL_TOKEN)
+                    {
+                        poll.registry()
+                            .deregister(&mut signals)
+                            .context("deregister startup signals after handshake")?;
+                        return Ok(StartupSignalObservation {
+                            signals,
+                            termination_signal: None,
+                        });
+                    }
+                }
+            })
+            .context("start startup-signal monitor")?;
+        Ok(Self { cancel, worker })
+    }
+
+    fn finish(self) -> Result<StartupSignalObservation> {
+        let wake_result = self.cancel.wake().context("wake startup-signal monitor");
+        let observation = self
+            .worker
+            .join()
+            .map_err(|_| anyhow!("startup-signal monitor panicked"))??;
+        wake_result?;
+        Ok(observation)
+    }
+}
+
+enum StartupSpeechOutcome {
+    Ready(Signals),
+    Terminated(i32),
+}
+
+fn start_configured_speech(
+    sr: &mut ScreenReader,
+    spec: speech::SpeechServerSpec,
+    speech_supervisor: &speech::supervisor::SupervisorHandle,
+) -> Result<StartupSpeechOutcome> {
+    // Install the termination handlers before the worker can spawn or block in
+    // an initialize RPC. The monitor waits on signal-pipe readiness rather than
+    // introducing a polling cadence into either startup or the terminal loop.
+    let signals = Signals::new([SIGHUP, SIGINT, SIGQUIT, SIGTERM])
+        .context("install startup termination signals")?;
+    let monitor = StartupSignalMonitor::start(signals, speech_supervisor.clone())?;
+    let startup_result = (|| -> Result<()> {
+        sr.configure_speech_server(spec)?;
+        sr.start_speech()
+            .context("start configured speech server")?;
+        Ok(())
+    })();
+    let mut observation = monitor.finish()?;
+
+    // Cover a signal which reached the pipe after the monitor observed its
+    // cancellation but before its Poll was dropped.
+    if observation.termination_signal.is_none()
+        && let Some(signal) = observation.signals.pending().find(|signal| {
+            terminal_signal_action(*signal)
+                .is_some_and(|action| matches!(action, TerminalSignalAction::Shutdown(_)))
+        })
+    {
+        speech_supervisor.terminate();
+        observation.termination_signal = Some(signal);
+    }
+    if let Some(signal) = observation.termination_signal {
+        return Ok(StartupSpeechOutcome::Terminated(signal));
+    }
+
+    startup_result?;
+    for signal in [SIGWINCH, SIGTSTP, SIGCONT] {
+        observation
+            .signals
+            .add_signal(signal)
+            .with_context(|| format!("install terminal signal {signal}"))?;
+    }
+    Ok(StartupSpeechOutcome::Ready(observation.signals))
+}
 
 fn stdout_retry_poll_timeout(
     current: Option<time::Duration>,
@@ -36,6 +174,33 @@ fn stdout_retry_poll_timeout(
     Some(current.map_or(STDOUT_WRITABLE_RETRY_INTERVAL, |timeout| {
         timeout.min(STDOUT_WRITABLE_RETRY_INTERVAL)
     }))
+}
+
+/// Add the one-shot silent-child deadline to the current wait. Once it has
+/// elapsed, consume it exactly once: an unblocked loop gets one immediate turn
+/// to run `on_startup`, while stdout backpressure retains its bounded retry
+/// interval instead of spinning on a permanently expired zero timeout.
+fn startup_deadline_poll_timeout(
+    current: Option<time::Duration>,
+    deadline: &mut Option<time::Instant>,
+    now: time::Instant,
+    stdout_backpressured: bool,
+) -> Option<time::Duration> {
+    let Some(at) = *deadline else {
+        return current;
+    };
+    let Some(remaining) = at
+        .checked_duration_since(now)
+        .filter(|wait| !wait.is_zero())
+    else {
+        *deadline = None;
+        return if stdout_backpressured {
+            current
+        } else {
+            Some(time::Duration::ZERO)
+        };
+    };
+    Some(current.map_or(remaining, |timeout| timeout.min(remaining)))
 }
 
 struct NonblockingFdGuard {
@@ -137,23 +302,45 @@ fn emergency_terminal_cleanup_bytes(focus_was_enabled: Option<bool>) -> Vec<u8> 
     lifecycle.shutdown().bytes
 }
 
-fn query_focus_mode<R: Read + AsRawFd>(stdin: &mut R, stdout: &mut dyn Write) -> Option<bool> {
+#[derive(Debug, Default, Eq, PartialEq)]
+struct FocusModeQueryResult {
+    was_enabled: Option<bool>,
+    pending_input: Vec<u8>,
+}
+
+fn query_focus_mode<R: Read + AsRawFd>(
+    stdin: &mut R,
+    stdout: &mut dyn Write,
+) -> FocusModeQueryResult {
     if stdout.write_all(FOCUS_EVENTS_QUERY).is_err() || stdout.flush().is_err() {
-        return None;
+        return FocusModeQueryResult::default();
     }
 
-    let mut poll = mio::Poll::new().ok()?;
+    let Ok(mut poll) = mio::Poll::new() else {
+        return FocusModeQueryResult::default();
+    };
     let stdin_fd = stdin.as_raw_fd();
     let mut source = mio::unix::SourceFd(&stdin_fd);
-    poll.registry()
+    if poll
+        .registry()
         .register(&mut source, mio::Token(0), mio::Interest::READABLE)
-        .ok()?;
+        .is_err()
+    {
+        return FocusModeQueryResult::default();
+    }
 
     let mut events = mio::Events::with_capacity(8);
     let mut response = Vec::new();
     for timeout_ms in [20, 10, 10] {
-        poll.poll(&mut events, Some(time::Duration::from_millis(timeout_ms)))
-            .ok()?;
+        if poll
+            .poll(&mut events, Some(time::Duration::from_millis(timeout_ms)))
+            .is_err()
+        {
+            return FocusModeQueryResult {
+                was_enabled: None,
+                pending_input: response,
+            };
+        }
         if events.is_empty() {
             continue;
         }
@@ -162,18 +349,27 @@ fn query_focus_mode<R: Read + AsRawFd>(stdin: &mut R, stdout: &mut dyn Write) ->
             Ok(0) => break,
             Ok(n) => {
                 response.extend_from_slice(&buf[..n]);
-                if let Some(enabled) = parse_focus_mode_report(&response) {
-                    return Some(enabled);
+                if parse_focus_mode_report(&response).is_some() {
+                    return separate_focus_mode_report_input(&response);
                 }
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
-            Err(_) => return None,
+            Err(_) => {
+                return FocusModeQueryResult {
+                    was_enabled: None,
+                    pending_input: response,
+                };
+            }
         }
     }
-    parse_focus_mode_report(&response)
+    separate_focus_mode_report_input(&response)
 }
 
 fn parse_focus_mode_report(buf: &[u8]) -> Option<bool> {
+    locate_focus_mode_report(buf).map(|(_, _, enabled)| enabled)
+}
+
+fn locate_focus_mode_report(buf: &[u8]) -> Option<(usize, usize, bool)> {
     let prefix = b"\x1B[?1004;";
     let mut i = 0usize;
     while i < buf.len() {
@@ -190,17 +386,44 @@ fn parse_focus_mode_report(buf: &[u8]) -> Option<bool> {
             i += 1;
             continue;
         }
-        let code = std::str::from_utf8(&buf[start..end])
-            .ok()?
-            .parse::<u8>()
-            .ok()?;
-        return match code {
-            1 | 3 => Some(true),
-            2 | 4 => Some(false),
-            _ => None,
+        let Some(code) = std::str::from_utf8(&buf[start..end])
+            .ok()
+            .and_then(|digits| digits.parse::<u8>().ok())
+        else {
+            i += 1;
+            continue;
         };
+        let enabled = match code {
+            1 | 3 => true,
+            2 | 4 => false,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        return Some((i, end + 2, enabled));
     }
     None
+}
+
+/// Remove every complete focus-mode response while preserving all user input
+/// which the ownership query happened to read in the same chunks. The first
+/// valid report defines the inherited mode; later duplicate replies are still
+/// protocol traffic and are not forwarded to the child.
+fn separate_focus_mode_report_input(buf: &[u8]) -> FocusModeQueryResult {
+    let mut remaining = buf;
+    let mut pending_input = Vec::with_capacity(buf.len());
+    let mut was_enabled = None;
+    while let Some((start, end, enabled)) = locate_focus_mode_report(remaining) {
+        pending_input.extend_from_slice(&remaining[..start]);
+        was_enabled.get_or_insert(enabled);
+        remaining = &remaining[end..];
+    }
+    pending_input.extend_from_slice(remaining);
+    FocusModeQueryResult {
+        was_enabled,
+        pending_input,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -394,11 +617,23 @@ impl PtyDrainState {
             }
         )
     }
+
+    const fn received_output(self) -> bool {
+        match self {
+            Self::Open {
+                received_output, ..
+            }
+            | Self::Eof { received_output } => received_output,
+        }
+    }
 }
 
 const PTY_READ_BUFFER_BYTES: usize = 8 * 1024;
 const PTY_DRAIN_BUDGET_BYTES: usize = 32 * 1024;
 const PTY_DRAIN_BUDGET_TIME: time::Duration = time::Duration::from_millis(4);
+const STARTUP_PTY_DRAIN_MAX_TURNS: usize = 4;
+const STARTUP_PTY_DRAIN_MAX_TIME: time::Duration = time::Duration::from_millis(8);
+const STARTUP_SILENT_CHILD_TIMEOUT: time::Duration = time::Duration::from_millis(50);
 
 /// Consume a bounded turn of currently available nonblocking PTY data. The
 /// callback receives the stream after each read so protocol replies can be
@@ -511,6 +746,19 @@ const fn setup_failure_action(event_loop_started: bool) -> SetupFailureAction {
     }
 }
 
+fn requested_config_path(
+    cli_config: Option<std::path::PathBuf>,
+    no_config: bool,
+    environment_config: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    cli_config.or_else(|| {
+        (!no_config)
+            .then_some(environment_config)
+            .flatten()
+            .map(std::path::PathBuf::from)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -518,7 +766,8 @@ mod tests {
         NonblockingFdGuard, PTY_DRAIN_BUDGET_BYTES, PTY_READ_BUFFER_BYTES, PtyDrainState,
         SetupFailureAction, ShutdownFenceBroker, ShutdownFenceOutcome, TerminalSignalAction,
         drain_available_input, drain_available_pty, drain_shutdown_fence_input,
-        emergency_terminal_cleanup_bytes, parse_focus_mode_report, setup_failure_action,
+        emergency_terminal_cleanup_bytes, parse_focus_mode_report, requested_config_path,
+        separate_focus_mode_report_input, setup_failure_action, startup_deadline_poll_timeout,
         stdout_retry_poll_timeout, terminal_signal_action, wait_for_shutdown_fence,
     };
     use clap::{CommandFactory, Parser};
@@ -529,7 +778,7 @@ mod tests {
         io::{self, Read, Write},
         os::fd::AsRawFd,
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     #[test]
@@ -543,6 +792,32 @@ mod tests {
             stdout_retry_poll_timeout(Some(Duration::from_millis(4)), true),
             Some(Duration::from_millis(4))
         );
+    }
+
+    #[test]
+    fn expired_startup_deadline_does_not_spin_while_stdout_is_backpressured() {
+        let now = Instant::now();
+        let mut deadline = Some(now - Duration::from_millis(1));
+        let timeout = startup_deadline_poll_timeout(None, &mut deadline, now, true);
+
+        assert_eq!(deadline, None);
+        assert_eq!(timeout, None);
+        assert_eq!(
+            stdout_retry_poll_timeout(timeout, true),
+            Some(Duration::from_millis(10))
+        );
+    }
+
+    #[test]
+    fn future_startup_deadline_is_a_one_shot_poll_wait() {
+        let now = Instant::now();
+        let mut deadline = Some(now + Duration::from_millis(50));
+
+        assert_eq!(
+            startup_deadline_poll_timeout(None, &mut deadline, now, false),
+            Some(Duration::from_millis(50))
+        );
+        assert!(deadline.is_some());
     }
 
     enum ReadStep {
@@ -775,6 +1050,90 @@ mod tests {
     }
 
     #[test]
+    fn internal_native_speech_host_does_not_require_a_terminal_shell() {
+        let cli = Cli::try_parse_from(["lector", "--native-speech-server"])
+            .expect("parse internal native speech host");
+        assert!(cli.native_speech_server);
+        assert!(
+            !Cli::command()
+                .render_long_help()
+                .to_string()
+                .contains("native-speech-server")
+        );
+    }
+
+    #[test]
+    fn lua_config_flags_are_explicit_and_mutually_exclusive() {
+        let configured = Cli::try_parse_from([
+            "lector",
+            "--shell",
+            "/bin/sh",
+            "--config",
+            "/tmp/lector.lua",
+        ])
+        .expect("parse explicit Lua config");
+        assert_eq!(
+            configured.config.as_deref(),
+            Some(std::path::Path::new("/tmp/lector.lua"))
+        );
+        assert!(!configured.no_config);
+
+        let defaults = Cli::try_parse_from(["lector", "--shell", "/bin/sh", "--no-config"])
+            .expect("parse no-config mode");
+        assert!(defaults.no_config);
+        assert!(defaults.config.is_none());
+
+        assert!(
+            Cli::try_parse_from([
+                "lector",
+                "--shell",
+                "/bin/sh",
+                "--config",
+                "/tmp/lector.lua",
+                "--no-config",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn no_config_overrides_the_environment_fallback_but_not_cli_validation() {
+        let environment = Some(std::ffi::OsString::from("/broken/from-environment.lua"));
+        assert_eq!(
+            requested_config_path(None, false, environment.clone()),
+            Some(std::path::PathBuf::from("/broken/from-environment.lua"))
+        );
+        assert_eq!(requested_config_path(None, true, environment), None);
+        assert_eq!(
+            requested_config_path(
+                Some(std::path::PathBuf::from("/explicit.lua")),
+                false,
+                Some(std::ffi::OsString::from("/environment.lua")),
+            ),
+            Some(std::path::PathBuf::from("/explicit.lua"))
+        );
+    }
+
+    #[test]
+    fn obsolete_public_speech_process_flags_are_rejected() {
+        for arguments in [
+            ["lector", "--shell", "/bin/sh", "--speech-driver", "proc"],
+            [
+                "lector",
+                "--shell",
+                "/bin/sh",
+                "--speech-server",
+                "/tmp/server",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_err());
+        }
+        let help = Cli::command().render_long_help().to_string();
+        assert!(!help.contains("speech-driver"), "{help}");
+        assert!(!help.contains("speech-server"), "{help}");
+    }
+
+    #[test]
     fn parse_focus_mode_report_enabled_code_1() {
         assert_eq!(parse_focus_mode_report(b"\x1B[?1004;1$y"), Some(true));
     }
@@ -799,6 +1158,27 @@ mod tests {
         assert_eq!(parse_focus_mode_report(b""), None);
         assert_eq!(parse_focus_mode_report(b"\x1B[?1004$p"), None);
         assert_eq!(parse_focus_mode_report(b"\x1B[?1004;9$y"), None);
+    }
+
+    #[test]
+    fn focus_query_preserves_input_around_and_between_terminal_reports() {
+        let result =
+            separate_focus_mode_report_input(b"before\x1B[?1004;1$ymiddle\x1B[?1004;3$yafter");
+
+        assert_eq!(result.was_enabled, Some(true));
+        assert_eq!(result.pending_input, b"beforemiddleafter");
+    }
+
+    #[test]
+    fn focus_query_preserves_incomplete_or_invalid_report_bytes() {
+        for input in [
+            b"key\x1B[?1004;1$".as_slice(),
+            b"key\x1B[?1004;9$y".as_slice(),
+        ] {
+            let result = separate_focus_mode_report_input(input);
+            assert_eq!(result.was_enabled, None);
+            assert_eq!(result.pending_input, input);
+        }
     }
 
     #[test]
@@ -1004,26 +1384,31 @@ mod tests {
 #[clap(author, version, about)]
 struct Cli {
     /// Lector will spawn this shell when it starts
-    #[clap(long, short = 's', env)]
-    shell: std::path::PathBuf,
-    /// Speech driver backend
-    #[clap(long, value_enum, default_value = "tts", env)]
-    speech_driver: SpeechDriverKind,
-    /// Path to the proc driver server (required when --speech-driver=proc)
-    #[clap(long, env)]
-    speech_server: Option<std::path::PathBuf>,
+    #[clap(
+        long,
+        short = 's',
+        env,
+        required_unless_present = "native_speech_server"
+    )]
+    shell: Option<std::path::PathBuf>,
+    /// Load Lua configuration from this file
+    #[clap(long, conflicts_with = "no_config")]
+    config: Option<std::path::PathBuf>,
+    /// Start with defaults instead of loading Lua configuration
+    #[clap(long, conflicts_with = "config")]
+    no_config: bool,
     /// Enable debug logging
     #[clap(long, env)]
     log: bool,
     /// Write structured debug logging to this file (also enables --log)
     #[clap(long, env = "LECTOR_LOG_FILE")]
     log_file: Option<std::path::PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum SpeechDriverKind {
-    Tts,
-    Proc,
+    /// Run Lector's internal native speech host
+    #[clap(long, hide = true)]
+    native_speech_server: bool,
+    /// Expected parent process for the internal native speech host
+    #[clap(long, hide = true, requires = "native_speech_server")]
+    native_speech_parent_pid: Option<u32>,
 }
 
 struct DiagnosticsShutdownGuard;
@@ -1036,18 +1421,49 @@ impl Drop for DiagnosticsShutdownGuard {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.native_speech_server {
+        return lector::native_tts_server::run(cli.native_speech_parent_pid);
+    }
+    let shell = cli
+        .shell
+        .as_ref()
+        .ok_or_else(|| anyhow!("--shell is required"))?;
+    // Resolve the environment fallback ourselves so an explicit --no-config
+    // can recover even when LECTOR_CONFIG points at a broken file. Clap would
+    // otherwise treat an env-provided value as conflicting CLI input.
+    let configured_path = requested_config_path(
+        cli.config.clone(),
+        cli.no_config,
+        std::env::var_os("LECTOR_CONFIG"),
+    );
+    let required_config = configured_path.is_some();
+    let conf_file = match configured_path {
+        Some(path) => path,
+        None if cli.no_config => std::path::PathBuf::new(),
+        None => {
+            let mut path =
+                dirs::config_dir().ok_or_else(|| anyhow!("cannot get config directory"))?;
+            path.push("lector");
+            path.push("init.lua");
+            path
+        }
+    };
+    if required_config && !conf_file.is_file() {
+        anyhow::bail!("configuration file does not exist: {}", conf_file.display());
+    }
+    let load_config = !cli.no_config;
     let logging_enabled = cli.log || cli.log_file.is_some();
     let terminal_geometry =
         pty::terminal_geometry(std::io::stdin().as_raw_fd()).context("cannot get terminal size")?;
 
-    // Keep PTY creation ahead of anything that may start threads. The macOS
-    // AVFoundation speech backend owns its synthesizer on a dedicated thread,
-    // and Unix PTY launchers still require a small post-fork setup window.
+    // Keep PTY creation ahead of the speech host and anything else that may
+    // start threads. Unix PTY launchers still require a small post-fork setup
+    // window.
     let init_term_attrs =
         termios::tcgetattr(std::io::stdin().as_fd()).context("read terminal settings")?;
     let virtual_environment = pty::compatible_terminal_environment();
     let mut process = pty::Process::spawn_with_geometry_and_environment(
-        &cli.shell,
+        shell,
         std::iter::empty::<&str>(),
         terminal_geometry,
         &init_term_attrs,
@@ -1059,9 +1475,9 @@ fn main() -> Result<()> {
     // diagnostics worker until that fork boundary has completed.
     if logging_enabled {
         diagnostics::initialize(cli.log_file.as_deref())?;
-        diagnostics::event("main", "startup", &format!("shell={}", cli.shell.display()));
+        diagnostics::event("main", "startup", &format!("shell={}", shell.display()));
     }
-    let _diagnostics_shutdown = DiagnosticsShutdownGuard;
+    let diagnostics_shutdown = DiagnosticsShutdownGuard;
 
     let mut physical_profile = PhysicalTerminalProfile::conservative(terminal_geometry);
     if let Some(term) = std::env::var_os("TERM")
@@ -1078,25 +1494,15 @@ fn main() -> Result<()> {
     let overrides = CapabilityOverrides::from_environment().map_err(anyhow::Error::msg)?;
     physical_profile.apply_overrides(&overrides);
 
-    let speech_driver: Box<dyn speech::Driver> = match cli.speech_driver {
-        SpeechDriverKind::Tts => {
-            Box::new(speech::tts::TtsDriver::new().context("create tts driver")?)
-        }
-        SpeechDriverKind::Proc => {
-            let path = cli
-                .speech_server
-                .ok_or_else(|| anyhow!("--speech-server is required when --speech-driver=proc"))?;
-            let driver =
-                speech::proc_driver::ProcDriver::new(&path).context("create proc driver")?;
-            let termination = driver.termination_handle();
-            Box::new(
-                speech::worker::BoundedAsyncDriver::new_with_shutdown(driver, move || {
-                    termination.terminate();
-                })
-                .context("start bounded proc speech worker")?,
-            )
-        }
-    };
+    let supervisor = speech::supervisor::Supervisor::default();
+    let speech_supervisor = supervisor.handle();
+    let shutdown_supervisor = speech_supervisor.clone();
+    let speech_driver: Box<dyn speech::Driver> = Box::new(
+        speech::worker::BoundedAsyncDriver::new_with_shutdown(supervisor, move || {
+            shutdown_supervisor.terminate();
+        })
+        .context("start bounded speech worker")?,
+    );
     let speech = speech::Speech::new(speech_driver);
     let mut screen_reader = ScreenReader::new(speech);
     let view_stack = views::ViewStack::new(Box::new(views::PtyView::new_with_geometry(
@@ -1107,39 +1513,78 @@ fn main() -> Result<()> {
     app.set_logging(logging_enabled);
     app.enable_output_scheduler(Default::default());
 
-    let mut conf_dir = dirs::config_dir().ok_or_else(|| anyhow!("cannot get config directory"))?;
-    conf_dir.push("lector");
-    let mut conf_file = conf_dir.clone();
-    conf_file.push("init.lua");
-
     let mut event_loop_started = false;
-    let setup_result = lua::setup(conf_file.clone(), &mut screen_reader, |screen_reader| {
-        event_loop_started = true;
-        do_events(
-            screen_reader,
-            &mut app,
-            &mut process,
-            None,
-            &init_term_attrs,
-        )
-    });
+    let mut termination_signal = None;
+    let setup_result = lua::setup(
+        conf_file.clone(),
+        load_config,
+        &mut screen_reader,
+        |screen_reader| {
+            event_loop_started = true;
+            let spec = screen_reader.speech_server_spec().clone();
+            match start_configured_speech(screen_reader, spec, &speech_supervisor)? {
+                StartupSpeechOutcome::Ready(signals) => {
+                    termination_signal = do_events(
+                        screen_reader,
+                        &mut app,
+                        &mut process,
+                        EventStartup {
+                            initial_message: None,
+                            config_path: Some(&conf_file),
+                            signals,
+                        },
+                        &speech_supervisor,
+                        &init_term_attrs,
+                    )?;
+                }
+                StartupSpeechOutcome::Terminated(signal) => {
+                    termination_signal = Some(signal);
+                }
+            }
+            Ok(())
+        },
+    );
     let result = match setup_result {
         Ok(()) => Ok(()),
         Err(err)
             if setup_failure_action(event_loop_started)
                 == SetupFailureAction::ShowConfigurationError =>
         {
-            do_events(
+            // A broken init.lua must still leave the error UI accessible. Drop
+            // any partially queued startup announcements, then start the
+            // built-in backend using default process selection.
+            screen_reader.stop_speaking()?;
+            match start_configured_speech(
                 &mut screen_reader,
-                &mut app,
-                &mut process,
-                Some(format!(
-                    "Error loading config file: {}\n\n{}",
-                    conf_file.display(),
-                    err
-                )),
-                &init_term_attrs,
+                speech::SpeechServerSpec::Native,
+                &speech_supervisor,
             )
+            .context("start native speech server for configuration error")?
+            {
+                StartupSpeechOutcome::Ready(signals) => {
+                    screen_reader.commit_speech_reconfiguration(speech::SpeechServerSpec::Native);
+                    termination_signal = do_events(
+                        &mut screen_reader,
+                        &mut app,
+                        &mut process,
+                        EventStartup {
+                            initial_message: Some(format!(
+                                "Error loading config file: {}\n\n{}",
+                                conf_file.display(),
+                                err
+                            )),
+                            config_path: None,
+                            signals,
+                        },
+                        &speech_supervisor,
+                        &init_term_attrs,
+                    )?;
+                }
+                StartupSpeechOutcome::Terminated(signal) => {
+                    termination_signal = Some(signal);
+                }
+            }
+            Ok(())
         }
         Err(err) => Err(anyhow!("{err}")),
     };
@@ -1151,17 +1596,42 @@ fn main() -> Result<()> {
     ) {
         eprintln!("failed to restore terminal settings: {err}");
     }
+    screen_reader.shutdown_speech();
     process.terminate();
-    result.map_err(|e| anyhow!("{}", e))
+    let result = result.map_err(|e| anyhow!("{}", e));
+    if let Some(signal) = termination_signal {
+        // Signal handlers deliberately return here first so owned subprocesses
+        // and diagnostics are shut down before restoring the signal's default
+        // disposition. A hard SIGKILL cannot run cleanup, which is why the
+        // built-in speech helper also has an independent parent watchdog.
+        drop(screen_reader);
+        drop(process);
+        drop(diagnostics_shutdown);
+        signal_hook::low_level::emulate_default_handler(signal)
+            .with_context(|| format!("terminate lector with signal {signal}"))?;
+    }
+    result
+}
+
+struct EventStartup<'a> {
+    initial_message: Option<String>,
+    config_path: Option<&'a std::path::Path>,
+    signals: Signals,
 }
 
 fn do_events(
     sr: &mut ScreenReader,
     app: &mut app::App,
     process: &mut pty::Process,
-    initial_message: Option<String>,
+    startup: EventStartup<'_>,
+    speech_supervisor: &speech::supervisor::SupervisorHandle,
     initial_term_attrs: &termios::Termios,
-) -> Result<()> {
+) -> Result<Option<i32>> {
+    let EventStartup {
+        initial_message,
+        config_path: startup_config_path,
+        mut signals,
+    } = startup;
     // This fallback is deliberately declared before the nonblocking
     // descriptor guards below. Rust drops locals in reverse order, so an
     // unwind restores the descriptor flags before this writes its final reset.
@@ -1175,17 +1645,32 @@ fn do_events(
     emergency_terminal.arm();
 
     // Set up a mio poll, to select between reading from stdin, and the PTY.
-    let mut signals = Signals::new([SIGWINCH, SIGTSTP, SIGCONT, SIGHUP, SIGINT, SIGQUIT, SIGTERM])?;
     const STDIN_TOKEN: mio::Token = mio::Token(0);
     const PTY_TOKEN: mio::Token = mio::Token(1);
     const SIGNALS_TOKEN: mio::Token = mio::Token(2);
     const STDOUT_TOKEN: mio::Token = mio::Token(3);
+    const SPEECH_TOKEN: mio::Token = mio::Token(4);
+    let mut startup_hook_path = if sr.has_on_startup_hook() {
+        startup_config_path
+            .map(|path| {
+                path.to_str()
+                    .ok_or_else(|| anyhow!("configuration path is not valid UTF-8"))
+                    .map(str::to_owned)
+            })
+            .transpose()?
+    } else {
+        None
+    };
     let mut poll = mio::Poll::new()?;
-    poll.registry().register(
-        &mut mio::unix::SourceFd(&std::io::stdin().as_raw_fd()),
-        STDIN_TOKEN,
-        mio::Interest::READABLE,
-    )?;
+    let speech_waker = Arc::new(mio::Waker::new(poll.registry(), SPEECH_TOKEN)?);
+    speech_supervisor.set_waker(Arc::clone(&speech_waker));
+    let stdin_fd = std::io::stdin().as_raw_fd();
+    let mut stdin_source = mio::unix::SourceFd(&stdin_fd);
+    let mut stdin_registered = startup_hook_path.is_none();
+    if stdin_registered {
+        poll.registry()
+            .register(&mut stdin_source, STDIN_TOKEN, mio::Interest::READABLE)?;
+    }
     let pty_fd = pty_stream.as_raw_fd();
     let mut pty_source = mio::unix::SourceFd(&pty_fd);
     poll.registry()
@@ -1196,7 +1681,10 @@ fn do_events(
     // Main event loop
     let mut stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
-    let focus_was_enabled = query_focus_mode(&mut stdin, &mut stdout);
+    let FocusModeQueryResult {
+        was_enabled: focus_was_enabled,
+        pending_input: mut startup_buffered_input,
+    } = query_focus_mode(&mut stdin, &mut stdout);
     emergency_terminal.set_prior_focus_mode(focus_was_enabled);
     let mut nonblocking_input =
         NonblockingFdGuard::enable(stdin.as_raw_fd()).context("make terminal input nonblocking")?;
@@ -1223,23 +1711,106 @@ fn do_events(
         if let Some(message) = initial_message {
             app.show_message(sr, "Lector Error", &message, &mut stdout)?;
         }
-        let startup_pty = drain_application_pty(app, sr, &mut pty_stream, &mut stdout)?;
+        // Capture the child output which is already available when Lector
+        // takes ownership of the physical terminal. Each drain is bounded on
+        // its own, and this outer gate prevents a continuously-writing child
+        // from postponing the ready hook forever.
+        let startup_drain_started = time::Instant::now();
+        let mut startup_drain_turns = 1_usize;
+        let mut startup_pty = drain_application_pty(app, sr, &mut pty_stream, &mut stdout)?;
+        let mut startup_received_pty_output = startup_pty.received_output();
+        while startup_pty.drain_again()
+            && startup_drain_turns < STARTUP_PTY_DRAIN_MAX_TURNS
+            && startup_drain_started.elapsed() < STARTUP_PTY_DRAIN_MAX_TIME
+        {
+            startup_pty = drain_application_pty(app, sr, &mut pty_stream, &mut stdout)?;
+            startup_received_pty_output |= startup_pty.received_output();
+            startup_drain_turns = startup_drain_turns.saturating_add(1);
+        }
         if startup_pty.is_eof() {
             app.handle_pty_eof(sr, &mut stdout)?;
             drain_scheduled_output_to_boundary(app, &mut stdout)?;
             return Ok(());
         }
         let mut pty_drain_pending = startup_pty.drain_again();
-        let mut stdin_drain_pending = false;
+        let mut stdin_drain_pending = !startup_buffered_input.is_empty();
+        // A nonblocking read immediately after the terminal handoff commonly
+        // races the child's first write. Start the full grace window only
+        // after focus negotiation, activation, and that first empty drain have
+        // completed. This is a one-shot startup deadline, not a poll cadence.
+        let mut startup_silent_child_deadline = startup_hook_path
+            .as_ref()
+            .filter(|_| !startup_received_pty_output)
+            .map(|_| time::Instant::now() + STARTUP_SILENT_CHILD_TIMEOUT);
+
+        // A blocked lifecycle write remains owned by the registered stdout
+        // readiness path. Otherwise, attempt the initial compositor flush
+        // now. Never force this drain: force would pierce an application's
+        // open DEC 2026 transaction and expose a working Neovim frame.
+        let startup_frame_output = if stdout_registered {
+            None
+        } else {
+            let report = app.drain_scheduled_output(&mut stdout, false)?;
+            if report.blocked {
+                poll.registry().register(
+                    &mut stdout_source,
+                    STDOUT_TOKEN,
+                    mio::Interest::WRITABLE,
+                )?;
+                stdout_registered = true;
+            }
+            Some(report)
+        };
+        let startup_child_ready = startup_received_pty_output
+            || startup_silent_child_deadline
+                .is_none_or(|deadline| time::Instant::now() >= deadline);
+        if startup_child_ready && !startup_received_pty_output {
+            startup_silent_child_deadline = None;
+        }
+        if startup_hook_path.is_some()
+            && startup_child_ready
+            && startup_frame_output.as_ref().is_some_and(|report| {
+                !report.blocked
+                    && !report.write_budget_exhausted
+                    && !app.application_synchronization_holds_output()
+            })
+        {
+            run_pending_startup_hook(
+                sr,
+                &mut startup_hook_path,
+                &poll,
+                &mut stdin_source,
+                STDIN_TOKEN,
+                &mut stdin_registered,
+                &mut stdin_drain_pending,
+                speech_supervisor,
+            )?;
+        }
+        service_speech_supervisor(sr, speech_supervisor)?;
         loop {
-            let mut effective_poll_timeout = platform::adjust_poll_timeout(None);
+            service_speech_supervisor(sr, speech_supervisor)?;
+            let mut effective_poll_timeout: Option<time::Duration> = None;
             if let Some(output_timeout) = app.scheduled_output_timeout() {
                 effective_poll_timeout = Some(
                     effective_poll_timeout
                         .map_or(output_timeout, |current| current.min(output_timeout)),
                 );
             }
-            if app.wants_tick() || pty_drain_pending || stdin_drain_pending {
+            if startup_hook_path.is_some()
+                && !startup_received_pty_output
+                && startup_silent_child_deadline.is_some()
+            {
+                effective_poll_timeout = startup_deadline_poll_timeout(
+                    effective_poll_timeout,
+                    &mut startup_silent_child_deadline,
+                    time::Instant::now(),
+                    stdout_registered,
+                );
+            }
+            if app.wants_tick()
+                || pty_drain_pending
+                || (startup_hook_path.is_none() && stdin_drain_pending)
+            {
                 effective_poll_timeout = Some(time::Duration::from_millis(0));
             }
             effective_poll_timeout =
@@ -1258,6 +1829,7 @@ fn do_events(
             pty_drain_pending = false;
             let mut stdin_ready = stdin_drain_pending;
             stdin_drain_pending = false;
+            let mut speech_ready = false;
             for event in events.iter() {
                 match event.token() {
                     STDIN_TOKEN => stdin_ready = true,
@@ -1335,12 +1907,18 @@ fn do_events(
                         }
                     }
                     STDOUT_TOKEN => app.notify_scheduled_output_writable(),
+                    SPEECH_TOKEN => speech_ready = true,
                     _ => unreachable!("encountered unknown event"),
                 }
             }
 
+            if speech_ready {
+                service_speech_supervisor(sr, speech_supervisor)?;
+            }
+
             if pty_ready {
                 let pty = drain_application_pty(app, sr, &mut pty_stream, &mut stdout)?;
+                startup_received_pty_output |= pty.received_output();
                 pty_drain_pending = pty.drain_again();
                 if pty.is_eof() {
                     app.handle_pty_eof(sr, &mut stdout)?;
@@ -1355,7 +1933,17 @@ fn do_events(
             // Apply ready child output before screen-derived input commands.
             // A poll turn may report both descriptors; reviewing the screen
             // first would otherwise observe the state just before that output.
-            if stdin_ready {
+            if stdin_ready && startup_hook_path.is_some() {
+                // Physical input remains in the kernel until the initial
+                // child frame has crossed its compositor flush boundary. A
+                // remembered readiness is serviced immediately after the hook
+                // rather than being lost to edge-trigger details.
+                stdin_drain_pending = true;
+            } else if stdin_ready {
+                if !startup_buffered_input.is_empty() {
+                    let buffered_input = std::mem::take(&mut startup_buffered_input);
+                    app.handle_stdin(sr, &buffered_input, &mut pty_stream, &mut stdout)?;
+                }
                 let input = drain_available_input(&mut stdin, |bytes| {
                     app.handle_stdin(sr, bytes, &mut pty_stream, &mut stdout)
                 })?;
@@ -1363,6 +1951,10 @@ fn do_events(
                 if input.is_eof() {
                     return Ok(());
                 }
+                // Lua input handlers may request a transactional server swap.
+                // Enqueue it now; spawning and handshaking remain entirely on
+                // the bounded speech worker.
+                service_speech_supervisor(sr, speech_supervisor)?;
             }
 
             if stdout_registered {
@@ -1420,13 +2012,35 @@ fn do_events(
                 stdout_registered = false;
             }
 
+            let startup_child_ready = startup_received_pty_output
+                || startup_silent_child_deadline
+                    .is_none_or(|deadline| time::Instant::now() >= deadline);
+            if startup_child_ready && !startup_received_pty_output {
+                startup_silent_child_deadline = None;
+            }
+            if startup_hook_path.is_some()
+                && startup_child_ready
+                && !output.blocked
+                && !output.write_budget_exhausted
+                && !app.application_synchronization_holds_output()
+            {
+                run_pending_startup_hook(
+                    sr,
+                    &mut startup_hook_path,
+                    &poll,
+                    &mut stdin_source,
+                    STDIN_TOKEN,
+                    &mut stdin_registered,
+                    &mut stdin_drain_pending,
+                    speech_supervisor,
+                )?;
+            }
+
             // The App owns stabilization and maximum-delay deadlines. Keeping
             // them with the exact presented revision avoids both a lost wakeup
             // behind a newer parser frame and a permanent 30 ms poll loop
             // after receiving output for a hidden tmux pane.
             app.maybe_finalize_changes(sr)?;
-
-            platform::tick_runloop();
         }
     })();
 
@@ -1470,13 +2084,82 @@ fn do_events(
         }
         return Err(error);
     }
+    if termination_signal.is_some() {
+        // Cleanup failures must not turn a handled termination signal into an
+        // ordinary error return. Report them, retain the emergency fallback
+        // when needed, and let main tear down owned children before re-raising
+        // the original signal.
+        if let Err(restore_error) = &output_restore_result {
+            eprintln!("failed to restore terminal output flags: {restore_error:#}");
+        }
+        if let Err(restore_error) = &input_restore_result {
+            eprintln!("failed to restore terminal input flags: {restore_error:#}");
+        }
+        if let Err(cleanup_error) = &cleanup_result {
+            eprintln!("failed to clean up physical terminal: {cleanup_error:#}");
+        }
+        if output_restore_result.is_ok() && input_restore_result.is_ok() && cleanup_result.is_ok() {
+            emergency_terminal.disarm();
+        }
+        return Ok(termination_signal);
+    }
     output_restore_result?;
     input_restore_result?;
     cleanup_result?;
     emergency_terminal.disarm();
-    if let Some(signal) = termination_signal {
-        signal_hook::low_level::emulate_default_handler(signal)
-            .with_context(|| format!("terminate lector with signal {signal}"))?;
+    Ok(termination_signal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pending_startup_hook(
+    sr: &mut ScreenReader,
+    startup_hook_path: &mut Option<String>,
+    poll: &mio::Poll,
+    stdin_source: &mut mio::unix::SourceFd<'_>,
+    stdin_token: mio::Token,
+    stdin_registered: &mut bool,
+    stdin_drain_pending: &mut bool,
+    speech_supervisor: &speech::supervisor::SupervisorHandle,
+) -> Result<()> {
+    let Some(config_path) = startup_hook_path.take() else {
+        return Ok(());
+    };
+    sr.hook_on_startup(&config_path)?;
+    service_speech_supervisor(sr, speech_supervisor)?;
+
+    // Do not let physical input race the ready hook. Registering a readable
+    // descriptor after bytes have arrived is level-safe on mio's supported
+    // pollers, and the explicit pending turn also covers an implementation
+    // which does not synthesize an immediate edge at registration.
+    if !*stdin_registered {
+        poll.registry()
+            .register(stdin_source, stdin_token, mio::Interest::READABLE)?;
+        *stdin_registered = true;
+        *stdin_drain_pending = true;
+    }
+    Ok(())
+}
+
+fn service_speech_supervisor(
+    sr: &mut ScreenReader,
+    supervisor: &speech::supervisor::SupervisorHandle,
+) -> Result<()> {
+    for event in supervisor.take_events() {
+        match event {
+            speech::supervisor::SupervisorEvent::Fatal(message) => {
+                anyhow::bail!("speech server failed: {message}");
+            }
+            speech::supervisor::SupervisorEvent::Reconfigured(spec) => {
+                sr.commit_speech_reconfiguration(spec);
+            }
+            speech::supervisor::SupervisorEvent::ReconfigureFailed(message) => {
+                sr.hook_on_error(&message, "speech-reconfigure")?;
+            }
+        }
+    }
+
+    if let Some(spec) = sr.take_speech_reconfiguration() {
+        sr.configure_speech_server(spec)?;
     }
     Ok(())
 }

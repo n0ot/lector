@@ -1,7 +1,7 @@
 use super::{
     clipboard::{Clipboard, ClipboardRegister, SystemClipboard, SystemClipboardProvider},
     keymap::{InputMode, KeyBindings},
-    speech::{self, Speech},
+    speech::{self, Speech, SpeechServerSpec},
     table::Session as TableSession,
 };
 use mlua::{Lua, WeakLua};
@@ -74,6 +74,8 @@ pub enum Error {
     InvalidLuaBindingContext,
     #[error("Lua hooks are only available in init.lua")]
     InvalidLuaHookContext,
+    #[error("lector.o.speech is startup-only; use lector.api.set_speech() at runtime")]
+    InvalidLuaSpeechConfigContext,
     #[error("on_live_read must return a string or nil")]
     InvalidLiveReadResult,
     #[error("clipboard: {0}")]
@@ -88,6 +90,9 @@ impl Error {
 
 pub struct ScreenReader {
     speech: Speech,
+    speech_server_spec: SpeechServerSpec,
+    pending_speech_reconfiguration: Option<SpeechServerSpec>,
+    lua_configuration_open: bool,
     options: Options,
     last_key: Vec<u8>,
     pending_key_echo: VecDeque<char>,
@@ -118,6 +123,9 @@ impl ScreenReader {
     pub fn new(speech: Speech) -> Self {
         ScreenReader {
             speech,
+            speech_server_spec: SpeechServerSpec::default(),
+            pending_speech_reconfiguration: None,
+            lua_configuration_open: false,
             options: Options::default(),
             last_key: Vec::new(),
             pending_key_echo: VecDeque::new(),
@@ -141,6 +149,63 @@ impl ScreenReader {
     pub fn set_lua_context(&mut self, lua: Rc<Lua>) {
         self.lua_ctx_weak = Some(lua.weak());
         self.lua_ctx = Some(lua);
+        self.lua_configuration_open = true;
+    }
+
+    /// Finish the startup-only portion of `init.lua` configuration.
+    ///
+    /// Hooks registered by `init.lua` run after this boundary, so changing the
+    /// speech server from a hook must use the asynchronous
+    /// `lector.api.set_speech()` path just like the Lua REPL does.
+    pub(crate) fn finish_lua_configuration(&mut self) {
+        self.lua_configuration_open = false;
+    }
+
+    pub fn speech_server_spec(&self) -> &SpeechServerSpec {
+        &self.speech_server_spec
+    }
+
+    pub(crate) fn set_startup_speech_server_spec(&mut self, spec: SpeechServerSpec) -> Result<()> {
+        if !self.lua_configuration_open {
+            return Err(Error::InvalidLuaSpeechConfigContext);
+        }
+        self.speech_server_spec = spec;
+        Ok(())
+    }
+
+    /// Queue a nonblocking, transactional speech-server replacement request.
+    ///
+    /// Only the latest unconsumed request is retained. The active
+    /// configuration is intentionally unchanged until the core has started and
+    /// handshaken the candidate and calls [`Self::commit_speech_reconfiguration`].
+    pub fn request_speech_reconfiguration(&mut self, spec: SpeechServerSpec) {
+        self.pending_speech_reconfiguration = Some(spec);
+    }
+
+    pub fn take_speech_reconfiguration(&mut self) -> Option<SpeechServerSpec> {
+        self.pending_speech_reconfiguration.take()
+    }
+
+    pub fn commit_speech_reconfiguration(&mut self, spec: SpeechServerSpec) {
+        self.speech_server_spec = spec;
+    }
+
+    /// Select the process backend that the speech worker should start or
+    /// transactionally replace.
+    pub fn configure_speech_server(&mut self, spec: SpeechServerSpec) -> Result<()> {
+        self.speech.configure_server(spec)?;
+        Ok(())
+    }
+
+    /// Cross the deferred speech-start boundary after Lua configuration.
+    pub fn start_speech(&mut self) -> Result<()> {
+        self.speech.start()?;
+        Ok(())
+    }
+
+    /// Begin bounded worker and child-process teardown.
+    pub fn shutdown_speech(&mut self) {
+        self.speech.shutdown();
     }
 
     pub fn input_mode(&self) -> InputMode {

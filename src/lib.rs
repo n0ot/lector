@@ -8,6 +8,7 @@ pub mod harness;
 mod keymap;
 mod line_editor;
 pub mod lua;
+pub mod native_tts_server;
 pub mod output_scheduler;
 pub mod platform;
 pub mod presentation;

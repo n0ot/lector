@@ -878,6 +878,18 @@ impl App {
                 .is_some_and(|view| view.accessibility_has_unfinalized_presentation())
     }
 
+    fn active_presentation_explicitly_stable(&mut self) -> bool {
+        if self.output_scheduler.is_none() || self.view_stack.has_overlay() {
+            return false;
+        }
+        let logical_view = self.view_stack.logical_active_view_id();
+        self.presented_accessibility_view == Some(logical_view)
+            && self
+                .view_stack
+                .model_by_id_mut(logical_view)
+                .is_some_and(|view| view.accessibility_presentation_explicitly_stable())
+    }
+
     fn prune_retired_accessibility_views(&mut self) {
         let mut retained = self
             .output_scheduler
@@ -991,6 +1003,18 @@ impl App {
                 .clone_from(&completed.accessibility.active_label);
             self.presented_accessibility_label_tracks_terminal_title =
                 completed.accessibility.active_label_tracks_terminal_title;
+            self.log_latency_stage("presentation-flushed", || {
+                let revision = completed
+                    .accessibility
+                    .frames
+                    .iter()
+                    .find(|frame| Some(frame.view_id) == completed.accessibility.active_view)
+                    .map_or(0, |frame| frame.revision.0);
+                format!(
+                    "active_view={:?} revision={revision}",
+                    completed.accessibility.active_view
+                )
+            });
         }
         for completed in &report.completed_effects {
             self.presented_scene.apply_terminal_effect(&completed.event);
@@ -1007,6 +1031,14 @@ impl App {
         }
         self.prune_retired_accessibility_views();
         Ok(report)
+    }
+
+    /// Reports an application atomic draw which deliberately has no physical
+    /// compositor boundary yet.
+    pub fn application_synchronization_holds_output(&self) -> bool {
+        self.output_scheduler
+            .as_ref()
+            .is_some_and(OutputScheduler::application_synchronization_holds_output)
     }
 
     pub fn scheduled_output_timeout(&mut self) -> Option<time::Duration> {
@@ -1033,17 +1065,21 @@ impl App {
         let pending_input_deadline = self
             .pending_input_last_at
             .map(|last_at| last_at.saturating_add(ESC_TIMEOUT_MS));
-        let accessibility_deadline = self
-            .active_presentation_finalization_pending()
-            .then(|| {
+        let accessibility_pending = self.active_presentation_finalization_pending();
+        let accessibility_deadline = if accessibility_pending {
+            if self.active_presentation_explicitly_stable() {
+                Some(self.clock.now_ms())
+            } else {
                 let last = self.last_pty_update?;
                 let first = self.first_pty_update.unwrap_or(last);
                 Some(
                     last.saturating_add(DIFF_DELAY as u128)
                         .min(first.saturating_add(MAX_DIFF_DELAY as u128)),
                 )
-            })
-            .flatten();
+            }
+        } else {
+            None
+        };
         let deadline = output_deadline
             .into_iter()
             .chain(gateway_deadline)
@@ -1183,6 +1219,12 @@ impl App {
     fn log_event(&self, message: &str) {
         if self.log_enabled {
             crate::diagnostics::event("app", "event", message);
+        }
+    }
+
+    fn log_latency_stage(&self, stage: &str, detail: impl FnOnce() -> String) {
+        if self.log_enabled {
+            crate::diagnostics::event("latency", stage, &detail());
         }
     }
 

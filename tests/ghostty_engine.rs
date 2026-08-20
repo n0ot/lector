@@ -142,6 +142,7 @@ fn ghostty_update_facts_merge_across_every_fragment() {
     assert_eq!(merged.screen_after, ScreenIdentity::Primary);
     assert!(!merged.synchronized_output);
     assert!(merged.synchronized_output_opened);
+    assert!(merged.synchronized_output_closed);
     assert!(!merged.changed_rows.is_empty());
 }
 
@@ -153,6 +154,7 @@ fn ghostty_update_reports_actual_screen_transition_and_synchronized_output() {
         .expect("enable synchronized output");
     assert!(synchronized.synchronized_output);
     assert!(synchronized.synchronized_output_opened);
+    assert!(!synchronized.synchronized_output_closed);
     assert_eq!(synchronized.printed_text(), "working");
 
     let alternate = ghostty
@@ -162,6 +164,7 @@ fn ghostty_update_reports_actual_screen_transition_and_synchronized_output() {
     assert_eq!(alternate.screen_after, ScreenIdentity::Alternate);
     assert!(!alternate.synchronized_output);
     assert!(!alternate.synchronized_output_opened);
+    assert!(!alternate.synchronized_output_closed);
     assert_eq!(alternate.printed_text(), "alt");
 
     let reopened = ghostty
@@ -169,6 +172,28 @@ fn ghostty_update_reports_actual_screen_transition_and_synchronized_output() {
         .expect("close and reopen synchronized output in one batch");
     assert!(reopened.synchronized_output);
     assert!(reopened.synchronized_output_opened);
+    assert!(!reopened.synchronized_output_closed);
+}
+
+#[test]
+fn synchronized_close_is_stable_only_when_it_ends_the_update() {
+    let mut ghostty = GhosttyEngine::new(3, 20).expect("create Ghostty engine");
+    ghostty
+        .advance(b"\x1b[?2026hworking")
+        .expect("open synchronized output");
+
+    let exact_close = ghostty
+        .advance(b" final\x1b[?2026l")
+        .expect("close at update boundary");
+    assert!(exact_close.synchronized_output_closed);
+
+    ghostty
+        .advance(b"\x1b[?2026hworking")
+        .expect("reopen synchronized output");
+    let trailing_output = ghostty
+        .advance(b" final\x1b[?2026lmore")
+        .expect("close before ordinary output");
+    assert!(!trailing_output.synchronized_output_closed);
 }
 
 #[test]

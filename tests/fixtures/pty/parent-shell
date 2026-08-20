@@ -3,8 +3,7 @@
 stty sane
 "$LECTOR_TEST_BINARY" \
     --shell "$LECTOR_TEST_CHILD_SHELL" \
-    --speech-driver proc \
-    --speech-server "$LECTOR_TEST_SPEECH_SERVER"
+    --config "$LECTOR_TEST_SPEECH_CONFIG"
 lector_status=$?
 
 # Model the interactive shell which regains this same terminal after Lector.

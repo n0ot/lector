@@ -33,7 +33,6 @@ fn root_binary_targets_are_explicit() {
     let binaries = [
         ("lector", "src/main.rs"),
         ("lector-harness", "src/bin/lector-harness.rs"),
-        ("lector-tts", "src/bin/lector-tts.rs"),
         ("proc_stub_server", "src/bin/proc_stub_server.rs"),
         (
             "tmux-control-adversary",

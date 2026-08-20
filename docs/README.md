@@ -9,6 +9,13 @@ read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
 - [Building with libghostty-vt](ghostty-builds.md) covers the pinned native
   dependency, supported targets, offline builds, and upgrades.
 
+## Speech
+
+- [Speech driver protocol](speech-driver-protocol.md) defines custom-server
+  configuration, NDJSON JSON-RPC framing, initialization, discovery, deadlines,
+  restart policy, and process cleanup. Its machine-readable method schema is
+  the repository-root [`openrpc.json`](../openrpc.json).
+
 ## tmux control mode
 
 - [Complete behavior](tmux-completion.md) is the integration overview,

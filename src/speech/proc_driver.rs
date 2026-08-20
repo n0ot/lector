@@ -1,11 +1,25 @@
 use super::Driver;
+use crate::proc_server_common::{
+    InitializeParams, InitializeResult, MAX_RPC_FRAME_BYTES, PeerInfo, SPEECH_PROTOCOL_VERSION,
+};
 use anyhow::Result as DriverResult;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::io::{BufRead, BufReader, Write};
+use mio::{Events, Interest, Poll, Token};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub const DEFAULT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(1);
+
+const STDOUT_TOKEN: Token = Token(0);
+const STDIN_TOKEN: Token = Token(1);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -24,6 +38,8 @@ pub enum Error {
     MissingStdout,
     #[error("serialize RPC request")]
     Serialize(#[source] serde_json::Error),
+    #[error("RPC request frame is {size} bytes; maximum is {limit}")]
+    RequestFrameTooLarge { size: usize, limit: usize },
     #[error("{operation}")]
     Io {
         operation: &'static str,
@@ -32,10 +48,25 @@ pub enum Error {
     },
     #[error("proc driver closed stdout while waiting for response")]
     Closed,
+    #[error("RPC {method:?} timed out after {timeout:?}")]
+    Timeout { method: String, timeout: Duration },
+    #[error("RPC response frame exceeds {limit} bytes")]
+    ResponseFrameTooLarge { limit: usize },
     #[error("parse RPC response")]
     Parse(#[source] serde_json::Error),
     #[error("proc driver returned unsupported JSON-RPC version {0:?}")]
     ProtocolVersion(String),
+    #[error("invalid RPC response: {0}")]
+    InvalidResponse(String),
+    #[error("speech protocol version {actual:?} is incompatible; expected {expected:?}")]
+    SpeechProtocolVersion {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("speech server did not advertise required capability {0:?}")]
+    MissingCapability(&'static str),
+    #[error("proc driver transport is no longer usable")]
+    Unavailable,
     #[error("proc driver RPC error {code}: {message}{data}")]
     Rpc {
         code: i64,
@@ -44,8 +75,46 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether the process/transport must be replaced before another call.
+    #[must_use]
+    pub fn is_transport_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Spawn { .. }
+                | Self::MissingStdin
+                | Self::MissingStdout
+                | Self::Io { .. }
+                | Self::Closed
+                | Self::Timeout { .. }
+                | Self::ResponseFrameTooLarge { .. }
+                | Self::Parse(_)
+                | Self::ProtocolVersion(_)
+                | Self::InvalidResponse(_)
+                | Self::SpeechProtocolVersion { .. }
+                | Self::MissingCapability(_)
+                | Self::Unavailable
+        )
+    }
+}
+
 fn io_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> Error {
     move |source| Error::Io { operation, source }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RpcTimeouts {
+    pub initialize: Duration,
+    pub call: Duration,
+}
+
+impl Default for RpcTimeouts {
+    fn default() -> Self {
+        Self {
+            initialize: DEFAULT_INITIALIZE_TIMEOUT,
+            call: DEFAULT_RPC_TIMEOUT,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -54,31 +123,22 @@ struct JsonRpcRequest<'a> {
     id: u64,
     method: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    params: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct JsonRpcResponse {
-    jsonrpc: String,
-    id: Option<u64>,
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Deserialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-    data: Option<serde_json::Value>,
+    params: Option<Value>,
 }
 
 pub struct ProcDriver {
     child: Arc<Mutex<Child>>,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: ChildStdout,
+    poll: Poll,
+    events: Events,
     request_buf: Vec<u8>,
-    response_buf: String,
+    response_buf: Vec<u8>,
     next_id: u64,
     rate: f32,
+    timeouts: RpcTimeouts,
+    legacy_protocol: bool,
+    unavailable: bool,
 }
 
 #[derive(Clone)]
@@ -87,15 +147,87 @@ pub struct TerminationHandle(Arc<Mutex<Child>>);
 impl TerminationHandle {
     /// Interrupts a driver blocked in pipe I/O without waiting for its worker.
     pub fn terminate(&self) {
-        if let Ok(mut child) = self.0.lock() {
-            let _ = child.kill();
+        // The worker may already hold this lock while reaping a child it has
+        // killed after an RPC failure. Shutdown is a foreground operation and
+        // must not wait behind that reap; in the contended case the child has
+        // already received its terminating signal.
+        match self.0.try_lock() {
+            Ok(mut child) => {
+                let _ = child.kill();
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                let _ = error.into_inner().kill();
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
         }
+    }
+
+    /// Terminates and synchronously reaps the speech server process.
+    pub fn terminate_and_reap(&self) -> std::io::Result<ExitStatus> {
+        let mut child = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("proc driver child lock is poisoned"))?;
+        let _ = child.kill();
+        child.wait()
     }
 }
 
 impl ProcDriver {
     pub fn new(path: &Path) -> Result<Self> {
+        Self::new_with_args_and_timeouts(path, std::iter::empty::<&OsStr>(), RpcTimeouts::default())
+    }
+
+    pub fn new_with_args<I, S>(path: &Path, args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Self::new_with_args_and_timeouts(path, args, RpcTimeouts::default())
+    }
+
+    pub fn new_with_timeout(path: &Path, timeout: Duration) -> Result<Self> {
+        Self::new_with_args_and_timeouts(
+            path,
+            std::iter::empty::<&OsStr>(),
+            RpcTimeouts {
+                initialize: timeout,
+                call: timeout,
+            },
+        )
+    }
+
+    pub fn new_with_args_and_timeouts<I, S>(
+        path: &Path,
+        args: I,
+        timeouts: RpcTimeouts,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Self::new_with_args_and_registration(path, args, timeouts, |_| {})
+    }
+
+    /// Spawns a driver and publishes its termination handle before initialize.
+    ///
+    /// The registration callback must not block. It runs after both child
+    /// pipes are captured but before nonblocking setup and the initialize RPC,
+    /// allowing another thread to interrupt a startup handshake during
+    /// shutdown.
+    pub fn new_with_args_and_registration<I, S, F>(
+        path: &Path,
+        args: I,
+        timeouts: RpcTimeouts,
+        register: F,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+        F: FnOnce(TerminationHandle),
+    {
         let mut child = Command::new(path)
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -103,17 +235,62 @@ impl ProcDriver {
                 path: path.display().to_string(),
                 source,
             })?;
-        let stdin = child.stdin.take().ok_or(Error::MissingStdin)?;
-        let stdout = child.stdout.take().ok_or(Error::MissingStdout)?;
-        Ok(ProcDriver {
-            child: Arc::new(Mutex::new(child)),
+        let Some(stdin) = child.stdin.take() else {
+            terminate_and_reap_child(&mut child);
+            return Err(Error::MissingStdin);
+        };
+        let Some(stdout) = child.stdout.take() else {
+            terminate_and_reap_child(&mut child);
+            return Err(Error::MissingStdout);
+        };
+        let child = Arc::new(Mutex::new(child));
+        register(TerminationHandle(Arc::clone(&child)));
+
+        if let Err(error) = make_nonblocking(stdin.as_raw_fd(), "make RPC stdin nonblocking") {
+            terminate_and_reap_shared_child(&child);
+            return Err(error);
+        }
+        if let Err(error) = make_nonblocking(stdout.as_raw_fd(), "make RPC stdout nonblocking") {
+            terminate_and_reap_shared_child(&child);
+            return Err(error);
+        }
+        let poll = match Poll::new().map_err(io_error("create RPC poll")) {
+            Ok(poll) => poll,
+            Err(error) => {
+                terminate_and_reap_shared_child(&child);
+                return Err(error);
+            }
+        };
+        let stdout_fd = stdout.as_raw_fd();
+        if let Err(error) = poll
+            .registry()
+            .register(
+                &mut mio::unix::SourceFd(&stdout_fd),
+                STDOUT_TOKEN,
+                Interest::READABLE,
+            )
+            .map_err(io_error("register RPC stdout"))
+        {
+            terminate_and_reap_shared_child(&child);
+            return Err(error);
+        }
+
+        let mut driver = Self {
+            child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout,
+            poll,
+            events: Events::with_capacity(4),
             request_buf: Vec::with_capacity(256),
-            response_buf: String::with_capacity(256),
+            response_buf: Vec::with_capacity(256),
             next_id: 1,
             rate: 1.0,
-        })
+            timeouts,
+            legacy_protocol: false,
+            unavailable: false,
+        };
+        driver.initialize()?;
+        Ok(driver)
     }
 
     #[must_use]
@@ -121,7 +298,94 @@ impl ProcDriver {
         TerminationHandle(Arc::clone(&self.child))
     }
 
-    fn call(&mut self, method: &str, params: Option<serde_json::Value>) -> Result<()> {
+    #[must_use]
+    pub fn is_legacy_protocol(&self) -> bool {
+        self.legacy_protocol
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        let result = match self.call_with_timeout(
+            "initialize",
+            Some(
+                serde_json::to_value(InitializeParams {
+                    protocol_version: SPEECH_PROTOCOL_VERSION.to_owned(),
+                    client: PeerInfo {
+                        name: "lector".to_owned(),
+                        version: env!("CARGO_PKG_VERSION").to_owned(),
+                    },
+                })
+                .map_err(Error::Serialize)?,
+            ),
+            self.timeouts.initialize,
+        ) {
+            Ok(result) => result,
+            Err(Error::Rpc { code: -32601, .. }) => {
+                self.legacy_protocol = true;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let initialized: InitializeResult = serde_json::from_value(result).map_err(|error| {
+            Error::InvalidResponse(format!("invalid initialize result: {error}"))
+        })?;
+        if initialized.protocol_version != SPEECH_PROTOCOL_VERSION {
+            return Err(Error::SpeechProtocolVersion {
+                expected: SPEECH_PROTOCOL_VERSION,
+                actual: initialized.protocol_version,
+            });
+        }
+        if initialized.server.name.is_empty() || initialized.server.version.is_empty() {
+            return Err(Error::InvalidResponse(
+                "initialize result has an empty server name or version".to_owned(),
+            ));
+        }
+        for (supported, name) in [
+            (initialized.capabilities.speak, "speak"),
+            (initialized.capabilities.stop, "stop"),
+            (initialized.capabilities.set_rate, "set_rate"),
+            (initialized.capabilities.rpc_discover, "rpc.discover"),
+        ] {
+            if !supported {
+                return Err(Error::MissingCapability(name));
+            }
+        }
+        Ok(())
+    }
+
+    fn call(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.call_with_timeout(method, params, self.timeouts.call)
+    }
+
+    fn call_with_timeout(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        if self.unavailable {
+            return Err(Error::Unavailable);
+        }
+        let result = self.call_inner(method, params, timeout);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.is_transport_failure())
+        {
+            self.unavailable = true;
+            if let Ok(mut child) = self.child.lock() {
+                terminate_and_reap_child(&mut child);
+            }
+        }
+        result
+    }
+
+    fn call_inner(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let started = Instant::now();
+        let deadline = started.checked_add(timeout).unwrap_or(started);
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let request = JsonRpcRequest {
@@ -133,51 +397,168 @@ impl ProcDriver {
         self.request_buf.clear();
         serde_json::to_writer(&mut self.request_buf, &request).map_err(Error::Serialize)?;
         self.request_buf.push(b'\n');
-        self.stdin
-            .write_all(&self.request_buf)
-            .map_err(io_error("write RPC request"))?;
-        self.stdin.flush().map_err(io_error("flush RPC request"))?;
+        if self.request_buf.len() > MAX_RPC_FRAME_BYTES {
+            return Err(Error::RequestFrameTooLarge {
+                size: self.request_buf.len(),
+                limit: MAX_RPC_FRAME_BYTES,
+            });
+        }
 
+        self.write_request(deadline, method, timeout)?;
+        let frame = self.read_response(deadline, method, timeout)?;
+        parse_response(&frame, id)
+    }
+
+    fn write_request(&mut self, deadline: Instant, method: &str, timeout: Duration) -> Result<()> {
+        let mut written = 0;
+        while written < self.request_buf.len() {
+            check_deadline(deadline, method, timeout)?;
+            match self.stdin.write(&self.request_buf[written..]) {
+                Ok(0) => {
+                    return Err(io_error("write RPC request")(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "speech server accepted zero bytes",
+                    )));
+                }
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.wait_for_stdin(deadline, method, timeout)?;
+                }
+                Err(error) => return Err(io_error("write RPC request")(error)),
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_stdin(&mut self, deadline: Instant, method: &str, timeout: Duration) -> Result<()> {
+        let stdin_fd = self.stdin.as_raw_fd();
+        self.poll
+            .registry()
+            .register(
+                &mut mio::unix::SourceFd(&stdin_fd),
+                STDIN_TOKEN,
+                Interest::WRITABLE,
+            )
+            .map_err(io_error("register RPC stdin"))?;
+        let waited = self.wait_for(STDIN_TOKEN, deadline, method, timeout);
+        let deregistered = self
+            .poll
+            .registry()
+            .deregister(&mut mio::unix::SourceFd(&stdin_fd))
+            .map_err(io_error("deregister RPC stdin"));
+        waited.and(deregistered)
+    }
+
+    fn read_response(
+        &mut self,
+        deadline: Instant,
+        method: &str,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
         loop {
-            self.response_buf.clear();
-            let read = self
-                .stdout
-                .read_line(&mut self.response_buf)
-                .map_err(io_error("read RPC response"))?;
-            if read == 0 {
-                return Err(Error::Closed);
+            check_deadline(deadline, method, timeout)?;
+            if let Some(newline) = self.response_buf.iter().position(|byte| *byte == b'\n') {
+                if newline.saturating_add(1) > MAX_RPC_FRAME_BYTES {
+                    return Err(Error::ResponseFrameTooLarge {
+                        limit: MAX_RPC_FRAME_BYTES,
+                    });
+                }
+                let remaining = self.response_buf.split_off(newline + 1);
+                let frame = std::mem::replace(&mut self.response_buf, remaining);
+                return Ok(frame);
             }
-            let response: JsonRpcResponse =
-                serde_json::from_str(self.response_buf.trim()).map_err(Error::Parse)?;
-            if response.id != Some(id) {
-                continue;
-            }
-            if response.jsonrpc != "2.0" {
-                return Err(Error::ProtocolVersion(response.jsonrpc));
-            }
-            if let Some(err) = response.error {
-                return Err(Error::Rpc {
-                    code: err.code,
-                    message: err.message,
-                    data: err.data.map(|v| format!(" ({v})")).unwrap_or_default(),
+            if self.response_buf.len() >= MAX_RPC_FRAME_BYTES {
+                return Err(Error::ResponseFrameTooLarge {
+                    limit: MAX_RPC_FRAME_BYTES,
                 });
             }
-            return Ok(());
+
+            let mut chunk = [0u8; 8192];
+            match self.stdout.read(&mut chunk) {
+                Ok(0) => return Err(Error::Closed),
+                Ok(read) => {
+                    if let Some(newline) = chunk[..read].iter().position(|byte| *byte == b'\n') {
+                        if self
+                            .response_buf
+                            .len()
+                            .saturating_add(newline)
+                            .saturating_add(1)
+                            > MAX_RPC_FRAME_BYTES
+                        {
+                            return Err(Error::ResponseFrameTooLarge {
+                                limit: MAX_RPC_FRAME_BYTES,
+                            });
+                        }
+                    } else if self.response_buf.len().saturating_add(read) > MAX_RPC_FRAME_BYTES {
+                        return Err(Error::ResponseFrameTooLarge {
+                            limit: MAX_RPC_FRAME_BYTES,
+                        });
+                    }
+                    self.response_buf.extend_from_slice(&chunk[..read]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.wait_for(STDOUT_TOKEN, deadline, method, timeout)?;
+                }
+                Err(error) => return Err(io_error("read RPC response")(error)),
+            }
+        }
+    }
+
+    fn wait_for(
+        &mut self,
+        token: Token,
+        deadline: Instant,
+        method: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(Error::Timeout {
+                    method: method.to_owned(),
+                    timeout,
+                });
+            };
+            match self.poll.poll(&mut self.events, Some(remaining)) {
+                Ok(()) => {
+                    if self.events.iter().any(|event| event.token() == token) {
+                        return Ok(());
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(Error::Timeout {
+                            method: method.to_owned(),
+                            timeout,
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(io_error("poll RPC pipe")(error)),
+            }
         }
     }
 }
 
 impl Driver for ProcDriver {
     fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()> {
-        self.call(
+        let result = self.call(
             "speak",
             Some(json!({ "text": text, "interrupt": interrupt })),
-        )
-        .map_err(Into::into)
+        )?;
+        if let Err(error) = expect_null_result("speak", result) {
+            self.fail_transport();
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     fn stop(&mut self) -> DriverResult<()> {
-        self.call("stop", None).map_err(Into::into)
+        let result = self.call("stop", None)?;
+        if let Err(error) = expect_null_result("stop", result) {
+            self.fail_transport();
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     fn get_rate(&self) -> f32 {
@@ -185,17 +566,250 @@ impl Driver for ProcDriver {
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
-        self.call("set_rate", Some(json!({ "rate": rate })))?;
-        self.rate = rate;
+        let result = self.call("set_rate", Some(json!({ "rate": rate })))?;
+        if self.legacy_protocol && result.is_null() {
+            self.rate = rate;
+            return Ok(());
+        }
+        let actual = match result.as_object().filter(|result| result.len() == 1) {
+            Some(result) => result
+                .get("rate")
+                .and_then(Value::as_f64)
+                .filter(|rate| rate.is_finite())
+                .map(|rate| rate as f32)
+                .filter(|rate| rate.is_finite()),
+            None => None,
+        };
+        let actual = match actual {
+            Some(actual) => actual,
+            None => {
+                self.fail_transport();
+                return Err(Error::InvalidResponse(
+                    "set_rate result must contain a finite rate".to_owned(),
+                )
+                .into());
+            }
+        };
+        self.rate = actual;
         Ok(())
+    }
+}
+
+impl ProcDriver {
+    fn fail_transport(&mut self) {
+        self.unavailable = true;
+        if let Ok(mut child) = self.child.lock() {
+            terminate_and_reap_child(&mut child);
+        }
     }
 }
 
 impl Drop for ProcDriver {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_and_reap_child(&mut child);
         }
+    }
+}
+
+fn make_nonblocking(fd: std::os::fd::RawFd, operation: &'static str) -> Result<()> {
+    let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(|error| Error::Io {
+        operation,
+        source: error.into(),
+    })?;
+    fcntl(
+        fd,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+    )
+    .map_err(|error| Error::Io {
+        operation,
+        source: error.into(),
+    })?;
+    Ok(())
+}
+
+fn terminate_and_reap_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn terminate_and_reap_shared_child(child: &Arc<Mutex<Child>>) {
+    if let Ok(mut child) = child.lock() {
+        terminate_and_reap_child(&mut child);
+    }
+}
+
+fn check_deadline(deadline: Instant, method: &str, timeout: Duration) -> Result<()> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(Error::Timeout {
+            method: method.to_owned(),
+            timeout,
+        })
+    }
+}
+
+fn parse_response(frame: &[u8], expected_id: u64) -> Result<Value> {
+    let response: Value = serde_json::from_slice(frame).map_err(Error::Parse)?;
+    let object = response
+        .as_object()
+        .ok_or_else(|| Error::InvalidResponse("response must be an object".to_owned()))?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "result" | "error"))
+    {
+        return Err(Error::InvalidResponse(
+            "response contains an unknown member".to_owned(),
+        ));
+    }
+    let version = object
+        .get("jsonrpc")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::InvalidResponse("response is missing jsonrpc".to_owned()))?;
+    if version != "2.0" {
+        return Err(Error::ProtocolVersion(version.to_owned()));
+    }
+    let id = object.get("id").and_then(Value::as_u64).ok_or_else(|| {
+        Error::InvalidResponse("response id must be an unsigned integer".to_owned())
+    })?;
+    if id != expected_id {
+        return Err(Error::InvalidResponse(format!(
+            "response id {id} does not match request id {expected_id}"
+        )));
+    }
+
+    match (object.get("result"), object.get("error")) {
+        (Some(result), None) => Ok(result.clone()),
+        (None, Some(error)) => {
+            let error = error
+                .as_object()
+                .ok_or_else(|| Error::InvalidResponse("error must be an object".to_owned()))?;
+            if error
+                .keys()
+                .any(|key| !matches!(key.as_str(), "code" | "message" | "data"))
+            {
+                return Err(Error::InvalidResponse(
+                    "error contains an unknown member".to_owned(),
+                ));
+            }
+            let code = error.get("code").and_then(Value::as_i64).ok_or_else(|| {
+                Error::InvalidResponse("error code must be an integer".to_owned())
+            })?;
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::InvalidResponse("error message must be a string".to_owned()))?
+                .to_owned();
+            let data = error
+                .get("data")
+                .map(|value| format!(" ({value})"))
+                .unwrap_or_default();
+            Err(Error::Rpc {
+                code,
+                message,
+                data,
+            })
+        }
+        (Some(_), Some(_)) => Err(Error::InvalidResponse(
+            "response must not contain both result and error".to_owned(),
+        )),
+        (None, None) => Err(Error::InvalidResponse(
+            "response must contain result or error".to_owned(),
+        )),
+    }
+}
+
+fn expect_null_result(method: &str, result: Value) -> Result<()> {
+    if result.is_null() {
+        Ok(())
+    } else {
+        Err(Error::InvalidResponse(format!(
+            "{method} result must be null"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, TerminationHandle, parse_response};
+    use serde_json::json;
+    use std::{
+        process::Command,
+        sync::{Arc, Mutex, mpsc},
+        thread,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn asynchronous_termination_never_waits_for_a_worker_reap_lock() {
+        let child = Arc::new(Mutex::new(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn test child"),
+        ));
+        let handle = TerminationHandle(Arc::clone(&child));
+        let held_child = Arc::clone(&child);
+        let (locked_tx, locked_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let holder = thread::spawn(move || {
+            let _child = held_child.lock().expect("hold child lock");
+            locked_tx.send(()).expect("report held child lock");
+            release_rx.recv().expect("release child lock");
+        });
+        locked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker acquired child lock");
+
+        let started = Instant::now();
+        handle.terminate();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "foreground termination blocked for {:?}",
+            started.elapsed()
+        );
+
+        release_tx.send(()).expect("release child lock");
+        holder.join().expect("join child-lock holder");
+        handle
+            .terminate_and_reap()
+            .expect("terminate and reap test child");
+    }
+
+    #[test]
+    fn response_envelope_requires_exactly_one_result_or_error() {
+        for response in [
+            json!({"jsonrpc":"2.0", "id":1}),
+            json!({"jsonrpc":"2.0", "id":1, "result":null, "error":{"code":-1,"message":"bad"}}),
+        ] {
+            let error = parse_response(response.to_string().as_bytes(), 1).unwrap_err();
+            assert!(matches!(error, Error::InvalidResponse(_)));
+            assert!(error.is_transport_failure());
+        }
+    }
+
+    #[test]
+    fn response_envelope_validates_version_id_and_error_shape() {
+        for response in [
+            json!({"jsonrpc":"1.0", "id":1, "result":null}),
+            json!({"jsonrpc":"2.0", "id":2, "result":null}),
+            json!({"jsonrpc":"2.0", "id":1, "error":{"code":"bad","message":"bad"}}),
+            json!({"jsonrpc":"2.0", "id":1, "error":{"code":-1,"message":7}}),
+        ] {
+            assert!(parse_response(response.to_string().as_bytes(), 1).is_err());
+        }
+    }
+
+    #[test]
+    fn valid_rpc_errors_are_not_transport_failures() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {"code": -32602, "message": "invalid params"},
+        });
+        let error = parse_response(response.to_string().as_bytes(), 1).unwrap_err();
+        assert!(matches!(error, Error::Rpc { code: -32602, .. }));
+        assert!(!error.is_transport_failure());
     }
 }

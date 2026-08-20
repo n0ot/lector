@@ -130,8 +130,9 @@ edge-triggered readiness notification is not lost, while returning control to
 input, presentation, and other ready sources. An open DEC 2026 frame receives
 no larger PTY budget.
 
-Modeled visual updates have a 4 ms event-boundary latency budget and a 64 KiB
-per-drain write budget. An unstarted render can be replaced by the newest
+Modeled visual updates become eligible at the end of their current bounded
+event-loop turn and have a 64 KiB per-drain write budget. An unstarted render
+can be replaced by the newest
 authoritative scene, while started transactions, lifecycle/control bytes, and
 bells are retained. This bounds obsolete incremental visual work
 without delaying terminal replies or input sent to the application PTY.

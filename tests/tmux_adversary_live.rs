@@ -62,10 +62,11 @@ impl LiveAdversary {
         command.args([
             "--shell",
             env!("CARGO_BIN_EXE_tmux-control-adversary"),
-            "--speech-driver",
-            "proc",
-            "--speech-server",
-            env!("CARGO_BIN_EXE_proc_stub_server"),
+            "--config",
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pty/proc-speech.lua")
+                .to_str()
+                .expect("UTF-8 speech config path"),
             "--log-file",
             log.to_str().expect("UTF-8 diagnostic path"),
         ]);
@@ -74,6 +75,10 @@ impl LiveAdversary {
         command.env("LECTOR_TMUX_ADVERSARY", scenario);
         command.env("LECTOR_TMUX_ADVERSARY_EVENTS", &event_log);
         command.env("LECTOR_PROC_STUB_LOG", &speech_log);
+        command.env(
+            "LECTOR_TEST_SPEECH_SERVER",
+            env!("CARGO_BIN_EXE_proc_stub_server"),
+        );
         if stall_speech {
             command.env("LECTOR_PROC_STUB_STALL_SPEECH", "1");
         }

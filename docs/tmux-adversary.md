@@ -5,15 +5,26 @@ spawn it as its shell, so every case crosses the real PTY, polling, compositor,
 input, logging, and shutdown paths without creating a tmux socket or touching a
 user's tmux server.
 
-Build it and Lector, then select a scenario with an environment variable:
+Build it, Lector, and the non-speaking test server:
 
 ```sh
 cargo build --bin lector --bin tmux-control-adversary --bin proc_stub_server
+```
+
+Put this in `/tmp/lector-adversary.lua` so the run exercises custom process
+speech without invoking system TTS:
+
+```lua
+lector.o.speech = { program = "target/debug/proc_stub_server" }
+```
+
+Then select a scenario with an environment variable:
+
+```sh
 LECTOR_TMUX_ADVERSARY=hidden-flood \
   target/debug/lector \
   --shell target/debug/tmux-control-adversary \
-  --speech-driver proc \
-  --speech-server target/debug/proc_stub_server \
+  --config /tmp/lector-adversary.lua \
   --log-file /tmp/lector-hidden-flood.jsonl
 ```
 

@@ -71,6 +71,13 @@ impl ScreenReader {
         func.call::<()>(tbl).map_err(Error::lua)
     }
 
+    /// Whether startup must wait for a physically presented child frame
+    /// before entering Lua. Most configurations do not install this hook, so
+    /// their terminal input path can remain immediate.
+    pub fn has_on_startup_hook(&self) -> bool {
+        self.lua_hooks.on_startup.is_some()
+    }
+
     pub fn hook_on_shutdown(&mut self, reason: &str) -> Result<()> {
         let Some(key) = &self.lua_hooks.on_shutdown else {
             return Ok(());

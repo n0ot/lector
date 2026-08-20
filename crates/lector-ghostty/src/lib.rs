@@ -443,6 +443,9 @@ pub struct UpdateSnapshot {
     pub alternate_screen_before: bool,
     pub alternate_screen_after: bool,
     pub synchronized_output: bool,
+    /// This update ended exactly at a real true-to-false synchronized-output
+    /// boundary. Ordinary bytes after the close make this false.
+    pub synchronized_output_closed: bool,
     /// The visible terminal model immediately after an actual false-to-true
     /// synchronized-output transition. The marker itself only changes mode,
     /// so after clearing that mode bit this is the exact committed model from
@@ -1963,6 +1966,7 @@ impl Terminal {
         self.stream_observer.begin_update(&self.snapshot);
         let mut render_damage = RenderDamageSnapshot::None;
         let mut synchronized_output_open_snapshot = None;
+        let mut synchronized_output_close_end = None;
         let mut history_extent_at_latest_checkpoint = scrollback_extent_before;
         let mut history_origin_at_latest_checkpoint = history_origin_before;
         let mut history_changed_before_latest_checkpoint = false;
@@ -1981,6 +1985,12 @@ impl Terminal {
             render_damage.merge(self.refresh_snapshot()?);
             self.anchor_semantic_events(scrollback_extent_before)?;
             let synchronization_boundary = self.stream_observer.take_synchronized_output_boundary();
+            if synchronization_boundary == Some(false)
+                && synchronized_before
+                && !self.snapshot.modes.synchronized_output
+            {
+                synchronized_output_close_end = Some(index + 1);
+            }
             if synchronization_boundary == Some(true)
                 && !synchronized_before
                 && self.snapshot.modes.synchronized_output
@@ -2062,6 +2072,8 @@ impl Terminal {
             alternate_screen_before,
             alternate_screen_after: self.snapshot.alternate_screen,
             synchronized_output: self.snapshot.modes.synchronized_output,
+            synchronized_output_closed: !self.snapshot.modes.synchronized_output
+                && synchronized_output_close_end == Some(bytes.len()),
             synchronized_output_open_snapshot,
         })
     }

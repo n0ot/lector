@@ -14,12 +14,39 @@ making its native handles non-`Send`.
 
 Bounded workers isolate side effects that may block:
 
-- The proc speech backend runs behind `speech::worker::BoundedAsyncDriver`.
-  Its bounded mailbox drops stale speech under overload and prioritizes stop
-  and rate changes, so pipe I/O cannot stall terminal processing. The native
-  TTS backend remains in-process and is not wrapped by this worker.
+- The speech supervisor owns both native and custom process backends behind the
+  bounded asynchronous speech worker. Its mailbox drops stale speech under
+  overload and prioritizes stop and rate changes. JSON-RPC pipe readiness and
+  absolute deadlines are worker-local; completion or fatal failure reaches the
+  main loop through an event-driven control path rather than a polling timer.
+  The default native backend is hosted by a hidden instance of the current
+  Lector executable, so pipe I/O, AVFoundation utterance construction,
+  playback, and Core Foundation lifecycle work cannot stall terminal
+  processing. On macOS the host submits only one non-interrupting utterance to
+  AVFoundation at a time and keeps the remaining queue bounded.
 - `diagnostics` owns log output. Producers enqueue records into a byte-bounded
   queue, and the event loop never performs the underlying file or stderr I/O.
+
+Startup preserves the Unix PTY post-fork boundary and gives Lua one coherent
+lifecycle:
+
+1. Lector spawns the application PTY before starting worker threads.
+2. It creates Lua and evaluates `init.lua`; top-level code selects a speech
+   process but does not need a separate pre-start configuration file.
+3. It starts and initializes the committed speech server, with one fresh
+   startup retry on failure.
+4. It activates the physical terminal, starts bounded capability probes, and presents
+   initial child output.
+5. It calls `on_startup` immediately before entering the normal input loop.
+
+Runtime speech replacement is transactional. A candidate process initializes
+and restores the configured rate while the old generation remains owned for rollback;
+only then is the active generation swapped and the old child terminated and
+reaped. Transport failures never replay an uncertain in-flight speech call.
+The supervisor permits a restart only when the preceding recorded crash was at
+least 30 seconds earlier, and otherwise asks the event loop to restore the
+terminal and exit nonzero. The exact process and protocol contract is in
+[`speech-driver-protocol.md`](speech-driver-protocol.md).
 
 Terminal input, PTYs, and physical-terminal output are nonblocking and drained
 in bounded turns. Physical input and child PTY output each yield after 32 KiB
@@ -84,6 +111,12 @@ makes the newest candidate eligible, but its contents remain unreadable until
 that exact render flushes. Prefixes, fragmented markers, and close/reopen
 sequences cannot expose a logical checkpoint which was never physically
 presented.
+
+When a batch ends exactly at a real close, that stabilization fact travels in
+the same accessibility frame as the pixels. Once the matching physical flush
+receipt arrives, auto-read may finalize immediately instead of waiting for the
+ordinary 30 ms debounce. Bytes after the close clear this fast-path marker, so
+the next ordinary frame still stabilizes normally.
 
 Raw input to the application is not deferred behind synchronized output.
 Snapshot consistency therefore does not make a read-and-act sequence atomic:
@@ -173,6 +206,9 @@ replies because tmux is authoritative there.
 - One event-loop thread owns mutable UI, terminal, and tmux state.
 - Spawn the PTY child before starting diagnostics or speech worker threads;
   Unix PTY launch performs post-fork setup.
+- Load top-level Lua speech configuration before spawning its selected speech
+  server; run `on_startup` only after server initialization and initial
+  physical presentation.
 - Each tmux pane has its own terminal engine and media namespace.
 - The output scheduler is the only live physical-output ordering path.
 - Queues and parser buffers have explicit bounds and defined overload behavior.

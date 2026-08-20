@@ -87,6 +87,10 @@ struct ByteThrottle {
 
 static DIAGNOSTICS: OnceLock<Diagnostics> = OnceLock::new();
 
+pub fn enabled() -> bool {
+    DIAGNOSTICS.get().is_some()
+}
+
 /// Initialize the process-wide log. A file is strongly preferred for stress
 /// runs so diagnostic output can never compete with the physical terminal.
 pub fn initialize(path: Option<&Path>) -> Result<()> {

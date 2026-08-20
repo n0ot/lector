@@ -384,6 +384,9 @@ pub struct UpdateSummary {
     /// boundary, including a close/reopen sequence whose final mode is still
     /// enabled.
     pub synchronized_output_opened: bool,
+    /// This batch ended exactly at a real synchronized-output close. It is a
+    /// stabilization boundary only after its exact render has flushed.
+    pub synchronized_output_closed: bool,
     pub batch_count: usize,
 }
 
@@ -405,6 +408,7 @@ impl Default for UpdateSummary {
             screen_after: ScreenIdentity::Primary,
             synchronized_output: false,
             synchronized_output_opened: false,
+            synchronized_output_closed: false,
             batch_count: 0,
         }
     }
@@ -423,6 +427,7 @@ impl UpdateSummary {
         self.screen_after = next.screen_after;
         self.synchronized_output = next.synchronized_output;
         self.synchronized_output_opened |= next.synchronized_output_opened;
+        self.synchronized_output_closed = next.synchronized_output_closed;
         self.batch_count = self.batch_count.saturating_add(next.batch_count);
         self.effects.bells = self.effects.bells.saturating_add(next.effects.bells);
         self.effects.title_changed |= next.effects.title_changed;
@@ -1170,6 +1175,7 @@ impl TerminalEngine for GhosttyEngine {
             screen_after: self.snapshot.screen,
             synchronized_output: self.snapshot.modes.synchronized_output,
             synchronized_output_opened: false,
+            synchronized_output_closed: false,
             batch_count: 1,
             ..UpdateSummary::default()
         }
@@ -1188,6 +1194,7 @@ impl TerminalEngine for GhosttyEngine {
             screen_after: self.snapshot.screen,
             synchronized_output: self.snapshot.modes.synchronized_output,
             synchronized_output_opened: false,
+            synchronized_output_closed: false,
             batch_count: 1,
             ..UpdateSummary::default()
         }
@@ -1337,6 +1344,7 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         screen_after: ghostty_screen_identity(update.alternate_screen_after),
         synchronized_output: update.synchronized_output,
         synchronized_output_opened: false,
+        synchronized_output_closed: update.synchronized_output_closed,
         batch_count: 1,
     }
 }

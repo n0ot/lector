@@ -4,9 +4,13 @@ use std::{fmt::Write, sync::LazyLock};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub mod proc_driver;
+pub mod supervisor;
 pub mod symbols;
 pub mod tts;
 pub mod worker;
+
+mod config;
+pub use config::SpeechServerSpec;
 
 const MIN_REPEAT_COUNT: usize = 4;
 static EXPAND_START_CAPS: LazyLock<Regex> = LazyLock::new(|| {
@@ -31,6 +35,25 @@ pub trait Driver {
     fn stop(&mut self) -> DriverResult<()>;
     fn get_rate(&self) -> f32;
     fn set_rate(&mut self, rate: f32) -> DriverResult<()>;
+
+    /// Finish starting a deferred backend.
+    ///
+    /// Ordinary drivers are already ready. Process-backed speech overrides
+    /// this so Lua can select the exact server before any process or worker I/O
+    /// is allowed to delay startup.
+    fn start(&mut self) -> DriverResult<()> {
+        Ok(())
+    }
+
+    /// Select or transactionally replace a process-backed speech server.
+    fn configure_server(&mut self, _spec: SpeechServerSpec) -> DriverResult<()> {
+        Err(anyhow::anyhow!(
+            "this speech backend does not support server configuration"
+        ))
+    }
+
+    /// Interrupt backend work during explicit lifecycle teardown.
+    fn shutdown(&mut self) {}
 }
 
 pub struct Speech {
@@ -182,6 +205,18 @@ impl Speech {
 
     pub fn set_rate(&mut self, rate: f32) -> Result<()> {
         self.driver.set_rate(rate).map_err(Error::Driver)
+    }
+
+    pub fn start(&mut self) -> Result<()> {
+        self.driver.start().map_err(Error::Driver)
+    }
+
+    pub fn configure_server(&mut self, spec: SpeechServerSpec) -> Result<()> {
+        self.driver.configure_server(spec).map_err(Error::Driver)
+    }
+
+    pub fn shutdown(&mut self) {
+        self.driver.shutdown();
     }
 
     pub fn symbol_level(&self) -> symbols::Level {

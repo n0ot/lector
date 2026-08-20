@@ -1,0 +1,19 @@
+#!/bin/bash
+
+set -u
+
+repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd)
+socket_dir="${TMPDIR:-/tmp}/lector-test-tmux"
+socket="$socket_dir/live-latency-attached-$$.sock"
+session="lector_latency_attached_$$"
+child="$repo_root/tests/fixtures/pty/latency-child"
+mkdir -p "$socket_dir"
+
+cleanup() {
+    tmux -S "$socket" kill-server >/dev/null 2>&1 || true
+    rm -f "$socket"
+}
+trap cleanup EXIT HUP INT TERM
+
+tmux -S "$socket" -f /dev/null new-session -d -x 80 -y 24 -s "$session" "$child"
+tmux -S "$socket" attach-session -t "$session"

@@ -57,10 +57,6 @@ name = "lector-harness"
 path = "src/bin/lector-harness.rs"
 
 [[bin]]
-name = "lector-tts"
-path = "src/bin/lector-tts.rs"
-
-[[bin]]
 name = "proc_stub_server"
 path = "src/bin/proc_stub_server.rs"
 

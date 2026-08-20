@@ -10,6 +10,7 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.log_bytes("stdin from terminal", input);
+        self.log_latency_stage("input-received", || format!("bytes={}", input.len()));
         let input = if let Some(broker) = self.startup_probe_broker.as_mut() {
             broker.ingest(input, self.clock.now_ms())
         } else {

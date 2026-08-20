@@ -31,7 +31,10 @@ pub struct OutputSchedulerConfig {
 impl Default for OutputSchedulerConfig {
     fn default() -> Self {
         Self {
-            latency_budget_ms: 4,
+            // PTY drains already coalesce all bytes which are ready in one
+            // bounded event-loop turn. Delaying the resulting authoritative
+            // scene adds key-to-pixel latency without buying another read.
+            latency_budget_ms: 0,
             synchronization_timeout_ms: 100,
             synchronization_hard_timeout_ms: 2_000,
             write_budget_bytes: 64 * 1024,
@@ -410,6 +413,17 @@ impl OutputScheduler {
                 .any(|transaction| transaction.kind == ActiveTransactionKind::Render)
     }
 
+    /// Whether a render can no longer be replaced against the currently
+    /// confirmed physical shadow. Pending renders and active renders at byte
+    /// offset zero are still unstarted, so a newer scene may diff from the
+    /// same confirmed presentation without forcing a full reconstruction.
+    pub fn has_started_render_work(&self) -> bool {
+        !self.awaiting_flush_renders.is_empty()
+            || self.active.iter().any(|transaction| {
+                transaction.kind == ActiveTransactionKind::Render && transaction.offset > 0
+            })
+    }
+
     pub fn enqueue_bell(&mut self, count: usize, now_ms: u128) {
         if count == 0 {
             return;
@@ -634,6 +648,18 @@ impl OutputScheduler {
 
     pub fn notify_writable(&mut self) {
         self.waiting_for_writable = false;
+    }
+
+    /// Whether an application-owned synchronized-output transaction is still
+    /// holding its compositor frame. Callers must not treat an empty drain
+    /// report as a physical presentation boundary while this is true: the
+    /// newest render is intentionally waiting for the application's DEC 2026
+    /// close (or the scheduler's existing timeout policy).
+    pub const fn application_synchronization_holds_output(&self) -> bool {
+        matches!(
+            self.application_synchronization,
+            Some(ApplicationSynchronization::Active { .. })
+        )
     }
 
     pub fn drain_ready(

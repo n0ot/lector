@@ -59,6 +59,7 @@ fn accessibility_bundle(marker: u64) -> PresentedAccessibilityBundle {
             },
             history_revision: 0,
             history: None,
+            explicitly_stable: false,
         }],
     )
 }
@@ -608,6 +609,35 @@ fn a_zero_byte_render_is_confirmed_without_waiting_for_an_impossible_flush() {
     assert_eq!(report.completed_renders.len(), 1);
     assert_eq!(report.completed_renders[0].geometry.cols, 20);
     assert!(!scheduler.has_render_work());
+}
+
+#[test]
+fn render_work_is_started_only_after_a_render_byte_is_accepted() {
+    let mut scheduler = OutputScheduler::new(
+        OutputSchedulerConfig {
+            write_budget_bytes: 2,
+            ..config()
+        },
+        false,
+    );
+    scheduler.enqueue_render(batch(b"render", 20), 0);
+    assert!(scheduler.has_render_work());
+    assert!(!scheduler.has_started_render_work());
+
+    let mut output = Vec::new();
+    scheduler
+        .drain_ready(4, false, &mut output)
+        .expect("start the render");
+    assert_eq!(output, b"re");
+    assert!(scheduler.has_started_render_work());
+
+    while scheduler.has_render_work() {
+        scheduler
+            .drain_ready(4, true, &mut output)
+            .expect("finish the render");
+    }
+    assert!(!scheduler.has_render_work());
+    assert!(!scheduler.has_started_render_work());
 }
 
 #[test]

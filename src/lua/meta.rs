@@ -3,11 +3,11 @@ use crate::{
     clipboard::{ClipboardRegister, SystemClipboardProvider},
     keymap::KeyBindings,
     screen_reader::ScreenReader,
-    speech::symbols,
+    speech::{SpeechServerSpec, symbols},
 };
 use anyhow::{Context as AnyhowContext, anyhow};
 use mlua::{Error, Function, IntoLua, Lua, Result, Table, Value};
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 macro_rules! add_callbacks_common {
     ($tbl:expr,
@@ -247,6 +247,7 @@ fn clipboard_register(name: &str) -> anyhow::Result<ClipboardRegister> {
 
 fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua::Value> {
     match option {
+        "speech" => speech_server_spec_to_lua(lua, sr.speech_server_spec()),
         "speech_rate" => sr.speech().get_rate().into_lua(lua),
         "symbol_level" => sr.speech().symbol_level().to_string().into_lua(lua),
         "help_mode" => sr.help_mode().into_lua(lua),
@@ -319,6 +320,9 @@ fn get_binding(lua: &Lua, sr: &ScreenReader, key: &str) -> anyhow::Result<Value>
 fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow::Result<()> {
     use mlua::Value::*;
     (match option {
+        "speech" => sr
+            .set_startup_speech_server_spec(speech_server_spec_from_lua(value)?)
+            .map_err(anyhow::Error::new),
         "speech_rate" => match value {
             Number(v) => sr
                 .speech_mut()
@@ -419,6 +423,126 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
         _ => Err(anyhow!("unknown option")),
     })
     .map_err(|e| anyhow!("set option: {}: {:?}", option, e))
+}
+
+pub(super) fn speech_server_spec_from_lua(value: Value) -> anyhow::Result<SpeechServerSpec> {
+    match value {
+        Value::String(value) => {
+            let value = lua_utf8(&value, "speech server")?;
+            if value == "native" {
+                Ok(SpeechServerSpec::Native)
+            } else {
+                Err(anyhow!(
+                    "speech server string must be \"native\" or a process table"
+                ))
+            }
+        }
+        Value::Table(table) => parse_process_speech_server(table),
+        _ => Err(anyhow!(
+            "speech server must be \"native\" or a table with program and args"
+        )),
+    }
+}
+
+pub(super) fn speech_server_spec_to_lua(lua: &Lua, spec: &SpeechServerSpec) -> mlua::Result<Value> {
+    match spec {
+        SpeechServerSpec::Native => "native".into_lua(lua),
+        SpeechServerSpec::Process { program, args } => {
+            let table = lua.create_table()?;
+            table.set("program", program.as_str())?;
+            table.set(
+                "args",
+                lua.create_sequence_from(args.iter().map(String::as_str))?,
+            )?;
+            Ok(Value::Table(table))
+        }
+    }
+}
+
+fn parse_process_speech_server(table: Table) -> anyhow::Result<SpeechServerSpec> {
+    for pair in table.clone().pairs::<Value, Value>() {
+        let (key, _) = pair.map_err(|error| anyhow!(error.to_string()))?;
+        let Value::String(key) = key else {
+            return Err(anyhow!("speech server table keys must be strings"));
+        };
+        match lua_utf8(&key, "speech server table key")?.as_str() {
+            "program" | "args" => {}
+            key => return Err(anyhow!("unknown speech server field: {key}")),
+        }
+    }
+
+    let program_value = table
+        .get::<Value>("program")
+        .map_err(|error| anyhow!(error.to_string()))?;
+    let Value::String(program_value) = program_value else {
+        return Err(anyhow!("speech server program must be a string"));
+    };
+    let program = lua_utf8(&program_value, "speech server program")?;
+    if program.is_empty() {
+        return Err(anyhow!("speech server program must not be empty"));
+    }
+    reject_nul(&program, "speech server program")?;
+
+    let args = match table
+        .get::<Value>("args")
+        .map_err(|error| anyhow!(error.to_string()))?
+    {
+        Value::Nil => Vec::new(),
+        Value::Table(args) => parse_speech_server_args(args)?,
+        _ => return Err(anyhow!("speech server args must be an array of strings")),
+    };
+
+    Ok(SpeechServerSpec::Process { program, args })
+}
+
+fn parse_speech_server_args(table: Table) -> anyhow::Result<Vec<String>> {
+    let mut indexed = BTreeMap::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair.map_err(|error| anyhow!(error.to_string()))?;
+        let Value::Integer(index) = key else {
+            return Err(anyhow!(
+                "speech server args must have consecutive integer indexes starting at 1"
+            ));
+        };
+        let index = usize::try_from(index)
+            .ok()
+            .filter(|index| *index > 0)
+            .ok_or_else(|| {
+                anyhow!("speech server args must have consecutive integer indexes starting at 1")
+            })?;
+        let Value::String(value) = value else {
+            return Err(anyhow!("speech server argument {index} must be a string"));
+        };
+        let value = lua_utf8(&value, &format!("speech server argument {index}"))?;
+        reject_nul(&value, &format!("speech server argument {index}"))?;
+        indexed.insert(index, value);
+    }
+
+    let mut args = Vec::with_capacity(indexed.len());
+    for expected in 1..=indexed.len() {
+        let Some(value) = indexed.remove(&expected) else {
+            return Err(anyhow!(
+                "speech server args must have consecutive integer indexes starting at 1"
+            ));
+        };
+        args.push(value);
+    }
+    Ok(args)
+}
+
+fn lua_utf8(value: &mlua::String, field: &str) -> anyhow::Result<String> {
+    value
+        .to_str()
+        .map(|value| value.to_string())
+        .map_err(|_| anyhow!("{field} must be valid UTF-8"))
+}
+
+fn reject_nul(value: &str, field: &str) -> anyhow::Result<()> {
+    if value.contains('\0') {
+        Err(anyhow!("{field} must not contain a NUL byte"))
+    } else {
+        Ok(())
+    }
 }
 
 fn with_screen_reader_mut<T>(

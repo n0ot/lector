@@ -105,8 +105,9 @@ SSH-like control sessions. See
 
 After the initial outer focus-mode ownership query, all live presentation,
 effect, bell, and lifecycle output passes through one serialized scheduler. It
-coalesces modeled scene updates at event-loop boundaries with a 4 ms latency
-budget, completes any started escape transaction before beginning another,
+coalesces modeled scene updates within each bounded event-loop turn and makes
+the resulting scene immediately eligible, completes any started escape
+transaction before beginning another,
 and keeps application input and terminal replies independent of presentation
 backpressure. Child PTY output also yields after 32 KiB or 4 ms, checked after
 each read of at most 8 KiB; synchronized output does not receive a larger turn.
@@ -118,6 +119,8 @@ remain private. Changed scrollback is revisioned and shared, so ordinary frames
 do not copy the bounded history on every update. Raw application input remains
 independent of presentation. Consequently, reading a cell and then sending
 coordinate-based input has the normal UI time-of-check to time-of-use race.
+The latency design, live direct/tmux gates, and diagnostic timeline are in
+[docs/performance.md](docs/performance.md).
 
 DEC private mode 2026 gates when a scene may be presented. A real close makes
 the final candidate eligible but does not make it readable before its physical
@@ -174,60 +177,63 @@ Or use the `SHELL` environment variable:
 SHELL=/bin/zsh cargo run
 ```
 
-## Speech drivers
+## Speech
 
-Lector defaults to the built‑in TTS driver. You can also run a proc‑based driver that speaks JSON‑RPC over stdin/stdout.
+Lector uses native speech by default. It hosts native TTS in an internal
+instance of the current Lector executable, keeping system speech and its macOS
+run loop away from terminal input and rendering. There is no separate native
+speech executable to install.
 
-Select a driver:
+Speech selection is Lua configuration, not a command-line driver setting:
 
-```bash
-cargo run -- --shell /bin/zsh --speech-driver tts
-cargo run -- --shell /bin/zsh --speech-driver proc --speech-server /path/to/driver
+```lua
+-- The default.
+lector.o.speech = "native"
+
+-- Or start a custom server with an exact argument vector.
+lector.o.speech = {
+  program = "/opt/lector-speech/bin/server",
+  args = { "--voice", "Alex" },
+}
 ```
 
-### Proc driver protocol
+Lector invokes `program` directly; it does not perform shell parsing. At
+startup it loads `init.lua`, starts and initializes the selected server, and
+then restores the configured speech rate. Assigning `lector.o.speech` is a
+top-level configuration operation.
 
-The proc driver speaks line‑delimited JSON‑RPC 2.0. Each request is one JSON object per line, and each response is one JSON object per line.
+The Lua REPL and hooks can request a nonblocking, transactional runtime switch:
 
-Supported methods:
-
-- `speak` params `{ "text": "...", "interrupt": true|false }`
-- `stop` params `{}` or omitted
-- `set_rate` params `{ "rate": 1.0 }`
-
-Example response:
-
-```json
-{"jsonrpc":"2.0","id":1,"result":null}
+```lua
+lector.api.set_speech("native")
+lector.api.set_speech({
+  program = "/opt/lector-speech/bin/other-server",
+  args = { "--voice", "Samantha" },
+})
 ```
 
-### Proc stub server (tests)
+The call returns immediately. Lector retains the old server for rollback while
+the candidate initializes; speech requested during that handshake waits in the
+bounded worker queue. A failed candidate leaves the old setting committed and
+calls `lector.hooks.on_error(message, "speech-reconfigure")`.
 
-There is a tiny proc server binary used by tests to validate the JSON‑RPC driver path without invoking system TTS. It’s called `proc_stub_server`.
-
-### Example proc server (TTS)
-
-Build the bundled TTS proc server and point Lector at it:
-
-```bash
-cargo build --release
-target/release/lector-tts
-```
-
-Then run Lector:
-
-```bash
-target/release/lector --shell /bin/zsh --speech-driver proc --speech-server target/release/lector-tts
-```
+Custom servers use bounded UTF-8 NDJSON JSON-RPC 2.0 over stdin/stdout. The
+canonical [`openrpc.json`](openrpc.json) makes the methods machine-readable,
+and [the speech driver protocol](docs/speech-driver-protocol.md) defines exact
+framing, initialization, deadlines, errors, process cleanup, and the 30-second
+restart policy. Speech RPC and deadlines run only on the speech worker, so a
+slow or hung server cannot add a polling floor or block Lector's terminal loop.
 
 ### Recording a diagnostic session
 
 `scripts/lector-trace` is a transparent PTY shim for reproducing interactive
 terminal problems while using the real TTS server. It records exact bytes in
-both directions, Lector's `--log` diagnostics, and every speech RPC in separate
-files. The trace contains everything typed, displayed, and spoken.
+both directions and Lector's `--log` diagnostics in separate files. With the
+built-in native server, it also records every speech RPC, so the trace contains
+everything typed, displayed, and spoken. A custom server can provide the same
+speech trace by honoring `LECTOR_SPEECH_RPC_LOG`.
 
-When `lector`, `lector-tts`, and `lector-trace` are installed together, run:
+When `lector` and `lector-trace` are installed together, run:
 
 ```bash
 lector-trace --shell "$SHELL"
@@ -390,9 +396,21 @@ Lector reads a config file on startup:
 - Linux: `~/.config/lector/init.lua`
 - macOS: `~/Library/Application Support/lector/init.lua`
 
+Use `--config PATH` (or `LECTOR_CONFIG`) to load a different file. Use
+`--no-config` to skip Lua configuration and start with defaults, including
+native speech; the two options are mutually exclusive.
+
+```bash
+lector --shell /bin/zsh --config ./lector-demo.lua
+lector --shell /bin/zsh --no-config
+```
+
 ### Common options
 
 ```lua
+-- speech backend; this top-level option is read before speech starts
+lector.o.speech = "native"
+
 -- speaking rate
 lector.o.speech_rate = 1.0
 
@@ -511,6 +529,18 @@ lector.hooks.on_table_mode_exit = function() end
 lector.hooks.on_clipboard_change = function(entry, meta) end
 lector.hooks.on_key_unhandled = function(key, mode)          -- return true to consume
   return false
+end
+```
+
+`on_startup` is the post-start boundary. It runs only after `init.lua` has
+finished, the selected speech server has initialized, the physical terminal
+and startup probes are active, and initial child output has been presented. It
+runs immediately before the normal input loop, so startup announcements belong
+there rather than at top level:
+
+```lua
+lector.hooks.on_startup = function(_)
+  lector.api.speak("welcome to Lector", false)
 end
 ```
 

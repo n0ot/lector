@@ -45,6 +45,9 @@ pub struct PresentedViewFrame {
     pub snapshot: TerminalSnapshot,
     pub history_revision: u64,
     pub history: Option<Arc<[Row]>>,
+    /// The source update for this exact revision ended at an explicit
+    /// synchronized-output commit boundary.
+    pub explicitly_stable: bool,
 }
 
 /// Accessibility frames committed atomically with a physical render flush.

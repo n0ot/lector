@@ -1048,13 +1048,7 @@ fn encode_base64(input: &[u8]) -> String {
 
 fn run_scheduler_workload(workload: SchedulerWorkload) -> Result<SchedulerWorkloadReport, String> {
     const UPDATES_PER_BOUNDARY: usize = 8;
-    let config = OutputSchedulerConfig {
-        latency_budget_ms: 4,
-        synchronization_timeout_ms: 100,
-        synchronization_hard_timeout_ms: 2_000,
-        write_budget_bytes: 64 * 1024,
-        maximum_pending_bytes: 2 * 1024 * 1024,
-    };
+    let config = OutputSchedulerConfig::default();
     let mut scheduler = OutputScheduler::new(config, true);
     let mut writer = BenchmarkWriter::default();
     let mut latencies = Vec::with_capacity(workload.iterations);

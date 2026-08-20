@@ -7,26 +7,32 @@ use super::Driver;
 use anyhow::{Result as DriverResult, anyhow};
 use std::{
     collections::VecDeque,
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
     thread,
+    time::Duration,
 };
+
+use super::SpeechServerSpec;
 
 const MAX_PENDING_SPEECH_ITEMS: usize = 32;
 const MAX_PENDING_SPEECH_BYTES: usize = 256 * 1024;
 const MAX_SPEECH_ITEM_BYTES: usize = 64 * 1024;
 const TRUNCATION_SUFFIX: &str = " … speech truncated";
+const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 enum Request {
     Speak { text: String, interrupt: bool },
     Stop,
     SetRate(f32),
+    ConfigureServer(SpeechServerSpec),
+    Start(mpsc::SyncSender<std::result::Result<(), String>>),
 }
 
 impl Request {
     fn speech_bytes(&self) -> usize {
         match self {
             Self::Speak { text, .. } => text.len(),
-            Self::Stop | Self::SetRate(_) => 0,
+            Self::Stop | Self::SetRate(_) | Self::ConfigureServer(_) | Self::Start(_) => 0,
         }
     }
 
@@ -155,6 +161,36 @@ impl Mailbox {
         Ok(())
     }
 
+    fn enqueue_server(&self, spec: SpeechServerSpec) -> DriverResult<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Ok(());
+        }
+        state
+            .requests
+            .retain(|request| !matches!(request, Request::ConfigureServer(_)));
+        state.requests.push_front(Request::ConfigureServer(spec));
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn enqueue_start(
+        &self,
+        completed: mpsc::SyncSender<std::result::Result<(), String>>,
+    ) -> DriverResult<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Err(anyhow!("speech worker has shut down"));
+        }
+        // Configuration and speech emitted while init.lua was loading must be
+        // observed before this activation fence.
+        state.requests.push_back(Request::Start(completed));
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
     fn next_request(&self) -> Option<Request> {
         let mut state = self.state.lock().ok()?;
         while state.requests.is_empty() && !state.shutdown {
@@ -264,10 +300,33 @@ impl Driver for BoundedAsyncDriver {
         self.rate = rate;
         Ok(())
     }
+
+    fn start(&mut self) -> DriverResult<()> {
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        self.mailbox.enqueue_start(completed_tx)?;
+        completed_rx
+            .recv_timeout(Duration::from_secs(15))
+            .map_err(|error| anyhow!("wait for speech backend startup: {error}"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    fn configure_server(&mut self, spec: SpeechServerSpec) -> DriverResult<()> {
+        self.mailbox.enqueue_server(spec)
+    }
+
+    fn shutdown(&mut self) {
+        self.shutdown_inner();
+    }
 }
 
 impl Drop for BoundedAsyncDriver {
     fn drop(&mut self) {
+        self.shutdown_inner();
+    }
+}
+
+impl BoundedAsyncDriver {
+    fn shutdown_inner(&mut self) {
         self.mailbox.shut_down();
         if let Some(shutdown_backend) = self.shutdown_backend.take() {
             shutdown_backend();
@@ -277,8 +336,13 @@ impl Drop for BoundedAsyncDriver {
         };
         // A backend can be permanently stuck in foreign code or pipe I/O.
         // Never move that failure back onto the event loop during teardown.
-        // If it has already stopped, reap it; otherwise detaching is bounded
-        // and process exit will reclaim the one process-lifetime worker.
+        // Give a killed process backend a small, bounded window to unwind and
+        // reap its child. A backend stuck in arbitrary foreign code is still
+        // detached after the deadline, so shutdown cannot hang Lector.
+        let deadline = std::time::Instant::now() + WORKER_SHUTDOWN_GRACE;
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
         if worker.is_finished() {
             let _ = worker.join();
         }
@@ -292,6 +356,16 @@ fn run_worker(mut driver: impl Driver, mailbox: &Mailbox) {
             Request::Speak { text, interrupt } => driver.speak(&text, interrupt),
             Request::Stop => driver.stop(),
             Request::SetRate(rate) => driver.set_rate(rate),
+            Request::ConfigureServer(spec) => driver.configure_server(spec),
+            Request::Start(completed) => {
+                let result = driver.start();
+                let report = match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                let _ = completed.send(report);
+                result
+            }
         };
         if let Err(error) = result {
             failures = failures.saturating_add(1);

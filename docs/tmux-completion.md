@@ -185,8 +185,8 @@ checked-in completion measurements were:
 
 | Workload | p95 render | Output/full-scene ratio | Semantic coverage | Semantic/pure-diff bytes |
 | --- | ---: | ---: | ---: | ---: |
-| tmux-like structural edits | 119.8 us | 3.93% | 100% | 12.37% |
-| Zellij-like layered redraws | 123.6 us | 3.10% | 83.32% | 49.95% |
+| tmux-like structural edits | 67.0 us | 2.87% | 100% | 9.02% |
+| Zellij-like layered redraws | 72.7 us | 2.82% | 83.32% | 45.34% |
 
 The mixed tmux soak uses 16 panes across eight windows while switching,
 resizing, emitting output, images, and bells. It compares every presented
@@ -195,15 +195,16 @@ media, records process CPU time and PTY-to-render p95, and constructs a full
 redraw alongside every incremental result. Separate harnesses measure 10,000
 bytes of key-to-PTY queuing/encoding and 100 rapid connection switches. The
 benchmark also gates peak RSS, scheduler backlog/recovery, and Kitty media
-throughput.
+throughput. Real-PTY direct, attached-tmux, and control-mode key-to-pixel gates
+are documented separately in [performance.md](performance.md).
 
 The final macOS ARM64 release soak retained 1,056 scrollback rows, 2,336 text
 bytes, and 64 image bytes across its 16 panes (averages of 66 rows, 146 text
-bytes, and 4 image bytes per pane). Its PTY-to-render p95 was 778 us and the
-192-frame workload used 168 ms of process CPU. It emitted 158,699 bytes versus
-178,450 bytes for the independently constructed full redraws. The final
-benchmark run measured 79 us tmux-like and 82 us Zellij-like p95, a maximum
-111-byte scheduler backlog, and 93 MiB/s Kitty recomposition throughput.
+bytes, and 4 image bytes per pane). Its PTY-to-render p95 was 404 us and the
+192-frame workload used 144 ms of process CPU. It emitted 157,163 bytes versus
+176,914 bytes for the independently constructed full redraws. The final
+benchmark run measured 67 us tmux-like and 73 us Zellij-like p95, a maximum
+127-byte scheduler backlog, and 161 MiB/s Kitty recomposition throughput.
 
 Run the completion gates with:
 

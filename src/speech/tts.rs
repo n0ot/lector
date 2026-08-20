@@ -66,3 +66,30 @@ impl Driver for TtsDriver {
         Ok(())
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{
+        super::{Driver, worker::BoundedAsyncDriver},
+        TtsDriver,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn native_speech_enqueue_does_not_wait_for_utterance_completion() {
+        let native = TtsDriver::new().expect("create native speech driver");
+        native.tts.set_volume(0.0).expect("mute native speech test");
+        let mut driver = BoundedAsyncDriver::new(native).expect("start native speech worker");
+        let deliberately_long = "Lector native speech remains asynchronous. ".repeat(40);
+
+        let started = Instant::now();
+        Driver::speak(&mut driver, &deliberately_long, true).expect("enqueue native speech");
+        let elapsed = started.elapsed();
+        Driver::stop(&mut driver).expect("stop native speech test");
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "native speak blocked for {elapsed:?} instead of returning after enqueue"
+        );
+    }
+}

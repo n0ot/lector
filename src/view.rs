@@ -43,6 +43,8 @@ pub struct View {
     live_revision: ViewRevision,
     presented_revision: ViewRevision,
     finalized_presented_revision: ViewRevision,
+    live_revision_explicitly_stable: bool,
+    presented_revision_explicitly_stable: bool,
     live_history_revision: u64,
     presented_history_revision: u64,
     shared_live_history: Option<(u64, std::sync::Arc<[crate::terminal::Row]>)>,
@@ -97,6 +99,8 @@ impl View {
             live_revision: ViewRevision(0),
             presented_revision: ViewRevision(0),
             finalized_presented_revision: ViewRevision(0),
+            live_revision_explicitly_stable: false,
+            presented_revision_explicitly_stable: false,
             live_history_revision: 0,
             presented_history_revision: 0,
             shared_live_history: None,
@@ -181,6 +185,7 @@ impl View {
         let synchronized_output_open_snapshot =
             self.engine.take_synchronized_output_open_snapshot();
         let synchronized = update.synchronized_output;
+        let synchronized_output_closed = update.synchronized_output_closed;
         self.application_transaction_open = synchronized;
         let synchronized_transaction_activity =
             was_synchronized || synchronized || update.synchronized_output_opened;
@@ -223,6 +228,7 @@ impl View {
             None
         };
         if self.presentation_tracking {
+            self.live_revision_explicitly_stable = synchronized_output_closed;
             self.advance_live_revision();
             self.unpresented_synchronized_output |= synchronized_transaction_activity;
         }
@@ -409,6 +415,7 @@ impl View {
         self.presented_update = UpdateSummary::default();
         if self.presentation_tracking {
             self.finalized_presented_revision = self.presented_revision;
+            self.presented_revision_explicitly_stable = false;
         }
         self.review_cursor_follow_pending = !frozen && self.review_cursor_screen_transition_pending;
         if self.cached_full_valid {
@@ -510,6 +517,7 @@ impl View {
             snapshot,
             history_revision: self.live_history_revision,
             history,
+            explicitly_stable: self.live_revision_explicitly_stable,
         }
     }
 
@@ -529,6 +537,7 @@ impl View {
             snapshot: self.committed_presentation_snapshot(),
             history_revision: self.presented_history_revision,
             history: None,
+            explicitly_stable: false,
         }
     }
 
@@ -559,6 +568,7 @@ impl View {
             self.presented_history_revision = frame.history_revision;
         }
         self.presented_revision = frame.revision;
+        self.presented_revision_explicitly_stable = frame.explicitly_stable;
         let synchronized_accessibility_diff = self.unpresented_synchronized_output;
         self.install_presented_snapshot(snapshot, caught_up);
         if self.unpresented_synchronized_output {
@@ -598,6 +608,13 @@ impl View {
     /// not yet crossed the speech-diff finalization boundary.
     pub(crate) fn accessibility_has_unfinalized_presentation(&self) -> bool {
         self.presentation_tracking && self.finalized_presented_revision != self.presented_revision
+    }
+
+    /// Whether the exact unfinalized frame which reached the physical terminal
+    /// ended at an application-declared atomic commit boundary.
+    pub(crate) fn accessibility_presentation_explicitly_stable(&self) -> bool {
+        self.accessibility_has_unfinalized_presentation()
+            && self.presented_revision_explicitly_stable
     }
 
     /// Returns the live viewport from the last committed application frame.
@@ -1961,6 +1978,7 @@ mod tests {
 
         view.process_changes(b"\r\x1b[2Kcommitted\x1b[?2026l");
         let closed = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(closed.explicitly_stable);
         assert!(!view.application_transaction_open());
         assert!(view.accessibility_awaiting_presentation());
         assert_eq!(view.line(0), "old");
@@ -1968,6 +1986,20 @@ mod tests {
         assert!(view.apply_presented_frame(closed));
         assert_eq!(view.line(0), "committed");
         assert!(!view.accessibility_awaiting_presentation());
+        assert!(view.accessibility_presentation_explicitly_stable());
+    }
+
+    #[test]
+    fn output_after_a_synchronized_close_requires_ordinary_stabilization() {
+        let mut view = View::new(1, 24);
+        view.process_changes(b"old");
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"\x1b[?2026h\rfinal\x1b[?2026l trailing");
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(!frame.explicitly_stable);
+        assert!(view.apply_presented_frame(frame));
+        assert!(!view.accessibility_presentation_explicitly_stable());
     }
 
     #[test]

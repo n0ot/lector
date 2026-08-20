@@ -81,6 +81,7 @@ impl App {
             .view_stack
             .active_mut()
             .handle_input(sr, input, pty_out)?;
+        self.log_latency_stage("input-dispatched", || format!("bytes={}", input.len()));
         self.handle_view_action(sr, action, term_out)
     }
 
@@ -388,11 +389,12 @@ impl App {
             && self
                 .output_scheduler
                 .as_ref()
-                .is_some_and(crate::output_scheduler::OutputScheduler::has_render_work)
+                .is_some_and(crate::output_scheduler::OutputScheduler::has_started_render_work)
         {
-            // A newer authoritative scene supersedes an unstarted render. If
-            // an older render has begun, this full reconstruction follows it
-            // without depending on its predicted shadow.
+            // If an older render has begun, this full reconstruction follows
+            // it without depending on its predicted shadow. An unstarted
+            // render is replaceable and was itself computed from the still
+            // confirmed scene, so it does not invalidate incremental damage.
             self.scene_renderer.invalidate();
             damage = SceneDamage::Full;
         }
@@ -739,5 +741,9 @@ impl App {
 
     pub fn debug_root_terminal_geometry(&mut self) -> crate::terminal::TerminalGeometry {
         self.view_stack.root_mut().model().live_screen().geometry
+    }
+
+    pub fn debug_last_render_strategy(&self) -> crate::presentation::RenderStrategy {
+        self.scene_renderer.last_strategy()
     }
 }

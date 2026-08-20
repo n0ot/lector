@@ -69,7 +69,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
         help="new directory for this trace (default: a timestamped system temp directory)",
     )
     parser.add_argument("--lector", type=Path, help="Lector executable")
-    parser.add_argument("--speech-server", type=Path, help="lector-tts executable")
+    parser.add_argument(
+        "--speech-server",
+        type=Path,
+        help="custom proc speech server executable (default: Lector's native TTS)",
+    )
     return parser.parse_known_args()
 
 
@@ -80,11 +84,6 @@ def main() -> int:
         str(args.lector)
         if args.lector
         else executable("lector", "--lector", script_directory)
-    )
-    speech_server = (
-        str(args.speech_server)
-        if args.speech_server
-        else executable("lector-tts", "--speech-server", script_directory)
     )
     if not lector_args:
         shell = os.environ.get("SHELL")
@@ -105,15 +104,14 @@ def main() -> int:
     lector_log_path = trace_directory / "lector.log"
     speech_log_path = trace_directory / "speech.jsonl"
     metadata_path = trace_directory / "metadata.json"
-    command = [
-        lector,
-        "--speech-driver",
-        "proc",
-        "--speech-server",
-        speech_server,
-        "--log",
-        *lector_args,
-    ]
+    command = [lector, "--log", *lector_args]
+    if args.speech_server:
+        speech_config_path = trace_directory / "speech-config.lua"
+        speech_config_path.write_text(
+            'lector.o.speech = {program = os.getenv("LECTOR_TRACE_SPEECH_SERVER"), args = {}}\n',
+            encoding="utf-8",
+        )
+        command[1:1] = ["--config", str(speech_config_path)]
 
     outer_input = sys.stdin.fileno()
     outer_output = sys.stdout.fileno()
@@ -148,6 +146,8 @@ def main() -> int:
 
     environment = os.environ.copy()
     environment["LECTOR_SPEECH_RPC_LOG"] = str(speech_log_path)
+    if args.speech_server:
+        environment["LECTOR_TRACE_SPEECH_SERVER"] = str(args.speech_server)
     lector_log = lector_log_path.open("wb", buffering=0)
     try:
         child = subprocess.Popen(

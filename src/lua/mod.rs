@@ -1,13 +1,18 @@
 use self::ext::LuaResultExt;
 use crate::screen_reader::ScreenReader;
 use anyhow::{Context as AnyhowContext, anyhow};
-use mlua::{Error, Function, Lua, LuaOptions, Result, StdLib};
+use mlua::{Error, Function, Lua, LuaOptions, Result, StdLib, Value};
 use std::{cell::RefCell, fs::File, io::Read, path::PathBuf, rc::Rc};
 
 mod ext;
 mod meta;
 
-pub fn setup<F>(init_lua_file: PathBuf, screen_reader: &mut ScreenReader, after: F) -> Result<()>
+pub fn setup<F>(
+    init_lua_file: PathBuf,
+    load_init_file: bool,
+    screen_reader: &mut ScreenReader,
+    after: F,
+) -> Result<()>
 where
     F: FnOnce(&mut ScreenReader) -> anyhow::Result<()>,
 {
@@ -20,15 +25,13 @@ where
     install_api_static(&lua, Rc::clone(&sr_ptr))?;
     meta::setup_static(&lua, Rc::clone(&sr_ptr))?;
 
-    if init_lua_file.is_file() {
-        load_file(&lua, &init_lua_file)?.call::<()>(())?;
-    }
-
-    if let Some(path) = init_lua_file.to_str() {
-        screen_reader
-            .hook_on_startup(path)
-            .map_err(Error::external)?;
-    }
+    let configuration_result = if load_init_file && init_lua_file.is_file() {
+        load_file(&lua, &init_lua_file).and_then(|function| function.call::<()>(()))
+    } else {
+        Ok(())
+    };
+    screen_reader.finish_lua_configuration();
+    configuration_result?;
 
     let result = after(screen_reader);
     match result {
@@ -74,16 +77,31 @@ fn load_file(lua: &Lua, path: &PathBuf) -> Result<Function> {
 fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
     let tbl_lector = lua.create_table()?;
     let tbl_api = lua.create_table()?;
-    let speak_fn = lua.create_function(move |_, (text, interrupt): (String, bool)| {
+    let speak_fn = lua.create_function({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |_, (text, interrupt): (String, bool)| {
+            let ptr = *sr_ptr.borrow();
+            if ptr.is_null() {
+                return Err(Error::external(anyhow!("screen reader unavailable")));
+            }
+            // Safety: pointer is set by the main thread before any Lua call.
+            let sr = unsafe { &mut *ptr };
+            sr.speak(&text, interrupt).to_lua_result()
+        }
+    })?;
+    let set_speech_fn = lua.create_function_mut(move |_, value: Value| {
         let ptr = *sr_ptr.borrow();
         if ptr.is_null() {
             return Err(Error::external(anyhow!("screen reader unavailable")));
         }
         // Safety: pointer is set by the main thread before any Lua call.
         let sr = unsafe { &mut *ptr };
-        sr.speak(&text, interrupt).to_lua_result()
+        let spec = meta::speech_server_spec_from_lua(value).map_err(Error::external)?;
+        sr.request_speech_reconfiguration(spec);
+        Ok(())
     })?;
     tbl_api.set("speak", speak_fn)?;
+    tbl_api.set("set_speech", set_speech_fn)?;
     tbl_lector.set("api", tbl_api)?;
     lua.globals().set("lector", tbl_lector)?;
     Ok(())
@@ -91,14 +109,15 @@ fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::setup;
+    use super::{setup, setup_repl};
     use crate::{
         keymap::{Binding, InputMode},
         screen_reader::ScreenReader,
-        speech::{self, symbols::Level},
+        speech::{self, SpeechServerSpec, symbols::Level},
         table::{Column, TableModel, TableState},
         view::View,
     };
+    use mlua::Lua;
     use std::{
         cell::RefCell,
         fs,
@@ -125,6 +144,159 @@ mod tests {
         fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    fn screen_reader() -> ScreenReader {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let speech = speech::Speech::new(Box::new(RecordingDriver(output)));
+        ScreenReader::new(speech)
+    }
+
+    fn temporary_lua_file(name: &str, source: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("lector-{name}-{unique}.lua"));
+        fs::write(&path, source).unwrap();
+        path
+    }
+
+    #[test]
+    fn startup_speech_configuration_preserves_exact_arguments() {
+        let mut screen_reader = screen_reader();
+        let path = temporary_lua_file(
+            "speech-config",
+            r#"
+                assert(lector.o.speech == "native")
+                lector.o.speech = {
+                    program = "/path with spaces/speech-server",
+                    args = {"one argument", "'literal quotes'", "$(not a shell)"},
+                }
+                local configured = lector.o.speech
+                assert(configured.program == "/path with spaces/speech-server")
+                assert(#configured.args == 3)
+                assert(configured.args[1] == "one argument")
+                assert(configured.args[2] == "'literal quotes'")
+                assert(configured.args[3] == "$(not a shell)")
+            "#,
+        );
+
+        setup(path.clone(), true, &mut screen_reader, |sr| {
+            assert_eq!(
+                sr.speech_server_spec(),
+                &SpeechServerSpec::Process {
+                    program: "/path with spaces/speech-server".to_string(),
+                    args: vec![
+                        "one argument".to_string(),
+                        "'literal quotes'".to_string(),
+                        "$(not a shell)".to_string(),
+                    ],
+                }
+            );
+            assert_eq!(sr.take_speech_reconfiguration(), None);
+            Ok(())
+        })
+        .unwrap();
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn disabled_configuration_keeps_startup_defaults() {
+        let mut screen_reader = screen_reader();
+        let path = temporary_lua_file(
+            "disabled-config",
+            r#"lector.o.speech = { program = "/must-not-run" }"#,
+        );
+
+        setup(path.clone(), false, &mut screen_reader, |sr| {
+            assert_eq!(sr.speech_server_spec(), &SpeechServerSpec::Native);
+            assert!(!sr.has_on_startup_hook());
+            Ok(())
+        })
+        .unwrap();
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repl_requires_explicit_nonblocking_speech_reconfiguration() {
+        let mut screen_reader = screen_reader();
+        let lua = Lua::new();
+        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
+        setup_repl(&lua, screen_reader_ptr).unwrap();
+
+        lua.load(
+            r#"
+                local assigned, message = pcall(function()
+                    lector.o.speech = {program = "/ignored"}
+                end)
+                assert(assigned == false)
+                assert(string.find(tostring(message), "startup%-only") ~= nil)
+                assert(lector.o.speech == "native")
+
+                lector.api.set_speech({program = "/first", args = {"first arg"}})
+                lector.api.set_speech({program = "/second", args = {"second arg"}})
+                -- A request is transactional: the getter reports the active
+                -- server until the core commits a successful replacement.
+                assert(lector.o.speech == "native")
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        let requested = screen_reader.take_speech_reconfiguration().unwrap();
+        assert_eq!(
+            requested,
+            SpeechServerSpec::Process {
+                program: "/second".to_string(),
+                args: vec!["second arg".to_string()],
+            }
+        );
+        screen_reader.commit_speech_reconfiguration(requested);
+        lua.load(
+            r#"
+                local active = lector.o.speech
+                assert(active.program == "/second")
+                assert(#active.args == 1 and active.args[1] == "second arg")
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn speech_server_specs_are_strictly_validated_before_queueing() {
+        let mut screen_reader = screen_reader();
+        let lua = Lua::new();
+        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
+        setup_repl(&lua, screen_reader_ptr).unwrap();
+
+        lua.load(
+            r#"
+                local invalid = {
+                    "not-native",
+                    {},
+                    {program = ""},
+                    {program = 42},
+                    {program = "/server", unknown = true},
+                    {program = "/server", args = "--not-an-array"},
+                    {program = "/server", args = {[2] = "gap"}},
+                    {program = "/server", args = {"valid", 42}},
+                    {program = "/server", args = {named = "value"}},
+                    {program = "bad\0program"},
+                    {program = "/server", args = {"bad\0arg"}},
+                }
+                for _, spec in ipairs(invalid) do
+                    assert(pcall(lector.api.set_speech, spec) == false)
+                end
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        assert_eq!(screen_reader.take_speech_reconfiguration(), None);
     }
 
     #[test]
@@ -187,7 +359,13 @@ mod tests {
         )
         .unwrap();
 
-        setup(path.clone(), &mut screen_reader, |sr| {
+        setup(path.clone(), true, &mut screen_reader, |sr| {
+            assert!(sr.has_on_startup_hook());
+            assert!(
+                !sr.help_mode(),
+                "on_startup must wait for the application's ready boundary"
+            );
+            sr.hook_on_startup(path.to_str().unwrap())?;
             assert!(sr.help_mode());
             assert!(!sr.auto_read_enabled());
             assert!(sr.suppress_key_echo());

@@ -168,6 +168,7 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.log_bytes("pty output from source", buf);
+        self.log_latency_stage("source-output-read", || format!("bytes={}", buf.len()));
         let events = self.tmux_gateway.push(buf)?;
         self.sync_root_tmux_termination_deadline();
         for event in events {
@@ -3100,6 +3101,12 @@ impl App {
         if presentation_tracking && !self.active_presentation_finalization_pending() {
             return Ok(false);
         }
+        // A synchronized-output close is an application-declared commit. The
+        // flag is carried by the exact presentation frame and only becomes
+        // visible here after the scheduler's physical flush receipt, so this
+        // fast path cannot observe a Neovim draw in progress.
+        let explicitly_stable =
+            presentation_tracking && self.active_presentation_explicitly_stable();
         let tmux_base_active = self
             .view_stack
             .active_tmux_connection_mut()
@@ -3117,10 +3124,14 @@ impl App {
         if accessibility_blocked {
             return Ok(false);
         }
-        if now_ms.saturating_sub(lpu) >= DIFF_DELAY as u128
+        if explicitly_stable
+            || now_ms.saturating_sub(lpu) >= DIFF_DELAY as u128
             || now_ms.saturating_sub(first_pty_update) >= MAX_DIFF_DELAY as u128
         {
             self.log_event("finalizing terminal changes");
+            self.log_latency_stage("accessibility-finalization-start", || {
+                format!("explicitly_stable={explicitly_stable}")
+            });
             let recent_input = self
                 .last_stdin_update
                 .is_some_and(|lsu| now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128);
@@ -3187,6 +3198,7 @@ impl App {
                 self.last_pty_update = None;
             }
             self.log_event("finished finalizing terminal changes");
+            self.log_latency_stage("accessibility-finalized", String::new);
             return Ok(true);
         }
         Ok(false)

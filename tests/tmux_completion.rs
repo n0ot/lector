@@ -617,22 +617,21 @@ fn scheduled_active_tmux_pane_finalization_wakes_once_without_spinning() {
     .expect("queue active-pane output");
     assert_eq!(
         app.scheduled_output_timeout(),
-        Some(Duration::from_millis(4)),
-        "the render deadline must wake the loop before accessibility can run"
+        Some(Duration::ZERO),
+        "the render must wake the loop immediately before accessibility can run"
     );
     assert!(
         !app.maybe_finalize_changes(&mut sr).unwrap(),
         "unpresented pane output reached accessibility"
     );
 
-    clock.advance(4);
     let report = app
         .drain_scheduled_output(&mut physical, false)
         .expect("present active-pane output at its render deadline");
     assert_eq!(report.completed_renders.len(), 1);
 
     let stabilization_ms = u128::from(lector::app::DIFF_DELAY);
-    let remaining_ms = stabilization_ms.saturating_sub(4);
+    let remaining_ms = stabilization_ms;
     assert_eq!(
         app.scheduled_output_timeout(),
         Some(Duration::from_millis(

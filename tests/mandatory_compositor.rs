@@ -297,7 +297,7 @@ impl FocusReportingGhosttyHost {
 }
 
 #[test]
-fn shutdown_fence_consumes_focus_reply_generated_by_the_final_eof_render() {
+fn shutdown_fence_follows_final_eof_render_without_redundant_focus_reenable() {
     let mut harness = Harness::new_scheduled(4, 40).expect("live harness");
     let mut ghostty = FocusReportingGhosttyHost::default();
     harness.configure_physical_terminal(Some(false));
@@ -334,8 +334,9 @@ fn shutdown_fence_consumes_focus_reply_generated_by_the_final_eof_render() {
     }
     assert_eq!(harness.application_input(), b"x");
 
-    // Two unpresented updates make the final authoritative render a full
-    // fallback. The live loop force-drains this render after observing EOF.
+    // Two unpresented updates replace one another against the same confirmed
+    // physical shadow. The live loop force-drains the newest render after EOF
+    // without treating the unstarted predecessor as terminal uncertainty.
     harness
         .handle_pty_output(b"\r\nfirst exit frame")
         .expect("queue first final frame");
@@ -348,9 +349,9 @@ fn shutdown_fence_consumes_focus_reply_generated_by_the_final_eof_render() {
         .expect("drain final EOF render");
 
     let escaped_reply = ghostty.replies_to_new_output(harness.terminal_output());
-    assert_eq!(
-        escaped_reply, b"\x1b[I",
-        "the final full render should reproduce Ghostty's late focus reply"
+    assert!(
+        escaped_reply.is_empty(),
+        "an unstarted replacement must not force a redundant focus-mode enable"
     );
 
     // Orderly cleanup keeps the alternate screen active, places DA1 after all
@@ -373,7 +374,7 @@ fn shutdown_fence_consumes_focus_reply_generated_by_the_final_eof_render() {
     }
     assert!(
         fence.is_matched(),
-        "DA1 must follow and drain the late focus reply"
+        "DA1 must fence every earlier reply-generating transaction"
     );
 
     harness
