@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+zig_target=${LECTOR_ZIG_CC_TARGET:-}
+
+case "$zig_target" in
+    aarch64-linux-musl|x86_64-linux-musl) ;;
+    *)
+        echo "LECTOR_ZIG_CC_TARGET must select a supported MUSL target" >&2
+        exit 2
+        ;;
+esac
+
+zig_bin=$("$repo_dir/scripts/bootstrap_zig.sh")
+linker_args=()
+while (($# > 0)); do
+    case "$1" in
+        # rustc's ld.lld flavor dispatches rust-lld with this pair. Zig's
+        # explicit ld.lld subcommand has already selected the GNU flavor.
+        -flavor)
+            shift
+            if (($# > 0)); then
+                shift
+            fi
+            ;;
+        *)
+            linker_args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+target_args=()
+if [[ "$zig_target" == aarch64-linux-musl ]]; then
+    # Zig's C driver rejects this lld option, so preserve the target's
+    # erratum mitigation through the direct linker interface.
+    target_args+=(--fix-cortex-a53-843419)
+fi
+
+exec "$zig_bin" ld.lld "${linker_args[@]}" -pie "${target_args[@]}"

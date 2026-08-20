@@ -120,7 +120,14 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(static_wrapper.contains("target-feature=+crt-static"));
     assert!(static_wrapper.contains("relocation-model=pic"));
     assert!(static_wrapper.contains("static-pie-cc"));
+    assert!(static_wrapper.contains("zig-lld"));
+    assert!(static_wrapper.contains("linker-flavor=ld.lld"));
     assert!(static_wrapper.contains("is_test"));
+
+    let zig_lld = include_str!("../scripts/zig-lld");
+    assert!(zig_lld.contains("ld.lld"));
+    assert!(zig_lld.contains("--fix-cortex-a53-843419"));
+    assert!(zig_lld.contains("-pie"));
 
     let static_linker = include_str!("../scripts/static-pie-cc");
     assert!(static_linker.contains("-static|-no-pie|-pie|-static-pie"));

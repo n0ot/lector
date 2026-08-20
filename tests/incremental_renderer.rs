@@ -162,11 +162,11 @@ fn multi_pane_damage_preserves_each_surface_region() {
         right_engine.normalized_snapshot(),
     );
     let left_update = UpdateSummary {
-        damage: TerminalDamage::Rows(vec![0..=0]),
+        damage: TerminalDamage::Rows(std::iter::once(0..=0).collect()),
         ..UpdateSummary::default()
     };
     let right_update = UpdateSummary {
-        damage: TerminalDamage::Rows(vec![1..=1]),
+        damage: TerminalDamage::Rows(std::iter::once(1..=1).collect()),
         ..UpdateSummary::default()
     };
 

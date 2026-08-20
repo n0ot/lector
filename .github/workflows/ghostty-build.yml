@@ -61,8 +61,6 @@ jobs:
     env:
       CC_aarch64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-cc
       CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-cc
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ github.workspace }}/scripts/zig-cc
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: ${{ github.workspace }}/scripts/zig-cc
       LECTOR_ZIG_CC_TARGET: ${{ matrix.zig_target }}
     strategy:
       fail-fast: false
