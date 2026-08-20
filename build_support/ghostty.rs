@@ -1,5 +1,6 @@
 pub const ADAPTER_VERSION: &str = "0.1.0";
 pub const GHOSTTY_COMMIT: &str = "43fe699071c7dceb161dc3b0c04fce46ade36174";
+pub const GHOSTTY_APP_VERSION: &str = "1.3.2-dev";
 pub const REQUIRED_ZIG_VERSION: &str = "0.16.0";
 pub const GHOSTTY_ARCHIVE_SHA256: &str =
     "fbff942fc10b4d0a9de146e805922ef2b763226813fc449fdbb22c9ac7dd0f4a";

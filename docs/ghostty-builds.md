@@ -308,11 +308,13 @@ GHOSTTY_PREBUILT_ROOT=/opt/lector/ghostty-prebuilt \
 Each profile directory must contain `static-lib/libghostty-vt.a` and the
 `lector-ghostty-build.txt` metadata written by the bootstrap. The adapter build
 script rejects or rebuilds missing and mismatched commit, Zig, target,
-optimization, headless-runtime, Kitty-graphics, C-header ABI, ABI-probe hash,
-or archive checksum state. Copying an unverified system library into place is
-unsupported. The dedicated `static-lib` directory prevents an identically
-named shared library emitted by Ghostty's install step from being selected by
-a platform linker.
+Ghostty app-version, optimization, headless-runtime, Kitty-graphics, C-header
+ABI, ABI-probe hash, or archive checksum state. Copying an unverified system
+library into place is unsupported. The explicit Ghostty app-version also keeps
+the enclosing Lector repository's branch or release tag from affecting the
+vendored source build. The dedicated `static-lib` directory prevents an
+identically named shared library emitted by Ghostty's install step from being
+selected by a platform linker.
 
 Release builders use the same pinned source and exact Zig version. Released
 Lector binaries do not require Zig, the Ghostty application, or a shared

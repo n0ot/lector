@@ -3,6 +3,7 @@ set -euo pipefail
 
 GHOSTTY_COMMIT=43fe699071c7dceb161dc3b0c04fce46ade36174
 GHOSTTY_ARCHIVE_SHA256=fbff942fc10b4d0a9de146e805922ef2b763226813fc449fdbb22c9ac7dd0f4a
+GHOSTTY_APP_VERSION=1.3.2-dev
 REQUIRED_ZIG_VERSION=0.16.0
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -107,6 +108,7 @@ metadata_has() {
 
 if [[ -s "$static_archive" && -f "$metadata_path" ]] &&
     metadata_has "ghostty_commit=$GHOSTTY_COMMIT" &&
+    metadata_has "ghostty_app_version=$GHOSTTY_APP_VERSION" &&
     metadata_has "zig_version=$REQUIRED_ZIG_VERSION" &&
     metadata_has "target=$target" &&
     metadata_has "optimize=$optimize" &&
@@ -168,10 +170,13 @@ fi
 mkdir -p "$prefix"
 (
     cd "$source_dir"
+    # The archive has no .git boundary, so pin Ghostty's version instead of
+    # allowing its build to interpret an enclosing Lector tag as its own.
     ZIG_GLOBAL_CACHE_DIR="$global_cache_dir" "$zig_bin" build \
         -Demit-lib-vt=true \
         -Demit-xcframework=false \
         -Dapp-runtime=none \
+        -Dversion-string="$GHOSTTY_APP_VERSION" \
         -Dtarget="$zig_target" \
         -Doptimize="$optimize" \
         --prefix "$prefix" \
@@ -205,6 +210,7 @@ archive_sha=$(sha256 "$archive_path")
 metadata_tmp="$metadata_path.tmp.$$"
 {
     printf 'ghostty_commit=%s\n' "$GHOSTTY_COMMIT"
+    printf 'ghostty_app_version=%s\n' "$GHOSTTY_APP_VERSION"
     printf 'zig_version=%s\n' "$REQUIRED_ZIG_VERSION"
     printf 'target=%s\n' "$target"
     printf 'optimize=%s\n' "$optimize"

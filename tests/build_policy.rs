@@ -12,6 +12,7 @@ fn ghostty_dependency_and_source_revisions_are_exactly_pinned() {
         ghostty::GHOSTTY_ARCHIVE_SHA256,
         "fbff942fc10b4d0a9de146e805922ef2b763226813fc449fdbb22c9ac7dd0f4a"
     );
+    assert_eq!(ghostty::GHOSTTY_APP_VERSION, "1.3.2-dev");
 
     let manifest = include_str!("../Cargo.toml");
     assert!(manifest.contains("default = [\"ghostty-vt\"]"));
@@ -87,6 +88,8 @@ fn cargo_build_automatically_bootstraps_and_validates_the_native_cache() {
     let bootstrap = include_str!("../scripts/bootstrap_ghostty.sh");
     assert!(bootstrap.contains(ghostty::GHOSTTY_COMMIT));
     assert!(bootstrap.contains(ghostty::GHOSTTY_ARCHIVE_SHA256));
+    assert!(bootstrap.contains(ghostty::GHOSTTY_APP_VERSION));
+    assert!(bootstrap.contains("-Dversion-string=\"$GHOSTTY_APP_VERSION\""));
     assert!(bootstrap.contains("shasum -a 256"));
     assert!(bootstrap.contains("build_info_probe.c"));
     assert!(bootstrap.contains("static_lib_dir=\"$prefix/static-lib\""));
@@ -100,6 +103,8 @@ fn cargo_build_automatically_bootstraps_and_validates_the_native_cache() {
         include_str!("../crates/lector-ghostty/bootstrap/bootstrap_ghostty.sh");
     assert!(packaged_bootstrap.contains(ghostty::GHOSTTY_COMMIT));
     assert!(packaged_bootstrap.contains(ghostty::GHOSTTY_ARCHIVE_SHA256));
+    assert!(packaged_bootstrap.contains(ghostty::GHOSTTY_APP_VERSION));
+    assert!(packaged_bootstrap.contains("-Dversion-string=\"$GHOSTTY_APP_VERSION\""));
     assert!(packaged_bootstrap.contains("$crate_dir/abi/build_info_probe.c"));
     assert!(packaged_bootstrap.contains("$bootstrap_dir/bootstrap_zig.sh"));
 }

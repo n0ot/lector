@@ -5,6 +5,7 @@ use std::{
 };
 
 const GHOSTTY_COMMIT: &str = "43fe699071c7dceb161dc3b0c04fce46ade36174";
+const GHOSTTY_APP_VERSION: &str = "1.3.2-dev";
 const REQUIRED_ZIG_VERSION: &str = "0.16.0";
 
 fn main() {
@@ -158,6 +159,7 @@ fn static_library_name(target: &str) -> &'static str {
 fn validate_metadata(metadata: &str, target: &str, optimize: &str) -> Result<(), String> {
     let expected = [
         ("ghostty_commit", GHOSTTY_COMMIT),
+        ("ghostty_app_version", GHOSTTY_APP_VERSION),
         ("zig_version", REQUIRED_ZIG_VERSION),
         ("target", target),
         ("optimize", optimize),
