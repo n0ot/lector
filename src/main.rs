@@ -18,6 +18,7 @@ use signal_hook_mio::v1_0::Signals;
 use std::{
     io::{ErrorKind, Read, Write},
     os::fd::{AsFd, AsRawFd, RawFd},
+    path::{Path, PathBuf},
     sync::Arc,
     thread, time,
 };
@@ -747,16 +748,66 @@ const fn setup_failure_action(event_loop_started: bool) -> SetupFailureAction {
 }
 
 fn requested_config_path(
-    cli_config: Option<std::path::PathBuf>,
+    cli_config: Option<PathBuf>,
     no_config: bool,
     environment_config: Option<std::ffi::OsString>,
-) -> Option<std::path::PathBuf> {
+) -> Option<PathBuf> {
     cli_config.or_else(|| {
         (!no_config)
             .then_some(environment_config)
             .flatten()
-            .map(std::path::PathBuf::from)
+            .map(PathBuf::from)
     })
+}
+
+fn resolved_default_config_path(
+    xdg_config_home: Option<std::ffi::OsString>,
+    platform_config_home: Option<PathBuf>,
+    legacy_config_file: Option<PathBuf>,
+    is_file: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    // The XDG Base Directory specification requires absolute paths. Empty or
+    // relative values are invalid and therefore behave as though the variable
+    // were unset.
+    let xdg_config_home = xdg_config_home
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty() && path.is_absolute());
+    let has_explicit_xdg_home = xdg_config_home.is_some();
+    let config_home = xdg_config_home.or(platform_config_home)?;
+    let preferred = config_home.join("lector/init.lua");
+
+    // Existing macOS installations used Application Support. Keep that file
+    // working until the user creates the new XDG config, but never escape an
+    // explicitly selected XDG_CONFIG_HOME.
+    if !has_explicit_xdg_home
+        && !is_file(&preferred)
+        && let Some(legacy) = legacy_config_file
+        && is_file(&legacy)
+    {
+        return Some(legacy);
+    }
+
+    Some(preferred)
+}
+
+fn default_config_path() -> Result<PathBuf> {
+    #[cfg(unix)]
+    let platform_config_home = dirs::home_dir().map(|path| path.join(".config"));
+    #[cfg(not(unix))]
+    let platform_config_home = dirs::config_dir();
+
+    #[cfg(target_os = "macos")]
+    let legacy_config_file = dirs::config_dir().map(|path| path.join("lector/init.lua"));
+    #[cfg(not(target_os = "macos"))]
+    let legacy_config_file = None;
+
+    resolved_default_config_path(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        platform_config_home,
+        legacy_config_file,
+        Path::is_file,
+    )
+    .ok_or_else(|| anyhow!("cannot get config directory"))
 }
 
 #[cfg(test)]
@@ -767,8 +818,9 @@ mod tests {
         SetupFailureAction, ShutdownFenceBroker, ShutdownFenceOutcome, TerminalSignalAction,
         drain_available_input, drain_available_pty, drain_shutdown_fence_input,
         emergency_terminal_cleanup_bytes, parse_focus_mode_report, requested_config_path,
-        separate_focus_mode_report_input, setup_failure_action, startup_deadline_poll_timeout,
-        stdout_retry_poll_timeout, terminal_signal_action, wait_for_shutdown_fence,
+        resolved_default_config_path, separate_focus_mode_report_input, setup_failure_action,
+        startup_deadline_poll_timeout, stdout_retry_poll_timeout, terminal_signal_action,
+        wait_for_shutdown_fence,
     };
     use clap::{CommandFactory, Parser};
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -777,6 +829,7 @@ mod tests {
         collections::VecDeque,
         io::{self, Read, Write},
         os::fd::AsRawFd,
+        path::PathBuf,
         thread,
         time::{Duration, Instant},
     };
@@ -1115,6 +1168,94 @@ mod tests {
     }
 
     #[test]
+    fn absolute_xdg_config_home_selects_lector_init_without_legacy_fallback() {
+        let legacy = PathBuf::from("/Users/test/Library/Application Support/lector/init.lua");
+        let xdg_home = std::env::current_dir()
+            .expect("get current directory")
+            .join("test-xdg-config");
+        let selected = resolved_default_config_path(
+            Some(xdg_home.clone().into_os_string()),
+            Some(PathBuf::from("/Users/test/.config")),
+            Some(legacy.clone()),
+            |path| path == legacy,
+        );
+
+        assert_eq!(selected, Some(xdg_home.join("lector/init.lua")));
+    }
+
+    #[test]
+    fn platform_default_prefers_xdg_location_then_falls_back_to_legacy_file() {
+        let preferred = PathBuf::from("/Users/test/.config/lector/init.lua");
+        let legacy = PathBuf::from("/Users/test/Library/Application Support/lector/init.lua");
+
+        assert_eq!(
+            resolved_default_config_path(
+                None,
+                Some(PathBuf::from("/Users/test/.config")),
+                Some(legacy.clone()),
+                |path| path == preferred,
+            ),
+            Some(preferred.clone())
+        );
+        assert_eq!(
+            resolved_default_config_path(
+                None,
+                Some(PathBuf::from("/Users/test/.config")),
+                Some(legacy.clone()),
+                |path| path == legacy,
+            ),
+            Some(legacy)
+        );
+        assert_eq!(
+            resolved_default_config_path(
+                None,
+                Some(PathBuf::from("/Users/test/.config")),
+                None,
+                |_| false,
+            ),
+            Some(preferred)
+        );
+    }
+
+    #[test]
+    fn empty_and_relative_xdg_values_are_ignored() {
+        let platform_home = Some(PathBuf::from("/Users/test/.config"));
+        let expected = Some(PathBuf::from("/Users/test/.config/lector/init.lua"));
+
+        for invalid in ["", "relative/config"] {
+            assert_eq!(
+                resolved_default_config_path(
+                    Some(invalid.into()),
+                    platform_home.clone(),
+                    None,
+                    |_| false,
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn absolute_xdg_config_home_does_not_require_a_platform_home() {
+        let xdg_home = std::env::current_dir()
+            .expect("get current directory")
+            .join("test-xdg-config");
+        assert_eq!(
+            resolved_default_config_path(
+                Some(xdg_home.clone().into_os_string()),
+                None,
+                None,
+                |_| false,
+            ),
+            Some(xdg_home.join("lector/init.lua"))
+        );
+        assert_eq!(
+            resolved_default_config_path(None, None, None, |_| false),
+            None
+        );
+    }
+
+    #[test]
     fn obsolete_public_speech_process_flags_are_rejected() {
         for arguments in [
             ["lector", "--shell", "/bin/sh", "--speech-driver", "proc"],
@@ -1393,7 +1534,7 @@ struct Cli {
     shell: Option<std::path::PathBuf>,
     /// Load Lua configuration from this file
     #[clap(long, conflicts_with = "no_config")]
-    config: Option<std::path::PathBuf>,
+    config: Option<PathBuf>,
     /// Start with defaults instead of loading Lua configuration
     #[clap(long, conflicts_with = "config")]
     no_config: bool,
@@ -1439,14 +1580,8 @@ fn main() -> Result<()> {
     let required_config = configured_path.is_some();
     let conf_file = match configured_path {
         Some(path) => path,
-        None if cli.no_config => std::path::PathBuf::new(),
-        None => {
-            let mut path =
-                dirs::config_dir().ok_or_else(|| anyhow!("cannot get config directory"))?;
-            path.push("lector");
-            path.push("init.lua");
-            path
-        }
+        None if cli.no_config => PathBuf::new(),
+        None => default_config_path()?,
     };
     if required_config && !conf_file.is_file() {
         anyhow::bail!("configuration file does not exist: {}", conf_file.display());

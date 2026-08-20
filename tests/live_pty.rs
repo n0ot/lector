@@ -3,6 +3,7 @@
 use lector_ghostty::{Terminal, TerminalColorScheme, TerminalProfile};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
+    ffi::OsString,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -84,6 +85,13 @@ enum StartupConfiguration {
     },
     NoConfig {
         config: PathBuf,
+        marker: PathBuf,
+    },
+    ResolvedConfig {
+        cli_config: Option<PathBuf>,
+        environment_config: Option<PathBuf>,
+        xdg_config_home: Option<OsString>,
+        home: PathBuf,
         marker: PathBuf,
     },
 }
@@ -182,6 +190,29 @@ impl LiveLector {
         )
     }
 
+    fn spawn_with_resolved_config(
+        shell: &Path,
+        cli_config: Option<PathBuf>,
+        environment_config: Option<PathBuf>,
+        xdg_config_home: Option<OsString>,
+        home: PathBuf,
+        marker: PathBuf,
+    ) -> Self {
+        Self::spawn_at_size_under_parent(
+            shell,
+            false,
+            STANDARD_TERMINAL,
+            false,
+            StartupConfiguration::ResolvedConfig {
+                cli_config,
+                environment_config,
+                xdg_config_home,
+                home,
+                marker,
+            },
+        )
+    }
+
     fn spawn_with_fatal_speech(shell: &Path, config: &Path, state: &Path) -> Self {
         Self::spawn_at_size_under_parent(
             shell,
@@ -239,6 +270,11 @@ impl LiveLector {
                 StartupConfiguration::NoConfig { .. } => {
                     command.arg("--no-config");
                 }
+                StartupConfiguration::ResolvedConfig { cli_config, .. } => {
+                    if let Some(config) = cli_config {
+                        command.args(["--config", config.to_str().expect("UTF-8 fixture path")]);
+                    }
+                }
             }
             command
         };
@@ -294,6 +330,25 @@ impl LiveLector {
             StartupConfiguration::NoConfig { config, marker } => {
                 command.env("LECTOR_CONFIG", config);
                 command.env("LECTOR_NO_CONFIG_MARKER", marker);
+            }
+            StartupConfiguration::ResolvedConfig {
+                environment_config,
+                xdg_config_home,
+                home,
+                marker,
+                ..
+            } => {
+                command.env_remove("LECTOR_CONFIG");
+                command.env_remove("XDG_CONFIG_HOME");
+                command.env("HOME", home);
+                command.env("LECTOR_CONFIG_TEST_MARKER", marker);
+                command.env("LECTOR_SPEECH_TEST_MUTE", "1");
+                if let Some(config) = environment_config {
+                    command.env("LECTOR_CONFIG", config);
+                }
+                if let Some(config_home) = xdg_config_home {
+                    command.env("XDG_CONFIG_HOME", config_home);
+                }
             }
             StartupConfiguration::ProcessFixture | StartupConfiguration::Native => {}
         }
@@ -566,6 +621,63 @@ impl Drop for LiveLector {
 
 fn fixture(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+fn write_config_resolution_fixture(path: &Path, identity: &str) {
+    fs::create_dir_all(path.parent().expect("config fixture parent"))
+        .expect("create config fixture directory");
+    fs::write(
+        path,
+        format!(
+            r#"
+                local marker = assert(io.open(os.getenv("LECTOR_CONFIG_TEST_MARKER"), "w"))
+                marker:write({identity:?})
+                marker:close()
+                lector.o.speech = {{
+                    program = assert(os.getenv("LECTOR_TEST_SPEECH_SERVER")),
+                    args = {{}},
+                }}
+            "#
+        ),
+    )
+    .expect("write config resolution fixture");
+}
+
+fn assert_resolved_config(
+    artifact_dir: &Path,
+    case: &str,
+    cli_config: Option<PathBuf>,
+    environment_config: Option<PathBuf>,
+    xdg_config_home: Option<OsString>,
+    home: PathBuf,
+    expected: &str,
+) {
+    let marker = artifact_dir.join(format!("{case}.loaded"));
+    let mut lector = LiveLector::spawn_with_resolved_config(
+        &fixture("tests/fixtures/pty/latency-child"),
+        cli_config,
+        environment_config,
+        xdg_config_home,
+        home,
+        marker.clone(),
+    );
+    assert!(
+        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+            physical_screen_contains(terminal, LATENCY_READY)
+        }),
+        "{case}: Lector did not reach the child terminal; output={:?}",
+        String::from_utf8_lossy(&lector.output)
+    );
+    assert_eq!(
+        fs::read_to_string(&marker).expect("selected config wrote its marker"),
+        expected,
+        "{case}: wrong init.lua was loaded"
+    );
+    lector.send(b"q");
+    assert!(
+        lector.finish(Duration::from_secs(3)),
+        "{case}: Lector did not exit"
+    );
 }
 
 fn assert_bell_lifecycle(mut lector: LiveLector, case: &str) {
@@ -997,6 +1109,148 @@ fn a_second_speech_crash_wakes_and_terminates_the_live_main_loop() {
 
     drop(lector);
     fs::remove_file(&state).expect("remove speech lifecycle state");
+}
+
+#[test]
+fn startup_config_resolution_honors_cli_environment_xdg_and_macos_legacy_order() {
+    let _serial = serialize_live_pty_test();
+    let unique = format!(
+        "config-resolution-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    );
+    let artifact_dir = fixture("target/test-artifacts/live-pty").join(&unique);
+    fs::create_dir_all(&artifact_dir).expect("create config resolution artifact directory");
+
+    let cli_home = artifact_dir.join("cli/home");
+    let cli_xdg = artifact_dir.join("cli/xdg");
+    let cli_config = artifact_dir.join("cli/explicit.lua");
+    let environment_config = artifact_dir.join("cli/environment.lua");
+    write_config_resolution_fixture(&cli_home.join(".config/lector/init.lua"), "home-default");
+    write_config_resolution_fixture(&cli_xdg.join("lector/init.lua"), "xdg");
+    write_config_resolution_fixture(&environment_config, "environment");
+    write_config_resolution_fixture(&cli_config, "cli");
+    assert_resolved_config(
+        &artifact_dir,
+        "cli-precedence",
+        Some(cli_config),
+        Some(environment_config),
+        Some(cli_xdg.into_os_string()),
+        cli_home,
+        "cli",
+    );
+
+    let environment_home = artifact_dir.join("environment/home");
+    let environment_xdg = artifact_dir.join("environment/xdg");
+    let environment_config = artifact_dir.join("environment/selected.lua");
+    write_config_resolution_fixture(
+        &environment_home.join(".config/lector/init.lua"),
+        "home-default",
+    );
+    write_config_resolution_fixture(&environment_xdg.join("lector/init.lua"), "xdg");
+    write_config_resolution_fixture(&environment_config, "environment");
+    assert_resolved_config(
+        &artifact_dir,
+        "environment-precedence",
+        None,
+        Some(environment_config),
+        Some(environment_xdg.into_os_string()),
+        environment_home,
+        "environment",
+    );
+
+    let xdg_home = artifact_dir.join("xdg/home");
+    let explicit_xdg = artifact_dir.join("xdg/selected");
+    write_config_resolution_fixture(&xdg_home.join(".config/lector/init.lua"), "home-default");
+    write_config_resolution_fixture(
+        &xdg_home.join("Library/Application Support/lector/init.lua"),
+        "legacy",
+    );
+    write_config_resolution_fixture(&explicit_xdg.join("lector/init.lua"), "xdg");
+    assert_resolved_config(
+        &artifact_dir,
+        "absolute-xdg",
+        None,
+        None,
+        Some(explicit_xdg.into_os_string()),
+        xdg_home,
+        "xdg",
+    );
+
+    for (case, xdg_config_home) in [("unset-xdg", None), ("empty-xdg", Some(OsString::new()))] {
+        let home = artifact_dir.join(case).join("home");
+        write_config_resolution_fixture(&home.join(".config/lector/init.lua"), "home-default");
+        assert_resolved_config(
+            &artifact_dir,
+            case,
+            None,
+            None,
+            xdg_config_home,
+            home,
+            "home-default",
+        );
+    }
+
+    let relative_home = artifact_dir.join("relative-xdg/home");
+    let relative_xdg = artifact_dir.join("relative-xdg/candidate");
+    let relative_xdg_value = relative_xdg
+        .strip_prefix(fixture(""))
+        .expect("artifact below repository root")
+        .as_os_str()
+        .to_owned();
+    write_config_resolution_fixture(
+        &relative_home.join(".config/lector/init.lua"),
+        "home-default",
+    );
+    write_config_resolution_fixture(&relative_xdg.join("lector/init.lua"), "relative-xdg");
+    assert_resolved_config(
+        &artifact_dir,
+        "relative-xdg",
+        None,
+        None,
+        Some(relative_xdg_value),
+        relative_home,
+        "home-default",
+    );
+
+    let legacy_home = artifact_dir.join("legacy/home");
+    write_config_resolution_fixture(
+        &legacy_home.join("Library/Application Support/lector/init.lua"),
+        "legacy",
+    );
+    assert_resolved_config(
+        &artifact_dir,
+        "legacy-fallback",
+        None,
+        None,
+        None,
+        legacy_home,
+        "legacy",
+    );
+
+    let preferred_home = artifact_dir.join("preferred/home");
+    write_config_resolution_fixture(
+        &preferred_home.join(".config/lector/init.lua"),
+        "home-default",
+    );
+    write_config_resolution_fixture(
+        &preferred_home.join("Library/Application Support/lector/init.lua"),
+        "legacy",
+    );
+    assert_resolved_config(
+        &artifact_dir,
+        "preferred-before-legacy",
+        None,
+        None,
+        None,
+        preferred_home,
+        "home-default",
+    );
+
+    fs::remove_dir_all(&artifact_dir).expect("remove config resolution artifacts");
 }
 
 #[test]

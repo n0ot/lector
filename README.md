@@ -391,14 +391,30 @@ Lector keeps multiple clipboard entries (not just one). You can cycle back and f
 
 ## Configuration (Lua)
 
-Lector reads a config file on startup:
+On Unix, Lector reads `$XDG_CONFIG_HOME/lector/init.lua` on startup, with the
+configuration root defaulting to `$HOME/.config`. `XDG_CONFIG_HOME` must be an
+absolute path, as required by the
+[XDG Base Directory specification](https://specifications.freedesktop.org/basedir/latest/);
+an unset, empty, or relative value uses `$HOME/.config`. On other platforms,
+an absolute `XDG_CONFIG_HOME` is also honored; otherwise Lector uses the
+platform-native configuration directory.
 
-- Linux: `~/.config/lector/init.lua`
-- macOS: `~/Library/Application Support/lector/init.lua`
+Configuration is selected in this order:
 
-Use `--config PATH` (or `LECTOR_CONFIG`) to load a different file. Use
-`--no-config` to skip Lua configuration and start with defaults, including
-native speech; the two options are mutually exclusive.
+1. The file passed to `--config PATH`.
+2. The file named by `LECTOR_CONFIG`.
+3. The XDG path above.
+
+An explicit file selected by `--config` or `LECTOR_CONFIG` must exist. On
+macOS, Lector also recognizes the former
+`~/Library/Application Support/lector/init.lua` location when no valid
+`XDG_CONFIG_HOME` was explicitly selected and the new XDG file does not exist.
+This compatibility fallback lets existing installations migrate without
+changing the XDG behavior.
+
+Use `--no-config` to skip every configuration source and start with defaults,
+including native speech. It is mutually exclusive with `--config` and takes
+precedence over `LECTOR_CONFIG`.
 
 ```bash
 lector --shell /bin/zsh --config ./lector-demo.lua
