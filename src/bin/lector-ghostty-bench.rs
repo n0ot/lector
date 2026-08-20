@@ -318,7 +318,7 @@ fn run() -> Result<(), String> {
     }
 
     if let Some(path) = validate_baseline {
-        load_baseline(&path)?;
+        load_baseline(&path, false)?;
         println!("valid Ghostty benchmark baseline: {}", path.display());
         return Ok(());
     }
@@ -354,7 +354,7 @@ fn run() -> Result<(), String> {
         media_workloads: vec![run_media_workload(if self_test { 4 } else { 1_000 })?],
     };
     if let Some(path) = check_baseline {
-        check_report(&report, &load_baseline(&path)?)?;
+        check_report(&report, &load_baseline(&path, true)?)?;
     }
     let json = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
     if let Some(path) = output {
@@ -366,7 +366,7 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn load_baseline(path: &PathBuf) -> Result<Baseline, String> {
+fn load_baseline(path: &PathBuf, require_current_target: bool) -> Result<Baseline, String> {
     let bytes = fs::read(path)
         .map_err(|error| format!("read benchmark baseline {}: {error}", path.display()))?;
     let baseline: Baseline = serde_json::from_slice(&bytes)
@@ -377,7 +377,7 @@ fn load_baseline(path: &PathBuf) -> Result<Baseline, String> {
             baseline.schema_version
         ));
     }
-    if baseline.target != target_triple() {
+    if require_current_target && baseline.target != target_triple() {
         return Err(format!(
             "benchmark baseline targets {}, current target is {}",
             baseline.target,
