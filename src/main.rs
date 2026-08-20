@@ -747,6 +747,23 @@ const fn setup_failure_action(event_loop_started: bool) -> SetupFailureAction {
     }
 }
 
+fn runtime_setup_error(error: mlua::Error) -> anyhow::Error {
+    // mlua::Error is not Send + Sync, so anyhow cannot retain it as a source.
+    // Preserve every available cause before crossing that type boundary.
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    if source.is_some() {
+        message.push_str("\n\nCaused by:");
+    }
+    let mut index = 0;
+    while let Some(error) = source {
+        message.push_str(&format!("\n    {index}: {error}"));
+        source = error.source();
+        index += 1;
+    }
+    anyhow::Error::msg(message)
+}
+
 fn requested_config_path(
     cli_config: Option<PathBuf>,
     no_config: bool,
@@ -818,9 +835,9 @@ mod tests {
         SetupFailureAction, ShutdownFenceBroker, ShutdownFenceOutcome, TerminalSignalAction,
         drain_available_input, drain_available_pty, drain_shutdown_fence_input,
         emergency_terminal_cleanup_bytes, parse_focus_mode_report, requested_config_path,
-        resolved_default_config_path, separate_focus_mode_report_input, setup_failure_action,
-        startup_deadline_poll_timeout, stdout_retry_poll_timeout, terminal_signal_action,
-        wait_for_shutdown_fence,
+        resolved_default_config_path, runtime_setup_error, separate_focus_mode_report_input,
+        setup_failure_action, startup_deadline_poll_timeout, stdout_retry_poll_timeout,
+        terminal_signal_action, wait_for_shutdown_fence,
     };
     use clap::{CommandFactory, Parser};
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -1519,6 +1536,19 @@ mod tests {
             SetupFailureAction::ReturnRuntimeError
         );
     }
+
+    #[test]
+    fn runtime_setup_errors_preserve_their_cause_chain() {
+        let error = anyhow::anyhow!("speech server rejected initialize")
+            .context("speech server startup failed twice")
+            .context("start configured speech server");
+        let error = runtime_setup_error(mlua::Error::external(error));
+        let rendered = format!("{error:?}");
+
+        assert!(rendered.contains("start configured speech server"));
+        assert!(rendered.contains("speech server startup failed twice"));
+        assert!(rendered.contains("speech server rejected initialize"));
+    }
 }
 
 #[derive(Parser)]
@@ -1721,7 +1751,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Err(err) => Err(anyhow!("{err}")),
+        Err(err) => Err(runtime_setup_error(err)),
     };
     // Clean up before returning the above result.
     if let Err(err) = termios::tcsetattr(
@@ -1733,7 +1763,6 @@ fn main() -> Result<()> {
     }
     screen_reader.shutdown_speech();
     process.terminate();
-    let result = result.map_err(|e| anyhow!("{}", e));
     if let Some(signal) = termination_signal {
         // Signal handlers deliberately return here first so owned subprocesses
         // and diagnostics are shut down before restoring the signal's default
