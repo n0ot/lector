@@ -5,7 +5,7 @@ set -u
 if [[ $# -ne 3 \
     || $1 != "one argument" \
     || $2 != "'literal quotes'" \
-    || $3 != '$(not a shell)' ]]; then
+    || $3 != "\$(not a shell)" ]]; then
     printf 'LECTOR-SPEECH-ARGV-ERROR' >&2
     exit 64
 fi

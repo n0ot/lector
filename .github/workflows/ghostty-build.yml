@@ -58,6 +58,11 @@ jobs:
   tier-two-static:
     name: ${{ matrix.target }} static link
     runs-on: ${{ matrix.runner }}
+    env:
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CC_x86_64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     strategy:
       fail-fast: false
       matrix:
@@ -72,6 +77,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install MUSL C toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
       - name: Compile authoritative Ghostty path
         run: >-
           cargo check --locked --target "${{ matrix.target }}"

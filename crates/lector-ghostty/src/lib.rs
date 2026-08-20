@@ -3743,7 +3743,10 @@ mod tests {
             .advance(b"one line")
             .expect("advance one dirty row");
 
-        assert_eq!(update.damage, RenderDamageSnapshot::Rows(vec![0..=0]));
+        assert_eq!(
+            update.damage,
+            RenderDamageSnapshot::Rows(std::iter::once(0..=0).collect())
+        );
         assert_eq!(
             terminal.snapshot_row_reads, 1,
             "an ordinary one-line update must not re-read the other 23 rows"

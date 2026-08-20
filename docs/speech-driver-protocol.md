@@ -103,7 +103,7 @@ self-describing through OpenRPC.
 On every new process, Lector's first call is `initialize`:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":"1.0","client":{"name":"lector","version":"0.4.0"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":"1.0","client":{"name":"lector","version":"0.4.1"}}}
 ```
 
 A compatible server responds within five seconds:

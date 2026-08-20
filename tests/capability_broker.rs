@@ -247,7 +247,7 @@ fn virtual_profile_drives_every_ghostty_generated_application_reply() {
 
     for expected in [
         b"lector".as_slice(),
-        b"\x1bP>|Lector 0.4.0\x1b\\",
+        b"\x1bP>|Lector 0.4.1\x1b\\",
         b"\x1b[4;432;720t",
         b"\x1b[6;18;9t",
         b"\x1b[8;24;80t",

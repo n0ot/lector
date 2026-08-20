@@ -3,7 +3,7 @@ Scenario: effects follow secure local policy and queries receive the Lector iden
 When pty-stdout: \x07\x1B]2;effects title\x07\x1B]7;file://host/tmp\x1B\\\x1B]52;c;aGVsbG8=\x1B\\\x1B]777;notify;Build;Done\x1B\\\x1B]9;4;1;50\x07\x1B[c\x1B[18t\x1B[?996n\x1B[>q
 And tick:
 Then expect-stdout-contains: effects title
-And expect-pty-stdin: \x1B[?64;22;28c\x1B[8;24;80t\x1B[?997;1n\x1BP>|Lector 0.4.0\x1B\\
+And expect-pty-stdin: \x1B[?64;22;28c\x1B[8;24;80t\x1B[?997;1n\x1BP>|Lector 0.4.1\x1B\\
 
 Scenario: bracketed paste follows the child terminal mode
 Given pty-stdout: \x1B[?2004h
