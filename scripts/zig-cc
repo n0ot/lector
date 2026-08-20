@@ -30,4 +30,15 @@ while (($# > 0)); do
     esac
 done
 
+is_link=true
+for argument in "${compiler_args[@]}"; do
+    case "$argument" in
+        -c|-E|-S) is_link=false ;;
+    esac
+done
+
+if [[ "$is_link" == true ]]; then
+    compiler_args+=(-lunwind)
+fi
+
 exec "$zig_bin" cc -target "$zig_target" "${compiler_args[@]}"
