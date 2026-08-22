@@ -5,6 +5,7 @@ pub(super) struct Options {
     help_mode: bool,
     auto_read: bool,
     suppress_key_echo: bool,
+    report_indentation: bool,
     review_follows_screen_cursor: bool,
     highlight_tracking: bool,
     table_header_auto: bool,
@@ -20,6 +21,7 @@ impl Default for Options {
             help_mode: false,
             auto_read: true,
             suppress_key_echo: false,
+            report_indentation: true,
             review_follows_screen_cursor: true,
             highlight_tracking: false,
             table_header_auto: true,
@@ -64,6 +66,14 @@ impl Options {
 
     pub(super) fn set_suppress_key_echo(&mut self, value: bool) {
         self.suppress_key_echo = value;
+    }
+
+    pub(super) fn report_indentation(&self) -> bool {
+        self.report_indentation
+    }
+
+    pub(super) fn set_report_indentation(&mut self, value: bool) {
+        self.report_indentation = value;
     }
 
     pub(super) fn review_follows_screen_cursor(&self) -> bool {
@@ -145,6 +155,7 @@ mod tests {
         assert!(!options.help_mode());
         assert!(options.auto_read());
         assert!(!options.suppress_key_echo());
+        assert!(options.report_indentation());
         assert!(options.review_follows_screen_cursor());
         assert!(!options.highlight_tracking());
         assert!(options.table_header_auto());

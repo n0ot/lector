@@ -259,6 +259,9 @@ impl ScreenReader {
     }
 
     pub fn report_application_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
+        if !self.indentation_reporting_enabled() {
+            return Ok(());
+        }
         let (indent_level, changed) = view.application_cursor_indentation_level();
         if changed {
             self.speak(&format!("indent {indent_level}"), false)?;
@@ -267,6 +270,9 @@ impl ScreenReader {
     }
 
     pub fn report_review_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
+        if !self.indentation_reporting_enabled() {
+            return Ok(());
+        }
         let (indent_level, changed) = view.review_cursor_indentation_level();
         if changed {
             self.speak(&format!("indent {indent_level}"), false)?;

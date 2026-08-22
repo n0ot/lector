@@ -449,6 +449,14 @@ impl ScreenReader {
         }
     }
 
+    pub fn indentation_reporting_enabled(&self) -> bool {
+        self.options.report_indentation()
+    }
+
+    pub fn set_indentation_reporting_enabled(&mut self, value: bool) {
+        self.options.set_report_indentation(value);
+    }
+
     pub fn review_follows_screen_cursor(&self) -> bool {
         self.options.review_follows_screen_cursor()
     }

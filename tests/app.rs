@@ -6,6 +6,7 @@ use lector::{
     speech,
     terminal::{Color, GhosttyEngine, TerminalEngine},
     terminal_protocol::PhysicalTerminalProfile,
+    view::View,
     views,
 };
 use std::{
@@ -166,6 +167,36 @@ fn make_app() -> (App, ScreenReader, Recorder, FakeClock) {
     let clock = FakeClock::default();
     let app = App::new_with_clock(view_stack, Box::new(clock.clone())).expect("create app");
     (app, screen_reader, recorder, clock)
+}
+
+#[test]
+fn indentation_reporting_option_covers_both_cursors_and_auto_read() {
+    let (_app, mut sr, recorder, _clock) = make_app();
+    sr.set_indentation_reporting_enabled(false);
+
+    let mut application_view = View::new(1, 16);
+    application_view.process_changes(b"  application");
+    sr.report_application_cursor_indentation_changes(&mut application_view)
+        .expect("suppress application cursor indentation");
+
+    let mut review_view = View::new(1, 16);
+    review_view.process_changes(b"    review");
+    sr.report_review_cursor_indentation_changes(&mut review_view)
+        .expect("suppress review cursor indentation");
+
+    let mut auto_read_view = View::new(1, 16);
+    auto_read_view.process_changes(b"      auto read");
+    sr.auto_read(&mut auto_read_view)
+        .expect("auto-read without indentation reporting");
+
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .all(|(text, _)| !text.starts_with("indent "))
+    );
 }
 
 #[test]

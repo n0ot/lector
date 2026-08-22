@@ -487,6 +487,10 @@ lector.o.auto_read = true
 -- suppress terminal output that echoes recently typed keys (disabled by default)
 lector.o.suppress_key_echo = false
 
+-- report indentation changes for the application and review cursors
+-- (enabled by default; set to false to disable)
+lector.o.report_indentation = false
+
 -- interrupt speech immediately when terminal focus is lost
 lector.o.stop_speech_on_focus_loss = true
 

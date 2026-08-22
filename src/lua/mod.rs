@@ -313,11 +313,13 @@ mod tests {
             &path,
             r#"
                 assert(lector.o.suppress_key_echo == false)
+                assert(lector.o.report_indentation == true)
                 assert(lector.o.tmux_bells == "audible")
                 assert(lector.o.clipboard.default_register == '"')
                 assert(lector.o.clipboard.system_provider == "native")
                 lector.o.auto_read = false
                 lector.o.suppress_key_echo = true
+                lector.o.report_indentation = false
                 lector.o.tmux_bells = "spoken"
                 lector.o.clipboard.default_register = "+"
                 lector.o.clipboard.system_provider = "osc52"
@@ -369,6 +371,7 @@ mod tests {
             assert!(sr.help_mode());
             assert!(!sr.auto_read_enabled());
             assert!(sr.suppress_key_echo());
+            assert!(!sr.indentation_reporting_enabled());
             assert_eq!(sr.tmux_bell_mode().to_string(), "spoken");
             assert_eq!(sr.clipboard_default_register().to_string(), "+");
             assert_eq!(sr.system_clipboard_provider().to_string(), "osc52");

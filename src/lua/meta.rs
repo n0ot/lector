@@ -253,6 +253,7 @@ fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua
         "help_mode" => sr.help_mode().into_lua(lua),
         "auto_read" => sr.auto_read_enabled().into_lua(lua),
         "suppress_key_echo" => sr.suppress_key_echo().into_lua(lua),
+        "report_indentation" => sr.indentation_reporting_enabled().into_lua(lua),
         "review_follows_screen_cursor" | "rev_follows" => {
             sr.review_follows_screen_cursor().into_lua(lua)
         }
@@ -362,6 +363,13 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
         "suppress_key_echo" => match value {
             Boolean(v) => {
                 sr.set_suppress_key_echo(v);
+                Ok(())
+            }
+            _ => Err(anyhow!("value must be a boolean")),
+        },
+        "report_indentation" => match value {
+            Boolean(v) => {
+                sr.set_indentation_reporting_enabled(v);
                 Ok(())
             }
             _ => Err(anyhow!("value must be a boolean")),
