@@ -11,7 +11,7 @@ mod tmux_connection;
 mod tmux_connections;
 mod tmux_portal;
 
-pub use lua_repl::LuaReplView;
+pub use lua_repl::{LuaReplSession, LuaReplView};
 pub use message::MessageView;
 pub use popup::{PopupResponse, PopupView};
 pub use pty::PtyView;

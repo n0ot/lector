@@ -1123,7 +1123,7 @@ pub struct App {
     deferred_kitty_releases: VecDeque<DeferredKittyRelease>,
     kitty_ctrl_c_input_handoff: Option<KittyInputHandoff>,
     log_enabled: bool,
-    lua_repl_history: Vec<String>,
+    lua_repl_session: Option<views::LuaReplSession>,
     last_stdin_update: Option<u128>,
     stabilization_profiles: HashMap<AccessibilityContext, StabilizationProfile>,
     scene_renderer: IncrementalVtRenderer,
@@ -1410,7 +1410,7 @@ impl App {
             deferred_kitty_releases: VecDeque::new(),
             kitty_ctrl_c_input_handoff: None,
             log_enabled: false,
-            lua_repl_history: Vec::new(),
+            lua_repl_session: None,
             last_stdin_update: None,
             stabilization_profiles: HashMap::new(),
             scene_renderer: IncrementalVtRenderer::new(RenderCapabilities {

@@ -5472,10 +5472,95 @@ fn lua_repl_history_persists_after_close() {
         .expect("history up");
 
     assert!(pty_out.is_empty());
+    let contents = app.debug_active_view_contents();
+    assert!(contents.contains("> print(1)"));
+    assert!(contents.lines().any(|line| line.trim() == "1"));
     let rendered = String::from_utf8_lossy(&term_out);
     assert!(rendered.contains("> print(1)"));
     let speaks = &recorder.inner.borrow().speaks;
     assert!(speaks.iter().any(|(text, _)| text == "Lua REPL"));
+}
+
+#[test]
+fn lua_repl_session_persists_transcript_draft_continuation_and_environment_after_close() {
+    let (mut app, mut sr, _recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open repl");
+    app.handle_stdin(&mut sr, b"saved = 17\r", &mut pty_out, &mut term_out)
+        .expect("define saved value");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish definition");
+    app.handle_stdin(
+        &mut sr,
+        b"function pending()\rreturn saved",
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("enter pending function");
+
+    app.handle_stdin(&mut sr, b"\x1B", &mut pty_out, &mut term_out)
+        .expect("queue escape");
+    clock.advance_ms(100);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("close repl");
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("reopen repl");
+
+    let contents = app.debug_active_view_contents();
+    assert!(contents.contains("> saved = 17"), "contents={contents:?}");
+    assert!(
+        contents.contains("> function pending()"),
+        "contents={contents:?}"
+    );
+    assert!(
+        contents.contains("... return saved"),
+        "contents={contents:?}"
+    );
+
+    app.handle_stdin(&mut sr, b"\x03saved\r", &mut pty_out, &mut term_out)
+        .expect("abort pending chunk and evaluate saved value");
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish saved value evaluation");
+    assert!(
+        app.debug_active_view_contents()
+            .lines()
+            .any(|line| line.trim() == "17")
+    );
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn lua_repl_kitty_ctrl_c_aborts_continuation_and_ctrl_u_clears_current_line() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(
+        &mut sr,
+        b"\x1BLfunction abandoned()\rdiscard me",
+        &mut pty_out,
+        &mut term_out,
+    )
+    .expect("open repl and enter continuation");
+    app.handle_stdin(&mut sr, b"\x1B[117;5u", &mut pty_out, &mut term_out)
+        .expect("Kitty Ctrl-U");
+    let contents = app.debug_active_view_contents();
+    assert!(contents.contains("> function abandoned()"));
+    assert!(contents.contains("..."));
+    assert!(!contents.contains("discard me"));
+
+    app.handle_stdin(&mut sr, b"still discarded", &mut pty_out, &mut term_out)
+        .expect("replace current continuation line");
+    app.handle_stdin(&mut sr, b"\x1B[99;5u", &mut pty_out, &mut term_out)
+        .expect("Kitty Ctrl-C");
+    let contents = app.debug_active_view_contents();
+    assert!(contents.lines().any(|line| line.trim() == ">"));
+    assert!(!contents.contains("function abandoned"));
+    assert!(!contents.contains("still discarded"));
+    assert!(pty_out.is_empty());
 }
 
 #[test]

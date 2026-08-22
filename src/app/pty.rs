@@ -551,7 +551,6 @@ impl App {
         self.queue_tmux_inventory(connection_id);
         self.active_tmux_connection = Some(connection_id);
         self.cancel_stabilization_bursts();
-        self.capture_lua_repl_history();
         self.view_stack.clear_overlays();
         let (rows, cols) = self.view_stack.root_mut().model().live_size();
         self.view_stack
@@ -643,7 +642,6 @@ impl App {
                     .flatten()
             });
         self.cancel_stabilization_bursts();
-        self.capture_lua_repl_history();
         if !preserve_connection_chooser {
             self.view_stack.clear_overlays();
         }

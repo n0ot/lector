@@ -390,8 +390,15 @@ impl App {
                             return Ok(());
                         }
                         let (rows, cols) = self.view_stack.active_mut().model().live_size();
-                        let repl =
-                            views::LuaReplView::new(rows, cols, self.lua_repl_history.clone())?;
+                        let session = match &self.lua_repl_session {
+                            Some(session) => session.clone(),
+                            None => {
+                                let session = views::LuaReplSession::new(Vec::new())?;
+                                self.lua_repl_session = Some(session.clone());
+                                session
+                            }
+                        };
+                        let repl = views::LuaReplView::from_session(rows, cols, session);
                         self.handle_view_action(
                             sr,
                             views::ViewAction::Push(Box::new(repl)),

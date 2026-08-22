@@ -63,7 +63,11 @@ impl LineEditor {
     }
 
     pub fn commit_history(&mut self) {
-        let line = self.input.as_str();
+        let line = self.input.clone();
+        self.commit_history_entry(&line);
+    }
+
+    pub fn commit_history_entry(&mut self, line: &str) {
         let ignored = line.trim().is_empty()
             || line.starts_with(' ')
             || self.history.last().is_some_and(|entry| entry == line);

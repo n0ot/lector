@@ -104,7 +104,6 @@ impl App {
                 self.announce_view_change(sr)?;
             }
             views::ViewAction::Pop => {
-                self.capture_lua_repl_history();
                 if self.view_stack.pop() {
                     self.render_active_view(term_out)?;
                     self.announce_view_change(sr)?;
@@ -225,21 +224,6 @@ impl App {
             views::ViewAction::None => {}
         }
         Ok(())
-    }
-
-    pub(super) fn capture_lua_repl_history(&mut self) {
-        if self.view_stack.active_mut().kind() != views::ViewKind::LuaRepl {
-            return;
-        }
-        let history = self
-            .view_stack
-            .active_mut()
-            .as_any()
-            .downcast_ref::<views::LuaReplView>()
-            .map(|repl| repl.history().to_vec());
-        if let Some(history) = history {
-            self.lua_repl_history = history;
-        }
     }
 
     pub(super) fn render_active_view(&mut self, term_out: &mut dyn Write) -> Result<()> {

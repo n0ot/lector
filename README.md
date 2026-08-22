@@ -616,8 +616,10 @@ end
 
 Lector has a built‑in Lua REPL so you can try commands while it’s running. Open it with `M-L`, experiment, then close it when you’re done.
 
-- Press `C-l` to clear the REPL screen while keeping the `Esc to close` banner visible.
-- REPL history is preserved after closing and reopening the overlay.
+- Lua automatically continues incomplete statements and expressions at a `... ` prompt.
+- Press `C-c` to discard a pending multiline chunk, or `C-u` to clear the current line.
+- Press `C-l` to clear submitted input and output. Unsubmitted input and the `Esc to close` banner remain visible.
+- The transcript, unsubmitted input, history, and Lua environment are preserved after closing and reopening the overlay.
 - Commands that start with a space and consecutive duplicate commands are not added to REPL history.
 
 ## Tips

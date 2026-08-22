@@ -7,7 +7,7 @@ use crate::{
     view::View,
 };
 use mlua::{
-    Error as LuaError, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Thread,
+    Error as LuaError, Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Thread,
     ThreadStatus, Value, VmState,
 };
 use std::{any::Any, cell::RefCell, io::Write, rc::Rc};
@@ -20,22 +20,38 @@ struct ReplOutput {
     lines: Vec<String>,
 }
 
-pub struct LuaReplView {
-    view: View,
-    title: String,
-    output: Vec<String>,
+#[derive(Clone)]
+enum TranscriptLine {
+    Input { continuation: bool, text: String },
+    Output(String),
+}
+
+struct LuaReplState {
+    transcript: Vec<TranscriptLine>,
     editor: LineEditor,
+    pending_lines: Vec<String>,
     lua: Lua,
     env: Table,
     thread: Option<Thread>,
     print_buffer: Rc<RefCell<ReplOutput>>,
     screen_reader_ptr: Rc<RefCell<*mut ScreenReader>>,
+}
+
+#[derive(Clone)]
+pub struct LuaReplSession {
+    state: Rc<RefCell<LuaReplState>>,
+}
+
+pub struct LuaReplView {
+    view: View,
+    title: String,
+    session: LuaReplSession,
     rendered_input: String,
     rendered_cursor: usize,
 }
 
-impl LuaReplView {
-    pub fn new(rows: u16, cols: u16, history: Vec<String>) -> Result<Self> {
+impl LuaReplSession {
+    pub fn new(history: Vec<String>) -> Result<Self> {
         let lua = Lua::new_with(StdLib::ALL_SAFE | StdLib::JIT, LuaOptions::default())
             .map_err(Error::lua)?;
         let print_buffer = Rc::new(RefCell::new(ReplOutput { lines: Vec::new() }));
@@ -61,58 +77,83 @@ impl LuaReplView {
         env.set_metatable(Some(env_meta)).map_err(Error::lua)?;
         env.set("_G", env.clone()).map_err(Error::lua)?;
 
-        let view = View::new(rows, cols);
         let mut editor = LineEditor::new();
         editor.set_history(history);
+        Ok(Self {
+            state: Rc::new(RefCell::new(LuaReplState {
+                transcript: initial_transcript(),
+                editor,
+                pending_lines: Vec::new(),
+                lua,
+                env,
+                thread: None,
+                print_buffer,
+                screen_reader_ptr,
+            })),
+        })
+    }
+}
+
+impl LuaReplView {
+    pub fn new(rows: u16, cols: u16, history: Vec<String>) -> Result<Self> {
+        let session = LuaReplSession::new(history)?;
+        Ok(Self::from_session(rows, cols, session))
+    }
+
+    pub fn from_session(rows: u16, cols: u16, session: LuaReplSession) -> Self {
         let mut repl = Self {
-            view,
+            view: View::new(rows, cols),
             title: "Lua REPL".to_string(),
-            output: Vec::new(),
-            editor,
-            lua,
-            env,
-            thread: None,
-            print_buffer,
-            screen_reader_ptr,
+            session,
             rendered_input: String::new(),
             rendered_cursor: 0,
         };
-        let added = repl.append_output("Lua REPL ready.");
-        repl.write_output_lines(&added);
-        repl.write_prompt();
         repl.render_full();
-        Ok(repl)
+        repl
     }
 
-    pub fn history(&self) -> &[String] {
-        self.editor.history()
+    pub fn history(&self) -> Vec<String> {
+        self.session.state.borrow().editor.history().to_vec()
     }
 
     fn set_screen_reader(&mut self, sr: &mut ScreenReader) {
-        *self.screen_reader_ptr.borrow_mut() = sr as *mut ScreenReader;
+        let screen_reader_ptr = Rc::clone(&self.session.state.borrow().screen_reader_ptr);
+        *screen_reader_ptr.borrow_mut() = sr as *mut ScreenReader;
+    }
+
+    fn is_continuing(&self) -> bool {
+        !self.session.state.borrow().pending_lines.is_empty()
+    }
+
+    fn prompt(&self) -> &'static str {
+        if self.is_continuing() { "... " } else { "> " }
     }
 
     fn append_output(&mut self, text: &str) -> Vec<String> {
         let mut added = Vec::new();
+        let mut state = self.session.state.borrow_mut();
         for line in text.split('\n') {
             let line = line.to_string();
-            self.output.push(line.clone());
+            state.transcript.push(TranscriptLine::Output(line.clone()));
             added.push(line);
         }
-        const MAX_LINES: usize = 1000;
-        if self.output.len() > MAX_LINES {
-            let excess = self.output.len() - MAX_LINES;
-            self.output.drain(0..excess);
-        }
+        trim_transcript(&mut state.transcript);
         added
     }
 
     fn drain_print_buffer(&mut self) -> Vec<String> {
-        let mut buffer = self.print_buffer.borrow_mut();
-        let mut added = Vec::new();
-        for line in buffer.lines.drain(..) {
-            self.output.push(line.clone());
-            added.push(line);
+        let print_buffer = Rc::clone(&self.session.state.borrow().print_buffer);
+        let added = print_buffer
+            .borrow_mut()
+            .lines
+            .drain(..)
+            .collect::<Vec<_>>();
+        if !added.is_empty() {
+            let mut state = self.session.state.borrow_mut();
+            state
+                .transcript
+                .extend(added.iter().cloned().map(TranscriptLine::Output));
+            trim_transcript(&mut state.transcript);
         }
         added
     }
@@ -129,19 +170,21 @@ impl LuaReplView {
     }
 
     fn write_prompt(&mut self) {
-        self.write_bytes(b"> ");
+        self.write_bytes(self.prompt().as_bytes());
         self.rendered_input.clear();
         self.rendered_cursor = 0;
     }
 
     fn try_append_input(&mut self) -> bool {
-        let input = self.editor.input().to_string();
-        let cursor = self.editor.cursor();
+        let (input, cursor) = {
+            let state = self.session.state.borrow();
+            (state.editor.input().to_string(), state.editor.cursor())
+        };
         let input_len = input.graphemes(true).count();
         let prev_input = self.rendered_input.as_str();
         let prev_len = prev_input.graphemes(true).count();
         let (_, cols) = self.view.size();
-        let available = usize::from(cols).saturating_sub(2);
+        let available = usize::from(cols).saturating_sub(self.prompt().len());
         if cursor == input_len
             && self.rendered_cursor == prev_len
             && input_len > prev_len
@@ -166,14 +209,35 @@ impl LuaReplView {
         let (rows, cols) = self.view.size();
         let rows = rows as usize;
         let cols = cols as usize;
-        let prompt = "> ";
+        let (transcript, pending_lines, input, editor_cursor) = {
+            let state = self.session.state.borrow();
+            (
+                state.transcript.clone(),
+                state.pending_lines.clone(),
+                state.editor.input().to_string(),
+                state.editor.cursor(),
+            )
+        };
+        let prompt = if pending_lines.is_empty() {
+            "> "
+        } else {
+            "... "
+        };
         let available = cols.saturating_sub(prompt.len());
-        let (visible_input, cursor_width) =
-            visible_input_window(self.editor.input(), self.editor.cursor(), available);
+        let (visible_input, cursor_width) = visible_input_window(&input, editor_cursor, available);
         let cursor_col = prompt.len() + cursor_width;
 
         let body_rows = rows.saturating_sub(1);
-        let mut body_lines: Vec<String> = self.output.to_vec();
+        let mut body_lines = transcript
+            .iter()
+            .map(|line| render_transcript_line(line, cols))
+            .collect::<Vec<_>>();
+        body_lines.extend(
+            pending_lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| render_input_line(index != 0, line, cols)),
+        );
         body_lines.push(format!("{}{}", prompt, visible_input));
         let body_lines = if body_lines.len() > body_rows {
             body_lines[body_lines.len() - body_rows..].to_vec()
@@ -199,51 +263,31 @@ impl LuaReplView {
         self.view.clear_update_summary();
         self.view.process_changes(&bytes);
         self.view.clear_update_summary();
-        self.rendered_input = self.editor.input().to_string();
-        self.rendered_cursor = self.editor.cursor();
+        self.rendered_input = input;
+        self.rendered_cursor = editor_cursor;
     }
 
-    fn start_eval(&mut self, input: &str) -> Result<()> {
-        let func = if let Some(rest) = input.strip_prefix('=') {
-            self.lua
-                .load(format!("return {}", rest))
-                .set_name("repl")
-                .set_environment(self.env.clone())
-                .into_function()
-                .map_err(Error::lua)?
-        } else {
-            let expr_code = format!("return {}", input);
-            match self
-                .lua
-                .load(&expr_code)
-                .set_name("repl")
-                .set_environment(self.env.clone())
-                .into_function()
-            {
-                Ok(func) => func,
-                Err(LuaError::SyntaxError { .. }) => self
-                    .lua
-                    .load(input)
-                    .set_name("repl")
-                    .set_environment(self.env.clone())
-                    .into_function()
-                    .map_err(Error::lua)?,
-                Err(err) => return Err(Error::lua(err)),
-            }
-        };
-        let thread = self.lua.create_thread(func).map_err(Error::lua)?;
+    fn classify_input(&self, input: &str) -> Result<CompileOutcome> {
+        let state = self.session.state.borrow();
+        classify_input(&state.lua, &state.env, input).map_err(Error::lua)
+    }
+
+    fn start_eval(&mut self, func: Function) -> Result<()> {
+        let lua = self.session.state.borrow().lua.clone();
+        let thread = lua.create_thread(func).map_err(Error::lua)?;
         thread
             .set_hook(
                 HookTriggers::new().every_nth_instruction(1000),
                 |_lua, _debug| Ok(VmState::Yield),
             )
             .map_err(Error::lua)?;
-        self.thread = Some(thread);
+        self.session.state.borrow_mut().thread = Some(thread);
         Ok(())
     }
 
     fn resume_eval(&mut self) -> Result<(bool, Vec<String>)> {
-        let Some(thread) = &self.thread else {
+        let thread = self.session.state.borrow().thread.clone();
+        let Some(thread) = thread else {
             return Ok((false, Vec::new()));
         };
         match thread.resume::<MultiValue>(()) {
@@ -257,43 +301,111 @@ impl LuaReplView {
                         }
                         added = self.append_output(&pieces.join("\t"));
                     }
-                    self.thread = None;
+                    self.session.state.borrow_mut().thread = None;
                 }
                 Ok((true, added))
             }
             Err(err) => {
                 let added = self.append_output(&format!("Error: {}", err));
-                self.thread = None;
+                self.session.state.borrow_mut().thread = None;
                 Ok((true, added))
             }
         }
     }
 
     fn clear_screen(&mut self) {
-        self.output.clear();
+        self.session.state.borrow_mut().transcript = initial_transcript();
         self.render_full();
+    }
+
+    fn clear_current_line(&mut self) -> ViewAction {
+        let mut state = self.session.state.borrow_mut();
+        if state.editor.input().is_empty() {
+            return ViewAction::None;
+        }
+        state.editor.clear();
+        drop(state);
+        self.render_full();
+        ViewAction::Redraw
+    }
+
+    fn abort_continuation(&mut self) -> ViewAction {
+        let mut state = self.session.state.borrow_mut();
+        if state.pending_lines.is_empty() {
+            return ViewAction::None;
+        }
+        state.pending_lines.clear();
+        state.editor.clear();
+        drop(state);
+        self.render_full();
+        ViewAction::Redraw
+    }
+
+    fn submit_input(&mut self) -> Result<ViewAction> {
+        let (line, source, pending_empty) = {
+            let state = self.session.state.borrow();
+            let line = state.editor.input().to_string();
+            let mut source = state.pending_lines.join("\n");
+            if !source.is_empty() {
+                source.push('\n');
+            }
+            source.push_str(&line);
+            (line, source, state.pending_lines.is_empty())
+        };
+        if pending_empty && line.trim().is_empty() {
+            return Ok(ViewAction::Bell);
+        }
+
+        match self.classify_input(&source)? {
+            CompileOutcome::Incomplete => {
+                self.write_bytes(b"\r\n");
+                let mut state = self.session.state.borrow_mut();
+                state.pending_lines.push(line);
+                state.editor.clear();
+                drop(state);
+                self.write_prompt();
+                Ok(ViewAction::Redraw)
+            }
+            CompileOutcome::Complete(func) => {
+                self.write_bytes(b"\r\n");
+                self.commit_submission(&source, line);
+                if let Err(err) = self.start_eval(func) {
+                    let added = self.append_output(&format!("Error: {err}"));
+                    self.write_output_lines(&added);
+                    self.write_prompt();
+                }
+                Ok(ViewAction::Redraw)
+            }
+            CompileOutcome::Error(err) => {
+                self.write_bytes(b"\r\n");
+                self.commit_submission(&source, line);
+                let added = self.append_output(&format!("Error: {}", err));
+                self.write_output_lines(&added);
+                self.write_prompt();
+                Ok(ViewAction::Redraw)
+            }
+        }
+    }
+
+    fn commit_submission(&mut self, source: &str, line: String) {
+        let mut state = self.session.state.borrow_mut();
+        state.editor.commit_history_entry(source);
+        let pending = std::mem::take(&mut state.pending_lines);
+        for (index, text) in pending.into_iter().chain(std::iter::once(line)).enumerate() {
+            state.transcript.push(TranscriptLine::Input {
+                continuation: index != 0,
+                text,
+            });
+        }
+        trim_transcript(&mut state.transcript);
+        state.editor.clear();
+        self.rendered_input.clear();
+        self.rendered_cursor = 0;
     }
 
     fn apply_editor_action(&mut self, action: EditorAction) -> Result<ViewAction> {
         match action {
-            EditorAction::Submit => {
-                let line = self.editor.input().to_string();
-                if line.trim().is_empty() {
-                    return Ok(ViewAction::Bell);
-                }
-                self.write_bytes(b"\r\n");
-                self.editor.commit_history();
-                self.editor.clear();
-                self.rendered_input.clear();
-                self.rendered_cursor = 0;
-                if let Err(err) = self.start_eval(&line) {
-                    let added = self.append_output(&format!("Error: {}", err));
-                    self.write_output_lines(&added);
-                    self.write_prompt();
-                    return Ok(ViewAction::Redraw);
-                }
-                Ok(ViewAction::Redraw)
-            }
+            EditorAction::Submit => self.submit_input(),
             EditorAction::Changed => {
                 if !self.try_append_input() {
                     self.apply_editor_update();
@@ -328,7 +440,7 @@ impl ViewController for LuaReplView {
     }
 
     fn wants_tick(&self) -> bool {
-        self.thread.is_some()
+        self.session.state.borrow().thread.is_some()
     }
 
     fn handle_input(
@@ -339,17 +451,23 @@ impl ViewController for LuaReplView {
     ) -> Result<ViewAction> {
         self.set_screen_reader(sr);
         if input == b"\x1B" {
-            self.thread = None;
+            self.session.state.borrow_mut().thread = None;
             return Ok(ViewAction::Pop);
         }
         if input == b"\x0C" {
             self.clear_screen();
             return Ok(ViewAction::Redraw);
         }
-        if self.thread.is_some() {
+        if self.session.state.borrow().thread.is_some() {
             return Ok(ViewAction::Bell);
         }
-        let action = self.editor.handle_bytes(input);
+        if input == b"\x03" && self.is_continuing() {
+            return Ok(self.abort_continuation());
+        }
+        if input == b"\x15" {
+            return Ok(self.clear_current_line());
+        }
+        let action = self.session.state.borrow_mut().editor.handle_bytes(input);
         self.apply_editor_action(action)
     }
 
@@ -367,17 +485,23 @@ impl ViewController for LuaReplView {
         if matches!(key.control_code(), Some(0x1B))
             || matches!(key.event().code, terminput::KeyCode::Esc)
         {
-            self.thread = None;
+            self.session.state.borrow_mut().thread = None;
             return Ok(ViewAction::Pop);
         }
         if matches!(key.control_code(), Some(0x0C)) {
             self.clear_screen();
             return Ok(ViewAction::Redraw);
         }
-        if self.thread.is_some() {
+        if self.session.state.borrow().thread.is_some() {
             return Ok(ViewAction::Bell);
         }
-        let action = self.editor.handle_key_input(key);
+        if matches!(key.control_code(), Some(0x03)) && self.is_continuing() {
+            return Ok(self.abort_continuation());
+        }
+        if matches!(key.control_code(), Some(0x15)) {
+            return Ok(self.clear_current_line());
+        }
+        let action = self.session.state.borrow_mut().editor.handle_key_input(key);
         self.apply_editor_action(action)
     }
 
@@ -388,17 +512,22 @@ impl ViewController for LuaReplView {
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
         self.set_screen_reader(sr);
-        if self.thread.is_some() {
+        if self.session.state.borrow().thread.is_some() {
             return Ok(ViewAction::Bell);
         }
         let contents = contents.replace("\r\n", "\n").replace('\r', "\n");
-        let action = self.editor.handle_text(&contents);
+        let action = self
+            .session
+            .state
+            .borrow_mut()
+            .editor
+            .handle_text(&contents);
         self.apply_editor_action(action)
     }
 
     fn tick(&mut self, sr: &mut ScreenReader, _pty_stream: &mut dyn Write) -> Result<ViewAction> {
         self.set_screen_reader(sr);
-        if self.thread.is_none() {
+        if self.session.state.borrow().thread.is_none() {
             return Ok(ViewAction::None);
         }
         let (progressed, added) = self.resume_eval()?;
@@ -410,7 +539,7 @@ impl ViewController for LuaReplView {
             self.write_output_lines(&printed);
         }
         if progressed {
-            if self.thread.is_none() {
+            if self.session.state.borrow().thread.is_none() {
                 self.write_prompt();
             }
             return Ok(ViewAction::Redraw);
@@ -422,6 +551,90 @@ impl ViewController for LuaReplView {
         self.view.set_size(rows, cols);
         self.render_full();
     }
+}
+
+enum CompileOutcome {
+    Complete(Function),
+    Incomplete,
+    Error(LuaError),
+}
+
+fn classify_input(lua: &Lua, env: &Table, input: &str) -> mlua::Result<CompileOutcome> {
+    if let Some(rest) = input.strip_prefix('=') {
+        return Ok(
+            match compile_function(lua, env, &format!("return {rest}")) {
+                Ok(func) => CompileOutcome::Complete(func),
+                Err(err) if syntax_error_is_incomplete(&err) => CompileOutcome::Incomplete,
+                Err(err) => CompileOutcome::Error(err),
+            },
+        );
+    }
+
+    let expression_error = match compile_function(lua, env, &format!("return {input}")) {
+        Ok(func) => return Ok(CompileOutcome::Complete(func)),
+        Err(err @ LuaError::SyntaxError { .. }) => err,
+        Err(err) => return Err(err),
+    };
+    match compile_function(lua, env, input) {
+        Ok(func) => Ok(CompileOutcome::Complete(func)),
+        Err(statement_error @ LuaError::SyntaxError { .. }) => {
+            if syntax_error_is_incomplete(&expression_error)
+                || syntax_error_is_incomplete(&statement_error)
+            {
+                Ok(CompileOutcome::Incomplete)
+            } else {
+                Ok(CompileOutcome::Error(statement_error))
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn compile_function(lua: &Lua, env: &Table, source: &str) -> mlua::Result<Function> {
+    lua.load(source)
+        .set_name("repl")
+        .set_environment(env.clone())
+        .into_function()
+}
+
+fn syntax_error_is_incomplete(error: &LuaError) -> bool {
+    matches!(
+        error,
+        LuaError::SyntaxError {
+            incomplete_input: true,
+            ..
+        }
+    )
+}
+
+fn initial_transcript() -> Vec<TranscriptLine> {
+    vec![TranscriptLine::Output("Lua REPL ready.".to_string())]
+}
+
+fn trim_transcript(transcript: &mut Vec<TranscriptLine>) {
+    const MAX_LINES: usize = 1000;
+    if transcript.len() > MAX_LINES {
+        let excess = transcript.len() - MAX_LINES;
+        transcript.drain(0..excess);
+    }
+}
+
+fn render_transcript_line(line: &TranscriptLine, cols: usize) -> String {
+    match line {
+        TranscriptLine::Input { continuation, text } => {
+            render_input_line(*continuation, text, cols)
+        }
+        TranscriptLine::Output(text) => text.clone(),
+    }
+}
+
+fn render_input_line(continuation: bool, text: &str, cols: usize) -> String {
+    let prompt = if continuation { "... " } else { "> " };
+    let displayed = text
+        .graphemes(true)
+        .map(display_grapheme)
+        .collect::<String>();
+    truncate_to_width(&format!("{prompt}{displayed}"), cols)
 }
 
 fn format_value(value: Value) -> String {
@@ -503,7 +716,10 @@ fn display_grapheme(grapheme: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{CLOSE_HINT, LuaReplView, truncate_to_width, visible_input_window};
+    use super::{
+        CLOSE_HINT, CompileOutcome, LuaReplSession, LuaReplView, classify_input, truncate_to_width,
+        visible_input_window,
+    };
     use crate::{screen_reader::ScreenReader, speech, views::ViewController};
     use std::{cell::RefCell, rc::Rc};
 
@@ -537,6 +753,22 @@ mod tests {
         };
         let sr = ScreenReader::new(speech::Speech::new(Box::new(driver)));
         (sr, speaks)
+    }
+
+    fn enter(repl: &mut LuaReplView, sr: &mut ScreenReader, input: &[u8]) {
+        repl.handle_input(sr, input, &mut Vec::new())
+            .expect("enter REPL input");
+    }
+
+    fn finish_eval(repl: &mut LuaReplView, sr: &mut ScreenReader) {
+        for _ in 0..100 {
+            if !repl.wants_tick() {
+                return;
+            }
+            repl.tick(sr, &mut Vec::new())
+                .expect("resume Lua evaluation");
+        }
+        panic!("Lua evaluation did not finish");
     }
 
     #[test]
@@ -611,7 +843,164 @@ mod tests {
         let screen = repl.model().screen();
         assert!(screen.contents_between(0, 0, 0, 30).starts_with(CLOSE_HINT));
         assert!(!screen.contents_between(1, 0, 1, 30).contains("alpha"));
+        assert!(screen.contents().contains("Lua REPL ready."));
         assert!(screen.contents().contains("> "));
+    }
+
+    #[test]
+    fn lua_parser_drives_statement_and_expression_continuation() {
+        let mut repl = LuaReplView::new(10, 40, Vec::new()).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+
+        enter(&mut repl, &mut sr, b"function foo()\r");
+        assert!(repl.model().screen().contents().contains("... "));
+        enter(&mut repl, &mut sr, b"return 41 +\r");
+        assert!(repl.model().screen().contents().contains("... "));
+        enter(&mut repl, &mut sr, b"1\r");
+        assert!(repl.model().screen().contents().contains("... "));
+        enter(&mut repl, &mut sr, b"end\r");
+        finish_eval(&mut repl, &mut sr);
+
+        assert_eq!(
+            repl.history(),
+            ["function foo()\nreturn 41 +\n1\nend".to_string()]
+        );
+
+        enter(&mut repl, &mut sr, b"foo()\r");
+        finish_eval(&mut repl, &mut sr);
+        let contents = repl.model().screen().contents();
+        assert!(contents.lines().any(|line| line.trim() == "42"));
+        assert!(contents.contains("> "));
+    }
+
+    #[test]
+    fn lua_parser_classifies_general_incomplete_constructs() {
+        let session = LuaReplSession::new(Vec::new()).expect("create Lua session");
+        let state = session.state.borrow();
+
+        for source in [
+            "if true then",
+            "repeat\nlocal value = 1",
+            "local value = {",
+            "local value = [[unterminated",
+            "1 +",
+        ] {
+            assert!(
+                matches!(
+                    classify_input(&state.lua, &state.env, source).expect("classify Lua"),
+                    CompileOutcome::Incomplete
+                ),
+                "source={source:?}"
+            );
+        }
+        assert!(matches!(
+            classify_input(&state.lua, &state.env, "local = 1").expect("classify invalid Lua"),
+            CompileOutcome::Error(_)
+        ));
+    }
+
+    #[test]
+    fn lua_repl_ctrl_c_aborts_continuation_without_history_or_lua_changes() {
+        let mut repl = LuaReplView::new(10, 50, Vec::new()).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+
+        enter(&mut repl, &mut sr, b"function abandoned()\r");
+        enter(&mut repl, &mut sr, b"return 7");
+        enter(&mut repl, &mut sr, b"\x03");
+        let contents = repl.model().screen().contents();
+        assert!(contents.contains("> "));
+        assert!(!contents.contains("function abandoned"));
+        assert!(repl.history().is_empty());
+
+        enter(&mut repl, &mut sr, b"abandoned == nil\r");
+        finish_eval(&mut repl, &mut sr);
+        assert!(
+            repl.model()
+                .screen()
+                .contents()
+                .lines()
+                .any(|line| line.trim() == "true")
+        );
+    }
+
+    #[test]
+    fn lua_repl_ctrl_l_preserves_pending_and_current_input() {
+        let mut repl = LuaReplView::new(10, 50, Vec::new()).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+        repl.append_output("old output");
+        repl.render_full();
+
+        enter(&mut repl, &mut sr, b"function kept()\r");
+        enter(&mut repl, &mut sr, b"return 9");
+        enter(&mut repl, &mut sr, b"\x0c");
+
+        let contents = repl.model().screen().contents();
+        assert!(contents.contains("Lua REPL ready."));
+        assert!(!contents.contains("old output"));
+        assert!(contents.contains("> function kept()"));
+        assert!(contents.contains("... return 9"));
+    }
+
+    #[test]
+    fn lua_repl_ctrl_l_preserves_main_prompt_draft() {
+        let mut repl = LuaReplView::new(8, 40, Vec::new()).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+        repl.append_output("old output");
+        repl.render_full();
+
+        enter(&mut repl, &mut sr, b"not submitted");
+        enter(&mut repl, &mut sr, b"\x0c");
+
+        let contents = repl.model().screen().contents();
+        assert!(contents.contains("Lua REPL ready."));
+        assert!(contents.contains("> not submitted"));
+        assert!(!contents.contains("old output"));
+    }
+
+    #[test]
+    fn lua_repl_ctrl_u_clears_only_the_current_line() {
+        let mut repl = LuaReplView::new(10, 50, Vec::new()).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+
+        enter(&mut repl, &mut sr, b"function kept()\r");
+        enter(&mut repl, &mut sr, b"discard me");
+        enter(&mut repl, &mut sr, b"\x15");
+
+        let contents = repl.model().screen().contents();
+        assert!(contents.contains("> function kept()"));
+        assert!(contents.contains("... "));
+        assert!(!contents.contains("discard me"));
+    }
+
+    #[test]
+    fn lua_repl_session_restores_transcript_draft_continuation_and_environment() {
+        let session = LuaReplSession::new(Vec::new()).expect("create Lua session");
+        let mut first = LuaReplView::from_session(12, 60, session.clone());
+        let (mut sr, _speaks) = make_screen_reader();
+
+        enter(&mut first, &mut sr, b"saved = 12\r");
+        finish_eval(&mut first, &mut sr);
+        enter(&mut first, &mut sr, b"function pending()\r");
+        enter(&mut first, &mut sr, b"return saved");
+        drop(first);
+
+        let mut reopened = LuaReplView::from_session(12, 60, session);
+        let contents = reopened.model().screen().contents();
+        assert!(contents.contains("> saved = 12"));
+        assert!(contents.contains("> function pending()"));
+        assert!(contents.contains("... return saved"));
+
+        enter(&mut reopened, &mut sr, b"\x03");
+        enter(&mut reopened, &mut sr, b"saved\r");
+        finish_eval(&mut reopened, &mut sr);
+        assert!(
+            reopened
+                .model()
+                .screen()
+                .contents()
+                .lines()
+                .any(|line| line.trim() == "12")
+        );
     }
 
     #[test]
