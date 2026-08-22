@@ -570,12 +570,13 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         let event = key.event();
-        let (child_kitty_keyboard_flags, application_cursor, application_keypad) = {
+        let (child_kitty_keyboard_flags, application_cursor, application_keypad, screen_identity) = {
             let screen = self.view_stack.active_mut().model().live_screen();
             (
                 screen.kitty_keyboard_flags(),
                 screen.application_cursor(),
                 screen.application_keypad(),
+                screen.screen,
             )
         };
         let kitty_press_mode =
@@ -587,12 +588,8 @@ impl App {
         {
             sr.set_pending_history_navigation();
         }
-        if !key.is_release()
-            && let Some(text) = key.text()
-        {
-            for character in text.chars() {
-                sr.record_forwarded_character(character);
-            }
+        if !key.is_release() {
+            sr.record_forwarded_key(key.text().as_deref(), screen_identity);
         }
         let input = if child_kitty_keyboard_flags == 0 {
             key.legacy_child_bytes(input, application_cursor, application_keypad)

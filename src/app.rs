@@ -76,6 +76,7 @@ const ADAPTIVE_DIFF_MARGIN: u16 = 4;
 const ADAPTIVE_DIFF_DECAY: u16 = 2;
 const ADAPTIVE_DIFF_CLEAN_BURSTS: u8 = 3;
 const LATE_CONTINUATION_WINDOW_MS: u128 = 100;
+const SEMANTIC_INPUT_REPAINT_SETTLE_MS: u128 = 120;
 const ESC_TIMEOUT_MS: u128 = 50;
 static ANSI_CSI_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$")
@@ -87,6 +88,14 @@ fn synchronize_pending_review_cursor(sr: &mut ScreenReader, view: &mut View) -> 
         let old = view.review_cursor_position();
         view.follow_application_cursor();
         sr.hook_on_review_cursor_move(old, view.review_cursor_position())?;
+    }
+    Ok(())
+}
+
+fn prepare_review_cursor_for_active_context(sr: &mut ScreenReader, view: &mut View) -> Result<()> {
+    let (old, new) = view.prepare_review_cursor_for_activation();
+    if old != new {
+        sr.hook_on_review_cursor_move(old, new)?;
     }
     Ok(())
 }
@@ -129,10 +138,9 @@ mod stabilization_tests {
         let update = PresentedUpdateStatus {
             explicitly_stable: true,
             completes_linear_output_record: true,
-            cursor_restored: true,
             ..PresentedUpdateStatus::default()
         };
-        let decision = stabilization_decision(400, burst(100, 390, 30), update, true, true);
+        let decision = stabilization_decision(400, burst(100, 390, 30), update, true);
         assert_eq!(
             decision,
             StabilizationDecision::BlockedByApplicationTransaction
@@ -148,11 +156,28 @@ mod stabilization_tests {
             ..PresentedUpdateStatus::default()
         };
         assert_eq!(
-            stabilization_decision(399, burst(100, 390, 8), update, false, false),
+            stabilization_decision(399, burst(100, 390, 8), update, false),
             StabilizationDecision::WaitUntil(400)
         );
         assert_eq!(
-            stabilization_decision(400, burst(100, 390, 8), update, false, false),
+            stabilization_decision(400, burst(100, 390, 8), update, false),
+            StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable)
+        );
+    }
+
+    #[test]
+    fn structural_semantic_input_repaint_waits_for_a_later_interface_frame() {
+        let update = PresentedUpdateStatus {
+            explicitly_stable: true,
+            structural_semantic_input_repaint: true,
+            ..PresentedUpdateStatus::default()
+        };
+        assert_eq!(
+            stabilization_decision(219, burst(100, 120, 8), update, false),
+            StabilizationDecision::WaitUntil(220)
+        );
+        assert_eq!(
+            stabilization_decision(220, burst(100, 120, 8), update, false),
             StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable)
         );
     }
@@ -162,23 +187,22 @@ mod stabilization_tests {
         let mut update = PresentedUpdateStatus {
             explicitly_stable: true,
             completes_linear_output_record: true,
-            cursor_restored: true,
             ..PresentedUpdateStatus::default()
         };
         let current_burst = burst(100, 190, 30);
         assert_eq!(
-            stabilization_decision(200, current_burst, update, false, true),
+            stabilization_decision(200, current_burst, update, false),
             StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable)
         );
         update.explicitly_stable = false;
         assert_eq!(
-            stabilization_decision(200, current_burst, update, false, true),
+            stabilization_decision(200, current_burst, update, false),
             StabilizationDecision::Commit(StabilizationCommitReason::LinearOutputRecord)
         );
         update.completes_linear_output_record = false;
         assert_eq!(
-            stabilization_decision(200, current_burst, update, false, true),
-            StabilizationDecision::Commit(StabilizationCommitReason::RecentInputCursorRestored)
+            stabilization_decision(200, current_burst, update, false),
+            StabilizationDecision::WaitUntil(220)
         );
     }
 
@@ -189,11 +213,11 @@ mod stabilization_tests {
             ..PresentedUpdateStatus::default()
         };
         assert_eq!(
-            stabilization_decision(399, burst(100, 120, 8), update, false, false),
+            stabilization_decision(399, burst(100, 120, 8), update, false),
             StabilizationDecision::WaitUntil(400)
         );
         assert_eq!(
-            stabilization_decision(400, burst(100, 120, 8), update, false, false),
+            stabilization_decision(400, burst(100, 120, 8), update, false),
             StabilizationDecision::Commit(StabilizationCommitReason::HardDeadline)
         );
     }
@@ -206,10 +230,10 @@ mod stabilization_tests {
         };
         let quiet_burst = burst(100, 120, 30);
         assert_eq!(
-            stabilization_decision(149, quiet_burst, update, false, false),
+            stabilization_decision(149, quiet_burst, update, false),
             StabilizationDecision::WaitUntil(150)
         );
-        let quiet = stabilization_decision(150, quiet_burst, update, false, false);
+        let quiet = stabilization_decision(150, quiet_burst, update, false);
         assert_eq!(
             quiet,
             StabilizationDecision::Commit(StabilizationCommitReason::QuietWindow)
@@ -221,11 +245,11 @@ mod stabilization_tests {
 
         let hard_burst = burst(100, 395, 30);
         assert_eq!(
-            stabilization_decision(399, hard_burst, update, false, false),
+            stabilization_decision(399, hard_burst, update, false),
             StabilizationDecision::WaitUntil(400)
         );
         assert_eq!(
-            stabilization_decision(400, hard_burst, update, false, false),
+            stabilization_decision(400, hard_burst, update, false),
             StabilizationDecision::Commit(StabilizationCommitReason::HardDeadline)
         );
     }
@@ -237,7 +261,7 @@ mod stabilization_tests {
             ..PresentedUpdateStatus::default()
         };
         assert_eq!(
-            stabilization_decision(400, burst(100, 370, 30), update, false, false),
+            stabilization_decision(400, burst(100, 370, 30), update, false),
             StabilizationDecision::Commit(StabilizationCommitReason::QuietWindow)
         );
         assert!(!StabilizationCommitReason::ExplicitlyStable.trains_adaptive_quiet(update));
@@ -363,11 +387,6 @@ mod stabilization_tests {
         let status = explicit.active_presented_update_status();
         assert!(status.finalization_pending);
         assert!(status.explicitly_stable);
-
-        let mut cursor = app_with_presented_update(b"\x1b[?25lworking\x1b[?25h");
-        let status = cursor.active_presented_update_status();
-        assert!(status.finalization_pending);
-        assert!(status.cursor_restored);
 
         let mut prompt = app_with_presented_update(b"\x1b]133;A\x07prompt");
         let status = prompt.active_presented_update_status();
@@ -511,11 +530,7 @@ mod stabilization_tests {
 }
 
 fn speak_application_cursor_line(sr: &mut ScreenReader, view: &View) -> Result<()> {
-    let line = view.line(view.screen().cursor_position().0);
-    if line.trim().is_empty() {
-        return Ok(());
-    }
-    sr.speak(&line, false)?;
+    sr.speak_application_cursor_line(view)?;
     Ok(())
 }
 
@@ -532,10 +547,10 @@ struct PresentedUpdateStatus {
     application_transaction_open: bool,
     explicitly_stable: bool,
     completes_linear_output_record: bool,
-    cursor_restored: bool,
     prompt_transaction_open: bool,
     parser_continuation: bool,
     adaptive_quiet_trainable: bool,
+    structural_semantic_input_repaint: bool,
 }
 
 fn adaptive_quiet_is_trainable(update: &UpdateSummary) -> bool {
@@ -543,6 +558,29 @@ fn adaptive_quiet_is_trainable(update: &UpdateSummary) -> bool {
         && !update.parser_continuation
         && update.screen_before == update.screen_after
         && !update.changed_rows.is_empty()
+}
+
+fn structural_semantic_input_repaint_needs_settling(view: &View, update: &UpdateSummary) -> bool {
+    if !update.output_report_structural
+        || update.semantic_input_boundary
+        || !view.accessibility_semantic_input_active()
+    {
+        return false;
+    }
+    let hinted_rows = update.changed_rows.iter().fold(0usize, |count, rows| {
+        count.saturating_add(usize::from(
+            rows.end().saturating_sub(*rows.start()).saturating_add(1),
+        ))
+    });
+    if hinted_rows > 0 {
+        hinted_rows == 1
+    } else {
+        // Renderer damage hints may be discarded under backpressure. Retained
+        // stream provenance still identifies a local cursor-line rewrite;
+        // a TUI which prints rows and then places its cursor is ready for the
+        // interface classifier instead of this settling gate.
+        update.line_feed_boundaries == 0 && update.cursor_operations_after_last_line_feed <= 1
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -556,7 +594,6 @@ struct StabilizationBurst {
 enum StabilizationCommitReason {
     ExplicitlyStable,
     LinearOutputRecord,
-    RecentInputCursorRestored,
     QuietWindow,
     HardDeadline,
 }
@@ -566,7 +603,6 @@ impl StabilizationCommitReason {
         match self {
             Self::ExplicitlyStable => "explicitly-stable",
             Self::LinearOutputRecord => "linear-output-record",
-            Self::RecentInputCursorRestored => "recent-input-cursor-restored",
             Self::QuietWindow => "quiet-window",
             Self::HardDeadline => "hard-deadline",
         }
@@ -606,7 +642,6 @@ fn stabilization_decision(
     burst: StabilizationBurst,
     update: PresentedUpdateStatus,
     application_transaction_open: bool,
-    recent_input: bool,
 ) -> StabilizationDecision {
     if application_transaction_open {
         return StabilizationDecision::BlockedByApplicationTransaction;
@@ -618,14 +653,18 @@ fn stabilization_decision(
     if update.prompt_transaction_open && now_ms < hard_deadline {
         return StabilizationDecision::WaitUntil(hard_deadline);
     }
+    let semantic_repaint_deadline = burst
+        .first_output_ms
+        .saturating_add(SEMANTIC_INPUT_REPAINT_SETTLE_MS)
+        .min(hard_deadline);
+    if update.structural_semantic_input_repaint && now_ms < semantic_repaint_deadline {
+        return StabilizationDecision::WaitUntil(semantic_repaint_deadline);
+    }
     if update.explicitly_stable {
         return StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable);
     }
     if update.completes_linear_output_record {
         return StabilizationDecision::Commit(StabilizationCommitReason::LinearOutputRecord);
-    }
-    if recent_input && update.cursor_restored {
-        return StabilizationDecision::Commit(StabilizationCommitReason::RecentInputCursorRestored);
     }
     if update.parser_continuation {
         return if now_ms >= hard_deadline {
@@ -1688,7 +1727,12 @@ impl App {
         if !view.accessibility_has_unfinalized_presentation() {
             return PresentedUpdateStatus::default();
         }
-        let parser_continuation = view.accessibility_update_summary().parser_continuation;
+        let update = view.accessibility_update_summary();
+        let parser_continuation = update.parser_continuation;
+        let output_report_structural = update.output_report_structural;
+        let adaptive_quiet_trainable = adaptive_quiet_is_trainable(update);
+        let structural_semantic_input_repaint = output_report_structural
+            && structural_semantic_input_repaint_needs_settling(view, update);
         PresentedUpdateStatus {
             context: Some(AccessibilityContext {
                 view_id: logical_view,
@@ -1698,12 +1742,10 @@ impl App {
             application_transaction_open: view.screen().modes.synchronized_output,
             explicitly_stable: view.accessibility_presentation_explicitly_stable(),
             completes_linear_output_record: view.accessibility_completes_linear_output_record(),
-            cursor_restored: view.accessibility_presentation_cursor_restored(),
             prompt_transaction_open: view.accessibility_prompt_transaction_open(),
             parser_continuation,
-            adaptive_quiet_trainable: adaptive_quiet_is_trainable(
-                view.accessibility_update_summary(),
-            ),
+            adaptive_quiet_trainable,
+            structural_semantic_input_repaint,
         }
     }
 
@@ -1981,7 +2023,6 @@ impl App {
             .map(|last_at| last_at.saturating_add(ESC_TIMEOUT_MS));
         let presented_update = self.active_presented_update_status();
         let now_ms = self.clock.now_ms();
-        let recent_input = stabilization_input_is_recent(now_ms, self.last_stdin_update);
         let accessibility_deadline = if presented_update.finalization_pending {
             presented_update
                 .context
@@ -1992,7 +2033,6 @@ impl App {
                         burst,
                         presented_update,
                         presented_update.application_transaction_open,
-                        recent_input,
                     )
                     .deadline_ms(now_ms)
                 })

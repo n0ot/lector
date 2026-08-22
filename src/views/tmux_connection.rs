@@ -720,6 +720,46 @@ mod tests {
         connection
     }
 
+    fn topology_with_two_windows(active_window: u64) -> TmuxTopology {
+        let lines = [
+            b"S\t$1\twork".to_vec(),
+            format!(
+                "W\t$1\t@10\t1\t{}\taaaa,20x4,0,0,20\taaaa,20x4,0,0,20\t{}\tleft",
+                usize::from(active_window == 10),
+                if active_window == 10 { "*" } else { "" }
+            )
+            .into_bytes(),
+            format!(
+                "W\t$1\t@11\t2\t{}\tbbbb,20x4,0,0,30\tbbbb,20x4,0,0,30\t{}\tright",
+                usize::from(active_window == 11),
+                if active_window == 11 { "*" } else { "" }
+            )
+            .into_bytes(),
+            b"P\t@10\t%20\t1\t1\t0\t0\t20\t4\t0\t0\t0\t1\t0\t0\t0\t0\t0\tleft-pane".to_vec(),
+            b"P\t@11\t%30\t1\t1\t0\t0\t20\t4\t0\t0\t0\t1\t0\t0\t0\t0\t0\tright-pane".to_vec(),
+            b"A\t$1".to_vec(),
+        ];
+        let mut topology = TmuxTopology::new(1);
+        topology.replace_inventory(&lines).expect("topology");
+        topology
+    }
+
+    fn ready_two_window_connection() -> TmuxConnectionView {
+        let topology = topology_with_two_windows(10);
+        let mut connection = TmuxConnectionView::new(4, 20, 1);
+        for request in connection.sync_topology(&topology).expect("sync topology") {
+            connection
+                .apply_bootstrap(
+                    request.pane_id,
+                    CommandStatus::Success,
+                    &[format!("pane {}", request.pane_id.0).into_bytes()],
+                    0,
+                )
+                .expect("bootstrap");
+        }
+        connection
+    }
+
     #[test]
     fn switching_away_and_back_drops_stale_active_update_metadata() {
         let mut connection = ready_connection();
@@ -839,5 +879,83 @@ mod tests {
                 .to_string();
             assert_eq!(cached, direct);
         }
+    }
+
+    #[test]
+    fn active_panes_restore_their_independent_review_cursors() {
+        let mut connection = ready_connection();
+        let left = connection
+            .panes
+            .pane_view_mut(PaneId(20))
+            .expect("left pane");
+        left.prepare_review_cursor_for_activation();
+        left.set_review_cursor_position((0, 1));
+
+        let right_active =
+            topology_with_layout(SPLIT_LAYOUT, SPLIT_LAYOUT, Some(PaneId(21)), "right");
+        connection
+            .sync_topology(&right_active)
+            .expect("activate right pane");
+        let right = connection
+            .panes
+            .pane_view_mut(PaneId(21))
+            .expect("right pane");
+        right.prepare_review_cursor_for_activation();
+        right.set_review_cursor_position((0, 2));
+
+        let left_active =
+            topology_with_layout(SPLIT_LAYOUT, SPLIT_LAYOUT, Some(PaneId(20)), "left");
+        connection
+            .sync_topology(&left_active)
+            .expect("reactivate left pane");
+        let left = connection
+            .panes
+            .pane_view_mut(PaneId(20))
+            .expect("left pane");
+        left.prepare_review_cursor_for_activation();
+        assert_eq!(left.review_cursor_position(), (0, 1));
+
+        let right = connection
+            .panes
+            .pane_view_mut(PaneId(21))
+            .expect("right pane");
+        assert_eq!(right.review_cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn active_tmux_windows_restore_their_independent_review_cursors() {
+        let mut connection = ready_two_window_connection();
+        let first = connection
+            .panes
+            .pane_view_mut(PaneId(20))
+            .expect("first window pane");
+        first.prepare_review_cursor_for_activation();
+        first.set_review_cursor_position((0, 1));
+
+        connection
+            .sync_topology(&topology_with_two_windows(11))
+            .expect("activate second window");
+        let second = connection
+            .panes
+            .pane_view_mut(PaneId(30))
+            .expect("second window pane");
+        second.prepare_review_cursor_for_activation();
+        second.set_review_cursor_position((0, 2));
+
+        connection
+            .sync_topology(&topology_with_two_windows(10))
+            .expect("reactivate first window");
+        let first = connection
+            .panes
+            .pane_view_mut(PaneId(20))
+            .expect("first window pane");
+        first.prepare_review_cursor_for_activation();
+        assert_eq!(first.review_cursor_position(), (0, 1));
+
+        let second = connection
+            .panes
+            .pane_view_mut(PaneId(30))
+            .expect("second window pane");
+        assert_eq!(second.review_cursor_position(), (0, 2));
     }
 }

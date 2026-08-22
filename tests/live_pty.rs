@@ -498,6 +498,13 @@ impl LiveLector {
         }
     }
 
+    fn pump_for(&mut self, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            self.pump_output(remaining.min(Duration::from_millis(5)));
+        }
+    }
+
     fn send(&mut self, bytes: &[u8]) {
         // A real terminal consumes output and sends protocol replies
         // independently of the user's next keypress. Keep this single-threaded
@@ -1416,6 +1423,197 @@ fn direct_output_flood_does_not_starve_auto_read_toggle() {
         lector.finish(Duration::from_secs(3)),
         "Lector did not exit after interrupting yes"
     );
+}
+
+#[test]
+#[ignore = "manual stress test requiring the maintainer's Bash, fzf, and Neovim setup"]
+fn actual_bash_fzf_and_neovim_behave_under_repeated_interactive_input() {
+    let _serial = serialize_live_pty_test();
+    let mut lector = LiveLector::spawn_with_config(
+        Path::new("/bin/bash"),
+        &fixture("tests/fixtures/pty/proc-speech-suppress.lua"),
+    );
+    lector.pump_for(Duration::from_secs(2));
+
+    let mut unexpected_fzf_speech = Vec::new();
+    for iteration in 0..100 {
+        lector.send(b"\x15");
+        lector.pump_for(Duration::from_millis(10));
+        lector.clear_speech_logs();
+        lector.send(b"\x12");
+        lector.pump_for(Duration::from_millis(if iteration == 0 {
+            500
+        } else {
+            80 + iteration % 41
+        }));
+        let speech = lector
+            .outer_speech()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<String>(line).ok())
+            .collect::<Vec<_>>();
+        if speech.as_slice() != [" greater "] {
+            unexpected_fzf_speech.push((iteration, speech));
+        }
+        lector.clear_speech_logs();
+        lector.send(b"\x1b");
+        lector.pump_for(Duration::from_millis(150));
+        lector.clear_speech_logs();
+    }
+    eprintln!("unexpected fzf speech samples: {unexpected_fzf_speech:#?}");
+
+    drop(lector);
+    let mut lector = LiveLector::spawn_with_config(
+        Path::new("/bin/bash"),
+        &fixture("tests/fixtures/pty/proc-speech-suppress.lua"),
+    );
+    lector.pump_for(Duration::from_secs(2));
+
+    let mut alternate_screen_launch_speech = Vec::new();
+    let mut alternate_screen_return_speech = Vec::new();
+    for iteration in 0..20 {
+        lector.send(b"\x15");
+        lector.clear_speech_logs();
+        lector.send(b"nvim ~/.bashrc\r");
+        assert!(
+            lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+                physical_screen_contains(terminal, "shellcheck shell=bash")
+            }),
+            "Neovim did not show .bashrc on iteration {iteration}"
+        );
+        lector.pump_for(Duration::from_millis(300));
+        alternate_screen_launch_speech.push(lector.outer_speech());
+
+        lector.send(b"\x1b");
+        lector.pump_for(Duration::from_millis(100));
+        lector.clear_speech_logs();
+        lector.send(b":q!\r");
+        lector.pump_for(Duration::from_millis(300));
+        alternate_screen_return_speech.push(lector.outer_speech());
+        lector.clear_speech_logs();
+    }
+    eprintln!("Neovim .bashrc launch speech: {alternate_screen_launch_speech:#?}");
+    eprintln!("Neovim .bashrc return speech: {alternate_screen_return_speech:#?}");
+    let expected_launch_speech = alternate_screen_launch_speech
+        .first()
+        .expect("at least one alternate-screen launch");
+    assert!(
+        expected_launch_speech.contains("shellcheck shell equals bash"),
+        "Neovim did not read the .bashrc cursor line"
+    );
+    assert!(
+        alternate_screen_launch_speech
+            .iter()
+            .all(|speech| speech == expected_launch_speech),
+        "Neovim alternate-screen launches produced inconsistent speech"
+    );
+    assert!(
+        alternate_screen_return_speech.iter().all(String::is_empty),
+        "Neovim alternate-screen returns spoke restored or typed content"
+    );
+
+    lector.send(b"\x15");
+    for byte in b"nvim --clean" {
+        lector.send(&[*byte]);
+    }
+    lector.send(b"\r");
+    assert!(
+        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+            physical_screen_contains(terminal, "[No Name]")
+        }),
+        "Neovim did not become visible; screen={:?}",
+        lector
+            .physical_terminal
+            .snapshot()
+            .rows
+            .iter()
+            .map(|row| row.text())
+            .collect::<Vec<_>>()
+    );
+    lector.pump_for(Duration::from_secs(1));
+    lector.clear_speech_logs();
+    lector.send_now(b"a");
+    // Keep the first inserted character in the same unsettled input/output
+    // window as the append command. This is the intermittent case that used
+    // to announce the initial `T` while the alternate-screen redraw arrived.
+    lector.send_now(b"T");
+    const WORDS: &[u8] = b"his is a test alpha beta gamma delta ";
+    for iteration in 0..3_200 {
+        let byte = WORDS[iteration % WORDS.len()];
+        lector.send_now(&[byte]);
+        if iteration < 1_200 {
+            lector.pump_for(Duration::from_millis(3 + (iteration % 7) as u64));
+        } else if iteration % 13 == 0 {
+            lector.pump_for(Duration::from_millis((iteration % 5) as u64));
+        }
+    }
+    lector.pump_for(Duration::from_secs(2));
+    let neovim_speech = lector.outer_speech();
+    eprintln!("Neovim speech: {neovim_speech:?}");
+
+    lector.send(b"\x1b");
+    lector.pump_for(Duration::from_millis(100));
+    lector.send(b":q!\r");
+    lector.pump_for(Duration::from_secs(1));
+    lector.send(b"exit\r");
+    assert!(lector.finish(Duration::from_secs(5)), "Lector did not exit");
+
+    assert!(
+        unexpected_fzf_speech.is_empty(),
+        "fzf did not consistently read only its application-cursor character"
+    );
+    assert!(
+        neovim_speech.is_empty(),
+        "Neovim spoke while suppressing typed-key echo"
+    );
+}
+
+#[test]
+#[ignore = "manual characterization requiring the maintainer's Neovim setup"]
+fn actual_neovim_separates_insert_mode_status_from_first_echo() {
+    let _serial = serialize_live_pty_test();
+    let mut lector = LiveLector::spawn_with_config(
+        Path::new("/bin/bash"),
+        &fixture("tests/fixtures/pty/proc-speech-suppress.lua"),
+    );
+    lector.pump_for(Duration::from_secs(2));
+    lector.clear_speech_logs();
+    lector.send(b"nvim\r");
+    assert!(
+        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+            physical_screen_contains(terminal, "[No Name]")
+        }),
+        "Neovim did not become visible"
+    );
+    lector.pump_for(Duration::from_secs(1));
+    for iteration in 0..40 {
+        lector.clear_speech_logs();
+        lector.send(b"a");
+        assert!(
+            lector.wait_for_physical_terminal(Duration::from_secs(1), |terminal| {
+                physical_screen_contains(terminal, "i [No Name]")
+            }),
+            "insert indicator did not become visible on iteration {iteration}"
+        );
+        lector.pump_for(Duration::from_millis(60 + (iteration % 7) * 17));
+        lector.send(b"T");
+        lector.pump_for(Duration::from_millis(250));
+        let speech = lector
+            .outer_speech()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<String>(line).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(speech.as_slice(), ["i"], "iteration {iteration} speech");
+
+        lector.send(b"\x1b");
+        lector.pump_for(Duration::from_millis(100));
+        lector.send(b"u");
+        lector.pump_for(Duration::from_millis(100));
+    }
+
+    lector.send(b":q!\r");
+    lector.pump_for(Duration::from_millis(300));
+    lector.send(b"exit\r");
+    assert!(lector.finish(Duration::from_secs(5)), "Lector did not exit");
 }
 
 #[test]

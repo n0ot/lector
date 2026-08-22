@@ -1,7 +1,6 @@
 use super::{Result, ScreenReader};
 use crate::view::View;
 use similar::{Algorithm, ChangeTag, TextDiff};
-use std::ops::RangeInclusive;
 
 #[derive(Default)]
 pub(super) struct AutoReadBuffers {
@@ -9,7 +8,8 @@ pub(super) struct AutoReadBuffers {
     graphemes: String,
     live_text: String,
     cursor_line: String,
-    changed_rows: Vec<RangeInclusive<u16>>,
+    interface_state: String,
+    interface_state_candidate: String,
     lcs: Vec<usize>,
 }
 
@@ -31,9 +31,19 @@ impl ScreenReader {
     }
 
     fn auto_read_impl(&mut self, view: &mut View, prefer_cursor: bool) -> Result<bool> {
-        self.report_application_cursor_indentation_changes(view)?;
-        let cursor_moves = view.accessibility_update_summary().cursor_operations;
-        let scrolled = view.accessibility_update_summary().scroll_operations > 0;
+        // Text entry can move an editor's application cursor between wrapped
+        // rows or onto a command line. Classify the pending echo before
+        // reporting that physical layout change as indentation. The queued
+        // text can still be awaiting its receipt when Enter is the newest key.
+        if !(prefer_cursor && (self.has_pending_key_echo() || self.key_echo_stream_active)) {
+            self.report_application_cursor_indentation_changes(view)?;
+        }
+        let update = view.accessibility_update_summary();
+        let cursor_moves = update.cursor_operations;
+        let line_feed_boundaries = update.line_feed_boundaries;
+        let cursor_operations_after_last_line_feed = update.cursor_operations_after_last_line_feed;
+        let scrolled = update.scroll_operations > 0;
+        let structural_repaint = update.output_report_structural && !scrolled;
         let linear_output_report = view
             .accessibility_update_summary()
             .has_linear_output_report();
@@ -86,7 +96,7 @@ impl ScreenReader {
             if screen_contents_unchanged {
                 let suppressed_echo = self.should_suppress_key_echo(&live_text);
                 self.auto_read_buffers.live_text = live_text;
-                return Ok(suppressed_echo);
+                return Ok(suppressed_echo || (prefer_cursor && self.key_echo_stream_active));
             }
         }
 
@@ -131,18 +141,12 @@ impl ScreenReader {
         }
         self.auto_read_buffers.live_text = live_text;
 
-        self.auto_read_buffers.changed_rows.clear();
-        self.auto_read_buffers.changed_rows.extend(
-            view.accessibility_update_summary()
-                .changed_rows
-                .iter()
-                .cloned(),
-        );
-
         let mut diff_text = std::mem::take(&mut self.auto_read_buffers.diff_text);
         diff_text.clear();
         let prev_cursor = view.prev_screen().cursor_position();
         let cursor = view.screen().cursor_position();
+        let cursor_shape_changed = view.prev_screen().cursor.shape != view.screen().cursor.shape;
+        let columns = usize::from(view.screen().size().1.max(1));
         let cursor_changed = cursor != prev_cursor;
         let (old_text, new_text, prev_hashes, curr_hashes) = view.full_contents_cached();
 
@@ -151,7 +155,12 @@ impl ScreenReader {
             && old_text == new_text
         {
             self.auto_read_buffers.diff_text = diff_text;
-            return Ok(false);
+            // Full-screen applications often close an acknowledged echo with
+            // a second synchronized transaction which only restores modes or
+            // cursor shape. Treat that receipt as handled while the validated
+            // echo stream is active; falling through to cursor tracking would
+            // announce a spurious indentation/layout change.
+            return Ok(prefer_cursor && self.key_echo_stream_active);
         }
 
         let cursor_row = usize::from(cursor.0);
@@ -159,44 +168,170 @@ impl ScreenReader {
             .get(cursor_row)
             .zip(curr_hashes.get(cursor_row))
             .is_some_and(|(prev, curr)| prev != curr);
-        let (single_changed_row, multiple_changed_rows) = if prev_hashes.len() == curr_hashes.len()
-        {
-            let mut changed_rows = self
-                .auto_read_buffers
-                .changed_rows
+        let prev_cursor_row = usize::from(prev_cursor.0);
+        let prev_cursor_row_changed = prev_hashes
+            .get(prev_cursor_row)
+            .zip(curr_hashes.get(prev_cursor_row))
+            .is_some_and(|(prev, curr)| prev != curr);
+        let (single_changed_row, changed_row_count) = if prev_hashes.len() == curr_hashes.len() {
+            // Presentation backpressure can deliberately discard renderer
+            // damage hints while retaining exact before/after snapshots. The
+            // snapshots are authoritative for accessibility: restricting this
+            // count to `changed_rows` made a full-screen redraw look like zero
+            // changed rows whenever those optional hints were unavailable.
+            let mut changed_rows = prev_hashes
                 .iter()
-                .flat_map(|range| range.clone())
-                .filter(|row| {
-                    prev_hashes.get(usize::from(*row)) != curr_hashes.get(usize::from(*row))
-                });
-            match (changed_rows.next(), changed_rows.next()) {
-                (Some(row), None) => (Some(row), false),
-                (_, Some(_)) => (None, true),
-                (None, None) => (None, false),
+                .zip(curr_hashes)
+                .enumerate()
+                .filter_map(|(row, (prev, curr))| (prev != curr).then_some(row as u16));
+            let first = changed_rows.next();
+            let count = first.is_some() as usize + changed_rows.count();
+            match (first, count) {
+                (Some(row), 1) => (Some(row), 1),
+                _ => (None, count),
             }
         } else {
-            (None, false)
+            (None, usize::MAX)
         };
-        // Full-screen applications commonly redraw a ruler or status line along with an
-        // inline edit. Keep the fine-grained insertion diff anchored to the cursor row in
-        // that case; otherwise the secondary row makes the update look like unrelated
-        // multi-line output and the whole edited line is announced.
-        let prefer_inline_cursor_row = prefer_cursor
-            && cursor_moves > 0
+        let multiple_changed_rows = changed_row_count > 1;
+        let interface_repaint = structural_repaint
+            && ((line_feed_boundaries == 0
+                && (prefer_cursor || multiple_changed_rows || cursor_shape_changed))
+                || (line_feed_boundaries > 0 && cursor_operations_after_last_line_feed > 0));
+        let pending_key_echo = self.has_pending_key_echo();
+        let pending_key_echo_count = self.pending_key_echo.len();
+        let cursor_advanced =
+            cursor.0 > prev_cursor.0 || (cursor.0 == prev_cursor.0 && cursor.1 > prev_cursor.1);
+        let previous_cursor_offset = usize::from(prev_cursor.0)
+            .saturating_mul(columns)
+            .saturating_add(usize::from(prev_cursor.1));
+        let cursor_offset = usize::from(cursor.0)
+            .saturating_mul(columns)
+            .saturating_add(usize::from(cursor.1));
+        let cursor_matches_initial_echo = cursor_offset >= previous_cursor_offset
+            && cursor_offset - previous_cursor_offset <= pending_key_echo_count;
+        let input_echo_row = if prefer_cursor
+            && pending_key_echo
+            && !scrolled
+            && multiple_changed_rows
+            && (self.key_echo_stream_active || cursor_matches_initial_echo)
+        {
+            if cursor_row_changed {
+                Some(cursor.0)
+            } else if cursor.0 > prev_cursor.0 && prev_cursor_row_changed {
+                // Autowrap leaves the application cursor on the following
+                // blank row. The printable cell was committed on the row the
+                // cursor just left, so compare that row for exact echo.
+                Some(prev_cursor.0)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let input_echo_cursor_row = input_echo_row.is_some();
+        let unpainted_echo_advanced_cursor = prefer_cursor
+            && pending_key_echo
+            && self.key_echo_stream_active
+            && !scrolled
+            && cursor_advanced
+            && !cursor_row_changed
+            && !prev_cursor_row_changed;
+        if unpainted_echo_advanced_cursor {
+            // A trailing whitespace cell is visually indistinguishable from
+            // the blank cell it replaced, although a full-screen editor may
+            // repaint its ruler. Once exact preceding echoes established an
+            // active text-entry stream, cursor advancement is the physical
+            // receipt for this otherwise invisible echo.
+            self.auto_read_buffers.diff_text = diff_text;
+            return Ok(true);
+        }
+        let cursor_row_inline_edit = prefer_cursor
+            && cursor_changed
             && !scrolled
             && cursor.0 == prev_cursor.0
             && cursor.1 > prev_cursor.1
             && cursor_row_changed
             && multiple_changed_rows;
+        if interface_repaint
+            && cursor_shape_changed
+            && !cursor_row_changed
+            && !prev_cursor_row_changed
+        {
+            // Cursor shape is application-controlled terminal state. When it
+            // changes alongside status-only painting, the compact changed
+            // label describes a real interface-mode transition rather than a
+            // typed character at the application cursor. Keep any pending
+            // echo intact for a later cursor-row receipt.
+            let mut state = std::mem::take(&mut self.auto_read_buffers.interface_state);
+            let mut candidate =
+                std::mem::take(&mut self.auto_read_buffers.interface_state_candidate);
+            let has_state = collect_compact_interface_state_change(
+                old_text,
+                new_text,
+                prev_cursor_row,
+                cursor_row,
+                &mut state,
+                &mut candidate,
+                &mut self.auto_read_buffers.lcs,
+            );
+            let state_to_speak = if has_state {
+                self.hook_on_live_read(&state, cursor_moves, scrolled)?
+            } else {
+                None
+            };
+            self.auto_read_buffers.interface_state = state;
+            self.auto_read_buffers.interface_state_candidate = candidate;
+            if has_state {
+                self.auto_read_buffers.diff_text = diff_text;
+                if pending_key_echo {
+                    // The application has visibly acknowledged a mode change
+                    // without painting at its cursor. Treat that receipt as
+                    // the start of a text-entry echo stream, but retain every
+                    // queued character until exact cursor-row evidence
+                    // acknowledges it.
+                    self.key_echo_stream_active = true;
+                }
+                if let Some(text) = state_to_speak
+                    && !text.is_empty()
+                {
+                    self.speak(&text, false)?;
+                }
+                return Ok(true);
+            }
+        }
+        if interface_repaint
+            && !input_echo_cursor_row
+            && !cursor_row_inline_edit
+            && !(changed_row_count == 1 && (cursor_row_changed || prev_cursor_row_changed))
+        {
+            // Cursor-addressed painting without line boundaries describes an
+            // interface frame, not line-oriented command output. Do not read
+            // arbitrary changed rows. Cursor coordinates alone cannot report
+            // an interface whose application cursor happens to reuse the
+            // shell's previous coordinate, so read the cursor row directly.
+            self.auto_read_buffers.diff_text = diff_text;
+            if pending_key_echo || self.key_echo_stream_active {
+                return Ok(true);
+            }
+            self.speak_application_cursor_line(view)?;
+            return Ok(true);
+        }
+        // Full-screen applications commonly redraw a ruler or status line along with an
+        // inline edit. Keep the fine-grained insertion diff anchored to the cursor row in
+        // that case; otherwise the secondary row makes the update look like unrelated
+        // multi-line output and the whole edited line is announced.
+        let prefer_inline_cursor_row = input_echo_cursor_row || cursor_row_inline_edit;
+        let inline_row = usize::from(input_echo_row.unwrap_or(cursor.0));
         let (diff_old_text, diff_new_text) = if prefer_inline_cursor_row {
             (
                 old_text
                     .split_terminator('\n')
-                    .nth(cursor_row)
+                    .nth(inline_row)
                     .unwrap_or(""),
                 new_text
                     .split_terminator('\n')
-                    .nth(cursor_row)
+                    .nth(inline_row)
                     .unwrap_or(""),
             )
         } else {
@@ -278,8 +413,21 @@ impl ScreenReader {
             self.auto_read_buffers.graphemes = graphemes;
         }
 
-        let suppress_echo = self.should_suppress_key_echo(&diff_text);
+        let suppress_echo = if input_echo_cursor_row {
+            self.should_suppress_cursor_row_key_echo(&diff_text)
+        } else {
+            self.should_suppress_key_echo(&diff_text)
+        };
         if suppress_echo {
+            self.auto_read_buffers.diff_text = diff_text;
+            return Ok(true);
+        }
+        if input_echo_cursor_row && self.key_echo_stream_active && changed_row_count > 2 {
+            // When an editor scrolls a wrapped logical line, equal physical
+            // row numbers no longer identify equal logical text. Do not read
+            // the replacement viewport row after an established sequence of
+            // exact echo acknowledgements; ordinary command output is outside
+            // that sequence and continues through the normal diff path.
             self.auto_read_buffers.diff_text = diff_text;
             return Ok(true);
         }
@@ -293,6 +441,44 @@ impl ScreenReader {
         self.auto_read_buffers.diff_text = diff_text;
         Ok(original_nonempty)
     }
+}
+
+const MAX_COMPACT_INTERFACE_STATE_CHARS: usize = 32;
+
+fn collect_compact_interface_state_change(
+    old_text: &str,
+    new_text: &str,
+    old_cursor_row: usize,
+    new_cursor_row: usize,
+    out: &mut String,
+    candidate: &mut String,
+    lcs: &mut Vec<usize>,
+) -> bool {
+    out.clear();
+    candidate.clear();
+
+    let old_rows = old_text.split_terminator('\n');
+    let new_rows = new_text.split_terminator('\n');
+    for (row, (old_row, new_row)) in old_rows.zip(new_rows).enumerate() {
+        if old_row == new_row || row == old_cursor_row || row == new_cursor_row {
+            continue;
+        }
+
+        candidate.clear();
+        if !collect_inserted_fields(old_row, new_row, candidate, lcs) {
+            continue;
+        }
+        let compact = candidate.trim();
+        let compact_chars = compact.chars().count();
+        if compact_chars == 0 || compact_chars > MAX_COMPACT_INTERFACE_STATE_CHARS {
+            continue;
+        }
+        if out.is_empty() || compact_chars < out.chars().count() {
+            out.clear();
+            out.push_str(compact);
+        }
+    }
+    !out.is_empty()
 }
 
 fn cursor_logical_line_matches(view: &View, report: &str, line: &mut String) -> bool {

@@ -2,6 +2,7 @@ use super::{Result, ScreenReader};
 use crate::{
     ext::ScreenExt,
     presentation::{ViewId, ViewRevision},
+    terminal::Row,
     view::View,
 };
 use std::collections::HashSet;
@@ -27,15 +28,26 @@ pub(super) enum PendingDeleteKind {
     Backspace {
         cursor: (u16, u16),
         text: String,
+        row_before: Row,
     },
     Delete {
-        cursor: (u16, u16),
+        application_cursor: (u16, u16),
+        target_col: u16,
         text: String,
-        line_before: String,
+        row_before: Row,
     },
 }
 
 impl ScreenReader {
+    pub(crate) fn speak_application_cursor_line(&mut self, view: &View) -> Result<bool> {
+        let line = view.line(view.screen().cursor_position().0);
+        if line.trim().is_empty() || self.should_suppress_key_echo(&line) {
+            return Ok(false);
+        }
+        self.speak(&line, false)?;
+        Ok(true)
+    }
+
     pub fn track_cursor(&mut self, view: &mut View) -> Result<()> {
         let (prev_cursor, cursor) = (
             view.prev_screen().cursor_position(),
@@ -115,6 +127,9 @@ impl ScreenReader {
         if text.is_empty() {
             return;
         }
+        let Some(row_before) = view.screen().rows.get(usize::from(row)).cloned() else {
+            return;
+        };
         self.push_pending_delete(PendingDelete {
             view_id,
             revision_boundary,
@@ -124,6 +139,7 @@ impl ScreenReader {
             kind: PendingDeleteKind::Backspace {
                 cursor: (row, virtual_col),
                 text,
+                row_before,
             },
         });
     }
@@ -142,7 +158,8 @@ impl ScreenReader {
             })
             .and_then(|pending| match pending.kind {
                 PendingDeleteKind::Delete {
-                    cursor: (pending_row, pending_col),
+                    target_col: pending_col,
+                    application_cursor: (pending_row, _),
                     ..
                 } if pending_row == row && pending_col >= col => Some(pending_col - col + 1),
                 _ => None,
@@ -157,6 +174,9 @@ impl ScreenReader {
         if text.is_empty() {
             return;
         }
+        let Some(row_before) = view.screen().rows.get(usize::from(row)).cloned() else {
+            return;
+        };
         self.push_pending_delete(PendingDelete {
             view_id,
             revision_boundary,
@@ -164,11 +184,45 @@ impl ScreenReader {
             evaluations: 0,
             input_sequence: self.input_sequence,
             kind: PendingDeleteKind::Delete {
-                cursor: (row, virtual_col),
+                application_cursor: (row, col),
+                target_col: virtual_col,
                 text,
-                line_before: view.line(row),
+                row_before,
             },
         });
+    }
+
+    /// Whether a causally later, physically accessible frame contains a
+    /// complete deletion result. Cursor movement alone is insufficient:
+    /// terminals commonly receive a backspace echo as cursor-left, erase,
+    /// cursor-left across separate writes. Requiring the edited row and its
+    /// logical cursor position to agree keeps that partial frame behind the
+    /// ordinary stabilization window.
+    pub(crate) fn has_confirmed_pending_delete(&self, view: &View) -> bool {
+        if self.pending_deletes.is_empty()
+            || view.prev_screen().screen != view.screen().screen
+            || view.accessibility_screen_transition_pending()
+        {
+            return false;
+        }
+
+        let view_id = view.view_id();
+        let accessibility_revision = view.accessibility_revision();
+        let cursor = view.screen().cursor_position();
+        self.pending_deletes.iter().any(|intent| {
+            intent.view_id == view_id
+                && revision_passed(intent.revision_boundary, accessibility_revision)
+                && (accessibility_revision.is_none()
+                    || intent.last_evaluated_revision != accessibility_revision)
+                && pending_delete_is_confirmed(intent, view, cursor)
+        })
+    }
+
+    pub(crate) fn resolve_confirmed_pending_delete(&mut self, view: &View) -> Result<bool> {
+        if !self.has_confirmed_pending_delete(view) {
+            return Ok(false);
+        }
+        self.resolve_pending_delete(view)
     }
 
     pub fn resolve_pending_delete(&mut self, view: &View) -> Result<bool> {
@@ -199,16 +253,7 @@ impl ScreenReader {
                 continue;
             }
 
-            let confirmed = match &intent.kind {
-                PendingDeleteKind::Backspace {
-                    cursor: old_cursor, ..
-                } => cursor.0 == old_cursor.0 && cursor.1 < old_cursor.1,
-                PendingDeleteKind::Delete {
-                    cursor: (row, _),
-                    line_before,
-                    ..
-                } => view.line(*row) != *line_before,
-            };
+            let confirmed = pending_delete_is_confirmed(&intent, view, cursor);
             if confirmed {
                 spoken.push(match intent.kind {
                     PendingDeleteKind::Backspace { text, .. }
@@ -279,6 +324,38 @@ impl ScreenReader {
         }
         Ok(())
     }
+}
+
+fn pending_delete_is_confirmed(intent: &PendingDelete, view: &View, cursor: (u16, u16)) -> bool {
+    match &intent.kind {
+        PendingDeleteKind::Backspace {
+            cursor: old_cursor,
+            row_before,
+            ..
+        } => {
+            cursor.0 == old_cursor.0
+                && cursor.1 < old_cursor.1
+                && row_text_changed(row_before, view, old_cursor.0)
+        }
+        PendingDeleteKind::Delete {
+            application_cursor,
+            row_before,
+            ..
+        } => {
+            cursor == *application_cursor
+                && row_text_changed(row_before, view, application_cursor.0)
+        }
+    }
+}
+
+fn row_text_changed(before: &Row, view: &View, row: u16) -> bool {
+    let Some(after) = view.screen().rows.get(usize::from(row)) else {
+        return true;
+    };
+    before.cells.len() != after.cells.len()
+        || before.cells.iter().zip(after.cells.iter()).any(|(a, b)| {
+            a.contents() != b.contents() || a.is_wide_continuation() != b.is_wide_continuation()
+        })
 }
 
 fn revision_passed(

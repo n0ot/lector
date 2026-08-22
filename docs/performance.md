@@ -36,10 +36,14 @@ after the physical output flush succeeds.
 - Accessibility stabilization is boundary-first. A DEC 2026 close is carried
   with its exact render receipt and becomes readable immediately after that
   receipt flushes. An OSC 133 prompt-start marker holds prompt auto-read until
-  its `B` input boundary, which is another immediate semantic commit. After
-  recent user input, an update ending in a real hidden-to-visible cursor
-  transition is a conservative legacy redraw hint. Output after any boundary
-  uses ordinary stabilization again.
+  its `B` input boundary, which is another immediate semantic commit. Output
+  after either boundary uses ordinary stabilization again.
+- A confirmed Backspace or Delete result can be announced immediately after
+  its physical receipt without finalizing the surrounding accessibility
+  update. Confirmation requires both the expected logical cursor position and
+  a changed input row, so a split echo containing only the first cursor-left
+  operation remains behind the ordinary stabilization window. The complete
+  update retains its ordinary semantic or quiet-window boundary.
 - On the primary screen, a structurally safe print stream ending in LF or CRLF
   is another real boundary. After the matching physical receipt, Lector checks
   the completed logical record against the presented screen/history tail and
@@ -60,7 +64,9 @@ they share the complete-record path. An ordinary attached tmux client exposes
 tmux's rendered VT stream instead; an inner application's newline or
 alternate-screen boundary may be opaque there. Lector applies the same safety
 classifier to the stream it can observe, but otherwise relies on tmux's outer
-DEC 2026 transaction, cursor restoration, or the bounded quiet fallback.
+DEC 2026 transaction or the bounded quiet fallback. Cursor visibility is only
+a painting hint: applications such as fzf and Neovim can restore it in the
+middle of a larger redraw, so it is deliberately not a speech boundary.
 Control mode adds parsing and `send-keys -H` routing, but no timer-based delay.
 
 ## Regression and latency gates

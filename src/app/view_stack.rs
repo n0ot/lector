@@ -765,15 +765,8 @@ impl App {
         };
         let now_ms = self.clock.now_ms();
         let view = self.view_stack.active_mut().model();
+        prepare_review_cursor_for_active_context(sr, view)?;
         view.with_live_screen(|view| -> Result<()> {
-            if sr.review_follows_screen_cursor()
-                && (view.scrollback() != 0
-                    || view.review_cursor_position() != view.screen().cursor_position())
-            {
-                let old = view.review_cursor_position();
-                view.follow_application_cursor();
-                sr.hook_on_review_cursor_move(old, view.review_cursor_position())?;
-            }
             if let Some(title) = &title {
                 sr.speak(title, false)?;
             }
@@ -801,16 +794,26 @@ impl App {
         } else {
             self.view_stack.active_mut().model()
         };
+        let presented_screen_identity_changed = view.prev_screen().screen != view.screen().screen;
+        if presented_screen_identity_changed {
+            sr.retain_pending_key_echo_for_screen(view.screen().screen);
+            prepare_review_cursor_for_active_context(sr, view)?;
+        }
         view.with_live_screen(|view| -> Result<()> {
-            let screen_transition = view.prev_screen().screen != view.screen().screen
-                || view.accessibility_screen_transition_pending();
+            let screen_identity_changed = view.prev_screen().screen != view.screen().screen;
+            let screen_transition =
+                screen_identity_changed || view.accessibility_screen_transition_pending();
             let screen_transition_stable =
                 screen_transition && view.screen().has_visible_non_whitespace_content();
             if screen_transition {
                 // Primary and alternate screens are separate accessibility
-                // contexts. Read the new cursor row and let finalization below
-                // establish it as the next auto-read diff baseline.
-                speak_application_cursor_line(sr, view)?;
+                // contexts. Do not let an acknowledgement from one context
+                // suppress text in the next. A restored primary screen is
+                // already-heard content, while a settled alternate screen is
+                // a new reading context.
+                if view.screen().screen == crate::terminal::ScreenIdentity::Alternate {
+                    speak_application_cursor_line(sr, view)?;
+                }
             } else {
                 let mut read_text = sr.resolve_pending_delete(view)?;
                 let auto_read_text = if sr.auto_read_enabled() {

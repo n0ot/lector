@@ -324,6 +324,15 @@ mod tests {
         );
         assert_eq!(shifted.text().as_deref(), Some("_"));
 
+        let terminput::Event::Key(uppercase_event) = terminput::Event::parse_from(b"T")
+            .expect("parse uppercase legacy key")
+            .expect("uppercase key event")
+        else {
+            panic!("uppercase input was not a key event");
+        };
+        let uppercase = KeyInput::new(uppercase_event, b"T");
+        assert_eq!(uppercase.text().as_deref(), Some("T"));
+
         for (ch, modifiers, expected) in [
             ('a', KeyModifiers::CTRL, 0x01),
             ('A', KeyModifiers::CTRL | KeyModifiers::SHIFT, 0x01),

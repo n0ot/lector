@@ -3178,7 +3178,7 @@ impl App {
             .active_tmux_connection_mut()
             .is_some_and(|view| view.is_ready() && !view.is_showing_portal());
         let overlay_active = !tmux_base_active && self.view_stack.has_overlay();
-        let (accessibility_blocked, update_status) = if presentation_tracking {
+        let (accessibility_blocked, mut update_status) = if presentation_tracking {
             (
                 presented_update.application_transaction_open,
                 presented_update,
@@ -3190,9 +3190,11 @@ impl App {
                 self.view_stack.root_mut().model()
             };
             let update = view.accessibility_update_summary();
-            let cursor_restored = update.cursor_visibility_restored;
             let parser_continuation = update.parser_continuation;
+            let output_report_structural = update.output_report_structural;
             let adaptive_quiet_trainable = adaptive_quiet_is_trainable(update);
+            let structural_semantic_input_repaint = output_report_structural
+                && structural_semantic_input_repaint_needs_settling(view, update);
             let context = AccessibilityContext {
                 view_id: view.view_id(),
                 screen: view.screen().screen,
@@ -3204,10 +3206,10 @@ impl App {
                     application_transaction_open: view.application_transaction_open(),
                     completes_linear_output_record: view
                         .accessibility_completes_linear_output_record(),
-                    cursor_restored,
                     prompt_transaction_open: view.accessibility_prompt_transaction_open(),
                     parser_continuation,
                     adaptive_quiet_trainable,
+                    structural_semantic_input_repaint,
                     ..PresentedUpdateStatus::default()
                 },
             )
@@ -3215,20 +3217,41 @@ impl App {
         let context = update_status
             .context
             .expect("an active accessibility update has a stabilization context");
+        if sr.has_pending_history_navigation() {
+            update_status.structural_semantic_input_repaint = false;
+        }
         let Some(burst) = self.stabilization_burst(context) else {
             return Ok(false);
         };
+        if !overlay_active
+            && !accessibility_blocked
+            && !update_status.prompt_transaction_open
+            && !update_status.parser_continuation
+        {
+            let (announced, revision) = {
+                let view = if presentation_tracking {
+                    self.presented_accessibility_model_mut()
+                } else if tmux_base_active {
+                    self.view_stack.active_mut().model()
+                } else {
+                    self.view_stack.root_mut().model()
+                };
+                (
+                    sr.resolve_confirmed_pending_delete(view)?,
+                    view.accessibility_revision(),
+                )
+            };
+            if announced {
+                self.log_latency_stage("delete-announced", || {
+                    format!("view_id={} revision={revision:?}", context.view_id.0)
+                });
+            }
+        }
         // Application-declared boundaries are carried by the exact presented
         // frame. The shared decision table therefore sees them only after the
         // scheduler's physical receipt and cannot commit a draw in progress.
         let recent_input = stabilization_input_is_recent(now_ms, self.last_stdin_update);
-        let decision = stabilization_decision(
-            now_ms,
-            burst,
-            update_status,
-            accessibility_blocked,
-            recent_input,
-        );
+        let decision = stabilization_decision(now_ms, burst, update_status, accessibility_blocked);
         if let StabilizationDecision::Commit(commit_reason) = decision {
             self.log_latency_stage("accessibility-finalization-start", || {
                 format!(
@@ -3246,18 +3269,30 @@ impl App {
             } else {
                 self.view_stack.root_mut().model()
             };
+            let presented_screen_identity_changed =
+                view.prev_screen().screen != view.screen().screen;
+            if !overlay_active && presented_screen_identity_changed {
+                sr.retain_pending_key_echo_for_screen(view.screen().screen);
+                prepare_review_cursor_for_active_context(sr, view)?;
+            }
             let mut screen_transition_observed = false;
             view.with_live_screen(|view| -> Result<()> {
-                let screen_transition = view.prev_screen().screen != view.screen().screen
-                    || view.accessibility_screen_transition_pending();
+                let screen_identity_changed = view.prev_screen().screen != view.screen().screen;
+                let screen_transition =
+                    screen_identity_changed || view.accessibility_screen_transition_pending();
                 screen_transition_observed = screen_transition;
                 let screen_transition_stable =
                     screen_transition && view.screen().has_visible_non_whitespace_content();
                 if !overlay_active && screen_transition {
                     // A screen identity handoff is a new reading context, not
-                    // a whole-screen diff. Finalization below resets its
-                    // baseline after announcing the application cursor row.
-                    speak_application_cursor_line(sr, view)?;
+                    // a whole-screen diff. Input echo acknowledgements cannot
+                    // cross that context boundary. Entering an alternate
+                    // screen announces its settled cursor row; restoring the
+                    // primary screen only reinstates content the user has
+                    // already heard.
+                    if view.screen().screen == crate::terminal::ScreenIdentity::Alternate {
+                        speak_application_cursor_line(sr, view)?;
+                    }
                 } else if !overlay_active {
                     let mut read_text = sr.resolve_pending_delete(view)?;
                     let semantic_history_read = if sr.take_pending_history_navigation() {

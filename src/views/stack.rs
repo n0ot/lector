@@ -24,7 +24,11 @@ pub struct ViewStack {
 }
 
 impl ViewStack {
-    pub fn new(root: Box<dyn ViewController>) -> Self {
+    pub fn new(mut root: Box<dyn ViewController>) -> Self {
+        // The root context is already active when the stack is constructed;
+        // its independent review cursor must not be mistaken for an
+        // uninitialized overlay on the first later compositor announcement.
+        root.model().mark_review_context_active();
         Self {
             views: vec![root],
             retired_views: Vec::new(),

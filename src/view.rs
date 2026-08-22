@@ -49,6 +49,12 @@ struct CompletedLinearRecordCache {
     result: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ReviewSelection {
+    scrollback: usize,
+    cursor: (u16, u16),
+}
+
 enum AccessibilityReadState {
     Live,
     /// Accessibility keeps reading the last committed model while the parser
@@ -283,14 +289,14 @@ pub struct View {
     /// terminal backpressure.
     standalone_update: UpdateSummary,
     /// Parser metadata which is safe to use with the currently presented
-    /// accessibility snapshot. When a receipt arrives behind the live parser,
-    /// this is deliberately empty: snapshot diffing remains exact, whereas
-    /// the live summary may already contain text from a newer, invisible
-    /// frame.
+    /// accessibility snapshot. Snapshot-diff fallbacks retain only fixed-size
+    /// structural provenance; transient printed text remains excluded.
     presented_update: UpdateSummary,
     prev_screen: TerminalSnapshot,
     prev_screen_time: u128,
     review_cursor_position: (u16, u16),
+    review_context_initialized: bool,
+    saved_primary_review_selection: Option<ReviewSelection>,
     review_cursor_follow_pending: bool,
     review_cursor_screen_transition_pending: bool,
     accessibility_screen_transition_pending: bool,
@@ -366,6 +372,8 @@ impl View {
             prev_screen,
             prev_screen_time: 0,
             review_cursor_position: cursor_position,
+            review_context_initialized: false,
+            saved_primary_review_selection: None,
             review_cursor_follow_pending: false,
             review_cursor_screen_transition_pending: false,
             accessibility_screen_transition_pending: false,
@@ -986,10 +994,6 @@ impl View {
             && self.presented_revision_explicitly_stable
     }
 
-    pub(crate) fn accessibility_presentation_cursor_restored(&self) -> bool {
-        self.accessibility_has_unfinalized_presentation() && self.presented_revision_cursor_restored
-    }
-
     pub(crate) fn accessibility_prompt_transaction_open(&self) -> bool {
         let active_screen = self.screen().screen;
         let alternate = active_screen == crate::terminal::ScreenIdentity::Alternate;
@@ -1001,6 +1005,16 @@ impl View {
         let (previous_count, previous_latest) =
             semantic_mark_summary(&self.prev_screen().semantic_marks, alternate);
         current_count != previous_count || current_latest != previous_latest
+    }
+
+    /// Whether the accessible primary-screen frame is still in the editable
+    /// OSC 133 input phase. Structural repainting in this phase can be a
+    /// transient Readline macro rather than content meant for auto-reading.
+    pub(crate) fn accessibility_semantic_input_active(&self) -> bool {
+        let alternate = self.screen().screen == crate::terminal::ScreenIdentity::Alternate;
+        semantic_mark_summary(&self.screen().semantic_marks, alternate)
+            .1
+            .is_some_and(|mark| matches!(mark.kind, Osc133Kind::InputStart))
     }
 
     /// Returns the live viewport from the last committed application frame.
@@ -1174,6 +1188,9 @@ impl View {
                 start <= revision && self.accessibility_journal_discarded_through > required_after
             });
         self.presented_accessibility_evidence_exact &= !discarded_in_required_range;
+        if !self.presented_accessibility_evidence_exact {
+            self.presented_update = snapshot_diff_provenance(&self.presented_update);
+        }
 
         while self
             .accessibility_journal
@@ -1195,14 +1212,15 @@ impl View {
                 && !self.presented_accessibility_requires_snapshot_diff
             {
                 self.presented_update.merge(entry.update);
+            } else {
+                if entry.requires_snapshot_diff {
+                    self.presented_update = snapshot_diff_provenance(&self.presented_update);
+                }
+                self.presented_update
+                    .merge(snapshot_diff_provenance(&entry.update));
             }
         }
         self.presented_accessibility_evidence_revision = revision;
-        if !self.presented_accessibility_evidence_exact
-            || self.presented_accessibility_requires_snapshot_diff
-        {
-            self.presented_update = UpdateSummary::default();
-        }
     }
 
     fn discard_accessibility_journal_through(&mut self, revision: ViewRevision) {
@@ -1564,7 +1582,6 @@ impl View {
         self.committed_snapshot = live_snapshot;
     }
 
-    #[cfg(test)]
     fn set_accessible_scrollback(&mut self, scrollback: usize) {
         if let AccessibilityReadState::Frozen {
             review_scrollback, ..
@@ -1698,6 +1715,67 @@ impl View {
             self.review_cursor_screen_transition_pending = false;
         }
         self.review_cursor_follow_pending = !frozen && self.review_cursor_screen_transition_pending;
+    }
+
+    /// Selects the review position belonging to the context which is becoming
+    /// active. A new context starts at its application cursor. Returning to an
+    /// existing overlay, pane, or primary screen preserves that context's
+    /// independent review position instead of overwriting it during the view
+    /// announcement.
+    pub(crate) fn prepare_review_cursor_for_activation(&mut self) -> ((u16, u16), (u16, u16)) {
+        let old = self.review_cursor_position;
+        let previous_screen = self.prev_screen().screen;
+        let current_screen = self.screen().screen;
+
+        if previous_screen != current_screen {
+            match (previous_screen, current_screen) {
+                (
+                    crate::terminal::ScreenIdentity::Primary,
+                    crate::terminal::ScreenIdentity::Alternate,
+                ) => {
+                    self.saved_primary_review_selection = Some(ReviewSelection {
+                        scrollback: self.scrollback(),
+                        cursor: self.review_cursor_position,
+                    });
+                    self.follow_application_cursor();
+                }
+                (
+                    crate::terminal::ScreenIdentity::Alternate,
+                    crate::terminal::ScreenIdentity::Primary,
+                ) => {
+                    if let Some(selection) = self.saved_primary_review_selection.take() {
+                        self.set_accessible_scrollback(selection.scrollback);
+                        let (rows, cols) = self.size();
+                        self.review_cursor_position = (
+                            selection.cursor.0.min(rows.saturating_sub(1)),
+                            selection.cursor.1.min(cols.saturating_sub(1)),
+                        );
+                    } else {
+                        self.follow_application_cursor();
+                    }
+                }
+                _ => self.follow_application_cursor(),
+            }
+            self.clear_review_mark();
+            self.review_context_initialized = true;
+            self.cancel_pending_screen_transition_follow();
+        } else if !self.review_context_initialized {
+            self.follow_application_cursor();
+            self.review_context_initialized = true;
+            self.cancel_pending_screen_transition_follow();
+        } else {
+            // Output received while another view was active may have queued a
+            // follow. Reactivating this already-initialized context restores
+            // its saved review position; later visible output can queue a new
+            // follow in the usual way.
+            self.review_cursor_follow_pending = false;
+        }
+
+        (old, self.review_cursor_position)
+    }
+
+    pub(crate) fn mark_review_context_active(&mut self) {
+        self.review_context_initialized = true;
     }
 
     pub(crate) fn cancel_pending_screen_transition_follow(&mut self) {
@@ -1945,6 +2023,12 @@ impl View {
         if self.presentation_tracking {
             self.reset_accessibility_journal_for_handoff();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_renderer_damage_hints(&mut self) {
+        self.standalone_update.changed_rows.clear();
+        self.standalone_update.damage = crate::terminal::TerminalDamage::None;
     }
 
     pub(crate) fn set_previous_screen_time(&mut self, time: u128) {
@@ -2447,12 +2531,34 @@ fn take_normalized_accessibility_evidence(
         output_report_structural: update.output_report_structural,
         parser_continuation: update.parser_continuation,
         cursor_operations: update.cursor_operations,
+        cursor_operations_after_last_line_feed: update.cursor_operations_after_last_line_feed,
+        line_feed_boundaries: update.line_feed_boundaries,
         scroll_operations: update.scroll_operations,
         changed_rows,
         cursor_before: update.cursor_before,
         screen_before: update.screen_before,
         screen_after: update.screen_after,
         semantic_input_boundary: update.semantic_input_boundary,
+        batch_count: update.batch_count,
+        ..UpdateSummary::default()
+    }
+}
+
+/// Keeps only fixed-size facts which remain true when accessibility must use
+/// authoritative before/after snapshots instead of the transient print
+/// stream. In particular, structural painting and LF boundaries describe how
+/// the application produced the committed frame without retaining its text.
+fn snapshot_diff_provenance(update: &UpdateSummary) -> UpdateSummary {
+    UpdateSummary {
+        output_report_structural: update.output_report_structural,
+        cursor_operations: update.cursor_operations,
+        cursor_operations_after_last_line_feed: update.cursor_operations_after_last_line_feed,
+        line_feed_boundaries: update.line_feed_boundaries,
+        scroll_operations: update.scroll_operations,
+        cursor_before: update.cursor_before,
+        cursor_after: update.cursor_after,
+        screen_before: update.screen_before,
+        screen_after: update.screen_after,
         batch_count: update.batch_count,
         ..UpdateSummary::default()
     }
@@ -2883,7 +2989,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_restore_at_end_of_update_is_a_legacy_stability_hint() {
+    fn cursor_restore_at_end_of_update_is_retained_as_painting_provenance() {
         let mut view = View::new(1, 24);
         view.enable_presentation_tracking();
 
@@ -2891,11 +2997,30 @@ mod tests {
         let restored = view.capture_live_presentation_frame(SurfaceId(1));
         assert!(restored.cursor_visibility_restored);
         assert!(view.apply_presented_frame(restored));
-        assert!(view.accessibility_presentation_cursor_restored());
+        assert!(view.presented_revision_cursor_restored);
 
         view.process_changes(b" trailing");
         let trailing = view.capture_live_presentation_frame(SurfaceId(1));
         assert!(!trailing.cursor_visibility_restored);
+    }
+
+    #[test]
+    fn alternate_screen_review_context_restores_the_primary_selection() {
+        let mut view = View::new(4, 40);
+        view.process_changes(b"saved review\r\nprimary cursor");
+        view.finalize_changes(0);
+        view.prepare_review_cursor_for_activation();
+        view.set_review_cursor_position((0, 0));
+
+        view.process_changes(b"\x1b[?1049h\x1b[2J\x1b[Halternate\x1b[3;5H");
+        view.prepare_review_cursor_for_activation();
+        assert_eq!(view.review_cursor_position(), (2, 4));
+        view.finalize_changes(1);
+
+        view.process_changes(b"\x1b[?1049l");
+        view.prepare_review_cursor_for_activation();
+        assert_eq!(view.review_cursor_position(), (0, 0));
+        assert_eq!(view.line(0), "saved review");
     }
 
     #[test]
@@ -3113,9 +3238,10 @@ mod tests {
         assert!(view.accessibility_journal.len() <= super::ACCESSIBILITY_JOURNAL_MAX_ENTRIES);
         assert!(view.accessibility_journal_bytes <= super::ACCESSIBILITY_JOURNAL_MAX_BYTES);
         assert!(view.apply_presented_frame(newest));
-        assert_eq!(
-            view.accessibility_update_summary().batch_count,
-            0,
+        assert!(view.accessibility_update_summary().batch_count > 0);
+        assert!(view.accessibility_update_summary().printed_runs.is_empty());
+        assert!(
+            !view.accessibility_completes_linear_output_record(),
             "an evicted prefix must use the authoritative snapshot diff"
         );
     }
@@ -3168,11 +3294,8 @@ mod tests {
         let frame = view.capture_live_presentation_frame(SurfaceId(1));
 
         assert!(view.apply_presented_frame(frame));
-        assert_eq!(
-            view.accessibility_update_summary().batch_count,
-            0,
-            "the later LF must not hide an unretained prefix"
-        );
+        assert!(view.accessibility_update_summary().batch_count > 0);
+        assert!(view.accessibility_update_summary().printed_runs.is_empty());
         assert!(!view.accessibility_completes_linear_output_record());
 
         view.finalize_changes(1);
@@ -3184,6 +3307,21 @@ mod tests {
             "after baseline\n"
         );
         assert!(view.accessibility_completes_linear_output_record());
+    }
+
+    #[test]
+    fn snapshot_diff_fallback_retains_fixed_size_output_provenance() {
+        let mut view = View::new(4, 40);
+        view.enable_presentation_tracking();
+        view.process_changes(b"\x1b[?2026h\x1b[2J\x1b[Hfirst\r\nsecond\x1b[4;1Hstatus\x1b[?2026l");
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.apply_presented_frame(frame));
+        let update = view.accessibility_update_summary();
+        assert!(update.printed_runs.is_empty());
+        assert!(update.output_report_structural);
+        assert_eq!(update.line_feed_boundaries, 1);
+        assert!(update.cursor_operations >= 2);
     }
 
     #[test]

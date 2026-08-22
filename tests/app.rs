@@ -2233,7 +2233,7 @@ fn alternate_screen_transition_realigns_review_cursor_even_at_the_same_position(
 }
 
 #[test]
-fn alternate_screen_handoffs_read_only_the_cursor_line_and_reset_the_diff() {
+fn alternate_screen_entry_reads_its_cursor_line_and_primary_restore_is_silent() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig {
         latency_budget_ms: 0,
@@ -2279,9 +2279,59 @@ fn alternate_screen_handoffs_read_only_the_cursor_line_and_reset_the_diff() {
         .expect("present the restored primary screen");
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    assert!(recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
+fn cursor_restore_does_not_expose_a_transient_alternate_screen_frame() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"primary", &mut term_out)
+        .expect("queue primary screen");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present primary screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x12", &mut pty_out, &mut term_out)
+        .expect("launch a full-screen application");
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[Htransient cursor row\x1b[?25h",
+        &mut term_out,
+    )
+    .expect("queue transient alternate frame");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present transient alternate frame");
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("hold cursor-bracketed alternate redraw")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    clock.advance_ms(5);
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?25l\x1b[H\x1b[2Kfinal cursor row\x1b[?25h",
+        &mut term_out,
+    )
+    .expect("queue completed alternate frame");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present completed alternate frame");
+    assert!(!app.maybe_finalize_changes(&mut sr).unwrap());
+
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("primary line".into(), false)]
+        &[("final cursor row".into(), false)]
     );
 }
 
@@ -2729,7 +2779,121 @@ fn abandoned_osc133_prompt_boundary_falls_back_at_the_maximum_delay() {
 }
 
 #[test]
-fn cursor_restore_after_input_bypasses_the_legacy_diff_delay() {
+fn alternate_screen_restores_the_primary_review_cursor() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    sr.set_review_follows_screen_cursor(false);
+
+    app.handle_pty(
+        &mut sr,
+        b"saved review target\r\nprimary application line",
+        &mut term_out,
+    )
+    .expect("draw primary screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("verify primary review cursor before transition");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("saved review target".into(), false)]
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?1049h\x1b[2J\x1b[Halternate first\r\nalternate cursor line",
+        &mut term_out,
+    )
+    .expect("enter alternate screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read alternate review cursor");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("alternate cursor line".into(), false)]
+    );
+
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_pty(&mut sr, b"\x1b[?1049l", &mut term_out)
+        .expect("restore primary screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read restored primary review cursor");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("saved review target".into(), false)]
+    );
+}
+
+#[test]
+fn alternate_screen_entry_does_not_read_coalesced_insert_echo() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    sr.set_suppress_key_echo(true);
+
+    app.handle_pty(&mut sr, b"primary", &mut term_out)
+        .expect("draw primary screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(&mut sr, b"\x1b[?1049h\x1b[2J\x1b[H", &mut term_out)
+        .expect("begin alternate-screen entry");
+    app.handle_stdin(&mut sr, b"aT", &mut pty_out, &mut term_out)
+        .expect("type before the entry presentation settles");
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?2026h\x1b[HT\x1b[2;1H~\x1b[3;1H-- INSERT --\x1b[1;2H\x1b[?2026l",
+        &mut term_out,
+    )
+    .expect("present first inserted character with editor repaint");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+
+    assert!(recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
+fn returning_from_an_overlay_preserves_the_underlying_review_cursor() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    sr.set_review_follows_screen_cursor(false);
+
+    app.handle_pty(
+        &mut sr,
+        b"overlay return target\r\napplication line",
+        &mut term_out,
+    )
+    .expect("draw source");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+
+    app.show_message(&mut sr, "Notice", "overlay", &mut term_out)
+        .expect("open overlay");
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("close overlay");
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
+        .expect("read restored source review cursor");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("overlay return target".into(), false)]
+    );
+}
+
+#[test]
+fn cursor_restore_after_input_waits_for_screen_quiet() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig::default());
     let mut pty_out = Vec::new();
@@ -2760,13 +2924,166 @@ fn cursor_restore_after_input_bypasses_the_legacy_diff_delay() {
         .expect("present legacy redraw");
 
     assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("cursor restoration is only a painting hint")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
         app.maybe_finalize_changes(&mut sr)
-            .expect("commit at cursor restoration")
+            .expect("commit after the redraw becomes quiet")
     );
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         [("new line".into(), false)]
     );
+}
+
+#[test]
+fn cursor_restore_does_not_expose_a_transient_fzf_height_frame() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"$ ", &mut term_out)
+        .expect("queue shell prompt");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present shell prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x12", &mut pty_out, &mut term_out)
+        .expect("launch reverse history search");
+    app.handle_pty(&mut sr, b"\x1b[?25l\x1b[2;1H$ \x1b[?25h", &mut term_out)
+        .expect("queue transient popup frame");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present transient popup frame");
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("hold cursor-bracketed partial redraw")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    clock.advance_ms(5);
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?25l\x1b[2;1H\x1b[2Kfinal history choice\x1b[?25h",
+        &mut term_out,
+    )
+    .expect("queue completed popup frame");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present completed popup frame");
+    assert!(!app.maybe_finalize_changes(&mut sr).unwrap());
+
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("final history choice".into(), false)]
+    );
+}
+
+#[test]
+fn reverse_search_interface_reads_only_its_application_cursor_row() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"$ ", &mut term_out)
+        .expect("draw shell prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x12", &mut pty_out, &mut term_out)
+        .expect("launch reverse history search");
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[2J\x1b[Hhistory item\x1b[2;1H----------------\x1b[3;1H>\x1b[4;1H1/100\x1b[3;1H",
+        &mut term_out,
+    )
+    .expect("draw cursor-addressed history interface");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[(" greater ".into(), false)]
+    );
+}
+
+#[test]
+fn reverse_search_discards_a_transient_semantic_input_macro() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1b]133;A\x07$ \x1b]133;B\x07", &mut term_out)
+        .expect("draw semantic shell prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x12", &mut pty_out, &mut term_out)
+        .expect("launch reverse history search");
+    app.handle_pty(&mut sr, b"\r\x1b[2K$ `__fzf_history__`", &mut term_out)
+        .expect("draw transient Readline macro");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(!app.maybe_finalize_changes(&mut sr).unwrap());
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[2J\x1b[Hhistory one\r\nhistory two\r\n\x1b[4;1H>\x1b[4;1H",
+        &mut term_out,
+    )
+    .expect("draw final cursor-addressed history interface");
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY));
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[(" greater ".into(), false)]
+    );
+}
+
+#[test]
+fn control_j_and_enter_have_identical_output_reading_semantics() {
+    fn spoken_after_submit(submit: &[u8]) -> Vec<(String, bool)> {
+        let (mut app, mut sr, recorder, clock) = make_app();
+        let mut pty_out = Vec::new();
+        let mut term_out = Vec::new();
+
+        app.handle_pty(&mut sr, b"$ command", &mut term_out)
+            .expect("draw command line");
+        clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+        assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+        recorder.inner.borrow_mut().speaks.clear();
+
+        app.handle_stdin(&mut sr, submit, &mut pty_out, &mut term_out)
+            .expect("submit command");
+        app.handle_pty(
+            &mut sr,
+            b"\x1b[2J\x1b[Hfirst result\r\nsecond result\r\nthird result\r\nfourth result",
+            &mut term_out,
+        )
+        .expect("draw line-oriented command output");
+        clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+        assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+
+        recorder.inner.borrow().speaks.clone()
+    }
+
+    let enter = spoken_after_submit(b"\r");
+    let control_j = spoken_after_submit(b"\n");
+    assert!(!enter.is_empty());
+    assert_eq!(control_j, enter);
 }
 
 #[test]
@@ -3468,6 +3785,205 @@ fn backspace_resolves_on_a_presented_frame_while_the_parser_is_newer() {
         "speaks={:?}",
         recorder.inner.borrow().speaks
     );
+}
+
+#[test]
+fn completed_backspace_echo_is_announced_without_finalizing_its_surrounding_update() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"abc", &mut term_out)
+        .expect("queue the original input line");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the original input line");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize abc"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x7f", &mut pty_out, &mut term_out)
+        .expect("forward and defer backspace");
+    app.handle_pty(&mut sr, b"\x08\x1b[P", &mut term_out)
+        .expect("queue the complete application echo");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the complete application echo");
+
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("announce the confirmed deletion without a quiet wait")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("c".into(), false)]
+    );
+
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the surrounding update at its normal boundary")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("c".into(), false)],
+        "ordinary finalization must not announce the deletion twice"
+    );
+    assert_eq!(pty_out, b"\x7f");
+}
+
+#[test]
+fn completed_delete_echo_is_announced_without_finalizing_its_surrounding_update() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"abc\x1b[2D", &mut term_out)
+        .expect("queue the original input line");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the original input line");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize abc"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1b[3~", &mut pty_out, &mut term_out)
+        .expect("forward and defer delete");
+    app.handle_pty(&mut sr, b"\x1b[P", &mut term_out)
+        .expect("queue the complete application echo");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the complete application echo");
+
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("announce the confirmed deletion without a quiet wait")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("b".into(), false)]
+    );
+
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the surrounding update at its normal boundary")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("b".into(), false)],
+        "ordinary finalization must not announce the deletion twice"
+    );
+    assert_eq!(pty_out, b"\x1b[3~");
+}
+
+#[test]
+fn split_backspace_echo_waits_for_the_erase_before_immediate_announcement() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"abc", &mut term_out)
+        .expect("queue the original input line");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the original input line");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize abc"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x7f", &mut pty_out, &mut term_out)
+        .expect("forward and defer backspace");
+    app.handle_pty(&mut sr, b"\x08", &mut term_out)
+        .expect("queue only the cursor-left prefix");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present only the cursor-left prefix");
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("the partial echo must retain stabilization")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    app.handle_pty(&mut sr, b"\x1b[P", &mut term_out)
+        .expect("queue the character erase");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the completed deletion");
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("the complete deletion can now be announced")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("c".into(), false)]
+    );
+
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("the surrounding update retains its quiet boundary")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("c".into(), false)]
+    );
+    assert_eq!(pty_out, b"\x7f");
+}
+
+#[test]
+fn backspace_inside_synchronized_output_waits_for_the_transaction_close_receipt() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"abc", &mut term_out)
+        .expect("queue the original input line");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the original input line");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize abc"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(&mut sr, b"\x1b[?2026h", &mut term_out)
+        .expect("open synchronized output");
+    app.handle_stdin(&mut sr, b"\x7f", &mut pty_out, &mut term_out)
+        .expect("press backspace inside the transaction");
+    app.handle_pty(&mut sr, b"\x08\x1b[P", &mut term_out)
+        .expect("apply the deletion inside the transaction");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("keep the open transaction held");
+    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("an open transaction cannot announce the deletion")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    app.handle_pty(&mut sr, b"\x1b[?2026l", &mut term_out)
+        .expect("close synchronized output");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the closed transaction");
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("the exact close receipt finalizes the transaction")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("c".into(), false)]
+    );
+    assert_eq!(pty_out, b"\x7f");
 }
 
 #[test]
@@ -4277,6 +4793,47 @@ fn inline_input_ignores_coupled_ruler_redraws() {
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         [("l".into(), false), ("p".into(), false)]
+    );
+}
+
+#[test]
+fn neovim_typeahead_suppression_skips_the_unechoed_append_command() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    sr.set_suppress_key_echo(true);
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[2J\x1B[23;1H[No Name]                                                   1,1            All\x1B[1;1H",
+        &mut term_out,
+    )
+    .expect("draw empty editor screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr)
+        .expect("finalize empty editor screen");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"a", &mut pty_out, &mut term_out)
+        .expect("queue append command");
+    app.handle_stdin(&mut sr, b"h", &mut pty_out, &mut term_out)
+        .expect("queue insert-mode typeahead");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[?25lh\x1B[23;65H2\x1B[1;2H\x1B[34h\x1B[?25h",
+        &mut term_out,
+    )
+    .expect("redraw inserted character and ruler");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize insert-mode redraw")
+    );
+
+    assert!(
+        recorder.inner.borrow().speaks.is_empty(),
+        "speaks={:?}",
+        recorder.inner.borrow().speaks
     );
 }
 

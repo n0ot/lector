@@ -23,6 +23,12 @@ const MAX_PENDING_KEY_ECHO_CHARS: usize = 256;
 const MAX_PENDING_DELETE_INTENTS: usize = 64;
 const MAX_PENDING_DELETE_PRESENTATIONS: u8 = 64;
 
+#[derive(Clone, Copy)]
+struct PendingKeyEcho {
+    character: char,
+    screen: crate::terminal::ScreenIdentity,
+}
+
 /// How bells received from panes in a tmux control connection are presented.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum TmuxBellMode {
@@ -95,7 +101,8 @@ pub struct ScreenReader {
     lua_configuration_open: bool,
     options: Options,
     last_key: Vec<u8>,
-    pending_key_echo: VecDeque<char>,
+    pending_key_echo: VecDeque<PendingKeyEcho>,
+    key_echo_stream_active: bool,
     cursor_tracking_mode: CursorTrackingMode,
     clipboard: Clipboard,
     system_clipboard: SystemClipboard,
@@ -129,6 +136,7 @@ impl ScreenReader {
             options: Options::default(),
             last_key: Vec::new(),
             pending_key_echo: VecDeque::new(),
+            key_echo_stream_active: false,
             cursor_tracking_mode: CursorTrackingMode::On,
             clipboard: Default::default(),
             system_clipboard: Default::default(),
@@ -235,6 +243,7 @@ impl ScreenReader {
         self.last_key.extend_from_slice(raw);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_forwarded_character(&mut self, character: char) {
         if !self.suppress_key_echo() {
             return;
@@ -242,7 +251,34 @@ impl ScreenReader {
         if self.pending_key_echo.len() == MAX_PENDING_KEY_ECHO_CHARS {
             self.pending_key_echo.pop_front();
         }
-        self.pending_key_echo.push_back(character);
+        self.pending_key_echo.push_back(PendingKeyEcho {
+            character,
+            screen: crate::terminal::ScreenIdentity::Primary,
+        });
+    }
+
+    pub(crate) fn record_forwarded_key(
+        &mut self,
+        text: Option<&str>,
+        screen: crate::terminal::ScreenIdentity,
+    ) {
+        if text.is_none_or(str::is_empty) {
+            self.key_echo_stream_active = false;
+        }
+        let Some(text) = text.filter(|_| self.suppress_key_echo()) else {
+            return;
+        };
+        for character in text.chars() {
+            if self.pending_key_echo.len() == MAX_PENDING_KEY_ECHO_CHARS {
+                self.pending_key_echo.pop_front();
+            }
+            self.pending_key_echo
+                .push_back(PendingKeyEcho { character, screen });
+        }
+    }
+
+    fn has_pending_key_echo(&self) -> bool {
+        self.suppress_key_echo() && !self.pending_key_echo.is_empty()
     }
 
     pub(crate) fn set_pending_history_navigation(&mut self) {
@@ -257,23 +293,89 @@ impl ScreenReader {
         std::mem::take(&mut self.pending_history_navigation)
     }
 
-    fn should_suppress_key_echo(&mut self, text: &str) -> bool {
+    pub(crate) fn has_pending_history_navigation(&self) -> bool {
+        self.pending_history_navigation
+    }
+
+    pub(crate) fn should_suppress_key_echo(&mut self, text: &str) -> bool {
+        // Screen diffs and completed terminal records can append a synthetic
+        // row delimiter which did not come from a printable key. Preserve
+        // spaces exactly, but exclude those record delimiters from matching.
+        let text = text.trim_end_matches(['\r', '\n']);
         if !self.suppress_key_echo() || text.is_empty() {
             return false;
         }
 
-        let mut matched = 0;
-        for character in text.chars() {
-            if self.pending_key_echo.get(matched) != Some(&character) {
+        let character_count = text.chars().count();
+        if character_count > self.pending_key_echo.len() {
+            // A restored prompt can reach accessibility in the same linear
+            // record as input typed immediately afterward. Suppress that
+            // record only when *all* currently pending input is its exact
+            // suffix; accepting a partial suffix would let ordinary command
+            // output which happens to end in one typed character disappear.
+            let pending_is_exact_suffix = !self.pending_key_echo.is_empty()
+                && text
+                    .chars()
+                    .rev()
+                    .zip(self.pending_key_echo.iter().rev())
+                    .all(|(character, pending)| character == pending.character);
+            if pending_is_exact_suffix {
                 self.pending_key_echo.clear();
-                return false;
+                self.key_echo_stream_active = true;
+                return true;
             }
-            matched += 1;
+            return false;
         }
-        for _ in 0..matched {
-            self.pending_key_echo.pop_front();
+        for start in 0..=self.pending_key_echo.len() - character_count {
+            if text.chars().enumerate().all(|(offset, character)| {
+                self.pending_key_echo
+                    .get(start + offset)
+                    .is_some_and(|pending| pending.character == character)
+            }) {
+                // Full-screen applications accept printable commands which
+                // never echo (for example Neovim's normal-mode `a`) before
+                // later echoing insert-mode typeahead. A matching suffix is
+                // the first positive acknowledgement: consume the stale
+                // command prefix with it, but never discard later typeahead
+                // merely because an unrelated status redraw arrived first.
+                for _ in 0..start + character_count {
+                    self.pending_key_echo.pop_front();
+                }
+                self.key_echo_stream_active = true;
+                return true;
+            }
         }
-        true
+        false
+    }
+
+    fn should_suppress_cursor_row_key_echo(&mut self, text: &str) -> bool {
+        if self.should_suppress_key_echo(text) {
+            return true;
+        }
+        if !self.key_echo_stream_active {
+            return false;
+        }
+
+        // A cursor-addressed editor can expose newly inserted text together
+        // with indentation cells which were already part of the logical line.
+        // Only the terminal-confirmed cursor-row echo path may discard that
+        // layout prefix; ordinary output retains the strict whole-text rule.
+        let without_record_boundary = text.trim_end_matches(['\r', '\n']);
+        let without_layout_prefix = without_record_boundary.trim_start_matches([' ', '\t']);
+        without_layout_prefix != without_record_boundary
+            && !without_layout_prefix.is_empty()
+            && self.should_suppress_key_echo(without_layout_prefix)
+    }
+
+    /// Primary and alternate input can overlap while physical presentation
+    /// catches up. Preserve only acknowledgements belonging to the screen
+    /// context which actually reached accessibility.
+    pub(crate) fn retain_pending_key_echo_for_screen(
+        &mut self,
+        screen: crate::terminal::ScreenIdentity,
+    ) {
+        self.pending_key_echo
+            .retain(|pending| pending.screen == screen);
     }
 
     pub(crate) fn request_pass_through(&mut self) {
@@ -446,6 +548,7 @@ impl ScreenReader {
         self.options.set_suppress_key_echo(value);
         if !value {
             self.pending_key_echo.clear();
+            self.key_echo_stream_active = false;
         }
     }
 
@@ -640,6 +743,32 @@ mod tests {
     }
 
     #[test]
+    fn key_echo_suppression_skips_an_unechoed_full_screen_command_prefix() {
+        let (mut sr, _speaks) = make_sr();
+        sr.set_suppress_key_echo(true);
+        for character in "ahello".chars() {
+            sr.record_forwarded_character(character);
+        }
+
+        assert!(!sr.should_suppress_key_echo("INSERT"));
+        assert!(sr.should_suppress_key_echo("h"));
+        assert!(sr.should_suppress_key_echo("ello\n"));
+        assert!(sr.pending_key_echo.is_empty());
+    }
+
+    #[test]
+    fn key_echo_suppression_accepts_complete_input_after_a_restored_prompt() {
+        let (mut sr, _speaks) = make_sr();
+        sr.set_suppress_key_echo(true);
+        for character in "nvim ~/.bashrc".chars() {
+            sr.record_forwarded_character(character);
+        }
+
+        assert!(sr.should_suppress_key_echo("ncarpenter:~$ nvim ~/.bashrc\n"));
+        assert!(sr.pending_key_echo.is_empty());
+    }
+
+    #[test]
     fn auto_read_suppresses_diff_echo_when_enabled() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
@@ -653,6 +782,155 @@ mod tests {
         let read = sr.auto_read(&mut view).unwrap();
         assert!(read);
         assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn auto_read_suppresses_full_screen_editor_echo_without_renderer_hints() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.process_changes(b"\x1b[2J\x1b[H\x1b[5;1H[No Name]\x1b[1;1H");
+        view.finalize_changes(0);
+
+        sr.set_suppress_key_echo(true);
+        sr.record_forwarded_key(Some("ahello"), crate::terminal::ScreenIdentity::Primary);
+        sr.record_last_key(b"o");
+        view.process_changes(
+            b"\x1b[?2026h\x1b[Hhello\x1b[2;1H~\x1b[3;1H~\x1b[4;1H-- INSERT --\x1b[5;1H[No Name] [+]\x1b[1;6H\x1b[?2026l",
+        );
+        // Renderer damage is optional under physical-output backpressure; the
+        // exact committed snapshots and fixed-size output provenance remain.
+        view.clear_renderer_damage_hints();
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(read);
+        assert!(speaks.borrow().is_empty());
+        assert!(sr.pending_key_echo.is_empty());
+    }
+
+    #[test]
+    fn cursor_shape_mode_transition_reads_status_without_consuming_later_echo() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.process_changes(b"\x1b[2J\x1b[H\x1b[4;3H[No Name]\x1b[1;1H");
+        view.finalize_changes(0);
+
+        sr.set_suppress_key_echo(true);
+        sr.record_forwarded_key(Some("a"), crate::terminal::ScreenIdentity::Primary);
+        sr.record_last_key(b"a");
+        view.process_changes(
+            b"\x1b[?2026h\x1b[6 q\x1b[4;1Hi [No Name]\x1b[5;1H-- INSERT --\x1b[1;1H\x1b[?2026l",
+        );
+
+        // The mode transition is recognized from terminal state even when
+        // the scheduler no longer considers its originating input recent.
+        let read = sr.auto_read(&mut view).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["i"]);
+        assert_eq!(sr.pending_key_echo.len(), 1);
+        assert!(sr.key_echo_stream_active);
+
+        view.finalize_changes(0);
+        sr.record_forwarded_key(Some("T"), crate::terminal::ScreenIdentity::Primary);
+        sr.record_last_key(b"T");
+        view.process_changes(
+            b"\x1b[?2026h\x1b[1;1H  T\x1b[4;1Hi [+] [No Name]\x1b[1;4H\x1b[?2026l",
+        );
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), ["i"]);
+        assert!(sr.pending_key_echo.is_empty());
+    }
+
+    #[test]
+    fn structural_interface_repaint_uses_application_cursor_tracking() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.finalize_changes(0);
+
+        view.process_changes(
+            b"\x1b[2J\x1b[Hhistory item\x1b[2;1H----------------\x1b[3;1H>\x1b[4;1H1/100\x1b[5;1H$ stale prompt\x1b[3;1H",
+        );
+        view.clear_renderer_damage_hints();
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), [" greater "]);
+    }
+
+    #[test]
+    fn recent_input_keeps_a_single_row_interface_status_diff_at_the_application_cursor() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.process_changes(b">\x1b[5;1H+\x1b[1;1H");
+        view.finalize_changes(0);
+
+        sr.record_forwarded_key(None, crate::terminal::ScreenIdentity::Primary);
+        view.process_changes(b"\x1b[5;1H-\x1b[1;1H");
+        view.clear_renderer_damage_hints();
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(read);
+        assert_eq!(speaks.borrow().as_slice(), [" greater "]);
+    }
+
+    #[test]
+    fn screen_transition_keeps_echo_from_the_presented_context() {
+        let (mut sr, _speaks) = make_sr();
+        sr.set_suppress_key_echo(true);
+
+        sr.record_last_key(b"o");
+        sr.record_forwarded_key(Some("old"), crate::terminal::ScreenIdentity::Alternate);
+        sr.record_last_key(b"n");
+        sr.record_forwarded_key(Some("new"), crate::terminal::ScreenIdentity::Primary);
+
+        sr.retain_pending_key_echo_for_screen(crate::terminal::ScreenIdentity::Primary);
+
+        assert_eq!(sr.pending_key_echo.len(), 3);
+        assert!(sr.should_suppress_key_echo("new\n"));
+        assert!(sr.pending_key_echo.is_empty());
+    }
+
+    #[test]
+    fn enter_does_not_silence_real_broad_output_without_renderer_hints() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.finalize_changes(0);
+
+        sr.record_forwarded_key(None, crate::terminal::ScreenIdentity::Primary);
+        view.process_changes(
+            b"\x1b[2J\x1b[Hfirst result\r\nsecond result\r\nthird result\r\nfourth result",
+        );
+        view.clear_renderer_damage_hints();
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(read);
+        assert!(speaks.borrow().join(" ").contains("first result"));
+    }
+
+    #[test]
+    fn printable_command_does_not_silence_real_broad_output_without_renderer_hints() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.finalize_changes(0);
+
+        sr.set_suppress_key_echo(true);
+        sr.record_forwarded_key(Some("s"), crate::terminal::ScreenIdentity::Primary);
+        view.process_changes(
+            b"\x1b[2J\x1b[Hfirst result\r\nsecond result\r\nthird result\r\nfourth result",
+        );
+        view.clear_renderer_damage_hints();
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(read);
+        assert!(speaks.borrow().join(" ").contains("first result"));
     }
 
     #[test]
@@ -791,6 +1069,26 @@ mod tests {
     }
 
     #[test]
+    fn deferred_backspace_stays_pending_after_cursor_only_partial_echo() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 10);
+
+        view.process_changes(b"$ x");
+        view.finalize_changes(0);
+        sr.defer_backspace(&view);
+
+        view.process_changes(b"\x08");
+        assert!(!sr.has_confirmed_pending_delete(&view));
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert!(speaks.borrow().is_empty());
+
+        view.process_changes(b"\x1B[P");
+        assert!(sr.has_confirmed_pending_delete(&view));
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["x"]);
+    }
+
+    #[test]
     fn deferred_delete_speaks_when_screen_changes() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
@@ -865,6 +1163,24 @@ mod tests {
         assert!(sr.resolve_pending_delete(&view).unwrap());
         assert!(!sr.resolve_pending_delete(&view).unwrap());
         assert_eq!(speaks.borrow().as_slice(), ["c", "b"]);
+    }
+
+    #[test]
+    fn rapid_deletes_speak_each_virtual_character_once_in_input_order() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 12);
+        view.process_changes(b"abc\x1b[3D");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"\x1b[3~");
+        sr.defer_delete(&view);
+        sr.record_last_key(b"\x1b[3~");
+        sr.defer_delete(&view);
+
+        view.process_changes(b"\x1b[P\x1b[P");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["a", "b"]);
     }
 
     #[test]

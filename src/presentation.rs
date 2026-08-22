@@ -71,7 +71,8 @@ pub struct PresentedViewFrame {
     /// synchronized-output or semantic prompt commit boundary.
     pub explicitly_stable: bool,
     /// The source update ended at a hidden-to-visible cursor transition. This
-    /// is a conservative legacy redraw hint, not an application transaction.
+    /// is painting provenance, not an application transaction or accessibility
+    /// commit boundary.
     pub cursor_visibility_restored: bool,
 }
 

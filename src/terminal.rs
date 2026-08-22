@@ -268,6 +268,11 @@ pub struct UpdateSummary {
     pub parser_continuation: bool,
     pub operations: Vec<TerminalOperation>,
     pub cursor_operations: usize,
+    pub cursor_operations_after_last_line_feed: usize,
+    /// Number of observed LF record boundaries. Unlike retained print text,
+    /// this fixed-size provenance can survive a snapshot-diff fallback and
+    /// distinguish line-oriented output from cursor-addressed interface paint.
+    pub line_feed_boundaries: usize,
     pub scroll_operations: usize,
     pub history_changed: bool,
     pub changed_rows: Vec<RangeInclusive<u16>>,
@@ -301,6 +306,8 @@ impl Default for UpdateSummary {
             parser_continuation: false,
             operations: Vec::new(),
             cursor_operations: 0,
+            cursor_operations_after_last_line_feed: 0,
+            line_feed_boundaries: 0,
             scroll_operations: 0,
             history_changed: false,
             changed_rows: Vec::new(),
@@ -346,6 +353,17 @@ impl UpdateSummary {
         self.cursor_operations = self
             .cursor_operations
             .saturating_add(next.cursor_operations);
+        if next.line_feed_boundaries > 0 {
+            self.cursor_operations_after_last_line_feed =
+                next.cursor_operations_after_last_line_feed;
+        } else {
+            self.cursor_operations_after_last_line_feed = self
+                .cursor_operations_after_last_line_feed
+                .saturating_add(next.cursor_operations_after_last_line_feed);
+        }
+        self.line_feed_boundaries = self
+            .line_feed_boundaries
+            .saturating_add(next.line_feed_boundaries);
         self.scroll_operations = self
             .scroll_operations
             .saturating_add(next.scroll_operations);
@@ -1393,6 +1411,11 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         .map(normalize_ghostty_effect)
         .filter(|event| !matches!(event, TerminalEvent::PtyReply(_)))
         .collect::<Vec<_>>();
+    let line_feed_boundaries = update
+        .printed_runs
+        .iter()
+        .filter(|run| run.boundary == GhosttyPrintBoundary::LineFeed)
+        .count();
     UpdateSummary {
         effects: TerminalEffects {
             bells: effects
@@ -1426,6 +1449,8 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
             .map(normalize_ghostty_operation)
             .collect(),
         cursor_operations: update.cursor_operations,
+        cursor_operations_after_last_line_feed: update.cursor_operations_after_last_line_feed,
+        line_feed_boundaries,
         scroll_operations: update.scroll_operations,
         history_changed: update.history_changed,
         changed_rows,

@@ -527,6 +527,10 @@ pub struct UpdateSnapshot {
     pub parser_continuation: bool,
     pub operations: Vec<OperationSnapshot>,
     pub cursor_operations: usize,
+    /// Cursor operations observed after the most recent LF in this update.
+    /// A TUI commonly prints rows linearly and then addresses its application
+    /// cursor, whereas ordinary line output leaves the cursor after the LF.
+    pub cursor_operations_after_last_line_feed: usize,
     pub scroll_operations: usize,
     /// Primary-screen retained history may have changed during this update.
     pub history_changed: bool,
@@ -546,8 +550,8 @@ pub struct UpdateSnapshot {
     /// continuation clears the boundary.
     pub semantic_input_boundary: bool,
     /// This update ended exactly at a real hidden-to-visible cursor
-    /// transition. Older full-screen applications commonly use that as a
-    /// redraw boundary when synchronized output is unavailable.
+    /// transition. This records application painting behavior; it is not a
+    /// transaction or accessibility commit boundary.
     pub cursor_visibility_restored: bool,
     /// The visible terminal model immediately after an actual false-to-true
     /// synchronized-output transition. The marker itself only changes mode,
@@ -1413,6 +1417,7 @@ struct StreamObserver {
     operation_reliable: bool,
     last_printed: Option<char>,
     cursor_operations: usize,
+    cursor_operations_after_last_line_feed: usize,
     scroll_operations: usize,
     history_cleared: bool,
     history_changed: bool,
@@ -1470,6 +1475,13 @@ impl StreamObserver {
 
     fn count(params: &vte::Params) -> u16 {
         Self::parameter(params, 0, 1)
+    }
+
+    fn record_cursor_operation(&mut self) {
+        self.cursor_operations = self.cursor_operations.saturating_add(1);
+        self.cursor_operations_after_last_line_feed = self
+            .cursor_operations_after_last_line_feed
+            .saturating_add(1);
     }
 
     fn private_modes_are_output_neutral(params: &vte::Params) -> bool {
@@ -1653,6 +1665,9 @@ impl StreamObserver {
 
     fn push_boundary(&mut self, boundary: PrintBoundarySnapshot) {
         self.flush_print();
+        if boundary == PrintBoundarySnapshot::LineFeed {
+            self.cursor_operations_after_last_line_feed = 0;
+        }
         if boundary == PrintBoundarySnapshot::LineFeed
             && let Some(previous) = self.printed_runs.last_mut()
             && previous.text.is_empty()
@@ -1685,6 +1700,9 @@ impl StreamObserver {
             semantic_input_boundary: std::mem::take(&mut self.semantic_input_boundary),
             operations,
             cursor_operations: std::mem::take(&mut self.cursor_operations),
+            cursor_operations_after_last_line_feed: std::mem::take(
+                &mut self.cursor_operations_after_last_line_feed,
+            ),
             scroll_operations: std::mem::take(&mut self.scroll_operations),
             history_changed,
         }
@@ -1698,6 +1716,7 @@ struct StreamUpdate {
     semantic_input_boundary: bool,
     operations: Vec<OperationSnapshot>,
     cursor_operations: usize,
+    cursor_operations_after_last_line_feed: usize,
     scroll_operations: usize,
     history_changed: bool,
 }
@@ -1713,7 +1732,7 @@ impl vte::Perform for StreamObserver {
         match byte {
             b'\x08' => {
                 self.mark_structural_output();
-                self.cursor_operations += 1;
+                self.record_cursor_operation();
                 self.operation_col = self.operation_col.saturating_sub(1);
             }
             b'\r' => {
@@ -1868,29 +1887,29 @@ impl vte::Perform for StreamObserver {
             }
             match action {
                 'A' => {
-                    self.cursor_operations += 1;
+                    self.record_cursor_operation();
                     self.operation_row = self.operation_row.saturating_sub(Self::count(params));
                 }
                 'B' => {
-                    self.cursor_operations += 1;
+                    self.record_cursor_operation();
                     self.operation_row = self
                         .operation_row
                         .saturating_add(Self::count(params))
                         .min(self.operation_rows.saturating_sub(1));
                 }
                 'C' => {
-                    self.cursor_operations += 1;
+                    self.record_cursor_operation();
                     self.operation_col = self
                         .operation_col
                         .saturating_add(Self::count(params))
                         .min(self.operation_cols.saturating_sub(1));
                 }
                 'D' => {
-                    self.cursor_operations += 1;
+                    self.record_cursor_operation();
                     self.operation_col = self.operation_col.saturating_sub(Self::count(params));
                 }
                 'E' => {
-                    self.cursor_operations += 1;
+                    self.record_cursor_operation();
                     self.operation_row = self
                         .operation_row
                         .saturating_add(Self::count(params))
@@ -1898,18 +1917,18 @@ impl vte::Perform for StreamObserver {
                     self.operation_col = 0;
                 }
                 'F' => {
-                    self.cursor_operations += 1;
+                    self.record_cursor_operation();
                     self.operation_row = self.operation_row.saturating_sub(Self::count(params));
                     self.operation_col = 0;
                 }
                 'G' | '`' => {
-                    self.cursor_operations += 1;
+                    self.record_cursor_operation();
                     self.operation_col = Self::parameter(params, 0, 1)
                         .saturating_sub(1)
                         .min(self.operation_cols.saturating_sub(1));
                 }
                 'H' | 'f' => {
-                    self.cursor_operations += 1;
+                    self.record_cursor_operation();
                     let mut row = Self::parameter(params, 0, 1).saturating_sub(1);
                     if self.origin_mode {
                         row = row.saturating_add(self.scroll_bounds().0);
@@ -1920,7 +1939,7 @@ impl vte::Perform for StreamObserver {
                         .min(self.operation_cols.saturating_sub(1));
                 }
                 'd' => {
-                    self.cursor_operations += 1;
+                    self.record_cursor_operation();
                     self.operation_row = Self::parameter(params, 0, 1)
                         .saturating_sub(1)
                         .min(self.operation_rows.saturating_sub(1));
@@ -2340,6 +2359,7 @@ impl Terminal {
             parser_continuation,
             operations: stream.operations,
             cursor_operations: stream.cursor_operations,
+            cursor_operations_after_last_line_feed: stream.cursor_operations_after_last_line_feed,
             scroll_operations: stream.scroll_operations,
             history_changed: stream.history_changed,
             damage: render_damage,
