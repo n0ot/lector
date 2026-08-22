@@ -194,12 +194,26 @@ the one current public-C-API gap for OSC 52 clipboard reads and generates the
 secure empty local reply; reads never reach the physical terminal.
 
 The child receives `TERM=xterm-256color`, and Lector removes inherited
-`TERMINFO` so a nested instance cannot accidentally pair that public name with
-its parent's private database. Lector does not inherit an outer vendor identity
-or advertise `xterm-ghostty`; the Ghostty engine supplies parsing and terminal
-state, not Ghostty's complete application-facing protocol contract. Lector
-derives a separate physical profile from conservative defaults, outer
-terminfo, bounded startup probes, and explicit overrides. DA1 is the final
+`TERMINFO`. It then supplies a target- and content-keyed private cache entry
+with the implemented terminfo `Sync` string. Lector prefers an overlay compiled
+from the host's own expanded `xterm-256color` entry, but the binary includes a
+compiled ncurses fallback for supported macOS and Linux systems when bounded
+`infocmp` or `tic` execution is unavailable or fails. If the normal cache is
+unusable or its bounded lock is contended, a process-owned temporary fallback
+survives for the child process's lifetime. Extraction is automatic and never
+modifies a system or normal user terminfo database. This makes DEC mode 2026
+discoverable to an ordinary local nested tmux client while the public,
+remotely portable terminal name remains unchanged. The private directory is not
+normally transported by SSH, so remote tmux uses its remote terminfo database
+and Lector's legacy stabilization path unless that host independently advertises
+`Sync`; direct mode-query replies can still traverse SSH. A pure `tmux -CC`
+client has no rendering tty and is not expected to expose `Sync` through
+`tmux info`; Lector instead stabilizes its `%output` stream at the compositor
+boundary. Lector does not inherit an outer vendor identity or advertise
+`xterm-ghostty`; the Ghostty engine supplies parsing and terminal state, not
+Ghostty's complete application-facing protocol contract. Lector derives a
+separate physical profile from conservative defaults, outer terminfo, bounded
+startup probes, and explicit overrides. DA1 is the final
 physical query, and probe replies are consumed through its processing fence
 before input parsing. Application-originated OSC 52 writes enter Lector's
 internal clipboard history regardless of its configured default register or

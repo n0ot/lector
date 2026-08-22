@@ -1,6 +1,6 @@
 use super::{Result, ViewAction, ViewController, ViewKind};
 use crate::{
-    presentation::{PresentedViewFrame, Scene, SurfaceId, ViewId},
+    presentation::{PresentedFrameIndex, PresentedViewFrame, Scene, SurfaceId, ViewId},
     screen_reader::ScreenReader,
     terminal::{TerminalGeometry, UpdateSummary},
     terminal_input::KeyInput,
@@ -336,9 +336,21 @@ impl TmuxConnectionView {
     }
 
     pub(crate) fn apply_presented_frame(&mut self, frame: &PresentedViewFrame) -> bool {
-        self.placeholder.apply_presented_frame(frame.clone())
-            || self.portal.apply_presented_frame(frame.clone())
+        self.placeholder.apply_presented_frame_ref(frame)
+            || self.portal.apply_presented_frame_ref(frame)
             || self.panes.apply_presented_frame(frame)
+    }
+
+    pub(crate) fn apply_presented_frames(&mut self, frames: &PresentedFrameIndex<'_>) -> usize {
+        let mut applied = 0usize;
+        for view in [&mut self.placeholder, &mut self.portal] {
+            if let Some(frame) = frames.get(view.view_id())
+                && view.apply_presented_frame_ref(frame)
+            {
+                applied = applied.saturating_add(1);
+            }
+        }
+        applied.saturating_add(self.panes.apply_presented_frames(frames))
     }
 
     pub(crate) fn model_by_id_mut(&mut self, view_id: ViewId) -> Option<&mut View> {

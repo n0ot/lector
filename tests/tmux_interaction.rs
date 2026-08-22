@@ -1,5 +1,6 @@
 use lector::{
     app::{App, Clock},
+    output_scheduler::OutputSchedulerConfig,
     screen_reader::ScreenReader,
     speech,
     terminal::GhosttyEngine,
@@ -171,7 +172,7 @@ fn ready_app() -> (App, ScreenReader, Recorder, Vec<u8>) {
     for pane in [20, 21, 22, 23] {
         assert!(command_text.contains(&format!("-t %{pane}\n")));
     }
-    for (serial, contents) in ["left", "second-window", "other-session", "right"]
+    for (serial, contents) in ["left", "right", "second-window", "other-session"]
         .into_iter()
         .enumerate()
     {
@@ -530,7 +531,14 @@ fn command_prompt_history_replies_messages_errors_and_popup_dismissal_are_access
             .0
             .borrow()
             .iter()
-            .any(|message| message.contains("hello"))
+            .any(|message| message == "tmux command result")
+    );
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|message| message.contains("Press Enter"))
     );
     input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
 
@@ -559,6 +567,7 @@ fn command_prompt_history_replies_messages_errors_and_popup_dismissal_are_access
     assert!(app.debug_active_view_contents().contains("work:1:1"));
     input(&mut app, &mut sr, &mut physical, b"\r");
 
+    recorder.0.borrow_mut().clear();
     app.handle_pty(&mut sr, b"%message external notice\n", &mut physical)
         .unwrap();
     assert!(app.debug_active_view_contents().contains("external notice"));
@@ -567,7 +576,7 @@ fn command_prompt_history_replies_messages_errors_and_popup_dismissal_are_access
             .0
             .borrow()
             .iter()
-            .any(|message| message.contains("external notice"))
+            .any(|message| message == "tmux message")
     );
     input(&mut app, &mut sr, &mut physical, b"\r");
     app.handle_pty(&mut sr, b"%config-error bad config line\n", &mut physical)
@@ -581,6 +590,7 @@ fn command_prompt_history_replies_messages_errors_and_popup_dismissal_are_access
     );
     input(&mut app, &mut sr, &mut physical, b"bad-command\r");
     assert_eq!(tick(&mut app, &mut sr, &mut physical), b"bad-command\n");
+    recorder.0.borrow_mut().clear();
     app.handle_pty(
         &mut sr,
         &reply(72, &[b"unknown command".to_vec()], false),
@@ -593,7 +603,7 @@ fn command_prompt_history_replies_messages_errors_and_popup_dismissal_are_access
             .0
             .borrow()
             .iter()
-            .any(|message| message.contains("unknown command"))
+            .any(|message| message == "tmux command failed")
     );
 }
 
@@ -706,12 +716,122 @@ fn window_and_session_changes_announce_the_new_location_concisely() {
 
     app.handle_pty(&mut sr, b"%session-window-changed $1 @11\n", &mut physical)
         .unwrap();
-    assert_eq!(&*recorder.0.borrow(), &["2: duplicate"]);
+    assert_eq!(&*recorder.0.borrow(), &["duplicate", "second-window"]);
 
     recorder.0.borrow_mut().clear();
     app.handle_pty(&mut sr, b"%session-changed $2 remote\n", &mut physical)
         .unwrap();
-    assert_eq!(&*recorder.0.borrow(), &["remote", "1: duplicate"]);
+    assert_eq!(
+        &*recorder.0.borrow(),
+        &["remote", "duplicate", "other-session"]
+    );
+}
+
+#[test]
+fn scheduled_location_changes_wait_for_their_receipt_and_stay_concise() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    recorder.0.borrow_mut().clear();
+    physical.clear();
+
+    app.handle_pty(&mut sr, b"%session-window-changed $1 @11\n", &mut physical)
+        .unwrap();
+    assert!(
+        recorder.0.borrow().is_empty(),
+        "the new window was announced before its frame flushed"
+    );
+    assert_eq!(
+        app.drain_scheduled_output(&mut physical, false)
+            .expect("flush the selected window")
+            .completed_renders
+            .len(),
+        1
+    );
+    assert!(
+        recorder.0.borrow().is_empty(),
+        "draining pixels alone announced the selected window"
+    );
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    assert_eq!(&*recorder.0.borrow(), &["duplicate", "second-window"]);
+
+    recorder.0.borrow_mut().clear();
+    app.handle_pty(
+        &mut sr,
+        b"%window-renamed @11 renamed-in-place\n",
+        &mut physical,
+    )
+    .unwrap();
+    assert!(recorder.0.borrow().is_empty());
+    assert_eq!(
+        app.drain_scheduled_output(&mut physical, false)
+            .expect("flush the in-place rename")
+            .completed_renders
+            .len(),
+        1
+    );
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    assert!(
+        recorder.0.borrow().is_empty(),
+        "an in-place rename was announced after its frame flushed"
+    );
+
+    app.handle_pty(&mut sr, b"%session-changed $2 remote\n", &mut physical)
+        .unwrap();
+    assert!(
+        recorder.0.borrow().is_empty(),
+        "the new session was announced before its frame flushed"
+    );
+    assert_eq!(
+        app.drain_scheduled_output(&mut physical, false)
+            .expect("flush the selected session")
+            .completed_renders
+            .len(),
+        1
+    );
+    assert!(recorder.0.borrow().is_empty());
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    assert_eq!(
+        &*recorder.0.borrow(),
+        &["remote", "duplicate", "other-session"]
+    );
+}
+
+#[test]
+fn pane_changes_read_only_the_new_application_cursor_line() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    recorder.0.borrow_mut().clear();
+
+    app.handle_pty(&mut sr, b"%window-pane-changed @10 %23\n", &mut physical)
+        .unwrap();
+
+    assert_eq!(&*recorder.0.borrow(), &["right"]);
+}
+
+#[test]
+fn tmux_location_renames_in_place_are_not_announced() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    recorder.0.borrow_mut().clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"%window-renamed @10 renamed-in-place\n",
+        &mut physical,
+    )
+    .unwrap();
+
+    assert!(recorder.0.borrow().is_empty());
+
+    app.handle_pty(
+        &mut sr,
+        b"%session-renamed renamed-in-place\n",
+        &mut physical,
+    )
+    .unwrap();
+
+    assert!(recorder.0.borrow().is_empty());
 }
 
 fn write_real_commands(

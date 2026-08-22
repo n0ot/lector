@@ -58,8 +58,11 @@ fn accessibility_bundle(marker: u64) -> PresentedAccessibilityBundle {
                 ..TerminalSnapshot::default()
             },
             history_revision: 0,
+            history_basis: Default::default(),
             history: None,
+            accessibility_epoch: Default::default(),
             explicitly_stable: false,
+            cursor_visibility_restored: false,
         }],
     )
 }
@@ -386,6 +389,28 @@ fn scheduler_owns_exactly_one_outer_synchronized_output_boundary() {
     assert_eq!(output, [SYNC_START, b"onetwo", SYNC_END].concat());
     assert_eq!(output.matches(SYNC_START), 1);
     assert_eq!(output.matches(SYNC_END), 1);
+}
+
+#[test]
+fn pending_render_accounting_tracks_a_synchronization_capability_change() {
+    let mut scheduler = OutputScheduler::new(config(), false);
+    scheduler.enqueue_render(batch(b"frame", 20), 0);
+    assert_eq!(scheduler.pending_bytes(), b"frame".len());
+
+    scheduler.set_synchronized_output_supported(true);
+    assert_eq!(
+        scheduler.pending_bytes(),
+        b"frame".len() + SYNC_START.len() + SYNC_END.len()
+    );
+    scheduler.set_synchronized_output_supported(false);
+    assert_eq!(scheduler.pending_bytes(), b"frame".len());
+
+    scheduler.set_synchronized_output_supported(true);
+    let mut output = Vec::new();
+    scheduler
+        .drain_ready(4, false, &mut output)
+        .expect("drain render after capability change");
+    assert_eq!(output, [SYNC_START, b"frame", SYNC_END].concat());
 }
 
 #[test]
@@ -743,7 +768,64 @@ fn compositor_bypass_replaces_unstarted_working_frame_model_effects() {
     assert!(!contains(&output, b"working title"));
     assert!(!contains(&output, b"file://localhost/working"));
     assert!(!contains(&output, b"working frame"));
-    assert!(report.application_synchronization_bypass_completed);
+    assert!(
+        report
+            .application_synchronization_bypass_completed
+            .is_some()
+    );
+}
+
+#[test]
+fn a_capacity_rejected_bypass_does_not_steal_the_started_generations_receipt() {
+    let mut scheduler = OutputScheduler::new(
+        OutputSchedulerConfig {
+            latency_budget_ms: 0,
+            write_budget_bytes: 1,
+            maximum_pending_bytes: 16,
+            ..config()
+        },
+        false,
+    );
+    scheduler.set_application_synchronized(true, 0);
+    scheduler.set_application_synchronization_bypassed(true);
+    assert_eq!(
+        scheduler.enqueue_render(batch(b"old", 10), 0),
+        EnqueueOutcome::Queued
+    );
+
+    let mut output = Vec::new();
+    let partial = scheduler
+        .drain_ready(0, false, &mut output)
+        .expect("start the first bypass");
+    assert_eq!(partial.bytes_written, 1);
+    scheduler.set_application_synchronization_bypassed(true);
+    assert_eq!(
+        scheduler.enqueue_render(batch(b"new-replacement", 20), 1),
+        EnqueueOutcome::DroppedForCapacity
+    );
+
+    let mut first_receipt = None;
+    for now_ms in 1..8 {
+        let report = scheduler
+            .drain_ready(now_ms, true, &mut output)
+            .expect("finish the retained bypass");
+        first_receipt = first_receipt.or(report.application_synchronization_bypass_completed);
+    }
+    assert_eq!(first_receipt, Some(1));
+
+    scheduler.set_application_synchronization_bypassed(true);
+    assert_eq!(
+        scheduler.enqueue_render(batch(b"retry", 20), 8),
+        EnqueueOutcome::Queued
+    );
+    let mut retry_receipt = None;
+    for now_ms in 8..16 {
+        let report = scheduler
+            .drain_ready(now_ms, true, &mut output)
+            .expect("finish the retry bypass");
+        retry_receipt = retry_receipt.or(report.application_synchronization_bypass_completed);
+    }
+    assert_eq!(retry_receipt, Some(2));
 }
 
 #[test]

@@ -454,7 +454,7 @@ fn prefix_waits_indefinitely_but_repeat_timeout_cancel_and_unbound_keys_are_dete
 fn connection_bootstrap_speaks_only_the_short_entry_cue_and_ready_pane() {
     let (_app, _sr, recorder, _clock, _physical) = ready_app();
     let messages = recorder.0.borrow();
-    assert_eq!(&*messages, &["tmux", "1: input", "ready"]);
+    assert_eq!(&*messages, &["tmux", "input", "ready"]);
     assert!(messages.iter().all(|message| {
         !message.contains("connection is active")
             && !message.contains("Waiting for tmux")
@@ -468,7 +468,7 @@ fn empty_initial_capture_uses_live_prompt_and_never_announces_blank_screen() {
         ready_app_with_bootstrap(Some(b"ncarpenter:~$"), &[]);
     assert!(app.debug_active_view_contents().contains("ncarpenter:~$"));
     let messages = recorder.0.borrow();
-    assert_eq!(&*messages, &["tmux", "1: input", "ncarpenter:~$"]);
+    assert_eq!(&*messages, &["tmux", "input", "ncarpenter:~$"]);
     assert!(messages.iter().all(|message| message != "blank screen"));
 }
 
@@ -902,7 +902,7 @@ new-window -d -t :10 -n tenth \"/bin/sh -c 'printf TENTH; exec cat'\"\n",
             .0
             .borrow()
             .iter()
-            .any(|message| message == "1: second"),
+            .any(|message| message == "second"),
         "the newly active window title was not announced"
     );
 
@@ -924,11 +924,7 @@ new-window -d -t :10 -n tenth \"/bin/sh -c 'printf TENTH; exec cat'\"\n",
         |app| app.debug_active_view_contents().contains("TENTH"),
     );
     assert!(
-        recorder
-            .0
-            .borrow()
-            .iter()
-            .any(|message| message == "10: tenth"),
+        recorder.0.borrow().iter().any(|message| message == "tenth"),
         "window ten was selected but its title was not announced"
     );
 

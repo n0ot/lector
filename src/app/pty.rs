@@ -15,62 +15,54 @@ impl App {
         Ok(candidate)
     }
 
-    /// Starts one bounded PTY-drain presentation transaction. Control records
-    /// are still parsed and applied in order; visible pane damage is composed
-    /// only when the drain turn finishes.
+    /// Starts one transport-neutral bounded PTY-drain presentation
+    /// transaction. Every read still mutates its terminal model and publishes
+    /// replies/effects immediately; only scene composition is deferred.
     pub fn begin_pty_presentation_batch(&mut self) {
-        debug_assert!(self.pending_tmux_presentation_batch.is_none());
-        self.pending_tmux_presentation_batch = Some(PendingTmuxPresentationBatch::default());
+        debug_assert!(self.pending_presentation_batch.is_none());
+        self.pending_presentation_batch = Some(PendingPresentationBatch::default());
     }
 
-    /// Drops presentation bookkeeping after a failed PTY drain. Model changes
-    /// that were already applied remain valid and will be included in the next
-    /// authoritative render; an unprocessed coalesced tail belongs to the
-    /// failed drain and is discarded with it.
+    /// Drops presentation bookkeeping after a failed PTY drain. Model changes,
+    /// replies, and nonvisual effects have already been applied or dispatched.
+    /// Physical bells remain transaction-owned and are canceled with the
+    /// visual update so a failed drain cannot emit an orphan notification.
     pub fn cancel_pty_presentation_batch(&mut self) {
-        self.pending_tmux_presentation_batch = None;
+        if self
+            .pending_presentation_batch
+            .take()
+            .is_some_and(|batch| batch.has_scene_work())
+        {
+            // The model is now ahead of the physical presentation. Force the
+            // next successful scene publication to reconstruct that gap.
+            self.scene_renderer.invalidate();
+        }
     }
 
-    /// Presents the final modeled state from one bounded PTY drain. The common
-    /// single-pane case retains semantic operation hints; interleaved panes
-    /// retain the union of their compositor regions. Topology transitions
-    /// conservatively produce one full composite.
-    pub fn finish_pty_presentation_batch(
-        &mut self,
-        sr: &mut ScreenReader,
-        term_out: &mut dyn Write,
-    ) -> Result<()> {
-        let pending = self
-            .pending_tmux_presentation_batch
-            .as_mut()
-            .and_then(PendingTmuxPresentationBatch::take_pending_gateway_event);
-        if let Some(event) = pending {
-            self.handle_tmux_gateway_event(sr, event, term_out)?;
-        }
-        let Some(batch) = self.pending_tmux_presentation_batch.take() else {
+    /// Presents the current authoritative scene exactly once after one bounded
+    /// PTY drain. The common root and single-pane cases retain their semantic
+    /// operation hints without allocating a pane map. Topology or overlay
+    /// transitions supersede stale incremental damage with a full scene.
+    pub fn finish_pty_presentation_batch(&mut self, term_out: &mut dyn Write) -> Result<()> {
+        let Some(batch) = self.pending_presentation_batch.take() else {
             return Ok(());
         };
-        let update_count = batch.updates.len();
-        let Some((&(connection_id, pane_id), update)) = batch.updates.first_key_value() else {
-            if batch.bell_count != 0 {
-                self.emit_physical_bells(term_out, batch.bell_count)?;
-            }
-            return Ok(());
-        };
-        let one_visible_pane = update_count == 1
-            && self
-                .view_stack
-                .active_tmux_connection_mut()
-                .is_some_and(|view| {
-                    view.connection_id() == connection_id
-                        && !view.is_showing_portal()
-                        && view.is_pane_visible(pane_id)
-                });
-        if one_visible_pane {
-            self.render_tmux_pane_update(term_out, pane_id, batch.bell_count, update)
-        } else {
-            self.render_tmux_batched_update(term_out, batch.bell_count, batch.updates)
+        let bell_count = batch.bell_count;
+        if batch.authoritative_scene_required {
+            return self.render_full_scene(term_out, bell_count);
         }
+
+        let active_tmux_connection = self
+            .view_stack
+            .active_tmux_connection_mut()
+            .map(|view| view.connection_id());
+        if active_tmux_connection.is_none() {
+            return batch.root_update.map_or(Ok(()), |update| {
+                self.render_terminal_update(term_out, bell_count, &update)
+            });
+        }
+
+        self.render_tmux_batched_updates(term_out, bell_count, batch.pane_updates())
     }
 
     fn mark_tmux_pane_capture_required(flow: &mut TmuxPaneFlowState) {
@@ -177,12 +169,19 @@ impl App {
         self.log_latency_stage("source-output-read", || format!("bytes={}", buf.len()));
         let events = self.tmux_gateway.push(buf)?;
         self.sync_root_tmux_termination_deadline();
+        self.handle_tmux_gateway_events(sr, events, term_out)?;
+        self.flush_pending_clipboard_writes(sr, term_out)
+    }
+
+    fn handle_tmux_gateway_events(
+        &mut self,
+        sr: &mut ScreenReader,
+        events: impl IntoIterator<Item = crate::tmux_gateway::GatewayEvent>,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        let mut coalescer = TmuxGatewayOutputCoalescer::default();
         for event in events {
-            let (first, second) = if let Some(batch) = &mut self.pending_tmux_presentation_batch {
-                batch.route_gateway_event(event)
-            } else {
-                (Some(event), None)
-            };
+            let (first, second) = coalescer.route_gateway_event(event);
             if let Some(event) = first {
                 self.handle_tmux_gateway_event(sr, event, term_out)?;
             }
@@ -190,7 +189,10 @@ impl App {
                 self.handle_tmux_gateway_event(sr, event, term_out)?;
             }
         }
-        self.flush_pending_clipboard_writes(sr, term_out)
+        if let Some(event) = coalescer.finish() {
+            self.handle_tmux_gateway_event(sr, event, term_out)?;
+        }
+        Ok(())
     }
 
     /// Resolves any active control connection when the root PTY transport
@@ -202,9 +204,7 @@ impl App {
     ) -> Result<()> {
         let events = self.tmux_gateway.finish_transport();
         self.tmux_termination_deadline_ms = None;
-        for event in events {
-            self.handle_tmux_gateway_event(sr, event, term_out)?;
-        }
+        self.handle_tmux_gateway_events(sr, events, term_out)?;
         self.flush_pending_clipboard_writes(sr, term_out)
     }
 
@@ -451,12 +451,28 @@ impl App {
                 | crate::terminal_protocol::EffectDisposition::Drop => {}
             }
         }
-        self.render_terminal_update(term_out, terminal_update.effects.bells, &terminal_update)?;
-        let now_ms = self.clock.now_ms();
-        if self.first_pty_update.is_none() {
-            self.first_pty_update = Some(now_ms);
+        let output_screen = (
+            terminal_update.screen_after,
+            terminal_update.screen_before != terminal_update.screen_after,
+        );
+        let adaptive_quiet_trainable = adaptive_quiet_is_trainable(&terminal_update);
+        let bells = terminal_update.effects.bells;
+        if let Some(batch) = &mut self.pending_presentation_batch {
+            batch.push_root(terminal_update, bells);
+        } else {
+            self.render_terminal_update(term_out, bells, &terminal_update)?;
         }
-        self.last_pty_update = Some(now_ms);
+        let now_ms = self.clock.now_ms();
+        let view_id = self.view_stack.root_mut().model().view_id();
+        self.note_pty_update(
+            AccessibilityContext {
+                view_id,
+                screen: output_screen.0,
+            },
+            now_ms,
+            output_screen.1,
+            adaptive_quiet_trainable,
+        );
         Ok(())
     }
 
@@ -534,8 +550,7 @@ impl App {
         self.queue_tmux_resize(connection_id, geometry);
         self.queue_tmux_inventory(connection_id);
         self.active_tmux_connection = Some(connection_id);
-        self.first_pty_update = None;
-        self.last_pty_update = None;
+        self.cancel_stabilization_bursts();
         self.capture_lua_repl_history();
         self.view_stack.clear_overlays();
         let (rows, cols) = self.view_stack.root_mut().model().live_size();
@@ -627,8 +642,7 @@ impl App {
                     .then(|| self.tmux_connections.last().map(|connection| connection.id))
                     .flatten()
             });
-        self.first_pty_update = None;
-        self.last_pty_update = None;
+        self.cancel_stabilization_bursts();
         self.capture_lua_repl_history();
         if !preserve_connection_chooser {
             self.view_stack.clear_overlays();
@@ -1619,19 +1633,33 @@ impl App {
         if previous.as_ref() == Some(&current) {
             return Ok(());
         }
+        if previous.as_ref().is_none_or(|previous| {
+            previous.session_id != current.session_id
+                || previous.window_id != current.window_id
+                || previous.pane_id != current.pane_id
+        }) {
+            self.cancel_stabilization_bursts();
+        }
         match previous {
             None => {
-                sr.speak(&current.window_title(), false)?;
+                sr.speak(&current.window_name, false)?;
                 self.announce_view_contents(sr)?;
             }
-            Some(previous)
-                if previous.session_id != current.session_id
-                    || previous.session_name != current.session_name =>
-            {
+            Some(previous) if previous.session_id != current.session_id => {
                 sr.speak(&current.session_name, false)?;
-                sr.speak(&current.window_title(), false)?;
+                sr.speak(&current.window_name, false)?;
+                self.announce_view_contents(sr)?;
             }
-            Some(_) => sr.speak(&current.window_title(), false)?,
+            Some(previous) if previous.window_id != current.window_id => {
+                sr.speak(&current.window_name, false)?;
+                self.announce_view_contents(sr)?;
+            }
+            Some(previous) if previous.pane_id != current.pane_id => {
+                self.announce_view_contents(sr)?;
+            }
+            // A rename or other label-only topology update stays silent while
+            // the user remains in the same tmux session, window, and pane.
+            Some(_) => {}
         }
         Ok(())
     }
@@ -2140,23 +2168,37 @@ impl App {
             }
         }
         let bells = outcome.as_ref().map_or(0, |outcome| outcome.bells);
+        let output_screen = outcome.as_ref().map(|outcome| {
+            (
+                outcome.update.screen_after,
+                outcome.update.screen_before != outcome.update.screen_after,
+            )
+        });
+        let adaptive_quiet_trainable = outcome
+            .as_ref()
+            .is_some_and(|outcome| adaptive_quiet_is_trainable(&outcome.update));
         let presented_bells = if bells > 0 {
             self.present_tmux_bell(sr, connection_id, pane_id, is_visible, term_out)?
         } else {
             0
         };
         if is_visible && let Some(outcome) = outcome {
-            if let Some(batch) = &mut self.pending_tmux_presentation_batch {
-                batch.push(connection_id, pane_id, presented_bells, outcome.update);
+            if let Some(batch) = &mut self.pending_presentation_batch {
+                batch.push_pane(connection_id, pane_id, outcome.update, presented_bells);
             } else {
                 self.render_tmux_pane_update(term_out, pane_id, presented_bells, &outcome.update)?;
             }
             if is_active_pane {
                 let now_ms = self.clock.now_ms();
-                if self.first_pty_update.is_none() {
-                    self.first_pty_update = Some(now_ms);
-                }
-                self.last_pty_update = Some(now_ms);
+                let view_id = self.view_stack.active_mut().model().view_id();
+                let (screen, screen_context_changed) =
+                    output_screen.expect("visible output retained its screen identity");
+                self.note_pty_update(
+                    AccessibilityContext { view_id, screen },
+                    now_ms,
+                    screen_context_changed,
+                    adaptive_quiet_trainable,
+                );
             }
         }
         Ok(())
@@ -3121,49 +3163,82 @@ impl App {
     }
 
     pub fn maybe_finalize_changes(&mut self, sr: &mut ScreenReader) -> Result<bool> {
-        let Some(lpu) = self.last_pty_update else {
-            return Ok(false);
-        };
-        let first_pty_update = self.first_pty_update.unwrap_or(lpu);
         let now_ms = self.clock.now_ms();
         let presentation_tracking = self.output_scheduler.is_some();
-        if presentation_tracking && !self.active_presentation_finalization_pending() {
+        let presented_update = if presentation_tracking {
+            self.active_presented_update_status()
+        } else {
+            PresentedUpdateStatus::default()
+        };
+        if presentation_tracking && !presented_update.finalization_pending {
             return Ok(false);
         }
-        // A synchronized-output close is an application-declared commit. The
-        // flag is carried by the exact presentation frame and only becomes
-        // visible here after the scheduler's physical flush receipt, so this
-        // fast path cannot observe a Neovim draw in progress.
-        let explicitly_stable =
-            presentation_tracking && self.active_presentation_explicitly_stable();
         let tmux_base_active = self
             .view_stack
             .active_tmux_connection_mut()
             .is_some_and(|view| view.is_ready() && !view.is_showing_portal());
         let overlay_active = !tmux_base_active && self.view_stack.has_overlay();
-        let accessibility_blocked = if presentation_tracking {
-            false
-        } else if tmux_base_active {
-            let view = self.view_stack.active_mut().model();
-            view.application_transaction_open()
+        let (accessibility_blocked, update_status) = if presentation_tracking {
+            (
+                presented_update.application_transaction_open,
+                presented_update,
+            )
         } else {
-            let view = self.view_stack.root_mut().model();
-            view.application_transaction_open()
+            let view = if tmux_base_active {
+                self.view_stack.active_mut().model()
+            } else {
+                self.view_stack.root_mut().model()
+            };
+            let update = view.accessibility_update_summary();
+            let cursor_restored = update.cursor_visibility_restored;
+            let parser_continuation = update.parser_continuation;
+            let adaptive_quiet_trainable = adaptive_quiet_is_trainable(update);
+            let context = AccessibilityContext {
+                view_id: view.view_id(),
+                screen: view.screen().screen,
+            };
+            (
+                view.application_transaction_open(),
+                PresentedUpdateStatus {
+                    context: Some(context),
+                    application_transaction_open: view.application_transaction_open(),
+                    completes_linear_output_record: view
+                        .accessibility_completes_linear_output_record(),
+                    cursor_restored,
+                    prompt_transaction_open: view.accessibility_prompt_transaction_open(),
+                    parser_continuation,
+                    adaptive_quiet_trainable,
+                    ..PresentedUpdateStatus::default()
+                },
+            )
         };
-        if accessibility_blocked {
+        let context = update_status
+            .context
+            .expect("an active accessibility update has a stabilization context");
+        let Some(burst) = self.stabilization_burst(context) else {
             return Ok(false);
-        }
-        if explicitly_stable
-            || now_ms.saturating_sub(lpu) >= DIFF_DELAY as u128
-            || now_ms.saturating_sub(first_pty_update) >= MAX_DIFF_DELAY as u128
-        {
-            self.log_event("finalizing terminal changes");
+        };
+        // Application-declared boundaries are carried by the exact presented
+        // frame. The shared decision table therefore sees them only after the
+        // scheduler's physical receipt and cannot commit a draw in progress.
+        let recent_input = stabilization_input_is_recent(now_ms, self.last_stdin_update);
+        let decision = stabilization_decision(
+            now_ms,
+            burst,
+            update_status,
+            accessibility_blocked,
+            recent_input,
+        );
+        if let StabilizationDecision::Commit(commit_reason) = decision {
             self.log_latency_stage("accessibility-finalization-start", || {
-                format!("explicitly_stable={explicitly_stable}")
+                format!(
+                    "reason={} parser_continuation={} prompt_transaction_open={} diff_delay_ms={}",
+                    commit_reason.as_str(),
+                    update_status.parser_continuation,
+                    update_status.prompt_transaction_open,
+                    burst.delay_ms,
+                )
             });
-            let recent_input = self
-                .last_stdin_update
-                .is_some_and(|lsu| now_ms.saturating_sub(lsu) <= MAX_DIFF_DELAY as u128);
             let view = if presentation_tracking {
                 self.presented_accessibility_model_mut()
             } else if tmux_base_active {
@@ -3171,8 +3246,19 @@ impl App {
             } else {
                 self.view_stack.root_mut().model()
             };
+            let mut screen_transition_observed = false;
             view.with_live_screen(|view| -> Result<()> {
-                if !overlay_active {
+                let screen_transition = view.prev_screen().screen != view.screen().screen
+                    || view.accessibility_screen_transition_pending();
+                screen_transition_observed = screen_transition;
+                let screen_transition_stable =
+                    screen_transition && view.screen().has_visible_non_whitespace_content();
+                if !overlay_active && screen_transition {
+                    // A screen identity handoff is a new reading context, not
+                    // a whole-screen diff. Finalization below resets its
+                    // baseline after announcing the application cursor row.
+                    speak_application_cursor_line(sr, view)?;
+                } else if !overlay_active {
                     let mut read_text = sr.resolve_pending_delete(view)?;
                     let semantic_history_read = if sr.take_pending_history_navigation() {
                         if let Some(input) = view.active_semantic_input() {
@@ -3207,6 +3293,11 @@ impl App {
                 }
 
                 synchronize_pending_review_cursor(sr, view)?;
+                if screen_transition_stable {
+                    view.complete_accessibility_screen_transition();
+                } else if screen_transition {
+                    view.defer_accessibility_screen_transition();
+                }
                 sr.hook_on_screen_update(view, overlay_active)?;
                 view.finalize_changes(now_ms);
                 Ok(())
@@ -3220,14 +3311,19 @@ impl App {
                     .presented_accessibility_model_mut()
                     .accessibility_awaiting_presentation();
             if parser_is_newer {
-                self.first_pty_update = Some(now_ms);
-                self.last_pty_update = Some(now_ms);
+                self.rebase_stabilization_burst_deadline(context, now_ms);
             } else {
-                self.first_pty_update = None;
-                self.last_pty_update = None;
+                self.finish_stabilization_burst(
+                    context,
+                    now_ms,
+                    burst.last_output_ms,
+                    commit_reason.trains_adaptive_quiet(update_status),
+                    screen_transition_observed,
+                );
             }
-            self.log_event("finished finalizing terminal changes");
-            self.log_latency_stage("accessibility-finalized", String::new);
+            self.log_latency_stage("accessibility-finalized", || {
+                format!("reason={}", commit_reason.as_str())
+            });
             return Ok(true);
         }
         Ok(false)

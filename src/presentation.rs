@@ -11,7 +11,7 @@ use crate::terminal::{
 };
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt, fs,
     path::PathBuf,
     sync::Arc,
@@ -29,6 +29,19 @@ pub struct ViewId(pub u64);
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ViewRevision(pub u64);
 
+/// Identity of one continuous accessibility-update context within a view.
+///
+/// Screen-identity and ownership handoffs start a new epoch without resetting
+/// the view's monotonic presentation revision. Carrying this compact token in
+/// a render receipt lets the view select only the parser evidence belonging to
+/// that exact context, even when the live parser has already entered a newer
+/// one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AccessibilityEpoch {
+    pub generation: u64,
+    pub start_revision: ViewRevision,
+}
+
 /// The exact view state represented by one physically presented surface.
 ///
 /// Visible state is retained with the render transaction. Scrollback is
@@ -44,10 +57,65 @@ pub struct PresentedViewFrame {
     /// every frame.
     pub snapshot: TerminalSnapshot,
     pub history_revision: u64,
-    pub history: Option<Arc<[Row]>>,
+    /// Basis of the history carried or reused by this frame. This is separate
+    /// from visible geometry because compositor transitions may fit an older
+    /// committed viewport to a newly resized surface without reflowing its
+    /// still-committed history.
+    pub history_basis: PresentedHistoryBasis,
+    pub history: Option<Arc<PresentedHistoryDelta>>,
+    /// Selects the bounded, view-owned accessibility evidence ending at
+    /// `revision`. The evidence itself stays out of replaceable render frames,
+    /// avoiding a clone of a growing update summary on every enqueue.
+    pub accessibility_epoch: AccessibilityEpoch,
     /// The source update for this exact revision ended at an explicit
-    /// synchronized-output commit boundary.
+    /// synchronized-output or semantic prompt commit boundary.
     pub explicitly_stable: bool,
+    /// The source update ended at a hidden-to-visible cursor transition. This
+    /// is a conservative legacy redraw hint, not an application transaction.
+    pub cursor_visibility_restored: bool,
+}
+
+/// Compact identity and absolute interval of one history generation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PresentedHistoryBasis {
+    pub(crate) screen: ScreenIdentity,
+    pub(crate) geometry: TerminalGeometry,
+    pub(crate) origin: usize,
+    pub(crate) extent: usize,
+}
+
+impl PresentedHistoryBasis {
+    pub(crate) fn from_snapshot(snapshot: &TerminalSnapshot) -> Self {
+        Self {
+            screen: snapshot.screen,
+            geometry: snapshot.geometry,
+            origin: snapshot.history_origin,
+            extent: snapshot.scrollback_extent,
+        }
+    }
+
+    pub(crate) fn end(self) -> Option<usize> {
+        self.origin.checked_add(self.extent)
+    }
+}
+
+/// One exact, structurally shared history transition carried by a render
+/// receipt. Coordinates are absolute within the monotonic history lineage.
+/// `rows` replaces `[replace_from, origin + extent)`; an unchanged prefix is
+/// shared logically with the preceding generation and never re-read from
+/// Ghostty. Structural transitions use `full_replacement` and deliberately
+/// discard that prefix.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PresentedHistoryDelta {
+    pub(crate) revision: u64,
+    pub(crate) base_revision: u64,
+    pub(crate) basis: PresentedHistoryBasis,
+    pub(crate) replace_from: usize,
+    pub(crate) rows: Arc<[Row]>,
+    pub(crate) full_replacement: bool,
+    pub(crate) previous: Option<Arc<PresentedHistoryDelta>>,
+    pub(crate) depth: usize,
+    pub(crate) retained_rows: usize,
 }
 
 /// Accessibility frames committed atomically with a physical render flush.
@@ -64,6 +132,34 @@ pub struct PresentedAccessibilityBundle {
     /// associated cell render under backpressure.
     pub active_label_tracks_terminal_title: bool,
     pub frames: Vec<PresentedViewFrame>,
+}
+
+/// Per-receipt routing table for bundles which contain multiple view frames.
+///
+/// Frame ownership is globally identified by [`ViewId`]. Building this table
+/// once lets the view hierarchy walk each owned model exactly once instead of
+/// scanning every pane for every frame. Single-frame bundles deliberately use
+/// their allocation-free targeted routing path instead.
+pub(crate) struct PresentedFrameIndex<'a> {
+    frames: HashMap<ViewId, &'a PresentedViewFrame>,
+}
+
+impl<'a> PresentedFrameIndex<'a> {
+    pub(crate) fn new(frames: &'a [PresentedViewFrame]) -> Self {
+        let mut indexed = HashMap::with_capacity(frames.len());
+        for frame in frames {
+            let previous = indexed.insert(frame.view_id, frame);
+            debug_assert!(
+                previous.is_none(),
+                "a presentation bundle must contain at most one frame per view"
+            );
+        }
+        Self { frames: indexed }
+    }
+
+    pub(crate) fn get(&self, view_id: ViewId) -> Option<&'a PresentedViewFrame> {
+        self.frames.get(&view_id).copied()
+    }
 }
 
 impl PresentedAccessibilityBundle {

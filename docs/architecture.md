@@ -57,15 +57,29 @@ output; it bounds queued work, completes a partially written escape transaction
 before starting another, and can replace unstarted rendering from authoritative
 scene state.
 
+One child-PTY drain is also the presentation transaction. Every read is parsed
+into the live terminal model before the read callback returns, and generated
+replies and nonvisual effects keep their stream order. Physical bells remain
+owned by the pending visual transaction and follow only an accepted scene. A
+transport-neutral
+`PendingPresentationBatch` merges only renderer damage and semantic operation
+hints. The common direct and one-pane cases use inline optional slots; storage
+for multiple pane sources is allocated only when it is needed. At the fairness
+boundary, Lector selects the authoritative root or composed tmux scene and
+captures it once. Cancellation invalidates incremental renderer state so the
+next successful publication reconstructs any model changes that were never
+presented.
+
 tmux control records remain ordered on the event-loop thread. Hidden panes do
 not retain cumulative speech/render summaries: each pane batch is applied as a
 bounded delta, and only the active accessibility pane keeps metadata until its
 next stabilization point. Adjacent ordinary output records for the same pane
-are combined up to 64 KiB within one bounded PTY drain, with control records,
-extended output, and pane changes acting as ordering fences. The first record
-is modeled immediately; its adjacent tail is modeled and the final visible
-state is composed and rendered at the drain boundary, before ready user input
-is dispatched. The active tmux layout is parsed into one
+inside one root-PTY read are combined up to 64 KiB, with control records,
+extended output, and pane changes acting as ordering fences. That coalescer is
+flushed before `handle_pty` returns, so it never defers model mutation or a
+protocol reply across reads. The final visible state from the bounded drain is
+composed and rendered once before ready user input is dispatched. The active
+tmux layout is parsed into one
 cached projection when topology changes instead of being reparsed for each
 visibility, input, and composition query. Selecting the live viewport is a
 no-op, and `Scrollback(0)` never materializes retained history. A lossy tmux
@@ -98,12 +112,19 @@ history, and review marks use only the last presented model.
 Every scheduled render owns an opaque accessibility bundle containing stable
 view identities, model revisions, and the exact visible snapshots represented
 by that scene. Changed scrollback generations are shared across candidate
-frames; unchanged history is not copied. The bundle follows its render through
-coalescing, replacement, partial writes, and backpressure. Only a successful
-flush returns it as a completed render, and applying completed bundles in order
-is the sole accessibility publication path. A capacity-dropped or replaced
-render therefore cannot become readable, and an older render which was already
-started publishes its own snapshot rather than a newer parser state.
+frames; unchanged history is not copied. History receipts carry bounded,
+Arc-linked append/evict deltas over an absolute window and use `VecDeque` at
+the presented boundary, so steady scrolling reads and installs only newly
+retained rows. Screen changes, reflow, resets, clears, disjoint intervals, and
+bounded chain compaction create independently applicable full roots. Every
+chain is validated before the committed deque moves, preserving exact state
+when intermediate frames are replaced or an older started frame completes.
+The bundle follows its render through coalescing, replacement, partial writes,
+and backpressure. Only a successful flush returns it as a completed render,
+and applying completed bundles in order is the sole accessibility publication
+path. A capacity-dropped or replaced render therefore cannot become readable,
+and an older render which was already started publishes its own snapshot rather
+than a newer parser state.
 
 DEC private mode 2026 controls render eligibility, not accessibility commit.
 While the mode is open, the scheduler holds the composed scene. A real close
@@ -145,6 +166,27 @@ overlay dismissal, tmux connection and pane removal, portal teardown, and pane
 resynchronization without turning permanent output backpressure into unbounded
 retention. Terminal-title effects carry their own flush receipt because the
 outer terminal can apply an OSC title before a larger cell render completes.
+
+Each view also keeps a bounded, revisioned journal of accessibility evidence.
+The journal contains only facts which can affect a reading decision, such as
+completed print records, structural taint, parser continuation, cursor and
+screen identities, and changed-row ranges; renderer operations, effects, and
+other heavyweight update data are not duplicated. A frame carries a compact
+epoch/revision selector rather than a cloned cumulative report. Its successful
+receipt moves exactly the selected evidence into the presented state. Missing
+evidence caused by an oversized or evicted journal range is sticky until that
+range is baselined, forcing the authoritative snapshot-diff fallback instead
+of guessing.
+
+Accessibility commit policy is one ordered decision table shared by deadline
+scheduling and finalization. Application-declared DEC 2026 and OSC 133
+boundaries come first. A structurally safe, LF-complete primary-screen record
+may commit after its exact physical receipt when its reported text validates
+against the newly presented logical-line tail. Cursor restoration after recent
+input is a conservative legacy boundary. Everything else uses the per-view
+adaptive quiet deadline and the bounded hard deadline. Incomplete escape
+sequences cannot quiet-commit, structural and title-only bursts do not train
+the timer, and context switches discard transient deadline state.
 
 The invariant is exact at completed presentation boundaries. When the outer
 terminal supports DEC 2026, Lector's global wrapper also hides partial VT

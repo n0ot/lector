@@ -16,6 +16,7 @@ pub use message::MessageView;
 pub use popup::{PopupResponse, PopupView};
 pub use pty::PtyView;
 pub use review::ReviewView;
+pub(crate) use stack::CompositorTransitionToken;
 pub use stack::ViewStack;
 pub use tmux_chooser::{TmuxChooserTarget, TmuxChooserView};
 pub use tmux_command::TmuxCommandView;

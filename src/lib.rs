@@ -5,6 +5,7 @@ mod commands;
 pub mod diagnostics;
 mod ext;
 pub mod harness;
+mod host_command;
 mod keymap;
 mod line_editor;
 pub mod lua;

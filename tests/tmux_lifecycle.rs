@@ -249,7 +249,7 @@ fn external_destruction_rejects_a_stale_confirmation_and_server_death_clears_it(
             .0
             .borrow()
             .iter()
-            .any(|message| message.contains("no longer exists"))
+            .any(|message| message == "tmux target disappeared")
     );
 
     let (mut app, mut sr, _recorder, mut physical) = ready_app(multi_inventory());

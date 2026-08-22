@@ -16,7 +16,7 @@ const READY: &[u8] = b"LECTOR-BELL-READY";
 const OUTER_READY: &[u8] = b"LECTOR-OUTER-SHELL-READY";
 const OUTER_PROMPT: &[u8] = b"LECTOR-OUTER-PROMPT>";
 const INNER_PROMPT: &[u8] = b"LECTOR-INNER-PROMPT>";
-const COMPATIBLE_ENVIRONMENT: &[u8] = b"ENV:xterm-256color:unset";
+const COMPATIBLE_ENVIRONMENT: &[u8] = b"ENV:xterm-256color:sync";
 const SPOKEN_READY: &str = "LECTOR dash- BELL dash- READY";
 const SPOKEN_READY_UPDATE: &str = "BELL dash- READY";
 const SPOKEN_OUTER_READY: &str = "OUTER dash- SHELL dash- READY";
@@ -25,6 +25,7 @@ const PARENT_AFTER: &[u8] = b"LECTOR-PARENT-AFTER:0";
 const PARENT_INPUT_LEAK: &[u8] = b"LECTOR-PARENT-INPUT-LEAK";
 const TMUX_FOREGROUND_READY: &[u8] = b"LECTOR-TMUX-FOREGROUND-READY";
 const TMUX_FOREGROUND_ACK: &[u8] = b"LECTOR-TMUX-FOREGROUND-ACK";
+const TMUX_SYNC_READY: &str = "LECTOR-TMUX-SYNC-READY";
 const LATENCY_READY: &str = "LECTOR-LATENCY-READY";
 const STARTUP_HOOK_MARKER: &[u8] = b"LECTOR-STARTUP-HOOK-RAN";
 static LIVE_PTY_LOCK: Mutex<()> = Mutex::new(());
@@ -696,7 +697,7 @@ fn assert_bell_lifecycle(mut lector: LiveLector, case: &str) {
         lector.wait_for(Duration::from_secs(2), |output| output
             .windows(COMPATIBLE_ENVIRONMENT.len())
             .any(|window| window == COMPATIBLE_ENVIRONMENT)),
-        "{case}: child did not receive the public compatibility TERM with private TERMINFO removed; output={:?}",
+        "{case}: child did not receive the public xterm identity with synchronized output advertised; output={:?}",
         String::from_utf8_lossy(&lector.output)
     );
 
@@ -1313,6 +1314,32 @@ fn ordinary_tmux_key_to_pixel_latency_stays_interactive() {
         &fixture("tests/fixtures/pty/latency-tmux"),
         "ordinary tmux client",
         false,
+    );
+}
+
+#[test]
+fn fresh_ordinary_tmux_client_loads_lectors_sync_capability() {
+    let _serial = serialize_live_pty_test();
+    let mut lector = LiveLector::spawn(&fixture("tests/fixtures/pty/tmux-sync-info"), false);
+    assert!(
+        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+            physical_screen_contains(terminal, TMUX_SYNC_READY)
+        }),
+        "fresh ordinary tmux client did not report Lector's Sync capability; screen={:?}; output={:?}",
+        lector
+            .physical_terminal
+            .snapshot()
+            .rows
+            .iter()
+            .map(|row| row.text())
+            .collect::<Vec<_>>(),
+        String::from_utf8_lossy(&lector.output)
+    );
+
+    lector.send(b"q");
+    assert!(
+        lector.finish(Duration::from_secs(5)),
+        "fresh ordinary tmux Sync fixture did not exit"
     );
 }
 

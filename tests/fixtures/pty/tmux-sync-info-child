@@ -1,0 +1,22 @@
+#!/bin/bash
+
+set -u
+
+for _ in {1..500}; do
+    if [[ -n $(tmux list-clients -F '#{client_name}' 2>/dev/null) ]]; then
+        break
+    fi
+    sleep 0.01
+done
+
+tmux_info=$(tmux info 2>&1)
+if grep -Eq 'Sync:.*2026' <<<"$tmux_info"; then
+    printf 'LECTOR-TMUX-SYNC-READY\r\n'
+else
+    printf 'LECTOR-TMUX-SYNC-MISSING\r\n%s\r\n' "$tmux_info"
+fi
+
+stty raw -echo
+while IFS= read -r -n 1 byte; do
+    [[ $byte == q ]] && exit 0
+done

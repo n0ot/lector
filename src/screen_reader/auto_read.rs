@@ -1,12 +1,15 @@
 use super::{Result, ScreenReader};
 use crate::view::View;
 use similar::{Algorithm, ChangeTag, TextDiff};
+use std::ops::RangeInclusive;
 
 #[derive(Default)]
 pub(super) struct AutoReadBuffers {
     diff_text: String,
     graphemes: String,
     live_text: String,
+    cursor_line: String,
+    changed_rows: Vec<RangeInclusive<u16>>,
     lcs: Vec<usize>,
 }
 
@@ -31,26 +34,66 @@ impl ScreenReader {
         self.report_application_cursor_indentation_changes(view)?;
         let cursor_moves = view.accessibility_update_summary().cursor_operations;
         let scrolled = view.accessibility_update_summary().scroll_operations > 0;
-        let changed_row_ranges = view.accessibility_update_summary().changed_rows.clone();
+        let linear_output_report = view
+            .accessibility_update_summary()
+            .has_linear_output_report();
 
         let mut live_text = std::mem::take(&mut self.auto_read_buffers.live_text);
         view.accessibility_update_summary()
             .printed_text_into(&mut live_text);
+        let validated_structural_line_report = {
+            let update = view.accessibility_update_summary();
+            let report = live_text.trim();
+            update.output_report_structural
+                && !update.parser_continuation
+                && update.screen_before == crate::terminal::ScreenIdentity::Primary
+                && update.screen_after == crate::terminal::ScreenIdentity::Primary
+                && cursor_moves == 0
+                && !live_text.contains('\n')
+                && !report.is_empty()
+                && cursor_logical_line_matches(
+                    view,
+                    report,
+                    &mut self.auto_read_buffers.cursor_line,
+                )
+        };
+        let readable_print_report = linear_output_report || validated_structural_line_report;
+        let completed_linear_record = view.accessibility_completes_linear_output_record();
+
+        // A completed blank record is still an authoritative presentation
+        // boundary. Consume any matching echo and report it as handled so a
+        // recent Enter does not fall through to cursor tracking or a
+        // whitespace-only screen diff.
+        if completed_linear_record && live_text.trim().is_empty() {
+            self.should_suppress_key_echo(&live_text);
+            self.auto_read_buffers.live_text = live_text;
+            return Ok(true);
+        }
 
         // Printing a separator into an already-blank cell can advance the
         // application cursor without changing normalized screen contents. It
         // is still an echo acknowledgement and must consume the corresponding
         // queued input character before a later word arrives.
-        if view.screen().contents() == view.prev_screen().contents() {
-            let suppressed_echo = self.should_suppress_key_echo(&live_text);
-            self.auto_read_buffers.live_text = live_text;
-            return Ok(suppressed_echo);
+        if !completed_linear_record {
+            let screen_contents_unchanged = {
+                // Populate View's reusable full-screen buffers here instead
+                // of allocating throwaway normalized strings. A validated LF
+                // record does not need a screen diff at all, so it bypasses
+                // this whole-screen scan.
+                let (previous, current, _, _) = view.full_contents_cached();
+                previous == current
+            };
+            if screen_contents_unchanged {
+                let suppressed_echo = self.should_suppress_key_echo(&live_text);
+                self.auto_read_buffers.live_text = live_text;
+                return Ok(suppressed_echo);
+            }
         }
 
         let mut live_read_result = None;
         {
             let text = live_text.trim();
-            if cursor_moves == 0 || scrolled {
+            if readable_print_report && (cursor_moves == 0 || scrolled) {
                 let mut spoken = false;
                 // Match against the verbatim print stream. Trimming is a
                 // speech concern; dropping spaces here desynchronizes the
@@ -61,11 +104,13 @@ impl ScreenReader {
                     && let Some(text) = self.hook_on_live_read(text, cursor_moves, scrolled)?
                     && !text.is_empty()
                 {
-                    crate::diagnostics::event(
-                        "screen-reader",
-                        "auto-read-progress",
-                        &format!("speaking live text bytes={}", text.len()),
-                    );
+                    if crate::diagnostics::enabled() {
+                        crate::diagnostics::event(
+                            "screen-reader",
+                            "auto-read-progress",
+                            &format!("speaking live text bytes={}", text.len()),
+                        );
+                    }
                     self.speak(&text, false)?;
                     crate::diagnostics::event(
                         "screen-reader",
@@ -85,6 +130,14 @@ impl ScreenReader {
             return Ok(result);
         }
         self.auto_read_buffers.live_text = live_text;
+
+        self.auto_read_buffers.changed_rows.clear();
+        self.auto_read_buffers.changed_rows.extend(
+            view.accessibility_update_summary()
+                .changed_rows
+                .iter()
+                .cloned(),
+        );
 
         let mut diff_text = std::mem::take(&mut self.auto_read_buffers.diff_text);
         diff_text.clear();
@@ -108,7 +161,9 @@ impl ScreenReader {
             .is_some_and(|(prev, curr)| prev != curr);
         let (single_changed_row, multiple_changed_rows) = if prev_hashes.len() == curr_hashes.len()
         {
-            let mut changed_rows = changed_row_ranges
+            let mut changed_rows = self
+                .auto_read_buffers
+                .changed_rows
                 .iter()
                 .flat_map(|range| range.clone())
                 .filter(|row| {
@@ -238,6 +293,45 @@ impl ScreenReader {
         self.auto_read_buffers.diff_text = diff_text;
         Ok(original_nonempty)
     }
+}
+
+fn cursor_logical_line_matches(view: &View, report: &str, line: &mut String) -> bool {
+    let snapshot = view.screen();
+    let cursor_row = usize::from(snapshot.cursor.row);
+    if cursor_row >= snapshot.rows.len() {
+        return false;
+    }
+
+    let history_len = snapshot.scrollback.len();
+    let cursor_index = history_len.saturating_add(cursor_row);
+    let row_at = |index: usize| {
+        if index < history_len {
+            &snapshot.scrollback[index]
+        } else {
+            &snapshot.rows[index - history_len]
+        }
+    };
+    let mut start = cursor_index;
+    let columns = usize::from(snapshot.size().1.max(1));
+    // Unicode byte length overestimates occupied cells, and the margin covers
+    // a nonzero starting column plus the cursor row. If the logical line is
+    // older than this, it cannot equal the report and there is no reason to
+    // scan or retain an arbitrarily long soft-wrapped history line.
+    let maximum_rows = report.len().div_ceil(columns).saturating_add(2);
+    let mut rows = 1usize;
+    while start > 0 && row_at(start - 1).wrapped {
+        if rows >= maximum_rows {
+            return false;
+        }
+        start -= 1;
+        rows = rows.saturating_add(1);
+    }
+
+    line.clear();
+    for index in start..=cursor_index {
+        row_at(index).append_contents_to(line);
+    }
+    line.trim() == report
 }
 
 fn next_line_diff_state(state: DiffState, tag: ChangeTag) -> DiffState {

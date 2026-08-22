@@ -1,7 +1,12 @@
 #!/bin/bash
 
 stty raw -echo
-printf 'LECTOR-BELL-READY|ENV:%s:%s' "$TERM" "${TERMINFO-unset}"
+if infocmp -1 -x "$TERM" 2>/dev/null | grep -q '^[[:space:]]*Sync='; then
+    lector_sync=sync
+else
+    lector_sync=missing-sync
+fi
+printf 'LECTOR-BELL-READY|ENV:%s:%s' "$TERM" "$lector_sync"
 if [[ ${LECTOR_TEST_PRELOAD_OUTPUT:-} == 1 ]]; then
     lector_parent=$PPID
     (sleep 0.2; kill -CONT "$lector_parent") &

@@ -67,7 +67,7 @@ fn physical_profile_uses_conservative_terminfo_probe_and_override_precedence() {
 #[test]
 fn terminfo_and_explicit_overrides_have_bounded_stable_parsers() {
     let terminfo = TerminfoCapabilities::from_infocmp(
-        "lector|Lector virtual terminal,\n\tcolors#256,\n\tRGB,\n\tOSC8,\n\tSync,\n",
+        "lector|Lector virtual terminal,\n\tcolors#256,\n\tRGB,\n\tOSC8,\n\tSync=\\E[?2026%?%p1%{1}%-%tl%eh%;,\n",
     );
     assert_eq!(terminfo.color_count, Some(256));
     assert!(terminfo.true_color);

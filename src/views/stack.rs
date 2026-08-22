@@ -1,10 +1,14 @@
 use super::ViewController;
 use crate::{
     presentation::{
-        GridPoint, GridRect, PresentedAccessibilityBundle, PresentedViewFrame, Scene, SurfaceId,
+        GridPoint, GridRect, PresentedAccessibilityBundle, PresentedFrameIndex, PresentedViewFrame,
+        Scene, SurfaceId,
     },
     terminal::{TerminalGeometry, TerminalSnapshot},
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CompositorTransitionToken(u64);
 
 pub struct ViewStack {
     views: Vec<Box<dyn ViewController>>,
@@ -14,7 +18,8 @@ pub struct ViewStack {
     retired_views: Vec<Box<dyn ViewController>>,
     base_count: usize,
     active_base: usize,
-    compositor_transition_pending: bool,
+    next_compositor_transition: u64,
+    compositor_transition: Option<CompositorTransitionToken>,
     presentation_tracking: bool,
 }
 
@@ -25,7 +30,8 @@ impl ViewStack {
             retired_views: Vec::new(),
             base_count: 1,
             active_base: 0,
-            compositor_transition_pending: false,
+            next_compositor_transition: 1,
+            compositor_transition: None,
             presentation_tracking: false,
         }
     }
@@ -58,7 +64,7 @@ impl ViewStack {
             self.views.insert(self.base_count, view);
             self.active_base = self.base_count;
             self.base_count = self.base_count.saturating_add(1);
-            self.compositor_transition_pending = true;
+            self.begin_compositor_transition();
         } else {
             self.views.push(view);
         }
@@ -82,14 +88,14 @@ impl ViewStack {
             self.retired_views.push(view);
         }
         if !self.has_overlay() {
-            self.compositor_transition_pending = true;
+            self.begin_compositor_transition();
         }
         true
     }
 
     pub(crate) fn clear_overlays(&mut self) {
         if self.has_overlay() {
-            self.compositor_transition_pending = true;
+            self.begin_compositor_transition();
         }
         if self.presentation_tracking {
             self.retired_views
@@ -100,11 +106,28 @@ impl ViewStack {
     }
 
     pub(crate) const fn compositor_transition_pending(&self) -> bool {
-        self.compositor_transition_pending
+        self.compositor_transition.is_some()
     }
 
-    pub(crate) fn complete_compositor_transition(&mut self) {
-        self.compositor_transition_pending = false;
+    pub(crate) const fn compositor_transition(&self) -> Option<CompositorTransitionToken> {
+        self.compositor_transition
+    }
+
+    pub(crate) fn complete_compositor_transition(
+        &mut self,
+        transition: CompositorTransitionToken,
+    ) -> bool {
+        if self.compositor_transition != Some(transition) {
+            return false;
+        }
+        self.compositor_transition = None;
+        true
+    }
+
+    fn begin_compositor_transition(&mut self) {
+        let transition = CompositorTransitionToken(self.next_compositor_transition);
+        self.next_compositor_transition = self.next_compositor_transition.wrapping_add(1).max(1);
+        self.compositor_transition = Some(transition);
     }
 
     pub(crate) fn presented_holds_synchronized_output(&mut self) -> bool {
@@ -153,14 +176,14 @@ impl ViewStack {
             None => 0,
         };
         if active_connection.is_some_and(|connection_id| connection_ids.contains(&connection_id)) {
-            self.compositor_transition_pending = true;
+            self.begin_compositor_transition();
         }
     }
 
     pub(crate) fn activate_terminal(&mut self) {
         self.clear_overlays();
         if self.active_base != 0 {
-            self.compositor_transition_pending = true;
+            self.begin_compositor_transition();
         }
         self.active_base = 0;
     }
@@ -171,7 +194,7 @@ impl ViewStack {
         };
         self.clear_overlays();
         if self.active_base != index {
-            self.compositor_transition_pending = true;
+            self.begin_compositor_transition();
         }
         self.active_base = index;
         true
@@ -243,17 +266,18 @@ impl ViewStack {
     }
 
     pub(crate) fn live_snapshots(&mut self) -> Vec<TerminalSnapshot> {
-        let indices = std::iter::once(self.active_base)
-            .chain(self.base_count..self.views.len())
-            .collect::<Vec<_>>();
-        indices
-            .into_iter()
-            .map(|index| {
-                let view = &mut self.views[index];
-                view.model()
-                    .with_live_screen(|model| model.live_screen().clone())
-            })
-            .collect()
+        let overlay_count = self.views.len().saturating_sub(self.base_count);
+        let mut snapshots = Vec::with_capacity(overlay_count.saturating_add(1));
+        snapshots.push(
+            self.views[self.active_base]
+                .model()
+                .with_live_screen(|model| model.live_screen().clone()),
+        );
+        snapshots.extend(self.views[self.base_count..].iter_mut().map(|view| {
+            view.model()
+                .with_live_screen(|model| model.live_screen().clone())
+        }));
+        snapshots
     }
 
     /// Snapshots suitable for a compositor-owned presentation. The hidden
@@ -354,18 +378,41 @@ impl ViewStack {
     }
 
     pub(crate) fn apply_presented_bundle(&mut self, bundle: &PresentedAccessibilityBundle) {
-        for frame in &bundle.frames {
-            for view in self.views.iter_mut().chain(&mut self.retired_views) {
-                if let Some(connection) = view
-                    .as_any_mut()
-                    .downcast_mut::<crate::views::TmuxConnectionView>()
-                {
-                    if connection.apply_presented_frame(frame) {
-                        break;
-                    }
-                } else if view.model().apply_presented_frame(frame.clone()) {
+        let [first, rest @ ..] = bundle.frames.as_slice() else {
+            return;
+        };
+        if rest.is_empty() {
+            self.apply_presented_frame(first);
+            return;
+        }
+
+        let frames = PresentedFrameIndex::new(&bundle.frames);
+        for view in self.views.iter_mut().chain(&mut self.retired_views) {
+            if let Some(connection) = view
+                .as_any_mut()
+                .downcast_mut::<crate::views::TmuxConnectionView>()
+            {
+                connection.apply_presented_frames(&frames);
+                continue;
+            }
+            let model = view.model();
+            if let Some(frame) = frames.get(model.view_id()) {
+                model.apply_presented_frame_ref(frame);
+            }
+        }
+    }
+
+    fn apply_presented_frame(&mut self, frame: &PresentedViewFrame) {
+        for view in self.views.iter_mut().chain(&mut self.retired_views) {
+            if let Some(connection) = view
+                .as_any_mut()
+                .downcast_mut::<crate::views::TmuxConnectionView>()
+            {
+                if connection.apply_presented_frame(frame) {
                     break;
                 }
+            } else if view.model().apply_presented_frame_ref(frame) {
+                break;
             }
         }
     }
@@ -585,6 +632,29 @@ mod tests {
     }
 
     #[test]
+    fn an_older_compositor_receipt_cannot_complete_a_newer_transition() {
+        let mut stack = ViewStack::new(Box::new(PtyView::new(4, 10)));
+
+        stack.push(Box::new(MessageView::new(4, 10, "First", "body")));
+        assert!(stack.pop());
+        let first = stack
+            .compositor_transition()
+            .expect("first overlay pop starts a transition");
+
+        stack.push(Box::new(MessageView::new(4, 10, "Second", "body")));
+        assert!(stack.pop());
+        let second = stack
+            .compositor_transition()
+            .expect("second overlay pop supersedes the transition");
+        assert_ne!(first, second);
+
+        assert!(!stack.complete_compositor_transition(first));
+        assert_eq!(stack.compositor_transition(), Some(second));
+        assert!(stack.complete_compositor_transition(second));
+        assert!(!stack.compositor_transition_pending());
+    }
+
+    #[test]
     fn resize_updates_every_view_in_the_stack() {
         let mut stack = ViewStack::new(Box::new(PtyView::new(4, 10)));
         stack.push(Box::new(MessageView::new(4, 10, "Notice", "body")));
@@ -593,6 +663,35 @@ mod tests {
 
         assert_eq!(stack.root_mut().model().size(), (7, 20));
         assert_eq!(stack.active_mut().model().size(), (7, 20));
+    }
+
+    #[test]
+    fn multi_view_receipt_routes_each_indexed_frame_to_its_owner() {
+        let mut stack = ViewStack::new(Box::new(PtyView::new(4, 10)));
+        stack.enable_presentation_tracking();
+        stack.root_mut().model().process_changes(b"root");
+        let root = stack.logical_active_view_id();
+
+        stack.push(Box::new(MessageView::new(4, 10, "Notice", "body")));
+        stack.active_mut().model().process_changes(b"overlay");
+        let overlay = stack.logical_active_view_id();
+        let bundle = stack.capture_presentation_bundle(true);
+        assert_eq!(bundle.frames.len(), 2);
+
+        stack.apply_presented_bundle(&bundle);
+
+        assert!(
+            !stack
+                .model_by_id_mut(root)
+                .expect("root frame owner")
+                .accessibility_awaiting_presentation()
+        );
+        assert!(
+            !stack
+                .model_by_id_mut(overlay)
+                .expect("overlay frame owner")
+                .accessibility_awaiting_presentation()
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Engine-neutral terminal state and Lector's Ghostty terminal adapter.
 
 use serde::{Deserialize, Serialize};
-use std::{ops::RangeInclusive, sync::Arc};
+use std::{collections::VecDeque, ops::RangeInclusive, sync::Arc};
 
 pub use lector_ghostty::{
     CellSnapshot as Cell, ColorSnapshot as Color, RowSnapshot as Row, StyleSnapshot as Style,
@@ -81,7 +81,7 @@ impl Default for TerminalGeometry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScreenIdentity {
     #[default]
@@ -237,7 +237,10 @@ pub struct PrintedRun {
 
 /// A renderer optimization hint recorded alongside Ghostty mutation. Ghostty's
 /// resulting snapshot remains authoritative; consumers must validate an
-/// operation before translating it to physical-terminal bytes.
+/// operation before translating it to physical-terminal bytes. Engine-produced
+/// `WriteRun` text is always ASCII, so its byte length is also its
+/// terminal-column count; the observer discards operation hints for non-ASCII
+/// output.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalOperation {
     ScrollUp { top: u16, bottom: u16, count: u16 },
@@ -256,6 +259,13 @@ pub struct UpdateSummary {
     pub damage: TerminalDamage,
     pub pty_replies: Vec<u8>,
     pub printed_runs: Vec<PrintedRun>,
+    /// At least one update since the last accessibility commit used
+    /// structural terminal output, so `printed_runs` must not be treated as a
+    /// completed linear record.
+    pub output_report_structural: bool,
+    /// Whether the newest engine update retained an incomplete authoritative
+    /// parser continuation.
+    pub parser_continuation: bool,
     pub operations: Vec<TerminalOperation>,
     pub cursor_operations: usize,
     pub scroll_operations: usize,
@@ -273,6 +283,10 @@ pub struct UpdateSummary {
     /// This batch ended exactly at a real synchronized-output close. It is a
     /// stabilization boundary only after its exact render has flushed.
     pub synchronized_output_closed: bool,
+    /// This batch ended at an OSC 133 input-start boundary with no subsequent
+    /// visible, structural, semantic, or incomplete parser output.
+    pub semantic_input_boundary: bool,
+    pub cursor_visibility_restored: bool,
     pub batch_count: usize,
 }
 
@@ -283,6 +297,8 @@ impl Default for UpdateSummary {
             damage: TerminalDamage::None,
             pty_replies: Vec::new(),
             printed_runs: Vec::new(),
+            output_report_structural: false,
+            parser_continuation: false,
             operations: Vec::new(),
             cursor_operations: 0,
             scroll_operations: 0,
@@ -295,6 +311,8 @@ impl Default for UpdateSummary {
             synchronized_output: false,
             synchronized_output_opened: false,
             synchronized_output_closed: false,
+            semantic_input_boundary: false,
+            cursor_visibility_restored: false,
             batch_count: 0,
         }
     }
@@ -314,11 +332,15 @@ impl UpdateSummary {
         self.synchronized_output = next.synchronized_output;
         self.synchronized_output_opened |= next.synchronized_output_opened;
         self.synchronized_output_closed = next.synchronized_output_closed;
+        self.semantic_input_boundary = next.semantic_input_boundary;
+        self.cursor_visibility_restored = next.cursor_visibility_restored;
         self.batch_count = self.batch_count.saturating_add(next.batch_count);
         self.effects.bells = self.effects.bells.saturating_add(next.effects.bells);
         self.effects.title_changed |= next.effects.title_changed;
         self.effects.events.append(&mut next.effects.events);
         self.pty_replies.append(&mut next.pty_replies);
+        self.output_report_structural |= next.output_report_structural;
+        self.parser_continuation = next.parser_continuation;
         append_printed_runs(&mut self.printed_runs, next.printed_runs);
         append_terminal_operations(&mut self.operations, next.operations);
         self.cursor_operations = self
@@ -328,8 +350,7 @@ impl UpdateSummary {
             .scroll_operations
             .saturating_add(next.scroll_operations);
         self.history_changed |= next.history_changed;
-        self.changed_rows.append(&mut next.changed_rows);
-        normalize_row_ranges(&mut self.changed_rows);
+        merge_row_ranges(&mut self.changed_rows, next.changed_rows);
         self.damage = merge_damage(
             std::mem::take(&mut self.damage),
             std::mem::take(&mut next.damage),
@@ -360,6 +381,44 @@ impl UpdateSummary {
             text.push_str(&run.text);
         }
     }
+
+    /// Whether this cumulative update is safe to finalize as a completed
+    /// line-oriented output record without waiting for screen quiet.
+    pub fn completes_linear_output_record(&self) -> bool {
+        self.has_linear_output_report()
+            && self.residual_carriage_returns_are_record_prefixes()
+            && self
+                .printed_runs
+                .last()
+                .is_some_and(|run| run.boundary == PrintBoundary::LineFeed && run.text.is_empty())
+    }
+
+    /// Whether the parallel print observer describes ordinary primary-screen
+    /// output rather than a structural redraw. Ambiguous reports must fall
+    /// back to the authoritative screen diff even after the quiet timer.
+    pub fn has_linear_output_report(&self) -> bool {
+        self.batch_count > 0
+            && !self.output_report_structural
+            && !self.parser_continuation
+            && self.screen_before == ScreenIdentity::Primary
+            && self.screen_after == ScreenIdentity::Primary
+    }
+
+    fn residual_carriage_returns_are_record_prefixes(&self) -> bool {
+        let mut content_since_line_feed = self.cursor_before.col != 0;
+        for run in &self.printed_runs {
+            match run.boundary {
+                PrintBoundary::Continue => {}
+                PrintBoundary::LineFeed => content_since_line_feed = false,
+                PrintBoundary::CarriageReturn if content_since_line_feed => return false,
+                PrintBoundary::CarriageReturn => {}
+            }
+            if !run.text.is_empty() {
+                content_since_line_feed = true;
+            }
+        }
+        true
+    }
 }
 
 fn append_printed_runs(target: &mut Vec<PrintedRun>, source: Vec<PrintedRun>) {
@@ -383,35 +442,120 @@ fn append_printed_runs(target: &mut Vec<PrintedRun>, source: Vec<PrintedRun>) {
     }
 }
 
+// A public `UpdateSummary` may contain manually constructed Unicode WriteRuns,
+// so their byte length cannot be cached or treated as a column count. Split
+// coalesced runs on fixed absolute-column boundaries instead: every adjacency
+// rescan is then bounded while merge grouping and Unicode column semantics stay
+// deterministic. UTF-8 uses at most four bytes per scalar value.
+const MAX_COALESCED_WRITE_RUN_COLUMNS: usize = 256;
+const MAX_COALESCED_WRITE_RUN_BYTES: usize = MAX_COALESCED_WRITE_RUN_COLUMNS * 4;
+
 fn append_terminal_operations(target: &mut Vec<TerminalOperation>, source: Vec<TerminalOperation>) {
     for operation in source {
-        match (target.last_mut(), operation) {
-            (
-                Some(TerminalOperation::WriteRun {
-                    row: previous_row,
-                    col: previous_col,
-                    text: previous_text,
-                }),
-                TerminalOperation::WriteRun { row, col, text },
-            ) if *previous_row == row
-                && previous_col.saturating_add(
-                    previous_text.chars().count().try_into().unwrap_or(u16::MAX),
-                ) == col =>
-            {
-                previous_text.push_str(&text);
+        match operation {
+            TerminalOperation::WriteRun { row, col, text } => {
+                append_terminal_write_run(target, row, col, text);
             }
-            (_, operation) => target.push(operation),
+            operation => target.push(operation),
         }
     }
+}
+
+fn append_terminal_write_run(
+    target: &mut Vec<TerminalOperation>,
+    row: u16,
+    col: u16,
+    text: String,
+) {
+    if text.is_empty() || col == u16::MAX {
+        append_terminal_write_run_chunk(target, row, col, text);
+        return;
+    }
+
+    let mut chunk_start = 0usize;
+    let mut chunk_col = col;
+    let mut chunk_columns = 0usize;
+    let mut chunk_limit =
+        MAX_COALESCED_WRITE_RUN_COLUMNS - usize::from(chunk_col) % MAX_COALESCED_WRITE_RUN_COLUMNS;
+    let mut split = false;
+    for (byte_index, _) in text.char_indices() {
+        if chunk_columns == chunk_limit {
+            append_terminal_write_run_chunk(
+                target,
+                row,
+                chunk_col,
+                text[chunk_start..byte_index].to_owned(),
+            );
+            split = true;
+            chunk_col = chunk_col.saturating_add(chunk_columns.try_into().unwrap_or(u16::MAX));
+            chunk_start = byte_index;
+            chunk_columns = 0;
+            if chunk_col == u16::MAX {
+                append_terminal_write_run_chunk(
+                    target,
+                    row,
+                    chunk_col,
+                    text[chunk_start..].to_owned(),
+                );
+                return;
+            }
+            chunk_limit = MAX_COALESCED_WRITE_RUN_COLUMNS
+                - usize::from(chunk_col) % MAX_COALESCED_WRITE_RUN_COLUMNS;
+        }
+        chunk_columns = chunk_columns.saturating_add(1);
+    }
+
+    if split {
+        append_terminal_write_run_chunk(target, row, chunk_col, text[chunk_start..].to_owned());
+    } else {
+        append_terminal_write_run_chunk(target, row, chunk_col, text);
+    }
+}
+
+fn append_terminal_write_run_chunk(
+    target: &mut Vec<TerminalOperation>,
+    row: u16,
+    col: u16,
+    text: String,
+) {
+    if let Some(TerminalOperation::WriteRun {
+        row: previous_row,
+        col: previous_col,
+        text: previous_text,
+    }) = target.last_mut()
+        && *previous_row == row
+        && usize::from(*previous_col) / MAX_COALESCED_WRITE_RUN_COLUMNS
+            == usize::from(col) / MAX_COALESCED_WRITE_RUN_COLUMNS
+        && previous_text
+            .len()
+            .checked_add(text.len())
+            .is_some_and(|len| len <= MAX_COALESCED_WRITE_RUN_BYTES)
+        && write_run_end_col(*previous_col, previous_text) == col
+    {
+        previous_text.push_str(&text);
+    } else {
+        target.push(TerminalOperation::WriteRun { row, col, text });
+    }
+}
+
+fn write_run_end_col(col: u16, text: &str) -> u16 {
+    // The caller bounds this scan to one fixed-column chunk. Engine-produced
+    // write hints are ASCII, while manually constructed Unicode hints retain
+    // their public character-column semantics.
+    let columns = if text.is_ascii() {
+        text.len()
+    } else {
+        text.chars().count()
+    };
+    col.saturating_add(columns.try_into().unwrap_or(u16::MAX))
 }
 
 fn merge_damage(left: TerminalDamage, right: TerminalDamage) -> TerminalDamage {
     match (left, right) {
         (TerminalDamage::Full, _) | (_, TerminalDamage::Full) => TerminalDamage::Full,
         (TerminalDamage::None, damage) | (damage, TerminalDamage::None) => damage,
-        (TerminalDamage::Rows(mut left), TerminalDamage::Rows(mut right)) => {
-            left.append(&mut right);
-            normalize_row_ranges(&mut left);
+        (TerminalDamage::Rows(mut left), TerminalDamage::Rows(right)) => {
+            merge_row_ranges(&mut left, right);
             TerminalDamage::Rows(left)
         }
     }
@@ -419,19 +563,94 @@ fn merge_damage(left: TerminalDamage, right: TerminalDamage) -> TerminalDamage {
 
 fn normalize_row_ranges(ranges: &mut Vec<RangeInclusive<u16>>) {
     ranges.sort_unstable_by_key(|range| *range.start());
-    let mut merged: Vec<RangeInclusive<u16>> = Vec::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
-        if let Some(previous) = merged.last_mut()
-            && range.start() <= &previous.end().saturating_add(1)
-        {
-            let start = *previous.start();
-            let end = (*previous.end()).max(*range.end());
-            *previous = start..=end;
+    coalesce_sorted_row_ranges(ranges);
+}
+
+fn merge_row_ranges(target: &mut Vec<RangeInclusive<u16>>, mut source: Vec<RangeInclusive<u16>>) {
+    if !row_ranges_are_normalized(target) {
+        normalize_row_ranges(target);
+    }
+    if !row_ranges_are_normalized(&source) {
+        normalize_row_ranges(&mut source);
+    }
+    if source.is_empty() {
+        return;
+    }
+    if target.is_empty() {
+        *target = source;
+        return;
+    }
+
+    if source
+        .first()
+        .is_some_and(|first| first.start() >= target.last().expect("target is nonempty").start())
+    {
+        for range in source {
+            append_sorted_row_range(target, range);
+        }
+        return;
+    }
+
+    // Both inputs are sorted and disjoint internally. Grow the target once,
+    // then perform the ordinary backwards merge with `source` as the separate
+    // right-hand storage. This reuses the target allocation and avoids sorting
+    // or rebuilding all previously accumulated ranges.
+    let left_len = target.len();
+    let right_len = source.len();
+    target.resize(left_len.saturating_add(right_len), 0..=0);
+    let mut left = left_len;
+    let mut right = right_len;
+    let mut write = left_len.saturating_add(right_len);
+    while left > 0 || right > 0 {
+        write -= 1;
+        let take_left =
+            right == 0 || (left > 0 && target[left - 1].start() > source[right - 1].start());
+        if take_left {
+            left -= 1;
+            if write != left {
+                target[write] = target[left].clone();
+            }
         } else {
-            merged.push(range);
+            right -= 1;
+            target[write] = source[right].clone();
         }
     }
-    *ranges = merged;
+    coalesce_sorted_row_ranges(target);
+}
+
+fn row_ranges_are_normalized(ranges: &[RangeInclusive<u16>]) -> bool {
+    ranges
+        .windows(2)
+        .all(|pair| pair[1].start() > &pair[0].end().saturating_add(1))
+}
+
+fn append_sorted_row_range(target: &mut Vec<RangeInclusive<u16>>, range: RangeInclusive<u16>) {
+    if let Some(previous) = target.last_mut()
+        && range.start() <= &previous.end().saturating_add(1)
+    {
+        let start = *previous.start();
+        let end = (*previous.end()).max(*range.end());
+        *previous = start..=end;
+    } else {
+        target.push(range);
+    }
+}
+
+fn coalesce_sorted_row_ranges(ranges: &mut Vec<RangeInclusive<u16>>) {
+    let mut write = 0usize;
+    for read in 0..ranges.len() {
+        if write > 0 && ranges[read].start() <= &ranges[write - 1].end().saturating_add(1) {
+            let start = *ranges[write - 1].start();
+            let end = (*ranges[write - 1].end()).max(*ranges[read].end());
+            ranges[write - 1] = start..=end;
+        } else {
+            if write != read {
+                ranges[write] = ranges[read].clone();
+            }
+            write += 1;
+        }
+    }
+    ranges.truncate(write);
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -444,7 +663,7 @@ pub enum Viewport {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TerminalSnapshot {
     pub rows: Arc<Vec<Row>>,
-    pub scrollback: Vec<Row>,
+    pub scrollback: VecDeque<Row>,
     pub cursor: Cursor,
     pub geometry: TerminalGeometry,
     pub screen: ScreenIdentity,
@@ -523,10 +742,9 @@ impl TerminalSnapshot {
         let mut contents = String::new();
         let mut wrapping = false;
         for row in self.rows.iter() {
-            let text = row.contents();
-            if !text.is_empty() {
-                contents.push_str(&text);
-            } else if wrapping {
+            let row_start = contents.len();
+            row.append_contents_to(&mut contents);
+            if contents.len() == row_start && wrapping {
                 contents.push('\n');
             }
             if !row.wrapped {
@@ -562,15 +780,16 @@ impl TerminalSnapshot {
                         break;
                     };
                     if row_index == start_row {
-                        contents.push_str(&row_contents(
+                        append_row_contents(
                             row,
                             start_col,
                             cols.saturating_sub(start_col),
-                        ));
+                            &mut contents,
+                        );
                     } else if row_index == end_row {
-                        contents.push_str(&row_contents(row, 0, end_col));
+                        append_row_contents(row, 0, end_col, &mut contents);
                     } else {
-                        contents.push_str(&row_contents(row, 0, cols));
+                        append_row_contents(row, 0, cols, &mut contents);
                     }
                     if row_index != end_row && !row.wrapped {
                         contents.push('\n');
@@ -582,7 +801,9 @@ impl TerminalSnapshot {
                 .rows
                 .get(usize::from(start_row))
                 .map_or_else(String::new, |row| {
-                    row_contents(row, start_col, end_col - start_col)
+                    let mut contents = String::new();
+                    append_row_contents(row, start_col, end_col - start_col, &mut contents);
+                    contents
                 }),
             _ => String::new(),
         }
@@ -598,30 +819,39 @@ impl TerminalSnapshot {
         out.clear();
         let (_, cols) = self.size();
         for row in self.rows.iter() {
-            out.push_str(row_contents(row, 0, cols).trim_end());
+            let row_start = out.len();
+            append_row_contents(row, 0, cols, out);
+            let trimmed_row_len = out[row_start..].trim_end().len();
+            out.truncate(row_start + trimmed_row_len);
             out.push('\n');
         }
+    }
+
+    /// Returns whether any visible cell contains a non-whitespace character.
+    ///
+    /// This is equivalent to `!self.contents().trim().is_empty()` without
+    /// constructing the whole-screen string.
+    pub fn has_visible_non_whitespace_content(&self) -> bool {
+        self.rows.iter().any(|row| {
+            row.cells.iter().any(|cell| {
+                !cell.continuation
+                    && cell
+                        .grapheme
+                        .chars()
+                        .any(|character| !character.is_whitespace())
+            })
+        })
     }
 }
 
 fn row_contents(row: &Row, start: u16, width: u16) -> String {
-    let end = usize::from(start.saturating_add(width)).min(row.cells.len());
-    let start = usize::from(start).min(end);
     let mut output = String::new();
-    let mut pending_spaces = 0;
-    for cell in &row.cells[start..end] {
-        if cell.continuation {
-            continue;
-        }
-        if cell.grapheme.is_empty() {
-            pending_spaces += 1;
-        } else {
-            output.extend(std::iter::repeat_n(' ', pending_spaces));
-            pending_spaces = 0;
-            output.push_str(&cell.grapheme);
-        }
-    }
+    append_row_contents(row, start, width, &mut output);
     output
+}
+
+fn append_row_contents(row: &Row, start: u16, width: u16, output: &mut String) {
+    row.append_contents_range_to(output, usize::from(start), usize::from(width));
 }
 
 pub trait TerminalEngine {
@@ -865,6 +1095,13 @@ impl GhosttyEngine {
             .map(|snapshot| normalize_ghostty_snapshot(&snapshot))
     }
 
+    pub fn normalized_history_rows_from(
+        &self,
+        logical_start: usize,
+    ) -> Result<Vec<Row>, lector_ghostty::Error> {
+        self.terminal.history_rows_from(logical_start)
+    }
+
     pub fn ghostty_snapshot_with_history(&self) -> Result<GhosttySnapshot, lector_ghostty::Error> {
         self.terminal.snapshot_with_history()
     }
@@ -958,7 +1195,7 @@ impl GhosttyEngine {
         }
         let visible_rows = live.rows.len();
         let history_rows = full.scrollback.len();
-        let mut all_rows = full.scrollback;
+        let mut all_rows = full.scrollback.into_iter().collect::<Vec<_>>();
         all_rows.extend(full.rows.iter().cloned());
         let start = history_rows.saturating_sub(offset);
         let end = start.saturating_add(visible_rows).min(all_rows.len());
@@ -1090,7 +1327,7 @@ impl TerminalEngine for GhosttyEngine {
 fn normalize_ghostty_snapshot(snapshot: &GhosttySnapshot) -> TerminalSnapshot {
     let mut normalized = TerminalSnapshot {
         rows: Arc::clone(&snapshot.rows),
-        scrollback: snapshot.scrollback.clone(),
+        scrollback: snapshot.scrollback.iter().cloned().collect(),
         ..TerminalSnapshot::default()
     };
     refresh_normalized_ghostty_metadata(&mut normalized, snapshot);
@@ -1144,9 +1381,9 @@ fn refresh_normalized_ghostty_metadata(
 }
 
 fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
-    let damage = match &update.damage {
+    let damage = match update.damage {
         GhosttyDamage::None => TerminalDamage::None,
-        GhosttyDamage::Rows(rows) => TerminalDamage::Rows(rows.clone()),
+        GhosttyDamage::Rows(rows) => TerminalDamage::Rows(rows),
         GhosttyDamage::Full => TerminalDamage::Full,
     };
     let changed_rows = update.changed_rows;
@@ -1181,6 +1418,8 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
                 },
             })
             .collect(),
+        output_report_structural: update.output_report_structural,
+        parser_continuation: update.parser_continuation,
         operations: update
             .operations
             .into_iter()
@@ -1197,6 +1436,8 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         synchronized_output: update.synchronized_output,
         synchronized_output_opened: false,
         synchronized_output_closed: update.synchronized_output_closed,
+        semantic_input_boundary: update.semantic_input_boundary,
+        cursor_visibility_restored: update.cursor_visibility_restored,
         batch_count: 1,
     }
 }

@@ -97,6 +97,14 @@ troubleshooting, and recovery are in
 [docs/tmux-completion.md](docs/tmux-completion.md); prefix and chooser behavior
 is in [docs/tmux-prefix.md](docs/tmux-prefix.md).
 
+An in-place application title change or tmux rename updates Lector's model but
+is not announced automatically. Switching tmux windows announces only the new
+window title, followed by the application cursor line once the composed frame
+is physically stable; it does not read the full `tmux session index title`
+label. Pane switches read only the new cursor line. Alternate-screen,
+overlay/base, window, session, and pane handoffs reset auto-read diff state so
+hidden or previous-context changes cannot replay as a whole-screen diff.
+
 For crash and hang diagnosis, the repository includes a socket-free hostile
 control peer and a kill-bounded live suite covering malformed records, silent
 and unread transports, active and hidden floods, window switching, and nested
@@ -135,18 +143,46 @@ Audible bells follow the completed visual transaction.
 
 ### Virtual terminal capabilities
 
-Lector launches the child with `TERM=xterm-256color` and removes any inherited
-`TERMINFO`. This is the widely installed compatibility contract implemented by
-the compositor. Lector deliberately does not inherit the physical
-terminal's vendor identity or advertise `xterm-ghostty`: using Ghostty's parser
-does not mean Lector implements every Ghostty extension. Device, mode,
-geometry, pixel-size, color-scheme, keyboard, focus, and clipboard queries from
-Lector's root child are answered locally by its Ghostty engine. tmux owns the
-PTYs behind a control connection and answers those pane queries itself; Lector's
-pane engines are observational shadows and discard their duplicate replies.
+Lector launches the child with `TERM=xterm-256color`. It removes any inherited
+`TERMINFO`, then supplies a target- and content-keyed private cache entry with
+the implemented `Sync` capability. When available, bounded `infocmp` and `tic`
+runs adapt the host's own `xterm-256color` entry. Lector also embeds a compiled
+ncurses entry and extracts it automatically on supported macOS and Linux
+systems when those tools are unavailable, fail, or time out. If the normal
+cache cannot be used, a process-owned temporary entry remains alive as long as
+the child process needs it. Lector writes neither the system terminfo database
+nor the user's normal terminfo database, and requires no setup command. This
+lets an ordinary local nested tmux client bracket its redraws with DEC mode 2026
+without changing the public terminal name sent over SSH. Lector also answers
+direct `DECRQM 2026` capability queries. This is the widely installed
+compatibility contract implemented by the compositor. Lector deliberately does
+not inherit the physical terminal's vendor identity or advertise
+`xterm-ghostty`: using Ghostty's parser does not mean Lector implements every
+Ghostty extension. Device, mode, geometry, pixel-size, color-scheme, keyboard,
+focus, and clipboard queries from Lector's root child are answered locally by
+its Ghostty engine. tmux owns the PTYs behind a control connection and answers
+those pane queries itself; Lector's pane engines are observational shadows and
+discard their duplicate replies.
 Lector puts DA1 last in its bounded physical-terminal startup probes and
 consumes replies through that processing fence; those replies are never sent to
 the application.
+
+The private database is local process state: SSH normally sends the public
+`TERM` name, not Lector's `TERMINFO` directory. A tmux client on a remote host
+therefore uses its remote terminfo database and the bounded legacy stabilization
+path unless that host independently advertises `Sync`. Direct mode queries can
+still traverse SSH and be answered by the local Lector terminal.
+
+Accessibility stabilization uses declared boundaries before timers. A DEC 2026
+close and an OSC 133 `B` prompt-input boundary commit immediately after their
+exact render flushes. A structurally safe primary-screen record ending in LF
+or CRLF is validated against those presented pixels and read immediately; this
+keeps line-oriented programs snappy without inferring anything from the Enter
+key. After recent user input, a redraw ending in a real hidden-to-visible cursor
+transition is a conservative legacy hint. Remaining unmarked output starts
+with a 30 ms quiet window, adapts per view between 8 and 60 ms, increases
+immediately after a detected late continuation, and retains the 300 ms
+streaming-output cap.
 
 The virtual terminal implements 256 colors, true color, OSC 8 hyperlinks, and
 the ordinary `xterm-256color` contract, so an inherited `COLORTERM` remains
@@ -157,10 +193,22 @@ internal clipboard history. This terminal-effect policy is independent of
 `lector.o.clipboard.system_provider`; it never writes the host or
 outer-terminal clipboard. Desktop notifications and unknown APC effects are
 dropped. Titles, working directories, progress, hyperlinks, and bells remain
-modeled Lector state. In the live scheduler, title,
-working-directory, progress, clipboard, and notification events remain typed
+modeled Lector state. In the live scheduler, title, working-directory,
+progress, clipboard, and notification events remain typed
 until the scheduler applies their explicit output policy; sensitive clipboard
 and notification payloads are never replayed as raw terminal bytes.
+
+Inside Lector, after attaching a fresh ordinary tmux client, the loaded
+capability can be checked with:
+
+```sh
+infocmp -1 -x xterm-256color | grep Sync
+tmux info | grep Sync
+```
+
+The `tmux info` check applies only to an ordinary tty client. A pure `tmux -CC`
+client has no rendering tty, so it is not expected to report or use `Sync`;
+Lector stabilizes control-mode `%output` at its own compositor boundary instead.
 
 Physical-terminal rendering starts conservatively, then applies terminfo,
 bounded probes, and finally explicit environment overrides. The supported

@@ -1,7 +1,8 @@
 use super::{
     ext::{CellExt, ScreenExt},
     presentation::{
-        PaneMediaStore, PresentationError, PresentedViewFrame, SurfaceId, ViewId, ViewRevision,
+        AccessibilityEpoch, PaneMediaStore, PresentationError, PresentedHistoryBasis,
+        PresentedHistoryDelta, PresentedViewFrame, SurfaceId, ViewId, ViewRevision,
     },
     terminal::{
         GhosttyEngine, GhosttyReviewMark, HistoryPosition, SemanticKind as Osc133Kind,
@@ -11,6 +12,7 @@ use super::{
 };
 use std::{
     cmp::min,
+    collections::VecDeque,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -22,6 +24,30 @@ use std::{
 pub const SCROLLBACK_LINES: usize = 10_000;
 
 static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
+
+// Exact parser evidence is retained only until its physical receipt is
+// consumed. Backpressure must not turn that retention into an unbounded output
+// log: beyond either limit accessibility safely falls back to snapshot diffing.
+const ACCESSIBILITY_JOURNAL_MAX_ENTRIES: usize = 1_024;
+const ACCESSIBILITY_JOURNAL_MAX_BYTES: usize = 1024 * 1024;
+const PRESENTED_HISTORY_MAX_DELTA_DEPTH: usize = 256;
+const PRESENTED_HISTORY_MAX_RETAINED_ROWS: usize = SCROLLBACK_LINES * 2;
+
+struct AccessibilityJournalEntry {
+    epoch: AccessibilityEpoch,
+    revision: ViewRevision,
+    update: UpdateSummary,
+    requires_snapshot_diff: bool,
+    retained_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CompletedLinearRecordCache {
+    epoch: AccessibilityEpoch,
+    revision: ViewRevision,
+    finalized_revision: ViewRevision,
+    result: bool,
+}
 
 enum AccessibilityReadState {
     Live,
@@ -40,24 +66,222 @@ enum AccessibilityReadState {
     },
 }
 
+fn semantic_mark_summary(
+    marks: &[Osc133Mark],
+    alternate_screen: bool,
+) -> (usize, Option<&Osc133Mark>) {
+    marks
+        .iter()
+        .filter(|mark| mark.alternate_screen == alternate_screen)
+        .fold((0, None), |(count, _), mark| {
+            (count.saturating_add(1), Some(mark))
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HistoryState {
+    revision: u64,
+    basis: PresentedHistoryBasis,
+}
+
+impl HistoryState {
+    fn from_snapshot_with_revision(snapshot: &TerminalSnapshot, revision: u64) -> Self {
+        Self {
+            revision,
+            basis: PresentedHistoryBasis::from_snapshot(snapshot),
+        }
+    }
+
+    fn from_delta(delta: &PresentedHistoryDelta) -> Self {
+        Self {
+            revision: delta.revision,
+            basis: delta.basis,
+        }
+    }
+}
+
+/// Validates a receipt chain using only compact interval metadata. Doing this
+/// before taking the committed deque makes malformed or obsolete receipts a
+/// cheap, transactional rejection instead of requiring an O(history) backup.
+fn validate_history_delta_chain(
+    delta: &PresentedHistoryDelta,
+    presented: HistoryState,
+) -> Option<HistoryState> {
+    validate_history_delta_chain_from(delta, presented.revision, presented)
+}
+
+fn validate_history_delta_chain_from(
+    delta: &PresentedHistoryDelta,
+    current_revision: u64,
+    current: HistoryState,
+) -> Option<HistoryState> {
+    if delta.revision <= current_revision {
+        return Some(current);
+    }
+    if delta.revision <= delta.base_revision {
+        return None;
+    }
+
+    let target = HistoryState::from_delta(delta);
+    let target_end = target.basis.end()?;
+    if delta.replace_from < target.basis.origin
+        || delta.replace_from > target_end
+        || delta.rows.len() != target_end - delta.replace_from
+    {
+        return None;
+    }
+
+    if delta.full_replacement {
+        return (delta.replace_from == target.basis.origin && delta.previous.is_none())
+            .then_some(target);
+    }
+
+    let base = if delta.base_revision == current_revision {
+        current
+    } else {
+        let previous = delta.previous.as_deref()?;
+        validate_history_delta_chain_from(previous, current_revision, current)?
+    };
+    let base_end = base.basis.end()?;
+    (base.revision == delta.base_revision
+        && base.basis.screen == target.basis.screen
+        && base.basis.geometry == target.basis.geometry
+        && base.basis.origin <= target.basis.origin
+        && target.basis.origin <= base_end
+        && delta.replace_from == base_end
+        && target_end >= base_end)
+        .then_some(target)
+}
+
+/// Applies a chain already accepted by [`validate_history_delta_chain`]. Rows
+/// are Arc-backed, so the only work proportional to history change is dropping
+/// evicted deque entries and cloning the newly retained row handles.
+fn apply_history_delta_chain(
+    scrollback: &mut VecDeque<crate::terminal::Row>,
+    delta: &PresentedHistoryDelta,
+    presented: HistoryState,
+) -> HistoryState {
+    if delta.revision <= presented.revision {
+        return presented;
+    }
+
+    let mut base = presented;
+    if !delta.full_replacement && delta.base_revision != base.revision {
+        base = apply_history_delta_chain(
+            scrollback,
+            delta
+                .previous
+                .as_deref()
+                .expect("validated incremental delta has its missing base"),
+            base,
+        );
+    }
+
+    let target = HistoryState::from_delta(delta);
+    apply_history_transition(
+        scrollback,
+        base,
+        target,
+        delta.replace_from,
+        delta.full_replacement,
+        delta.rows.iter().cloned(),
+    );
+    target
+}
+
+fn apply_history_transition(
+    scrollback: &mut VecDeque<crate::terminal::Row>,
+    base: HistoryState,
+    target: HistoryState,
+    replace_from: usize,
+    full_replacement: bool,
+    rows: impl IntoIterator<Item = crate::terminal::Row>,
+) {
+    if full_replacement {
+        scrollback.clear();
+    } else {
+        debug_assert_eq!(base.basis.screen, target.basis.screen);
+        debug_assert_eq!(base.basis.geometry, target.basis.geometry);
+        let evicted = target.basis.origin - base.basis.origin;
+        for _ in 0..evicted {
+            let removed = scrollback.pop_front();
+            debug_assert!(removed.is_some());
+        }
+        scrollback.truncate(replace_from - target.basis.origin);
+    }
+    scrollback.extend(rows);
+    debug_assert_eq!(scrollback.len(), target.basis.extent);
+}
+
+/// Cuts a bounded receipt chain without asking Ghostty to decode the complete
+/// history again. The committed deque plus the existing exact chain already
+/// owns every immutable overlap row; only the newest suffix came from the
+/// adapter. Started receipts keep their old Arcs, while the new root becomes
+/// independently applicable from any presented generation.
+fn compact_history_delta_root(
+    committed: &VecDeque<crate::terminal::Row>,
+    presented: HistoryState,
+    previous: &PresentedHistoryDelta,
+    base: HistoryState,
+    target: HistoryState,
+    replace_from: usize,
+    rows: Vec<crate::terminal::Row>,
+) -> Option<Arc<[crate::terminal::Row]>> {
+    if committed.len() != presented.basis.extent {
+        return None;
+    }
+    let validated = validate_history_delta_chain(previous, presented)?;
+    if validated != base {
+        return None;
+    }
+    let mut materialized = committed.clone();
+    let applied = apply_history_delta_chain(&mut materialized, previous, presented);
+    if applied != base {
+        return None;
+    }
+    apply_history_transition(&mut materialized, base, target, replace_from, false, rows);
+    Some(Arc::from(Vec::from(materialized)))
+}
+
 pub struct View {
     view_id: ViewId,
     presentation_tracking: bool,
     live_revision: ViewRevision,
     presented_revision: ViewRevision,
     finalized_presented_revision: ViewRevision,
+    live_accessibility_epoch: AccessibilityEpoch,
+    accessibility_epoch_floor_generation: u64,
+    presented_accessibility_epoch: AccessibilityEpoch,
+    presented_accessibility_evidence_revision: ViewRevision,
+    presented_accessibility_evidence_exact: bool,
+    presented_accessibility_requires_snapshot_diff: bool,
+    accessibility_journal: VecDeque<AccessibilityJournalEntry>,
+    accessibility_journal_bytes: usize,
+    accessibility_journal_gap_start: Option<ViewRevision>,
+    accessibility_journal_discarded_through: ViewRevision,
+    completed_linear_record_cache: Option<CompletedLinearRecordCache>,
+    completed_linear_record_report: String,
+    completed_linear_record_presented: String,
     live_revision_explicitly_stable: bool,
     presented_revision_explicitly_stable: bool,
+    live_revision_cursor_restored: bool,
+    presented_revision_cursor_restored: bool,
     live_history_revision: u64,
     presented_history_revision: u64,
-    shared_live_history: Option<(u64, std::sync::Arc<[crate::terminal::Row]>)>,
+    presented_history_basis: PresentedHistoryBasis,
+    shared_live_history: Option<Arc<PresentedHistoryDelta>>,
     application_transaction_open: bool,
     unpresented_synchronized_output: bool,
     engine: GhosttyEngine,
     committed_snapshot: TerminalSnapshot,
     accessibility_read_state: AccessibilityReadState,
     media: PaneMediaStore,
-    pending_update: UpdateSummary,
+    /// Cumulative parser metadata for standalone Views, where parsing is also
+    /// the accessibility publication boundary. Presentation-tracked Views use
+    /// the bounded revision journal and `presented_update` exclusively; keeping
+    /// a second cumulative copy here would grow without bound under physical
+    /// terminal backpressure.
+    standalone_update: UpdateSummary,
     /// Parser metadata which is safe to use with the currently presented
     /// accessibility snapshot. When a receipt arrives behind the live parser,
     /// this is deliberately empty: snapshot diffing remains exact, whereas
@@ -69,6 +293,7 @@ pub struct View {
     review_cursor_position: (u16, u16),
     review_cursor_follow_pending: bool,
     review_cursor_screen_transition_pending: bool,
+    accessibility_screen_transition_pending: bool,
     review_scrollback: usize,
     retained_history_len: usize,
     review_mark: Option<GhosttyReviewMark>,
@@ -96,16 +321,39 @@ impl View {
         let cursor_position = engine.snapshot().cursor_position();
         let prev_screen = engine.snapshot().clone();
         let committed_snapshot = engine.snapshot_with_history();
+        let presented_history_basis = PresentedHistoryBasis::from_snapshot(&committed_snapshot);
         View {
             view_id: ViewId(NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed)),
             presentation_tracking: false,
             live_revision: ViewRevision(0),
             presented_revision: ViewRevision(0),
             finalized_presented_revision: ViewRevision(0),
+            live_accessibility_epoch: AccessibilityEpoch {
+                generation: 1,
+                start_revision: ViewRevision(0),
+            },
+            accessibility_epoch_floor_generation: 1,
+            presented_accessibility_epoch: AccessibilityEpoch {
+                generation: 1,
+                start_revision: ViewRevision(0),
+            },
+            presented_accessibility_evidence_revision: ViewRevision(0),
+            presented_accessibility_evidence_exact: true,
+            presented_accessibility_requires_snapshot_diff: false,
+            accessibility_journal: VecDeque::new(),
+            accessibility_journal_bytes: 0,
+            accessibility_journal_gap_start: None,
+            accessibility_journal_discarded_through: ViewRevision(0),
+            completed_linear_record_cache: None,
+            completed_linear_record_report: String::new(),
+            completed_linear_record_presented: String::new(),
             live_revision_explicitly_stable: false,
             presented_revision_explicitly_stable: false,
+            live_revision_cursor_restored: false,
+            presented_revision_cursor_restored: false,
             live_history_revision: 0,
             presented_history_revision: 0,
+            presented_history_basis,
             shared_live_history: None,
             application_transaction_open: false,
             unpresented_synchronized_output: false,
@@ -113,13 +361,14 @@ impl View {
             committed_snapshot,
             accessibility_read_state: AccessibilityReadState::Live,
             media: PaneMediaStore::new(Default::default()),
-            pending_update: UpdateSummary::default(),
+            standalone_update: UpdateSummary::default(),
             presented_update: UpdateSummary::default(),
             prev_screen,
             prev_screen_time: 0,
             review_cursor_position: cursor_position,
             review_cursor_follow_pending: false,
             review_cursor_screen_transition_pending: false,
+            accessibility_screen_transition_pending: false,
             review_scrollback: 0,
             retained_history_len: 0,
             review_mark: None,
@@ -141,11 +390,13 @@ impl View {
 
     /// Processes one parser batch and returns that batch's update summary.
     ///
-    /// When `retain_for_accessibility` is true, the view's pending summary
-    /// still accumulates normally for finalization. Callers which only need the
-    /// just-observed renderer/effect delta leave it false, avoiding both a
-    /// cumulative merge and cloning [`Self::update_summary`], whose size can
-    /// grow across many batches.
+    /// When `retain_for_accessibility` is true, print provenance moves into the
+    /// accessibility owner instead of being cloned. Standalone views merge
+    /// that subset into their pending summary; presentation-tracked views
+    /// append it to the bounded receipt journal. The returned renderer/effect
+    /// delta retains its damage rows but not that accessibility-only text.
+    /// Callers which need only the immediate delta leave retention false, so
+    /// shadow panes retain no cumulative vectors.
     pub(crate) fn process_changes_with_batch(
         &mut self,
         buf: &[u8],
@@ -184,62 +435,98 @@ impl View {
         // Output is always interpreted against the live drawing screen. The
         // selected review viewport is restored afterward.
         self.engine.select_viewport(Viewport::Live);
-        let update = TerminalEngine::advance(&mut self.engine, buf);
+        let mut update = TerminalEngine::advance(&mut self.engine, buf);
         let synchronized_output_open_snapshot =
             self.engine.take_synchronized_output_open_snapshot();
         let synchronized = update.synchronized_output;
         let synchronized_output_closed = update.synchronized_output_closed;
+        let semantic_prompt_committed = update.semantic_input_boundary
+            && update.screen_after == crate::terminal::ScreenIdentity::Primary;
+        let cursor_visibility_restored = update.cursor_visibility_restored;
         self.application_transaction_open = synchronized;
         let synchronized_transaction_activity =
             was_synchronized || synchronized || update.synchronized_output_opened;
         let live_history_origin = self.engine.snapshot().history_origin;
         let live_scrollback_extent = self.engine.snapshot().scrollback_extent;
         let live_snapshot = needs_live_snapshot_copy.then(|| self.engine.snapshot().clone());
+        let screen_transition = update.screen_before != update.screen_after;
         let batch_history_changed = update.history_changed
             || live_scrollback_extent != old_scrollback_extent
-            || live_history_origin != old_history_origin;
+            || live_history_origin != old_history_origin
+            || screen_transition;
         if self.presentation_tracking && batch_history_changed {
             self.live_history_revision = self
                 .live_history_revision
                 .checked_add(1)
                 .expect("view history presentation revision exhausted");
-            self.shared_live_history = None;
         }
-        let screen_transition = update.screen_before != update.screen_after;
         if screen_transition {
             self.review_cursor_screen_transition_pending = true;
+        }
+        if self.presentation_tracking && screen_transition {
+            // A primary/alternate handoff is a new accessibility context. Keep
+            // older journal entries alive for already-captured receipts, but
+            // tag this update and every later one with a fresh epoch so their
+            // evidence can never be merged across the transition.
+            self.begin_accessibility_epoch();
         }
         // This boundary flag drives the scheduler for the just-observed PTY
         // batch; unlike damage and printed runs it must not stay sticky until
         // speech finalization.
-        let mut batch_update = if capture_batch {
+        let mut accessibility_evidence = None;
+        let batch_update = if capture_batch {
             if retain_for_accessibility {
-                let batch_update = update.clone();
-                let mut accessibility_update = update;
-                // Structural operations are renderer hints. Accessibility
-                // consumes print, cursor, scroll, effect, and dirty-row facts;
-                // retaining operation strings until speech finalization makes
-                // every physical receipt clone a growing renderer-only log.
-                accessibility_update.operations.clear();
-                self.pending_update.synchronized_output_opened = false;
-                self.pending_update.merge(accessibility_update);
-                Some(batch_update)
+                if self.presentation_tracking {
+                    accessibility_evidence =
+                        Some(take_normalized_accessibility_evidence(&mut update, true));
+                    // The renderer owns this exact batch while the bounded
+                    // journal owns the accessibility subset. Do not also retain
+                    // a cumulative legacy summary while a receipt is pending.
+                    Some(update)
+                } else {
+                    // Standalone callers have no later physical receipt. Keep
+                    // their established cumulative summary contract, while the
+                    // returned clone remains the exact renderer/effect batch.
+                    let batch_update = update.clone();
+                    update.operations.clear();
+                    self.standalone_update.synchronized_output_opened = false;
+                    self.standalone_update.merge(update);
+                    Some(batch_update)
+                }
             } else {
                 // There is no accessibility consumer for this pane. Move the
-                // exact batch to its immediate renderer/effect consumer and
-                // leave no cumulative vectors behind.
-                self.pending_update = UpdateSummary::default();
+                // renderer/effect facts to their immediate consumer, but drop
+                // print provenance which neither consumer uses. Leave no
+                // cumulative vectors behind.
+                update.printed_runs.clear();
+                self.standalone_update = UpdateSummary::default();
                 Some(update)
             }
         } else {
-            self.pending_update.synchronized_output_opened = false;
-            self.pending_update.merge(update);
+            if self.presentation_tracking {
+                accessibility_evidence =
+                    Some(take_normalized_accessibility_evidence(&mut update, false));
+            } else {
+                self.standalone_update.synchronized_output_opened = false;
+                self.standalone_update.merge(update);
+            }
             None
         };
         if self.presentation_tracking {
-            self.live_revision_explicitly_stable = synchronized_output_closed;
+            self.live_revision_explicitly_stable =
+                synchronized_output_closed || semantic_prompt_committed;
+            self.live_revision_cursor_restored = cursor_visibility_restored;
             self.advance_live_revision();
             self.unpresented_synchronized_output |= synchronized_transaction_activity;
+            if let Some(evidence) = accessibility_evidence {
+                self.append_accessibility_evidence(evidence, synchronized_transaction_activity);
+            } else {
+                // A non-accessible shadow update deliberately has no retained
+                // parser facts. Mark the hole so a later receipt can use the
+                // exact snapshot but cannot mistake surrounding facts for a
+                // complete summary.
+                self.note_accessibility_evidence_gap(self.live_revision);
+            }
         }
         // A repaint is not itself a cursor move. Full-screen applications
         // commonly redraw a spinner or prompt in place; treating every such
@@ -355,12 +642,6 @@ impl View {
                 live_snapshot.expect("standalone view captured its live snapshot"),
                 batch_history_changed,
             );
-            if let Some(update) = &mut batch_update {
-                // Match the pending-summary contract: once an atomic update
-                // closes, transient writes from inside it are not eligible for
-                // auto-read or batch consumers either.
-                update.printed_runs.clear();
-            }
         } else {
             let live_snapshot = live_snapshot.expect("standalone view captured its live snapshot");
             let (review_scrollback, review_cursor_position) = translate_review_selection(
@@ -420,11 +701,17 @@ impl View {
                 .select_viewport(Viewport::Scrollback(visible_offset));
         }
         self.prev_screen_time = now_ms;
-        self.pending_update = UpdateSummary::default();
+        self.completed_linear_record_cache = None;
+        self.standalone_update = UpdateSummary::default();
         self.presented_update = UpdateSummary::default();
         if self.presentation_tracking {
             self.finalized_presented_revision = self.presented_revision;
             self.presented_revision_explicitly_stable = false;
+            self.presented_revision_cursor_restored = false;
+            self.presented_accessibility_evidence_revision = self.presented_revision;
+            self.presented_accessibility_evidence_exact = true;
+            self.presented_accessibility_requires_snapshot_diff = false;
+            self.discard_accessibility_journal_through(self.presented_revision);
         }
         self.review_cursor_follow_pending = !frozen && self.review_cursor_screen_transition_pending;
         if self.cached_full_valid {
@@ -471,6 +758,11 @@ impl View {
         }
 
         self.presentation_tracking = true;
+        // Any metadata accumulated before the scheduler took ownership is
+        // represented by the committed snapshot established below. It must not
+        // survive as an unbounded parallel log.
+        self.standalone_update = UpdateSummary::default();
+        self.reset_accessibility_journal_for_handoff();
         if matches!(
             self.accessibility_read_state,
             AccessibilityReadState::Frozen { .. }
@@ -482,9 +774,12 @@ impl View {
             self.live_history_revision = 1;
             self.shared_live_history = None;
             self.unpresented_synchronized_output = true;
+            self.append_accessibility_evidence(UpdateSummary::default(), true);
         } else {
             self.committed_snapshot = self.live_snapshot_with_history();
         }
+        self.presented_history_basis =
+            PresentedHistoryBasis::from_snapshot(&self.committed_snapshot);
         self.presented_revision = ViewRevision(0);
     }
 
@@ -518,6 +813,7 @@ impl View {
     ) -> PresentedViewFrame {
         debug_assert!(self.presentation_tracking);
         let snapshot = self.with_live_screen(|view| view.live_screen().clone());
+        let history_basis = PresentedHistoryBasis::from_snapshot(&snapshot);
         let history = self.presentation_history_if_changed();
         PresentedViewFrame {
             view_id: self.view_id,
@@ -525,8 +821,11 @@ impl View {
             surface_id,
             snapshot,
             history_revision: self.live_history_revision,
+            history_basis,
             history,
+            accessibility_epoch: self.live_accessibility_epoch,
             explicitly_stable: self.live_revision_explicitly_stable,
+            cursor_visibility_restored: self.live_revision_cursor_restored,
         }
     }
 
@@ -539,21 +838,43 @@ impl View {
         surface_id: SurfaceId,
     ) -> PresentedViewFrame {
         debug_assert!(self.presentation_tracking);
+        let history_basis = self.presented_history_basis;
         PresentedViewFrame {
             view_id: self.view_id,
             revision: self.presented_revision,
             surface_id,
             snapshot: self.committed_presentation_snapshot(),
             history_revision: self.presented_history_revision,
+            history_basis,
             history: None,
+            accessibility_epoch: self.presented_accessibility_epoch,
             explicitly_stable: false,
+            cursor_visibility_restored: false,
         }
     }
 
     /// Publishes a model only after the render carrying it has completely
     /// flushed. Returns `false` for a frame routed to the wrong view, a frame
     /// from the future, or an obsolete duplicate.
+    #[cfg(test)]
     pub(crate) fn apply_presented_frame(&mut self, frame: PresentedViewFrame) -> bool {
+        if !self.can_apply_presented_frame(&frame) {
+            return false;
+        }
+        self.install_presented_frame(frame)
+    }
+
+    /// Applies a borrowed receipt only when it belongs to this view and can
+    /// advance its presented state. Routing code uses this boundary so rejected
+    /// candidates never clone a full terminal snapshot.
+    pub(crate) fn apply_presented_frame_ref(&mut self, frame: &PresentedViewFrame) -> bool {
+        if !self.can_apply_presented_frame(frame) {
+            return false;
+        }
+        self.install_presented_frame(frame.clone())
+    }
+
+    fn can_apply_presented_frame(&self, frame: &PresentedViewFrame) -> bool {
         if !self.presentation_tracking
             || frame.view_id != self.view_id
             || frame.revision > self.live_revision
@@ -561,42 +882,81 @@ impl View {
         {
             return false;
         }
+        frame.history_revision >= self.presented_history_revision
+            && (frame.history_revision == self.presented_history_revision
+                || frame
+                    .history
+                    .as_ref()
+                    .is_some_and(|history| history.revision == frame.history_revision))
+    }
 
-        if frame.history_revision < self.presented_history_revision {
+    fn install_presented_frame(&mut self, frame: PresentedViewFrame) -> bool {
+        let caught_up = frame.revision == self.live_revision;
+        let accessibility_epoch = frame.accessibility_epoch;
+        let frame_revision = frame.revision;
+        let mut snapshot = frame.snapshot;
+        if snapshot.screen != frame.history_basis.screen
+            || snapshot.history_origin != frame.history_basis.origin
+            || snapshot.scrollback_extent != frame.history_basis.extent
+            // A committed compositor transition may fit the old viewport to
+            // live geometry without reflowing its committed history. Every
+            // advancing application frame must use one geometry for both.
+            || (frame.revision != self.presented_revision
+                && snapshot.geometry != frame.history_basis.geometry)
+        {
             return false;
         }
-        let caught_up = frame.revision == self.live_revision;
-        let mut snapshot = frame.snapshot;
         if frame.history_revision == self.presented_history_revision {
+            if frame.history_basis != self.presented_history_basis {
+                return false;
+            }
             snapshot.scrollback = std::mem::take(&mut self.committed_snapshot.scrollback);
         } else {
-            let Some(history) = frame.history else {
+            let history = frame
+                .history
+                .expect("a validated newer history revision carries its rows");
+            let presented = HistoryState::from_snapshot_with_revision(
+                &self.committed_snapshot,
+                self.presented_history_revision,
+            );
+            let Some(target) = validate_history_delta_chain(&history, presented) else {
                 return false;
             };
-            snapshot.scrollback = history.as_ref().to_vec();
+            if target.revision != frame.history_revision || target.basis != frame.history_basis {
+                return false;
+            }
+            snapshot.scrollback = std::mem::take(&mut self.committed_snapshot.scrollback);
+            let applied = apply_history_delta_chain(&mut snapshot.scrollback, &history, presented);
+            debug_assert_eq!(applied, target);
             self.presented_history_revision = frame.history_revision;
+            self.presented_history_basis = target.basis;
         }
         self.presented_revision = frame.revision;
-        self.presented_revision_explicitly_stable = frame.explicitly_stable;
-        let synchronized_accessibility_diff = self.unpresented_synchronized_output;
+        self.completed_linear_record_cache = None;
+        let accessibility_epoch_is_current =
+            accessibility_epoch.generation >= self.accessibility_epoch_floor_generation;
+        self.presented_revision_explicitly_stable =
+            accessibility_epoch_is_current && frame.explicitly_stable;
+        self.presented_revision_cursor_restored =
+            accessibility_epoch_is_current && frame.cursor_visibility_restored;
         self.install_presented_snapshot(snapshot, caught_up);
+        self.publish_accessibility_evidence(accessibility_epoch, frame_revision);
         if self.unpresented_synchronized_output {
-            // Parser print runs include text overwritten inside an atomic
-            // transaction. Diffing presented snapshots is the only truthful
-            // source once any part of such a transaction is flushed.
-            self.pending_update.printed_runs.clear();
+            // Exact journal entries from an atomic transaction already require
+            // snapshot diffing. Keep the parser-ahead marker set until the
+            // receipt catches up so no later partial generation is mistaken for
+            // an ordinary print stream.
             if caught_up {
                 self.unpresented_synchronized_output = false;
             }
         }
-        self.presented_update = if caught_up && !synchronized_accessibility_diff {
-            self.pending_update.clone()
-        } else {
-            // `pending_update` has already advanced past this receipt. Its
-            // printed runs and cursor hints are not safe for accessibility;
-            // the two presented snapshots still provide an exact diff.
-            UpdateSummary::default()
-        };
+        if self
+            .shared_live_history
+            .as_ref()
+            .is_some_and(|history| history.revision <= self.presented_history_revision)
+        {
+            self.shared_live_history = None;
+        }
         true
     }
 
@@ -624,6 +984,23 @@ impl View {
     pub(crate) fn accessibility_presentation_explicitly_stable(&self) -> bool {
         self.accessibility_has_unfinalized_presentation()
             && self.presented_revision_explicitly_stable
+    }
+
+    pub(crate) fn accessibility_presentation_cursor_restored(&self) -> bool {
+        self.accessibility_has_unfinalized_presentation() && self.presented_revision_cursor_restored
+    }
+
+    pub(crate) fn accessibility_prompt_transaction_open(&self) -> bool {
+        let active_screen = self.screen().screen;
+        let alternate = active_screen == crate::terminal::ScreenIdentity::Alternate;
+        let (current_count, current_latest) =
+            semantic_mark_summary(&self.screen().semantic_marks, alternate);
+        if !current_latest.is_some_and(|mark| matches!(mark.kind, Osc133Kind::PromptStart)) {
+            return false;
+        }
+        let (previous_count, previous_latest) =
+            semantic_mark_summary(&self.prev_screen().semantic_marks, alternate);
+        current_count != previous_count || current_latest != previous_latest
     }
 
     /// Returns the live viewport from the last committed application frame.
@@ -672,7 +1049,7 @@ impl View {
         // transaction was open, including text overwritten before commit.
         // Auto-read must compare the two committed snapshots instead of
         // speaking that transient stream.
-        self.pending_update.printed_runs.clear();
+        self.standalone_update.printed_runs.clear();
         self.invalidate_visible_cache();
     }
 
@@ -685,6 +1062,175 @@ impl View {
         );
     }
 
+    fn begin_accessibility_epoch(&mut self) {
+        self.live_accessibility_epoch = AccessibilityEpoch {
+            generation: self
+                .live_accessibility_epoch
+                .generation
+                .checked_add(1)
+                .expect("view accessibility epoch exhausted"),
+            start_revision: self.live_revision,
+        };
+    }
+
+    fn reset_accessibility_journal_for_handoff(&mut self) {
+        if self.live_revision > self.finalized_presented_revision {
+            self.note_accessibility_evidence_gap(ViewRevision(
+                self.finalized_presented_revision.0.saturating_add(1),
+            ));
+            self.accessibility_journal_discarded_through = self.live_revision;
+        }
+        self.completed_linear_record_cache = None;
+        self.accessibility_journal.clear();
+        self.accessibility_journal_bytes = 0;
+        self.begin_accessibility_epoch();
+        self.accessibility_epoch_floor_generation = self.live_accessibility_epoch.generation;
+        self.presented_accessibility_epoch = self.live_accessibility_epoch;
+        self.presented_accessibility_evidence_revision = self.presented_revision;
+        self.presented_accessibility_evidence_exact = true;
+        self.presented_accessibility_requires_snapshot_diff = false;
+    }
+
+    fn append_accessibility_evidence(
+        &mut self,
+        update: UpdateSummary,
+        requires_snapshot_diff: bool,
+    ) {
+        let retained_bytes = accessibility_evidence_retained_bytes(&update);
+        if retained_bytes > ACCESSIBILITY_JOURNAL_MAX_BYTES {
+            // The snapshot remains exact, but no later parser report can be
+            // considered complete until a receipt through this missing record
+            // becomes the finalized diff baseline.
+            self.note_accessibility_evidence_gap(self.live_revision);
+            return;
+        }
+
+        self.accessibility_journal_bytes = self
+            .accessibility_journal_bytes
+            .saturating_add(retained_bytes);
+        self.accessibility_journal
+            .push_back(AccessibilityJournalEntry {
+                epoch: self.live_accessibility_epoch,
+                revision: self.live_revision,
+                update,
+                requires_snapshot_diff,
+                retained_bytes,
+            });
+        while self.accessibility_journal.len() > ACCESSIBILITY_JOURNAL_MAX_ENTRIES
+            || self.accessibility_journal_bytes > ACCESSIBILITY_JOURNAL_MAX_BYTES
+        {
+            let Some(discarded) = self.accessibility_journal.pop_front() else {
+                break;
+            };
+            self.accessibility_journal_bytes = self
+                .accessibility_journal_bytes
+                .saturating_sub(discarded.retained_bytes);
+            self.note_accessibility_evidence_gap(discarded.revision);
+        }
+    }
+
+    fn note_accessibility_evidence_gap(&mut self, revision: ViewRevision) {
+        self.accessibility_journal_gap_start = Some(
+            self.accessibility_journal_gap_start
+                .map_or(revision, |start| start.min(revision)),
+        );
+        self.accessibility_journal_discarded_through =
+            self.accessibility_journal_discarded_through.max(revision);
+    }
+
+    fn publish_accessibility_evidence(
+        &mut self,
+        epoch: AccessibilityEpoch,
+        revision: ViewRevision,
+    ) {
+        if epoch.generation < self.accessibility_epoch_floor_generation {
+            // An ownership handoff invalidated this parser context after its
+            // frame was captured. The physical snapshot may still flush, but
+            // its old facts must never move the accessibility epoch backwards.
+            self.presented_update = UpdateSummary::default();
+            return;
+        }
+        if self.presented_accessibility_epoch != epoch {
+            self.presented_accessibility_epoch = epoch;
+            self.presented_accessibility_evidence_revision = epoch.start_revision;
+            self.presented_accessibility_evidence_exact = true;
+            self.presented_accessibility_requires_snapshot_diff = false;
+            self.presented_update = UpdateSummary::default();
+        }
+
+        let required_after = self
+            .presented_accessibility_evidence_revision
+            .max(epoch.start_revision);
+        if revision < required_after {
+            // A committed compositor transition may deliberately carry an
+            // older snapshot after an ownership reset. It has no parser facts
+            // in the new context and must not revive the previous summary.
+            self.presented_update = UpdateSummary::default();
+            self.presented_accessibility_evidence_revision = revision;
+            return;
+        }
+        let discarded_in_required_range =
+            self.accessibility_journal_gap_start.is_some_and(|start| {
+                start <= revision && self.accessibility_journal_discarded_through > required_after
+            });
+        self.presented_accessibility_evidence_exact &= !discarded_in_required_range;
+
+        while self
+            .accessibility_journal
+            .front()
+            .is_some_and(|entry| entry.revision <= revision)
+        {
+            let entry = self
+                .accessibility_journal
+                .pop_front()
+                .expect("journal front was checked");
+            self.accessibility_journal_bytes = self
+                .accessibility_journal_bytes
+                .saturating_sub(entry.retained_bytes);
+            if entry.epoch != epoch || entry.revision <= required_after {
+                continue;
+            }
+            self.presented_accessibility_requires_snapshot_diff |= entry.requires_snapshot_diff;
+            if self.presented_accessibility_evidence_exact
+                && !self.presented_accessibility_requires_snapshot_diff
+            {
+                self.presented_update.merge(entry.update);
+            }
+        }
+        self.presented_accessibility_evidence_revision = revision;
+        if !self.presented_accessibility_evidence_exact
+            || self.presented_accessibility_requires_snapshot_diff
+        {
+            self.presented_update = UpdateSummary::default();
+        }
+    }
+
+    fn discard_accessibility_journal_through(&mut self, revision: ViewRevision) {
+        while self
+            .accessibility_journal
+            .front()
+            .is_some_and(|entry| entry.revision <= revision)
+        {
+            let entry = self
+                .accessibility_journal
+                .pop_front()
+                .expect("journal front was checked");
+            self.accessibility_journal_bytes = self
+                .accessibility_journal_bytes
+                .saturating_sub(entry.retained_bytes);
+        }
+        if let Some(gap_start) = self.accessibility_journal_gap_start
+            && revision >= gap_start
+        {
+            if revision >= self.accessibility_journal_discarded_through {
+                self.accessibility_journal_gap_start = None;
+            } else {
+                self.accessibility_journal_gap_start =
+                    Some(ViewRevision(revision.0.saturating_add(1)));
+            }
+        }
+    }
+
     fn live_snapshot_with_history(&mut self) -> TerminalSnapshot {
         let visible_offset = self.review_scrollback;
         self.engine.select_viewport(Viewport::Live);
@@ -694,22 +1240,126 @@ impl View {
         snapshot
     }
 
-    fn presentation_history_if_changed(
-        &mut self,
-    ) -> Option<std::sync::Arc<[crate::terminal::Row]>> {
+    fn presentation_history_if_changed(&mut self) -> Option<Arc<PresentedHistoryDelta>> {
         if self.live_history_revision == self.presented_history_revision {
             return None;
         }
-        if let Some((revision, history)) = &self.shared_live_history
-            && *revision == self.live_history_revision
+        if let Some(history) = &self.shared_live_history
+            && history.revision == self.live_history_revision
         {
-            return Some(std::sync::Arc::clone(history));
+            return Some(Arc::clone(history));
         }
 
-        let history = std::sync::Arc::<[crate::terminal::Row]>::from(
-            self.live_snapshot_with_history().scrollback,
+        let live = self.engine.snapshot();
+        let target = HistoryState {
+            revision: self.live_history_revision,
+            basis: PresentedHistoryBasis::from_snapshot(live),
+        };
+        let base = self
+            .shared_live_history
+            .as_deref()
+            .map(HistoryState::from_delta)
+            .unwrap_or(HistoryState {
+                revision: self.presented_history_revision,
+                basis: self.presented_history_basis,
+            });
+        let base_end = base.basis.end();
+        let target_end = target.basis.end();
+        let append_compatible = target.basis.extent != 0
+            && base.basis.screen == target.basis.screen
+            && base.basis.geometry == target.basis.geometry
+            && base.basis.origin <= target.basis.origin
+            && base_end.is_some_and(|end| target.basis.origin <= end)
+            && base_end
+                .zip(target_end)
+                .is_some_and(|(base_end, target_end)| target_end >= base_end);
+        let incremental_rows = base_end
+            .zip(target_end)
+            .filter(|_| append_compatible)
+            .map_or(target.basis.extent, |(base_end, target_end)| {
+                target_end - base_end
+            });
+        let compact = append_compatible
+            && self.shared_live_history.as_ref().is_some_and(|history| {
+                history.depth >= PRESENTED_HISTORY_MAX_DELTA_DEPTH
+                    || history.retained_rows.saturating_add(incremental_rows)
+                        > PRESENTED_HISTORY_MAX_RETAINED_ROWS
+            });
+        let incremental_replace_from = if append_compatible {
+            base_end.expect("append-compatible history has a finite end")
+        } else {
+            target.basis.origin
+        };
+        let logical_start = incremental_replace_from
+            .checked_sub(target.basis.origin)
+            .expect("history replacement begins within the target window");
+        let row_suffix = self
+            .engine
+            .normalized_history_rows_from(logical_start)
+            .unwrap_or_else(|error| panic!("Ghostty history delta failed: {error}"));
+        debug_assert_eq!(
+            row_suffix.len(),
+            target
+                .basis
+                .end()
+                .and_then(|end| end.checked_sub(incremental_replace_from))
+                .expect("history delta interval must be representable"),
+            "Ghostty history suffix must match its advertised logical interval"
         );
-        self.shared_live_history = Some((self.live_history_revision, history.clone()));
+        let (full_replacement, replace_from, rows) =
+            if compact {
+                let presented = HistoryState {
+                    revision: self.presented_history_revision,
+                    basis: self.presented_history_basis,
+                };
+                let compacted =
+                    compact_history_delta_root(
+                        &self.committed_snapshot.scrollback,
+                        presented,
+                        self.shared_live_history
+                            .as_deref()
+                            .expect("compaction requires an existing history chain"),
+                        base,
+                        target,
+                        incremental_replace_from,
+                        row_suffix,
+                    )
+                    .unwrap_or_else(|| {
+                        Arc::from(self.engine.normalized_history_rows_from(0).unwrap_or_else(
+                            |error| panic!("Ghostty history compaction fallback failed: {error}"),
+                        ))
+                    });
+                (true, target.basis.origin, compacted)
+            } else {
+                (
+                    !append_compatible,
+                    incremental_replace_from,
+                    Arc::from(row_suffix),
+                )
+            };
+        let previous = (!full_replacement)
+            .then(|| self.shared_live_history.as_ref().map(Arc::clone))
+            .flatten();
+        let depth = previous.as_ref().map_or(1, |history| history.depth + 1);
+        let retained_rows = previous
+            .as_ref()
+            .map_or(rows.len(), |history| history.retained_rows + rows.len());
+        let history = Arc::new(PresentedHistoryDelta {
+            revision: target.revision,
+            base_revision: if full_replacement {
+                self.presented_history_revision
+            } else {
+                base.revision
+            },
+            basis: target.basis,
+            replace_from,
+            rows,
+            full_replacement,
+            previous,
+            depth,
+            retained_rows,
+        });
+        self.shared_live_history = Some(Arc::clone(&history));
         Some(history)
     }
 
@@ -1055,6 +1705,18 @@ impl View {
         self.review_cursor_follow_pending = false;
     }
 
+    pub(crate) fn accessibility_screen_transition_pending(&self) -> bool {
+        self.accessibility_screen_transition_pending
+    }
+
+    pub(crate) fn defer_accessibility_screen_transition(&mut self) {
+        self.accessibility_screen_transition_pending = true;
+    }
+
+    pub(crate) fn complete_accessibility_screen_transition(&mut self) {
+        self.accessibility_screen_transition_pending = false;
+    }
+
     pub(crate) fn set_review_cursor_row(&mut self, row: u16) {
         self.review_cursor_position.0 = row;
     }
@@ -1143,7 +1805,7 @@ impl View {
     }
 
     pub(crate) fn update_summary(&self) -> &UpdateSummary {
-        &self.pending_update
+        &self.standalone_update
     }
 
     /// Update metadata paired with [`Self::screen`]. This differs from
@@ -1154,27 +1816,135 @@ impl View {
         if self.presentation_tracking {
             &self.presented_update
         } else {
-            &self.pending_update
+            &self.standalone_update
         }
+    }
+
+    /// Whether the currently accessible, physically presented update is a
+    /// complete append-only output record. The parallel print observer only
+    /// supplies provenance; Ghostty's resulting snapshot validates that the
+    /// reported text actually exists in the presented terminal history/grid.
+    pub(crate) fn accessibility_completes_linear_output_record(&mut self) -> bool {
+        let cache_key = self.presentation_tracking.then_some((
+            self.presented_accessibility_epoch,
+            self.presented_revision,
+            self.finalized_presented_revision,
+        ));
+        if let (Some((epoch, revision, finalized_revision)), Some(cached)) =
+            (cache_key, self.completed_linear_record_cache)
+            && cached.epoch == epoch
+            && cached.revision == revision
+            && cached.finalized_revision == finalized_revision
+        {
+            return cached.result;
+        }
+
+        let result = self.validate_completed_linear_output_record();
+        if let Some((epoch, revision, finalized_revision)) = cache_key {
+            self.completed_linear_record_cache = Some(CompletedLinearRecordCache {
+                epoch,
+                revision,
+                finalized_revision,
+                result,
+            });
+        }
+        result
+    }
+
+    fn validate_completed_linear_output_record(&mut self) -> bool {
+        if self.presentation_tracking && !self.accessibility_has_unfinalized_presentation() {
+            return false;
+        }
+        let update = self.accessibility_update_summary();
+        if self.screen().screen != crate::terminal::ScreenIdentity::Primary
+            || self.prev_screen.screen != crate::terminal::ScreenIdentity::Primary
+            || update.screen_before != crate::terminal::ScreenIdentity::Primary
+            || update.screen_after != crate::terminal::ScreenIdentity::Primary
+            || !update.completes_linear_output_record()
+        {
+            return false;
+        }
+
+        let mut reported = std::mem::take(&mut self.completed_linear_record_report);
+        self.accessibility_update_summary()
+            .printed_text_into(&mut reported);
+        if reported.trim_end_matches('\n').is_empty() {
+            self.completed_linear_record_report = reported;
+            return true;
+        }
+
+        let mut presented = std::mem::take(&mut self.completed_linear_record_presented);
+        presented.clear();
+        let result = {
+            let reported = reported.trim_end_matches('\n');
+            let snapshot = self.screen();
+            let columns = usize::from(snapshot.size().1.max(1));
+            // A completed record is necessarily at the live tail. Include the
+            // whole visible grid plus only enough recent history to cover the
+            // reported bytes, explicit line boundaries, and a small cursor/wrap
+            // margin. Scanning all retained history for every streamed line would
+            // turn long-running output into quadratic work.
+            let history_rows = reported
+                .len()
+                .div_ceil(columns)
+                .saturating_add(reported.matches('\n').count())
+                .saturating_add(4);
+            let history_start = snapshot.scrollback.len().saturating_sub(history_rows);
+            // The qualifying stream ends in a real LF, so its completed record
+            // is strictly before the post-update cursor. At the bottom margin
+            // that row either moved upward or entered scrollback. Including the
+            // cursor row could let unrelated stale text there validate a bad
+            // repaint.
+            let visible_rows_before_cursor =
+                usize::from(snapshot.cursor.row).min(snapshot.rows.len());
+            for row in snapshot
+                .scrollback
+                .iter()
+                .skip(history_start)
+                .chain(snapshot.rows.iter().take(visible_rows_before_cursor))
+            {
+                row.append_contents_to(&mut presented);
+                if !row.wrapped {
+                    presented.push('\n');
+                }
+            }
+            let presented = presented.trim_end_matches('\n');
+            // A completed record must be the exact live tail, not merely text
+            // found somewhere nearby. Tail anchoring rejects stale suffixes and
+            // later stale matches such as writing `ab` over `abab`.
+            if !presented.ends_with(reported) {
+                false
+            } else {
+                let start = presented.len().saturating_sub(reported.len());
+                let line_start = presented[..start].rfind('\n').map_or(0, |index| index + 1);
+                presented[line_start..].find(reported) == Some(start.saturating_sub(line_start))
+            }
+        };
+        self.completed_linear_record_report = reported;
+        self.completed_linear_record_presented = presented;
+        result
     }
 
     /// A view used as a shadow model may observe output without owning the
     /// application's PTY. Its terminal replies are useful to a real terminal
     /// owner but must not remain pending in an observational surface.
     pub(crate) fn discard_shadow_pty_replies(&mut self) {
-        self.pending_update.pty_replies.clear();
+        self.standalone_update.pty_replies.clear();
     }
 
     /// Pane-scoped terminal side effects observed since the last finalized
     /// screen update. Borrowed callback data has already been copied into
     /// owned, normalized values before reaching this model.
     pub fn terminal_events(&self) -> &[crate::terminal::TerminalEvent] {
-        &self.pending_update.effects.events
+        &self.standalone_update.effects.events
     }
 
     pub(crate) fn clear_update_summary(&mut self) {
-        self.pending_update = UpdateSummary::default();
+        self.standalone_update = UpdateSummary::default();
         self.presented_update = UpdateSummary::default();
+        if self.presentation_tracking {
+            self.reset_accessibility_journal_for_handoff();
+        }
     }
 
     pub(crate) fn set_previous_screen_time(&mut self, time: u128) {
@@ -1658,6 +2428,59 @@ impl View {
     }
 }
 
+/// Transfers print provenance to accessibility and copies changed-row ranges
+/// only when the immediate renderer still owns the batch. Renderer operations,
+/// terminal replies, and side effects never enter the presentation journal.
+fn take_normalized_accessibility_evidence(
+    update: &mut UpdateSummary,
+    preserve_renderer_damage: bool,
+) -> UpdateSummary {
+    let changed_rows = if preserve_renderer_damage {
+        update.changed_rows.clone()
+    } else {
+        std::mem::take(&mut update.changed_rows)
+    };
+    // `completes_linear_output_record` uses the starting column to reject a
+    // carriage-return overwrite of content which predates this evidence span.
+    UpdateSummary {
+        printed_runs: std::mem::take(&mut update.printed_runs),
+        output_report_structural: update.output_report_structural,
+        parser_continuation: update.parser_continuation,
+        cursor_operations: update.cursor_operations,
+        scroll_operations: update.scroll_operations,
+        changed_rows,
+        cursor_before: update.cursor_before,
+        screen_before: update.screen_before,
+        screen_after: update.screen_after,
+        semantic_input_boundary: update.semantic_input_boundary,
+        batch_count: update.batch_count,
+        ..UpdateSummary::default()
+    }
+}
+
+fn accessibility_evidence_retained_bytes(update: &UpdateSummary) -> usize {
+    std::mem::size_of::<AccessibilityJournalEntry>()
+        .saturating_add(
+            update
+                .printed_runs
+                .len()
+                .saturating_mul(std::mem::size_of::<crate::terminal::PrintedRun>()),
+        )
+        .saturating_add(
+            update
+                .printed_runs
+                .iter()
+                .map(|run| run.text.len())
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            update
+                .changed_rows
+                .len()
+                .saturating_mul(std::mem::size_of::<std::ops::RangeInclusive<u16>>()),
+        )
+}
+
 fn history_window_end(snapshot: &TerminalSnapshot) -> usize {
     snapshot
         .history_origin
@@ -1743,22 +2566,26 @@ fn snapshot_at_scrollback(snapshot: &TerminalSnapshot, scrollback: usize) -> Ter
     let offset = scrollback.min(history_len);
     let end = history_len.saturating_add(height).saturating_sub(offset);
     let start = end.saturating_sub(height);
-    let rows = snapshot
-        .scrollback
-        .iter()
-        .chain(snapshot.rows.iter())
-        .skip(start)
-        .take(height)
-        .cloned()
-        .collect::<Vec<_>>()
-        .into();
+    let rows = if offset == 0 {
+        Arc::clone(&snapshot.rows)
+    } else {
+        snapshot
+            .scrollback
+            .iter()
+            .chain(snapshot.rows.iter())
+            .skip(start)
+            .take(height)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into()
+    };
     let mut cursor = snapshot.cursor;
     if offset != 0 {
         cursor.visible = false;
     }
     TerminalSnapshot {
         rows,
-        scrollback: Vec::new(),
+        scrollback: VecDeque::new(),
         cursor,
         geometry: snapshot.geometry,
         screen: snapshot.screen,
@@ -1861,11 +2688,15 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{View, compute_row_hashes, fnv1a_64};
+    use super::{
+        PRESENTED_HISTORY_MAX_DELTA_DEPTH, PRESENTED_HISTORY_MAX_RETAINED_ROWS, View,
+        compute_row_hashes, fnv1a_64,
+    };
     use crate::{
         presentation::SurfaceId,
         terminal::{HistoryPosition, SemanticKind as Osc133Kind, Viewport},
     };
+    use std::sync::Arc;
 
     #[test]
     fn resize_clamps_review_cursor_and_clears_displaced_mark() {
@@ -1906,6 +2737,28 @@ mod tests {
         assert_eq!(view.update_summary().batch_count, 0);
         assert_eq!(view.screen().contents(), view.prev_screen().contents());
         assert_eq!(view.prev_screen_time, 42);
+    }
+
+    #[test]
+    fn standalone_batch_retains_its_full_nonrenderer_summary() {
+        let mut view = View::new(2, 16);
+        let batch = view.process_changes_with_batch(b"hello\x07\x1b]2;pane title\x07\x1b[6n", true);
+        let retained = view.update_summary();
+
+        assert_eq!(retained.batch_count, batch.batch_count);
+        assert_eq!(retained.effects, batch.effects);
+        assert_eq!(retained.pty_replies, batch.pty_replies);
+        assert_eq!(retained.printed_text(), batch.printed_text());
+        assert_eq!(retained.damage, batch.damage);
+        assert_eq!(retained.changed_rows, batch.changed_rows);
+        assert_eq!(retained.cursor_before, batch.cursor_before);
+        assert_eq!(retained.cursor_after, batch.cursor_after);
+        assert_eq!(retained.screen_before, batch.screen_before);
+        assert_eq!(retained.screen_after, batch.screen_after);
+        assert!(
+            retained.operations.is_empty(),
+            "renderer-only operations must not accumulate in the standalone summary"
+        );
     }
 
     #[test]
@@ -2000,6 +2853,52 @@ mod tests {
     }
 
     #[test]
+    fn osc133_prompt_start_waits_for_input_boundary_commit() {
+        let mut view = View::new(1, 24);
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"\x1b]133;A\x07$ ");
+        let partial = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(!partial.explicitly_stable);
+        assert!(view.apply_presented_frame(partial));
+        assert!(view.accessibility_prompt_transaction_open());
+
+        view.process_changes(b"ready \x1b]133;B\x07");
+        let complete = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(complete.explicitly_stable);
+        assert!(view.apply_presented_frame(complete));
+        assert!(!view.accessibility_prompt_transaction_open());
+        assert!(view.accessibility_presentation_explicitly_stable());
+    }
+
+    #[test]
+    fn a_new_prompt_marker_at_the_same_cell_opens_a_new_transaction() {
+        let mut view = View::new(1, 24);
+        view.process_changes(b"\x1b]133;A\x07$ ");
+        view.finalize_changes(1);
+        assert!(!view.accessibility_prompt_transaction_open());
+
+        view.process_changes(b"\r\x1b]133;A\x07$ ");
+        assert!(view.accessibility_prompt_transaction_open());
+    }
+
+    #[test]
+    fn cursor_restore_at_end_of_update_is_a_legacy_stability_hint() {
+        let mut view = View::new(1, 24);
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"\x1b[?25llegacy redraw\x1b[?25h");
+        let restored = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(restored.cursor_visibility_restored);
+        assert!(view.apply_presented_frame(restored));
+        assert!(view.accessibility_presentation_cursor_restored());
+
+        view.process_changes(b" trailing");
+        let trailing = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(!trailing.cursor_visibility_restored);
+    }
+
+    #[test]
     fn output_after_a_synchronized_close_requires_ordinary_stabilization() {
         let mut view = View::new(1, 24);
         view.process_changes(b"old");
@@ -2031,6 +2930,279 @@ mod tests {
         assert!(view.apply_presented_frame(newest));
         assert_eq!(view.line(0), "newer");
         assert!(!view.accessibility_awaiting_presentation());
+    }
+
+    #[test]
+    fn parser_ahead_receipt_publishes_its_exact_lf_and_continuation_facts() {
+        let mut view = View::new(3, 40);
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"receipt line\r\n");
+        let completed = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b"newer parser text\x1b[");
+        let continuation = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.apply_presented_frame(completed));
+        assert!(view.accessibility_awaiting_presentation());
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "receipt line\n"
+        );
+        assert!(!view.accessibility_update_summary().parser_continuation);
+        assert!(!view.accessibility_update_summary().output_report_structural);
+        assert!(view.accessibility_completes_linear_output_record());
+
+        view.finalize_changes(1);
+        assert!(view.apply_presented_frame(continuation));
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "newer parser text"
+        );
+        assert!(view.accessibility_update_summary().parser_continuation);
+        assert!(!view.accessibility_completes_linear_output_record());
+    }
+
+    #[test]
+    fn parser_ahead_receipt_keeps_its_structural_classifier_fact() {
+        let mut view = View::new(3, 40);
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"\x1b[2J\x1b[Hstructural frame");
+        let structural = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b" newer ordinary text");
+
+        assert!(view.apply_presented_frame(structural));
+        assert!(view.accessibility_update_summary().output_report_structural);
+        assert!(!view.accessibility_update_summary().parser_continuation);
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "structural frame"
+        );
+    }
+
+    #[test]
+    fn receipt_evidence_preserves_the_starting_column_for_carriage_return_classification() {
+        let mut view = View::new(3, 40);
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"prefix");
+        let baseline = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(baseline));
+        view.finalize_changes(1);
+
+        view.process_changes(b"\rreplacement\n");
+        let overwritten = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(overwritten));
+        assert_eq!(view.accessibility_update_summary().cursor_before.col, 6);
+        assert!(!view.accessibility_completes_linear_output_record());
+    }
+
+    #[test]
+    fn screen_transition_epoch_preserves_an_older_receipt_without_crossing_contexts() {
+        let mut view = View::new(3, 40);
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"primary record\r\n");
+        let primary = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b"\x1b[?1049h\x1b[2J\x1b[Halternate line");
+        let alternate = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.apply_presented_frame(primary));
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "primary record\n"
+        );
+        view.finalize_changes(1);
+
+        assert!(view.apply_presented_frame(alternate));
+        assert_eq!(
+            view.accessibility_update_summary().screen_before,
+            crate::terminal::ScreenIdentity::Primary
+        );
+        assert_eq!(
+            view.accessibility_update_summary().screen_after,
+            crate::terminal::ScreenIdentity::Alternate
+        );
+        assert!(view.accessibility_update_summary().output_report_structural);
+        assert!(
+            !view
+                .accessibility_update_summary()
+                .printed_text()
+                .contains("primary record")
+        );
+    }
+
+    #[test]
+    fn ordered_split_receipts_extend_only_the_presented_evidence_prefix() {
+        let mut view = View::new(3, 40);
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"split");
+        let partial = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b" record\r\n");
+        let complete = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.apply_presented_frame(partial));
+        assert_eq!(view.accessibility_update_summary().printed_text(), "split");
+        assert!(!view.accessibility_completes_linear_output_record());
+
+        assert!(view.apply_presented_frame(complete));
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "split record\n"
+        );
+        assert!(view.accessibility_completes_linear_output_record());
+    }
+
+    #[test]
+    fn replacement_receipt_collects_skipped_revision_evidence_once() {
+        let mut view = View::new(3, 40);
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"replacement");
+        let obsolete = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b" winner\r\n");
+        let winner = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.apply_presented_frame(winner));
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "replacement winner\n"
+        );
+        assert!(view.accessibility_completes_linear_output_record());
+        assert!(!view.apply_presented_frame(obsolete));
+    }
+
+    #[test]
+    fn accessibility_handoff_epoch_rejects_stale_receipt_evidence() {
+        let mut view = View::new(4, 40);
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"stale record\r\n\x1b]133;B\x07");
+        let stale = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(stale.explicitly_stable);
+        view.clear_update_summary();
+        let handoff_epoch = view.live_accessibility_epoch;
+        view.process_changes(b"fresh record\r\n");
+        let fresh = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.apply_presented_frame(stale));
+        assert_eq!(view.presented_accessibility_epoch, handoff_epoch);
+        assert_eq!(view.accessibility_update_summary().batch_count, 0);
+        assert!(!view.accessibility_presentation_explicitly_stable());
+        assert!(!view.accessibility_completes_linear_output_record());
+
+        assert!(view.apply_presented_frame(fresh));
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "fresh record\n"
+        );
+        assert!(view.accessibility_completes_linear_output_record());
+    }
+
+    #[test]
+    fn accessibility_journal_is_bounded_and_falls_back_after_eviction() {
+        let mut view = View::new(2, 40);
+        view.enable_presentation_tracking();
+
+        for _ in 0..=super::ACCESSIBILITY_JOURNAL_MAX_ENTRIES {
+            view.process_changes(b"x");
+        }
+        let newest = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.accessibility_journal.len() <= super::ACCESSIBILITY_JOURNAL_MAX_ENTRIES);
+        assert!(view.accessibility_journal_bytes <= super::ACCESSIBILITY_JOURNAL_MAX_BYTES);
+        assert!(view.apply_presented_frame(newest));
+        assert_eq!(
+            view.accessibility_update_summary().batch_count,
+            0,
+            "an evicted prefix must use the authoritative snapshot diff"
+        );
+    }
+
+    #[test]
+    fn tracked_output_under_sustained_backpressure_has_no_unbounded_legacy_summary() {
+        let mut view = View::new(2, 40);
+        view.enable_presentation_tracking();
+
+        // No presentation frame is applied: this models a physical writer
+        // which remains backpressured while the parser and replaceable render
+        // continue advancing. Exercise both batch-producing call sites and the
+        // summary-free model-only path.
+        for index in 0..super::ACCESSIBILITY_JOURNAL_MAX_ENTRIES.saturating_mul(2) {
+            if index % 2 == 0 {
+                let batch = view.process_changes_with_batch(b"streaming output ", true);
+                assert_eq!(batch.batch_count, 1);
+                assert!(
+                    batch.printed_runs.is_empty(),
+                    "print provenance should move to the bounded receipt journal"
+                );
+            } else {
+                view.process_changes(b"more output ");
+            }
+        }
+
+        assert!(view.accessibility_awaiting_presentation());
+        assert!(view.accessibility_journal.len() <= super::ACCESSIBILITY_JOURNAL_MAX_ENTRIES);
+        assert!(view.accessibility_journal_bytes <= super::ACCESSIBILITY_JOURNAL_MAX_BYTES);
+        assert!(view.accessibility_journal_gap_start.is_some());
+
+        let legacy = view.update_summary();
+        assert_eq!(legacy.batch_count, 0);
+        assert!(legacy.printed_runs.is_empty());
+        assert!(legacy.changed_rows.is_empty());
+        assert!(legacy.operations.is_empty());
+        assert!(legacy.effects.events.is_empty());
+        assert!(legacy.pty_replies.is_empty());
+        assert_eq!(view.accessibility_update_summary().batch_count, 0);
+    }
+
+    #[test]
+    fn oversized_evidence_keeps_later_lf_ambiguous_until_a_diff_baseline() {
+        let mut view = View::new(2, 80);
+        view.enable_presentation_tracking();
+
+        let oversized = vec![b'x'; super::ACCESSIBILITY_JOURNAL_MAX_BYTES + 1];
+        view.process_changes(&oversized);
+        view.process_changes(b"\r\nlater line\r\n");
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.apply_presented_frame(frame));
+        assert_eq!(
+            view.accessibility_update_summary().batch_count,
+            0,
+            "the later LF must not hide an unretained prefix"
+        );
+        assert!(!view.accessibility_completes_linear_output_record());
+
+        view.finalize_changes(1);
+        view.process_changes(b"after baseline\r\n");
+        let after_baseline = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(after_baseline));
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "after baseline\n"
+        );
+        assert!(view.accessibility_completes_linear_output_record());
+    }
+
+    #[test]
+    fn completed_record_validation_is_cached_for_one_presented_revision() {
+        let mut view = View::new(3, 40);
+        view.enable_presentation_tracking();
+        view.process_changes(b"cached line\r\n");
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(frame));
+
+        assert!(view.accessibility_completes_linear_output_record());
+        view.completed_linear_record_report.clear();
+        view.completed_linear_record_report
+            .push_str("cache sentinel");
+        assert!(view.accessibility_completes_linear_output_record());
+        assert_eq!(view.completed_linear_record_report, "cache sentinel");
+
+        view.finalize_changes(1);
+        assert!(!view.accessibility_completes_linear_output_record());
     }
 
     #[test]
@@ -2074,6 +3246,238 @@ mod tests {
         assert_eq!(view.scrollback(), 0);
         assert_eq!(view.line(0), "three");
         assert_eq!(view.line(1), "four");
+    }
+
+    #[test]
+    fn dropped_history_receipts_replay_the_complete_delta_chain() {
+        let mut view = View::new(2, 12);
+        view.process_changes(b"one\r\ntwo");
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"\r\nthree");
+        let _dropped_one = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b"\r\nfour");
+        let _dropped_two = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b"\r\nfive");
+        let newest = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.apply_presented_frame(newest));
+        assert_eq!(view.committed_snapshot.history_origin, 0);
+        assert_eq!(
+            view.committed_snapshot
+                .scrollback
+                .iter()
+                .map(|row| row.contents())
+                .collect::<Vec<_>>(),
+            ["one", "two", "three"]
+        );
+    }
+
+    #[test]
+    fn malformed_history_metadata_rejects_without_moving_committed_rows() {
+        let mut view = View::new(2, 12);
+        view.process_changes(b"one\r\ntwo");
+        view.enable_presentation_tracking();
+        view.process_changes(b"\r\nthree");
+        let valid = view.capture_live_presentation_frame(SurfaceId(1));
+        let mut malformed = valid.clone();
+        malformed.snapshot.history_origin = malformed.snapshot.history_origin.saturating_add(1);
+
+        assert!(!view.apply_presented_frame(malformed));
+        assert_eq!(view.presented_history_revision, 0);
+        assert!(view.committed_snapshot.scrollback.is_empty());
+        assert!(view.apply_presented_frame(valid));
+        assert_eq!(view.committed_snapshot.scrollback[0].contents(), "one");
+    }
+
+    #[test]
+    fn resurfacing_after_a_disjoint_hidden_history_gap_uses_a_full_root() {
+        let mut view = View::new_with_scrollback(2, 12, 2);
+        view.process_changes(b"one\r\ntwo\r\nthree\r\nfour");
+        view.enable_presentation_tracking();
+
+        // Model a view which keeps parsing while no scene includes it. The
+        // new logical window no longer overlaps the last presented interval.
+        view.process_changes(b"\r\nfive\r\nsix\r\nseven\r\neight");
+        let resurfaced = view.capture_live_presentation_frame(SurfaceId(1));
+        let history = resurfaced.history.as_deref().expect("resurface root");
+        assert!(history.full_replacement);
+        assert!(history.previous.is_none());
+        assert!(view.apply_presented_frame(resurfaced));
+        assert_eq!(
+            view.committed_snapshot
+                .scrollback
+                .iter()
+                .map(|row| row.contents())
+                .collect::<Vec<_>>(),
+            ["five", "six"]
+        );
+    }
+
+    #[test]
+    fn a_flushed_intermediate_history_receipt_is_skipped_by_the_newer_chain() {
+        let mut view = View::new(2, 12);
+        view.process_changes(b"one\r\ntwo");
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"\r\nthree");
+        let dropped = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b"\r\nfour");
+        let intermediate = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b"\r\nfive");
+        let newest = view.capture_live_presentation_frame(SurfaceId(1));
+
+        drop(dropped);
+        assert!(view.apply_presented_frame(intermediate));
+        assert_eq!(view.presented_history_revision, 2);
+        assert!(view.apply_presented_frame(newest));
+        assert_eq!(view.presented_history_revision, 3);
+        assert_eq!(
+            view.committed_snapshot
+                .scrollback
+                .iter()
+                .map(|row| row.contents())
+                .collect::<Vec<_>>(),
+            ["one", "two", "three"]
+        );
+    }
+
+    #[test]
+    fn capped_history_chain_evicts_exact_prefix_when_intermediate_is_dropped() {
+        let mut view = View::new_with_scrollback(2, 12, 2);
+        view.process_changes(b"one\r\ntwo\r\nthree\r\nfour");
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"\r\nfive");
+        let _dropped = view.capture_live_presentation_frame(SurfaceId(1));
+        view.process_changes(b"\r\nsix");
+        let newest = view.capture_live_presentation_frame(SurfaceId(1));
+
+        assert!(view.apply_presented_frame(newest));
+        assert_eq!(view.committed_snapshot.history_origin, 2);
+        assert_eq!(view.committed_snapshot.scrollback_extent, 2);
+        assert_eq!(
+            view.committed_snapshot
+                .scrollback
+                .iter()
+                .map(|row| row.contents())
+                .collect::<Vec<_>>(),
+            ["three", "four"]
+        );
+    }
+
+    #[test]
+    fn parser_ahead_alternate_handoff_uses_independent_full_roots() {
+        let mut view = View::new_with_scrollback(2, 12, 2);
+        view.process_changes(b"one\r\ntwo\r\nthree\r\nfour");
+        view.enable_presentation_tracking();
+
+        view.process_changes(b"\x1b[?1049h");
+        let alternate = view.capture_live_presentation_frame(SurfaceId(1));
+        let alternate_history = alternate.history.as_deref().expect("alternate root");
+        assert!(alternate_history.full_replacement);
+        assert!(alternate_history.rows.is_empty());
+
+        view.process_changes(b"\x1b[?1049l");
+        let primary = view.capture_live_presentation_frame(SurfaceId(1));
+        let primary_history = primary.history.as_deref().expect("primary root");
+        assert!(primary_history.full_replacement);
+        assert!(primary_history.previous.is_none());
+        assert_eq!(
+            primary_history
+                .rows
+                .iter()
+                .map(|row| row.contents())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+
+        assert!(view.apply_presented_frame(alternate));
+        assert!(view.screen().alternate_screen());
+        assert!(view.apply_presented_frame(primary));
+        assert!(!view.screen().alternate_screen());
+        assert_eq!(
+            view.committed_snapshot
+                .scrollback
+                .iter()
+                .map(|row| row.contents())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+    }
+
+    #[test]
+    fn false_positive_history_change_still_carries_a_zero_row_generation() {
+        let mut view = View::new(2, 4);
+        view.enable_presentation_tracking();
+
+        // The observer conservatively treats a right-margin write on the
+        // bottom row as possible wrap/scroll. Ghostty remains wrap-pending, so
+        // the absolute history interval itself is unchanged.
+        view.process_changes(b"\x1b[2;4Hx");
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+        let history = frame.history.as_deref().expect("history generation");
+        assert!(history.rows.is_empty());
+        assert_eq!(history.revision, frame.history_revision);
+        assert!(view.apply_presented_frame(frame));
+    }
+
+    #[test]
+    fn clear_reset_and_reflow_history_generations_start_full_roots() {
+        for structural_update in [b"\x1b[3J".as_slice(), b"\x1bc".as_slice()] {
+            let mut view = View::new_with_scrollback(2, 12, 2);
+            view.process_changes(b"one\r\ntwo\r\nthree\r\nfour");
+            view.enable_presentation_tracking();
+            view.process_changes(structural_update);
+            let frame = view.capture_live_presentation_frame(SurfaceId(1));
+            let history = frame.history.as_deref().expect("structural root");
+            assert!(history.full_replacement);
+            assert!(history.previous.is_none());
+            assert!(view.apply_presented_frame(frame));
+        }
+
+        let mut resized = View::new_with_scrollback(2, 12, 2);
+        resized.process_changes(b"one\r\ntwo\r\nthree\r\nfour");
+        resized.enable_presentation_tracking();
+        resized.process_changes(b"\r\nfive");
+        let _pending = resized.capture_live_presentation_frame(SurfaceId(1));
+        resized.set_size(3, 12);
+        let frame = resized.capture_live_presentation_frame(SurfaceId(1));
+        let history = frame.history.as_deref().expect("reflow root");
+        assert!(history.full_replacement);
+        assert!(history.previous.is_none());
+        assert!(resized.apply_presented_frame(frame));
+    }
+
+    #[test]
+    fn history_delta_chain_compacts_without_invalidating_started_receipts() {
+        let mut view = View::new_with_scrollback(2, 12, 2);
+        view.process_changes(b"one\r\ntwo\r\nthree\r\nfour");
+        view.enable_presentation_tracking();
+        let mut oldest = None;
+        let mut newest = None;
+        let mut saw_compacted_root = false;
+
+        for index in 0..(PRESENTED_HISTORY_MAX_DELTA_DEPTH + 32) {
+            view.process_changes(format!("\r\nline-{index}").as_bytes());
+            let frame = view.capture_live_presentation_frame(SurfaceId(1));
+            let history = frame.history.as_ref().expect("history delta");
+            if oldest.is_none() {
+                oldest = Some(Arc::clone(history));
+            } else if history.full_replacement {
+                saw_compacted_root = true;
+            }
+            assert!(history.depth <= PRESENTED_HISTORY_MAX_DELTA_DEPTH);
+            assert!(history.retained_rows <= PRESENTED_HISTORY_MAX_RETAINED_ROWS);
+            newest = Some(frame);
+        }
+
+        let oldest = oldest.expect("first started receipt");
+        assert!(!oldest.rows.is_empty());
+        assert!(saw_compacted_root);
+        assert!(view.apply_presented_frame(newest.expect("newest receipt")));
+        assert_eq!(view.committed_snapshot.scrollback.len(), 2);
+        assert!(!oldest.rows[0].contents().is_empty());
     }
 
     #[test]
@@ -2145,7 +3549,10 @@ mod tests {
         let alternate = view.capture_live_presentation_frame(SurfaceId(1));
         assert!(alternate.snapshot.alternate_screen());
         assert_eq!(
-            alternate.history.as_deref().map(<[_]>::len),
+            alternate
+                .history
+                .as_deref()
+                .map(|history| history.rows.len()),
             Some(0),
             "the active history basis changed even though the final screen is alternate"
         );
@@ -2159,7 +3566,11 @@ mod tests {
             .as_deref()
             .expect("refreshed primary history");
         assert_eq!(
-            history.iter().map(|row| row.contents()).collect::<Vec<_>>(),
+            history
+                .rows
+                .iter()
+                .map(|row| row.contents())
+                .collect::<Vec<_>>(),
             ["two", "three"]
         );
         assert!(view.apply_presented_frame(primary));

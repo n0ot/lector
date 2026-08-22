@@ -851,6 +851,7 @@ dependencies = [
  "signal-hook",
  "signal-hook-mio",
  "similar",
+ "tempfile",
  "terminput",
  "thiserror 2.0.17",
  "unicode-segmentation",

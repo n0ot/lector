@@ -5,7 +5,10 @@
 //! application queries are answered from the virtual profile attached to that
 //! source's Ghostty engine.
 
-use crate::terminal::{TerminalEvent, TerminalGeometry};
+use crate::{
+    host_command::run_bounded_output,
+    terminal::{TerminalEvent, TerminalGeometry},
+};
 use std::collections::BTreeMap;
 
 const PROBE_INACTIVITY_TIMEOUT_MS: u128 = 50;
@@ -45,7 +48,10 @@ impl TerminfoCapabilities {
             {
                 result.color_count = Some(value);
             }
-            let name = line.trim_end_matches(',');
+            let capability = line.trim_end_matches(',');
+            let name = capability
+                .split_once(['=', '#'])
+                .map_or(capability, |(name, _)| name);
             match name {
                 "Tc" | "RGB" => result.true_color = true,
                 "Sync" => result.synchronized_output = true,
@@ -59,10 +65,10 @@ impl TerminfoCapabilities {
     }
 
     pub fn detect(term: &std::ffi::OsStr) -> Option<Self> {
-        let output = std::process::Command::new("infocmp")
-            .args([std::ffi::OsStr::new("-1"), std::ffi::OsStr::new("-x"), term])
-            .output()
-            .ok()?;
+        let mut command = std::process::Command::new("infocmp");
+        command.args([std::ffi::OsStr::new("-1"), std::ffi::OsStr::new("-x"), term]);
+        let output =
+            run_bounded_output(&mut command, &std::env::temp_dir(), "outer-infocmp").ok()?;
         output
             .status
             .success()

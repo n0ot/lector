@@ -73,6 +73,8 @@ struct BenchmarkReport {
 struct CompositorWorkloadReport {
     name: &'static str,
     iterations: usize,
+    updates: usize,
+    updates_per_drain: usize,
     input_bytes: u64,
     elapsed_ns: u64,
     throughput_mib_per_second: f64,
@@ -110,6 +112,8 @@ struct SchedulerWorkloadReport {
     iterations: usize,
     updates: usize,
     elapsed_ns: u64,
+    allocations: u64,
+    allocated_bytes: u64,
     latency_p50_ns: u64,
     latency_p95_ns: u64,
     latency_max_ns: u64,
@@ -248,6 +252,8 @@ struct SchedulerBaselineWorkload {
 #[derive(Deserialize)]
 struct SchedulerBaselineLimits {
     maximum_latency_p95_ns: u64,
+    maximum_allocations: u64,
+    maximum_allocated_bytes: u64,
     maximum_pending_bytes: usize,
     minimum_replaced_render_percent: f64,
     minimum_completed_render_percent: f64,
@@ -346,7 +352,31 @@ fn run() -> Result<(), String> {
             .into_iter()
             .map(run_renderer_workload)
             .collect::<Result<_, _>>()?,
-        compositor_workloads: vec![run_compositor_workload(if self_test { 4 } else { 10_000 })?],
+        compositor_workloads: {
+            let iterations = if self_test { 4 } else { 10_000 };
+            vec![
+                run_compositor_workload(
+                    "direct-compositor-pipeline",
+                    iterations,
+                    1,
+                    CompositorUpdateKind::CellEdit,
+                )?,
+                run_compositor_workload(
+                    "direct-drain-coalescing",
+                    iterations,
+                    4,
+                    CompositorUpdateKind::CellEdit,
+                )?,
+                run_compositor_workload(
+                    "scrolling-lf-receipts",
+                    if self_test { 32 } else { 1_000 },
+                    1,
+                    CompositorUpdateKind::ScrollingLine {
+                        prefill_rows: if self_test { 0 } else { 10_000 },
+                    },
+                )?,
+            ]
+        },
         scheduler_workloads: scheduler_workloads(self_test)
             .into_iter()
             .map(run_scheduler_workload)
@@ -483,6 +513,8 @@ fn load_baseline(path: &PathBuf, require_current_target: bool) -> Result<Baselin
         }
         let limits = &workload.limits;
         if limits.maximum_latency_p95_ns == 0
+            || limits.maximum_allocations == 0
+            || limits.maximum_allocated_bytes == 0
             || limits.maximum_pending_bytes == 0
             || !limits.minimum_replaced_render_percent.is_finite()
             || !(0.0..=100.0).contains(&limits.minimum_replaced_render_percent)
@@ -700,6 +732,18 @@ fn check_report(report: &BenchmarkReport, baseline: &Baseline) -> Result<(), Str
                 actual.name, actual.latency_p95_ns, limits.maximum_latency_p95_ns
             ));
         }
+        if actual.allocations > limits.maximum_allocations {
+            failures.push(format!(
+                "{} scheduler allocations {} exceed {}",
+                actual.name, actual.allocations, limits.maximum_allocations
+            ));
+        }
+        if actual.allocated_bytes > limits.maximum_allocated_bytes {
+            failures.push(format!(
+                "{} scheduler allocated bytes {} exceed {}",
+                actual.name, actual.allocated_bytes, limits.maximum_allocated_bytes
+            ));
+        }
         if actual.maximum_pending_bytes > limits.maximum_pending_bytes {
             failures.push(format!(
                 "{} scheduler pending bytes {} exceed {}",
@@ -869,7 +913,21 @@ impl Driver for NoopSpeechDriver {
 /// scheduler enqueue, physical write, flush confirmation, and publication.
 /// Unlike the renderer microbenchmarks, this deliberately includes every
 /// allocation and clone owned by the compositor pipeline.
-fn run_compositor_workload(iterations: usize) -> Result<CompositorWorkloadReport, String> {
+#[derive(Clone, Copy)]
+enum CompositorUpdateKind {
+    CellEdit,
+    ScrollingLine { prefill_rows: usize },
+}
+
+fn run_compositor_workload(
+    name: &'static str,
+    iterations: usize,
+    updates_per_drain: usize,
+    update_kind: CompositorUpdateKind,
+) -> Result<CompositorWorkloadReport, String> {
+    if updates_per_drain == 0 {
+        return Err("compositor workload requires at least one update per drain".to_owned());
+    }
     let geometry = TerminalGeometry::from_cells(24, 80);
     let stack = ViewStack::new(Box::new(PtyView::new(geometry.rows, geometry.cols)));
     let mut app = App::new(stack).map_err(|error| error.to_string())?;
@@ -881,6 +939,7 @@ fn run_compositor_workload(iterations: usize) -> Result<CompositorWorkloadReport
     for row in 1..=geometry.rows {
         initial.extend_from_slice(format!("\x1b[{row};1Hbaseline row {row:02}").as_bytes());
     }
+    initial.extend_from_slice(format!("\x1b[{};1H", geometry.rows).as_bytes());
     app.handle_pty(&mut screen_reader, &initial, &mut writer)
         .map_err(|error| error.to_string())?;
     let initial_report = app
@@ -890,15 +949,54 @@ fn run_compositor_workload(iterations: usize) -> Result<CompositorWorkloadReport
         return Err("initial compositor render did not complete".to_owned());
     }
 
-    let updates = (0..iterations)
-        .map(|iteration| {
-            format!(
+    if let CompositorUpdateKind::ScrollingLine { prefill_rows } = update_kind
+        && prefill_rows != 0
+    {
+        // Establish the steady-state worst case outside the allocation and
+        // latency fence. Every measured LF then evicts one row and appends one
+        // row at Lector's 10,000-line logical cap instead of measuring only
+        // cheap growth from an empty history.
+        let mut prefill = Vec::with_capacity(prefill_rows.saturating_mul(24));
+        for row in 0..prefill_rows {
+            prefill.extend_from_slice(format!("prefill line {row:06}\r\n").as_bytes());
+        }
+        app.handle_pty(&mut screen_reader, &prefill, &mut writer)
+            .map_err(|error| error.to_string())?;
+        let mut prefill_completed = 0usize;
+        for _ in 0..64 {
+            let report = app
+                .drain_scheduled_output(&mut writer, true)
+                .map_err(|error| error.to_string())?;
+            prefill_completed = prefill_completed.saturating_add(report.completed_renders.len());
+            if prefill_completed != 0 {
+                break;
+            }
+            if report.blocked || !report.write_budget_exhausted {
+                break;
+            }
+        }
+        if prefill_completed != 1 {
+            return Err(format!(
+                "scrolling compositor prefill completed {prefill_completed} renders"
+            ));
+        }
+    }
+
+    let update_count = iterations
+        .checked_mul(updates_per_drain)
+        .ok_or("compositor workload update count overflowed")?;
+    let updates = (0..update_count)
+        .map(|iteration| match update_kind {
+            CompositorUpdateKind::CellEdit => format!(
                 "\x1b[{};{}H{}",
                 iteration % usize::from(geometry.rows) + 1,
                 iteration % usize::from(geometry.cols - 1) + 1,
                 char::from(b'a' + (iteration % 26) as u8),
             )
-            .into_bytes()
+            .into_bytes(),
+            CompositorUpdateKind::ScrollingLine { .. } => {
+                format!("streamed line {iteration:06}\r\n").into_bytes()
+            }
         })
         .collect::<Vec<_>>();
     let input_bytes = updates
@@ -914,9 +1012,16 @@ fn run_compositor_workload(iterations: usize) -> Result<CompositorWorkloadReport
     ALLOCATIONS.store(0, Ordering::Relaxed);
     ALLOCATED_BYTES.store(0, Ordering::Relaxed);
     let started = Instant::now();
-    for update in &updates {
+    for drain_updates in updates.chunks_exact(updates_per_drain) {
         let iteration_started = Instant::now();
-        app.handle_pty(&mut screen_reader, update, &mut writer)
+        app.begin_pty_presentation_batch();
+        for update in drain_updates {
+            if let Err(error) = app.handle_pty(&mut screen_reader, update, &mut writer) {
+                app.cancel_pty_presentation_batch();
+                return Err(error.to_string());
+            }
+        }
+        app.finish_pty_presentation_batch(&mut writer)
             .map_err(|error| error.to_string())?;
         let report = app
             .drain_scheduled_output(&mut writer, true)
@@ -931,8 +1036,10 @@ fn run_compositor_workload(iterations: usize) -> Result<CompositorWorkloadReport
     let seconds = elapsed_ns as f64 / 1_000_000_000.0;
 
     Ok(CompositorWorkloadReport {
-        name: "direct-compositor-pipeline",
+        name,
         iterations,
+        updates: update_count,
+        updates_per_drain,
         input_bytes,
         elapsed_ns,
         throughput_mib_per_second: input_bytes as f64 / (1024.0 * 1024.0) / seconds,
@@ -1275,10 +1382,14 @@ fn run_scheduler_workload(workload: SchedulerWorkload) -> Result<SchedulerWorklo
     let mut replaced_renders = 0usize;
     let mut blocked_writes = 0usize;
     let mut completed_renders = 0usize;
+    let mut allocations = 0u64;
+    let mut allocated_bytes = 0u64;
     let updates_per_iteration = match workload.kind {
         SchedulerWorkloadKind::EventBoundaryCoalescing => UPDATES_PER_BOUNDARY,
         SchedulerWorkloadKind::BackpressureRecovery => 1,
     };
+    ALLOCATIONS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
     let started = Instant::now();
     for iteration in 0..workload.iterations {
         let boundary_started = Instant::now();
@@ -1286,34 +1397,51 @@ fn run_scheduler_workload(workload: SchedulerWorkload) -> Result<SchedulerWorklo
             SchedulerWorkloadKind::EventBoundaryCoalescing => {
                 for update in 0..UPDATES_PER_BOUNDARY {
                     let batch = scheduler_benchmark_batch(iteration, update);
-                    if scheduler.enqueue_render(batch, iteration as u128)
-                        == EnqueueOutcome::ReplacedObsoleteRender
-                    {
+                    let (outcome, batch_allocations, batch_allocated_bytes) =
+                        measure_allocations(|| scheduler.enqueue_render(batch, iteration as u128));
+                    allocations = allocations.saturating_add(batch_allocations);
+                    allocated_bytes = allocated_bytes.saturating_add(batch_allocated_bytes);
+                    if outcome == EnqueueOutcome::ReplacedObsoleteRender {
                         replaced_renders = replaced_renders.saturating_add(1);
                     }
                     maximum_pending_bytes = maximum_pending_bytes.max(scheduler.pending_bytes());
                 }
-                let report = scheduler
-                    .drain_ready(iteration as u128, true, &mut writer)
-                    .map_err(|error| error.to_string())?;
+                let (report, drain_allocations, drain_allocated_bytes) =
+                    measure_allocations(|| {
+                        scheduler.drain_ready(iteration as u128, true, &mut writer)
+                    });
+                allocations = allocations.saturating_add(drain_allocations);
+                allocated_bytes = allocated_bytes.saturating_add(drain_allocated_bytes);
+                let report = report.map_err(|error| error.to_string())?;
                 completed_renders =
                     completed_renders.saturating_add(report.completed_renders.len());
             }
             SchedulerWorkloadKind::BackpressureRecovery => {
-                scheduler
-                    .enqueue_render(scheduler_benchmark_batch(iteration, 0), iteration as u128);
+                let batch = scheduler_benchmark_batch(iteration, 0);
+                let (_, enqueue_allocations, enqueue_allocated_bytes) =
+                    measure_allocations(|| scheduler.enqueue_render(batch, iteration as u128));
+                allocations = allocations.saturating_add(enqueue_allocations);
+                allocated_bytes = allocated_bytes.saturating_add(enqueue_allocated_bytes);
                 maximum_pending_bytes = maximum_pending_bytes.max(scheduler.pending_bytes());
                 writer.block_next_write = true;
-                let blocked = scheduler
-                    .drain_ready(iteration as u128, true, &mut writer)
-                    .map_err(|error| error.to_string())?;
+                let (blocked, blocked_allocations, blocked_allocated_bytes) =
+                    measure_allocations(|| {
+                        scheduler.drain_ready(iteration as u128, true, &mut writer)
+                    });
+                allocations = allocations.saturating_add(blocked_allocations);
+                allocated_bytes = allocated_bytes.saturating_add(blocked_allocated_bytes);
+                let blocked = blocked.map_err(|error| error.to_string())?;
                 if blocked.blocked {
                     blocked_writes = blocked_writes.saturating_add(1);
                 }
-                scheduler.notify_writable();
-                let completed = scheduler
-                    .drain_ready(iteration as u128, true, &mut writer)
-                    .map_err(|error| error.to_string())?;
+                let (completed, recovery_allocations, recovery_allocated_bytes) =
+                    measure_allocations(|| {
+                        scheduler.notify_writable();
+                        scheduler.drain_ready(iteration as u128, true, &mut writer)
+                    });
+                allocations = allocations.saturating_add(recovery_allocations);
+                allocated_bytes = allocated_bytes.saturating_add(recovery_allocated_bytes);
+                let completed = completed.map_err(|error| error.to_string())?;
                 completed_renders =
                     completed_renders.saturating_add(completed.completed_renders.len());
             }
@@ -1327,6 +1455,8 @@ fn run_scheduler_workload(workload: SchedulerWorkload) -> Result<SchedulerWorklo
         iterations: workload.iterations,
         updates: workload.iterations.saturating_mul(updates_per_iteration),
         elapsed_ns,
+        allocations,
+        allocated_bytes,
         latency_p50_ns: percentile(&latencies, 50),
         latency_p95_ns: percentile(&latencies, 95),
         latency_max_ns: latencies.last().copied().unwrap_or(0),
@@ -1336,6 +1466,24 @@ fn run_scheduler_workload(workload: SchedulerWorkload) -> Result<SchedulerWorklo
         blocked_writes,
         completed_renders,
     })
+}
+
+/// Measures only allocations owned by an operation under test. Synthetic
+/// `RenderBatch` construction happens before this fence, so scheduler limits do
+/// not mostly measure fixture strings and blank scene snapshots.
+fn measure_allocations<T>(operation: impl FnOnce() -> T) -> (T, u64, u64) {
+    let allocations_before = ALLOCATIONS.load(Ordering::Relaxed);
+    let bytes_before = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    let result = operation();
+    (
+        result,
+        ALLOCATIONS
+            .load(Ordering::Relaxed)
+            .saturating_sub(allocations_before),
+        ALLOCATED_BYTES
+            .load(Ordering::Relaxed)
+            .saturating_sub(bytes_before),
+    )
 }
 
 fn scheduler_benchmark_batch(iteration: usize, update: usize) -> RenderBatch {

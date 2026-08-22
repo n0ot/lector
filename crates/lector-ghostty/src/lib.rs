@@ -8,6 +8,8 @@
 mod ffi;
 
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     borrow::Cow, cell::RefCell, collections::BTreeMap, ffi::c_void, fmt, marker::PhantomData,
     mem::MaybeUninit, ops::RangeInclusive, ptr::NonNull, rc::Rc, sync::Arc,
@@ -285,8 +287,23 @@ impl RowSnapshot {
 
     pub fn text(&self) -> String {
         let mut output = String::new();
+        self.append_contents_to(&mut output);
+        output
+    }
+
+    /// Appends this row's visible text without allocating an intermediate
+    /// string. Trailing blank cells remain omitted, matching [`Self::text`].
+    pub fn append_contents_to(&self, output: &mut String) {
+        self.append_contents_range_to(output, 0, self.cells.len());
+    }
+
+    /// Appends the visible text in a range of physical cells without
+    /// allocating an intermediate string. Trailing blank cells remain omitted.
+    pub fn append_contents_range_to(&self, output: &mut String, start: usize, width: usize) {
+        let end = start.saturating_add(width).min(self.cells.len());
+        let start = start.min(end);
         let mut pending_spaces = 0;
-        for cell in self.cells.iter() {
+        for cell in &self.cells[start..end] {
             if cell.continuation {
                 continue;
             }
@@ -298,7 +315,6 @@ impl RowSnapshot {
                 output.push_str(&cell.grapheme);
             }
         }
-        output
     }
 }
 
@@ -500,6 +516,15 @@ pub struct UpdateSnapshot {
     pub effects: Vec<EffectSnapshot>,
     pub pty_replies: Vec<u8>,
     pub printed_runs: Vec<PrintedRunSnapshot>,
+    /// The observed stream used cursor-addressed or otherwise structural
+    /// terminal operations, so its printed runs are not a linear output
+    /// record. This is accessibility provenance only; Ghostty's snapshot
+    /// remains authoritative.
+    pub output_report_structural: bool,
+    /// Ghostty retained an incomplete parser continuation after this update.
+    /// Even an observed LF is not an accessibility boundary until the
+    /// authoritative terminal parser has returned to ground state.
+    pub parser_continuation: bool,
     pub operations: Vec<OperationSnapshot>,
     pub cursor_operations: usize,
     pub scroll_operations: usize,
@@ -515,6 +540,15 @@ pub struct UpdateSnapshot {
     /// This update ended exactly at a real true-to-false synchronized-output
     /// boundary. Ordinary bytes after the close make this false.
     pub synchronized_output_closed: bool,
+    /// This update ended at an OSC 133 `B` input-start boundary, followed only
+    /// by controls proven not to alter the displayed output. Visible text,
+    /// structural output, another semantic phase, or an incomplete parser
+    /// continuation clears the boundary.
+    pub semantic_input_boundary: bool,
+    /// This update ended exactly at a real hidden-to-visible cursor
+    /// transition. Older full-screen applications commonly use that as a
+    /// redraw boundary when synchronized output is unavailable.
+    pub cursor_visibility_restored: bool,
     /// The visible terminal model immediately after an actual false-to-true
     /// synchronized-output transition. The marker itself only changes mode,
     /// so after clearing that mode bit this is the exact committed model from
@@ -1361,6 +1395,11 @@ struct StreamObserver {
     events: Vec<SemanticKindSnapshot>,
     printed_runs: Vec<PrintedRunSnapshot>,
     current_print: String,
+    output_report_structural: bool,
+    raw_escape_pending: bool,
+    raw_utf8_continuations: u8,
+    raw_utf8_next_min: u8,
+    raw_utf8_next_max: u8,
     operations: Vec<OperationSnapshot>,
     operation_rows: u16,
     operation_cols: u16,
@@ -1381,11 +1420,23 @@ struct StreamObserver {
     clipboard_read_queries: Vec<Vec<u8>>,
     default_color_queries: Vec<u8>,
     synchronized_output_boundary: Option<bool>,
+    cursor_visibility_boundary: Option<bool>,
+    semantic_input_boundary: bool,
 }
 
 impl StreamObserver {
     fn begin_update(&mut self, snapshot: &TerminalSnapshot) {
         self.operations.clear();
+        self.semantic_input_boundary = false;
+        self.output_report_structural = snapshot.alternate_screen
+            || !snapshot.cursor.visible
+            || snapshot.modes.synchronized_output
+            || snapshot.modes.application_keypad
+            || snapshot.modes.application_cursor
+            || snapshot.modes.mouse_protocol != MouseProtocol::None
+            || self.scroll_region.is_some()
+            || self.origin_mode
+            || self.left_right_margin_mode;
         self.operation_rows = snapshot.rows.len().try_into().unwrap_or(u16::MAX);
         self.operation_cols = snapshot
             .rows
@@ -1421,6 +1472,67 @@ impl StreamObserver {
         Self::parameter(params, 0, 1)
     }
 
+    fn private_modes_are_output_neutral(params: &vte::Params) -> bool {
+        let mut count = 0usize;
+        for values in params.iter() {
+            for value in values {
+                count = count.saturating_add(1);
+                if *value != 2004 {
+                    return false;
+                }
+            }
+        }
+        count == 1
+    }
+
+    /// Observe raw framing which `vte::Perform` does not report. In
+    /// particular, vte 0.15 silently enters SOS/PM/APC string state, so the
+    /// `ESC _` Kitty-graphics introducer has no callback which could taint the
+    /// accessibility print report. Retain a single ESC across update
+    /// boundaries so a fragmented introducer is classified identically. The
+    /// 8-bit C1 APC byte is structural when it occurs at a UTF-8 code-point
+    /// boundary. Track continuation bytes across updates so the same byte in a
+    /// valid multibyte character does not unnecessarily disable linear output.
+    fn observe_raw_byte(&mut self, byte: u8) {
+        if self.raw_utf8_continuations > 0 {
+            if (self.raw_utf8_next_min..=self.raw_utf8_next_max).contains(&byte) {
+                self.raw_utf8_continuations -= 1;
+                self.raw_utf8_next_min = 0x80;
+                self.raw_utf8_next_max = 0xbf;
+                self.raw_escape_pending = false;
+                return;
+            }
+            self.raw_utf8_continuations = 0;
+        }
+        if byte == 0x9f || (self.raw_escape_pending && byte == b'_') {
+            self.mark_structural_output();
+        }
+        self.raw_escape_pending = byte == b'\x1b';
+        (
+            self.raw_utf8_continuations,
+            self.raw_utf8_next_min,
+            self.raw_utf8_next_max,
+        ) = match byte {
+            0xc2..=0xdf => (1, 0x80, 0xbf),
+            0xe0 => (2, 0xa0, 0xbf),
+            0xe1..=0xec | 0xee..=0xef => (2, 0x80, 0xbf),
+            0xed => (2, 0x80, 0x9f),
+            0xf0 => (3, 0x90, 0xbf),
+            0xf1..=0xf3 => (3, 0x80, 0xbf),
+            0xf4 => (3, 0x80, 0x8f),
+            _ => (0, 0, 0),
+        };
+    }
+
+    fn mark_visible_output(&mut self) {
+        self.semantic_input_boundary = false;
+    }
+
+    fn mark_structural_output(&mut self) {
+        self.output_report_structural = true;
+        self.semantic_input_boundary = false;
+    }
+
     fn record_write(&mut self, character: char) {
         if self.operation_col >= self.operation_cols {
             self.operation_reliable = false;
@@ -1447,7 +1559,12 @@ impl StreamObserver {
         match self.operations.last_mut() {
             Some(OperationSnapshot::WriteRun { row, col, text })
                 if *row == self.operation_row
-                    && col.saturating_add(text.chars().count().try_into().unwrap_or(u16::MAX))
+                    // `operations` is private observer state, and every
+                    // character entering a WriteRun passed the ASCII guard
+                    // above. Its byte length is therefore its exact column
+                    // length; rescanning the growing String would make a
+                    // fragmented line quadratic.
+                    && col.saturating_add(text.len().try_into().unwrap_or(u16::MAX))
                         == self.operation_col =>
             {
                 text.push(character);
@@ -1495,10 +1612,15 @@ impl StreamObserver {
             || !self.clipboard_read_queries.is_empty()
             || !self.default_color_queries.is_empty()
             || self.synchronized_output_boundary.is_some()
+            || self.cursor_visibility_boundary.is_some()
     }
 
     fn take_synchronized_output_boundary(&mut self) -> Option<bool> {
         self.synchronized_output_boundary.take()
+    }
+
+    fn take_cursor_visibility_boundary(&mut self) -> Option<bool> {
+        self.cursor_visibility_boundary.take()
     }
 
     fn take_clipboard_read_queries(&mut self) -> Vec<Vec<u8>> {
@@ -1559,6 +1681,8 @@ impl StreamObserver {
         };
         StreamUpdate {
             printed_runs: std::mem::take(&mut self.printed_runs),
+            output_report_structural: std::mem::take(&mut self.output_report_structural),
+            semantic_input_boundary: std::mem::take(&mut self.semantic_input_boundary),
             operations,
             cursor_operations: std::mem::take(&mut self.cursor_operations),
             scroll_operations: std::mem::take(&mut self.scroll_operations),
@@ -1570,6 +1694,8 @@ impl StreamObserver {
 #[derive(Default)]
 struct StreamUpdate {
     printed_runs: Vec<PrintedRunSnapshot>,
+    output_report_structural: bool,
+    semantic_input_boundary: bool,
     operations: Vec<OperationSnapshot>,
     cursor_operations: usize,
     scroll_operations: usize,
@@ -1578,6 +1704,7 @@ struct StreamUpdate {
 
 impl vte::Perform for StreamObserver {
     fn print(&mut self, character: char) {
+        self.mark_visible_output();
         self.current_print.push(character);
         self.record_write(character);
     }
@@ -1585,23 +1712,41 @@ impl vte::Perform for StreamObserver {
         self.flush_print();
         match byte {
             b'\x08' => {
+                self.mark_structural_output();
                 self.cursor_operations += 1;
                 self.operation_col = self.operation_col.saturating_sub(1);
             }
             b'\r' => {
+                self.mark_visible_output();
                 self.push_boundary(PrintBoundarySnapshot::CarriageReturn);
                 self.operation_col = 0;
             }
-            b'\n' | b'\x0b' | b'\x0c' => {
+            b'\n' => {
+                self.mark_visible_output();
                 self.push_boundary(PrintBoundarySnapshot::LineFeed);
                 self.line_feed();
             }
-            b'\t' => self.operation_reliable = false,
-            _ => {}
+            b'\x0b' | b'\x0c' => {
+                self.mark_structural_output();
+                self.push_boundary(PrintBoundarySnapshot::LineFeed);
+                self.line_feed();
+            }
+            b'\t' => {
+                self.mark_structural_output();
+                self.operation_reliable = false;
+            }
+            // NUL and BEL do not alter printed-text provenance. Other C0
+            // controls may select character sets or mutate terminal state in
+            // ways this observer does not model conservatively.
+            b'\0' | b'\x07' => {}
+            _ => {
+                self.mark_structural_output();
+            }
         }
     }
     fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {
         self.flush_print();
+        self.mark_structural_output();
     }
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
         self.flush_print();
@@ -1633,6 +1778,17 @@ impl vte::Perform for StreamObserver {
             return;
         }
         let [b"133", marker, rest @ ..] = params else {
+            // Known title, working-directory, hyperlink, palette, clipboard,
+            // and notification OSCs do not address text cells. Unknown OSCs
+            // may carry inline media or proprietary screen mutations.
+            if !matches!(
+                params.first().copied(),
+                Some(
+                    b"0" | b"1" | b"2" | b"4" | b"7" | b"8" | b"9" | b"10" | b"11" | b"12" | b"52"
+                )
+            ) {
+                self.mark_structural_output();
+            }
             return;
         };
         let kind = match *marker {
@@ -1645,18 +1801,31 @@ impl vte::Perform for StreamObserver {
                     .and_then(|value| std::str::from_utf8(value).ok())
                     .and_then(|value| value.parse().ok()),
             },
-            _ => return,
+            _ => {
+                self.semantic_input_boundary = false;
+                return;
+            }
         };
+        self.semantic_input_boundary = matches!(kind, SemanticKindSnapshot::InputStart);
         self.events.push(kind);
     }
     fn csi_dispatch(
         &mut self,
         params: &vte::Params,
         intermediates: &[u8],
-        _ignore: bool,
+        ignore: bool,
         action: char,
     ) {
         self.flush_print();
+        let output_neutral_private_mode = !ignore
+            && intermediates == b"?"
+            && matches!(action, 'h' | 'l')
+            && Self::private_modes_are_output_neutral(params);
+        if !(!ignore && intermediates.is_empty() && matches!(action, 'm' | 'n' | 'c'))
+            && !output_neutral_private_mode
+        {
+            self.mark_structural_output();
+        }
         if intermediates == b"?" && matches!(action, 'h' | 'l') {
             let enabled = action == 'h';
             for values in params.iter() {
@@ -1670,10 +1839,11 @@ impl vte::Perform for StreamObserver {
                             self.scroll_region = None;
                             self.operation_reliable = false;
                         }
-                        // Input/reporting and cursor-visibility modes do not
-                        // alter the location or meaning of cell operations.
+                        25 => self.cursor_visibility_boundary = Some(enabled),
+                        // Input and reporting modes do not alter the location
+                        // or meaning of cell operations.
                         2026 => self.synchronized_output_boundary = Some(enabled),
-                        1 | 12 | 25 | 66 | 67 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015
+                        1 | 12 | 66 | 67 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015
                         | 1016 | 2004 => {}
                         // Unmodeled private modes can save/restore the cursor,
                         // resize/reset the grid, or change how later controls
@@ -1894,6 +2064,7 @@ impl vte::Perform for StreamObserver {
     }
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
         self.flush_print();
+        self.mark_structural_output();
         if !intermediates.is_empty() {
             self.operation_reliable = false;
             return;
@@ -1967,6 +2138,8 @@ pub struct Terminal {
     kitty_image_cache: RefCell<BTreeMap<u32, CachedKittyImage>>,
     #[cfg(test)]
     snapshot_row_reads: usize,
+    #[cfg(test)]
+    history_row_reads: Cell<usize>,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
@@ -2041,6 +2214,8 @@ impl Terminal {
             kitty_image_cache: RefCell::new(BTreeMap::new()),
             #[cfg(test)]
             snapshot_row_reads: 0,
+            #[cfg(test)]
+            history_row_reads: Cell::new(0),
             _thread_bound: PhantomData,
         };
         result.refresh_snapshot()?;
@@ -2056,24 +2231,28 @@ impl Terminal {
         let mut render_damage = RenderDamageSnapshot::None;
         let mut synchronized_output_open_snapshot = None;
         let mut synchronized_output_close_end = None;
+        let mut cursor_visibility_restore_end = None;
         let mut history_extent_at_latest_checkpoint = scrollback_extent_before;
         let mut history_origin_at_latest_checkpoint = history_origin_before;
         let mut history_changed_before_latest_checkpoint = false;
         let new_semantic_start = self.semantic_marks.len();
         let mut segment_start = 0;
         for (index, byte) in bytes.iter().copied().enumerate() {
+            self.stream_observer.observe_raw_byte(byte);
             self.stream_parser
                 .advance(&mut self.stream_observer, &[byte]);
             if !self.stream_observer.has_boundary_events() {
                 continue;
             }
             let synchronized_before = self.snapshot.modes.synchronized_output;
+            let cursor_visible_before = self.snapshot.cursor.visible;
             self.write_vt(&bytes[segment_start..=index]);
             self.answer_clipboard_queries();
             self.answer_default_color_queries();
             render_damage.merge(self.refresh_snapshot()?);
             self.anchor_semantic_events(scrollback_extent_before)?;
             let synchronization_boundary = self.stream_observer.take_synchronized_output_boundary();
+            let cursor_visibility_boundary = self.stream_observer.take_cursor_visibility_boundary();
             if synchronization_boundary == Some(false)
                 && synchronized_before
                 && !self.snapshot.modes.synchronized_output
@@ -2112,6 +2291,12 @@ impl Terminal {
                 history_extent_at_latest_checkpoint = self.snapshot.scrollback_extent;
                 history_origin_at_latest_checkpoint = self.snapshot.history_origin;
             }
+            if cursor_visibility_boundary == Some(true)
+                && !cursor_visible_before
+                && self.snapshot.cursor.visible
+            {
+                cursor_visibility_restore_end = Some(index + 1);
+            }
             segment_start = index + 1;
         }
         if segment_start < bytes.len() {
@@ -2146,10 +2331,13 @@ impl Terminal {
             self.snapshot.working_directory = Some(path.clone());
         }
         let changed_rows = render_damage.changed_rows(self.snapshot.rows.len());
+        let parser_continuation = terminal_has_continuation(&self.terminal).unwrap_or(true);
         Ok(UpdateSnapshot {
             effects,
             pty_replies,
             printed_runs: stream.printed_runs,
+            output_report_structural: stream.output_report_structural,
+            parser_continuation,
             operations: stream.operations,
             cursor_operations: stream.cursor_operations,
             scroll_operations: stream.scroll_operations,
@@ -2163,6 +2351,9 @@ impl Terminal {
             synchronized_output: self.snapshot.modes.synchronized_output,
             synchronized_output_closed: !self.snapshot.modes.synchronized_output
                 && synchronized_output_close_end == Some(bytes.len()),
+            semantic_input_boundary: stream.semantic_input_boundary && !parser_continuation,
+            cursor_visibility_restored: self.snapshot.cursor.visible
+                && cursor_visibility_restore_end == Some(bytes.len()),
             synchronized_output_open_snapshot,
         })
     }
@@ -2338,6 +2529,8 @@ impl Terminal {
             kitty_image_cache: RefCell::new(BTreeMap::new()),
             #[cfg(test)]
             snapshot_row_reads: 0,
+            #[cfg(test)]
+            history_row_reads: Cell::new(0),
             _thread_bound: PhantomData,
         };
         result.refresh_snapshot()?;
@@ -2533,6 +2726,27 @@ impl Terminal {
         Ok(snapshot)
     }
 
+    /// Reads the suffix of the current logical history window beginning at a
+    /// window-relative row. Presentation receipts use this to carry only rows
+    /// added since their previous history generation instead of materializing
+    /// the complete bounded scrollback after every line feed.
+    pub fn history_rows_from(&self, logical_start: usize) -> Result<Vec<RowSnapshot>, Error> {
+        let actual_extent = self.actual_scrollback_extent()?;
+        let logical_extent = actual_extent.min(self.scrollback_capacity);
+        if logical_start > logical_extent {
+            return Err(Error::InvalidValue);
+        }
+        let physical_start = actual_extent
+            .saturating_sub(logical_extent)
+            .saturating_add(logical_start);
+        let (_, cols) = self.snapshot.size();
+        let mut history = Vec::with_capacity(logical_extent.saturating_sub(logical_start));
+        for row in physical_start..actual_extent {
+            history.push(self.read_grid_row(row, cols)?);
+        }
+        Ok(history)
+    }
+
     pub fn scrollback_extent(&self) -> usize {
         self.snapshot.scrollback_extent
     }
@@ -2600,7 +2814,7 @@ impl Terminal {
         };
         let logical_row = logical_scrollback_extent.saturating_add(active_row);
         let col = self.snapshot.cursor.col;
-        for kind in events {
+        for &kind in &events {
             let actual_history = self.actual_scrollback_extent()?;
             let physical_anchor_row = actual_history.saturating_add(active_row);
             let reference = self.track_screen_position(physical_anchor_row, col)?;
@@ -2988,6 +3202,9 @@ impl Terminal {
     }
 
     fn read_grid_row(&self, row: usize, cols: u16) -> Result<RowSnapshot, Error> {
+        #[cfg(test)]
+        self.history_row_reads
+            .set(self.history_row_reads.get().saturating_add(1));
         let row = u32::try_from(row).map_err(|_| Error::LimitExceeded)?;
         let row_reference = terminal_grid_ref(&self.terminal, ffi::POINT_TAG_HISTORY, 0, row)?;
         let raw_row = grid_ref_query_row(&row_reference)?;
@@ -3131,6 +3348,25 @@ fn continuation_bytes(handle: &TerminalHandle) -> Result<Vec<u8>, Error> {
     }
     bytes.truncate(written);
     Ok(bytes)
+}
+
+fn terminal_has_continuation(handle: &TerminalHandle) -> Result<bool, Error> {
+    let mut required = 0usize;
+    // SAFETY: this is the documented size query with a null destination and
+    // valid output counter. A nonzero requirement is exactly Ghostty's
+    // retained parser continuation.
+    let result = unsafe {
+        ffi::ghostty_terminal_continuation_buf(
+            handle.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            &mut required,
+        )
+    };
+    if result != ffi::OUT_OF_SPACE {
+        result_from_code(result)?;
+    }
+    Ok(required != 0)
 }
 
 fn terminal_string(
@@ -3732,7 +3968,46 @@ static FAILING_VTABLE: ffi::AllocatorVtable = ffi::AllocatorVtable {
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderDamageSnapshot, Terminal};
+    use std::{borrow::Cow, sync::Arc};
+
+    use super::{
+        CellSnapshot, OperationSnapshot, RenderDamageSnapshot, RowSnapshot, StreamObserver,
+        Terminal,
+    };
+
+    #[test]
+    fn row_content_appenders_share_range_and_trailing_blank_semantics() {
+        let cell = |grapheme| CellSnapshot {
+            grapheme: Cow::Borrowed(grapheme),
+            ..CellSnapshot::default()
+        };
+        let row = RowSnapshot {
+            cells: Arc::new(vec![
+                cell("a"),
+                CellSnapshot::default(),
+                cell("界"),
+                CellSnapshot {
+                    continuation: true,
+                    ..CellSnapshot::default()
+                },
+                CellSnapshot::default(),
+                cell(" "),
+            ]),
+            wrapped: false,
+        };
+
+        let mut full = String::from("prefix:");
+        row.append_contents_to(&mut full);
+        assert_eq!(full, "prefix:a 界  ");
+
+        let mut middle = String::new();
+        row.append_contents_range_to(&mut middle, 1, 3);
+        assert_eq!(middle, " 界");
+
+        let mut trailing_blank = String::new();
+        row.append_contents_range_to(&mut trailing_blank, 0, 2);
+        assert_eq!(trailing_blank, "a");
+    }
 
     #[test]
     fn partial_snapshot_refresh_reads_only_ghostty_dirty_rows() {
@@ -3752,5 +4027,53 @@ mod tests {
             "an ordinary one-line update must not re-read the other 23 rows"
         );
         assert_eq!(terminal.snapshot().rows[0].text(), "one line");
+    }
+
+    #[test]
+    fn history_suffix_capture_reads_only_new_rows_at_the_logical_cap() {
+        const CAPACITY: usize = 10_000;
+        let mut terminal =
+            Terminal::new_with_scrollback(2, 8, CAPACITY).expect("create capped history terminal");
+        let mut output = Vec::with_capacity((CAPACITY + 2) * 9);
+        for row in 0..(CAPACITY + 2) {
+            output.extend_from_slice(format!("r{row:06}\r\n").as_bytes());
+        }
+        terminal.advance(&output).expect("fill logical history cap");
+        assert_eq!(terminal.snapshot().scrollback_extent, CAPACITY);
+
+        terminal.history_row_reads.set(0);
+        let suffix = terminal
+            .history_rows_from(CAPACITY - 1)
+            .expect("read newest logical history row");
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].contents(), "r010000");
+        assert_eq!(
+            terminal.history_row_reads.get(),
+            1,
+            "suffix capture must not revisit the other 9,999 retained rows"
+        );
+    }
+
+    #[test]
+    fn ascii_observer_coalesces_a_large_fragmented_run_without_rescanning_text() {
+        const CHARACTERS: usize = 16_384;
+        let mut observer = StreamObserver {
+            operation_rows: 1,
+            operation_cols: u16::MAX,
+            operation_reliable: true,
+            ..StreamObserver::default()
+        };
+
+        for _ in 0..CHARACTERS {
+            observer.record_write('x');
+        }
+
+        assert_eq!(observer.operations.len(), 1);
+        let OperationSnapshot::WriteRun { row, col, text } = &observer.operations[0] else {
+            panic!("fragmented ASCII writes must remain one observer run");
+        };
+        assert_eq!((*row, *col), (0, 0));
+        assert_eq!(text.len(), CHARACTERS);
+        assert!(text.is_ascii());
     }
 }

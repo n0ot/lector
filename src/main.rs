@@ -685,9 +685,11 @@ where
     }
 }
 
-/// Drain one fair PTY turn while coalescing visible tmux pane damage into one
-/// presentation. Parsing, model mutation, and protocol replies remain ordered
-/// per read; only the expensive scene composition is deferred to the boundary.
+/// Drain one fair PTY turn while coalescing transport-neutral scene damage
+/// into one presentation. Parsing, model mutation, protocol replies, and
+/// nonvisual effects remain ordered per read. Physical bells are retained
+/// behind the accepted scene they describe; only scene composition is deferred
+/// to the boundary.
 fn drain_application_pty<R>(
     app: &mut app::App,
     sr: &mut ScreenReader,
@@ -705,7 +707,7 @@ where
     });
     match result {
         Ok(state) => {
-            app.finish_pty_presentation_batch(sr, term_out)?;
+            app.finish_pty_presentation_batch(term_out)?;
             Ok(state)
         }
         Err(error) => {

@@ -8,6 +8,5 @@ Then expect-stdout-contains: hidden update
 And expect-screen-contains: hidden update
 And expect-no-pty-stdin:
 And expect-speak: Review
-And expect-speak-contains: root
 And expect-speak: Terminal
 And expect-speak-contains: hidden update

@@ -2,8 +2,8 @@
 
 use crate::{
     presentation::{
-        CursorOwner, GridPoint, GridRect, PresentationError, PresentedViewFrame, Scene,
-        SceneSurface, SurfaceId, ViewId,
+        CursorOwner, GridPoint, GridRect, PresentationError, PresentedFrameIndex,
+        PresentedViewFrame, Scene, SceneSurface, SurfaceId, ViewId,
     },
     terminal::{Cell, Cursor, Row, TerminalGeometry, TerminalSnapshot, UpdateSummary},
     tmux_control::CommandStatus,
@@ -754,9 +754,6 @@ impl TmuxPaneSet {
         let rows = dimension(state.metadata.height);
         let cols = dimension(state.metadata.width);
         let mut view = View::new(rows, cols);
-        if self.presentation_tracking {
-            view.enable_presentation_tracking();
-        }
         let bytes = reconstruction_bytes(
             state.metadata.alternate_on,
             state.metadata.cursor_x,
@@ -772,11 +769,19 @@ impl TmuxPaneSet {
         view.process_changes(&bytes);
         let buffered = std::mem::take(&mut state.prebootstrap_output);
         self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
-        if view.contents_full().trim().is_empty() && !buffered.is_empty() {
+        if !view.screen().has_visible_non_whitespace_content() && !buffered.is_empty() {
             view.process_changes(&buffered);
         }
         view.discard_shadow_pty_replies();
+        // An authoritative capture establishes the pane's diff baseline; it is
+        // not application output to announce. Finalize it while parsing is
+        // still the publication boundary, then let physical receipts own every
+        // later revision. Enabling tracking first would make this finalization
+        // a no-op and leave the complete capture in the accessibility journal.
         view.finalize_changes(now_ms);
+        if self.presentation_tracking {
+            view.enable_presentation_tracking();
+        }
         let retired = std::mem::replace(&mut state.view, view);
         state.bootstrapped = true;
         state.bootstrap_requested = false;
@@ -827,9 +832,6 @@ impl TmuxPaneSet {
         let rows = dimension(metadata.height);
         let cols = dimension(metadata.width);
         let mut view = View::new(rows, cols);
-        if self.presentation_tracking {
-            view.enable_presentation_tracking();
-        }
         let bytes = reconstruction_bytes(
             metadata.alternate_on,
             metadata.cursor_x,
@@ -844,7 +846,12 @@ impl TmuxPaneSet {
         );
         view.process_changes(&bytes);
         view.discard_shadow_pty_replies();
+        // Baseline the authoritative snapshot before presentation tracking
+        // starts so capture text cannot taint the first later output receipt.
         view.finalize_changes(now_ms);
+        if self.presentation_tracking {
+            view.enable_presentation_tracking();
+        }
         let retired = std::mem::replace(&mut state.view, view);
         state.bootstrapped = true;
         state.bootstrap_requested = false;
@@ -929,19 +936,40 @@ impl TmuxPaneSet {
     }
 
     pub(crate) fn apply_presented_frame(&mut self, frame: &PresentedViewFrame) -> bool {
+        self.visit_presentation_views_mut(&mut |view| view.apply_presented_frame_ref(frame))
+    }
+
+    pub(crate) fn apply_presented_frames(&mut self, frames: &PresentedFrameIndex<'_>) -> usize {
+        let mut applied = 0usize;
+        self.visit_presentation_views_mut(&mut |view| {
+            if let Some(frame) = frames.get(view.view_id())
+                && view.apply_presented_frame_ref(frame)
+            {
+                applied = applied.saturating_add(1);
+            }
+            false
+        });
+        applied
+    }
+
+    /// Visits every live, portal, and receipt-retained model exactly once.
+    /// Returning `true` stops the traversal, which keeps targeted single-frame
+    /// routing cheap while the indexed bundle path completes one linear walk.
+    fn visit_presentation_views_mut(
+        &mut self,
+        visitor: &mut impl FnMut(&mut View) -> bool,
+    ) -> bool {
         for state in self.panes.values_mut() {
-            if state.view.apply_presented_frame(frame.clone()) {
+            if visitor(&mut state.view) {
                 return true;
             }
             if let Some(portal) = &mut state.portal
-                && portal.view.apply_presented_frame(frame.clone())
+                && visitor(&mut portal.view)
             {
                 return true;
             }
         }
-        self.retired_presentations
-            .iter_mut()
-            .any(|view| view.apply_presented_frame(frame.clone()))
+        self.retired_presentations.iter_mut().any(visitor)
     }
 
     pub(crate) fn model_by_id_mut(&mut self, view_id: ViewId) -> Option<&mut View> {
@@ -1374,12 +1402,14 @@ fn capture_line_flags(line: &[u8]) -> (&[u8], &[u8]) {
 #[cfg(test)]
 mod synchronization_tests {
     use super::{
-        TmuxLayout, TmuxPaneSet, capture_command_for_metadata, pending_escape_capture_command,
-        portable_capture_command_for_metadata,
+        PaneState, TmuxLayout, TmuxPaneSet, capture_command_for_metadata,
+        pending_escape_capture_command, portable_capture_command_for_metadata,
     };
     use crate::{
+        presentation::{PresentedFrameIndex, SurfaceId},
         tmux_control::CommandStatus,
-        tmux_model::{PaneCaptureMetadata, PaneId, TmuxTopology},
+        tmux_model::{Pane, PaneCaptureMetadata, PaneId, TmuxTopology, WindowId},
+        view::View,
     };
 
     const SPLIT: &str = "abcd,20x4,0,0{10x4,0,0,20,9x4,11,0,21}";
@@ -1424,6 +1454,77 @@ mod synchronization_tests {
         let mut topology = TmuxTopology::new(1);
         topology.replace_inventory(&lines).expect("topology");
         topology
+    }
+
+    fn present_live_split(panes: &mut TmuxPaneSet) {
+        let layout = TmuxLayout::parse(SPLIT).expect("layout");
+        let (_, frames) = panes.capture_live_presentation_frames(&layout, Some(PaneId(20)));
+        for frame in &frames {
+            assert!(panes.apply_presented_frame(frame));
+        }
+    }
+
+    #[test]
+    fn indexed_receipt_routing_is_linear_in_owned_pane_views() {
+        const PANE_COUNT: usize = 128;
+        let mut panes = TmuxPaneSet::new(1);
+        let mut frames = Vec::with_capacity(PANE_COUNT);
+        for index in 0..PANE_COUNT {
+            let pane_id = PaneId(u64::try_from(index).expect("pane index fits u64") + 1);
+            let surface_id = SurfaceId(
+                u64::try_from(index).expect("surface index fits u64") + 0x8000_0001_0000_0001,
+            );
+            let mut view = View::new(1, 4);
+            view.enable_presentation_tracking();
+            view.process_changes(b"cell");
+            frames.push(view.capture_live_presentation_frame(surface_id));
+            panes.panes.insert(
+                pane_id,
+                PaneState {
+                    view,
+                    portal: None,
+                    metadata: Pane {
+                        id: pane_id,
+                        window_id: WindowId(1),
+                        index: u32::try_from(index).expect("pane index fits u32"),
+                        title: String::new(),
+                        left: 0,
+                        top: 0,
+                        width: 4,
+                        height: 1,
+                        dead: false,
+                        cursor_x: 0,
+                        cursor_y: 0,
+                        cursor_visible: true,
+                        cursor_shape: String::new(),
+                        alternate_on: false,
+                        pane_in_mode: 0,
+                        mode: String::new(),
+                        history_size: 0,
+                    },
+                    surface_id,
+                    bootstrap_requested: false,
+                    bootstrapped: true,
+                    prebootstrap_output: Vec::new(),
+                },
+            );
+        }
+
+        let mut visited = 0usize;
+        assert!(!panes.visit_presentation_views_mut(&mut |_| {
+            visited = visited.saturating_add(1);
+            false
+        }));
+        assert_eq!(visited, PANE_COUNT);
+
+        let index = PresentedFrameIndex::new(&frames);
+        assert_eq!(panes.apply_presented_frames(&index), PANE_COUNT);
+        assert!(
+            panes
+                .panes
+                .values()
+                .all(|state| !state.view.accessibility_awaiting_presentation())
+        );
     }
 
     #[test]
@@ -1606,6 +1707,108 @@ mod synchronization_tests {
 
         assert_eq!(panes.pane_view(PaneId(21)).unwrap().line(0), "v-4095");
         assert_eq!(panes.pane_view(PaneId(22)).unwrap().line(0), "h-4095");
+    }
+
+    #[test]
+    fn tracked_bootstrap_capture_is_a_baseline_not_part_of_the_first_lf_report() {
+        let topology = split_topology();
+        let mut panes = TmuxPaneSet::new(1);
+        panes.enable_presentation_tracking();
+        for request in panes.reconcile(&topology).expect("reconcile") {
+            let capture = if request.pane_id == PaneId(20) {
+                b"CAPTURE".to_vec()
+            } else {
+                b"RIGHT".to_vec()
+            };
+            panes
+                .apply_bootstrap(request.pane_id, CommandStatus::Success, &[capture], 10)
+                .expect("bootstrap");
+        }
+        present_live_split(&mut panes);
+
+        panes
+            .process_output_with_summary_retention(PaneId(20), b"later!!\r\n", true)
+            .expect("process first incremental output")
+            .expect("bootstrapped pane update");
+        present_live_split(&mut panes);
+
+        let view = panes.pane_view_mut(PaneId(20)).expect("active pane");
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "later!!\n"
+        );
+        assert!(!view.accessibility_update_summary().output_report_structural);
+        assert!(view.accessibility_completes_linear_output_record());
+    }
+
+    #[test]
+    fn tracked_resync_capture_baselines_alternate_transition_before_the_next_lf() {
+        let topology = split_topology();
+        let mut panes = TmuxPaneSet::new(1);
+        panes.enable_presentation_tracking();
+        for request in panes.reconcile(&topology).expect("reconcile") {
+            panes
+                .apply_bootstrap(request.pane_id, CommandStatus::Success, &[], 0)
+                .expect("bootstrap");
+        }
+        present_live_split(&mut panes);
+
+        let metadata = PaneCaptureMetadata {
+            pane_id: PaneId(20),
+            left: 0,
+            top: 0,
+            width: 10,
+            height: 4,
+            dead: false,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: true,
+            cursor_shape: "block".to_owned(),
+            alternate_on: true,
+            pane_in_mode: 0,
+            history_size: 0,
+        };
+        panes
+            .apply_resync_capture(&metadata, &[b"CAPTURE".to_vec()], &[], 20)
+            .expect("apply alternate-screen resync capture");
+        present_live_split(&mut panes);
+        {
+            let view = panes.pane_view(PaneId(20)).expect("resynchronized pane");
+            assert!(view.screen().alternate_screen());
+            assert!(view.prev_screen().alternate_screen());
+            assert_eq!(view.accessibility_update_summary().batch_count, 0);
+        }
+
+        panes
+            .process_output_with_summary_retention(PaneId(20), b"\x1b[?1049l", true)
+            .expect("leave alternate screen")
+            .expect("transition update");
+        present_live_split(&mut panes);
+        {
+            let view = panes.pane_view_mut(PaneId(20)).expect("transitioned pane");
+            assert_eq!(
+                view.accessibility_update_summary().screen_before,
+                crate::terminal::ScreenIdentity::Alternate
+            );
+            assert_eq!(
+                view.accessibility_update_summary().screen_after,
+                crate::terminal::ScreenIdentity::Primary
+            );
+            view.finalize_changes(21);
+        }
+
+        panes
+            .process_output_with_summary_retention(PaneId(20), b"later!!\r\n", true)
+            .expect("process first primary-screen output")
+            .expect("incremental output");
+        present_live_split(&mut panes);
+        let view = panes.pane_view_mut(PaneId(20)).expect("active pane");
+        assert_eq!(
+            view.accessibility_update_summary().printed_text(),
+            "later!!\n"
+        );
+        assert!(!view.accessibility_update_summary().output_report_structural);
+        assert!(view.accessibility_completes_linear_output_record());
     }
 
     #[test]

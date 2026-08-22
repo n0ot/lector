@@ -514,7 +514,7 @@ fn base_switch_replacements_present_only_the_targets_committed_frame() {
 }
 
 #[test]
-fn tmux_location_announcement_waits_for_the_matching_physical_frame() {
+fn tmux_title_change_in_place_stays_silent_after_the_matching_physical_frame() {
     let (mut app, mut sr, recorder, mut physical) = app();
     let mut router = add_ready_connection(
         &mut app,
@@ -549,8 +549,8 @@ fn tmux_location_announcement_waits_for_the_matching_physical_frame() {
     assert_eq!(report.completed_renders.len(), 1);
     let mut root = Vec::new();
     app.handle_tick(&mut sr, &mut root, &mut physical)
-        .expect("announce the physically presented window");
-    assert_eq!(recorder.0.borrow().as_slice(), ["1: renamed"]);
+        .expect("finish the physically presented title change");
+    assert!(recorder.0.borrow().is_empty());
 }
 
 #[test]

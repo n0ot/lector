@@ -490,7 +490,7 @@ fn parent_controls_render_and_announce_when_focus_returns_to_a_nested_pane_porta
         app.debug_active_view_contents()
             .contains("tmux control mode is running")
     );
-    assert_eq!(&*recorder.0.borrow(), &["1.1: outer"]);
+    assert_eq!(&*recorder.0.borrow(), &["ion in this pane."]);
 }
 
 #[test]

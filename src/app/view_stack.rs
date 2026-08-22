@@ -10,7 +10,7 @@ enum ApplicationPresentationModel {
 struct RenderSynchronization {
     opened: bool,
     activity: bool,
-    compositor_bypass: bool,
+    compositor_transition: Option<views::CompositorTransitionToken>,
 }
 
 impl App {
@@ -114,8 +114,7 @@ impl App {
                         // deadline so the real close still drives one atomic
                         // auto-read/finalization pass.
                         if !self.view_stack.presented_holds_synchronized_output() {
-                            self.first_pty_update = None;
-                            self.last_pty_update = None;
+                            self.cancel_stabilization_bursts();
                         }
                     }
                 }
@@ -252,6 +251,10 @@ impl App {
         term_out: &mut dyn Write,
         bell_count: usize,
     ) -> Result<()> {
+        if let Some(batch) = &mut self.pending_presentation_batch {
+            batch.require_authoritative_scene(bell_count);
+            return Ok(());
+        }
         self.render_scene_with_update(term_out, bell_count, None)
     }
 
@@ -271,8 +274,8 @@ impl App {
         terminal_update: Option<&UpdateSummary>,
     ) -> Result<()> {
         let scene = self.composed_scene_with_bells(bell_count)?;
-        let compositor_transition = self.view_stack.compositor_transition_pending();
-        let damage = if compositor_transition {
+        let compositor_transition = self.view_stack.compositor_transition();
+        let damage = if compositor_transition.is_some() {
             SceneDamage::Full
         } else {
             terminal_update.map_or(SceneDamage::Full, |update| {
@@ -285,7 +288,7 @@ impl App {
             RenderSynchronization {
                 opened: terminal_update.is_some_and(|update| update.synchronized_output_opened),
                 activity: terminal_update.is_some_and(|update| update.synchronized_output),
-                compositor_bypass: compositor_transition,
+                compositor_transition,
             },
             scene,
             damage,
@@ -310,8 +313,8 @@ impl App {
         let Some(surface) = scene.panes.iter().find(|surface| surface.id == surface_id) else {
             return Ok(());
         };
-        let compositor_transition = self.view_stack.compositor_transition_pending();
-        let damage = if compositor_transition {
+        let compositor_transition = self.view_stack.compositor_transition();
+        let damage = if compositor_transition.is_some() {
             SceneDamage::Full
         } else {
             SceneDamage::from_terminal_update(surface, update, scene.geometry)
@@ -322,48 +325,57 @@ impl App {
             RenderSynchronization {
                 opened: update.synchronized_output_opened,
                 activity: update.synchronized_output,
-                compositor_bypass: compositor_transition,
+                compositor_transition,
             },
             scene,
             damage,
         )
     }
 
-    pub(super) fn render_tmux_batched_update(
+    pub(super) fn render_tmux_batched_updates(
         &mut self,
         term_out: &mut dyn Write,
         bell_count: usize,
-        updates: BTreeMap<(u64, crate::tmux_model::PaneId), UpdateSummary>,
+        updates: impl IntoIterator<Item = PendingPanePresentation>,
     ) -> Result<()> {
-        let synchronized_output_opened = updates
-            .values()
-            .any(|update| update.synchronized_output_opened);
-        let synchronized_output_activity =
-            updates.values().any(|update| update.synchronized_output);
-        let surface_updates = self
-            .view_stack
-            .active_tmux_connection_mut()
-            .map(|view| {
-                updates
-                    .into_iter()
-                    .filter_map(|((connection_id, pane_id), update)| {
-                        (connection_id == view.connection_id())
-                            .then(|| {
-                                view.surface_id(pane_id)
-                                    .map(|surface_id| (surface_id, update))
-                            })
-                            .flatten()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let mut first_surface_update = None;
+        let mut additional_surface_updates = Vec::new();
+        if let Some(view) = self.view_stack.active_tmux_connection_mut() {
+            for pending in updates {
+                if pending.connection_id != view.connection_id()
+                    || !view.is_pane_visible(pending.pane_id)
+                {
+                    continue;
+                }
+                let Some(surface_id) = view.surface_id(pending.pane_id) else {
+                    continue;
+                };
+                let surface_update = (surface_id, pending.update);
+                if first_surface_update.is_some() {
+                    additional_surface_updates.push(surface_update);
+                } else {
+                    first_surface_update = Some(surface_update);
+                }
+            }
+        }
+        let Some(first_surface_update) = first_surface_update else {
+            return Ok(());
+        };
+        let surface_updates =
+            std::iter::once(&first_surface_update).chain(additional_surface_updates.iter());
+        let synchronized_output_opened = surface_updates
+            .clone()
+            .any(|(_, update)| update.synchronized_output_opened);
+        let synchronized_output_activity = surface_updates
+            .clone()
+            .any(|(_, update)| update.synchronized_output);
         let scene = self.composed_scene_with_bells(bell_count)?;
-        let compositor_transition = self.view_stack.compositor_transition_pending();
-        let damage = if compositor_transition {
+        let compositor_transition = self.view_stack.compositor_transition();
+        let damage = if compositor_transition.is_some() {
             SceneDamage::Full
         } else {
             SceneDamage::from_terminal_updates(
-                surface_updates.iter().filter_map(|(surface_id, update)| {
+                surface_updates.filter_map(|(surface_id, update)| {
                     scene
                         .panes
                         .iter()
@@ -379,7 +391,7 @@ impl App {
             RenderSynchronization {
                 opened: synchronized_output_opened,
                 activity: synchronized_output_activity,
-                compositor_bypass: compositor_transition,
+                compositor_transition,
             },
             scene,
             damage,
@@ -387,9 +399,13 @@ impl App {
     }
 
     pub(super) fn render_tmux_topology_update(&mut self, term_out: &mut dyn Write) -> Result<()> {
+        if let Some(batch) = &mut self.pending_presentation_batch {
+            batch.require_authoritative_scene(0);
+            return Ok(());
+        }
         let scene = self.composed_scene_with_bells(0)?;
-        let compositor_transition = self.view_stack.compositor_transition_pending();
-        let damage = if compositor_transition {
+        let compositor_transition = self.view_stack.compositor_transition();
+        let damage = if compositor_transition.is_some() {
             SceneDamage::Full
         } else {
             SceneDamage::regions([crate::presentation::GridRect::new(
@@ -402,7 +418,7 @@ impl App {
             term_out,
             0,
             RenderSynchronization {
-                compositor_bypass: compositor_transition,
+                compositor_transition,
                 ..RenderSynchronization::default()
             },
             scene,
@@ -436,8 +452,10 @@ impl App {
         let presented_application_synchronized =
             self.view_stack.presented_holds_synchronized_output();
         let compositor_overlay_visible = self.view_stack.has_overlay();
+        let compositor_bypass_requested =
+            compositor_overlay_visible || synchronization.compositor_transition.is_some();
         let compensate_compositor_effects = scheduled
-            && (synchronization.compositor_bypass
+            && (synchronization.compositor_transition.is_some()
                 || (compositor_overlay_visible && presented_application_synchronized));
         let title_effect = (scheduled
             && (compensate_compositor_effects
@@ -460,9 +478,13 @@ impl App {
             .scene_renderer
             .render(&scene, &damage, &self.presented_scene)?;
         if let Some(scheduler) = &mut self.output_scheduler {
+            let application_synchronization_timed_out =
+                scheduler.application_synchronization_is_ignored();
             let accessibility = self.view_stack.capture_presentation_bundle(
                 !compositor_overlay_visible
-                    && (!synchronization.compositor_bypass || !presented_application_synchronized),
+                    && (synchronization.compositor_transition.is_none()
+                        || !presented_application_synchronized
+                        || application_synchronization_timed_out),
             );
             if let Some(effect) = title_effect {
                 scheduler.enqueue_terminal_effect(ROOT_SOURCE, effect, self.clock.now_ms());
@@ -480,24 +502,52 @@ impl App {
                 synchronization.activity,
                 self.clock.now_ms(),
             );
-            scheduler.set_application_synchronization_bypassed(
-                compositor_overlay_visible || synchronization.compositor_bypass,
-            );
+            scheduler.set_application_synchronization_bypassed(compositor_bypass_requested);
             let render_outcome = scheduler.enqueue_render_with_accessibility(
                 batch,
                 accessibility,
                 self.clock.now_ms(),
             );
-            scheduler.enqueue_bell(bell_count, self.clock.now_ms());
+            let accepted_bypass_generation = (render_outcome
+                != crate::output_scheduler::EnqueueOutcome::DroppedForCapacity
+                && compositor_bypass_requested
+                && presented_application_synchronized)
+                .then(|| scheduler.application_synchronization_bypass_generation())
+                .flatten();
+            let capacity_will_drain = scheduler.pending_bytes() != 0 || scheduler.has_render_work();
+            if render_outcome != crate::output_scheduler::EnqueueOutcome::DroppedForCapacity {
+                scheduler.enqueue_bell(bell_count, self.clock.now_ms());
+            }
             self.prune_retired_accessibility_views();
             if render_outcome == crate::output_scheduler::EnqueueOutcome::DroppedForCapacity {
+                self.scene_renderer.invalidate();
+                if capacity_will_drain
+                    && synchronization.compositor_transition
+                        == self.view_stack.compositor_transition()
+                    && synchronization.compositor_transition
+                        != self.compositor_transition_retry_attempt
+                {
+                    self.compositor_transition_retry = synchronization.compositor_transition;
+                }
                 self.log_event("discarded physical render which exceeded the scheduler budget");
-            } else if synchronization.compositor_bypass && !presented_application_synchronized {
-                // With no application transaction to hold a replacement, every
-                // subsequent live scene is also committed. The accepted render
-                // therefore completes the compositor handoff logically even
-                // though its physical flush is asynchronous.
-                self.view_stack.complete_compositor_transition();
+            } else {
+                if compositor_bypass_requested {
+                    self.compositor_transition_bypass_owner =
+                        accepted_bypass_generation.zip(synchronization.compositor_transition);
+                }
+                if let Some(transition) = synchronization.compositor_transition {
+                    if self.compositor_transition_retry == Some(transition) {
+                        self.compositor_transition_retry = None;
+                    }
+                    if !presented_application_synchronized {
+                        // With no application transaction to hold a
+                        // replacement, every subsequent live scene is also
+                        // committed. The accepted render therefore completes
+                        // the compositor handoff logically even though its
+                        // physical flush is asynchronous.
+                        self.view_stack.complete_compositor_transition(transition);
+                    }
+                }
             }
             return Ok(());
         }
@@ -513,8 +563,8 @@ impl App {
         }
         self.scene_renderer.confirm(&batch.predicted);
         self.presented_scene = batch.predicted;
-        if synchronization.compositor_bypass {
-            self.view_stack.complete_compositor_transition();
+        if let Some(transition) = synchronization.compositor_transition {
+            self.view_stack.complete_compositor_transition(transition);
         }
         Ok(())
     }
@@ -525,9 +575,14 @@ impl App {
     }
 
     fn composed_scene_with_bells(&mut self, bell_count: usize) -> Result<Scene> {
+        let parser_synchronization_open = self.view_stack.presented_holds_synchronized_output();
+        let application_synchronization_held = parser_synchronization_open
+            && self
+                .output_scheduler
+                .as_ref()
+                .is_none_or(|scheduler| !scheduler.application_synchronization_is_ignored());
         let application_model = if self.view_stack.has_overlay()
-            || (self.view_stack.compositor_transition_pending()
-                && self.view_stack.presented_holds_synchronized_output())
+            || (self.view_stack.compositor_transition_pending() && application_synchronization_held)
         {
             ApplicationPresentationModel::Committed
         } else {
@@ -691,7 +746,7 @@ impl App {
     }
 
     pub(super) fn accessibility_announcement_ready(&mut self) -> bool {
-        self.pending_tmux_presentation_batch.is_none()
+        self.pending_presentation_batch.is_none()
             && self.logical_accessibility_view_is_presented()
             && self
                 .output_scheduler
@@ -722,10 +777,8 @@ impl App {
             if let Some(title) = &title {
                 sr.speak(title, false)?;
             }
-            let contents = view.contents_full();
-            if !contents.trim().is_empty() {
-                sr.speak(&contents, false)?;
-            }
+            speak_application_cursor_line(sr, view)?;
+            view.complete_accessibility_screen_transition();
             view.finalize_changes(now_ms);
             Ok(())
         })
@@ -749,21 +802,37 @@ impl App {
             self.view_stack.active_mut().model()
         };
         view.with_live_screen(|view| -> Result<()> {
-            let mut read_text = sr.resolve_pending_delete(view)?;
-            let auto_read_text = if sr.auto_read_enabled() {
-                if recent_input {
-                    sr.auto_read_after_input(view)?
-                } else {
-                    sr.auto_read(view)?
-                }
+            let screen_transition = view.prev_screen().screen != view.screen().screen
+                || view.accessibility_screen_transition_pending();
+            let screen_transition_stable =
+                screen_transition && view.screen().has_visible_non_whitespace_content();
+            if screen_transition {
+                // Primary and alternate screens are separate accessibility
+                // contexts. Read the new cursor row and let finalization below
+                // establish it as the next auto-read diff baseline.
+                speak_application_cursor_line(sr, view)?;
             } else {
-                false
-            };
-            read_text |= auto_read_text;
-            if recent_input && !read_text {
-                sr.track_cursor(view)?;
+                let mut read_text = sr.resolve_pending_delete(view)?;
+                let auto_read_text = if sr.auto_read_enabled() {
+                    if recent_input {
+                        sr.auto_read_after_input(view)?
+                    } else {
+                        sr.auto_read(view)?
+                    }
+                } else {
+                    false
+                };
+                read_text |= auto_read_text;
+                if recent_input && !read_text {
+                    sr.track_cursor(view)?;
+                }
             }
             synchronize_pending_review_cursor(sr, view)?;
+            if screen_transition_stable {
+                view.complete_accessibility_screen_transition();
+            } else if screen_transition {
+                view.defer_accessibility_screen_transition();
+            }
             sr.hook_on_screen_update(view, overlay_active)?;
             view.finalize_changes(now_ms);
             Ok(())

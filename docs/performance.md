@@ -26,20 +26,42 @@ after the physical output flush succeeds.
   [speech protocol](speech-driver-protocol.md) for restart and shutdown policy.
 - The output scheduler has no intentional visual delay. One PTY readiness turn
   already drains and coalesces immediately ready data up to its 32 KiB or 4 ms
-  fairness bound, then the newest scene is eligible at once.
+  fairness bound. Every read mutates the terminal model and emits replies in
+  order, while scene damage is accumulated without composing intermediate
+  frames. The authoritative root or tmux scene is captured once at the drain
+  boundary and is then eligible at once.
 - An unstarted queued render is replaceable against the still-confirmed
   physical scene. Only a render whose bytes have started, or whose receipt is
   waiting for flush, invalidates incremental rendering for its successor.
-- Ordinary accessibility diffs retain the 30 ms quiet-window debounce and
-  300 ms maximum delay. A DEC 2026 transaction is different: no working frame
-  is presented or read, and an exact close-at-end marker is carried with its
-  render receipt. The final frame can be read immediately after that receipt's
-  successful flush. Output after the close clears the marker and uses ordinary
-  stabilization.
+- Accessibility stabilization is boundary-first. A DEC 2026 close is carried
+  with its exact render receipt and becomes readable immediately after that
+  receipt flushes. An OSC 133 prompt-start marker holds prompt auto-read until
+  its `B` input boundary, which is another immediate semantic commit. After
+  recent user input, an update ending in a real hidden-to-visible cursor
+  transition is a conservative legacy redraw hint. Output after any boundary
+  uses ordinary stabilization again.
+- On the primary screen, a structurally safe print stream ending in LF or CRLF
+  is another real boundary. After the matching physical receipt, Lector checks
+  the completed logical record against the presented screen/history tail and
+  reads that record without a quiet-window delay. The record journal preserves
+  application newlines across physical wrapping and scrolling; a trailing
+  fragment, cursor-addressed redraw, standalone carriage return, parser
+  continuation, alternate screen, or missing journal range falls back to the
+  screen model and stabilization policy. This is output-driven and has no
+  Enter-key heuristic.
+- Truly unmarked output uses a per-view adaptive quiet window. It starts at 30
+  ms, is bounded between 8 and 60 ms, decreases only after repeated clean
+  bursts, and increases immediately when a continuation arrives shortly after
+  an ordinary finalization without intervening input. The 300 ms maximum delay
+  remains the progressive-reading boundary for continuously changing output.
 
-These rules apply equally to a direct child terminal, an ordinary attached tmux
-client, and a tmux `-CC` control client. Control mode adds parsing and
-`send-keys -H` routing, but no timer-based delay.
+Direct mode and tmux `-CC` both retain the application's byte provenance, so
+they share the complete-record path. An ordinary attached tmux client exposes
+tmux's rendered VT stream instead; an inner application's newline or
+alternate-screen boundary may be opaque there. Lector applies the same safety
+classifier to the stream it can observe, but otherwise relies on tmux's outer
+DEC 2026 transaction, cursor restoration, or the bounded quiet fallback.
+Control mode adds parsing and `send-keys -H` routing, but no timer-based delay.
 
 ## Regression and latency gates
 
@@ -59,6 +81,24 @@ The 2026-08-19 local macOS run measured:
 
 The small control-mode delta supports treating tmux parsing and routing as
 normal processing cost, not as the earlier timer-shaped latency source.
+
+The release benchmark separately exercises the production compositor with one
+update per drain, with four modeled reads per drain, and with one LF per receipt
+after pre-filling the full 10,000-row history window. It counts allocations and
+bytes as well as latency, output size, throughput, and completed physical
+receipts. The at-cap workload makes a return to O(total history) receipt copies
+fail by hundreds of times rather than hiding behind growth from an empty
+window. Scheduler coalescing and backpressure workloads fence their allocator
+counters around scheduler calls, excluding synthetic batch construction, and
+have their own scheduler-owned allocation and retained-byte ceilings. These
+gates catch both a return to per-read scene composition and a subtler regression
+which keeps cumulative accessibility metadata behind a blocked physical writer.
+
+```sh
+cargo run --locked --release --features ghostty-vt \
+  --bin lector-ghostty-bench -- \
+  --check-baseline benchmarks/ghostty-release-baseline-macos-aarch64.json
+```
 
 The deterministic Neovim-style regression in `tests/app.rs` opens DEC 2026,
 replaces several transient full-screen draws, blocks the final physical flush,

@@ -701,6 +701,108 @@ fn scheduled_active_tmux_pane_finalization_wakes_once_without_spinning() {
 }
 
 #[test]
+fn synchronized_timeout_recovers_a_visible_nonactive_pane_after_overlay_pop() {
+    let (mut app, mut sr, _recorder, clock, mut physical) = ready_app_with_clock(true);
+    app.drain_scheduled_output(&mut physical, true)
+        .expect("present the bootstrapped tmux scene");
+    let mut control = Vec::new();
+    app.handle_tick(&mut sr, &mut control, &mut physical)
+        .expect("finish the deferred bootstrap announcement");
+    physical.clear();
+
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(21, b"\x1b[?2026h\x1b[2J\x1b[HLIVE"),
+        &mut physical,
+    )
+    .expect("open a synchronized draw in the visible non-active pane");
+    app.show_message(&mut sr, "Notice", "OVERLAY", &mut physical)
+        .expect("replace the held working render with an overlay");
+    app.drain_scheduled_output(&mut physical, false)
+        .expect("present the overlay");
+    let overlay = app
+        .presented_scene()
+        .clone()
+        .into_terminal_snapshot()
+        .contents_full();
+    assert!(overlay.contains("Press Ente"), "{overlay:?}");
+    physical.clear();
+
+    let mut pty_out = Vec::new();
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut physical)
+        .expect("dismiss the overlay before the application timeout");
+    app.drain_scheduled_output(&mut physical, false)
+        .expect("present the committed tmux underlay");
+    let committed = app
+        .presented_scene()
+        .clone()
+        .into_terminal_snapshot()
+        .contents_full();
+    assert!(!committed.contains("LIVE"), "{committed:?}");
+    physical.clear();
+
+    clock.advance(100);
+    let timeout = app
+        .drain_scheduled_output(&mut physical, false)
+        .expect("time out the non-active pane transaction");
+    assert!(timeout.synchronization_timed_out);
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        Some(Duration::ZERO),
+        "timeout recovery must not depend on the active pane's revision"
+    );
+    app.drain_scheduled_output(&mut physical, false)
+        .expect("publish the authoritative live multi-pane scene");
+    let released = app
+        .presented_scene()
+        .clone()
+        .into_terminal_snapshot()
+        .contents_full();
+    assert!(released.contains("LIVE"), "{released:?}");
+    assert!(!released.contains("Press Ente"), "{released:?}");
+    assert!(pty_out.is_empty());
+}
+
+#[test]
+fn complete_control_mode_pane_line_finalizes_at_its_receipt() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = ready_app_with_clock(true);
+    app.drain_scheduled_output(&mut physical, true)
+        .expect("present the bootstrapped tmux scene");
+    let mut control = Vec::new();
+    app.handle_tick(&mut sr, &mut control, &mut physical)
+        .expect("finish the deferred bootstrap announcement");
+    recorder.0.borrow_mut().clear();
+    physical.clear();
+
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(20, b"\n\nwrapped\r\n"),
+        &mut physical,
+    )
+    .expect("queue LF-complete active-pane output");
+    assert!(
+        !app.maybe_finalize_changes(&mut sr).unwrap(),
+        "unpresented control-mode output reached accessibility"
+    );
+
+    let report = app
+        .drain_scheduled_output(&mut physical, false)
+        .expect("present LF-complete pane output");
+    assert_eq!(report.completed_renders.len(), 1);
+    assert_eq!(app.scheduled_output_timeout(), Some(Duration::ZERO));
+    assert!(
+        app.maybe_finalize_changes(&mut sr).unwrap(),
+        "the presented logical record retained the quiet-window delay"
+    );
+    assert!(
+        recorder.0.borrow().iter().any(|text| text == "wrapped"),
+        "control-mode line was not auto-read: {:?}",
+        recorder.0.borrow()
+    );
+    assert_eq!(app.scheduled_output_timeout(), None);
+}
+
+#[test]
 fn pty_presentation_batch_models_visible_output_before_finishing_render() {
     let (mut app, mut sr, _recorder, _initial_physical) = ready_app(false);
     let before = app
@@ -734,8 +836,7 @@ fn pty_presentation_batch_models_visible_output_before_finishing_render() {
     assert!(physical.bytes.is_empty());
     assert_eq!(physical.flushes, 0);
 
-    app.finish_pty_presentation_batch(&mut sr, &mut physical)
-        .unwrap();
+    app.finish_pty_presentation_batch(&mut physical).unwrap();
     assert!(!physical.bytes.is_empty());
     assert_eq!(physical.flushes, 1);
     assert!(
@@ -773,14 +874,13 @@ fn pty_presentation_batch_coalesces_same_pane_records_into_one_final_render() {
     assert!(
         app.debug_tmux_pane_contents(1, 20)
             .unwrap()
-            .contains("FIRST"),
-        "the adjacent tail should wait for the PTY-drain boundary"
+            .contains("FINAL"),
+        "the second read must mutate the pane before handle_pty returns"
     );
     assert!(physical.bytes.is_empty());
     assert_eq!(physical.flushes, 0);
 
-    app.finish_pty_presentation_batch(&mut sr, &mut physical)
-        .unwrap();
+    app.finish_pty_presentation_batch(&mut physical).unwrap();
     assert_eq!(
         physical.flushes, 1,
         "same-pane records rendered more than once"
@@ -795,7 +895,39 @@ fn pty_presentation_batch_coalesces_same_pane_records_into_one_final_render() {
 }
 
 #[test]
-fn pty_presentation_batch_advances_ghostty_twice_for_a_fragmented_same_pane_burst() {
+fn pty_presentation_batch_composes_multiple_visible_panes_once() {
+    let (mut app, mut sr, _recorder, _initial_physical) = ready_app(false);
+    let mut physical = PresentationOutput::default();
+
+    app.begin_pty_presentation_batch();
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(20, b"\x1b[1;1H\x1b[2KL20"),
+        &mut physical,
+    )
+    .expect("model left pane");
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(21, b"\x1b[1;1H\x1b[2KR21"),
+        &mut physical,
+    )
+    .expect("model right pane");
+    assert!(physical.bytes.is_empty());
+
+    app.finish_pty_presentation_batch(&mut physical)
+        .expect("compose both visible panes");
+    let presented = app
+        .presented_scene()
+        .clone()
+        .into_terminal_snapshot()
+        .contents_full();
+    assert!(presented.contains("L20"), "presented={presented:?}");
+    assert!(presented.contains("R21"), "presented={presented:?}");
+    assert_eq!(physical.flushes, 1);
+}
+
+#[test]
+fn fragmented_tmux_reads_mutate_the_pane_immediately_but_render_once() {
     const RECORDS: usize = 512;
     let (mut app, mut sr, _recorder, _initial_physical) = ready_app(false);
     let mut physical = PresentationOutput::default();
@@ -809,19 +941,23 @@ fn pty_presentation_batch_advances_ghostty_twice_for_a_fragmented_same_pane_burs
             &mut physical,
         )
         .unwrap();
+        assert_eq!(
+            app.debug_tmux_pane_pending_update_batch_count(1, 20),
+            Some(index + 1),
+            "read {index} was still pending after handle_pty returned"
+        );
     }
 
     assert_eq!(
         app.debug_tmux_pane_pending_update_batch_count(1, 20),
-        Some(1),
-        "adjacent tmux records reached Ghostty before the drain boundary"
+        Some(RECORDS),
+        "a fragmented read remained outside the terminal model"
     );
-    app.finish_pty_presentation_batch(&mut sr, &mut physical)
-        .unwrap();
+    app.finish_pty_presentation_batch(&mut physical).unwrap();
     assert_eq!(
         app.debug_tmux_pane_pending_update_batch_count(1, 20),
-        Some(2),
-        "a fragmented same-pane burst should require only the immediate and coalesced advances"
+        Some(RECORDS),
+        "finishing presentation unexpectedly mutated the pane model"
     );
     let contents = app.debug_tmux_pane_contents(1, 20).unwrap();
     let compact = contents
@@ -829,6 +965,40 @@ fn pty_presentation_batch_advances_ghostty_twice_for_a_fragmented_same_pane_burs
         .filter(|character| !character.is_whitespace())
         .collect::<String>();
     assert!(compact.contains("record-511"), "contents={contents:?}");
+    assert_eq!(physical.flushes, 1);
+}
+
+#[test]
+fn adjacent_tmux_records_from_one_read_are_coalesced_before_modeling() {
+    const RECORDS: usize = 128;
+    let (mut app, mut sr, _recorder, _initial_physical) = ready_app(false);
+    let mut physical = PresentationOutput::default();
+    let mut transport = Vec::new();
+    for index in 0..RECORDS {
+        transport.extend(pane_output_record(
+            20,
+            format!("\r\x1b[2Krecord-{index:03}").as_bytes(),
+        ));
+    }
+
+    app.begin_pty_presentation_batch();
+    app.handle_pty(&mut sr, &transport, &mut physical)
+        .expect("process one read containing adjacent tmux records");
+    assert_eq!(
+        app.debug_tmux_pane_pending_update_batch_count(1, 20),
+        Some(1),
+        "one adjacent same-pane run should reach Ghostty as one parser batch"
+    );
+    let contents = app.debug_tmux_pane_contents(1, 20).unwrap();
+    let compact = contents
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(compact.contains("record-127"), "contents={contents:?}");
+    assert!(physical.bytes.is_empty());
+
+    app.finish_pty_presentation_batch(&mut physical)
+        .expect("present coalesced tmux read");
     assert_eq!(physical.flushes, 1);
 }
 
@@ -852,8 +1022,7 @@ fn canceling_pty_presentation_batch_cannot_leave_a_stale_deferred_render() {
     );
     app.cancel_pty_presentation_batch();
     app.cancel_pty_presentation_batch();
-    app.finish_pty_presentation_batch(&mut sr, &mut physical)
-        .unwrap();
+    app.finish_pty_presentation_batch(&mut physical).unwrap();
     assert!(physical.bytes.is_empty());
     assert_eq!(physical.flushes, 0);
     assert_eq!(app.presented_scene(), &before);
@@ -865,8 +1034,7 @@ fn canceling_pty_presentation_batch_cannot_leave_a_stale_deferred_render() {
         &mut physical,
     )
     .unwrap();
-    app.finish_pty_presentation_batch(&mut sr, &mut physical)
-        .unwrap();
+    app.finish_pty_presentation_batch(&mut physical).unwrap();
     assert_eq!(physical.flushes, 1);
     let presented = app
         .presented_scene()
@@ -1096,6 +1264,34 @@ fn pane_default_colour_queries_use_the_control_client_report_channel() {
 }
 
 #[test]
+fn coalesced_pane_runs_preserve_reply_order_across_a_control_fence() {
+    let (mut app, mut sr, _recorder, mut physical) = ready_app(false);
+    let mut transport = pane_output_record(20, b"L20\x1b]10;?\x1b\\");
+    transport.extend_from_slice(b"%window-renamed @10 renamed-in-place\n");
+    transport.extend_from_slice(&pane_output_record(21, b"R21\x1b]11;?\x1b\\"));
+
+    app.handle_pty(&mut sr, &transport, &mut physical)
+        .expect("process pane runs separated by a control notification");
+
+    assert!(
+        app.debug_tmux_pane_contents(1, 20)
+            .expect("left pane")
+            .contains("L20")
+    );
+    assert!(
+        app.debug_tmux_pane_contents(1, 21)
+            .expect("right pane")
+            .contains("R21")
+    );
+    assert_eq!(
+        drain(&mut app, &mut sr, &mut physical),
+        b"refresh-client -r '%20:\x1b]10;rgb:ffff/ffff/ffff\x1b\\'\n\
+          refresh-client -r '%21:\x1b]11;rgb:0000/0000/0000\x1b\\'\n",
+        "the control fence or pane change reordered generated replies"
+    );
+}
+
+#[test]
 fn bounded_foreground_bursts_do_not_pause_and_input_runs_between_turns() {
     let (mut app, mut sr, _recorder, mut physical) = ready_app(false);
     let mut first_turn = vec![b'x'; 24 * 1024];
@@ -1104,7 +1300,7 @@ fn bounded_foreground_bursts_do_not_pause_and_input_runs_between_turns() {
     app.begin_pty_presentation_batch();
     app.handle_pty(&mut sr, &pane_output_record(20, &first_turn), &mut physical)
         .expect("process one bounded foreground-output turn");
-    app.finish_pty_presentation_batch(&mut sr, &mut physical)
+    app.finish_pty_presentation_batch(&mut physical)
         .expect("present the final foreground state");
 
     let contents = app.debug_tmux_pane_contents(1, 20).unwrap();
@@ -1138,7 +1334,7 @@ fn bounded_foreground_bursts_do_not_pause_and_input_runs_between_turns() {
         &mut physical,
     )
     .expect("process the next bounded foreground-output turn");
-    app.finish_pty_presentation_batch(&mut sr, &mut physical)
+    app.finish_pty_presentation_batch(&mut physical)
         .expect("present the second foreground state");
     let contents = app.debug_tmux_pane_contents(1, 20).unwrap();
     let compact = contents

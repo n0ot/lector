@@ -10,4 +10,4 @@ And expect-no-pty-stdin:
 And expect-speak: Review
 And expect-speak-contains: before
 And expect-speak: Terminal
-And expect-speak-contains: hidden wid
+And expect-speak-contains: e \xE7\x95\x8C

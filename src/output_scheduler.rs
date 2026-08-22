@@ -73,9 +73,10 @@ pub struct DrainReport {
     pub blocked: bool,
     pub write_budget_exhausted: bool,
     pub synchronization_timed_out: bool,
-    /// A compositor-owned render crossed an application's synchronized-output
-    /// hold and has now been physically flushed.
-    pub application_synchronization_bypass_completed: bool,
+    /// The exact compositor-owned render generation which crossed an
+    /// application's synchronized-output hold and has now been physically
+    /// flushed.
+    pub application_synchronization_bypass_completed: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +88,11 @@ struct PendingBytes {
 #[derive(Clone, Debug)]
 struct PendingRender {
     batch: RenderBatch,
+    /// Retained-byte upper bound computed once at enqueue time. Production
+    /// batches are exact; a manually embedded DEC 2026 marker is conservatively
+    /// counted even though activation strips it. Pending capacity checks are
+    /// frequent under backpressure, so they never rescan every transaction.
+    byte_len: usize,
     generation: u64,
     accessibility: PresentedAccessibilityBundle,
 }
@@ -283,10 +289,10 @@ impl OutputScheduler {
         else {
             return EnqueueOutcome::DroppedForCapacity;
         };
-        let replaceable_pending_bytes = self.pending_render.as_ref().map_or(0, |render| {
-            render_batch_byte_len(&render.batch, self.synchronized_output_supported)
-                .unwrap_or(usize::MAX)
-        });
+        let replaceable_pending_bytes = self
+            .pending_render
+            .as_ref()
+            .map_or(0, |render| render.byte_len);
         let replaceable_active_index = self.active.iter().position(|transaction| {
             transaction.kind == ActiveTransactionKind::Render && transaction.offset == 0
         });
@@ -350,6 +356,7 @@ impl OutputScheduler {
         self.note_pending(now_ms);
         self.pending_render = Some(PendingRender {
             batch,
+            byte_len: render_bytes,
             generation,
             accessibility,
         });
@@ -401,6 +408,18 @@ impl OutputScheduler {
     }
 
     pub fn set_synchronized_output_supported(&mut self, supported: bool) {
+        if supported != self.synchronized_output_supported
+            && let Some(render) = &mut self.pending_render
+        {
+            let wrapper_bytes = SYNCHRONIZED_OUTPUT_START
+                .len()
+                .saturating_add(SYNCHRONIZED_OUTPUT_END.len());
+            render.byte_len = if supported {
+                render.byte_len.saturating_add(wrapper_bytes)
+            } else {
+                render.byte_len.saturating_sub(wrapper_bytes)
+            };
+        }
         self.synchronized_output_supported = supported;
     }
 
@@ -557,10 +576,10 @@ impl OutputScheduler {
             .iter()
             .map(|transaction| transaction.bytes.len())
             .sum::<usize>();
-        let render = self.pending_render.as_ref().map_or(0, |render| {
-            render_batch_byte_len(&render.batch, self.synchronized_output_supported)
-                .unwrap_or(usize::MAX)
-        });
+        let render = self
+            .pending_render
+            .as_ref()
+            .map_or(0, |render| render.byte_len);
         let effects = self
             .pending_effects
             .iter()
@@ -660,6 +679,23 @@ impl OutputScheduler {
             self.application_synchronization,
             Some(ApplicationSynchronization::Active { .. })
         )
+    }
+
+    /// Whether the current still-open application transaction has already
+    /// crossed the fail-open timeout. Compositor transitions may present the
+    /// live model in this state, but a later real close still ends the epoch.
+    pub(crate) const fn application_synchronization_is_ignored(&self) -> bool {
+        matches!(
+            self.application_synchronization,
+            Some(ApplicationSynchronization::IgnoringUntilClose)
+        )
+    }
+
+    /// The render generation currently responsible for completing a
+    /// compositor bypass. Callers bind their own transition token to this
+    /// generation only after an enqueue succeeds.
+    pub(crate) const fn application_synchronization_bypass_generation(&self) -> Option<u64> {
+        self.application_synchronization_bypass_generation
     }
 
     pub fn drain_ready(
@@ -851,22 +887,43 @@ impl OutputScheduler {
             });
         }
         if let Some(render) = self.pending_render.take() {
-            let mut bytes = Vec::new();
-            if self.synchronized_output_supported {
-                bytes.extend_from_slice(SYNCHRONIZED_OUTPUT_START);
-            }
-            for transaction in render.batch.transactions {
-                append_without_synchronization_markers(&mut bytes, &transaction.bytes);
-            }
-            if self.synchronized_output_supported {
-                bytes.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
-            }
+            let RenderBatch {
+                mut transactions,
+                predicted,
+            } = render.batch;
+            let bytes = if !self.synchronized_output_supported && transactions.len() == 1 {
+                let transaction = transactions
+                    .pop()
+                    .expect("a one-transaction render has one transaction");
+                if contains_synchronization_marker(&transaction.bytes) {
+                    let mut bytes = Vec::with_capacity(render.byte_len);
+                    append_without_synchronization_markers(&mut bytes, &transaction.bytes);
+                    bytes
+                } else {
+                    // Scheduled production rendering disables inline DEC 2026
+                    // wrappers. Move its usual single transaction directly
+                    // instead of allocating and copying the complete frame.
+                    transaction.bytes
+                }
+            } else {
+                let mut bytes = Vec::with_capacity(render.byte_len);
+                if self.synchronized_output_supported {
+                    bytes.extend_from_slice(SYNCHRONIZED_OUTPUT_START);
+                }
+                for transaction in transactions {
+                    append_without_synchronization_markers(&mut bytes, &transaction.bytes);
+                }
+                if self.synchronized_output_supported {
+                    bytes.extend_from_slice(SYNCHRONIZED_OUTPUT_END);
+                }
+                bytes
+            };
             self.active.push_back(ActiveTransaction {
                 kind: ActiveTransactionKind::Render,
                 bytes,
                 offset: 0,
                 completed_render: Some(TrackedRender {
-                    predicted: render.batch.predicted,
+                    predicted,
                     generation: render.generation,
                     accessibility: render.accessibility,
                 }),
@@ -945,7 +1002,7 @@ impl OutputScheduler {
             }
             if completes_synchronization_bypass {
                 self.application_synchronization_bypass_generation = None;
-                report.application_synchronization_bypass_completed = true;
+                report.application_synchronization_bypass_completed = Some(render.generation);
             }
         }
         report
@@ -1096,17 +1153,30 @@ fn truncate_string(value: &mut String, maximum: usize) {
     value.truncate(boundary);
 }
 
+fn contains_synchronization_marker(source: &[u8]) -> bool {
+    source
+        .windows(SYNCHRONIZED_OUTPUT_START.len())
+        .any(|bytes| bytes == SYNCHRONIZED_OUTPUT_START || bytes == SYNCHRONIZED_OUTPUT_END)
+}
+
 fn append_without_synchronization_markers(target: &mut Vec<u8>, source: &[u8]) {
     let mut offset = 0;
     while offset < source.len() {
-        let remaining = &source[offset..];
+        let Some(relative_escape) = source[offset..].iter().position(|byte| *byte == b'\x1b')
+        else {
+            target.extend_from_slice(&source[offset..]);
+            break;
+        };
+        let escape = offset.saturating_add(relative_escape);
+        target.extend_from_slice(&source[offset..escape]);
+        let remaining = &source[escape..];
         if remaining.starts_with(SYNCHRONIZED_OUTPUT_START) {
-            offset += SYNCHRONIZED_OUTPUT_START.len();
+            offset = escape.saturating_add(SYNCHRONIZED_OUTPUT_START.len());
         } else if remaining.starts_with(SYNCHRONIZED_OUTPUT_END) {
-            offset += SYNCHRONIZED_OUTPUT_END.len();
+            offset = escape.saturating_add(SYNCHRONIZED_OUTPUT_END.len());
         } else {
-            target.push(source[offset]);
-            offset += 1;
+            target.push(source[escape]);
+            offset = escape.saturating_add(1);
         }
     }
 }

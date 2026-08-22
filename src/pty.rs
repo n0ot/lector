@@ -1,3 +1,6 @@
+use crate::host_command::{
+    BoundedOutput, HOST_TOOL_STDOUT_LIMIT, read_bounded_file, run_bounded_output,
+};
 use crate::terminal::TerminalGeometry;
 use anyhow::{Context, Result, anyhow};
 use nix::errno::Errno;
@@ -9,28 +12,115 @@ use nix::unistd::{Pid, dup};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::fs::File;
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
-use std::path::Path;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const CHILD_TERMINATION_REAP_TIMEOUT: Duration = Duration::from_millis(250);
 const CHILD_TERMINATION_REAP_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const VIRTUAL_TERM: &str = "xterm-256color";
+const SYNC_TERMINFO_CAPABILITY: &str = "\tSync=\\E[?2026%?%p1%{1}%-%tl%eh%;,\n";
+const COMPILED_SYNC_NAME: &[u8] = b"Sync\0";
+const COMPILED_SYNC_VALUE: &[u8] = b"\x1b[?2026%?%p1%{1}%-%tl%eh%;\0";
+const SYNC_TERMINFO_CACHE_VERSION: &str = "sync-v3";
+const SYNC_TERMINFO_MARKER: &str = "lector-xterm-256color-sync-v3\n";
+const BUNDLED_SYNC_TERMINFO: &[u8] = include_bytes!("../assets/terminfo/xterm-256color-sync.b64");
+const TERMINFO_CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const TERMINFO_CACHE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const UNIQUE_DIRECTORY_ATTEMPTS: usize = 128;
+
+static NEXT_TERMINFO_DIRECTORY_ID: AtomicU64 = AtomicU64::new(1);
+static TERMINFO_CACHE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
+static TERMINFO_CACHE_COMPONENT: OnceLock<String> = OnceLock::new();
+static DECODED_BUNDLED_SYNC_TERMINFO: OnceLock<Vec<u8>> = OnceLock::new();
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TerminfoDirectory {
+    Persistent(PathBuf),
+    Temporary(Arc<TemporaryDirectory>),
+}
+
+impl TerminfoDirectory {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Persistent(path) => path,
+            Self::Temporary(directory) => &directory.path,
+        }
+    }
+
+    fn temporary_owner(&self) -> Option<Arc<TemporaryDirectory>> {
+        match self {
+            Self::Persistent(_) => None,
+            Self::Temporary(directory) => Some(Arc::clone(directory)),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TemporaryDirectory {
+    path: PathBuf,
+}
+
+impl TemporaryDirectory {
+    fn create(parent: &Path, prefix: &str) -> io::Result<Self> {
+        std::fs::create_dir_all(parent)?;
+        for _ in 0..UNIQUE_DIRECTORY_ATTEMPTS {
+            let id = NEXT_TERMINFO_DIRECTORY_ID.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!("{prefix}-{}-{id}", std::process::id()));
+            match private_directory_builder().create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            ErrorKind::AlreadyExists,
+            "could not reserve a unique terminfo directory",
+        ))
+    }
+}
+
+impl Drop for TemporaryDirectory {
+    fn drop(&mut self) {
+        let _ = remove_path(&self.path);
+    }
+}
+
+struct TerminfoCacheLock {
+    _process: MutexGuard<'static, ()>,
+    file: File,
+}
+
+impl Drop for TerminfoCacheLock {
+    fn drop(&mut self) {
+        // SAFETY: `file` remains open for this call and is owned by the guard.
+        let _ = unsafe { nix::libc::flock(self.file.as_raw_fd(), nix::libc::LOCK_UN) };
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VirtualTerminalEnvironment {
     pub term: String,
+    terminfo: Option<TerminfoDirectory>,
 }
 
 impl VirtualTerminalEnvironment {
     pub fn apply(&self, command: &mut CommandBuilder) {
         command.env("TERM", &self.term);
-        // A nested Lector can inherit its parent's application-facing
-        // TERMINFO. That private database must not be paired with the public
-        // compatibility identity.
-        command.env_remove("TERMINFO");
+        if let Some(terminfo) = &self.terminfo {
+            command.env("TERMINFO", terminfo.path());
+        } else {
+            command.env_remove("TERMINFO");
+        }
+        command.env("TERM_PROGRAM", "Lector");
+        command.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
         // COLORTERM is deliberately untouched: callers preserve it only when
         // the selected virtual profile implements the advertised color mode.
     }
@@ -42,13 +132,401 @@ impl VirtualTerminalEnvironment {
 #[must_use]
 pub fn compatible_terminal_environment() -> VirtualTerminalEnvironment {
     VirtualTerminalEnvironment {
-        term: "xterm-256color".to_owned(),
+        term: VIRTUAL_TERM.to_owned(),
+        terminfo: synchronized_output_terminfo().ok(),
+    }
+}
+
+fn synchronized_output_terminfo() -> io::Result<TerminfoDirectory> {
+    let cache = dirs::cache_dir().map(|cache| {
+        cache
+            .join("lector")
+            .join("terminfo")
+            .join(terminfo_cache_component())
+    });
+    match cache {
+        Some(cache) => synchronized_output_terminfo_with_cache(&cache),
+        None => temporary_synchronized_output_terminfo(),
+    }
+}
+
+fn synchronized_output_terminfo_with_cache(cache: &Path) -> io::Result<TerminfoDirectory> {
+    finish_terminfo_installation(install_synchronized_output_terminfo_with(cache, true))
+}
+
+#[cfg(test)]
+fn synchronized_output_terminfo_with_cache_options(
+    cache: &Path,
+    use_host_tools: bool,
+    lock_timeout: Duration,
+) -> io::Result<TerminfoDirectory> {
+    finish_terminfo_installation(install_synchronized_output_terminfo_with_timeout(
+        cache,
+        use_host_tools,
+        lock_timeout,
+    ))
+}
+
+fn finish_terminfo_installation(installed: io::Result<PathBuf>) -> io::Result<TerminfoDirectory> {
+    match installed {
+        Ok(path) => Ok(TerminfoDirectory::Persistent(path)),
+        Err(cache_error) => temporary_synchronized_output_terminfo().map_err(|temporary_error| {
+            io::Error::other(format!(
+                "private terminfo cache failed ({cache_error}); temporary fallback failed ({temporary_error})"
+            ))
+        }),
+    }
+}
+
+fn temporary_synchronized_output_terminfo() -> io::Result<TerminfoDirectory> {
+    let prefix = format!("lector-terminfo-{}", terminfo_cache_component());
+    let directory = TemporaryDirectory::create(&std::env::temp_dir(), &prefix)?;
+    write_bundled_terminfo(&directory.path)?;
+    write_terminfo_marker(&directory.path)?;
+    if !installed_terminfo_ready(&directory.path) {
+        return Err(io::Error::other(
+            "temporary synchronized-output terminfo entry is incomplete",
+        ));
+    }
+    Ok(TerminfoDirectory::Temporary(Arc::new(directory)))
+}
+
+fn install_synchronized_output_terminfo_with(
+    cache: &Path,
+    use_host_tools: bool,
+) -> io::Result<PathBuf> {
+    install_synchronized_output_terminfo_with_timeout(
+        cache,
+        use_host_tools,
+        TERMINFO_CACHE_LOCK_TIMEOUT,
+    )
+}
+
+fn install_synchronized_output_terminfo_with_timeout(
+    cache: &Path,
+    use_host_tools: bool,
+    lock_timeout: Duration,
+) -> io::Result<PathBuf> {
+    let installed = cache.join("db");
+    if installed_terminfo_ready(&installed) {
+        return Ok(installed);
+    }
+
+    std::fs::create_dir_all(cache)?;
+    let _lock = acquire_terminfo_cache_lock(cache, lock_timeout)?;
+    if installed_terminfo_ready(&installed) {
+        return Ok(installed);
+    }
+    remove_stale_terminfo_staging_directories(cache)?;
+    remove_path(&installed)?;
+
+    let staging = TemporaryDirectory::create(cache, ".db")?;
+
+    let used_host_entry = use_host_tools && build_host_terminfo(&staging.path).is_ok();
+    if !used_host_entry {
+        reset_private_directory(&staging.path)?;
+        write_bundled_terminfo(&staging.path)?;
+    }
+    write_terminfo_marker(&staging.path)?;
+
+    match std::fs::rename(&staging.path, &installed) {
+        Ok(()) => {}
+        Err(_) if installed_terminfo_ready(&installed) => {
+            return Ok(installed);
+        }
+        Err(error) => return Err(error),
+    }
+    if installed_terminfo_ready(&installed) {
+        Ok(installed)
+    } else {
+        let _ = remove_path(&installed);
+        Err(io::Error::other(
+            "private synchronized-output terminfo entry is incomplete",
+        ))
+    }
+}
+
+fn acquire_terminfo_cache_lock(cache: &Path, timeout: Duration) -> io::Result<TerminfoCacheLock> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    let process = loop {
+        match TERMINFO_CACHE_PROCESS_LOCK.try_lock() {
+            Ok(lock) => break lock,
+            Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(TryLockError::WouldBlock) => wait_for_terminfo_cache_lock(deadline)?,
+        }
+    };
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(cache.join(".lock"))?;
+    loop {
+        // SAFETY: `file` is open and owned by this function. `LOCK_NB` keeps
+        // acquisition bounded; the resulting advisory lock is released by the
+        // returned guard.
+        let result =
+            unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(TerminfoCacheLock {
+                _process: process,
+                file,
+            });
+        }
+        let error = io::Error::last_os_error();
+        let blocked = error
+            .raw_os_error()
+            .is_some_and(|code| code == nix::libc::EWOULDBLOCK || code == nix::libc::EAGAIN);
+        if !blocked {
+            return Err(error);
+        }
+        wait_for_terminfo_cache_lock(deadline)?;
+    }
+}
+
+fn wait_for_terminfo_cache_lock(deadline: Instant) -> io::Result<()> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return Err(io::Error::new(
+            ErrorKind::TimedOut,
+            "private terminfo cache lock timed out",
+        ));
+    };
+    thread::sleep(remaining.min(TERMINFO_CACHE_LOCK_POLL_INTERVAL));
+    Ok(())
+}
+
+fn remove_stale_terminfo_staging_directories(cache: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(cache)? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(".db-"))
+        {
+            remove_path(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn private_directory_builder() -> DirBuilder {
+    let mut builder = DirBuilder::new();
+    builder.mode(0o700);
+    builder
+}
+
+fn reset_private_directory(path: &Path) -> io::Result<()> {
+    remove_path(path)?;
+    private_directory_builder().create(path)
+}
+
+fn write_terminfo_marker(directory: &Path) -> io::Result<()> {
+    std::fs::write(directory.join(".lector-sync"), SYNC_TERMINFO_MARKER)
+}
+
+fn terminfo_cache_component() -> &'static str {
+    TERMINFO_CACHE_COMPONENT.get_or_init(|| {
+        format!(
+            "{}-{SYNC_TERMINFO_CACHE_VERSION}-{}-{}-{}-{}-{:016x}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            target_abi(),
+            if cfg!(target_endian = "little") {
+                "little"
+            } else {
+                "big"
+            },
+            terminfo_content_digest()
+        )
+    })
+}
+
+fn target_abi() -> &'static str {
+    if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "gnu") {
+        "gnu"
+    } else {
+        "native"
+    }
+}
+
+fn terminfo_content_digest() -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET_BASIS;
+    for bytes in [
+        SYNC_TERMINFO_CACHE_VERSION.as_bytes(),
+        SYNC_TERMINFO_CAPABILITY.as_bytes(),
+        SYNC_TERMINFO_MARKER.as_bytes(),
+        BUNDLED_SYNC_TERMINFO,
+    ] {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= u64::from(b'|');
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+fn build_host_terminfo(staging: &Path) -> io::Result<()> {
+    let source_path = staging.join("lector-xterm-256color.ti");
+    let mut infocmp = Command::new("infocmp");
+    infocmp
+        .env_remove("TERMINFO")
+        .env_remove("TERMINFO_DIRS")
+        .args(["-x", VIRTUAL_TERM]);
+    let infocmp_output = run_bounded_output(&mut infocmp, staging, "infocmp")?;
+    if !infocmp_output.status.success() {
+        return Err(host_terminfo_tool_failure("infocmp", &infocmp_output));
+    }
+    let mut source = infocmp_output.stdout;
+    if !String::from_utf8_lossy(&source)
+        .lines()
+        .any(|line| line.trim_start().starts_with("Sync="))
+    {
+        source.extend_from_slice(SYNC_TERMINFO_CAPABILITY.as_bytes());
+    }
+    std::fs::write(&source_path, source)?;
+    let mut tic = Command::new("tic");
+    tic.env_remove("TERMINFO")
+        .env_remove("TERMINFO_DIRS")
+        .arg("-x")
+        .arg("-o")
+        .arg(staging)
+        .arg(&source_path);
+    let tic_output = run_bounded_output(&mut tic, staging, "tic")?;
+    if !tic_output.status.success() {
+        return Err(host_terminfo_tool_failure("tic", &tic_output));
+    }
+    let _ = std::fs::remove_file(&source_path);
+    if !compiled_terminfo_advertises_sync(staging) {
+        return Err(io::Error::other(
+            "host tic output does not advertise synchronized output",
+        ));
+    }
+    Ok(())
+}
+
+fn write_bundled_terminfo(staging: &Path) -> io::Result<()> {
+    let entry = decoded_bundled_sync_terminfo()?;
+    // ncurses installations use either the initial character or its two-digit
+    // hexadecimal value as the first directory component. Supplying both
+    // layouts makes the same private entry work on macOS, glibc Linux, and
+    // musl Linux without invoking tic on the target machine.
+    for directory in ["x", "78"] {
+        let directory = staging.join(directory);
+        std::fs::create_dir(&directory)?;
+        std::fs::write(directory.join(VIRTUAL_TERM), entry)?;
+    }
+    Ok(())
+}
+
+fn decoded_bundled_sync_terminfo() -> io::Result<&'static [u8]> {
+    if let Some(entry) = DECODED_BUNDLED_SYNC_TERMINFO.get() {
+        return Ok(entry);
+    }
+    let decoded = decode_base64(BUNDLED_SYNC_TERMINFO)?;
+    let _ = DECODED_BUNDLED_SYNC_TERMINFO.set(decoded);
+    Ok(DECODED_BUNDLED_SYNC_TERMINFO
+        .get()
+        .expect("decoded bundled terminfo was initialized"))
+}
+
+fn decode_base64(encoded: &[u8]) -> io::Result<Vec<u8>> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let digits = encoded
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .map(|byte| {
+            digit(byte).ok_or_else(|| {
+                io::Error::new(ErrorKind::InvalidData, "invalid bundled terminfo base64")
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if digits.len() % 4 == 1 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "truncated bundled terminfo base64",
+        ));
+    }
+
+    let mut decoded = Vec::with_capacity(digits.len().saturating_mul(3) / 4);
+    for chunk in digits.chunks(4) {
+        decoded.push((chunk[0] << 2) | (chunk[1] >> 4));
+        if let Some(third) = chunk.get(2) {
+            decoded.push((chunk[1] << 4) | (third >> 2));
+            if let Some(fourth) = chunk.get(3) {
+                decoded.push((third << 6) | fourth);
+            }
+        }
+    }
+    Ok(decoded)
+}
+
+fn installed_terminfo_ready(terminfo: &Path) -> bool {
+    std::fs::read_to_string(terminfo.join(".lector-sync"))
+        .is_ok_and(|marker| marker == SYNC_TERMINFO_MARKER)
+        && compiled_terminfo_advertises_sync(terminfo)
+}
+
+fn compiled_terminfo_advertises_sync(terminfo: &Path) -> bool {
+    ["x", "78"].iter().any(|directory| {
+        read_bounded_file(
+            &terminfo.join(directory).join(VIRTUAL_TERM),
+            HOST_TOOL_STDOUT_LIMIT,
+        )
+        .is_ok_and(|entry| {
+            entry
+                .windows(COMPILED_SYNC_NAME.len())
+                .any(|window| window == COMPILED_SYNC_NAME)
+                && entry
+                    .windows(COMPILED_SYNC_VALUE.len())
+                    .any(|window| window == COMPILED_SYNC_VALUE)
+        })
+    })
+}
+
+fn host_terminfo_tool_failure(name: &str, output: &BoundedOutput) -> io::Error {
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if detail.is_empty() {
+        io::Error::other(format!("{name} failed with {}", output.status))
+    } else {
+        io::Error::other(format!("{name} failed with {}: {detail}", output.status))
     }
 }
 
 pub struct Process {
     master: Box<dyn MasterPty + Send>,
     child: Option<Box<dyn Child + Send + Sync>>,
+    _temporary_terminfo: Option<Arc<TemporaryDirectory>>,
 }
 
 impl Process {
@@ -113,6 +591,9 @@ impl Process {
         let mut command = CommandBuilder::new(program);
         command.args(args);
         command.cwd(current_dir);
+        let temporary_terminfo = environment
+            .and_then(|environment| environment.terminfo.as_ref())
+            .and_then(TerminfoDirectory::temporary_owner);
         if let Some(environment) = environment {
             environment.apply(&mut command);
         }
@@ -125,6 +606,7 @@ impl Process {
         Ok(Self {
             master: pair.master,
             child: Some(child),
+            _temporary_terminfo: temporary_terminfo,
         })
     }
 
@@ -430,8 +912,12 @@ pub fn set_raw(fd: RawFd) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        PTY_WRITE_BUFFER_LIMIT, Process, PtyStream, compatible_terminal_environment, set_raw,
-        terminal_geometry, terminate_child,
+        PTY_WRITE_BUFFER_LIMIT, Process, PtyStream, TerminfoDirectory, VIRTUAL_TERM,
+        VirtualTerminalEnvironment, acquire_terminfo_cache_lock, compatible_terminal_environment,
+        compiled_terminfo_advertises_sync, install_synchronized_output_terminfo_with, set_raw,
+        synchronized_output_terminfo_with_cache, synchronized_output_terminfo_with_cache_options,
+        target_abi, terminal_geometry, terminate_child, terminfo_cache_component,
+        terminfo_content_digest,
     };
     use crate::terminal::TerminalGeometry;
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -445,9 +931,10 @@ mod tests {
     use std::os::fd::{AsRawFd, BorrowedFd};
     use std::path::Path;
     use std::sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, Barrier, Mutex, MutexGuard,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::thread;
     use std::time::{Duration, Instant};
 
     // macOS has a finite system PTY pool. These tests each hold a real PTY
@@ -542,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_environment_advertises_only_the_supported_xterm_contract() {
+    fn compatible_environment_keeps_the_public_xterm_identity() {
         let environment = compatible_terminal_environment();
         let mut command = CommandBuilder::new("/bin/sh");
         command.env("TERMINFO", "/stale/private/terminfo");
@@ -550,7 +1037,122 @@ mod tests {
         environment.apply(&mut command);
 
         assert_eq!(command.get_env("TERM"), Some(OsStr::new("xterm-256color")));
-        assert!(command.get_env("TERMINFO").is_none());
+        assert_eq!(
+            command.get_env("TERMINFO"),
+            environment
+                .terminfo
+                .as_ref()
+                .map(TerminfoDirectory::path)
+                .map(Path::as_os_str)
+        );
+        assert_eq!(command.get_env("TERM_PROGRAM"), Some(OsStr::new("Lector")));
+    }
+
+    #[test]
+    fn private_terminfo_overlay_advertises_synchronized_output() {
+        let cache = tempfile::tempdir().expect("create terminfo test cache");
+        let terminfo = install_synchronized_output_terminfo_with(cache.path(), true)
+            .expect("compile synchronized-output terminfo");
+        assert!(compiled_terminfo_advertises_sync(&terminfo));
+    }
+
+    #[test]
+    fn bundled_terminfo_needs_no_host_compiler_or_system_entry() {
+        let cache = tempfile::tempdir().expect("create bundled terminfo test cache");
+        let terminfo = install_synchronized_output_terminfo_with(cache.path(), false)
+            .expect("extract bundled synchronized-output terminfo");
+
+        assert!(terminfo.join("x/xterm-256color").is_file());
+        assert!(terminfo.join("78/xterm-256color").is_file());
+        assert!(compiled_terminfo_advertises_sync(&terminfo));
+    }
+
+    #[test]
+    fn terminfo_cache_key_names_the_target_and_embedded_content() {
+        let component = terminfo_cache_component();
+
+        assert!(component.contains(std::env::consts::OS));
+        assert!(component.contains(std::env::consts::ARCH));
+        assert!(component.contains(target_abi()));
+        assert!(component.ends_with(&format!("{:016x}", terminfo_content_digest())));
+    }
+
+    #[test]
+    fn concurrent_callers_repair_one_incomplete_cache_entry() {
+        let root = tempfile::tempdir().expect("create concurrent terminfo cache");
+        let cache = Arc::new(root.path().join("cache"));
+        let incomplete = cache.join("db");
+        std::fs::create_dir_all(incomplete.join("x")).expect("create incomplete cache entry");
+        std::fs::write(incomplete.join(".lector-sync"), super::SYNC_TERMINFO_MARKER)
+            .expect("write premature cache marker");
+        std::fs::write(incomplete.join("x/xterm-256color"), b"incomplete")
+            .expect("write incomplete terminfo entry");
+
+        let callers = 8;
+        let barrier = Arc::new(Barrier::new(callers));
+        let workers = (0..callers)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    install_synchronized_output_terminfo_with(&cache, false)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            let installed = worker
+                .join()
+                .expect("terminfo installer thread panicked")
+                .expect("concurrent terminfo installation failed");
+            assert_eq!(installed, cache.join("db"));
+            assert!(compiled_terminfo_advertises_sync(&installed));
+        }
+        assert!(
+            std::fs::read_dir(&*cache)
+                .expect("read repaired cache")
+                .all(|entry| !entry
+                    .expect("read cache entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".db-"))
+        );
+    }
+
+    #[test]
+    fn contended_cache_lock_falls_back_within_its_deadline() {
+        let root = tempfile::tempdir().expect("create contended terminfo cache");
+        let cache = root.path().join("cache");
+        std::fs::create_dir_all(&cache).expect("create cache directory");
+        let held = acquire_terminfo_cache_lock(&cache, Duration::from_millis(20))
+            .expect("hold cache lock");
+        let started = Instant::now();
+
+        let terminfo = synchronized_output_terminfo_with_cache_options(
+            &cache,
+            false,
+            Duration::from_millis(20),
+        )
+        .expect("fall back from a contended cache lock");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(&terminfo, TerminfoDirectory::Temporary(_)));
+        assert!(compiled_terminfo_advertises_sync(terminfo.path()));
+        drop(held);
+    }
+
+    #[test]
+    fn unusable_cache_uses_a_temporary_entry() {
+        let root = tempfile::tempdir().expect("create blocked terminfo cache");
+        let blocker = root.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block cache creation").expect("write cache blocker");
+
+        let terminfo = synchronized_output_terminfo_with_cache(&blocker.join("cache"))
+            .expect("fall back from unusable cache path");
+
+        assert!(matches!(&terminfo, TerminfoDirectory::Temporary(_)));
+        assert!(compiled_terminfo_advertises_sync(terminfo.path()));
     }
 
     #[test]
@@ -745,10 +1347,19 @@ mod tests {
     fn spawn_applies_the_compatible_terminal_environment_to_the_real_child() {
         let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
-        let environment = compatible_terminal_environment();
+        let cache = tempfile::tempdir().expect("create terminfo test cache");
+        let terminfo = install_synchronized_output_terminfo_with(cache.path(), true)
+            .expect("compile synchronized-output terminfo");
+        let environment = VirtualTerminalEnvironment {
+            term: VIRTUAL_TERM.to_owned(),
+            terminfo: Some(TerminfoDirectory::Persistent(terminfo)),
+        };
         let mut process = Process::spawn_with_geometry_and_environment(
             Path::new("/bin/sh"),
-            ["-c", "printf '%s|%s\\n' \"$TERM\" \"${TERMINFO-unset}\""],
+            [
+                "-c",
+                "printf '%s|%s|%s\\n' \"$TERM\" \"${TERMINFO:+set}\" \"$TERM_PROGRAM\"",
+            ],
             TerminalGeometry::new(5, 13, 8, 16),
             &attrs,
             Some(&environment),
@@ -760,8 +1371,51 @@ mod tests {
             .read_to_string(&mut output)
             .expect("read child environment");
 
-        assert!(output.contains("xterm-256color|unset"), "{output:?}");
+        assert!(output.contains("xterm-256color|set|Lector"), "{output:?}");
         assert!(process.wait().expect("wait for child").success());
+    }
+
+    #[test]
+    fn process_keeps_a_temporary_terminfo_entry_alive_for_its_child() {
+        let _guard = serialize_real_pty_test();
+        let attrs = terminal_attrs();
+        let root = tempfile::tempdir().expect("create blocked terminfo cache");
+        let blocker = root.path().join("not-a-directory");
+        std::fs::write(&blocker, b"block cache creation").expect("write cache blocker");
+        let terminfo = synchronized_output_terminfo_with_cache(&blocker.join("cache"))
+            .expect("create temporary terminfo fallback");
+        let temporary_path = terminfo.path().to_owned();
+        assert!(matches!(&terminfo, TerminfoDirectory::Temporary(_)));
+        let environment = VirtualTerminalEnvironment {
+            term: VIRTUAL_TERM.to_owned(),
+            terminfo: Some(terminfo),
+        };
+        let mut process = Process::spawn_with_geometry_and_environment(
+            Path::new("/bin/sh"),
+            [
+                "-c",
+                "read _; test -r \"$TERMINFO/x/xterm-256color\" && printf 'TERMINFO_ALIVE\\n'",
+            ],
+            TerminalGeometry::new(5, 13, 8, 16),
+            &attrs,
+            Some(&environment),
+        )
+        .expect("spawn child with temporary terminfo");
+        let mut stream = process.stream().expect("clone PTY stream");
+
+        drop(environment);
+        assert!(temporary_path.is_dir());
+        stream.write_all(b"continue\n").expect("release child");
+        let mut output = String::new();
+        stream
+            .read_to_string(&mut output)
+            .expect("read temporary terminfo check");
+
+        assert!(output.contains("TERMINFO_ALIVE"), "{output:?}");
+        assert!(process.wait().expect("wait for child").success());
+        assert!(temporary_path.is_dir());
+        drop(process);
+        assert!(!temporary_path.exists());
     }
 
     #[test]
