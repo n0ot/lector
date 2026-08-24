@@ -206,12 +206,15 @@ streaming-output cap.
 
 A cursor-addressed primary-screen repaint which hides the application cursor
 and newly populates multiple previously blank rows is treated as a bounded new
-interface or modal and that changed region is read in full. Once the interface
-is established, replacement-style redraws remain anchored to its cursor line.
-Cursor-addressed transcript growth above a prompt cursor instead uses the
-inserted-text diff, and prefix-preserving streaming extensions omit parallel
-status-row replacements. A visible application cursor otherwise stays
-authoritative for editable and search interfaces.
+interface or modal and that changed region is read in full. Cursor-addressed
+transcript growth above a prompt cursor uses the inserted-text diff, and
+prefix-preserving streaming extensions omit parallel status-row replacements.
+Other settled replacement-style redraws use the ordinary inserted-text diff:
+recent input or a stationary application cursor does not make changed text safe
+to discard. When the application cursor actually moves while only an unrelated
+single row changes, cursor tracking reads the destination instead of that
+incidental ruler or status update. Key-echo suppression consumes only an exact
+terminal acknowledgement of queued input.
 
 For TUIs which hide or park the hardware cursor, or leave it at an input prompt,
 Lector can also recognize two deliberately narrow visual-focus representations

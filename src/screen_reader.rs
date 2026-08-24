@@ -850,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_interface_repaint_uses_application_cursor_tracking() {
+    fn stable_multirow_interface_replacement_uses_the_ordinary_diff() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(5, 24);
         view.process_changes(
@@ -864,24 +864,139 @@ mod tests {
         let read = sr.auto_read_after_input(&mut view).unwrap();
 
         assert!(read);
-        assert_eq!(speaks.borrow().as_slice(), [" greater "]);
+        assert_eq!(
+            speaks.borrow().as_slice(),
+            ["new history item\n\n2 slash 100"]
+        );
     }
 
     #[test]
-    fn recent_input_keeps_a_single_row_interface_status_diff_at_the_application_cursor() {
+    fn recent_input_reads_a_status_diff_when_the_cursor_is_stationary() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(5, 24);
-        view.process_changes(b">\x1b[5;1H+\x1b[1;1H");
+        view.process_changes(b"cursor text\x1b[1;1H");
         view.finalize_changes(0);
 
         sr.record_forwarded_key(None, crate::terminal::ScreenIdentity::Primary);
-        view.process_changes(b"\x1b[5;1H-\x1b[1;1H");
+        view.process_changes(b"\x1b[5;1Hfile status\x1b[1;1H");
         view.clear_renderer_damage_hints();
 
         let read = sr.auto_read_after_input(&mut view).unwrap();
 
         assert!(read);
-        assert_eq!(speaks.borrow().as_slice(), [" greater "]);
+        assert_eq!(speaks.borrow().as_slice(), ["file status"]);
+    }
+
+    #[test]
+    fn counted_cursor_move_reads_the_destination_instead_of_the_ruler() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.process_changes(b"first\x1b[2;1Hsecond\x1b[3;1Hthird\x1b[5;1H1,1\x1b[1;1H");
+        view.finalize_changes(0);
+
+        sr.set_suppress_key_echo(true);
+        sr.record_forwarded_key(Some("3G"), crate::terminal::ScreenIdentity::Primary);
+        view.process_changes(b"\x1b[5;1H3,1\x1b[3;1H");
+        view.clear_renderer_damage_hints();
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(!read);
+        assert!(speaks.borrow().is_empty());
+        sr.track_cursor(&mut view).unwrap();
+        assert_eq!(speaks.borrow().as_slice(), ["third"]);
+    }
+
+    #[test]
+    fn active_echo_stream_does_not_hide_a_later_cursor_only_move() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(3, 24);
+        view.process_changes(b"first\x1b[2;1Hsecond\x1b[1;1H");
+        view.finalize_changes(0);
+
+        sr.set_suppress_key_echo(true);
+        sr.record_forwarded_key(Some("x"), crate::terminal::ScreenIdentity::Primary);
+        view.process_changes(b"x");
+        assert!(sr.auto_read_after_input(&mut view).unwrap());
+        assert!(sr.key_echo_stream_active);
+        assert!(speaks.borrow().is_empty());
+        view.finalize_changes(0);
+
+        sr.record_forwarded_key(Some("j"), crate::terminal::ScreenIdentity::Primary);
+        view.process_changes(b"\x1b[2;1H");
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(!read);
+        sr.track_cursor(&mut view).unwrap();
+        assert_eq!(speaks.borrow().as_slice(), ["second"]);
+    }
+
+    #[test]
+    fn pending_echo_does_not_silence_stable_cursor_addressed_output() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.process_changes(b"old one\x1b[2;1Hold two\x1b[4;1Hworking\x1b[5;1H>\x1b[5;2H");
+        view.finalize_changes(0);
+
+        sr.set_suppress_key_echo(true);
+        sr.record_forwarded_key(Some("x"), crate::terminal::ScreenIdentity::Primary);
+        view.process_changes(
+            b"\x1b[1;1Hdone one\x1b[2;1Hdone two\x1b[4;1Hfinished\x1b[5;1H$ \x1b[5;3H",
+        );
+        view.clear_renderer_damage_hints();
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(read);
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("done one"));
+        assert!(spoken.contains("finished"));
+        assert!(spoken.contains('$'));
+    }
+
+    #[test]
+    fn failed_cursor_row_echo_candidate_restores_the_full_diff() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.process_changes(b"abc\x1b[2;1Hold result\x1b[3;1Hold detail\x1b[5;1H1,4\x1b[1;4H");
+        view.finalize_changes(0);
+
+        sr.set_suppress_key_echo(true);
+        sr.key_echo_stream_active = true;
+        sr.record_forwarded_key(Some("x"), crate::terminal::ScreenIdentity::Primary);
+        view.process_changes(
+            b"\x1b[1;1Habcq\x1b[2;1Himportant result\x1b[3;1Hnew detail\x1b[5;1H1,5\x1b[1;5H",
+        );
+        view.clear_renderer_damage_hints();
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(read);
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("important result"));
+        assert!(spoken.contains("new detail"));
+    }
+
+    #[test]
+    fn stable_spinner_repaint_reads_changes_instead_of_the_prompt_cursor() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 28);
+        view.process_changes(
+            b"answer so far\x1b[2;1Hthinking 1\x1b[3;1Htokens 10\x1b[4;1H>\x1b[4;2H",
+        );
+        view.finalize_changes(0);
+
+        view.process_changes(b"\x1b[2;1Hthinking 2\x1b[3;1Htokens 20\x1b[4;2H");
+        view.clear_renderer_damage_hints();
+
+        let read = sr.auto_read_after_input(&mut view).unwrap();
+
+        assert!(read);
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("thinking 2"));
+        assert!(spoken.contains("tokens 20"));
+        assert!(!spoken.contains("greater"));
     }
 
     #[test]

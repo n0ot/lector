@@ -47,6 +47,8 @@ impl ScreenReader {
         let cursor_operations_after_last_line_feed = update.cursor_operations_after_last_line_feed;
         let scrolled = update.scroll_operations > 0;
         let structural_repaint = update.output_report_structural && !scrolled;
+        let prev_cursor = view.prev_screen().cursor_position();
+        let cursor = view.screen().cursor_position();
         let linear_output_report = view
             .accessibility_update_summary()
             .has_linear_output_report();
@@ -103,7 +105,8 @@ impl ScreenReader {
             if screen_contents_unchanged {
                 let suppressed_echo = self.should_suppress_key_echo(&live_text);
                 self.auto_read_buffers.live_text = live_text;
-                return Ok(suppressed_echo || (prefer_cursor && self.key_echo_stream_active));
+                return Ok(suppressed_echo
+                    || (prefer_cursor && self.key_echo_stream_active && cursor == prev_cursor));
             }
         }
 
@@ -150,11 +153,17 @@ impl ScreenReader {
 
         let mut diff_text = std::mem::take(&mut self.auto_read_buffers.diff_text);
         diff_text.clear();
-        let prev_cursor = view.prev_screen().cursor_position();
-        let cursor = view.screen().cursor_position();
         let cursor_shape_changed = view.prev_screen().cursor.shape != view.screen().cursor.shape;
         let columns = usize::from(view.screen().size().1.max(1));
         let cursor_changed = cursor != prev_cursor;
+        let new_interface_region = if structural_repaint {
+            let mut region = std::mem::take(&mut self.auto_read_buffers.interface_region);
+            let has_region = collect_new_interface_region(view, &mut region);
+            self.auto_read_buffers.interface_region = region;
+            has_region
+        } else {
+            false
+        };
         let (old_text, new_text, prev_hashes, curr_hashes) = view.full_contents_cached();
 
         if prev_hashes.len() == curr_hashes.len()
@@ -167,7 +176,7 @@ impl ScreenReader {
             // cursor shape. Treat that receipt as handled while the validated
             // echo stream is active; falling through to cursor tracking would
             // announce a spurious indentation/layout change.
-            return Ok(prefer_cursor && self.key_echo_stream_active);
+            return Ok(prefer_cursor && self.key_echo_stream_active && cursor == prev_cursor);
         }
 
         let cursor_row = usize::from(cursor.0);
@@ -239,21 +248,26 @@ impl ScreenReader {
             None
         };
         let input_echo_cursor_row = input_echo_row.is_some();
-        let unpainted_echo_advanced_cursor = prefer_cursor
+        let unpainted_echo_candidate = prefer_cursor
             && pending_key_echo
             && self.key_echo_stream_active
             && !scrolled
             && cursor_advanced
             && !cursor_row_changed
             && !prev_cursor_row_changed;
-        if unpainted_echo_advanced_cursor {
+        if unpainted_echo_candidate {
             // A trailing whitespace cell is visually indistinguishable from
             // the blank cell it replaced, although a full-screen editor may
-            // repaint its ruler. Once exact preceding echoes established an
-            // active text-entry stream, cursor advancement is the physical
-            // receipt for this otherwise invisible echo.
-            self.auto_read_buffers.diff_text = diff_text;
-            return Ok(true);
+            // repaint its ruler. Cursor advancement alone is ambiguous, so
+            // suppress this update only when the terminal's actual print
+            // report exactly acknowledges pending input.
+            let live_text = std::mem::take(&mut self.auto_read_buffers.live_text);
+            let suppress_echo = self.should_suppress_key_echo(&live_text);
+            self.auto_read_buffers.live_text = live_text;
+            if suppress_echo {
+                self.auto_read_buffers.diff_text = diff_text;
+                return Ok(true);
+            }
         }
         let cursor_row_inline_edit = prefer_cursor
             && cursor_changed
@@ -344,22 +358,17 @@ impl ScreenReader {
             && !input_echo_cursor_row
             && !cursor_row_inline_edit
             && !(changed_row_count == 1 && (cursor_row_changed || prev_cursor_row_changed))
+            && new_interface_region
         {
             // Cursor-addressed painting without line boundaries describes an
             // interface frame, not line-oriented command output. A bounded
             // group of rows newly populated from blank space is evidence that
             // a new interface or modal opened, so introduce that region in
-            // full. Replacement-style redraws remain anchored to the cursor;
-            // transcript growth was separated above and follows the diff.
+            // full. Stable replacement-style redraws are otherwise ordinary
+            // diffs; recent input and a stationary cursor cannot prove that
+            // their changed text is incidental.
             self.auto_read_buffers.diff_text = diff_text;
-            if pending_key_echo || self.key_echo_stream_active {
-                return Ok(true);
-            }
-            if !self.read_new_interface_region_repaint(view)?
-                && !self.read_application_cursor_logical_line_repaint(view, true)?
-            {
-                self.speak_application_cursor_line(view)?;
-            }
+            self.read_new_interface_region_repaint()?;
             return Ok(true);
         }
         // Full-screen applications commonly redraw a ruler or status line along with an
@@ -383,20 +392,13 @@ impl ScreenReader {
             (old_text, new_text)
         };
 
-        let line_changes = TextDiff::configure()
-            .algorithm(Algorithm::Patience)
-            .diff_lines(diff_old_text, diff_new_text);
-
-        let mut diff_state = DiffState::NoChanges;
-        for change in line_changes.iter_all_changes() {
-            diff_state = next_line_diff_state(diff_state, change.tag());
-            if change.tag() == ChangeTag::Insert
-                && let Some(change_str) = change.as_str()
-            {
-                diff_text.push_str(change_str);
-                diff_text.push('\n');
-            }
-        }
+        let diff_state = collect_auto_read_diff(
+            diff_old_text,
+            diff_new_text,
+            &mut diff_text,
+            &mut self.auto_read_buffers.graphemes,
+            &mut self.auto_read_buffers.lcs,
+        );
 
         let cursor_crossed_changed_row = single_changed_row.is_some_and(|row| {
             if cursor.0 > prev_cursor.0 {
@@ -422,42 +424,6 @@ impl ScreenReader {
             return Ok(false);
         }
 
-        if diff_state == DiffState::Single {
-            let mut graphemes = std::mem::take(&mut self.auto_read_buffers.graphemes);
-            graphemes.clear();
-            diff_state = DiffState::NoChanges;
-            let mut previous_tag = None;
-            for change in TextDiff::configure()
-                .algorithm(Algorithm::Patience)
-                .diff_graphemes(diff_old_text, diff_new_text)
-                .iter_all_changes()
-            {
-                diff_state = next_grapheme_diff_state(diff_state, previous_tag, change.tag());
-                previous_tag = Some(change.tag());
-                if diff_state != DiffState::Multi
-                    && change.tag() == ChangeTag::Insert
-                    && let Some(change_str) = change.as_str()
-                {
-                    graphemes.push_str(change_str);
-                }
-            }
-
-            if diff_state == DiffState::Multi {
-                graphemes.clear();
-                if collect_inserted_fields(
-                    diff_old_text,
-                    diff_new_text,
-                    &mut graphemes,
-                    &mut self.auto_read_buffers.lcs,
-                ) {
-                    std::mem::swap(&mut diff_text, &mut graphemes);
-                }
-            } else {
-                std::mem::swap(&mut diff_text, &mut graphemes);
-            }
-            self.auto_read_buffers.graphemes = graphemes;
-        }
-
         let suppress_echo = if input_echo_cursor_row {
             self.should_suppress_cursor_row_key_echo(&diff_text)
         } else {
@@ -467,14 +433,22 @@ impl ScreenReader {
             self.auto_read_buffers.diff_text = diff_text;
             return Ok(true);
         }
-        if input_echo_cursor_row && self.key_echo_stream_active && changed_row_count > 2 {
-            // When an editor scrolls a wrapped logical line, equal physical
-            // row numbers no longer identify equal logical text. Do not read
-            // the replacement viewport row after an established sequence of
-            // exact echo acknowledgements; ordinary command output is outside
-            // that sequence and continues through the normal diff path.
-            self.auto_read_buffers.diff_text = diff_text;
-            return Ok(true);
+        if input_echo_cursor_row {
+            // Selecting the cursor row protects exact editor echoes from a
+            // parallel ruler repaint. If the candidate does not match queued
+            // input, it was not proven to be an echo: restore the complete
+            // stable-frame diff so unrelated output cannot disappear.
+            collect_auto_read_diff(
+                old_text,
+                new_text,
+                &mut diff_text,
+                &mut self.auto_read_buffers.graphemes,
+                &mut self.auto_read_buffers.lcs,
+            );
+            if self.should_suppress_key_echo(&diff_text) {
+                self.auto_read_buffers.diff_text = diff_text;
+                return Ok(true);
+            }
         }
 
         let original_nonempty = !diff_text.is_empty();
@@ -491,9 +465,8 @@ impl ScreenReader {
     ///
     /// Cursor-addressed interfaces repaint physical rows, but a terminal
     /// autowrap still represents one logical line. Keep this separate from the
-    /// ordinary cursor tracker: only a causally matched history response or
-    /// the guarded interface-repaint path above should widen a physical cursor
-    /// row into its wrap-connected run.
+    /// ordinary cursor tracker: only a causally matched history response should
+    /// widen a physical cursor row into its wrap-connected run.
     pub(crate) fn read_history_navigation_logical_line_repaint(
         &mut self,
         view: &View,
@@ -501,24 +474,19 @@ impl ScreenReader {
         // Unlike generic auto-read, an explicit history selection is not a
         // printable key echo. A still-pending typed suffix must not suppress
         // the recalled command which replaced it.
-        self.read_application_cursor_logical_line_repaint(view, false)
+        self.read_application_cursor_logical_line_repaint(view)
     }
 
-    fn read_new_interface_region_repaint(&mut self, view: &View) -> Result<bool> {
-        let mut region = std::mem::take(&mut self.auto_read_buffers.interface_region);
-        let has_region = collect_new_interface_region(view, &mut region);
-        if has_region {
+    fn read_new_interface_region_repaint(&mut self) -> Result<()> {
+        let region = std::mem::take(&mut self.auto_read_buffers.interface_region);
+        if !self.should_suppress_key_echo(&region) {
             self.speak(&region, false)?;
         }
         self.auto_read_buffers.interface_region = region;
-        Ok(has_region)
+        Ok(())
     }
 
-    fn read_application_cursor_logical_line_repaint(
-        &mut self,
-        view: &View,
-        suppress_key_echo: bool,
-    ) -> Result<bool> {
+    fn read_application_cursor_logical_line_repaint(&mut self, view: &View) -> Result<bool> {
         let update = view.accessibility_update_summary();
         if !update.output_report_structural
             || update.parser_continuation
@@ -531,9 +499,7 @@ impl ScreenReader {
         let mut line = std::mem::take(&mut self.auto_read_buffers.cursor_line);
         let has_logical_line = collect_application_cursor_logical_line(view, &mut line);
         let handled = if has_logical_line {
-            if !suppress_key_echo || !self.should_suppress_key_echo(&line) {
-                self.speak(&line, false)?;
-            }
+            self.speak(&line, false)?;
             true
         } else {
             false
@@ -891,6 +857,62 @@ fn next_line_diff_state(state: DiffState, tag: ChangeTag) -> DiffState {
         },
         DiffState::Multi => DiffState::Multi,
     }
+}
+
+fn collect_auto_read_diff(
+    old_text: &str,
+    new_text: &str,
+    diff_text: &mut String,
+    graphemes: &mut String,
+    lcs: &mut Vec<usize>,
+) -> DiffState {
+    diff_text.clear();
+    let line_changes = TextDiff::configure()
+        .algorithm(Algorithm::Patience)
+        .diff_lines(old_text, new_text);
+
+    let mut diff_state = DiffState::NoChanges;
+    for change in line_changes.iter_all_changes() {
+        diff_state = next_line_diff_state(diff_state, change.tag());
+        if change.tag() == ChangeTag::Insert
+            && let Some(change_str) = change.as_str()
+        {
+            diff_text.push_str(change_str);
+            diff_text.push('\n');
+        }
+    }
+
+    if diff_state != DiffState::Single {
+        return diff_state;
+    }
+
+    graphemes.clear();
+    diff_state = DiffState::NoChanges;
+    let mut previous_tag = None;
+    for change in TextDiff::configure()
+        .algorithm(Algorithm::Patience)
+        .diff_graphemes(old_text, new_text)
+        .iter_all_changes()
+    {
+        diff_state = next_grapheme_diff_state(diff_state, previous_tag, change.tag());
+        previous_tag = Some(change.tag());
+        if diff_state != DiffState::Multi
+            && change.tag() == ChangeTag::Insert
+            && let Some(change_str) = change.as_str()
+        {
+            graphemes.push_str(change_str);
+        }
+    }
+
+    if diff_state == DiffState::Multi {
+        graphemes.clear();
+        if collect_inserted_fields(old_text, new_text, graphemes, lcs) {
+            std::mem::swap(diff_text, graphemes);
+        }
+    } else {
+        std::mem::swap(diff_text, graphemes);
+    }
+    diff_state
 }
 
 fn next_grapheme_diff_state(

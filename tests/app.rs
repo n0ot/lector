@@ -1574,7 +1574,7 @@ fn readline_history_repaint_reads_the_complete_soft_wrapped_cursor_line() {
 }
 
 #[test]
-fn unwrapped_multirow_interface_repaint_still_reads_only_the_cursor_row() {
+fn unwrapped_multirow_interface_repaint_reads_its_stable_diff() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -1609,7 +1609,7 @@ fn unwrapped_multirow_interface_repaint_still_reads_only_the_cursor_row() {
     assert_eq!(pty_out, b"\x1B[A");
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("Status done".into(), false)]
+        &[("Menu new\n\nPanel new\n\nStatus done".into(), false)]
     );
 }
 
@@ -3446,7 +3446,7 @@ fn cursor_restore_does_not_expose_a_transient_fzf_height_frame() {
 }
 
 #[test]
-fn reverse_search_interface_reads_only_its_application_cursor_row() {
+fn reverse_search_interface_reads_its_settled_contents() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -3470,7 +3470,10 @@ fn reverse_search_interface_reads_only_its_application_cursor_row() {
 
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[(" greater ".into(), false)]
+        &[(
+            "history item\n\n----------------\n\n greater \n\n1 slash 100".into(),
+            false,
+        )]
     );
 }
 
@@ -3505,7 +3508,15 @@ fn reverse_search_discards_a_transient_semantic_input_macro() {
 
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[(" greater ".into(), false)]
+        &[("history one\n\nhistory two\n\n greater ".into(), false)]
+    );
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .all(|(text, _)| !text.contains("__fzf_history__"))
     );
 }
 
