@@ -103,7 +103,10 @@ window title, followed by the application cursor line once the composed frame
 is physically stable; it does not read the full `tmux session index title`
 label. Pane switches read only the new cursor line. Alternate-screen,
 overlay/base, window, session, and pane handoffs reset auto-read diff state so
-hidden or previous-context changes cannot replay as a whole-screen diff.
+hidden or previous-context changes cannot replay as a whole-screen diff. A
+settled alternate screen is read in full because it is a new application
+context; restoring the already-seen primary screen reads only its current
+application-cursor line.
 
 For crash and hang diagnosis, the repository includes a socket-free hostile
 control peer and a kill-bounded live suite covering malformed records, silent
@@ -201,6 +204,13 @@ with a 30 ms quiet window, adapts per view between 8 and 60 ms, increases
 immediately after a detected late continuation, and retains the 300 ms
 streaming-output cap.
 
+A cursor-addressed primary-screen repaint which hides the application cursor
+and newly populates multiple previously blank rows is treated as a bounded new
+interface or modal and that changed region is read in full. Once the interface
+is established, subsequent redraws remain anchored to its cursor line. A
+visible application cursor likewise stays authoritative for editable and
+search interfaces.
+
 For TUIs which hide or park the hardware cursor, or leave it at an input prompt,
 Lector can also recognize two deliberately narrow visual-focus representations
 without depending on a particular framework, color, or key binding. The common
@@ -209,11 +219,18 @@ application and a causally later presented frame. Lector assigns no meaning to
 the key itself, so application-defined bindings, access keys, and remaps use the
 same path as arrows.
 
-A style-only move must be exactly one reciprocal style transfer between bounded
-text runs, with a selected style demonstrably rarer than the baseline. A textual
-line pointer may instead move one compact, punctuation-like token between the
-same leading-gutter columns of two stable, aligned item rows. Its glyph is
-learned from the frame, so `>`, Unicode pointers, and configured markers behave
+A style-only move must be either one exact reciprocal style transfer between
+bounded text runs or a bounded row bundle of one or more reciprocal style
+transitions between exactly two stable rows. In a bundle, at least one
+component must move a selected style which is demonstrably rarer than its
+baseline across meaningful text, and every
+directional component must identify the same destination. This permits a theme
+to style one bounded payload run, match fragments within it, and a separate
+gutter independently without assigning application-specific meaning to the
+exact color or emphasis values. A textual line pointer may instead move one
+compact, punctuation-like token between the same
+leading-gutter columns of two stable, aligned item rows. Its glyph is learned
+from the frame, so `>`, Unicode pointers, and configured markers behave
 identically; an unchanged copy at the prompt is irrelevant. A marker-only list
 needs an unchanged peer row, while a two-row list needs corroborating reciprocal
 styling. A marker printed directly against its item text is likewise accepted
@@ -409,7 +426,12 @@ When a shell emits the OSC 133 `B` input-boundary marker, ordinary unmodified
 Up/Down history navigation speaks the recalled editable input without the
 primary prompt. Readline does not emit a fresh marker for every history item;
 Lector correlates the forwarded arrow with the redraw after the existing `B`
-marker. Without OSC 133 integration, speech uses cursor/diff behavior.
+marker. If a temporary interface reuses that primary screen while the shell
+marker remains, an exact visual-focus transfer takes precedence over the stale
+semantic boundary. Without OSC 133 integration, speech uses cursor/diff
+behavior. A stable multi-row repaint joined by terminal soft-wrap metadata is
+read as one logical cursor line; because no semantic prompt boundary exists in
+that fallback, the prompt may be included.
 
 ### Copy/paste and clipboard history
 

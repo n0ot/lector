@@ -601,12 +601,9 @@ impl App {
         let kitty_press_mode =
             (!key.is_release() && input.starts_with(b"\x1b[") && input.ends_with(b"u"))
                 .then_some(child_kitty_keyboard_flags);
-        if !key.is_release()
+        let history_navigation = !key.is_release()
             && event.modifiers.is_empty()
-            && matches!(event.code, KeyCode::Up | KeyCode::Down)
-        {
-            sr.set_pending_history_navigation();
-        }
+            && matches!(event.code, KeyCode::Up | KeyCode::Down);
         if !key.is_release() {
             sr.record_forwarded_key(key.text().as_deref(), screen_identity);
         }
@@ -664,6 +661,9 @@ impl App {
         self.handle_view_action(sr, action, term_out)?;
         if let Some((view_id, revision_boundary, forwarded)) = visual_focus_claim {
             sr.record_forwarded_visual_focus_input(view_id, revision_boundary, forwarded);
+            if history_navigation && forwarded {
+                sr.set_pending_history_navigation();
+            }
         }
         Ok(())
     }

@@ -18,8 +18,11 @@ pub(super) struct PendingVisualFocusInput {
 }
 
 impl ScreenReader {
+    /// Invalidate both interpretations paired with the most recently
+    /// forwarded key. Non-key input and view changes cannot satisfy either.
     pub(crate) fn clear_pending_visual_focus_input(&mut self) {
         self.pending_visual_focus_input = None;
+        self.clear_pending_history_navigation();
     }
 
     /// Record any decoded key press which actually reached the child. Raw byte
@@ -32,6 +35,9 @@ impl ScreenReader {
         revision_boundary: Option<ViewRevision>,
         forwarded: bool,
     ) {
+        if !forwarded {
+            self.clear_pending_history_navigation();
+        }
         self.pending_visual_focus_input = forwarded.then_some(PendingVisualFocusInput {
             view_id,
             revision_boundary,
@@ -47,7 +53,7 @@ impl ScreenReader {
             return false;
         };
         if pending.input_sequence != self.input_sequence || pending.view_id != view.view_id() {
-            self.pending_visual_focus_input = None;
+            self.clear_pending_visual_focus_input();
             return false;
         }
         if !revision_passed(pending.revision_boundary, view.accessibility_revision()) {
@@ -56,14 +62,28 @@ impl ScreenReader {
         self.pending_visual_focus_input.take().is_some()
     }
 
-    pub(super) fn read_visual_focus_transfer(
-        &mut self,
-        view: &View,
-        cursor_moves: usize,
-        scrolled: bool,
-        structural_repaint: bool,
-        linear_output_report: bool,
-    ) -> Result<bool> {
+    /// `Some(false)` keeps both interpretations pending on an older physical
+    /// receipt, `Some(true)` permits arbitration, and `None` means there is no
+    /// valid claim for this view.
+    pub(crate) fn visual_focus_response_presentation_ready(&self, view: &View) -> Option<bool> {
+        let pending = self.pending_visual_focus_input.as_ref()?;
+        if pending.input_sequence != self.input_sequence || pending.view_id != view.view_id() {
+            return None;
+        }
+        Some(revision_passed(
+            pending.revision_boundary,
+            view.accessibility_revision(),
+        ))
+    }
+
+    /// Read a physically proven visual-focus transfer. Callers may give this
+    /// exact physical evidence precedence over a higher-level interpretation:
+    /// a shell semantic marker can remain on the primary screen while a child
+    /// interface temporarily owns it.
+    pub(crate) fn read_visual_focus_transfer(&mut self, view: &View) -> Result<bool> {
+        let update = view.accessibility_update_summary();
+        let cursor_moves = update.cursor_operations;
+        let scrolled = update.scroll_operations > 0;
         if !self.take_visual_focus_input_response(view) {
             return Ok(false);
         }
@@ -71,8 +91,8 @@ impl ScreenReader {
         // separate policy and avoid speaking the same transfer twice.
         if self.highlight_tracking_enabled()
             || scrolled
-            || !structural_repaint
-            || linear_output_report
+            || !(update.output_report_structural && !scrolled)
+            || update.has_linear_output_report()
         {
             return Ok(false);
         }
@@ -110,6 +130,14 @@ struct StyleChangeGroup {
 }
 
 #[derive(Clone, Copy)]
+enum RareStyleSide {
+    Before,
+    After,
+}
+
+const MAX_FOCUS_STYLE_CHANGE_GROUPS: usize = 16;
+
+#[derive(Clone, Copy)]
 struct CellSpan {
     row: u16,
     start: u16,
@@ -132,9 +160,13 @@ fn collect_visual_focus_transfer(
     collect_moving_gutter_marker(previous, current, out)
 }
 
-/// Detect a single reciprocal transfer of one distinctive style between two
-/// bounded textual runs. Keep this path independent from textual markers so
-/// its intentionally strict, coordinate-stable behavior does not change.
+/// Detect a bounded bundle of reciprocal style transfers between two textual
+/// rows. A focus theme may style one bounded payload run, match fragments
+/// within it, and a separate gutter independently; all of those channels still
+/// have to exchange exact styles between the same two rows, and every channel
+/// with rarity evidence must agree on which row gained the rare style.
+/// Keep this path independent from textual markers so its intentionally strict,
+/// coordinate-stable behavior does not change.
 fn collect_style_focus_transfer(
     previous: &TerminalSnapshot,
     current: &TerminalSnapshot,
@@ -150,7 +182,7 @@ fn collect_style_focus_transfer(
         return false;
     }
 
-    let mut groups: Vec<StyleChangeGroup> = Vec::with_capacity(2);
+    let mut groups: Vec<StyleChangeGroup> = Vec::with_capacity(4);
     let mut changed_rows = [None, None];
     for (row_index, (old_row, new_row)) in previous.rows.iter().zip(current.rows.iter()).enumerate()
     {
@@ -193,7 +225,7 @@ fn collect_style_focus_transfer(
             {
                 group.cells.push((row, col));
             } else {
-                if groups.len() == 2 {
+                if groups.len() == MAX_FOCUS_STYLE_CHANGE_GROUPS {
                     return false;
                 }
                 groups.push(StyleChangeGroup {
@@ -205,10 +237,118 @@ fn collect_style_focus_transfer(
         }
     }
 
-    if groups.len() != 2
-        || groups[0].before != groups[1].after
-        || groups[0].after != groups[1].before
+    // Preserve the original single-channel path, including horizontal focus
+    // transfers within one row. Compound transfers below need two distinct
+    // rows so their independent style channels have an unambiguous owner.
+    if groups.len() == 2 && collect_single_style_focus_transfer(previous, current, &groups, out) {
+        return true;
+    }
+
+    let [Some(first_row), Some(second_row)] = changed_rows else {
+        return false;
+    };
+    if groups.len() < 2 || !groups.len().is_multiple_of(2) {
+        return false;
+    }
+
+    let mut paired = vec![false; groups.len()];
+    let mut destination = None;
+    let mut decisive_pairs = Vec::with_capacity(groups.len() / 2);
+    for index in 0..groups.len() {
+        if paired[index] {
+            continue;
+        }
+        let Some(group_row) = style_change_group_row(&groups[index]) else {
+            return false;
+        };
+        let Some(reverse_index) = groups.iter().enumerate().find_map(|(candidate, group)| {
+            (candidate != index
+                && !paired[candidate]
+                && group.before == groups[index].after
+                && group.after == groups[index].before)
+                .then_some(candidate)
+        }) else {
+            return false;
+        };
+        let Some(reverse_row) = style_change_group_row(&groups[reverse_index]) else {
+            return false;
+        };
+        if !rows_are_the_focus_pair(first_row, second_row, group_row, reverse_row) {
+            return false;
+        }
+
+        paired[index] = true;
+        paired[reverse_index] = true;
+        if let Some(pair_destination) = reciprocal_style_pair_destination(
+            previous,
+            current,
+            &groups[index],
+            group_row,
+            reverse_row,
+        ) {
+            if destination.is_some_and(|known| known != pair_destination) {
+                return false;
+            }
+            destination = Some(pair_destination);
+            decisive_pairs.push((index, reverse_index));
+        }
+    }
+
+    // Key identity supplies no directional semantics. At least one style pair
+    // must make the selected side demonstrably rarer than its baseline, and
+    // every such pair must identify the same destination row. Ambiguous pairs
+    // may corroborate that row but can never choose it.
+    let Some(destination) = destination else {
+        return false;
+    };
+    let source = if destination == first_row {
+        second_row
+    } else {
+        first_row
+    };
+    let Some(removed_span) =
+        single_meaningful_style_change_span(previous, current, previous, source)
+    else {
+        return false;
+    };
+    let Some(added_span) =
+        single_meaningful_style_change_span(previous, current, current, destination)
+    else {
+        return false;
+    };
+
+    // Decoration may participate in the same row transfer, but it cannot be
+    // the only directional evidence. Preserve the old requirement that a rare
+    // style itself moves between meaningful text in the source and destination.
+    if !decisive_pairs.iter().any(|(first, second)| {
+        let (removed, added) = if style_change_group_row(&groups[*first]) == Some(source) {
+            (&groups[*first], &groups[*second])
+        } else {
+            (&groups[*second], &groups[*first])
+        };
+        group_intersects_alphanumeric_text(previous, removed, removed_span)
+            && group_intersects_alphanumeric_text(current, added, added_span)
+    }) {
+        return false;
+    }
+
+    // A visible hardware cursor anywhere on either candidate row has more
+    // authoritative ownership than an inferred style cursor.
+    if current.cursor.visible && (current.cursor.row == source || current.cursor.row == destination)
     {
+        return false;
+    }
+
+    finish_style_focus_span(current, added_span, out)
+}
+
+fn collect_single_style_focus_transfer(
+    previous: &TerminalSnapshot,
+    current: &TerminalSnapshot,
+    groups: &[StyleChangeGroup],
+    out: &mut String,
+) -> bool {
+    if groups[0].before != groups[1].after || groups[0].after != groups[1].before {
         return false;
     }
 
@@ -222,31 +362,11 @@ fn collect_style_focus_transfer(
         return false;
     }
 
-    let first_style = &groups[0].before;
-    let second_style = &groups[0].after;
-    let first_count = textual_style_count(previous, first_style)
-        .saturating_add(textual_style_count(current, first_style));
-    let second_count = textual_style_count(previous, second_style)
-        .saturating_add(textual_style_count(current, second_style));
-
-    // Selection styling should be distinctive among actual text, not merely
-    // different. A two-to-one prevalence margin establishes which side is the
-    // baseline and, critically, which reciprocal transition is the new focus.
-    let rarity_destination = if first_count.saturating_mul(2) <= second_count {
-        Some(1usize)
-    } else if second_count.saturating_mul(2) <= first_count {
-        Some(0usize)
-    } else {
-        None
-    };
-
-    // Key identity supplies no directional semantics. If prevalence does not
-    // distinguish the selected style (for example a bare two-option swap),
-    // the terminal grid cannot prove which transition is the destination.
-    // Stay silent rather than guess from theme-dependent visual salience.
-    let added_index = rarity_destination;
-    let Some(added_index) = added_index else {
-        return false;
+    let added_index = match rare_style_side(previous, current, &groups[0].before, &groups[0].after)
+    {
+        Some(RareStyleSide::Before) => 1,
+        Some(RareStyleSide::After) => 0,
+        None => return false,
     };
     let (removed_span, added_span) = if added_index == 0 {
         (second_span, first_span)
@@ -260,9 +380,6 @@ fn collect_style_focus_transfer(
     {
         return false;
     }
-
-    // A static visible application cursor is useful independent evidence, but
-    // a cursor sitting inside either styled run makes ownership ambiguous.
     if current.cursor.visible
         && (span_contains(removed_span, current.cursor_position())
             || span_contains(added_span, current.cursor_position()))
@@ -270,6 +387,14 @@ fn collect_style_focus_transfer(
         return false;
     }
 
+    finish_style_focus_span(current, added_span, out)
+}
+
+fn finish_style_focus_span(
+    current: &TerminalSnapshot,
+    added_span: CellSpan,
+    out: &mut String,
+) -> bool {
     append_span_text(current, added_span, out);
     let trimmed = out.trim();
     if trimmed
@@ -287,6 +412,115 @@ fn collect_style_focus_transfer(
         out.push_str(&trimmed);
     }
     true
+}
+
+fn style_change_group_row(group: &StyleChangeGroup) -> Option<u16> {
+    let row = group.cells.first()?.0;
+    group.cells.iter().all(|cell| cell.0 == row).then_some(row)
+}
+
+fn rows_are_the_focus_pair(first: u16, second: u16, left: u16, right: u16) -> bool {
+    left != right && (left == first && right == second || left == second && right == first)
+}
+
+fn reciprocal_style_pair_destination(
+    previous: &TerminalSnapshot,
+    current: &TerminalSnapshot,
+    forward: &StyleChangeGroup,
+    forward_row: u16,
+    reverse_row: u16,
+) -> Option<u16> {
+    match rare_style_side(previous, current, &forward.before, &forward.after) {
+        Some(RareStyleSide::Before) => Some(reverse_row),
+        Some(RareStyleSide::After) => Some(forward_row),
+        None => None,
+    }
+}
+
+fn rare_style_side(
+    previous: &TerminalSnapshot,
+    current: &TerminalSnapshot,
+    before: &Style,
+    after: &Style,
+) -> Option<RareStyleSide> {
+    let before_count =
+        textual_style_count(previous, before).saturating_add(textual_style_count(current, before));
+    let after_count =
+        textual_style_count(previous, after).saturating_add(textual_style_count(current, after));
+
+    // A two-to-one prevalence margin establishes which exact style is the
+    // selection. A style absent from all nonblank cells supplies no evidence.
+    if before_count > 0 && before_count.saturating_mul(2) <= after_count {
+        Some(RareStyleSide::Before)
+    } else if after_count > 0 && after_count.saturating_mul(2) <= before_count {
+        Some(RareStyleSide::After)
+    } else {
+        None
+    }
+}
+
+/// Find the sole bounded, text-bearing component in one changed row. Multiple
+/// reciprocal style channels may occupy that component. Separate punctuation
+/// decorations, such as a stationary gutter bar, remain outside the spoken
+/// span and do not make the row ambiguous.
+fn single_meaningful_style_change_span(
+    previous: &TerminalSnapshot,
+    current: &TerminalSnapshot,
+    text: &TerminalSnapshot,
+    row: u16,
+) -> Option<CellSpan> {
+    let old_cells = &previous.rows.get(usize::from(row))?.cells;
+    let new_cells = &current.rows.get(usize::from(row))?.cells;
+    if old_cells.len() != new_cells.len() {
+        return None;
+    }
+
+    let mut candidate = None;
+    let mut start = None;
+    for column in 0..=old_cells.len() {
+        let changed =
+            column < old_cells.len() && old_cells[column].style != new_cells[column].style;
+        if changed {
+            start.get_or_insert(column);
+            continue;
+        }
+        let Some(component_start) = start.take() else {
+            continue;
+        };
+        let component_end = column.saturating_sub(1);
+        let Ok(start) = u16::try_from(component_start) else {
+            return None;
+        };
+        let Ok(end) = u16::try_from(component_end) else {
+            return None;
+        };
+        let span = CellSpan { row, start, end };
+        if span_alphanumeric_count(text, span) < 2 {
+            continue;
+        }
+        if candidate.is_some() || !bounded_text_run(text, span) {
+            return None;
+        }
+        candidate = Some(span);
+    }
+    candidate
+}
+
+fn group_intersects_alphanumeric_text(
+    snapshot: &TerminalSnapshot,
+    group: &StyleChangeGroup,
+    span: CellSpan,
+) -> bool {
+    group.cells.iter().any(|(row, col)| {
+        *row == span.row
+            && *col >= span.start
+            && *col <= span.end
+            && snapshot
+                .rows
+                .get(usize::from(*row))
+                .and_then(|row| row.cells.get(usize::from(*col)))
+                .is_some_and(cell_has_word_content)
+    })
 }
 
 /// Detect a short, punctuation-like line pointer which moved between two
@@ -978,6 +1212,23 @@ mod tests {
     }
 
     #[test]
+    fn invalidating_focus_evidence_clears_its_paired_history_interpretation() {
+        let mut reader = screen_reader();
+        let view = View::new(2, 10);
+        reader.record_forwarded_visual_focus_input(
+            view.view_id(),
+            view.input_intent_revision_boundary(),
+            true,
+        );
+        reader.set_pending_history_navigation();
+
+        reader.clear_pending_visual_focus_input();
+
+        assert!(reader.pending_visual_focus_input.is_none());
+        assert!(!reader.has_pending_history_navigation());
+    }
+
+    #[test]
     fn detects_fzf_pointer_while_identical_prompt_stays_put() {
         let mut previous = snapshot(&["> Alpha", "  Bravo", "> query"], &[(0, 0..=6, inverse())]);
         let mut current = snapshot(&["  Alpha", "> Bravo", "> query"], &[(1, 0..=6, inverse())]);
@@ -1244,6 +1495,227 @@ mod tests {
         let current = snapshot(&lines, &[(1, 0..=4, inverse())]);
 
         assert_eq!(detects(&previous, &current).as_deref(), Some("Bravo"));
+    }
+
+    #[test]
+    fn preserves_single_style_focus_transfer_within_one_row() {
+        let lines = ["Alpha Bravo", "Delta Gamma", "Third Option"];
+        let previous = snapshot(&lines, &[(0, 0..=4, inverse())]);
+        let current = snapshot(&lines, &[(0, 6..=10, inverse())]);
+
+        assert_eq!(detects(&previous, &current).as_deref(), Some("Bravo"));
+    }
+
+    fn stationary_gutter_style_bundle() -> (TerminalSnapshot, TerminalSnapshot) {
+        let inactive_gutter = Style {
+            dim: true,
+            ..Style::default()
+        };
+        let active_gutter = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let active_payload = Style {
+            bold: true,
+            inverse: true,
+            ..Style::default()
+        };
+        let lines = ["▌ Alpha", "▌ Bravo", "▌ Delta", "▌ Gamma"];
+        let previous = snapshot(
+            &lines,
+            &[
+                (0, 0..=0, active_gutter.clone()),
+                (0, 2..=6, active_payload.clone()),
+                (1, 0..=0, inactive_gutter.clone()),
+                (2, 0..=0, inactive_gutter.clone()),
+                (3, 0..=0, inactive_gutter.clone()),
+            ],
+        );
+        let current = snapshot(
+            &lines,
+            &[
+                (0, 0..=0, inactive_gutter.clone()),
+                (1, 0..=0, active_gutter),
+                (1, 2..=6, active_payload),
+                (2, 0..=0, inactive_gutter.clone()),
+                (3, 0..=0, inactive_gutter),
+            ],
+        );
+        (previous, current)
+    }
+
+    #[test]
+    fn detects_compound_row_style_transfer_with_stationary_gutter() {
+        let (previous, current) = stationary_gutter_style_bundle();
+
+        assert_eq!(detects(&previous, &current).as_deref(), Some("Bravo"));
+    }
+
+    #[test]
+    fn rejects_compound_transfer_on_a_visible_cursor_row() {
+        let (mut previous, mut current) = stationary_gutter_style_bundle();
+        set_hardware_cursor(&mut previous, 0, 0);
+        set_hardware_cursor(&mut current, 0, 0);
+
+        assert_eq!(detects(&previous, &current), None);
+    }
+
+    #[test]
+    fn detects_stationary_gutter_and_payload_sharing_one_style_channel() {
+        let selected = inverse();
+        let lines = ["▌ Alpha", "▌ Bravo", "▌ Delta", "▌ Gamma"];
+        let previous = snapshot(
+            &lines,
+            &[(0, 0..=0, selected.clone()), (0, 2..=6, selected.clone())],
+        );
+        let current = snapshot(
+            &lines,
+            &[(1, 0..=0, selected.clone()), (1, 2..=6, selected)],
+        );
+
+        assert_eq!(detects(&previous, &current).as_deref(), Some("Bravo"));
+    }
+
+    #[test]
+    fn detects_payload_with_an_independently_styled_match_fragment() {
+        let inactive_gutter = Style {
+            dim: true,
+            ..Style::default()
+        };
+        let active_gutter = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let active_payload = Style {
+            bold: true,
+            inverse: true,
+            ..Style::default()
+        };
+        let inactive_match = Style {
+            foreground: Color::Indexed(2),
+            ..Style::default()
+        };
+        let active_match = Style {
+            foreground: Color::Indexed(2),
+            bold: true,
+            inverse: true,
+            ..Style::default()
+        };
+        let lines = ["▌ Alpha", "▌ Bravo", "▌ Delta", "▌ Gamma"];
+        let previous = snapshot(
+            &lines,
+            &[
+                (0, 0..=0, active_gutter.clone()),
+                (0, 2..=6, active_payload.clone()),
+                (0, 3..=3, active_match.clone()),
+                (1, 0..=0, inactive_gutter.clone()),
+                (1, 3..=3, inactive_match.clone()),
+                (2, 0..=0, inactive_gutter.clone()),
+                (2, 3..=3, inactive_match.clone()),
+                (3, 0..=0, inactive_gutter.clone()),
+                (3, 3..=3, inactive_match.clone()),
+            ],
+        );
+        let current = snapshot(
+            &lines,
+            &[
+                (0, 0..=0, inactive_gutter.clone()),
+                (0, 3..=3, inactive_match.clone()),
+                (1, 0..=0, active_gutter),
+                (1, 2..=6, active_payload),
+                (1, 3..=3, active_match),
+                (2, 0..=0, inactive_gutter.clone()),
+                (2, 3..=3, inactive_match.clone()),
+                (3, 0..=0, inactive_gutter),
+                (3, 3..=3, inactive_match),
+            ],
+        );
+
+        assert_eq!(detects(&previous, &current).as_deref(), Some("Bravo"));
+    }
+
+    #[test]
+    fn rejects_direction_selected_only_by_punctuation() {
+        let selected_decoration = inverse();
+        let first_payload = Style {
+            foreground: Color::Indexed(1),
+            ..Style::default()
+        };
+        let second_payload = Style {
+            foreground: Color::Indexed(4),
+            ..Style::default()
+        };
+        let lines = ["!Alpha", "!Bravo", "!Delta", "!Gamma"];
+        let previous = snapshot(
+            &lines,
+            &[
+                (0, 0..=0, selected_decoration.clone()),
+                (0, 1..=5, first_payload.clone()),
+                (1, 1..=5, second_payload.clone()),
+            ],
+        );
+        let current = snapshot(
+            &lines,
+            &[
+                (0, 1..=5, second_payload),
+                (1, 0..=0, selected_decoration),
+                (1, 1..=5, first_payload),
+            ],
+        );
+
+        assert_eq!(detects(&previous, &current), None);
+    }
+
+    #[test]
+    fn rejects_unpaired_style_channel_in_candidate_rows() {
+        let (previous, mut current) = stationary_gutter_style_bundle();
+        set_style(
+            &mut current,
+            0,
+            1..=1,
+            Style {
+                foreground: Color::Indexed(1),
+                ..Style::default()
+            },
+        );
+
+        assert_eq!(detects(&previous, &current), None);
+    }
+
+    #[test]
+    fn rejects_compound_style_channels_with_conflicting_destinations() {
+        let inactive_prefix = Style {
+            dim: true,
+            ..Style::default()
+        };
+        let active_prefix = Style {
+            bold: true,
+            ..Style::default()
+        };
+        let selected_payload = inverse();
+        let lines = ["xyAlpha", "xyBravo", "xyDelta", "xyGamma"];
+        let previous = snapshot(
+            &lines,
+            &[
+                (0, 0..=1, inactive_prefix.clone()),
+                (0, 2..=6, selected_payload.clone()),
+                (1, 0..=1, active_prefix.clone()),
+                (2, 0..=1, inactive_prefix.clone()),
+                (3, 0..=1, inactive_prefix.clone()),
+            ],
+        );
+        let current = snapshot(
+            &lines,
+            &[
+                (0, 0..=1, active_prefix),
+                (1, 0..=1, inactive_prefix.clone()),
+                (1, 2..=6, selected_payload),
+                (2, 0..=1, inactive_prefix.clone()),
+                (3, 0..=1, inactive_prefix),
+            ],
+        );
+
+        assert_eq!(detects(&previous, &current), None);
     }
 
     #[test]

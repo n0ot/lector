@@ -792,12 +792,10 @@ impl App {
             if screen_transition {
                 // Primary and alternate screens are separate accessibility
                 // contexts. Do not let an acknowledgement from one context
-                // suppress text in the next. A restored primary screen is
-                // already-heard content, while a settled alternate screen is
-                // a new reading context.
-                if view.screen().screen == crate::terminal::ScreenIdentity::Alternate {
-                    speak_application_cursor_line(sr, view)?;
-                }
+                // suppress text in the next. A settled alternate screen is a
+                // new reading context, while the restored primary screen has
+                // already been heard and only needs its current line.
+                announce_screen_transition(sr, view)?;
             } else {
                 let mut read_text = sr.resolve_pending_delete(view)?;
                 let auto_read_text = if sr.auto_read_enabled() {

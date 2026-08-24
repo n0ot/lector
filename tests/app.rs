@@ -1418,20 +1418,39 @@ fn review_prompt_jumps_use_osc133_markers() {
 #[test]
 fn readline_history_arrows_speak_the_recalled_input_without_the_prompt() {
     let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
     app.handle_pty(
         &mut sr,
-        b"\x1B]133;A\x07user@host$ \x1B]133;B\x07old",
+        b"\x1B[2;1H\x1B[2m\xe2\x96\x8c\x1B[0m\x1B[1;1H\x1B]133;A\x07user@host$ \x1B]133;B\x07old",
         &mut term_out,
     )
     .expect("render editable prompt");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present editable prompt");
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(
         app.maybe_finalize_changes(&mut sr)
             .expect("finalize prompt")
     );
     recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B7\x1B[2;1H\x1B[2;4m\xe2\x96\x8c\x1B[0m\x1B8",
+        &mut term_out,
+    )
+    .expect("queue a pre-input prompt repaint");
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    app.drain_scheduled_output(&mut writer, false)
+        .expect("write the pre-input repaint up to its flush fence");
 
     app.handle_stdin(&mut sr, b"\x1B[A", &mut pty_out, &mut term_out)
         .expect("forward history up");
@@ -1441,6 +1460,21 @@ fn readline_history_arrows_speak_the_recalled_input_without_the_prompt() {
         &mut term_out,
     )
     .expect("render Readline history selection");
+
+    writer.block_flush = false;
+    writer.block_writes = true;
+    app.drain_scheduled_output(&mut writer, true)
+        .expect("flush only the pre-input repaint");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the pre-input receipt")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    writer.block_writes = false;
+    app.drain_scheduled_output(&mut writer, true)
+        .expect("present the Readline redraw");
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(
         app.maybe_finalize_changes(&mut sr)
@@ -1456,6 +1490,361 @@ fn readline_history_arrows_speak_the_recalled_input_without_the_prompt() {
         .map(|(text, _)| text.clone())
         .collect();
     assert_eq!(spoken, ["recalled command"]);
+}
+
+#[test]
+fn readline_history_repaint_reads_the_complete_soft_wrapped_cursor_line() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.on_resize(8, 20, &mut term_out)
+        .expect("resize the terminal");
+    app.handle_pty(&mut sr, b"P> ", &mut term_out)
+        .expect("render a prompt without semantic markers");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize prompt")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B[A", &mut pty_out, &mut term_out)
+        .expect("recall the newer wrapped entry");
+    app.handle_pty(
+        &mut sr,
+        b"bravo red blue green white black orange purple gray",
+        &mut term_out,
+    )
+    .expect("render the newer wrapped entry");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the newer entry")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B[A", &mut pty_out, &mut term_out)
+        .expect("recall the older wrapped entry");
+    // Byte-for-byte Readline 8.3 redraw at 20 columns: it edits all three
+    // physical rows, then leaves the hardware cursor on the final one.
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[A\x1B[A\r\x1B[C\x1B[C\x1B[Calpha one two th\r\n\r\x1B[C\x1B[C four five six seve\x1B[1Pn eight nine",
+        &mut term_out,
+    )
+    .expect("render the older wrapped entry");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the older entry")
+    );
+
+    assert_eq!(pty_out, b"\x1B[A\x1B[A");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[(
+            "P greater  alpha one two three four five six seven eight nine".into(),
+            false,
+        )]
+    );
+
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1B[B", &mut pty_out, &mut term_out)
+        .expect("return to the newer wrapped entry");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[A\x1B[A\r\x1B[C\x1B[C\x1B[Cbravo red blue g\r\n\r\x1B[C\x1B[Cn white black orange purple gray",
+        &mut term_out,
+    )
+    .expect("redraw the newer wrapped entry");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the newer entry again")
+    );
+
+    assert_eq!(pty_out, b"\x1B[A\x1B[A\x1B[B");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[(
+            "P greater  bravo red blue green white black orange purple gray".into(),
+            false,
+        )]
+    );
+}
+
+#[test]
+fn unwrapped_multirow_interface_repaint_still_reads_only_the_cursor_row() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[HMenu old\x1B[2;1HPanel old\x1B[3;1HStatus wait",
+        &mut term_out,
+    )
+    .expect("render an unwrapped interface");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the initial interface")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B[A", &mut pty_out, &mut term_out)
+        .expect("forward interface navigation");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[HMenu new\x1B[2;1HPanel new\x1B[3;1HStatus done",
+        &mut term_out,
+    )
+    .expect("repaint the unwrapped interface");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the interface repaint")
+    );
+
+    assert_eq!(pty_out, b"\x1B[A");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("Status done".into(), false)]
+    );
+}
+
+#[test]
+fn newly_opened_primary_screen_interface_reads_its_bounded_region() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[10;1HAsk for input\x1B[12;1Hcurrent status\x1B[10;1H",
+        &mut term_out,
+    )
+    .expect("render the underlying interface");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the underlying interface")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("confirm opening the modal");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[?2026h\x1B[10;1H\x1B[JSelect model\x1B[11;1HChoose one\x1B[13;1HFirst choice\x1B[14;1HSecond choice\x1B[16;1HPress enter to confirm\x1B[?25l\x1B[?2026l",
+        &mut term_out,
+    )
+    .expect("open a bounded multi-row modal in the primary screen");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the modal")
+    );
+
+    assert_eq!(pty_out, b"\r");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[(
+            "Select model\nChoose one\n\nFirst choice\nSecond choice\n\nPress enter to confirm"
+                .into(),
+            false,
+        )]
+    );
+}
+
+#[test]
+fn wrapped_history_selection_is_not_suppressed_by_stale_printable_echo() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    sr.set_suppress_key_echo(true);
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.on_resize(8, 20, &mut term_out)
+        .expect("resize the terminal");
+    app.handle_pty(&mut sr, b"P> ", &mut term_out)
+        .expect("render a prompt without semantic markers");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize prompt")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    // The typed x has reached the model but not an accessibility commit when
+    // Up replaces it. Since the recalled command also ends in x, generic echo
+    // suffix matching must not consume the history announcement.
+    app.handle_stdin(&mut sr, b"x", &mut pty_out, &mut term_out)
+        .expect("type a draft suffix");
+    app.handle_pty(&mut sr, b"x", &mut term_out)
+        .expect("echo the uncommitted draft suffix");
+    app.handle_stdin(&mut sr, b"\x1B[A", &mut pty_out, &mut term_out)
+        .expect("recall wrapped history");
+    app.handle_pty(
+        &mut sr,
+        b"\r\x1B[2KP> alpha one two three four five six seven eight nine x",
+        &mut term_out,
+    )
+    .expect("replace the draft with wrapped history");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize wrapped history")
+    );
+
+    assert_eq!(pty_out, b"x\x1B[A");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[(
+            "P greater  alpha one two three four five six seven eight nine x".into(),
+            false,
+        )]
+    );
+}
+
+#[test]
+fn visual_focus_transfer_precedes_a_stale_shell_input_marker() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"\x1B]133;A\x07$ \x1B]133;B\x07old", &mut term_out)
+        .expect("render editable prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize prompt")
+    );
+
+    app.handle_stdin(&mut sr, b"\x12", &mut pty_out, &mut term_out)
+        .expect("forward history search key");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[2J\x1B[H\x1B[1m\xe2\x96\x8c\x1B[0m \x1B[1;7mAlpha\x1B[0m\x1B[2;1H\x1B[2m\xe2\x96\x8c\x1B[0m Bravo\x1B[3;1H\x1B[2m\xe2\x96\x8c\x1B[0m Delta\x1B[4;1H\x1B[2m\xe2\x96\x8c\x1B[0m Gamma\x1B[6;3H\x1B[?25h",
+        &mut term_out,
+    )
+    .expect("render temporary history interface");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize history interface")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B[A", &mut pty_out, &mut term_out)
+        .expect("forward interface navigation");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[H\x1B[2m\xe2\x96\x8c\x1B[0m Alpha\x1B[2;1H\x1B[1m\xe2\x96\x8c\x1B[0m \x1B[1;7mBravo\x1B[0m\x1B[6;3H",
+        &mut term_out,
+    )
+    .expect("move visual focus");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize visual focus move")
+    );
+
+    assert_eq!(pty_out, b"\x12\x1B[A");
+    let spoken: Vec<_> = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.clone())
+        .collect();
+    assert_eq!(spoken, ["Bravo"]);
+}
+
+#[test]
+fn stale_shell_input_waits_for_the_visual_focus_keys_presented_frame() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1B]133;A\x07$ \x1B]133;B\x07old", &mut term_out)
+        .expect("queue editable prompt");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present editable prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize prompt")
+    );
+
+    app.handle_stdin(&mut sr, b"\x12", &mut pty_out, &mut term_out)
+        .expect("forward history search key");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[2J\x1B[H\x1B[1m\xe2\x96\x8c\x1B[0m \x1B[1;7mAlpha\x1B[0m\x1B[2;1H\x1B[2m\xe2\x96\x8c\x1B[0m Bravo\x1B[3;1H\x1B[2m\xe2\x96\x8c\x1B[0m Delta\x1B[4;1H\x1B[2m\xe2\x96\x8c\x1B[0m Gamma\x1B[6;3H\x1B[?25h",
+        &mut term_out,
+    )
+    .expect("queue temporary history interface");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present temporary history interface");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize history interface")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    // This harmless style repaint was modeled before Up and cannot prove
+    // how that key should be interpreted, even though its receipt comes later.
+    app.handle_pty(
+        &mut sr,
+        b"\x1B7\x1B[3;1H\x1B[2;4m\xe2\x96\x8c\x1B[0m\x1B8",
+        &mut term_out,
+    )
+    .expect("queue a pre-input repaint");
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    app.drain_scheduled_output(&mut writer, false)
+        .expect("write the pre-input repaint up to its flush fence");
+
+    app.handle_stdin(&mut sr, b"\x1B[A", &mut pty_out, &mut term_out)
+        .expect("forward interface navigation");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[H\x1B[2m\xe2\x96\x8c\x1B[0m Alpha\x1B[2;1H\x1B[1m\xe2\x96\x8c\x1B[0m \x1B[1;7mBravo\x1B[0m\x1B[6;3H",
+        &mut term_out,
+    )
+    .expect("queue the causally later visual focus frame");
+
+    writer.block_flush = false;
+    writer.block_writes = true;
+    app.drain_scheduled_output(&mut writer, true)
+        .expect("flush only the pre-input repaint");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the pre-input receipt")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    recorder.inner.borrow_mut().speaks.clear();
+    writer.block_writes = false;
+    app.drain_scheduled_output(&mut writer, true)
+        .expect("present the visual focus frame");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the visual focus receipt")
+    );
+
+    assert_eq!(pty_out, b"\x12\x1B[A");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("Bravo".into(), false)]
+    );
 }
 
 #[test]
@@ -2233,7 +2622,7 @@ fn alternate_screen_transition_realigns_review_cursor_even_at_the_same_position(
 }
 
 #[test]
-fn alternate_screen_entry_reads_its_cursor_line_and_primary_restore_is_silent() {
+fn alternate_screen_entry_reads_the_settled_view_and_primary_restore_reads_its_cursor_line() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig {
         latency_budget_ms: 0,
@@ -2269,7 +2658,7 @@ fn alternate_screen_entry_reads_its_cursor_line_and_primary_restore_is_silent() 
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("cursor line".into(), false)]
+        &[("not the cursor line\ncursor line".into(), false)]
     );
 
     recorder.inner.borrow_mut().speaks.clear();
@@ -2279,7 +2668,10 @@ fn alternate_screen_entry_reads_its_cursor_line_and_primary_restore_is_silent() 
         .expect("present the restored primary screen");
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
-    assert!(recorder.inner.borrow().speaks.is_empty());
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("primary line".into(), false)]
+    );
 }
 
 #[test]
@@ -2823,8 +3215,12 @@ fn alternate_screen_restores_the_primary_review_cursor() {
         .expect("restore primary screen");
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
-    assert!(recorder.inner.borrow().speaks.is_empty());
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("primary application line".into(), false)]
+    );
 
+    recorder.inner.borrow_mut().speaks.clear();
     app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
         .expect("read restored primary review cursor");
     assert_eq!(
@@ -3462,7 +3858,7 @@ fn auto_read_advances_to_a_presented_frame_while_the_parser_is_newer() {
 }
 
 #[test]
-fn lagged_neovim_alternate_screen_receipt_reads_only_its_cursor_line() {
+fn lagged_neovim_alternate_screen_receipt_reads_its_settled_view() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig {
         latency_budget_ms: 0,
@@ -3514,7 +3910,7 @@ fn lagged_neovim_alternate_screen_receipt_reads_only_its_cursor_line() {
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("cursor line".into(), false)]
+        &[("file first line\ncursor line".into(), false)]
     );
 }
 

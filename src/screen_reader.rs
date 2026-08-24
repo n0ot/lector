@@ -853,11 +853,12 @@ mod tests {
     fn structural_interface_repaint_uses_application_cursor_tracking() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(5, 24);
+        view.process_changes(
+            b"\x1b[2J\x1b[Hold history item\x1b[2;1H----------------\x1b[3;1H>\x1b[4;1H1/100\x1b[5;1H$ stale prompt\x1b[3;1H",
+        );
         view.finalize_changes(0);
 
-        view.process_changes(
-            b"\x1b[2J\x1b[Hhistory item\x1b[2;1H----------------\x1b[3;1H>\x1b[4;1H1/100\x1b[5;1H$ stale prompt\x1b[3;1H",
-        );
+        view.process_changes(b"\x1b[Hnew history item\x1b[4;1H2/100\x1b[3;1H");
         view.clear_renderer_damage_hints();
 
         let read = sr.auto_read_after_input(&mut view).unwrap();

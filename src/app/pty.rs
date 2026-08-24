@@ -3298,7 +3298,22 @@ impl App {
         let context = update_status
             .context
             .expect("an active accessibility update has a stabilization context");
-        if sr.has_pending_history_navigation() {
+        let history_focus_presentation = if sr.has_pending_history_navigation() {
+            let view = if presentation_tracking {
+                self.presented_accessibility_model_mut()
+            } else if tmux_base_active {
+                self.view_stack.active_mut().model()
+            } else {
+                self.view_stack.root_mut().model()
+            };
+            sr.visual_focus_response_presentation_ready(view)
+        } else {
+            None
+        };
+        if sr.has_pending_history_navigation() && history_focus_presentation.is_none() {
+            sr.clear_pending_history_navigation();
+        }
+        if history_focus_presentation == Some(true) {
             update_status.structural_semantic_input_repaint = false;
         }
         let Some(burst) = self.stabilization_burst(context) else {
@@ -3367,26 +3382,40 @@ impl App {
                 if !overlay_active && screen_transition {
                     // A screen identity handoff is a new reading context, not
                     // a whole-screen diff. Input echo acknowledgements cannot
-                    // cross that context boundary. Entering an alternate
-                    // screen announces its settled cursor row; restoring the
-                    // primary screen only reinstates content the user has
-                    // already heard.
-                    if view.screen().screen == crate::terminal::ScreenIdentity::Alternate {
-                        speak_application_cursor_line(sr, view)?;
-                    }
+                    // cross that context boundary. Read a settled alternate
+                    // screen in full, then only the current line when its
+                    // already-heard primary context is restored.
+                    announce_screen_transition(sr, view)?;
                 } else if !overlay_active {
                     let mut read_text = sr.resolve_pending_delete(view)?;
-                    let semantic_history_read = if sr.take_pending_history_navigation() {
+                    // A shell's OSC 133 B marker can remain attached to the
+                    // primary grid while a temporary interface owns that same
+                    // screen. First honor an exact, key-caused visual focus
+                    // transfer; only then interpret Up/Down as Readline history.
+                    let history_waits_for_presentation = history_focus_presentation == Some(false);
+                    let visual_focus_read = sr.has_pending_history_navigation()
+                        && history_focus_presentation == Some(true)
+                        && sr.auto_read_enabled()
+                        && recent_input
+                        && sr.read_visual_focus_transfer(view)?;
+                    let navigation_read = if visual_focus_read {
+                        sr.clear_pending_history_navigation();
+                        true
+                    } else if !history_waits_for_presentation
+                        && sr.take_pending_history_navigation()
+                    {
                         if let Some(input) = view.active_semantic_input() {
                             sr.speak(if input.is_empty() { "blank" } else { &input }, false)?;
                             true
+                        } else if sr.auto_read_enabled() && recent_input {
+                            sr.read_history_navigation_logical_line_repaint(view)?
                         } else {
                             false
                         }
                     } else {
                         false
                     };
-                    if semantic_history_read {
+                    if navigation_read {
                         read_text = true;
                     } else {
                         if sr.highlight_tracking_enabled() {

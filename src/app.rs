@@ -535,6 +535,18 @@ fn speak_application_cursor_line(sr: &mut ScreenReader, view: &View) -> Result<(
     Ok(())
 }
 
+fn announce_screen_transition(sr: &mut ScreenReader, view: &View) -> Result<()> {
+    match view.screen().screen {
+        ScreenIdentity::Alternate => {
+            sr.speak_application_screen(view)?;
+        }
+        ScreenIdentity::Primary => {
+            sr.speak_application_cursor_line(view)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct AccessibilityContext {
     view_id: ViewId,

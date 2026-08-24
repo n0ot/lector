@@ -1507,8 +1507,16 @@ fn actual_bash_fzf_and_neovim_behave_under_repeated_interactive_input() {
         "Neovim alternate-screen launches produced inconsistent speech"
     );
     assert!(
-        alternate_screen_return_speech.iter().all(String::is_empty),
-        "Neovim alternate-screen returns spoke restored or typed content"
+        alternate_screen_return_speech
+            .first()
+            .is_some_and(|speech| !speech.is_empty()),
+        "Neovim alternate-screen return did not read the restored cursor line"
+    );
+    assert!(
+        alternate_screen_return_speech
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]),
+        "Neovim alternate-screen returns produced inconsistent cursor-line speech"
     );
 
     lector.send(b"\x15");

@@ -10,6 +10,7 @@ pub(super) struct AutoReadBuffers {
     cursor_line: String,
     interface_state: String,
     interface_state_candidate: String,
+    interface_region: String,
     lcs: Vec<usize>,
 }
 
@@ -48,15 +49,7 @@ impl ScreenReader {
             .accessibility_update_summary()
             .has_linear_output_report();
 
-        if prefer_cursor
-            && self.read_visual_focus_transfer(
-                view,
-                cursor_moves,
-                scrolled,
-                structural_repaint,
-                linear_output_report,
-            )?
-        {
+        if prefer_cursor && self.read_visual_focus_transfer(view)? {
             return Ok(true);
         }
 
@@ -318,15 +311,19 @@ impl ScreenReader {
             && !(changed_row_count == 1 && (cursor_row_changed || prev_cursor_row_changed))
         {
             // Cursor-addressed painting without line boundaries describes an
-            // interface frame, not line-oriented command output. Do not read
-            // arbitrary changed rows. Cursor coordinates alone cannot report
-            // an interface whose application cursor happens to reuse the
-            // shell's previous coordinate, so read the cursor row directly.
+            // interface frame, not line-oriented command output. A bounded
+            // group of rows newly populated from blank space is evidence that
+            // a new interface or modal opened, so introduce that region in
+            // full. Ongoing interface redraws remain anchored to the cursor.
             self.auto_read_buffers.diff_text = diff_text;
             if pending_key_echo || self.key_echo_stream_active {
                 return Ok(true);
             }
-            self.speak_application_cursor_line(view)?;
+            if !self.read_new_interface_region_repaint(view)?
+                && !self.read_application_cursor_logical_line_repaint(view, true)?
+            {
+                self.speak_application_cursor_line(view)?;
+            }
             return Ok(true);
         }
         // Full-screen applications commonly redraw a ruler or status line along with an
@@ -453,9 +450,237 @@ impl ScreenReader {
         self.auto_read_buffers.diff_text = diff_text;
         Ok(original_nonempty)
     }
+
+    /// Speak the application cursor's complete soft-wrapped logical line.
+    ///
+    /// Cursor-addressed interfaces repaint physical rows, but a terminal
+    /// autowrap still represents one logical line. Keep this separate from the
+    /// ordinary cursor tracker: only a causally matched history response or
+    /// the guarded interface-repaint path above should widen a physical cursor
+    /// row into its wrap-connected run.
+    pub(crate) fn read_history_navigation_logical_line_repaint(
+        &mut self,
+        view: &View,
+    ) -> Result<bool> {
+        // Unlike generic auto-read, an explicit history selection is not a
+        // printable key echo. A still-pending typed suffix must not suppress
+        // the recalled command which replaced it.
+        self.read_application_cursor_logical_line_repaint(view, false)
+    }
+
+    fn read_new_interface_region_repaint(&mut self, view: &View) -> Result<bool> {
+        let mut region = std::mem::take(&mut self.auto_read_buffers.interface_region);
+        let has_region = collect_new_interface_region(view, &mut region);
+        if has_region {
+            self.speak(&region, false)?;
+        }
+        self.auto_read_buffers.interface_region = region;
+        Ok(has_region)
+    }
+
+    fn read_application_cursor_logical_line_repaint(
+        &mut self,
+        view: &View,
+        suppress_key_echo: bool,
+    ) -> Result<bool> {
+        let update = view.accessibility_update_summary();
+        if !update.output_report_structural
+            || update.parser_continuation
+            || update.scroll_operations > 0
+            || update.screen_before != crate::terminal::ScreenIdentity::Primary
+            || update.screen_after != crate::terminal::ScreenIdentity::Primary
+        {
+            return Ok(false);
+        }
+        let mut line = std::mem::take(&mut self.auto_read_buffers.cursor_line);
+        let has_logical_line = collect_application_cursor_logical_line(view, &mut line);
+        let handled = if has_logical_line {
+            if !suppress_key_echo || !self.should_suppress_key_echo(&line) {
+                self.speak(&line, false)?;
+            }
+            true
+        } else {
+            false
+        };
+        self.auto_read_buffers.cursor_line = line;
+        Ok(handled)
+    }
 }
 
 const MAX_COMPACT_INTERFACE_STATE_CHARS: usize = 32;
+const MIN_NEW_INTERFACE_POPULATED_ROWS: usize = 2;
+const MAX_NEW_INTERFACE_REGION_ROWS: usize = 64;
+const MAX_NEW_INTERFACE_REGION_CELLS: usize = 8_192;
+const MAX_APPLICATION_CURSOR_LOGICAL_LINE_ROWS: usize = 64;
+const MAX_APPLICATION_CURSOR_LOGICAL_LINE_CELLS: usize = 8_192;
+
+fn collect_new_interface_region(view: &View, out: &mut String) -> bool {
+    out.clear();
+    let previous = view.prev_screen();
+    let current = view.screen();
+    if previous.screen != crate::terminal::ScreenIdentity::Primary
+        || current.screen != crate::terminal::ScreenIdentity::Primary
+        // A visible application cursor remains the strongest generic anchor
+        // for editable/search interfaces. Hidden-cursor frames instead need
+        // their newly opened region introduced explicitly.
+        || current.cursor.visible
+        || previous.geometry != current.geometry
+        || previous.scrollback.len() != current.scrollback.len()
+        || previous.rows.len() != current.rows.len()
+    {
+        return false;
+    }
+
+    let mut first_changed = None;
+    let mut last_changed = 0usize;
+    let mut changed_text_rows = 0usize;
+    let mut newly_populated_rows = 0usize;
+    for (row, (old_row, new_row)) in previous.rows.iter().zip(current.rows.iter()).enumerate() {
+        if rows_have_same_text(old_row, new_row) {
+            continue;
+        }
+        first_changed.get_or_insert(row);
+        last_changed = row;
+        changed_text_rows = changed_text_rows.saturating_add(1);
+        if !row_has_visible_non_whitespace(old_row) && row_has_visible_non_whitespace(new_row) {
+            newly_populated_rows = newly_populated_rows.saturating_add(1);
+        }
+    }
+
+    let Some(first_changed) = first_changed else {
+        return false;
+    };
+    let row_count = last_changed.saturating_sub(first_changed).saturating_add(1);
+    let cells = row_count.saturating_mul(usize::from(current.size().1));
+    if changed_text_rows < 2
+        || newly_populated_rows < MIN_NEW_INTERFACE_POPULATED_ROWS
+        || row_count > MAX_NEW_INTERFACE_REGION_ROWS
+        || cells > MAX_NEW_INTERFACE_REGION_CELLS
+    {
+        return false;
+    }
+
+    out.push_str(&current.contents_between(
+        first_changed as u16,
+        0,
+        last_changed as u16,
+        current.size().1,
+    ));
+    let trimmed = out.trim();
+    let leading = trimmed.as_ptr() as usize - out.as_ptr() as usize;
+    let trailing = leading.saturating_add(trimmed.len());
+    if leading > 0 {
+        out.drain(..leading);
+    }
+    out.truncate(trailing.saturating_sub(leading));
+    !out.is_empty()
+}
+
+fn row_has_visible_non_whitespace(row: &crate::terminal::Row) -> bool {
+    row.cells.iter().any(|cell| {
+        !cell.is_wide_continuation()
+            && cell
+                .contents()
+                .chars()
+                .any(|character| !character.is_whitespace())
+    })
+}
+
+fn collect_application_cursor_logical_line(view: &View, out: &mut String) -> bool {
+    out.clear();
+    let previous = view.prev_screen();
+    let current = view.screen();
+    if !current.cursor.visible
+        || previous.screen != current.screen
+        || previous.geometry != current.geometry
+        || previous.scrollback.len() != current.scrollback.len()
+        || previous.rows.len() != current.rows.len()
+    {
+        return false;
+    }
+
+    let Some((previous_start, previous_end)) = cursor_soft_wrapped_span(previous) else {
+        return false;
+    };
+    let Some((current_start, current_end)) = cursor_soft_wrapped_span(current) else {
+        return false;
+    };
+    let history_len = current.scrollback.len();
+    if current_start < history_len
+        || previous_start < history_len
+        || current_start != previous_start
+        || current_end == current_start
+    {
+        return false;
+    }
+
+    let span_end = previous_end.max(current_end);
+    let span_start_row = current_start - history_len;
+    let span_end_row = span_end - history_len;
+    let mut changed_text_rows = 0usize;
+    for (row, (old_row, new_row)) in previous.rows.iter().zip(current.rows.iter()).enumerate() {
+        if rows_have_same_text(old_row, new_row) {
+            continue;
+        }
+        if row < span_start_row || row > span_end_row {
+            return false;
+        }
+        changed_text_rows = changed_text_rows.saturating_add(1);
+    }
+
+    let row_count = current_end.saturating_sub(current_start).saturating_add(1);
+    let cells = row_count.saturating_mul(usize::from(current.size().1));
+    if row_count < 2
+        || changed_text_rows < 2
+        || row_count > MAX_APPLICATION_CURSOR_LOGICAL_LINE_ROWS
+        || cells > MAX_APPLICATION_CURSOR_LOGICAL_LINE_CELLS
+    {
+        return false;
+    }
+
+    for row in span_start_row..=current_end - history_len {
+        current.rows[row].append_contents_to(out);
+    }
+    out.truncate(out.trim_end().len());
+    !out.is_empty()
+}
+
+fn cursor_soft_wrapped_span(
+    snapshot: &crate::terminal::TerminalSnapshot,
+) -> Option<(usize, usize)> {
+    let history_len = snapshot.scrollback.len();
+    let cursor_index = history_len.saturating_add(usize::from(snapshot.cursor.row));
+    let total_rows = history_len.saturating_add(snapshot.rows.len());
+    if cursor_index >= total_rows {
+        return None;
+    }
+    let row_at = |index: usize| {
+        if index < history_len {
+            &snapshot.scrollback[index]
+        } else {
+            &snapshot.rows[index - history_len]
+        }
+    };
+
+    let mut start = cursor_index;
+    while start > 0 && row_at(start - 1).wrapped {
+        start -= 1;
+    }
+    let mut end = cursor_index;
+    while end.saturating_add(1) < total_rows && row_at(end).wrapped {
+        end += 1;
+    }
+    (cursor_index == end).then_some((start, end))
+}
+
+fn rows_have_same_text(previous: &crate::terminal::Row, current: &crate::terminal::Row) -> bool {
+    previous.cells.len() == current.cells.len()
+        && previous
+            .cells
+            .iter()
+            .zip(current.cells.iter())
+            .all(|(old, new)| old.contents() == new.contents())
+}
 
 fn collect_compact_interface_state_change(
     old_text: &str,

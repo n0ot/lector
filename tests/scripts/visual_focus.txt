@@ -11,6 +11,17 @@ Then expect-pty-stdin: j
 And expect-speak: Bravo
 And expect-no-speak:
 
+Scenario: stationary gutter and payload styles move as one row focus bundle
+Given pty-stdout: \x1B[?1049h\x1B[?2026h\x1B[2J\x1B[H\x1B[1m▌\x1B[0m \x1B[1;7mAlpha\x1B[0m\x1B[2;1H\x1B[2m▌\x1B[0m Bravo\x1B[3;1H\x1B[2m▌\x1B[0m Delta\x1B[4;1H\x1B[2m▌\x1B[0m Gamma\x1B[6;1H> \x1B[6;3H\x1B[?25h\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: \x1B[A
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[2m▌\x1B[0m Alpha\x1B[2;1H\x1B[1m▌\x1B[0m \x1B[1;7mBravo\x1B[0m\x1B[6;3H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: \x1B[A
+And expect-speak: Bravo
+And expect-no-speak:
+
 Scenario: arbitrary Unicode gutter marker moves without style semantics
 Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H▌ Alpha\x1B[2;1H  Same\x1B[3;1H  Same\x1B[5;1H> \x1B[24;80H\x1B[?2026l
 And settled:
@@ -151,6 +162,17 @@ And advance: 301
 And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[2;1H\x1B[7mBravo\x1B[27m\x1B[24;80H\x1B[?2026l
 And settled:
 Then expect-pty-stdin: j
+And expect-no-speak:
+
+Scenario: expired Up input does not get special visual focus treatment
+Given pty-stdout: \x1B[?1049h\x1B[?2026h\x1B[2J\x1B[H\x1B[1m▌\x1B[0m \x1B[1;7mAlpha\x1B[0m\x1B[2;1H\x1B[2m▌\x1B[0m Bravo\x1B[3;1H\x1B[2m▌\x1B[0m Delta\x1B[4;1H\x1B[2m▌\x1B[0m Gamma\x1B[6;1H> \x1B[6;3H\x1B[?25h\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: \x1B[A
+And advance: 301
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[2m▌\x1B[0m Alpha\x1B[2;1H\x1B[1m▌\x1B[0m \x1B[1;7mBravo\x1B[0m\x1B[6;3H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: \x1B[A
 And expect-no-speak:
 
 Scenario: style animation without input remains silent

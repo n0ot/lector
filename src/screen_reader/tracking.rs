@@ -39,6 +39,24 @@ pub(super) enum PendingDeleteKind {
 }
 
 impl ScreenReader {
+    pub(crate) fn speak_application_screen(&mut self, view: &View) -> Result<bool> {
+        // A printable key can be presented in the first settled frame of a
+        // newly entered screen. Preserve the same exact-echo suppression used
+        // by cursor-line tracking before widening the announcement.
+        let cursor_line = view.line(view.screen().cursor_position().0);
+        if self.should_suppress_key_echo(&cursor_line) {
+            return Ok(false);
+        }
+
+        let contents = view.screen().contents();
+        let contents = contents.trim();
+        if contents.is_empty() {
+            return Ok(false);
+        }
+        self.speak(contents, false)?;
+        Ok(true)
+    }
+
     pub(crate) fn speak_application_cursor_line(&mut self, view: &View) -> Result<bool> {
         let line = view.line(view.screen().cursor_position().0);
         if line.trim().is_empty() || self.should_suppress_key_echo(&line) {
