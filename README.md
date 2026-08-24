@@ -207,9 +207,11 @@ streaming-output cap.
 A cursor-addressed primary-screen repaint which hides the application cursor
 and newly populates multiple previously blank rows is treated as a bounded new
 interface or modal and that changed region is read in full. Once the interface
-is established, subsequent redraws remain anchored to its cursor line. A
-visible application cursor likewise stays authoritative for editable and
-search interfaces.
+is established, replacement-style redraws remain anchored to its cursor line.
+Cursor-addressed transcript growth above a prompt cursor instead uses the
+inserted-text diff, and prefix-preserving streaming extensions omit parallel
+status-row replacements. A visible application cursor otherwise stays
+authoritative for editable and search interfaces.
 
 For TUIs which hide or park the hardware cursor, or leave it at an input prompt,
 Lector can also recognize two deliberately narrow visual-focus representations

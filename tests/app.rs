@@ -1614,6 +1614,66 @@ fn unwrapped_multirow_interface_repaint_still_reads_only_the_cursor_row() {
 }
 
 #[test]
+fn cursor_addressed_transcript_growth_reads_the_inserted_response() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[?2026h\x1B[2J\x1B[HYou: explain repainting\x1B[4;1HWorking 1s\x1B[5;1H> \x1B[5;3H\x1B[?2026l",
+        &mut term_out,
+    )
+    .expect("render a cursor-addressed conversation");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the conversation")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("submit the prompt");
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[?2026h\x1B[2J\x1B[HYou: explain repainting\x1B[2;1HClaude:\x1B[3;1HThe response starts here.\x1B[4;1HIt continues on this row\x1B[6;1HWorking 1s\x1B[7;1H> \x1B[7;3H\x1B[?2026l",
+        &mut term_out,
+    )
+    .expect("paint assistant output above the stable prompt cursor");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the assistant response")
+    );
+
+    assert_eq!(pty_out, b"\r");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[(
+            "Claude:\n\nThe response starts here.\n\nIt continues on this row".into(),
+            false,
+        )]
+    );
+
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_pty(
+        &mut sr,
+        b"\x1B[?2026h\x1B[4;1HIt continues on this row with more detail.\x1B[6;1HWorking 2s\x1B[7;3H\x1B[?2026l",
+        &mut term_out,
+    )
+    .expect("stream more response text alongside a status repaint");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the streamed response")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("with more detail.".into(), false)]
+    );
+}
+
+#[test]
 fn newly_opened_primary_screen_interface_reads_its_bounded_region() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();

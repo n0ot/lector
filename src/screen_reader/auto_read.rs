@@ -11,6 +11,8 @@ pub(super) struct AutoReadBuffers {
     interface_state: String,
     interface_state_candidate: String,
     interface_region: String,
+    transcript_growth: String,
+    transcript_growth_candidate: String,
     lcs: Vec<usize>,
 }
 
@@ -203,6 +205,8 @@ impl ScreenReader {
             && ((line_feed_boundaries == 0
                 && (prefer_cursor || multiple_changed_rows || cursor_shape_changed))
                 || (line_feed_boundaries > 0 && cursor_operations_after_last_line_feed > 0));
+        let transcript_growth_repaint = interface_repaint
+            && has_inserted_transcript_lines(old_text, new_text, prev_cursor_row.min(cursor_row));
         let pending_key_echo = self.has_pending_key_echo();
         let pending_key_echo_count = self.pending_key_echo.len();
         let cursor_advanced =
@@ -305,7 +309,38 @@ impl ScreenReader {
                 return Ok(true);
             }
         }
+        if interface_repaint && !input_echo_cursor_row && !cursor_row_inline_edit {
+            let mut growth = std::mem::take(&mut self.auto_read_buffers.transcript_growth);
+            let mut candidate =
+                std::mem::take(&mut self.auto_read_buffers.transcript_growth_candidate);
+            let has_growth = collect_extended_transcript_lines(
+                old_text,
+                new_text,
+                prev_cursor_row.min(cursor_row),
+                &mut growth,
+                &mut candidate,
+                &mut self.auto_read_buffers.lcs,
+            );
+            let suppress_echo = has_growth && self.should_suppress_key_echo(&growth);
+            let growth_to_speak = if has_growth && !suppress_echo {
+                self.hook_on_live_read(&growth, cursor_moves, scrolled)?
+            } else {
+                None
+            };
+            self.auto_read_buffers.transcript_growth = growth;
+            self.auto_read_buffers.transcript_growth_candidate = candidate;
+            if has_growth {
+                self.auto_read_buffers.diff_text = diff_text;
+                if let Some(text) = growth_to_speak
+                    && !text.is_empty()
+                {
+                    self.speak(&text, false)?;
+                }
+                return Ok(true);
+            }
+        }
         if interface_repaint
+            && !transcript_growth_repaint
             && !input_echo_cursor_row
             && !cursor_row_inline_edit
             && !(changed_row_count == 1 && (cursor_row_changed || prev_cursor_row_changed))
@@ -314,7 +349,8 @@ impl ScreenReader {
             // interface frame, not line-oriented command output. A bounded
             // group of rows newly populated from blank space is evidence that
             // a new interface or modal opened, so introduce that region in
-            // full. Ongoing interface redraws remain anchored to the cursor.
+            // full. Replacement-style redraws remain anchored to the cursor;
+            // transcript growth was separated above and follows the diff.
             self.auto_read_buffers.diff_text = diff_text;
             if pending_key_echo || self.key_echo_stream_active {
                 return Ok(true);
@@ -513,6 +549,86 @@ const MAX_NEW_INTERFACE_REGION_ROWS: usize = 64;
 const MAX_NEW_INTERFACE_REGION_CELLS: usize = 8_192;
 const MAX_APPLICATION_CURSOR_LOGICAL_LINE_ROWS: usize = 64;
 const MAX_APPLICATION_CURSOR_LOGICAL_LINE_CELLS: usize = 8_192;
+
+fn transcript_lines_before_cursor(text: &str, cursor_row: usize) -> impl Iterator<Item = &str> {
+    text.split_terminator('\n')
+        .take(cursor_row)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+}
+
+/// Full-screen chat clients commonly redraw the whole transcript with the
+/// hardware cursor left at a prompt below it. Preserved lines followed by new
+/// lines above that cursor distinguish transcript growth from a menu whose
+/// labels were replaced in place.
+fn has_inserted_transcript_lines(old_text: &str, new_text: &str, cursor_row: usize) -> bool {
+    let old_count = transcript_lines_before_cursor(old_text, cursor_row).count();
+    let new_count = transcript_lines_before_cursor(new_text, cursor_row).count();
+    if old_count == 0 || new_count <= old_count {
+        return false;
+    }
+
+    let mut old_lines = transcript_lines_before_cursor(old_text, cursor_row).peekable();
+    let mut target = old_lines.next();
+    let mut matched = 0usize;
+    let mut skipped_old_line = false;
+    for new_line in transcript_lines_before_cursor(new_text, cursor_row) {
+        if target.is_some_and(|old_line| old_line == new_line) {
+            matched = matched.saturating_add(1);
+            target = old_lines.next();
+        } else if !skipped_old_line
+            && old_lines
+                .peek()
+                .is_some_and(|old_line| *old_line == new_line)
+        {
+            // Permit one transient spinner/status line to disappear while
+            // stable earlier context remains in order.
+            skipped_old_line = true;
+            matched = matched.saturating_add(1);
+            old_lines.next();
+            target = old_lines.next();
+        }
+    }
+    matched > 0 && old_count.saturating_sub(matched) <= 1
+}
+
+/// Collect only prefix-preserving line extensions above the prompt cursor.
+/// This lets streaming response text bypass cursor-only TUI tracking without
+/// also announcing a separately repainted status or ruler row.
+fn collect_extended_transcript_lines(
+    old_text: &str,
+    new_text: &str,
+    cursor_row: usize,
+    out: &mut String,
+    candidate: &mut String,
+    lcs: &mut Vec<usize>,
+) -> bool {
+    out.clear();
+    candidate.clear();
+    for (old_line, new_line) in old_text
+        .split_terminator('\n')
+        .zip(new_text.split_terminator('\n'))
+        .take(cursor_row)
+    {
+        let old_line = old_line.trim_end();
+        let new_line = new_line.trim_end();
+        let extends_by_field = !old_line.trim().is_empty()
+            && new_line.starts_with(old_line)
+            && new_line.len() > old_line.len()
+            && new_line.split_whitespace().count() > old_line.split_whitespace().count();
+        if !extends_by_field {
+            continue;
+        }
+        candidate.clear();
+        if collect_inserted_fields(old_line, new_line, candidate, lcs) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(candidate);
+        }
+    }
+    !out.is_empty()
+}
 
 fn collect_new_interface_region(view: &View, out: &mut String) -> bool {
     out.clear();
@@ -978,7 +1094,26 @@ fn is_word_char(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_inserted_fields, field_replacement};
+    use super::{collect_extended_transcript_lines, collect_inserted_fields, field_replacement};
+
+    #[test]
+    fn extended_transcript_lines_exclude_parallel_status_replacements() {
+        let old = "You: explain repainting\nClaude:\nThe response starts here.\nIt continues on this row\n\nWorking 1s\n> \n";
+        let new = "You: explain repainting\nClaude:\nThe response starts here.\nIt continues on this row with more detail.\n\nWorking 2s\n> \n";
+        let mut output = String::new();
+        let mut candidate = String::new();
+        let mut lcs = Vec::new();
+
+        assert!(collect_extended_transcript_lines(
+            old,
+            new,
+            6,
+            &mut output,
+            &mut candidate,
+            &mut lcs,
+        ));
+        assert_eq!(output, "with more detail.");
+    }
 
     #[test]
     fn replacement_expands_to_word_boundaries() {
