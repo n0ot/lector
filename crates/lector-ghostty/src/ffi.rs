@@ -81,6 +81,7 @@ pub(crate) const TERMINAL_OPT_SCROLLBACK_MAX_LINES: TerminalOption = 28;
 pub(crate) const TERMINAL_OPT_DESKTOP_NOTIFICATION: TerminalOption = 29;
 pub(crate) const TERMINAL_OPT_PROGRESS_REPORT: TerminalOption = 30;
 pub(crate) const TERMINAL_OPT_CONTINUATION_MAX_BYTES: TerminalOption = 31;
+pub(crate) const TERMINAL_OPT_MODE: TerminalOption = 34;
 pub(crate) const TERMINAL_OPT_UNKNOWN_SEQUENCE: TerminalOption = 35;
 pub(crate) const TERMINAL_OPT_UNKNOWN_MAX_BYTES: TerminalOption = 36;
 
@@ -308,8 +309,12 @@ pub(crate) const MODE_ANY_MOUSE: Mode = 1003;
 pub(crate) const MODE_FOCUS_EVENT: Mode = 1004;
 pub(crate) const MODE_UTF8_MOUSE: Mode = 1005;
 pub(crate) const MODE_SGR_MOUSE: Mode = 1006;
+pub(crate) const MODE_URXVT_MOUSE: Mode = 1015;
+pub(crate) const MODE_SGR_PIXEL_MOUSE: Mode = 1016;
 pub(crate) const MODE_BRACKETED_PASTE: Mode = 2004;
 pub(crate) const MODE_SYNCHRONIZED_OUTPUT: Mode = 2026;
+pub(crate) const MODE_COLOR_SCHEME_UPDATES: Mode = 2031;
+pub(crate) const MODE_IN_BAND_RESIZE: Mode = 2048;
 
 pub(crate) type KittyGraphicsData = c_int;
 pub(crate) const KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR: KittyGraphicsData = 1;

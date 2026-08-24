@@ -106,6 +106,14 @@ pub trait ViewController {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn model(&mut self) -> &mut View;
+    /// Changes only values returned to future child colour queries. Composite
+    /// controllers override this to update every terminal shadow they own.
+    fn set_virtual_terminal_colors(
+        &mut self,
+        colors: crate::terminal_protocol::VirtualTerminalColors,
+    ) {
+        self.model().set_virtual_terminal_colors(colors);
+    }
     /// Makes screen-derived accessibility state advance only after the
     /// corresponding physical render has completed its flush.
     fn enable_presentation_tracking(&mut self) {

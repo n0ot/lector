@@ -48,6 +48,18 @@ impl ScreenReader {
             .accessibility_update_summary()
             .has_linear_output_report();
 
+        if prefer_cursor
+            && self.read_visual_focus_transfer(
+                view,
+                cursor_moves,
+                scrolled,
+                structural_repaint,
+                linear_output_report,
+            )?
+        {
+            return Ok(true);
+        }
+
         let mut live_text = std::mem::take(&mut self.auto_read_buffers.live_text);
         view.accessibility_update_summary()
             .printed_text_into(&mut live_text);

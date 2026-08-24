@@ -12,7 +12,7 @@ use lector::{
     screen_reader::ScreenReader,
     speech,
     terminal::TerminalGeometry,
-    terminal_protocol::PhysicalTerminalProfile,
+    terminal_protocol::{PhysicalTerminalProfile, VirtualTerminalColors},
     tmux_control::CommandStatus,
     tmux_model::{INVENTORY_COMMAND, INVENTORY_REPLY_COUNT, PaneId, TmuxTopology},
     tmux_panes::TmuxPaneSet,
@@ -1260,6 +1260,65 @@ fn pane_default_colour_queries_use_the_control_client_report_channel() {
         drain(&mut app, &mut sr, &mut physical),
         b"refresh-client -r '%20:\x1b]10;rgb:ffff/ffff/ffff\x1b\\'\n\
           refresh-client -r '%20:\x1b]11;rgb:0000/0000/0000\x1b\\'\n"
+    );
+}
+
+#[test]
+fn prebootstrap_tmux_pane_default_colour_reports_survive_capture_and_wait_for_outer_profile() {
+    let recorder = Recorder::default();
+    let stack = views::ViewStack::new(Box::new(views::PtyView::new(4, 10)));
+    let app = App::new(stack).expect("create prebootstrap app");
+    let (mut app, mut sr, _recorder, mut physical) =
+        start_app_with_bootstraps_in_flight(app, recorder, false);
+    app.start_capability_probes(&mut physical)
+        .expect("start outer probes");
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(20, b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\"),
+        &mut physical,
+    )
+    .expect("buffer pane color queries before its bootstrap capture");
+
+    assert!(drain(&mut app, &mut sr, &mut physical).is_empty());
+
+    // The capture contains visible content, so the visual bootstrap does not
+    // replay buffered output. Non-visual report effects must still survive.
+    app.handle_pty(
+        &mut sr,
+        &reply(30, &[b"captured-visible-content".to_vec()]),
+        &mut physical,
+    )
+    .expect("complete pane bootstrap");
+    let held = drain(&mut app, &mut sr, &mut physical);
+    assert!(
+        !held
+            .windows(b"refresh-client -r".len())
+            .any(|window| window == b"refresh-client -r"),
+        "a prebootstrap pane report escaped before the outer color probe: {held:?}"
+    );
+
+    let mut root_input = Vec::new();
+    app.handle_stdin(
+        &mut sr,
+        b"\x1b]10;rgb:1234/2345/3456\x1b\\\x1b]11;rgb:dabc/ebcd/fcde\x1b\\\x1b[?64;22c",
+        &mut root_input,
+        &mut physical,
+    )
+    .expect("consume exact light outer profile");
+    assert!(root_input.is_empty());
+    assert_eq!(
+        app.physical_profile().virtual_terminal_colors(),
+        Some(VirtualTerminalColors::new(
+            lector::terminal_protocol::ColorScheme::Light,
+            lector::terminal_protocol::DefaultColor::new(0x1234, 0x2345, 0x3456),
+            lector::terminal_protocol::DefaultColor::new(0xdabc, 0xebcd, 0xfcde),
+        ))
+    );
+
+    assert_eq!(
+        drain(&mut app, &mut sr, &mut physical),
+        b"refresh-client -r '%20:\x1b]10;rgb:1234/2345/3456\x1b\\'\n\
+          refresh-client -r '%20:\x1b]11;rgb:dabc/ebcd/fcde\x1b\\'\n"
     );
 }
 

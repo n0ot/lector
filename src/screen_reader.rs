@@ -11,11 +11,13 @@ mod auto_read;
 mod hooks;
 mod options;
 mod tracking;
+mod visual_focus;
 
 use auto_read::AutoReadBuffers;
 use hooks::LuaHooks;
 use options::Options;
 use tracking::{CursorTrackingMode, PendingDelete};
+use visual_focus::PendingVisualFocusInput;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -117,6 +119,7 @@ pub struct ScreenReader {
     pending_deletes: VecDeque<PendingDelete>,
     input_sequence: u64,
     pending_history_navigation: bool,
+    pending_visual_focus_input: Option<PendingVisualFocusInput>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -151,6 +154,7 @@ impl ScreenReader {
             pending_deletes: VecDeque::new(),
             input_sequence: 0,
             pending_history_navigation: false,
+            pending_visual_focus_input: None,
         }
     }
 

@@ -148,7 +148,29 @@ impl App {
     }
 
     pub fn flush_application_replies(&mut self, pty_out: &mut dyn Write) -> Result<()> {
-        let replies = self.application_replies.take(ROOT_SOURCE);
+        // The child can run before the outer terminal answers Lector's
+        // startup probes. Hold its generated replies only while the bounded
+        // broker can still learn the exact default colours; otherwise an
+        // eager TUI could permanently cache Lector's dark fallback on a light
+        // terminal. A completed/expired probe always releases the child.
+        let color_probe_pending = self
+            .startup_probe_broker
+            .as_ref()
+            .is_some_and(|broker| broker.color_wait_pending(self.clock.now_ms()));
+        let mut replies = self.application_replies.take(ROOT_SOURCE);
+        if replies.is_empty() {
+            return Ok(());
+        }
+        if color_probe_pending
+            && let Some(offset) =
+                crate::terminal_protocol::first_virtual_color_reply_offset(&replies)
+        {
+            let held = replies.split_off(offset);
+            self.application_replies.queue(ROOT_SOURCE, &held);
+        }
+        if let Some(colors) = self.physical_profile.virtual_terminal_colors() {
+            replies = crate::terminal_protocol::rewrite_virtual_color_replies(&replies, colors);
+        }
         if replies.is_empty() {
             return Ok(());
         }
@@ -1313,19 +1335,24 @@ impl App {
         }
         if let Some((pane_id, status, output, line_flags)) = bootstrap_reply {
             self.discard_deferred_tmux_pane_output((connection_id, pane_id));
-            if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
-                let was_ready = view.is_ready();
-                view.apply_bootstrap_with_line_flags(
-                    pane_id,
-                    status,
-                    &output,
-                    line_flags,
-                    self.clock.now_ms(),
-                )?;
-                let is_ready = view.is_ready() && !view.is_showing_portal();
-                render_topology = is_ready && (!was_ready || view.is_pane_visible(pane_id));
-                announce_tmux_location |= !was_ready && is_ready;
-            }
+            let bootstrap_replies =
+                if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
+                    let was_ready = view.is_ready();
+                    let replies = view.apply_bootstrap_with_line_flags(
+                        pane_id,
+                        status,
+                        &output,
+                        line_flags,
+                        self.clock.now_ms(),
+                    )?;
+                    let is_ready = view.is_ready() && !view.is_showing_portal();
+                    render_topology = is_ready && (!was_ready || view.is_pane_visible(pane_id));
+                    announce_tmux_location |= !was_ready && is_ready;
+                    replies
+                } else {
+                    Vec::new()
+                };
+            self.queue_tmux_pane_report_replies(connection_id, pane_id, &bootstrap_replies);
             let pane_is_presented = self
                 .tmux_connections
                 .iter()
@@ -2156,14 +2183,7 @@ impl App {
         // every other shadow reply remains tmux-owned and is discarded.
         if let Some(outcome) = &mut outcome {
             let replies = std::mem::take(&mut outcome.update.pty_replies);
-            for command in crate::tmux_input::refresh_client_report_commands(pane_id, &replies) {
-                self.pending_tmux_commands.push_back(PendingTmuxCommand {
-                    connection_id,
-                    bytes: command,
-                    expected_replies: vec![ExpectedTmuxReply::Ignored],
-                    kind: PendingTmuxCommandKind::Ordinary,
-                });
-            }
+            self.queue_tmux_pane_report_replies(connection_id, pane_id, &replies);
         }
         let bells = outcome.as_ref().map_or(0, |outcome| outcome.bells);
         let output_screen = outcome.as_ref().map(|outcome| {
@@ -2200,6 +2220,22 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn queue_tmux_pane_report_replies(
+        &mut self,
+        connection_id: u64,
+        pane_id: crate::tmux_model::PaneId,
+        replies: &[u8],
+    ) {
+        for command in crate::tmux_input::refresh_client_report_commands(pane_id, replies) {
+            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+                connection_id,
+                bytes: command,
+                expected_replies: vec![ExpectedTmuxReply::Ignored],
+                kind: PendingTmuxCommandKind::ColorReport(pane_id),
+            });
+        }
     }
 
     fn resolve_destroyed_tmux_gateways(
@@ -2914,13 +2950,35 @@ impl App {
     ) -> Result<()> {
         let queued = self.pending_tmux_commands.len();
         let mut wrote = false;
+        let color_probe_pending = self
+            .startup_probe_broker
+            .as_ref()
+            .is_some_and(|broker| broker.color_wait_pending(self.clock.now_ms()));
+        let mut color_blocked_transports = BTreeSet::new();
         for _ in 0..queued {
-            let Some(command) = self.pending_tmux_commands.pop_front() else {
+            let Some(mut command) = self.pending_tmux_commands.pop_front() else {
                 break;
             };
-            if self.direct_transport_for(command.connection_id) != Some(connection_id) {
+            let direct_transport = self.direct_transport_for(command.connection_id);
+            if direct_transport != Some(connection_id) {
                 self.pending_tmux_commands.push_back(command);
                 continue;
+            }
+            if color_blocked_transports.contains(&direct_transport) {
+                self.pending_tmux_commands.push_back(command);
+                continue;
+            }
+            if color_probe_pending && matches!(command.kind, PendingTmuxCommandKind::ColorReport(_))
+            {
+                color_blocked_transports.insert(direct_transport);
+                self.pending_tmux_commands.push_back(command);
+                continue;
+            }
+            if matches!(command.kind, PendingTmuxCommandKind::ColorReport(_))
+                && let Some(colors) = self.physical_profile.virtual_terminal_colors()
+            {
+                command.bytes =
+                    crate::terminal_protocol::rewrite_virtual_color_replies(&command.bytes, colors);
             }
             let rejected_connection_id = command.connection_id;
             let rejected_replies = command.expected_replies.clone();
@@ -3064,7 +3122,9 @@ impl App {
                     .map(|bytes| (bytes, vec![ExpectedTmuxReply::Ignored]))
                     .collect::<Vec<_>>()
             }
-            PendingTmuxCommandKind::Ordinary | PendingTmuxCommandKind::Resize => {
+            PendingTmuxCommandKind::Ordinary
+            | PendingTmuxCommandKind::Resize
+            | PendingTmuxCommandKind::ColorReport(_) => {
                 vec![(command.bytes, command.expected_replies)]
             }
         };

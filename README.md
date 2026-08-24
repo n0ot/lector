@@ -165,7 +165,24 @@ those pane queries itself; Lector's pane engines are observational shadows and
 discard their duplicate replies.
 Lector puts DA1 last in its bounded physical-terminal startup probes and
 consumes replies through that processing fence; those replies are never sent to
-the application.
+the application. The same probe set reads the outer terminal's exact OSC 10/11
+default foreground and background plus its native light/dark report when
+available. Lector mirrors those values into OSC 10/11 and color-scheme replies
+for direct children, including applications which query during startup; the
+wait for outer replies is strictly bounded. For tmux-owned panes, Lector routes
+the exact OSC 10/11 values through tmux's report API when tmux asks for them;
+native color-scheme query handling remains tmux-owned. A semantic light/dark
+report wins over a luminance guess while the exact colors themselves are
+preserved, so one-shot adaptive-theme queries see the same startup defaults
+they would see without Lector in the path.
+
+Ghostty's parser recognizes more private modes than Lector implements end to
+end. URXVT mouse encoding 1015, pixel-coordinate mouse mode 1016, live
+color-scheme notifications 2031, and in-band resize reports 2048 are therefore
+reported as unsupported and kept reset even when an application enables them
+without querying first. This keeps applications on Lector's implemented mouse
+encodings and normal PTY resize path instead of advertising a partially working
+extension.
 
 The private database is local process state: SSH normally sends the public
 `TERM` name, not Lector's `TERMINFO` directory. A tmux client on a remote host
@@ -183,6 +200,29 @@ transition is a conservative legacy hint. Remaining unmarked output starts
 with a 30 ms quiet window, adapts per view between 8 and 60 ms, increases
 immediately after a detected late continuation, and retains the 300 ms
 streaming-output cap.
+
+For TUIs which hide or park the hardware cursor, or leave it at an input prompt,
+Lector can also recognize two deliberately narrow visual-focus representations
+without depending on a particular framework, color, or key binding. The common
+gate requires a decoded key press with nonempty input actually sent to the
+application and a causally later presented frame. Lector assigns no meaning to
+the key itself, so application-defined bindings, access keys, and remaps use the
+same path as arrows.
+
+A style-only move must be exactly one reciprocal style transfer between bounded
+text runs, with a selected style demonstrably rarer than the baseline. A textual
+line pointer may instead move one compact, punctuation-like token between the
+same leading-gutter columns of two stable, aligned item rows. Its glyph is
+learned from the frame, so `>`, Unicode pointers, and configured markers behave
+identically; an unchanged copy at the prompt is irrelevant. A marker-only list
+needs an unchanged peer row, while a two-row list needs corroborating reciprocal
+styling. A marker printed directly against its item text is likewise accepted
+only with reciprocal style evidence. Geometry, wrapping, links, cursor
+visibility, and cursor shape remain exact; coordinates may differ only while
+the cursor remains hidden. Global restyles, ambiguous style swaps, prompt
+edits, spinners, marker replacements, multiple simultaneous moves, scrolling or
+reordering, unrelated text updates, conceal/blink changes, and real cursor
+movement stay on the existing reading paths rather than being guessed as focus.
 
 The virtual terminal implements 256 colors, true color, OSC 8 hyperlinks, and
 the ordinary `xterm-256color` contract, so an inherited `COLORTERM` remains

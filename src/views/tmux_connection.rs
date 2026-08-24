@@ -193,7 +193,7 @@ impl TmuxConnectionView {
         status: CommandStatus,
         output: &[Vec<u8>],
         now_ms: u128,
-    ) -> std::result::Result<(), TmuxPaneError> {
+    ) -> std::result::Result<Vec<u8>, TmuxPaneError> {
         self.panes.apply_bootstrap(pane_id, status, output, now_ms)
     }
 
@@ -204,7 +204,7 @@ impl TmuxConnectionView {
         output: &[Vec<u8>],
         line_flags: bool,
         now_ms: u128,
-    ) -> std::result::Result<(), TmuxPaneError> {
+    ) -> std::result::Result<Vec<u8>, TmuxPaneError> {
         self.panes
             .apply_bootstrap_with_line_flags(pane_id, status, output, line_flags, now_ms)
     }
@@ -552,6 +552,15 @@ impl ViewController for TmuxConnectionView {
             }
         }
         &mut self.placeholder
+    }
+
+    fn set_virtual_terminal_colors(
+        &mut self,
+        colors: crate::terminal_protocol::VirtualTerminalColors,
+    ) {
+        self.placeholder.set_virtual_terminal_colors(colors);
+        self.portal.set_virtual_terminal_colors(colors);
+        self.panes.set_virtual_terminal_colors(colors);
     }
 
     fn enable_presentation_tracking(&mut self) {

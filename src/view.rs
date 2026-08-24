@@ -2044,6 +2044,15 @@ impl View {
         self.screen().size()
     }
 
+    /// Update future application colour-query replies without changing any
+    /// visible cells or accessibility/presentation revisions.
+    pub(crate) fn set_virtual_terminal_colors(
+        &mut self,
+        colors: crate::terminal_protocol::VirtualTerminalColors,
+    ) {
+        self.engine.set_virtual_terminal_colors(colors);
+    }
+
     /// Resizes this view
     pub fn set_size(&mut self, rows: u16, cols: u16) {
         self.set_size_with_geometry(TerminalGeometry::from_cells(rows, cols));

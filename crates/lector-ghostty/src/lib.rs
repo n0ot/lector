@@ -404,6 +404,20 @@ pub enum TerminalColorScheme {
     Dark,
 }
 
+/// One exact default colour exposed through an OSC 10 or OSC 11 query.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalDefaultColor {
+    pub red: u16,
+    pub green: u16,
+    pub blue: u16,
+}
+
+impl TerminalDefaultColor {
+    pub const fn new(red: u16, green: u16, blue: u16) -> Self {
+        Self { red, green, blue }
+    }
+}
+
 /// Virtual terminal values supplied to Ghostty's query callbacks.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TerminalProfile {
@@ -412,6 +426,8 @@ pub struct TerminalProfile {
     pub cell_width: u32,
     pub cell_height: u32,
     pub color_scheme: TerminalColorScheme,
+    pub default_foreground: Option<TerminalDefaultColor>,
+    pub default_background: Option<TerminalDefaultColor>,
     pub enquiry: Vec<u8>,
     pub version: String,
     pub da_conformance: u16,
@@ -676,6 +692,14 @@ impl TerminalHandle {
         // lifetimes are tied to the owning `Terminal` below.
         result_from_code(unsafe { ffi::ghostty_terminal_set(self.as_ptr(), option, value) })
     }
+
+    fn set_mode(&self, mode: ffi::Mode, value: bool) -> Result<(), Error> {
+        let config = ffi::TerminalModeConfig { mode, value };
+        self.set_option(
+            ffi::TERMINAL_OPT_MODE,
+            (&config as *const ffi::TerminalModeConfig).cast(),
+        )
+    }
 }
 
 impl Drop for TerminalHandle {
@@ -769,6 +793,66 @@ const UNKNOWN_SEQUENCE_MAX_BYTES: usize = 256;
 const CONTINUATION_MAX_BYTES: usize = 64 * 1024;
 const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// DEC private modes understood by Ghostty's parser but not implemented by
+/// Lector's application-facing terminal contract.
+///
+/// Modes 1015 and 1016 select mouse encodings which Lector does not translate,
+/// mode 2031 subscribes to live colour-scheme notifications, and mode 2048
+/// makes resize notifications arrive in-band. Reporting Ghostty's internal
+/// mode bit as supported would therefore make applications select protocols
+/// which Lector cannot deliver. Keep these reports at DECRQM state zero until
+/// the matching input, theme-notification, and resize paths are implemented.
+fn force_unbrokered_private_modes_unsupported(bytes: &mut [u8]) {
+    let mut sequence_start = 0usize;
+    while sequence_start < bytes.len() {
+        let Some((mut cursor, next_start)) = (match bytes[sequence_start] {
+            b'\x1b' if bytes.get(sequence_start + 1) == Some(&b'[') => {
+                Some((sequence_start + 2, sequence_start + 2))
+            }
+            0x9b => Some((sequence_start + 1, sequence_start + 1)),
+            _ => None,
+        }) else {
+            sequence_start += 1;
+            continue;
+        };
+        sequence_start = next_start;
+
+        if bytes.get(cursor) != Some(&b'?') {
+            continue;
+        }
+        cursor += 1;
+
+        let mut mode = 0u16;
+        let digits_start = cursor;
+        while let Some(digit @ b'0'..=b'9') = bytes.get(cursor).copied() {
+            let Some(next) = mode
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(u16::from(digit - b'0')))
+            else {
+                mode = u16::MAX;
+                break;
+            };
+            mode = next;
+            cursor += 1;
+        }
+        if cursor == digits_start || !matches!(mode, 1015 | 1016 | 2031 | 2048) {
+            continue;
+        }
+        if bytes.get(cursor) != Some(&b';') {
+            continue;
+        }
+        let state_index = cursor + 1;
+        if !matches!(bytes.get(state_index), Some(b'0'..=b'4'))
+            || bytes.get(state_index + 1) != Some(&b'$')
+            || bytes.get(state_index + 2) != Some(&b'y')
+        {
+            continue;
+        }
+        bytes[state_index] = b'0';
+        sequence_start = state_index + 3;
+    }
+}
+
 fn stable_digest(bytes: &[u8]) -> u64 {
     let mut digest = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
@@ -799,10 +883,15 @@ impl EffectSink {
             self.pty_replies.clear();
             return Err(error);
         }
-        Ok((
-            std::mem::take(&mut self.events),
-            std::mem::take(&mut self.pty_replies),
-        ))
+        let mut events = std::mem::take(&mut self.events);
+        let mut pty_replies = std::mem::take(&mut self.pty_replies);
+        force_unbrokered_private_modes_unsupported(&mut pty_replies);
+        for event in &mut events {
+            if let EffectSnapshot::PtyReply(reply) = event {
+                force_unbrokered_private_modes_unsupported(reply);
+            }
+        }
+        Ok((events, pty_replies))
     }
 }
 
@@ -1394,6 +1483,11 @@ struct CachedKittyImage {
     data_digest: u64,
 }
 
+const UNBROKERED_MODE_URXVT_MOUSE: u8 = 1 << 0;
+const UNBROKERED_MODE_SGR_PIXEL_MOUSE: u8 = 1 << 1;
+const UNBROKERED_MODE_COLOR_SCHEME_UPDATES: u8 = 1 << 2;
+const UNBROKERED_MODE_IN_BAND_RESIZE: u8 = 1 << 3;
+
 #[derive(Default)]
 struct StreamObserver {
     events: Vec<SemanticKindSnapshot>,
@@ -1427,6 +1521,7 @@ struct StreamObserver {
     synchronized_output_boundary: Option<bool>,
     cursor_visibility_boundary: Option<bool>,
     semantic_input_boundary: bool,
+    unbrokered_private_mode_boundary: u8,
 }
 
 impl StreamObserver {
@@ -1625,6 +1720,7 @@ impl StreamObserver {
             || !self.default_color_queries.is_empty()
             || self.synchronized_output_boundary.is_some()
             || self.cursor_visibility_boundary.is_some()
+            || self.unbrokered_private_mode_boundary != 0
     }
 
     fn take_synchronized_output_boundary(&mut self) -> Option<bool> {
@@ -1633,6 +1729,10 @@ impl StreamObserver {
 
     fn take_cursor_visibility_boundary(&mut self) -> Option<bool> {
         self.cursor_visibility_boundary.take()
+    }
+
+    fn take_unbrokered_private_mode_boundary(&mut self) -> u8 {
+        std::mem::take(&mut self.unbrokered_private_mode_boundary)
     }
 
     fn take_clipboard_read_queries(&mut self) -> Vec<Vec<u8>> {
@@ -1862,8 +1962,21 @@ impl vte::Perform for StreamObserver {
                         // Input and reporting modes do not alter the location
                         // or meaning of cell operations.
                         2026 => self.synchronized_output_boundary = Some(enabled),
-                        1 | 12 | 66 | 67 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 1015
-                        | 1016 | 2004 => {}
+                        1015 => {
+                            self.unbrokered_private_mode_boundary |= UNBROKERED_MODE_URXVT_MOUSE;
+                        }
+                        1016 => {
+                            self.unbrokered_private_mode_boundary |=
+                                UNBROKERED_MODE_SGR_PIXEL_MOUSE;
+                        }
+                        2031 => {
+                            self.unbrokered_private_mode_boundary |=
+                                UNBROKERED_MODE_COLOR_SCHEME_UPDATES;
+                        }
+                        2048 => {
+                            self.unbrokered_private_mode_boundary |= UNBROKERED_MODE_IN_BAND_RESIZE;
+                        }
+                        1 | 12 | 66 | 67 | 1000 | 1002 | 1003 | 1004 | 1005 | 1006 | 2004 => {}
                         // Unmodeled private modes can save/restore the cursor,
                         // resize/reset the grid, or change how later controls
                         // are interpreted. The dirty-state path remains safe.
@@ -2266,6 +2379,11 @@ impl Terminal {
             let synchronized_before = self.snapshot.modes.synchronized_output;
             let cursor_visible_before = self.snapshot.cursor.visible;
             self.write_vt(&bytes[segment_start..=index]);
+            let enforce_unbrokered_modes =
+                self.stream_observer.take_unbrokered_private_mode_boundary();
+            if enforce_unbrokered_modes != 0 {
+                self.enforce_unbrokered_private_modes(enforce_unbrokered_modes)?;
+            }
             self.answer_clipboard_queries();
             self.answer_default_color_queries();
             render_damage.merge(self.refresh_snapshot()?);
@@ -2320,6 +2438,11 @@ impl Terminal {
         }
         if segment_start < bytes.len() {
             self.write_vt(&bytes[segment_start..]);
+            let enforce_unbrokered_modes =
+                self.stream_observer.take_unbrokered_private_mode_boundary();
+            if enforce_unbrokered_modes != 0 {
+                self.enforce_unbrokered_private_modes(enforce_unbrokered_modes)?;
+            }
             self.answer_clipboard_queries();
             self.answer_default_color_queries();
             render_damage.merge(self.refresh_snapshot()?);
@@ -2399,27 +2522,50 @@ impl Terminal {
     fn answer_default_color_queries(&mut self) {
         for query in self.stream_observer.take_default_color_queries() {
             // libghostty-vt exposes the light/dark preference but no exact
-            // default-color callback. Give applications a deterministic
-            // virtual default consistent with that preference. tmux control
-            // clients can then return this raw OSC report with
-            // `refresh-client -r` without routing it through pane input.
+            // default-color callback. Lector's profile retains the outer
+            // terminal's OSC defaults so direct applications and tmux pane
+            // shadows receive the same values. The deterministic black/white
+            // pair remains the fallback when no exact outer value is known.
             let light =
                 self.effect_sink.terminal_profile.color_scheme == TerminalColorScheme::Light;
-            let white = b"rgb:ffff/ffff/ffff";
-            let black = b"rgb:0000/0000/0000";
-            let color: &[u8] = match (query, light) {
-                (10, true) | (11, false) => black,
-                (10, false) | (11, true) => white,
+            let black = TerminalDefaultColor::new(0, 0, 0);
+            let white = TerminalDefaultColor::new(u16::MAX, u16::MAX, u16::MAX);
+            let color = match (query, light) {
+                (10, _) => self.effect_sink.terminal_profile.default_foreground,
+                (11, _) => self.effect_sink.terminal_profile.default_background,
                 _ => continue,
-            };
+            }
+            .unwrap_or(match (query, light) {
+                (10, true) | (11, false) => black,
+                _ => white,
+            });
             self.effect_sink.pty_replies.extend_from_slice(b"\x1b]");
             self.effect_sink
                 .pty_replies
                 .extend_from_slice(query.to_string().as_bytes());
             self.effect_sink.pty_replies.push(b';');
-            self.effect_sink.pty_replies.extend_from_slice(color);
+            self.effect_sink.pty_replies.extend_from_slice(
+                format!(
+                    "rgb:{:04x}/{:04x}/{:04x}",
+                    color.red, color.green, color.blue
+                )
+                .as_bytes(),
+            );
             self.effect_sink.pty_replies.extend_from_slice(b"\x1b\\");
         }
+    }
+
+    /// Update values used by future child colour queries without resetting
+    /// the terminal grid or any parser state.
+    pub fn set_color_profile(
+        &mut self,
+        color_scheme: TerminalColorScheme,
+        default_foreground: TerminalDefaultColor,
+        default_background: TerminalDefaultColor,
+    ) {
+        self.effect_sink.terminal_profile.color_scheme = color_scheme;
+        self.effect_sink.terminal_profile.default_foreground = Some(default_foreground);
+        self.effect_sink.terminal_profile.default_background = Some(default_background);
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), Error> {
@@ -2436,6 +2582,11 @@ impl Terminal {
         if rows == 0 || cols == 0 {
             return Err(Error::InvalidValue);
         }
+        // A child may blindly enable a private mode even after Lector reports
+        // it unsupported. Clear Ghostty's in-band-resize ModeState before it
+        // observes this resize. This direct option cannot disturb an
+        // incomplete VT sequence or any supported mouse encoding.
+        self.enforce_unbrokered_private_modes(UNBROKERED_MODE_IN_BAND_RESIZE)?;
         let cell_layout_changed = self.effect_sink.terminal_profile.rows != rows
             || self.effect_sink.terminal_profile.columns != cols;
         self.effect_sink.terminal_profile.rows = rows;
@@ -2726,6 +2877,23 @@ impl Terminal {
         unsafe {
             ffi::ghostty_terminal_vt_write(self.terminal.as_ptr(), bytes.as_ptr(), bytes.len())
         };
+    }
+
+    fn enforce_unbrokered_private_modes(&self, modes: u8) -> Result<(), Error> {
+        for (flag, mode) in [
+            (UNBROKERED_MODE_URXVT_MOUSE, ffi::MODE_URXVT_MOUSE),
+            (UNBROKERED_MODE_SGR_PIXEL_MOUSE, ffi::MODE_SGR_PIXEL_MOUSE),
+            (
+                UNBROKERED_MODE_COLOR_SCHEME_UPDATES,
+                ffi::MODE_COLOR_SCHEME_UPDATES,
+            ),
+            (UNBROKERED_MODE_IN_BAND_RESIZE, ffi::MODE_IN_BAND_RESIZE),
+        ] {
+            if modes & flag != 0 {
+                self.terminal.set_mode(mode, false)?;
+            }
+        }
+        Ok(())
     }
 
     /// Captures the newest logically retained history rows. Ghostty allocates

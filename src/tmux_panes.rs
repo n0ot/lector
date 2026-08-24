@@ -530,6 +530,7 @@ pub struct TmuxPaneSet {
     orphan_output: BTreeMap<PaneId, Vec<u8>>,
     prebootstrap_bytes: usize,
     presentation_tracking: bool,
+    virtual_terminal_colors: crate::terminal_protocol::VirtualTerminalColors,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -562,6 +563,9 @@ impl TmuxPaneSet {
             orphan_output: BTreeMap::new(),
             prebootstrap_bytes: 0,
             presentation_tracking: false,
+            virtual_terminal_colors: crate::terminal_protocol::VirtualTerminalColors::for_scheme(
+                crate::terminal_protocol::ColorScheme::Dark,
+            ),
         }
     }
 
@@ -590,6 +594,7 @@ impl TmuxPaneSet {
         }
         self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(removed_bytes);
         let mut requests = Vec::new();
+        let virtual_terminal_colors = self.virtual_terminal_colors;
         for pane in topology.panes().values() {
             let rows = dimension(pane.height);
             let cols = dimension(pane.width);
@@ -597,6 +602,7 @@ impl TmuxPaneSet {
                 let surface_id = SurfaceId(self.next_surface_id);
                 self.next_surface_id = self.next_surface_id.saturating_add(1);
                 let mut view = View::new(rows, cols);
+                view.set_virtual_terminal_colors(virtual_terminal_colors);
                 if self.presentation_tracking {
                     view.enable_presentation_tracking();
                 }
@@ -643,6 +649,17 @@ impl TmuxPaneSet {
                 portal.view.enable_presentation_tracking();
             }
         }
+    }
+
+    pub(crate) fn set_virtual_terminal_colors(
+        &mut self,
+        colors: crate::terminal_protocol::VirtualTerminalColors,
+    ) {
+        self.virtual_terminal_colors = colors;
+        self.visit_presentation_views_mut(&mut |view| {
+            view.set_virtual_terminal_colors(colors);
+            false
+        });
     }
 
     pub fn process_output(
@@ -725,7 +742,7 @@ impl TmuxPaneSet {
         status: CommandStatus,
         output: &[Vec<u8>],
         now_ms: u128,
-    ) -> Result<(), TmuxPaneError> {
+    ) -> Result<Vec<u8>, TmuxPaneError> {
         self.apply_bootstrap_with_line_flags(pane_id, status, output, true, now_ms)
     }
 
@@ -736,7 +753,7 @@ impl TmuxPaneSet {
         output: &[Vec<u8>],
         line_flags: bool,
         now_ms: u128,
-    ) -> Result<(), TmuxPaneError> {
+    ) -> Result<Vec<u8>, TmuxPaneError> {
         let state = self
             .panes
             .get_mut(&pane_id)
@@ -746,14 +763,34 @@ impl TmuxPaneSet {
             state.bootstrap_requested = false;
             let buffered = std::mem::take(&mut state.prebootstrap_output);
             self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
-            state.view.process_changes(&buffered);
+            let update = state.view.process_changes_with_batch(&buffered, true);
             state.view.discard_shadow_pty_replies();
-            return Ok(());
+            return Ok(update.pty_replies);
         }
 
         let rows = dimension(state.metadata.height);
         let cols = dimension(state.metadata.width);
+        let buffered = std::mem::take(&mut state.prebootstrap_output);
+        self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
+
+        // A capture can already contain every visible byte from the buffered
+        // `%output`, so replaying that stream into the authoritative view is
+        // conditional below. Terminal report queries are non-visual and do
+        // not appear in a capture, however. Parse the bounded buffer once in
+        // an isolated shadow so its OSC 10/11 replies survive either branch
+        // without duplicating text or accessibility revisions.
+        let buffered_replies = if buffered.is_empty() {
+            Vec::new()
+        } else {
+            let mut effect_shadow = View::new(rows, cols);
+            effect_shadow.set_virtual_terminal_colors(self.virtual_terminal_colors);
+            effect_shadow
+                .process_changes_with_batch(&buffered, false)
+                .pty_replies
+        };
+
         let mut view = View::new(rows, cols);
+        view.set_virtual_terminal_colors(self.virtual_terminal_colors);
         let bytes = reconstruction_bytes(
             state.metadata.alternate_on,
             state.metadata.cursor_x,
@@ -767,8 +804,6 @@ impl TmuxPaneSet {
             },
         );
         view.process_changes(&bytes);
-        let buffered = std::mem::take(&mut state.prebootstrap_output);
-        self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
         if !view.screen().has_visible_non_whitespace_content() && !buffered.is_empty() {
             view.process_changes(&buffered);
         }
@@ -788,7 +823,7 @@ impl TmuxPaneSet {
         if self.presentation_tracking {
             self.retired_presentations.push(retired);
         }
-        Ok(())
+        Ok(buffered_replies)
     }
 
     pub fn apply_resync_capture(
@@ -832,6 +867,7 @@ impl TmuxPaneSet {
         let rows = dimension(metadata.height);
         let cols = dimension(metadata.width);
         let mut view = View::new(rows, cols);
+        view.set_virtual_terminal_colors(self.virtual_terminal_colors);
         let bytes = reconstruction_bytes(
             metadata.alternate_on,
             metadata.cursor_x,
@@ -1013,6 +1049,7 @@ impl TmuxPaneSet {
             self.retired_presentations.push(retired);
         }
         let mut view = View::new(rows, cols);
+        view.set_virtual_terminal_colors(self.virtual_terminal_colors);
         if presentation_tracking {
             view.enable_presentation_tracking();
         }

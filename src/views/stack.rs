@@ -21,6 +21,7 @@ pub struct ViewStack {
     next_compositor_transition: u64,
     compositor_transition: Option<CompositorTransitionToken>,
     presentation_tracking: bool,
+    virtual_terminal_colors: crate::terminal_protocol::VirtualTerminalColors,
 }
 
 impl ViewStack {
@@ -37,6 +38,9 @@ impl ViewStack {
             next_compositor_transition: 1,
             compositor_transition: None,
             presentation_tracking: false,
+            virtual_terminal_colors: crate::terminal_protocol::VirtualTerminalColors::for_scheme(
+                crate::terminal_protocol::ColorScheme::Dark,
+            ),
         }
     }
 
@@ -60,6 +64,7 @@ impl ViewStack {
     }
 
     pub fn push(&mut self, mut view: Box<dyn ViewController>) {
+        view.set_virtual_terminal_colors(self.virtual_terminal_colors);
         if self.presentation_tracking {
             view.enable_presentation_tracking();
         }
@@ -78,6 +83,16 @@ impl ViewStack {
         self.presentation_tracking = true;
         for view in &mut self.views {
             view.enable_presentation_tracking();
+        }
+    }
+
+    pub(crate) fn set_virtual_terminal_colors(
+        &mut self,
+        colors: crate::terminal_protocol::VirtualTerminalColors,
+    ) {
+        self.virtual_terminal_colors = colors;
+        for view in self.views.iter_mut().chain(&mut self.retired_views) {
+            view.set_virtual_terminal_colors(colors);
         }
     }
 

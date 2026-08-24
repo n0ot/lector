@@ -166,6 +166,9 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        // A focus notification can independently repaint the child. Never
+        // attribute that later frame to an earlier key press.
+        sr.clear_pending_visual_focus_input();
         let forward_to_app = self
             .view_stack
             .active_mut()
@@ -233,6 +236,7 @@ impl App {
                 self.handle_key_event(sr, key, raw, pty_out, term_out)
             }
             Event::Paste(contents) => {
+                sr.clear_pending_visual_focus_input();
                 self.log_event(&format!("parsed paste event: [{} chars]", contents.len()));
                 let view_action = self
                     .view_stack
@@ -241,6 +245,7 @@ impl App {
                 self.handle_view_action(sr, view_action, term_out)
             }
             Event::Mouse(mouse) => {
+                sr.clear_pending_visual_focus_input();
                 if let Some(view) = self.view_stack.active_tmux_connection_mut() {
                     if let Some(action) = view.translate_mouse_input(mouse) {
                         self.last_stdin_update = Some(self.clock.now_ms());
@@ -274,6 +279,9 @@ impl App {
             self.forwarded_key_presses.remove(&key_id);
             self.consumed_key_presses.remove(&key_id);
             self.view_transition_key_presses.remove(&key_id);
+            if key_event.kind != KeyEventKind::Release {
+                sr.clear_pending_visual_focus_input();
+            }
             self.log_event("swallowing stale Ctrl-C during Kitty input handoff");
             return Ok(());
         }
@@ -577,6 +585,10 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         let event = key.event();
+        let visual_focus_context = (!key.is_release()).then(|| {
+            let view = self.view_stack.active_mut().model();
+            (view.view_id(), view.input_intent_revision_boundary())
+        });
         let (child_kitty_keyboard_flags, application_cursor, application_keypad, screen_identity) = {
             let screen = self.view_stack.active_mut().model().live_screen();
             (
@@ -609,6 +621,14 @@ impl App {
             .view_stack
             .active_mut()
             .handle_key_input(sr, key, &input, pty_out)?;
+        let visual_focus_claim = visual_focus_context.map(|(view_id, revision_boundary)| {
+            let forwarded = match &action {
+                views::ViewAction::PtyInput => !input.is_empty(),
+                views::ViewAction::TmuxInput { bytes, .. } => !bytes.is_empty(),
+                _ => false,
+            };
+            (view_id, revision_boundary, forwarded)
+        });
         if let Some(mode) = kitty_press_mode {
             let target = match &action {
                 views::ViewAction::PtyInput => Some(ForwardedInputTarget::RootPty),
@@ -641,7 +661,11 @@ impl App {
             self.view_transition_key_presses
                 .insert((event.code, event.modifiers, event.state));
         }
-        self.handle_view_action(sr, action, term_out)
+        self.handle_view_action(sr, action, term_out)?;
+        if let Some((view_id, revision_boundary, forwarded)) = visual_focus_claim {
+            sr.record_forwarded_visual_focus_input(view_id, revision_boundary, forwarded);
+        }
+        Ok(())
     }
 
     fn active_forwarded_input_target(&mut self) -> Option<(ForwardedInputTarget, u8)> {
@@ -723,6 +747,7 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.log_bytes("forwarding raw bytes to active view", raw);
+        sr.clear_pending_visual_focus_input();
         self.update_last_key(sr, raw, false)?;
         let _ = sr.take_pass_through();
         self.dispatch_to_view(sr, raw, pty_out, term_out)

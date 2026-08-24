@@ -981,7 +981,7 @@ impl GhosttyEngine {
                 columns: profile.geometry.cols,
                 cell_width: profile.geometry.cell_width_px,
                 cell_height: profile.geometry.cell_height_px,
-                color_scheme: match profile.color_scheme {
+                color_scheme: match profile.colors.color_scheme {
                     crate::terminal_protocol::ColorScheme::Light => {
                         lector_ghostty::TerminalColorScheme::Light
                     }
@@ -989,6 +989,16 @@ impl GhosttyEngine {
                         lector_ghostty::TerminalColorScheme::Dark
                     }
                 },
+                default_foreground: Some(lector_ghostty::TerminalDefaultColor::new(
+                    profile.colors.default_foreground.red,
+                    profile.colors.default_foreground.green,
+                    profile.colors.default_foreground.blue,
+                )),
+                default_background: Some(lector_ghostty::TerminalDefaultColor::new(
+                    profile.colors.default_background.red,
+                    profile.colors.default_background.green,
+                    profile.colors.default_background.blue,
+                )),
                 enquiry: profile.enquiry,
                 version: profile.version,
                 da_conformance: profile.da_conformance,
@@ -1033,6 +1043,35 @@ impl GhosttyEngine {
     /// diagnostics and adapter tests can retain the underlying error.
     pub fn advance(&mut self, bytes: &[u8]) -> Result<UpdateSummary, lector_ghostty::Error> {
         self.try_advance(bytes)
+    }
+
+    /// Changes only the application-facing colour query contract. The live
+    /// grid and every parser, history, and presentation state remain intact.
+    pub fn set_virtual_terminal_colors(
+        &mut self,
+        colors: crate::terminal_protocol::VirtualTerminalColors,
+    ) {
+        let color_scheme = match colors.color_scheme {
+            crate::terminal_protocol::ColorScheme::Light => {
+                lector_ghostty::TerminalColorScheme::Light
+            }
+            crate::terminal_protocol::ColorScheme::Dark => {
+                lector_ghostty::TerminalColorScheme::Dark
+            }
+        };
+        self.terminal.set_color_profile(
+            color_scheme,
+            lector_ghostty::TerminalDefaultColor::new(
+                colors.default_foreground.red,
+                colors.default_foreground.green,
+                colors.default_foreground.blue,
+            ),
+            lector_ghostty::TerminalDefaultColor::new(
+                colors.default_background.red,
+                colors.default_background.green,
+                colors.default_background.blue,
+            ),
+        );
     }
 
     pub fn try_resize(&mut self, rows: u16, cols: u16) -> Result<(), lector_ghostty::Error> {

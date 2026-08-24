@@ -1,12 +1,13 @@
 use lector::{
     harness::Harness,
     terminal::{
-        ClipboardContent, ClipboardLocation, GhosttyEngine, TerminalEvent, TerminalGeometry,
+        ClipboardContent, ClipboardLocation, GhosttyEngine, TerminalEngine, TerminalEvent,
+        TerminalGeometry,
     },
     terminal_protocol::{
-        ApplicationReplyBroker, CapabilityOverrides, ColorScheme, EffectDisposition,
+        ApplicationReplyBroker, CapabilityOverrides, ColorScheme, DefaultColor, EffectDisposition,
         PhysicalTerminalProfile, ProbePolicy, ProbeReport, ShutdownFenceBroker, StartupProbeBroker,
-        TerminalEffectPolicy, TerminfoCapabilities, VirtualTerminalProfile,
+        TerminalEffectPolicy, TerminfoCapabilities, VirtualTerminalColors, VirtualTerminalProfile,
     },
 };
 
@@ -57,6 +58,8 @@ fn physical_profile_uses_conservative_terminfo_probe_and_override_precedence() {
     assert!(profile.true_color);
     assert!(profile.hyperlinks);
     assert_eq!(profile.color_scheme, Some(ColorScheme::Dark));
+    assert_eq!(profile.default_foreground, None);
+    assert_eq!(profile.default_background, None);
     assert!(!profile.synchronized_output);
     assert!(profile.kitty_keyboard);
     assert!(profile.kitty_graphics);
@@ -109,6 +112,7 @@ fn startup_probe_replies_are_fragment_safe_out_of_order_and_never_become_input()
         b"\x1b[?1004$p",
         b"\x1b[?2026$p",
         b"\x1b[?u",
+        b"\x1b[?996n",
         b"\x1b]10;?\x1b\\",
         b"\x1b]11;?\x1b\\",
     ] {
@@ -135,6 +139,144 @@ fn startup_probe_replies_are_fragment_safe_out_of_order_and_never_become_input()
         TerminalGeometry::new(30, 100, 10, 20)
     );
     assert_eq!(broker.profile().color_scheme, Some(ColorScheme::Dark));
+    assert_eq!(
+        broker.profile().default_foreground,
+        Some(DefaultColor::WHITE)
+    );
+    assert_eq!(
+        broker.profile().default_background,
+        Some(DefaultColor::BLACK)
+    );
+}
+
+#[test]
+fn startup_probe_retains_and_normalizes_exact_outer_default_colors() {
+    let profile = PhysicalTerminalProfile::conservative(geometry());
+    let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 0);
+    let _ = broker.startup_queries();
+
+    assert!(
+        broker
+            .ingest(
+                b"\x1b]10;rgb:a/bb/ccc\x1b\\\x1b]11;rgb:1/22/333\x07\x1b[?64;22c",
+                1,
+            )
+            .is_empty()
+    );
+    assert_eq!(
+        broker.profile().default_foreground,
+        Some(DefaultColor::new(0xaaaa, 0xbbbb, 0xcccc))
+    );
+    assert_eq!(
+        broker.profile().default_background,
+        Some(DefaultColor::new(0x1111, 0x2222, 0x3333))
+    );
+    assert_eq!(broker.profile().color_scheme, Some(ColorScheme::Dark));
+    assert_eq!(
+        broker.profile().virtual_terminal_colors(),
+        Some(VirtualTerminalColors::new(
+            ColorScheme::Dark,
+            DefaultColor::new(0xaaaa, 0xbbbb, 0xcccc),
+            DefaultColor::new(0x1111, 0x2222, 0x3333),
+        ))
+    );
+}
+
+#[test]
+fn native_color_scheme_wins_and_exact_defaults_still_wait_for_each_other() {
+    let mut harness = Harness::new(24, 80).expect("create native-theme harness");
+    harness
+        .start_capability_probes()
+        .expect("start outer probes");
+    harness
+        .handle_pty_output(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?996n")
+        .expect("handle eager child theme queries");
+
+    // The semantic reply arrives first, but exact OSC defaults are still in
+    // flight. Releasing now would make the child cache black/white fallbacks.
+    harness
+        .handle_terminal_input(b"\x1b[?997;2n")
+        .expect("consume native light report");
+    harness
+        .flush_application_replies()
+        .expect("keep exact defaults pending");
+    assert!(harness.application_input().is_empty());
+
+    // The later OSC pair looks dark by luminance. The native semantic result
+    // remains authoritative while the exact values pass through unchanged.
+    harness
+        .handle_terminal_input(
+            b"\x1b]10;rgb:eeee/dddd/cccc\x1b\\\x1b]11;rgb:1111/2222/3333\x1b\\\x1b[?64;22c",
+        )
+        .expect("consume exact defaults and fence");
+    harness
+        .flush_application_replies()
+        .expect("release exact child profile");
+    assert_eq!(
+        harness.physical_profile().color_scheme,
+        Some(ColorScheme::Light)
+    );
+    assert!(contains(
+        harness.application_input(),
+        b"\x1b]10;rgb:eeee/dddd/cccc\x1b\\"
+    ));
+    assert!(contains(
+        harness.application_input(),
+        b"\x1b]11;rgb:1111/2222/3333\x1b\\"
+    ));
+    assert!(contains(harness.application_input(), b"\x1b[?997;2n"));
+}
+
+#[test]
+fn exact_defaults_do_not_beat_a_later_contradictory_native_scheme() {
+    let mut harness = Harness::new(24, 80).expect("create reordered-theme harness");
+    harness
+        .start_capability_probes()
+        .expect("start outer probes");
+    harness
+        .handle_pty_output(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?996n")
+        .expect("handle eager child theme queries");
+    harness
+        .handle_terminal_input(b"\x1b]10;rgb:eeee/dddd/cccc\x1b\\\x1b]11;rgb:1111/2222/3333\x1b\\")
+        .expect("consume exact dark-looking defaults first");
+    harness
+        .flush_application_replies()
+        .expect("wait for native scheme");
+    assert!(harness.application_input().is_empty());
+
+    harness
+        .handle_terminal_input(b"\x1b[?997;2n\x1b[?64;22c")
+        .expect("consume contradictory native light result and fence");
+    harness
+        .flush_application_replies()
+        .expect("release reconciled child profile");
+    assert!(contains(harness.application_input(), b"\x1b[?997;2n"));
+}
+
+#[test]
+fn one_outer_default_color_still_provides_a_bounded_scheme_fallback() {
+    let profile = PhysicalTerminalProfile::conservative(geometry());
+    let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 0);
+    let _ = broker.startup_queries();
+    assert!(
+        broker
+            .ingest(b"\x1b]11;rgb:eeee/eeee/eeee\x1b\\\x1b[?64;22c", 1)
+            .is_empty()
+    );
+    assert_eq!(broker.profile().color_scheme, Some(ColorScheme::Light));
+    assert_eq!(broker.profile().default_foreground, None);
+    assert_eq!(
+        broker.profile().default_background,
+        Some(DefaultColor::new(0xeeee, 0xeeee, 0xeeee))
+    );
+    assert_eq!(
+        broker.profile().virtual_terminal_colors(),
+        Some(VirtualTerminalColors::new(
+            ColorScheme::Light,
+            DefaultColor::BLACK,
+            DefaultColor::new(0xeeee, 0xeeee, 0xeeee),
+        ))
+    );
 }
 
 #[test]
@@ -269,6 +411,330 @@ fn virtual_profile_drives_every_ghostty_generated_application_reply() {
     }
     assert!(!contains(&replies, b"Ghostty"));
     assert!(!contains(&replies, b"xterm"));
+}
+
+#[test]
+fn running_virtual_terminal_updates_exact_defaults_and_color_scheme_without_reset() {
+    let dark = VirtualTerminalColors::new(
+        ColorScheme::Dark,
+        DefaultColor::new(0xeeee, 0xdddd, 0xcccc),
+        DefaultColor::new(0x1111, 0x2222, 0x3333),
+    );
+    let mut engine = GhosttyEngine::new_with_profile(
+        24,
+        80,
+        VirtualTerminalProfile::lector(geometry(), ColorScheme::Dark).with_colors(dark),
+    )
+    .expect("create dark virtual terminal");
+    let dark_replies = engine
+        .advance(b"before\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?996n")
+        .expect("query dark virtual terminal")
+        .pty_replies;
+    assert!(contains(&dark_replies, b"\x1b]10;rgb:eeee/dddd/cccc\x1b\\"));
+    assert!(contains(&dark_replies, b"\x1b]11;rgb:1111/2222/3333\x1b\\"));
+    assert!(contains(&dark_replies, b"\x1b[?997;1n"));
+
+    let light = VirtualTerminalColors::new(
+        ColorScheme::Light,
+        DefaultColor::new(0x1234, 0x2345, 0x3456),
+        DefaultColor::new(0xdabc, 0xebcd, 0xfcde),
+    );
+    engine.set_virtual_terminal_colors(light);
+    let light_replies = engine
+        .advance(b"after\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?996n")
+        .expect("query updated light virtual terminal")
+        .pty_replies;
+    assert!(contains(
+        &light_replies,
+        b"\x1b]10;rgb:1234/2345/3456\x1b\\"
+    ));
+    assert!(contains(
+        &light_replies,
+        b"\x1b]11;rgb:dabc/ebcd/fcde\x1b\\"
+    ));
+    assert!(contains(&light_replies, b"\x1b[?997;2n"));
+    assert!(engine.snapshot().contents().contains("before"));
+    assert!(engine.snapshot().contents().contains("after"));
+}
+
+#[test]
+fn eager_child_color_queries_wait_for_and_match_light_and_dark_outer_profiles() {
+    for (foreground, background, scheme_report) in [
+        (
+            "eeee/dddd/cccc",
+            "1111/2222/3333",
+            b"\x1b[?997;1n".as_slice(),
+        ),
+        (
+            "1234/2345/3456",
+            "dabc/ebcd/fcde",
+            b"\x1b[?997;2n".as_slice(),
+        ),
+    ] {
+        let mut harness = Harness::new(24, 80).expect("create eager-child harness");
+        harness
+            .start_capability_probes()
+            .expect("start outer probes");
+        harness
+            .handle_pty_output(b"\x1b[18t\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?996n")
+            .expect("handle child queries before outer replies");
+        harness
+            .flush_application_replies()
+            .expect("defer child replies");
+        assert_eq!(harness.application_input(), b"\x1b[8;24;80t");
+
+        let outer =
+            format!("\x1b]10;rgb:{foreground}\x1b\\\x1b]11;rgb:{background}\x1b\\\x1b[?64;22c");
+        harness
+            .handle_terminal_input(outer.as_bytes())
+            .expect("consume outer color profile");
+        harness
+            .flush_application_replies()
+            .expect("release reconciled child replies");
+
+        let replies = harness.application_input();
+        assert!(contains(
+            replies,
+            format!("\x1b]10;rgb:{foreground}\x1b\\").as_bytes()
+        ));
+        assert!(contains(
+            replies,
+            format!("\x1b]11;rgb:{background}\x1b\\").as_bytes()
+        ));
+        assert!(contains(replies, scheme_report));
+    }
+}
+
+#[test]
+fn outer_theme_negotiation_is_presentation_transparent() {
+    let mut harness = Harness::new(24, 80).expect("create transparent-theme harness");
+    harness
+        .start_capability_probes()
+        .expect("start outer probes");
+    harness
+        .handle_pty_output(b"visible content")
+        .expect("render ordinary child content");
+    let grid_before_queries = harness.active_view_contents();
+    assert!(grid_before_queries.contains("visible content"));
+    let presentation_before_queries = harness.terminal_output().to_vec();
+
+    harness
+        .handle_pty_output(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[?996n")
+        .expect("consume child theme queries");
+    assert_eq!(
+        harness.terminal_output(),
+        presentation_before_queries,
+        "child theme queries must not leak to or redraw the physical terminal"
+    );
+    assert!(harness.application_input().is_empty());
+
+    harness
+        .handle_terminal_input(
+            b"\x1b]10;rgb:1111/2222/3333\x1b\\\x1b]11;rgb:dddd/eeee/ffff\x1b\\\x1b[?997;2n\x1b[?64;22c",
+        )
+        .expect("consume exact outer defaults and native theme reply");
+    harness
+        .flush_application_replies()
+        .expect("release reconciled child theme replies");
+
+    assert_eq!(
+        harness.terminal_output(),
+        presentation_before_queries,
+        "outer probe replies and child query replies must remain off the presentation path"
+    );
+    assert_eq!(
+        harness.active_view_contents(),
+        grid_before_queries,
+        "theme negotiation must not mutate the application grid"
+    );
+    assert!(contains(
+        harness.application_input(),
+        b"\x1b]10;rgb:1111/2222/3333\x1b\\"
+    ));
+    assert!(contains(
+        harness.application_input(),
+        b"\x1b]11;rgb:dddd/eeee/ffff\x1b\\"
+    ));
+    assert!(contains(harness.application_input(), b"\x1b[?997;2n"));
+}
+
+#[test]
+fn continuous_unrelated_input_cannot_extend_the_child_color_wait() {
+    let mut harness = Harness::new(24, 80).expect("create bounded-theme harness");
+    harness
+        .start_capability_probes()
+        .expect("start outer probes");
+    harness
+        .handle_pty_output(b"\x1b]10;?\x1b\\\x1b[?996n")
+        .expect("handle child theme queries");
+
+    for _ in 0..5 {
+        harness.advance_clock(10);
+        harness
+            .handle_terminal_input(b"x")
+            .expect("forward unrelated input while probe remains active");
+        harness
+            .flush_application_replies()
+            .expect("apply bounded color hold");
+        assert!(!contains(harness.application_input(), b"\x1b]10;rgb:"));
+    }
+
+    harness.advance_clock(2);
+    harness
+        .handle_terminal_input(b"x")
+        .expect("forward input beyond absolute color deadline");
+    harness
+        .flush_application_replies()
+        .expect("release fallback at absolute deadline");
+    assert!(contains(
+        harness.application_input(),
+        b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"
+    ));
+    assert!(contains(harness.application_input(), b"\x1b[?997;1n"));
+}
+
+#[test]
+fn unbrokered_pixel_mouse_theme_notification_and_resize_modes_stay_unsupported() {
+    let profile = VirtualTerminalProfile::lector(geometry(), ColorScheme::Dark);
+    let mut engine = GhosttyEngine::new_with_profile(24, 80, profile)
+        .expect("create engine with Lector virtual profile");
+
+    let initial = engine
+        .advance(b"\x1b[?1015$p\x1b[?1016$p\x1b[?2031$p\x1b[?2048$p\x1b[?1006$p\x1b[?2026$p")
+        .expect("query initial private modes")
+        .pty_replies;
+    assert_eq!(
+        initial,
+        b"\x1b[?1015;0$y\x1b[?1016;0$y\x1b[?2031;0$y\x1b[?2048;0$y\x1b[?1006;2$y\x1b[?2026;2$y"
+    );
+
+    let after_enable = engine
+        .advance(
+            b"\x1b[?1015h\x1b[?1016h\x1b[?2031h\x1b[?2048h\x1b[?1006h\x1b[?2026h\x1b[?1015$p\x1b[?1016$p\x1b[?2031$p\x1b[?2048$p\x1b[?1006$p\x1b[?2026$p",
+        )
+        .expect("enable and query private modes")
+        .pty_replies;
+    assert_eq!(
+        after_enable,
+        b"\x1b[?1015;0$y\x1b[?1016;0$y\x1b[?2031;0$y\x1b[?2048;0$y\x1b[?1006;1$y\x1b[?2026;1$y"
+    );
+    assert_eq!(
+        engine.snapshot().mouse_protocol_encoding(),
+        lector::terminal::MouseEncoding::Sgr,
+        "clearing pixel mouse must preserve the requested cell-coordinate SGR encoding"
+    );
+
+    TerminalEngine::resize_with_geometry(&mut engine, TerminalGeometry::new(30, 100, 10, 20));
+    let after_resize = engine
+        .advance(b"\x1b[?2048$p")
+        .expect("query mode after resize")
+        .pty_replies;
+    assert_eq!(after_resize, b"\x1b[?2048;0$y");
+    assert!(
+        !contains(&after_resize, b"\x1b[48;"),
+        "an unsupported in-band resize report escaped after resize"
+    );
+}
+
+#[test]
+fn fragmented_multi_mode_enable_is_corrected_only_after_its_complete_csi() {
+    let mut engine = GhosttyEngine::new_with_profile(
+        24,
+        80,
+        VirtualTerminalProfile::lector(geometry(), ColorScheme::Dark),
+    )
+    .expect("create fragmented-mode engine");
+
+    let prefix = engine
+        .advance(b"\x1b[")
+        .expect("retain incomplete CSI without injecting policy bytes");
+    assert!(prefix.pty_replies.is_empty());
+    let completed = engine
+        .advance(b"?1006;1016;2031;2048hready\x1b[?1016$p\x1b[?2031$p\x1b[?2048$p\x1b[?1006$p")
+        .expect("complete blind multi-mode enable")
+        .pty_replies;
+    assert_eq!(
+        completed,
+        b"\x1b[?1016;0$y\x1b[?2031;0$y\x1b[?2048;0$y\x1b[?1006;1$y"
+    );
+    assert!(engine.snapshot().contents().contains("ready"));
+    assert_eq!(
+        engine.snapshot().mouse_protocol_encoding(),
+        lector::terminal::MouseEncoding::Sgr
+    );
+
+    TerminalEngine::resize_with_geometry(&mut engine, TerminalGeometry::new(30, 100, 10, 20));
+    assert!(
+        engine
+            .advance(b"")
+            .expect("collect any resize side effects")
+            .pty_replies
+            .is_empty(),
+        "blind mode 2048 must not survive long enough to emit an in-band resize"
+    );
+}
+
+#[test]
+fn terminal_reset_does_not_resurrect_a_previously_requested_mouse_encoding() {
+    let mut engine = GhosttyEngine::new_with_profile(
+        24,
+        80,
+        VirtualTerminalProfile::lector(geometry(), ColorScheme::Dark),
+    )
+    .expect("create reset-mode engine");
+    engine
+        .advance(b"\x1b[?1006h")
+        .expect("enable supported SGR mouse");
+    assert_eq!(
+        engine.snapshot().mouse_protocol_encoding(),
+        lector::terminal::MouseEncoding::Sgr
+    );
+
+    let reset_reply = engine
+        .advance(b"\x1bc\x1b[?1006$p")
+        .expect("reset terminal and query SGR mouse")
+        .pty_replies;
+    assert_eq!(reset_reply, b"\x1b[?1006;2$y");
+    assert_eq!(
+        engine.snapshot().mouse_protocol_encoding(),
+        lector::terminal::MouseEncoding::Default
+    );
+}
+
+#[test]
+fn unsupported_resize_mode_does_not_change_supported_mouse_encoding_order() {
+    let mut engine = GhosttyEngine::new_with_profile(
+        24,
+        80,
+        VirtualTerminalProfile::lector(geometry(), ColorScheme::Dark),
+    )
+    .expect("create mouse-order engine");
+
+    engine
+        .advance(b"\x1b[?1006h\x1b[?1005h")
+        .expect("select supported mouse encodings in one order");
+    let before = engine.snapshot().mouse_protocol_encoding();
+    engine
+        .advance(b"\x1b[?2048h")
+        .expect("blindly enable resize mode");
+    assert_eq!(
+        engine.snapshot().mouse_protocol_encoding(),
+        before,
+        "clearing 2048 must not change the pre-existing encoding snapshot"
+    );
+
+    engine
+        .advance(b"\x1b[?1005h\x1b[?1006h")
+        .expect("select supported mouse encodings in the other order");
+    let before = engine.snapshot().mouse_protocol_encoding();
+    engine
+        .advance(b"\x1b[?2048h")
+        .expect("blindly enable resize mode again");
+    assert_eq!(
+        engine.snapshot().mouse_protocol_encoding(),
+        before,
+        "clearing 2048 must preserve the other encoding snapshot too"
+    );
 }
 
 #[test]

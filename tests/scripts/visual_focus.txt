@@ -1,0 +1,194 @@
+# Framework-agnostic visually driven focus through the end-to-end PTY,
+# compositor, stabilization, input, and speech pipeline.
+Scenario: fzf pointer moves while the identical prompt marker stays put
+Given pty-stdout: \x1B[?1049h\x1B[?2026h\x1B[2J\x1B[H> \x1B[7mAlpha\x1B[27m\x1B[2;1H  Bravo\x1B[3;1H  Delta\x1B[5;1H> \x1B[5;3H\x1B[?25h\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: j
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27m  Alpha\x1B[2;1H> \x1B[7mBravo\x1B[27m\x1B[5;3H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: j
+And expect-speak: Bravo
+And expect-no-speak:
+
+Scenario: arbitrary Unicode gutter marker moves without style semantics
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H▌ Alpha\x1B[2;1H  Same\x1B[3;1H  Same\x1B[5;1H> \x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: g
+And pty-stdout: \x1B[?2026h\x1B[H  Alpha\x1B[2;1H▌ Same\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: g
+And expect-speak: Same
+And expect-no-speak:
+
+Scenario: Bubble Tea hidden cursor bookkeeping does not mask style focus
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[7mAlpha\x1B[27m\x1B[2;1HBravo\x1B[3;1HDelta\x1B[4;1HGamma\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: j
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[2;1H\x1B[7mBravo\x1B[27m\x1B[?2026l
+And settled:
+Then expect-pty-stdin: j
+And expect-speak: Bravo
+And expect-no-speak:
+
+Scenario: ncurses adjacent line mark requires reciprocal selection style
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[7m-Alpha\x1B[27m\x1B[2;1H Bravo\x1B[3;1H Charlie\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: j
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27m Alpha\x1B[2;1H\x1B[7m-Bravo\x1B[27m\x1B[?2026l
+And settled:
+Then expect-pty-stdin: j
+And expect-speak: Bravo
+And expect-no-speak:
+
+Scenario: inverse style transfer follows an application defined j binding
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[7mAlpha\x1B[27m\x1B[2;1HBravo\x1B[3;1HDelta\x1B[4;1HGamma\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: j
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[2;1H\x1B[7mBravo\x1B[27m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: j
+And expect-speak: Bravo
+And expect-no-speak:
+
+Scenario: RGB background foreground and bold select the second duplicate label
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[1;38;2;232;111;176;48;5;24mSame\x1B[0m\x1B[2;1HSame\x1B[3;1HSame\x1B[4;1HSame\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: \x0E
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[22;39;49mSame\x1B[2;1H\x1B[1;38;2;232;111;176;48;5;24mSame\x1B[0m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: \x0E
+And expect-speak: Same
+And expect-no-speak:
+
+Scenario: Control P can move style focus upward without a key map
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[HAlpha\x1B[2;1H\x1B[7mBravo\x1B[27m\x1B[3;1HDelta\x1B[4;1HGamma\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: \x10
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[7mAlpha\x1B[2;1H\x1B[27mBravo\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: \x10
+And expect-speak: Alpha
+And expect-no-speak:
+
+Scenario: application defined k binding uses the same focus evidence
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[HAlpha\x1B[2;1H\x1B[7mBravo\x1B[27m\x1B[3;1HDelta\x1B[4;1HGamma\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: k
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[7mAlpha\x1B[2;1H\x1B[27mBravo\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: k
+And expect-speak: Alpha
+And expect-no-speak:
+
+Scenario: arbitrary access key can jump to a nonadjacent focus target
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[7mAlpha\x1B[27m\x1B[2;1HBravo\x1B[3;1HDelta\x1B[4;1HGamma\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: g
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[4;1H\x1B[7mGamma\x1B[27m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: g
+And expect-speak: Gamma
+And expect-no-speak:
+
+Scenario: function key can drive the same nonadjacent focus transfer
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[7mAlpha\x1B[27m\x1B[2;1HBravo\x1B[3;1HDelta\x1B[4;1HGamma\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: \x1B[19~
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[3;1H\x1B[7mDelta\x1B[27m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: \x1B[19~
+And expect-speak: Delta
+And expect-no-speak:
+
+Scenario: Kitty press claim survives its matching legacy child release
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[7mAlpha\x1B[27m\x1B[2;1HBravo\x1B[3;1HDelta\x1B[4;1HGamma\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: \x1B[106;1:1u\x1B[106;1:3u
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[2;1H\x1B[7mBravo\x1B[27m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: j
+And expect-speak: Bravo
+And expect-no-speak:
+
+Scenario: Kitty key repeat is generic visual focus input
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[7mAlpha\x1B[27m\x1B[2;1HBravo\x1B[3;1HDelta\x1B[4;1HGamma\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: \x1B[106;1:2u
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[2;1H\x1B[7mBravo\x1B[27m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: j
+And expect-speak: Bravo
+And expect-no-speak:
+
+Scenario: empty legacy transcode is not child input evidence
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[7mAlpha\x1B[27m\x1B[2;1HBravo\x1B[3;1HDelta\x1B[4;1HGamma\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: \x1B[120;9:1u
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[2;1H\x1B[7mBravo\x1B[27m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-no-pty-stdin:
+And expect-no-speak:
+
+Scenario: expired forwarded input is not visual focus evidence
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[7mAlpha\x1B[27m\x1B[2;1HBravo\x1B[3;1HDelta\x1B[4;1HGamma\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: j
+And advance: 301
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[2;1H\x1B[7mBravo\x1B[27m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: j
+And expect-no-speak:
+
+Scenario: style animation without input remains silent
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[1;38;5;15mLoading\x1B[0m\x1B[2;1HReady\x1B[3;1HWaiting\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When pty-stdout: \x1B[?2026h\x1B[H\x1B[22;39mL\x1B[1;2H\x1B[1;38;5;15moa\x1B[0m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-no-pty-stdin:
+And expect-no-speak:
+
+Scenario: arbitrary forwarded key does not turn a global theme swap into focus
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[31mAlpha\x1B[2;1H\x1B[34mBravo\x1B[3;1H\x1B[31mDelta\x1B[4;1H\x1B[34mGamma\x1B[0m\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: x
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[34mAlpha\x1B[2;1H\x1B[31mBravo\x1B[3;1H\x1B[34mDelta\x1B[4;1H\x1B[31mGamma\x1B[0m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: x
+And expect-no-speak:
+
+Scenario: ambiguous two option swap after arbitrary key stays silent
+Given pty-stdout: \x1B[?1049h\x1B[?25l\x1B[?2026h\x1B[2J\x1B[H\x1B[31mAlpha\x1B[2;1H\x1B[34mBravo\x1B[0m\x1B[24;80H\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: j
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[34mAlpha\x1B[2;1H\x1B[31mBravo\x1B[0m\x1B[24;80H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: j
+And expect-no-speak:
+
+Scenario: real application cursor movement remains authoritative over a different style target
+Given pty-stdout: \x1B[?1049h\x1B[?2026h\x1B[2J\x1B[H\x1B[7mAlpha\x1B[27m\x1B[2;1HBravo\x1B[3;1HDelta\x1B[4;1HGamma\x1B[H\x1B[?25h\x1B[?2026l
+And settled:
+And clear-speech:
+When stdin: \x1B[B
+And pty-stdout: \x1B[?2026h\x1B[H\x1B[27mAlpha\x1B[4;1H\x1B[7mGamma\x1B[27m\x1B[2;1H\x1B[?2026l
+And settled:
+Then expect-pty-stdin: \x1B[B
+And expect-speak: Bravo
+And expect-no-speak:

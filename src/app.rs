@@ -1317,6 +1317,7 @@ enum PendingTmuxCommandKind {
     Ordinary,
     Resize,
     Input(crate::tmux_model::PaneId),
+    ColorReport(crate::tmux_model::PaneId),
 }
 
 struct TmuxPrefixState {
@@ -1667,6 +1668,12 @@ impl App {
     }
 
     pub fn set_physical_profile(&mut self, profile: PhysicalTerminalProfile) {
+        let colors = profile.virtual_terminal_colors();
+        if colors != self.physical_profile.virtual_terminal_colors()
+            && let Some(colors) = colors
+        {
+            self.view_stack.set_virtual_terminal_colors(colors);
+        }
         let capabilities = RenderCapabilities {
             synchronized_output: self.output_scheduler.is_none() && profile.synchronized_output,
             hyperlinks: profile.hyperlinks,
@@ -2056,6 +2063,12 @@ impl App {
                     .and_then(StartupProbeBroker::next_deadline_ms),
             )
             .chain(
+                self.startup_probe_broker
+                    .as_ref()
+                    .and_then(StartupProbeBroker::color_wait_deadline_ms)
+                    .filter(|deadline| *deadline > now_ms),
+            )
+            .chain(
                 self.deferred_kitty_releases
                     .iter()
                     .map(|release| release.release_at_ms)
@@ -2193,11 +2206,26 @@ impl App {
         let pending_read_ready = self.pending_active_view_read.is_some()
             && self.pending_active_view_read == self.presented_accessibility_view
             && self.logical_accessibility_view_is_presented();
+        let color_wait_pending = self
+            .startup_probe_broker
+            .as_ref()
+            .is_some_and(|broker| broker.color_wait_pending(self.clock.now_ms()));
+        let pending_tmux_command_ready = if color_wait_pending {
+            self.pending_tmux_commands
+                .iter()
+                .take_while(|command| {
+                    !matches!(command.kind, PendingTmuxCommandKind::ColorReport(_))
+                })
+                .next()
+                .is_some()
+        } else {
+            !self.pending_tmux_commands.is_empty()
+        };
         presented_transition_ready
             || pending_read_ready
             || !self.pending_tmux_background_output.is_empty()
             || self.view_stack.active_mut().wants_tick()
-            || !self.pending_tmux_commands.is_empty()
+            || pending_tmux_command_ready
             || !self.pending_direct_gateway_input.is_empty()
             || self
                 .tmux_termination_deadline_ms

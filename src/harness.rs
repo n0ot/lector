@@ -492,6 +492,11 @@ impl Harness {
         &self.term_out
     }
 
+    /// Returns the active virtual screen without mutating harness cursors.
+    pub fn active_view_contents(&mut self) -> String {
+        self.app.debug_active_view_contents()
+    }
+
     /// Returns each slice accepted by the physical writer in order. Tests use
     /// this to replay the exact writer-side transaction stream through the
     /// terminal oracle instead of treating the concatenated output as source

@@ -57,6 +57,13 @@ fn harness_script_auto_read() {
 }
 
 #[test]
+fn harness_script_visual_focus() {
+    let script = include_str!("scripts/visual_focus.txt");
+    let mut harness = Harness::new(24, 80).expect("create harness");
+    harness.run_script(script).expect("run script");
+}
+
+#[test]
 fn harness_script_terminal_effects_and_modes() {
     let script = include_str!("scripts/terminal_effects_and_modes.txt");
     let mut harness = Harness::new(24, 80).expect("create harness");

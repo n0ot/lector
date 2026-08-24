@@ -25,6 +25,131 @@ pub enum ColorScheme {
     Dark,
 }
 
+/// One exact terminal default colour, normalized to OSC's 16-bit RGB space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DefaultColor {
+    pub red: u16,
+    pub green: u16,
+    pub blue: u16,
+}
+
+impl DefaultColor {
+    pub const BLACK: Self = Self::new(0, 0, 0);
+    pub const WHITE: Self = Self::new(u16::MAX, u16::MAX, u16::MAX);
+
+    pub const fn new(red: u16, green: u16, blue: u16) -> Self {
+        Self { red, green, blue }
+    }
+
+    const fn luminance(self) -> u32 {
+        self.red as u32 * 299 + self.green as u32 * 587 + self.blue as u32 * 114
+    }
+}
+
+/// The colour contract exposed by every Lector-owned virtual terminal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtualTerminalColors {
+    pub color_scheme: ColorScheme,
+    pub default_foreground: DefaultColor,
+    pub default_background: DefaultColor,
+}
+
+impl VirtualTerminalColors {
+    pub const fn for_scheme(color_scheme: ColorScheme) -> Self {
+        match color_scheme {
+            ColorScheme::Light => Self {
+                color_scheme,
+                default_foreground: DefaultColor::BLACK,
+                default_background: DefaultColor::WHITE,
+            },
+            ColorScheme::Dark => Self {
+                color_scheme,
+                default_foreground: DefaultColor::WHITE,
+                default_background: DefaultColor::BLACK,
+            },
+        }
+    }
+
+    pub const fn new(
+        color_scheme: ColorScheme,
+        default_foreground: DefaultColor,
+        default_background: DefaultColor,
+    ) -> Self {
+        Self {
+            color_scheme,
+            default_foreground,
+            default_background,
+        }
+    }
+}
+
+/// Reconcile already-generated child replies with a colour profile learned
+/// after the child issued its query. This closes the bounded startup race in
+/// which the child exists before Lector receives the outer terminal's probe
+/// replies. Input is exclusively trusted terminal-engine output, not arbitrary
+/// child data.
+pub(crate) fn rewrite_virtual_color_replies(
+    replies: &[u8],
+    colors: VirtualTerminalColors,
+) -> Vec<u8> {
+    let mut rewritten = Vec::with_capacity(replies.len());
+    let mut index = 0;
+    while index < replies.len() {
+        let remaining = &replies[index..];
+        let color_slot = if remaining.starts_with(b"\x1b]10;") {
+            Some((10_u8, colors.default_foreground))
+        } else if remaining.starts_with(b"\x1b]11;") {
+            Some((11_u8, colors.default_background))
+        } else {
+            None
+        };
+        if let Some((slot, color)) = color_slot
+            && let Some(length) = complete_escape_len(remaining)
+        {
+            rewritten.extend_from_slice(
+                format!(
+                    "\x1b]{slot};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+                    color.red, color.green, color.blue
+                )
+                .as_bytes(),
+            );
+            index += length;
+            continue;
+        }
+        let scheme_report_len = [b"\x1b[?997;1n".as_slice(), b"\x1b[?997;2n".as_slice()]
+            .into_iter()
+            .find_map(|report| remaining.starts_with(report).then_some(report.len()));
+        if let Some(report_len) = scheme_report_len {
+            let state = match colors.color_scheme {
+                ColorScheme::Dark => 1,
+                ColorScheme::Light => 2,
+            };
+            rewritten.extend_from_slice(format!("\x1b[?997;{state}n").as_bytes());
+            index += report_len;
+            continue;
+        }
+        rewritten.push(replies[index]);
+        index += 1;
+    }
+    rewritten
+}
+
+pub(crate) fn first_virtual_color_reply_offset(replies: &[u8]) -> Option<usize> {
+    [
+        b"\x1b]10;".as_slice(),
+        b"\x1b]11;".as_slice(),
+        b"\x1b[?997;1n".as_slice(),
+        b"\x1b[?997;2n".as_slice(),
+    ]
+    .into_iter()
+    .filter_map(|prefix| {
+        replies
+            .windows(prefix.len())
+            .position(|window| window == prefix)
+    })
+    .min()
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TerminfoCapabilities {
     pub color_count: Option<u16>,
@@ -80,6 +205,8 @@ impl TerminfoCapabilities {
 pub struct ProbeReport {
     pub geometry: Option<TerminalGeometry>,
     pub color_scheme: Option<ColorScheme>,
+    pub default_foreground: Option<DefaultColor>,
+    pub default_background: Option<DefaultColor>,
     pub synchronized_output: Option<bool>,
     pub kitty_keyboard: Option<bool>,
     pub kitty_graphics: Option<bool>,
@@ -165,6 +292,8 @@ pub struct PhysicalTerminalProfile {
     pub color_count: u16,
     pub true_color: bool,
     pub color_scheme: Option<ColorScheme>,
+    pub default_foreground: Option<DefaultColor>,
+    pub default_background: Option<DefaultColor>,
     pub hyperlinks: bool,
     pub synchronized_output: bool,
     pub kitty_keyboard: bool,
@@ -180,6 +309,8 @@ impl PhysicalTerminalProfile {
             color_count: 8,
             true_color: false,
             color_scheme: None,
+            default_foreground: None,
+            default_background: None,
             hyperlinks: false,
             synchronized_output: false,
             kitty_keyboard: false,
@@ -207,6 +338,12 @@ impl PhysicalTerminalProfile {
         if let Some(scheme) = probe.color_scheme {
             self.color_scheme = Some(scheme);
         }
+        if let Some(color) = probe.default_foreground {
+            self.default_foreground = Some(color);
+        }
+        if let Some(color) = probe.default_background {
+            self.default_background = Some(color);
+        }
         apply_option(&mut self.synchronized_output, probe.synchronized_output);
         apply_option(&mut self.kitty_keyboard, probe.kitty_keyboard);
         apply_option(&mut self.kitty_graphics, probe.kitty_graphics);
@@ -225,6 +362,26 @@ impl PhysicalTerminalProfile {
         apply_option(&mut self.kitty_graphics, overrides.kitty_graphics);
         apply_option(&mut self.focus_reporting, overrides.focus_reporting);
         apply_option(&mut self.clipboard_read, overrides.clipboard_read);
+    }
+
+    /// Resolve the child-facing colours only after the outer terminal has
+    /// supplied enough information to classify its default palette. Exact
+    /// defaults win when available; the light/dark pair is a deterministic
+    /// fallback for profiles supplied by tests or future non-OSC probes.
+    pub fn virtual_terminal_colors(&self) -> Option<VirtualTerminalColors> {
+        let color_scheme = self.color_scheme?;
+        let fallback = VirtualTerminalColors::for_scheme(color_scheme);
+        Some(VirtualTerminalColors::new(
+            color_scheme,
+            self.default_foreground
+                .unwrap_or(fallback.default_foreground),
+            self.default_background
+                .unwrap_or(fallback.default_background),
+        ))
+    }
+
+    pub const fn has_exact_default_colors(&self) -> bool {
+        self.default_foreground.is_some() && self.default_background.is_some()
     }
 }
 
@@ -259,6 +416,7 @@ pub struct StartupProbeBroker {
     profile: PhysicalTerminalProfile,
     report: ProbeReport,
     policy: ProbePolicy,
+    started_at_ms: u128,
     last_activity_at_ms: u128,
     started: bool,
     finished: bool,
@@ -267,8 +425,10 @@ pub struct StartupProbeBroker {
     malformed_replies: usize,
     pixel_width: Option<u32>,
     pixel_height: Option<u32>,
-    foreground_luminance: Option<u32>,
-    background_luminance: Option<u32>,
+    foreground: Option<DefaultColor>,
+    background: Option<DefaultColor>,
+    semantic_color_scheme: Option<ColorScheme>,
+    semantic_color_scheme_report_received: bool,
     primary_device_attributes_received: bool,
 }
 
@@ -278,6 +438,7 @@ impl StartupProbeBroker {
             profile,
             report: ProbeReport::default(),
             policy,
+            started_at_ms,
             last_activity_at_ms: started_at_ms,
             started: false,
             finished: false,
@@ -286,8 +447,10 @@ impl StartupProbeBroker {
             malformed_replies: 0,
             pixel_width: None,
             pixel_height: None,
-            foreground_luminance: None,
-            background_luminance: None,
+            foreground: None,
+            background: None,
+            semantic_color_scheme: None,
+            semantic_color_scheme_report_received: false,
             primary_device_attributes_received: false,
         }
     }
@@ -297,7 +460,7 @@ impl StartupProbeBroker {
             return Vec::new();
         }
         self.started = true;
-        let mut queries = b"\x1b[>c\x1b[=c\x1b[14t\x1b[16t\x1b[18t\x1b[?1004$p\x1b[?2026$p\x1b[?u\x1b]10;?\x1b\\\x1b]11;?\x1b\\".to_vec();
+        let mut queries = b"\x1b[>c\x1b[=c\x1b[14t\x1b[16t\x1b[18t\x1b[?1004$p\x1b[?2026$p\x1b[?u\x1b[?996n\x1b]10;?\x1b\\\x1b]11;?\x1b\\".to_vec();
         if self.policy.clipboard_read {
             queries.extend_from_slice(b"\x1b]52;c;?\x1b\\");
         }
@@ -397,6 +560,32 @@ impl StartupProbeBroker {
         &self.profile
     }
 
+    /// Absolute deadline used only for child colour replies. Ordinary input
+    /// may extend the broker's fragment-safety timeout, but can never hold a
+    /// child theme negotiation indefinitely.
+    pub const fn color_wait_deadline_ms(&self) -> Option<u128> {
+        if self.started && !self.finished && !self.color_profile_complete() {
+            Some(
+                self.started_at_ms
+                    .saturating_add(PROBE_INACTIVITY_TIMEOUT_MS + 1),
+            )
+        } else {
+            None
+        }
+    }
+
+    pub fn color_wait_pending(&self, now_ms: u128) -> bool {
+        !self.finished
+            && !self.color_profile_complete()
+            && self
+                .color_wait_deadline_ms()
+                .is_some_and(|deadline| now_ms < deadline)
+    }
+
+    const fn color_profile_complete(&self) -> bool {
+        self.profile.has_exact_default_colors() && self.semantic_color_scheme_report_received
+    }
+
     /// The startup probe sends one DA1 request. If its response has not been
     /// observed, an orderly-shutdown fence must ignore one DA1 response before
     /// accepting the response to its fresh request. Terminal replies are
@@ -424,6 +613,15 @@ impl StartupProbeBroker {
             let _ = flags;
             self.report.kitty_keyboard = Some(true);
             self.profile.apply_probe(&self.report);
+            return true;
+        }
+        if let Some(color_scheme) = parse_color_scheme_report(sequence) {
+            self.semantic_color_scheme_report_received = true;
+            if let Some(color_scheme) = color_scheme {
+                self.semantic_color_scheme = Some(color_scheme);
+                self.report.color_scheme = Some(color_scheme);
+                self.profile.apply_probe(&self.report);
+            }
             return true;
         }
         if let Some((kind, first, second)) = parse_size_report(sequence) {
@@ -457,11 +655,10 @@ impl StartupProbeBroker {
             self.report.geometry = Some(self.profile.geometry);
             return true;
         }
-        if let Some((slot, red, green, blue)) = parse_color_report(sequence) {
-            let luminance = u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114;
+        if let Some((slot, color)) = parse_color_report(sequence) {
             match slot {
-                10 => self.report_foreground(luminance),
-                11 => self.report_background(luminance),
+                10 => self.report_foreground(color),
+                11 => self.report_background(color),
                 _ => return false,
             }
             return true;
@@ -482,27 +679,44 @@ impl StartupProbeBroker {
         false
     }
 
-    fn report_foreground(&mut self, luminance: u32) {
-        self.foreground_luminance = Some(luminance);
+    fn report_foreground(&mut self, color: DefaultColor) {
+        self.foreground = Some(color);
+        self.report.default_foreground = Some(color);
         self.resolve_color_scheme();
     }
 
-    fn report_background(&mut self, luminance: u32) {
-        self.background_luminance = Some(luminance);
+    fn report_background(&mut self, color: DefaultColor) {
+        self.background = Some(color);
+        self.report.default_background = Some(color);
         self.resolve_color_scheme();
     }
 
     fn resolve_color_scheme(&mut self) {
-        let (Some(foreground), Some(background)) =
-            (self.foreground_luminance, self.background_luminance)
-        else {
-            return;
+        let inferred = match (self.foreground, self.background) {
+            (Some(foreground), Some(background)) => {
+                if background.luminance() < foreground.luminance() {
+                    ColorScheme::Dark
+                } else {
+                    ColorScheme::Light
+                }
+            }
+            (None, Some(background)) => {
+                if background.luminance() < u32::from(u16::MAX) * 500 {
+                    ColorScheme::Dark
+                } else {
+                    ColorScheme::Light
+                }
+            }
+            (Some(foreground), None) => {
+                if foreground.luminance() >= u32::from(u16::MAX) * 500 {
+                    ColorScheme::Dark
+                } else {
+                    ColorScheme::Light
+                }
+            }
+            (None, None) => return,
         };
-        self.report.color_scheme = Some(if background < foreground {
-            ColorScheme::Dark
-        } else {
-            ColorScheme::Light
-        });
+        self.report.color_scheme = Some(self.semantic_color_scheme.unwrap_or(inferred));
         self.profile.apply_probe(&self.report);
     }
 }
@@ -589,7 +803,20 @@ fn parse_size_report(sequence: &[u8]) -> Option<(u8, u32, u32)> {
     (parts.next().is_none()).then_some((kind, first, second))
 }
 
-fn parse_color_report(sequence: &[u8]) -> Option<(u8, u16, u16, u16)> {
+fn parse_color_scheme_report(sequence: &[u8]) -> Option<Option<ColorScheme>> {
+    let body = sequence
+        .strip_prefix(b"\x1b[?997;")
+        .or_else(|| sequence.strip_prefix(b"\x9b?997;"))?
+        .strip_suffix(b"n")?;
+    let state = std::str::from_utf8(body).ok()?.parse::<u16>().ok()?;
+    Some(match state {
+        1 => Some(ColorScheme::Dark),
+        2 => Some(ColorScheme::Light),
+        _ => None,
+    })
+}
+
+fn parse_color_report(sequence: &[u8]) -> Option<(u8, DefaultColor)> {
     let body = sequence.strip_prefix(b"\x1b]")?;
     let body = body
         .strip_suffix(b"\x1b\\")
@@ -597,13 +824,28 @@ fn parse_color_report(sequence: &[u8]) -> Option<(u8, u16, u16, u16)> {
     let text = std::str::from_utf8(body).ok()?;
     let (slot, rgb) = text.split_once(";rgb:")?;
     let mut channels = rgb.split('/');
-    let red = u16::from_str_radix(channels.next()?, 16).ok()?;
-    let green = u16::from_str_radix(channels.next()?, 16).ok()?;
-    let blue = u16::from_str_radix(channels.next()?, 16).ok()?;
+    let red = parse_osc_color_channel(channels.next()?)?;
+    let green = parse_osc_color_channel(channels.next()?)?;
+    let blue = parse_osc_color_channel(channels.next()?)?;
     if channels.next().is_some() {
         return None;
     }
-    Some((slot.parse().ok()?, red, green, blue))
+    Some((slot.parse().ok()?, DefaultColor::new(red, green, blue)))
+}
+
+fn parse_osc_color_channel(channel: &str) -> Option<u16> {
+    let digits = channel.len();
+    if !(1..=4).contains(&digits) || !channel.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let value = u32::from_str_radix(channel, 16).ok()?;
+    let maximum = (1_u32 << (digits * 4)) - 1;
+    value
+        .saturating_mul(u32::from(u16::MAX))
+        .saturating_add(maximum / 2)
+        .checked_div(maximum)?
+        .try_into()
+        .ok()
 }
 
 fn is_primary_device_attributes_reply(sequence: &[u8]) -> bool {
@@ -720,7 +962,7 @@ fn is_clipboard_reply(sequence: &[u8]) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VirtualTerminalProfile {
     pub geometry: TerminalGeometry,
-    pub color_scheme: ColorScheme,
+    pub colors: VirtualTerminalColors,
     pub enquiry: Vec<u8>,
     pub version: String,
     pub da_conformance: u16,
@@ -735,7 +977,7 @@ impl VirtualTerminalProfile {
     pub fn lector(geometry: TerminalGeometry, color_scheme: ColorScheme) -> Self {
         Self {
             geometry,
-            color_scheme,
+            colors: VirtualTerminalColors::for_scheme(color_scheme),
             enquiry: b"lector".to_vec(),
             version: format!("Lector {}", env!("CARGO_PKG_VERSION")),
             da_conformance: 64,
@@ -748,6 +990,11 @@ impl VirtualTerminalProfile {
             da_unit_id: 0,
             clipboard_read: false,
         }
+    }
+
+    pub fn with_colors(mut self, colors: VirtualTerminalColors) -> Self {
+        self.colors = colors;
+        self
     }
 }
 
