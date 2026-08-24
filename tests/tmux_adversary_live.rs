@@ -1,6 +1,10 @@
 #![cfg(target_os = "macos")]
 
 use lector_ghostty::{Terminal, TerminalColorScheme, TerminalProfile};
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     fs,
@@ -312,6 +316,15 @@ impl LiveAdversary {
         }
     }
 
+    fn terminate_lector(&self) {
+        let pid = self.child.process_id().expect("Lector process id");
+        kill(
+            Pid::from_raw(i32::try_from(pid).expect("Lector pid fits in i32")),
+            Signal::SIGTERM,
+        )
+        .expect("signal Lector");
+    }
+
     fn assert_diagnostics(&self, scenario: &str) {
         let log = fs::read_to_string(&self.log).expect("read Lector diagnostic log");
         assert!(log.contains("\"kind\":\"log-start\""), "{scenario}: {log}");
@@ -555,4 +568,87 @@ fn nested_control_session_accepts_input_and_gracefully_cascades_deepest_first() 
         "nested graceful cascade did not finish"
     );
     live.assert_diagnostics("nested");
+}
+
+#[test]
+fn termination_signal_gracefully_detaches_every_nested_connection() {
+    let _serial = LIVE_ADVERSARY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut live = LiveAdversary::spawn("nested");
+    assert!(
+        live.wait_for(NESTED_READY, Duration::from_secs(5)),
+        "nested control session did not bootstrap"
+    );
+
+    live.terminate_lector();
+    assert!(
+        live.wait_for_event("nested-detach", Duration::from_secs(1)),
+        "shutdown did not detach the nested connection"
+    );
+    assert!(
+        live.wait_for_event("detach", Duration::from_secs(1)),
+        "shutdown did not continue to the outer connection"
+    );
+    assert!(
+        live.finish(Duration::from_secs(3)),
+        "Lector did not finish bounded shutdown"
+    );
+    live.assert_diagnostics("signal-nested-shutdown");
+}
+
+#[test]
+fn termination_signal_skips_an_unresponsive_connection_within_the_global_deadline() {
+    let _serial = LIVE_ADVERSARY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut live = LiveAdversary::spawn("no-read");
+    assert!(
+        live.wait_for(READY, Duration::from_secs(4)),
+        "unresponsive peer did not finish bootstrapping"
+    );
+
+    let began = Instant::now();
+    live.terminate_lector();
+    assert!(
+        live.finish(Duration::from_millis(2_500)),
+        "Lector exceeded its global shutdown budget"
+    );
+    assert!(
+        began.elapsed() < Duration::from_millis(2_500),
+        "shutdown was not bounded: {:?}",
+        began.elapsed()
+    );
+    assert!(
+        fs::read_to_string(&live.log)
+            .expect("read bounded-shutdown diagnostics")
+            .contains("did not detach within 200 milliseconds"),
+        "the stuck connection was not skipped after its per-connection budget"
+    );
+    live.assert_diagnostics("signal-unresponsive-shutdown");
+}
+
+#[test]
+fn a_second_shutdown_signal_exits_without_waiting_for_the_stuck_peer() {
+    let _serial = LIVE_ADVERSARY_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut live = LiveAdversary::spawn("no-read");
+    assert!(
+        live.wait_for(READY, Duration::from_secs(4)),
+        "unresponsive peer did not finish bootstrapping"
+    );
+
+    live.terminate_lector();
+    assert!(live.wait_for_log("shutdown-signal", Duration::from_millis(100)));
+    live.terminate_lector();
+    assert!(
+        live.finish(Duration::from_secs(1)),
+        "second termination signal did not force process exit"
+    );
+    let log = fs::read_to_string(&live.log).expect("read forced-shutdown diagnostics");
+    assert!(
+        !log.contains("did not detach within 200 milliseconds"),
+        "the second signal waited for the graceful timeout: {log}"
+    );
 }

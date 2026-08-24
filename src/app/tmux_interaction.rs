@@ -104,7 +104,7 @@ impl App {
         Ok(true)
     }
 
-    fn begin_graceful_tmux_teardown(
+    pub(super) fn begin_graceful_tmux_teardown(
         &mut self,
         connection_id: u64,
         sr: &mut ScreenReader,
@@ -115,8 +115,80 @@ impl App {
         self.pending_graceful_teardown = Some(PendingGracefulTeardown {
             remaining,
             awaiting: None,
+            awaiting_deadline_ms: None,
+            mode: GracefulTeardownMode::Interactive,
         });
         self.advance_graceful_tmux_teardown(sr, term_out)
+    }
+
+    /// Begin a bounded graceful-detach attempt for every known tmux control
+    /// connection. Descendants are always attempted before their ancestors.
+    pub fn begin_tmux_shutdown(
+        &mut self,
+        sr: &mut ScreenReader,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        self.pending_force_abandon = None;
+        self.pending_gateway_confirmation = None;
+        self.pending_tmux_confirmation = None;
+        self.pending_graceful_teardown = Some(PendingGracefulTeardown {
+            remaining: self.tmux_hierarchy.all_teardown_order().into(),
+            awaiting: None,
+            awaiting_deadline_ms: None,
+            mode: GracefulTeardownMode::Shutdown,
+        });
+        self.advance_graceful_tmux_teardown(sr, term_out)
+    }
+
+    /// Whether process shutdown still has a graceful tmux attempt in flight.
+    #[must_use]
+    pub fn tmux_shutdown_pending(&self) -> bool {
+        self.pending_graceful_teardown
+            .as_ref()
+            .is_some_and(|pending| pending.mode == GracefulTeardownMode::Shutdown)
+    }
+
+    /// Time until the current shutdown detach attempt should be skipped.
+    #[must_use]
+    pub fn tmux_shutdown_timeout(&self) -> Option<time::Duration> {
+        let deadline_ms = self
+            .pending_graceful_teardown
+            .as_ref()
+            .filter(|pending| pending.mode == GracefulTeardownMode::Shutdown)?
+            .awaiting_deadline_ms?;
+        Some(time::Duration::from_millis(
+            deadline_ms
+                .saturating_sub(self.clock.now_ms())
+                .try_into()
+                .unwrap_or(u64::MAX),
+        ))
+    }
+
+    /// Advance only the tmux shutdown state and write its queued control
+    /// commands. Ordinary terminal input and view timers are intentionally not
+    /// serviced once process shutdown has begun.
+    pub fn handle_tmux_shutdown_tick(
+        &mut self,
+        sr: &mut ScreenReader,
+        pty_out: &mut dyn Write,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        self.advance_graceful_tmux_teardown(sr, term_out)?;
+        if let Some(connection_id) = self.tmux_gateway.active_connection() {
+            self.drain_tmux_commands_for(connection_id, pty_out)?;
+        }
+        if let Some(pending) = self.pending_graceful_teardown.as_mut().filter(|pending| {
+            pending.mode == GracefulTeardownMode::Shutdown
+                && pending.awaiting.is_some()
+                && pending.awaiting_deadline_ms.is_none()
+        }) {
+            pending.awaiting_deadline_ms = Some(
+                self.clock
+                    .now_ms()
+                    .saturating_add(TMUX_SHUTDOWN_DETACH_TIMEOUT_MS),
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn advance_graceful_tmux_teardown(
@@ -124,43 +196,70 @@ impl App {
         sr: &mut ScreenReader,
         term_out: &mut dyn Write,
     ) -> Result<()> {
-        if self
-            .pending_graceful_teardown
-            .as_ref()
-            .and_then(|pending| pending.awaiting)
-            .is_some_and(|connection_id| self.tmux_hierarchy.contains(connection_id))
-        {
-            return Ok(());
-        }
-        if let Some(pending) = self.pending_graceful_teardown.as_mut() {
-            pending.awaiting = None;
-        }
-
-        let next = loop {
-            let Some(pending) = self.pending_graceful_teardown.as_mut() else {
-                return Ok(());
-            };
-            let Some(connection_id) = pending.remaining.pop_front() else {
-                self.pending_graceful_teardown = None;
-                self.log_event("completed graceful tmux connection teardown");
-                return Ok(());
-            };
-            if self.tmux_hierarchy.contains(connection_id) {
-                break connection_id;
+        loop {
+            let now_ms = self.clock.now_ms();
+            let awaiting = self
+                .pending_graceful_teardown
+                .as_ref()
+                .and_then(|pending| pending.awaiting);
+            if let Some(connection_id) = awaiting
+                && self.tmux_hierarchy.contains(connection_id)
+            {
+                let timed_out = self
+                    .pending_graceful_teardown
+                    .as_ref()
+                    .and_then(|pending| pending.awaiting_deadline_ms)
+                    .is_some_and(|deadline| now_ms >= deadline);
+                if !timed_out {
+                    return Ok(());
+                }
+                self.log_event(&format!(
+                    "tmux connection {connection_id} did not detach within {TMUX_SHUTDOWN_DETACH_TIMEOUT_MS} milliseconds; trying its ancestor"
+                ));
             }
-        };
-
-        if self.queue_accessible_tmux_detach(next, sr, term_out)? {
             if let Some(pending) = self.pending_graceful_teardown.as_mut() {
-                pending.awaiting = Some(next);
+                pending.awaiting = None;
+                pending.awaiting_deadline_ms = None;
+            }
+
+            let next = loop {
+                let Some(pending) = self.pending_graceful_teardown.as_mut() else {
+                    return Ok(());
+                };
+                let Some(connection_id) = pending.remaining.pop_front() else {
+                    self.pending_graceful_teardown = None;
+                    self.log_event("completed graceful tmux connection teardown attempts");
+                    return Ok(());
+                };
+                if self.tmux_hierarchy.contains(connection_id) {
+                    break connection_id;
+                }
+            };
+
+            let mode = self
+                .pending_graceful_teardown
+                .as_ref()
+                .map(|pending| pending.mode)
+                .expect("graceful teardown exists while selecting its next connection");
+            if self.queue_accessible_tmux_detach(next, sr, term_out)? {
+                if let Some(pending) = self.pending_graceful_teardown.as_mut() {
+                    pending.awaiting = Some(next);
+                    pending.awaiting_deadline_ms = None;
+                }
+                self.log_event(&format!(
+                    "requested graceful tmux detach for connection {next}"
+                ));
+                return Ok(());
+            }
+
+            if mode == GracefulTeardownMode::Interactive {
+                self.pending_graceful_teardown = None;
+                return Ok(());
             }
             self.log_event(&format!(
-                "requested graceful tmux detach for connection {next}"
+                "tmux connection {next} is inaccessible during shutdown; trying its ancestor"
             ));
-        } else {
-            self.pending_graceful_teardown = None;
         }
-        Ok(())
     }
 
     fn queue_accessible_tmux_detach(
@@ -169,6 +268,12 @@ impl App {
         _sr: &mut ScreenReader,
         _term_out: &mut dyn Write,
     ) -> Result<bool> {
+        // Once this client is selected for teardown, older view, input, and
+        // recovery work on the same control channel is obsolete. In
+        // particular, a carrier resumed for a descendant must not put a pane
+        // recapture ahead of its own eventual detach.
+        self.pending_tmux_commands
+            .retain(|command| command.connection_id != connection_id);
         // A nested control stream is carried as pane output by every ancestor.
         // The connection chooser can cover those panes long enough for tmux's
         // pause-after flow control to stop delivery. Resume the route from the
@@ -213,21 +318,148 @@ impl App {
         Some(gateway_path)
     }
 
-    pub(super) fn active_tmux_gateway_path(&self) -> Vec<(u64, crate::tmux_model::PaneId)> {
-        self.active_tmux_connection
-            .and_then(|connection_id| self.tmux_gateway_path(connection_id))
-            .map(|path| {
-                path.into_iter()
-                    .map(|hop| (hop.parent_connection_id, hop.pane_id))
-                    .collect()
+    /// Every pane which transports a live nested control connection must stay
+    /// flowing, even when that connection is not selected. Pane snapshots can
+    /// recover ordinary terminal output after `pause-after`; they cannot
+    /// reconstruct bytes lost from a nested tmux control protocol stream.
+    pub(super) fn live_tmux_gateway_carriers(&self) -> Vec<(u64, crate::tmux_model::PaneId)> {
+        self.tmux_connections
+            .iter()
+            .filter_map(
+                |connection| match self.tmux_hierarchy.origin(connection.id) {
+                    Some(GatewayOrigin::Pane {
+                        parent_connection_id,
+                        pane_id,
+                        ..
+                    }) => Some((parent_connection_id, crate::tmux_model::PaneId(pane_id))),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    pub(super) fn is_live_tmux_gateway_carrier(
+        &self,
+        parent_connection_id: u64,
+        pane_id: crate::tmux_model::PaneId,
+    ) -> bool {
+        self.tmux_connections.iter().any(|connection| {
+            matches!(
+                self.tmux_hierarchy.origin(connection.id),
+                Some(GatewayOrigin::Pane {
+                    parent_connection_id: candidate_parent,
+                    pane_id: candidate_pane,
+                    ..
+                }) if candidate_parent == parent_connection_id && candidate_pane == pane_id.0
+            )
+        })
+    }
+
+    /// Queue the transport route to a connection before restoring that
+    /// connection's own last user-visible tmux location. Routing an inner
+    /// connection through an ancestor must not replace the ancestor's memory.
+    pub(super) fn queue_tmux_connection_activation(&mut self, connection_id: u64) -> bool {
+        if !self.remember_tmux_gateway_parent_locations(connection_id) {
+            return false;
+        }
+        if !self.queue_tmux_gateway_path_resumes(connection_id) {
+            return false;
+        }
+        self.queue_preferred_tmux_location(connection_id);
+        true
+    }
+
+    pub(super) fn remember_tmux_gateway_parent_locations(&mut self, connection_id: u64) -> bool {
+        let Some(gateway_path) = self.tmux_gateway_path(connection_id) else {
+            return false;
+        };
+        for hop in &gateway_path {
+            if let Some(connection) = self
+                .tmux_connections
+                .iter_mut()
+                .find(|connection| connection.id == hop.parent_connection_id)
+                && connection.preferred_location.is_none()
+            {
+                connection.preferred_location = connection.topology.attached_location();
+            }
+        }
+        true
+    }
+
+    fn queue_preferred_tmux_location(&mut self, connection_id: u64) {
+        let commands = self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+            .and_then(|connection| {
+                let preferred = connection.preferred_location.as_ref()?;
+                let topology = &connection.topology;
+                let session = topology.session(preferred.session_id)?;
+                let window = topology.window(preferred.window_id)?;
+                if !session
+                    .windows
+                    .values()
+                    .any(|window_id| *window_id == preferred.window_id)
+                {
+                    return None;
+                }
+                if let Some(pane_id) = preferred.pane_id
+                    && topology
+                        .pane(pane_id)
+                        .is_none_or(|pane| pane.window_id != preferred.window_id)
+                {
+                    return None;
+                }
+
+                let mut commands = Vec::new();
+                if topology.attached_session() != Some(preferred.session_id) {
+                    commands.push(format!("switch-client -t ${}", preferred.session_id.0));
+                }
+                if session.active_window != Some(preferred.window_id) {
+                    commands.push(format!("select-window -t @{}", preferred.window_id.0));
+                }
+                if let Some(pane_id) = preferred.pane_id
+                    && window.active_pane != Some(pane_id)
+                {
+                    commands.push(format!("select-pane -t %{}", pane_id.0));
+                }
+                Some(commands)
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for command in commands {
+            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+                connection_id,
+                bytes: format!("{command}\n").into_bytes(),
+                expected_replies: vec![ExpectedTmuxReply::Ignored],
+                kind: PendingTmuxCommandKind::Ordinary,
+            });
+        }
     }
 
     pub(super) fn queue_tmux_gateway_path_resumes(&mut self, connection_id: u64) -> bool {
         let Some(gateway_path) = self.tmux_gateway_path(connection_id) else {
             return false;
         };
+        for hop in &gateway_path {
+            let mut canceled_pause = false;
+            self.pending_tmux_commands.retain(|command| {
+                let is_unsent_pause = command.connection_id == hop.parent_connection_id
+                    && command.expected_replies.iter().any(|reply| {
+                        matches!(reply, ExpectedTmuxReply::PanePause(pane_id) if *pane_id == hop.pane_id)
+                    });
+                canceled_pause |= is_unsent_pause;
+                !is_unsent_pause
+            });
+            if canceled_pause
+                && let Some(flow) = self
+                    .tmux_connections
+                    .iter_mut()
+                    .find(|connection| connection.id == hop.parent_connection_id)
+                    .and_then(|connection| connection.pane_flow.get_mut(&hop.pane_id))
+            {
+                flow.pause_requested = false;
+            }
+        }
         let mut restore_commands = Vec::new();
         for hop in &gateway_path {
             let Some(connection) = self

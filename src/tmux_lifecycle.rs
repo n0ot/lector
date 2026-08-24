@@ -146,6 +146,23 @@ impl ConnectionHierarchy {
         ordered
     }
 
+    /// Return every connection in a stable, deepest-first teardown order.
+    /// Independent direct transports are ordered by connection id.
+    #[must_use]
+    pub fn all_teardown_order(&self) -> Vec<u64> {
+        let roots = self
+            .origins
+            .iter()
+            .filter_map(|(id, origin)| matches!(origin, GatewayOrigin::Direct).then_some(*id))
+            .collect::<Vec<_>>();
+        let mut ordered = Vec::with_capacity(self.origins.len());
+        for root in roots {
+            self.collect_descendants(root, &mut ordered);
+            ordered.push(root);
+        }
+        ordered
+    }
+
     /// Remove a connection and all descendants, deepest descendants first.
     pub fn remove_connection(&mut self, connection_id: u64) -> Vec<u64> {
         if !self.origins.contains_key(&connection_id) {
@@ -288,5 +305,47 @@ mod tests {
         assert!(hierarchy.remove_connection(1).is_empty());
         assert!(hierarchy.teardown_order(1).is_empty());
         assert!(hierarchy.is_empty());
+    }
+
+    #[test]
+    fn all_teardown_order_covers_each_tree_deepest_first() {
+        let mut hierarchy = ConnectionHierarchy::new();
+        hierarchy.insert(10, GatewayOrigin::Direct).unwrap();
+        hierarchy.insert(1, GatewayOrigin::Direct).unwrap();
+        hierarchy
+            .insert(
+                2,
+                GatewayOrigin::Pane {
+                    parent_connection_id: 1,
+                    session_id: 1,
+                    window_id: 10,
+                    pane_id: 20,
+                },
+            )
+            .unwrap();
+        hierarchy
+            .insert(
+                3,
+                GatewayOrigin::Pane {
+                    parent_connection_id: 2,
+                    session_id: 1,
+                    window_id: 30,
+                    pane_id: 40,
+                },
+            )
+            .unwrap();
+        hierarchy
+            .insert(
+                4,
+                GatewayOrigin::Pane {
+                    parent_connection_id: 1,
+                    session_id: 2,
+                    window_id: 50,
+                    pane_id: 60,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(hierarchy.all_teardown_order(), vec![3, 2, 4, 1, 10]);
     }
 }

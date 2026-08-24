@@ -653,13 +653,19 @@ impl Process {
     }
 
     pub fn terminate(&mut self) {
+        self.terminate_with_timeout(CHILD_TERMINATION_REAP_TIMEOUT);
+    }
+
+    /// Kill the child process group and spend no longer than `reap_timeout`
+    /// checking for the direct child to exit.
+    pub fn terminate_with_timeout(&mut self, reap_timeout: Duration) {
         let Some(mut child) = self.child.take() else {
             return;
         };
         terminate_child(
             &mut *child,
             self.master.process_group_leader(),
-            CHILD_TERMINATION_REAP_TIMEOUT,
+            reap_timeout,
         );
     }
 }

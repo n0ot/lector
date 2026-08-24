@@ -46,6 +46,7 @@ const ROOT_SOURCE: SurfaceId = SurfaceId(1);
 const MAX_NESTED_TMUX_GATEWAYS: usize = 4_096;
 const TMUX_TERMINATOR_TIMEOUT_MS: u128 = 1_000;
 const TMUX_FORCE_ABANDON_GRACE_MS: u128 = 750;
+const TMUX_SHUTDOWN_DETACH_TIMEOUT_MS: u128 = 200;
 const TMUX_BELL_COALESCE_MS: u128 = 250;
 const TMUX_RECOVERY_QUIET_MS: u128 = 100;
 const TMUX_RECOVERY_HARD_DEADLINE_MS: u128 = 1_000;
@@ -1211,6 +1212,7 @@ struct TmuxConnectionState {
     flow_control_warning_announced: bool,
     capture_line_flags_supported: Option<bool>,
     last_announced_location: Option<crate::tmux_model::TmuxLocation>,
+    preferred_location: Option<crate::tmux_model::TmuxLocation>,
 }
 
 struct PendingTmuxPaneCapture {
@@ -1377,6 +1379,14 @@ struct KittyInputHandoff {
 struct PendingGracefulTeardown {
     remaining: VecDeque<u64>,
     awaiting: Option<u64>,
+    awaiting_deadline_ms: Option<u128>,
+    mode: GracefulTeardownMode,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GracefulTeardownMode {
+    Interactive,
+    Shutdown,
 }
 
 struct PendingForceAbandon {
@@ -2058,6 +2068,11 @@ impl App {
                     .map(|pending| pending.deadline_ms),
             )
             .chain(
+                self.pending_graceful_teardown
+                    .as_ref()
+                    .and_then(|pending| pending.awaiting_deadline_ms),
+            )
+            .chain(
                 self.startup_probe_broker
                     .as_ref()
                     .and_then(StartupProbeBroker::next_deadline_ms),
@@ -2239,6 +2254,11 @@ impl App {
                 .pending_force_abandon
                 .as_ref()
                 .is_some_and(|pending| pending.deadline_ms <= self.clock.now_ms())
+            || self
+                .pending_graceful_teardown
+                .as_ref()
+                .and_then(|pending| pending.awaiting_deadline_ms)
+                .is_some_and(|deadline| deadline <= self.clock.now_ms())
             || self.tmux_connections.iter().any(|connection| {
                 connection.pane_flow.values().any(|flow| {
                     !flow.resync_requested
@@ -2356,7 +2376,7 @@ impl App {
         self.pending_gateway_confirmation = None;
         self.active_tmux_connection = Some(connection_id);
         self.cancel_stabilization_bursts();
-        self.queue_tmux_gateway_path_resumes(connection_id);
+        self.queue_tmux_connection_activation(connection_id);
         if let Some(connection) = self.view_stack.tmux_connection_mut(connection_id) {
             connection.show_connection();
         }

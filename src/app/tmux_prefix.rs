@@ -228,9 +228,10 @@ impl App {
                 }
             }
             crate::tmux_prefix::BindingAction::Detach => {
-                // Commands are queued on the selected control connection, so
-                // tmux already knows which invoking client must be detached.
-                self.queue_tmux_user_command(connection_id, "detach-client")
+                // A connection may carry nested control clients from any of
+                // its tmux sessions. Detach those descendants first, then the
+                // invoking connection itself.
+                self.begin_graceful_tmux_teardown(connection_id, sr, term_out)
             }
             crate::tmux_prefix::BindingAction::Confirm { command, .. } => {
                 self.begin_tmux_confirmation(sr, connection_id, &command, term_out)

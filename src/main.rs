@@ -19,7 +19,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::fd::{AsFd, AsRawFd, RawFd},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     thread, time,
 };
 
@@ -27,6 +27,7 @@ const FOCUS_EVENTS_QUERY: &[u8] = b"\x1B[?1004$p";
 const STDOUT_WRITABLE_RETRY_INTERVAL: time::Duration = time::Duration::from_millis(10);
 const SHUTDOWN_FENCE_TIMEOUT: time::Duration = time::Duration::from_millis(1_000);
 const SHUTDOWN_INPUT_SETTLE_TIME: time::Duration = time::Duration::from_millis(50);
+const TMUX_SHUTDOWN_TIMEOUT: time::Duration = time::Duration::from_secs(2);
 
 const STARTUP_SIGNAL_TOKEN: mio::Token = mio::Token(0);
 const STARTUP_SIGNAL_CANCEL_TOKEN: mio::Token = mio::Token(1);
@@ -287,7 +288,12 @@ impl Drop for EmergencyTerminalGuard {
             return;
         }
         let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(&emergency_terminal_cleanup_bytes(self.focus_was_enabled));
+        // This is the last-resort path, including failures which occur before
+        // the normal shutdown reactor is fully constructed. Never let a
+        // stopped or backpressured terminal turn the fallback itself into an
+        // unbounded cleanup phase.
+        let _nonblocking_output = NonblockingFdGuard::enable(stdout.as_raw_fd()).ok();
+        let _ = stdout.write(&emergency_terminal_cleanup_bytes(self.focus_was_enabled));
         let _ = stdout.flush();
         let _ = termios::tcsetattr(
             std::io::stdin().as_fd(),
@@ -529,12 +535,9 @@ fn wait_for_shutdown_fence<R: Read + AsRawFd>(
 
         if let Some(outcome) = drain_shutdown_fence_input(stdin, &mut broker)? {
             if outcome == ShutdownFenceOutcome::Reply {
-                drain_shutdown_handoff_input(
-                    stdin,
-                    &mut poll,
-                    &mut events,
-                    SHUTDOWN_INPUT_SETTLE_TIME,
-                )?;
+                let settle_time = SHUTDOWN_INPUT_SETTLE_TIME
+                    .min(deadline.saturating_duration_since(time::Instant::now()));
+                drain_shutdown_handoff_input(stdin, &mut poll, &mut events, settle_time)?;
             }
             return Ok(outcome);
         }
@@ -1592,6 +1595,76 @@ impl Drop for DiagnosticsShutdownGuard {
     }
 }
 
+struct HardExitWatchdog {
+    cancel: std::sync::mpsc::Sender<()>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl HardExitWatchdog {
+    fn arm(deadline: time::Instant, signal: Option<i32>) -> Option<Self> {
+        let (cancel, receiver) = std::sync::mpsc::channel();
+        let exit_status = signal.map_or(1, |signal| 128_i32.saturating_add(signal));
+        let worker = thread::Builder::new()
+            .name("lector-shutdown-watchdog".to_owned())
+            .spawn(move || {
+                let remaining = deadline.saturating_duration_since(time::Instant::now());
+                if matches!(
+                    receiver.recv_timeout(remaining),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    // The deadline covers cleanup outside the event reactor as
+                    // well: terminal restoration, speech, diagnostics, and
+                    // child reaping. At this point graceful work has already
+                    // exhausted its budget, so avoid running any more drops.
+                    unsafe { nix::libc::_exit(exit_status) };
+                }
+            })
+            .ok()?;
+        Some(Self {
+            cancel,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for HardExitWatchdog {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn arm_hard_exit_watchdog(
+    watchdog: &mut Option<HardExitWatchdog>,
+    deadline: time::Instant,
+    signal: Option<i32>,
+) {
+    if watchdog.is_none() {
+        *watchdog = HardExitWatchdog::arm(deadline, signal);
+    }
+}
+
+fn install_second_termination_signal_exit() -> Result<Arc<AtomicBool>> {
+    let armed = Arc::new(AtomicBool::new(false));
+    for signal in [SIGHUP, SIGINT, SIGQUIT, SIGTERM] {
+        // Registration order is significant. The first signal observes false,
+        // then arms the flag and enters Lector's graceful path. Any subsequent
+        // termination signal exits directly from signal-hook, including while
+        // cleanup is outside the event reactor.
+        signal_hook::flag::register_conditional_shutdown(
+            signal,
+            128_i32.saturating_add(signal),
+            Arc::clone(&armed),
+        )
+        .with_context(|| format!("install forced shutdown handler for signal {signal}"))?;
+        signal_hook::flag::register(signal, Arc::clone(&armed))
+            .with_context(|| format!("install shutdown arming handler for signal {signal}"))?;
+    }
+    Ok(armed)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     if cli.native_speech_server {
@@ -1644,7 +1717,11 @@ fn main() -> Result<()> {
         diagnostics::initialize(cli.log_file.as_deref())?;
         diagnostics::event("main", "startup", &format!("shell={}", shell.display()));
     }
+    // Declared before the ordinary cleanup guards so it is canceled only
+    // after their drops have completed.
+    let mut hard_exit_watchdog = None;
     let diagnostics_shutdown = DiagnosticsShutdownGuard;
+    let _second_signal_exit_armed = install_second_termination_signal_exit()?;
 
     let mut physical_profile = PhysicalTerminalProfile::conservative(terminal_geometry);
     if let Some(term) = std::env::var_os("TERM")
@@ -1682,6 +1759,7 @@ fn main() -> Result<()> {
 
     let mut event_loop_started = false;
     let mut termination_signal = None;
+    let mut shutdown_deadline = None;
     let setup_result = lua::setup(
         conf_file.clone(),
         load_config,
@@ -1691,7 +1769,7 @@ fn main() -> Result<()> {
             let spec = screen_reader.speech_server_spec().clone();
             match start_configured_speech(screen_reader, spec, &speech_supervisor)? {
                 StartupSpeechOutcome::Ready(signals) => {
-                    termination_signal = do_events(
+                    let exit = do_events(
                         screen_reader,
                         &mut app,
                         &mut process,
@@ -1702,10 +1780,14 @@ fn main() -> Result<()> {
                         },
                         &speech_supervisor,
                         &init_term_attrs,
+                        &mut hard_exit_watchdog,
                     )?;
+                    termination_signal = exit.termination_signal;
+                    shutdown_deadline = Some(exit.shutdown_deadline);
                 }
                 StartupSpeechOutcome::Terminated(signal) => {
                     termination_signal = Some(signal);
+                    shutdown_deadline = Some(time::Instant::now() + TMUX_SHUTDOWN_TIMEOUT);
                 }
             }
             Ok(())
@@ -1730,7 +1812,7 @@ fn main() -> Result<()> {
             {
                 StartupSpeechOutcome::Ready(signals) => {
                     screen_reader.commit_speech_reconfiguration(speech::SpeechServerSpec::Native);
-                    termination_signal = do_events(
+                    let exit = do_events(
                         &mut screen_reader,
                         &mut app,
                         &mut process,
@@ -1745,10 +1827,14 @@ fn main() -> Result<()> {
                         },
                         &speech_supervisor,
                         &init_term_attrs,
+                        &mut hard_exit_watchdog,
                     )?;
+                    termination_signal = exit.termination_signal;
+                    shutdown_deadline = Some(exit.shutdown_deadline);
                 }
                 StartupSpeechOutcome::Terminated(signal) => {
                     termination_signal = Some(signal);
+                    shutdown_deadline = Some(time::Instant::now() + TMUX_SHUTDOWN_TIMEOUT);
                 }
             }
             Ok(())
@@ -1764,7 +1850,17 @@ fn main() -> Result<()> {
         eprintln!("failed to restore terminal settings: {err}");
     }
     screen_reader.shutdown_speech();
-    process.terminate();
+    if event_loop_started && shutdown_deadline.is_none() {
+        shutdown_deadline = Some(time::Instant::now() + TMUX_SHUTDOWN_TIMEOUT);
+    }
+    if let Some(deadline) = shutdown_deadline {
+        arm_hard_exit_watchdog(&mut hard_exit_watchdog, deadline, termination_signal);
+    }
+    if let Some(deadline) = shutdown_deadline {
+        process.terminate_with_timeout(deadline.saturating_duration_since(time::Instant::now()));
+    } else {
+        process.terminate();
+    }
     if let Some(signal) = termination_signal {
         // Signal handlers deliberately return here first so owned subprocesses
         // and diagnostics are shut down before restoring the signal's default
@@ -1785,6 +1881,11 @@ struct EventStartup<'a> {
     signals: Signals,
 }
 
+struct EventExit {
+    termination_signal: Option<i32>,
+    shutdown_deadline: time::Instant,
+}
+
 fn do_events(
     sr: &mut ScreenReader,
     app: &mut app::App,
@@ -1792,7 +1893,8 @@ fn do_events(
     startup: EventStartup<'_>,
     speech_supervisor: &speech::supervisor::SupervisorHandle,
     initial_term_attrs: &termios::Termios,
-) -> Result<Option<i32>> {
+    hard_exit_watchdog: &mut Option<HardExitWatchdog>,
+) -> Result<EventExit> {
     let EventStartup {
         initial_message,
         config_path: startup_config_path,
@@ -1865,6 +1967,8 @@ fn do_events(
     app.activate_physical_terminal(&mut stdout)?;
     app.flush_pending_clipboard_writes(sr, &mut stdout)?;
     let mut termination_signal = None;
+    let mut shutdown_deadline = None;
+    let mut force_shutdown = false;
 
     let event_result = (|| -> Result<()> {
         app.start_capability_probes(&mut stdout)?;
@@ -1894,8 +1998,15 @@ fn do_events(
             startup_drain_turns = startup_drain_turns.saturating_add(1);
         }
         if startup_pty.is_eof() {
+            let deadline = time::Instant::now() + TMUX_SHUTDOWN_TIMEOUT;
+            shutdown_deadline = Some(deadline);
+            arm_hard_exit_watchdog(hard_exit_watchdog, deadline, None);
             app.handle_pty_eof(sr, &mut stdout)?;
-            drain_scheduled_output_to_boundary(app, &mut stdout)?;
+            let _ = drain_scheduled_output_until(
+                app,
+                &mut stdout,
+                shutdown_deadline.expect("startup EOF armed a shutdown deadline"),
+            )?;
             return Ok(());
         }
         let mut pty_drain_pending = startup_pty.drain_again();
@@ -1954,15 +2065,35 @@ fn do_events(
         }
         service_speech_supervisor(sr, speech_supervisor)?;
         loop {
-            service_speech_supervisor(sr, speech_supervisor)?;
+            if shutdown_deadline.is_none() {
+                service_speech_supervisor(sr, speech_supervisor)?;
+            }
             let mut effective_poll_timeout: Option<time::Duration> = None;
-            if let Some(output_timeout) = app.scheduled_output_timeout() {
+            if let Some(deadline) = shutdown_deadline {
+                if force_shutdown || !app.tmux_shutdown_pending() {
+                    return Ok(());
+                }
+                if time::Instant::now() >= deadline {
+                    diagnostics::event(
+                        "event-loop",
+                        "shutdown-timeout",
+                        "global cleanup exceeded 2 seconds",
+                    );
+                    return Ok(());
+                }
+                let remaining = deadline.saturating_duration_since(time::Instant::now());
+                effective_poll_timeout = Some(
+                    app.tmux_shutdown_timeout()
+                        .map_or(remaining, |attempt| attempt.min(remaining)),
+                );
+            } else if let Some(output_timeout) = app.scheduled_output_timeout() {
                 effective_poll_timeout = Some(
                     effective_poll_timeout
                         .map_or(output_timeout, |current| current.min(output_timeout)),
                 );
             }
-            if startup_hook_path.is_some()
+            if shutdown_deadline.is_none()
+                && startup_hook_path.is_some()
                 && !startup_received_pty_output
                 && startup_silent_child_deadline.is_some()
             {
@@ -1973,14 +2104,18 @@ fn do_events(
                     stdout_registered,
                 );
             }
-            if app.wants_tick()
+            if (shutdown_deadline.is_none() && app.wants_tick())
                 || pty_drain_pending
-                || (startup_hook_path.is_none() && stdin_drain_pending)
+                || (shutdown_deadline.is_none()
+                    && startup_hook_path.is_none()
+                    && stdin_drain_pending)
             {
                 effective_poll_timeout = Some(time::Duration::from_millis(0));
             }
-            effective_poll_timeout =
-                stdout_retry_poll_timeout(effective_poll_timeout, stdout_registered);
+            if shutdown_deadline.is_none() {
+                effective_poll_timeout =
+                    stdout_retry_poll_timeout(effective_poll_timeout, stdout_registered);
+            }
             poll.poll(&mut events, effective_poll_timeout)
                 .or_else(|e| {
                     if e.kind() == ErrorKind::Interrupted {
@@ -2021,6 +2156,21 @@ fn do_events(
                     }
                     SIGNALS_TOKEN => {
                         for signal in signals.pending() {
+                            if shutdown_deadline.is_some() {
+                                if matches!(
+                                    terminal_signal_action(signal),
+                                    Some(TerminalSignalAction::Shutdown(_))
+                                ) {
+                                    diagnostics::event(
+                                        "event-loop",
+                                        "forced-shutdown-signal",
+                                        &signal.to_string(),
+                                    );
+                                    force_shutdown = true;
+                                    shutdown_deadline = Some(time::Instant::now());
+                                }
+                                continue;
+                            }
                             match terminal_signal_action(signal) {
                                 Some(TerminalSignalAction::Resize) => {
                                     let geometry =
@@ -2066,7 +2216,20 @@ fn do_events(
                                         &signal.to_string(),
                                     );
                                     termination_signal = Some(signal);
-                                    return Ok(());
+                                    let deadline = time::Instant::now() + TMUX_SHUTDOWN_TIMEOUT;
+                                    shutdown_deadline = Some(deadline);
+                                    arm_hard_exit_watchdog(
+                                        hard_exit_watchdog,
+                                        deadline,
+                                        Some(signal),
+                                    );
+                                    app.begin_tmux_shutdown(sr, &mut stdout)?;
+                                    if stdin_registered {
+                                        poll.registry().deregister(&mut stdin_source)?;
+                                        stdin_registered = false;
+                                    }
+                                    stdin_drain_pending = false;
+                                    startup_buffered_input.clear();
                                 }
                                 None => {}
                             }
@@ -2078,7 +2241,7 @@ fn do_events(
                 }
             }
 
-            if speech_ready {
+            if speech_ready && shutdown_deadline.is_none() {
                 service_speech_supervisor(sr, speech_supervisor)?;
             }
 
@@ -2087,11 +2250,20 @@ fn do_events(
                 startup_received_pty_output |= pty.received_output();
                 pty_drain_pending = pty.drain_again();
                 if pty.is_eof() {
+                    if shutdown_deadline.is_none() {
+                        let deadline = time::Instant::now() + TMUX_SHUTDOWN_TIMEOUT;
+                        shutdown_deadline = Some(deadline);
+                        arm_hard_exit_watchdog(hard_exit_watchdog, deadline, termination_signal);
+                    }
                     app.handle_pty_eof(sr, &mut stdout)?;
                     // Present the last complete child frame before lifecycle cleanup
                     // discards obsolete queued work. This keeps a BEL in that work
                     // associated with the child frame instead of shutdown.
-                    drain_scheduled_output_to_boundary(app, &mut stdout)?;
+                    let _ = drain_scheduled_output_until(
+                        app,
+                        &mut stdout,
+                        shutdown_deadline.expect("PTY EOF armed a shutdown deadline"),
+                    )?;
                     return Ok(());
                 }
             }
@@ -2099,7 +2271,11 @@ fn do_events(
             // Apply ready child output before screen-derived input commands.
             // A poll turn may report both descriptors; reviewing the screen
             // first would otherwise observe the state just before that output.
-            if stdin_ready && startup_hook_path.is_some() {
+            if shutdown_deadline.is_some() {
+                // No ordinary input, view timers, or speech work is serviced
+                // once graceful process shutdown has begun. PTY traffic above
+                // remains live so each tmux `%exit` can advance the cascade.
+            } else if stdin_ready && startup_hook_path.is_some() {
                 // Physical input remains in the kernel until the initial
                 // child frame has crossed its compositor flush boundary. A
                 // remembered readiness is serviced immediately after the hook
@@ -2115,12 +2291,52 @@ fn do_events(
                 })?;
                 stdin_drain_pending = input.drain_again();
                 if input.is_eof() {
-                    return Ok(());
+                    let deadline = time::Instant::now() + TMUX_SHUTDOWN_TIMEOUT;
+                    shutdown_deadline = Some(deadline);
+                    arm_hard_exit_watchdog(hard_exit_watchdog, deadline, None);
+                    app.begin_tmux_shutdown(sr, &mut stdout)?;
+                    if stdin_registered {
+                        poll.registry().deregister(&mut stdin_source)?;
+                        stdin_registered = false;
+                    }
+                    stdin_drain_pending = false;
                 }
                 // Lua input handlers may request a transactional server swap.
                 // Enqueue it now; spawning and handshaking remain entirely on
                 // the bounded speech worker.
-                service_speech_supervisor(sr, speech_supervisor)?;
+                if shutdown_deadline.is_none() {
+                    service_speech_supervisor(sr, speech_supervisor)?;
+                }
+            }
+
+            if shutdown_deadline.is_some() {
+                if force_shutdown
+                    || shutdown_deadline.is_some_and(|deadline| time::Instant::now() >= deadline)
+                {
+                    return Ok(());
+                }
+                app.handle_tmux_shutdown_tick(sr, &mut pty_stream, &mut stdout)?;
+                let dropped_pty_bytes = pty_stream.take_dropped_write_bytes();
+                if dropped_pty_bytes != 0 {
+                    diagnostics::event(
+                        "event-loop",
+                        "tmux-shutdown-write-overflow",
+                        &format!("dropped={dropped_pty_bytes}"),
+                    );
+                    force_shutdown = true;
+                }
+                let wants_pty_writable = pty_stream.has_pending_writes();
+                if wants_pty_writable != pty_writable_registered {
+                    let interest = if wants_pty_writable {
+                        mio::Interest::READABLE.add(mio::Interest::WRITABLE)
+                    } else {
+                        mio::Interest::READABLE
+                    };
+                    poll.registry()
+                        .reregister(&mut pty_source, PTY_TOKEN, interest)?;
+                    pty_writable_registered = wants_pty_writable;
+                }
+                continue;
             }
 
             if stdout_registered {
@@ -2210,16 +2426,32 @@ fn do_events(
         }
     })();
 
-    let output_restore_result = nonblocking_output.restore();
-    let input_restore_result = nonblocking_input.restore();
+    let shutdown_deadline =
+        *shutdown_deadline.get_or_insert_with(|| time::Instant::now() + TMUX_SHUTDOWN_TIMEOUT);
+    arm_hard_exit_watchdog(hard_exit_watchdog, shutdown_deadline, termination_signal);
+
     let cleanup_result = (|| -> Result<()> {
         let stale_da1_replies = app.outstanding_startup_primary_device_attributes_replies();
         app.begin_physical_terminal_shutdown_fence(&mut stdout)?;
-        drain_scheduled_output_to_boundary(app, &mut stdout)?;
-        let fence_result =
-            wait_for_shutdown_fence(&mut stdin, stale_da1_replies, SHUTDOWN_FENCE_TIMEOUT);
+        let began_fence = drain_scheduled_output_until(app, &mut stdout, shutdown_deadline)?;
+        let fence_result = if began_fence && time::Instant::now() < shutdown_deadline {
+            wait_for_shutdown_fence(
+                &mut stdin,
+                stale_da1_replies,
+                SHUTDOWN_FENCE_TIMEOUT
+                    .min(shutdown_deadline.saturating_duration_since(time::Instant::now())),
+            )
+        } else {
+            Ok(ShutdownFenceOutcome::TimedOut)
+        };
         app.finish_physical_terminal_shutdown_fence(&mut stdout)?;
-        drain_scheduled_output_to_boundary(app, &mut stdout)?;
+        let finished_lifecycle = drain_scheduled_output_until(app, &mut stdout, shutdown_deadline)?;
+        if !began_fence || !finished_lifecycle {
+            // The normal compositor path was backpressured at the hard
+            // deadline. Make one nonblocking best-effort reset and move on.
+            let _ = stdout.write(&emergency_terminal_cleanup_bytes(focus_was_enabled));
+            let _ = stdout.flush();
+        }
         termios::tcsetattr(
             std::io::stdin().as_fd(),
             // Input generated while Lector still owned Kitty key-release
@@ -2234,6 +2466,8 @@ fn do_events(
         let _ = fence_result?;
         Ok(())
     })();
+    let output_restore_result = nonblocking_output.restore();
+    let input_restore_result = nonblocking_input.restore();
 
     if let Err(error) = event_result {
         if let Err(restore_error) = &output_restore_result {
@@ -2267,13 +2501,19 @@ fn do_events(
         if output_restore_result.is_ok() && input_restore_result.is_ok() && cleanup_result.is_ok() {
             emergency_terminal.disarm();
         }
-        return Ok(termination_signal);
+        return Ok(EventExit {
+            termination_signal,
+            shutdown_deadline,
+        });
     }
     output_restore_result?;
     input_restore_result?;
     cleanup_result?;
     emergency_terminal.disarm();
-    Ok(termination_signal)
+    Ok(EventExit {
+        termination_signal,
+        shutdown_deadline,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2335,6 +2575,26 @@ fn drain_scheduled_output_to_boundary(app: &mut app::App, term_out: &mut dyn Wri
         let report = app.drain_scheduled_output(term_out, true)?;
         if !report.blocked && !report.write_budget_exhausted {
             return Ok(());
+        }
+        app.notify_scheduled_output_writable();
+    }
+}
+
+fn drain_scheduled_output_until(
+    app: &mut app::App,
+    term_out: &mut dyn Write,
+    deadline: time::Instant,
+) -> Result<bool> {
+    loop {
+        if time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        let report = app.drain_scheduled_output(term_out, true)?;
+        if !report.blocked && !report.write_budget_exhausted {
+            return Ok(true);
+        }
+        if report.blocked {
+            return Ok(false);
         }
         app.notify_scheduled_output_writable();
     }

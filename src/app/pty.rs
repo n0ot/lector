@@ -552,6 +552,7 @@ impl App {
             flow_control_warning_announced: false,
             capture_line_flags_supported: None,
             last_announced_location: None,
+            preferred_location: None,
         });
         self.pending_tmux_commands.push_back(PendingTmuxCommand {
             connection_id,
@@ -571,6 +572,7 @@ impl App {
         let geometry = self.view_stack.root_mut().model().live_screen().geometry;
         self.queue_tmux_resize(connection_id, geometry);
         self.queue_tmux_inventory(connection_id);
+        self.remember_tmux_gateway_parent_locations(connection_id);
         self.active_tmux_connection = Some(connection_id);
         self.cancel_stabilization_bursts();
         self.view_stack.clear_overlays();
@@ -692,7 +694,7 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         let now_ms = self.clock.now_ms();
-        let active_gateway_path = self.active_tmux_gateway_path();
+        let active_gateway_path = self.live_tmux_gateway_carriers();
         let connection_is_presented = self
             .view_stack
             .presented_tmux_connection_mut()
@@ -1191,6 +1193,20 @@ impl App {
             }
             location_changed =
                 sync_topology && previous_location != connection.topology.attached_location();
+        }
+        let connection_is_user_visible = self.active_tmux_connection == Some(connection_id)
+            && self
+                .view_stack
+                .tmux_connection_mut(connection_id)
+                .is_some_and(|view| !view.is_showing_connection_portal());
+        if sync_topology
+            && connection_is_user_visible
+            && let Some(connection) = self
+                .tmux_connections
+                .iter_mut()
+                .find(|connection| connection.id == connection_id)
+        {
+            connection.preferred_location = connection.topology.attached_location();
         }
         if let Some(window_id) = self
             .tmux_connections
@@ -1723,14 +1739,20 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         let key = (connection_id, pane_id);
-        let pane_is_visible = self
-            .view_stack
-            .presented_tmux_connection_mut()
-            .is_some_and(|view| {
-                view.connection_id() == connection_id
-                    && !view.is_showing_portal()
-                    && view.is_pane_visible(pane_id)
-            });
+        // A carrier can be outside the attached session while its child is
+        // selected. Its direct terminal bytes are still part of the same pane
+        // stream as the nested control protocol, so applying pause-after to
+        // that pane would also stop (and eventually lose) child control data.
+        let pane_is_transport_critical = self.is_live_tmux_gateway_carrier(connection_id, pane_id);
+        let pane_is_visible = pane_is_transport_critical
+            || self
+                .view_stack
+                .presented_tmux_connection_mut()
+                .is_some_and(|view| {
+                    view.connection_id() == connection_id
+                        && !view.is_showing_portal()
+                        && view.is_pane_visible(pane_id)
+                });
         let pane_needs_resync = self
             .tmux_connections
             .iter_mut()
@@ -2341,7 +2363,7 @@ impl App {
 
     pub(super) fn sync_tmux_panes(&mut self, connection_id: u64) -> Result<bool> {
         let now_ms = self.clock.now_ms();
-        let active_gateway_path = self.active_tmux_gateway_path();
+        let active_gateway_path = self.live_tmux_gateway_carriers();
         let topology = {
             let Some(connection) = self
                 .tmux_connections
@@ -2677,6 +2699,7 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.expire_tmux_gateway_terminators(sr, term_out)?;
+        self.advance_graceful_tmux_teardown(sr, term_out)?;
         self.queue_due_tmux_pane_resyncs()?;
         self.flush_deferred_kitty_releases(pty_out)?;
         self.drain_direct_gateway_input(pty_out)?;
@@ -2780,7 +2803,7 @@ impl App {
     }
 
     fn queue_due_tmux_pane_resyncs(&mut self) -> Result<()> {
-        let active_gateway_path = self.active_tmux_gateway_path();
+        let active_gateway_path = self.live_tmux_gateway_carriers();
         let presented_connection = self
             .view_stack
             .presented_tmux_connection_mut()
