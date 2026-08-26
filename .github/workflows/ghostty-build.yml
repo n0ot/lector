@@ -51,9 +51,18 @@ jobs:
         run: >-
           git grep -Il -E '^#!.*(ba)?sh' -- scripts tests/fixtures/pty
           | xargs shellcheck -x
+      - name: Install cargo-nextest
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7
+        with:
+          tool: nextest
+          version: 0.9.143
       - name: Run complete suite
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --locked --workspace --all-targets --all-features
+        run: cargo nextest run --locked --workspace --all-targets --all-features
+      - name: Run documentation tests
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --locked --workspace --doc --all-features
 
   tier-two-static:
     name: ${{ matrix.target }} static link

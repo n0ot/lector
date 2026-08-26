@@ -1131,8 +1131,11 @@ mod tests {
         let root = tempfile::tempdir().expect("create contended terminfo cache");
         let cache = root.path().join("cache");
         std::fs::create_dir_all(&cache).expect("create cache directory");
-        let held = acquire_terminfo_cache_lock(&cache, Duration::from_millis(20))
-            .expect("hold cache lock");
+        // Other unit tests may briefly own the process-wide cache lock. Wait
+        // for that unrelated setup before deliberately holding this cache's
+        // file lock and measuring the short fallback deadline below.
+        let held =
+            acquire_terminfo_cache_lock(&cache, Duration::from_secs(2)).expect("hold cache lock");
         let started = Instant::now();
 
         let terminfo = synchronized_output_terminfo_with_cache_options(

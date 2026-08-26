@@ -209,8 +209,8 @@ benchmark run measured 67 us tmux-like and 73 us Zellij-like p95, a maximum
 Run the completion gates with:
 
 ```sh
-cargo test --locked --all-targets
-cargo test --release --test tmux_completion -- --nocapture
+cargo nextest run --locked --all-targets
+cargo test --release --test tmux tmux_completion:: -- --nocapture
 cargo ghostty-bench
 ```
 

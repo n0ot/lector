@@ -893,6 +893,7 @@ fn drive_real_tmux(
 
 #[test]
 fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
+    let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()

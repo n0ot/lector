@@ -1,0 +1,16 @@
+[test-groups]
+external-process = { max-threads = 4 }
+live-pty = { max-threads = 1 }
+real-tmux = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(speech) | (binary(tmux) & not test(/(^|::)(real_|two_real_)/))'
+test-group = 'external-process'
+
+[[profile.default.overrides]]
+filter = 'binary(tmux) & test(/(^|::)(real_|two_real_)/)'
+test-group = 'real-tmux'
+
+[[profile.default.overrides]]
+filter = 'binary(live_pty) | binary(tmux_adversary_live)'
+test-group = 'live-pty'

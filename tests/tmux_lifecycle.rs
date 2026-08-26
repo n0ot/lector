@@ -479,6 +479,7 @@ impl Drop for DisposableTmuxServer {
 
 #[test]
 fn real_tmux_create_split_kill_window_and_detach_use_only_a_disposable_server() {
+    let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()

@@ -3,6 +3,7 @@ name = "lector"
 version = "0.4.1"
 edition = "2024"
 autobins = false
+autotests = false
 default-run = "lector"
 description = "A terminal screen reader"
 license = "MIT"
@@ -54,14 +55,17 @@ path = "src/main.rs"
 [[bin]]
 name = "lector-harness"
 path = "src/bin/lector-harness.rs"
+test = false
 
 [[bin]]
 name = "proc_stub_server"
 path = "src/bin/proc_stub_server.rs"
+test = false
 
 [[bin]]
 name = "tmux-control-adversary"
 path = "src/bin/tmux-control-adversary.rs"
+test = false
 
 [[bin]]
 name = "lector-ghostty-bench"
@@ -75,3 +79,42 @@ core-foundation = "0.10"
 
 [dev-dependencies]
 tempfile = "3.25.0"
+
+[profile.test]
+debug = "line-tables-only"
+
+[[test]]
+name = "app"
+path = "tests/app.rs"
+
+[[test]]
+name = "core"
+path = "tests/suite_core.rs"
+
+[[test]]
+name = "ghostty_build"
+path = "tests/ghostty_build.rs"
+
+[[test]]
+name = "terminal"
+path = "tests/suite_terminal.rs"
+
+[[test]]
+name = "presentation"
+path = "tests/suite_presentation.rs"
+
+[[test]]
+name = "speech"
+path = "tests/suite_speech.rs"
+
+[[test]]
+name = "tmux"
+path = "tests/suite_tmux.rs"
+
+[[test]]
+name = "live_pty"
+path = "tests/live_pty.rs"
+
+[[test]]
+name = "tmux_adversary_live"
+path = "tests/tmux_adversary_live.rs"

@@ -759,6 +759,7 @@ fn drive_real_tmux(
 
 #[test]
 fn real_tmux_discovers_c_a_and_executes_next_window_through_control_mode() {
+    let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()

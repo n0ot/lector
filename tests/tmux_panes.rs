@@ -839,6 +839,7 @@ fn verify_app_scene(case: &str, app: &mut App, physical: &[u8]) {
 
 #[test]
 fn real_tmux_split_resize_zoom_close_and_bootstrap_match_the_render_oracle() {
+    let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()

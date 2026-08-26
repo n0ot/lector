@@ -74,6 +74,32 @@ fn root_binary_targets_are_explicit() {
 }
 
 #[test]
+fn integration_targets_are_consolidated_without_disabling_test_discovery() {
+    let manifest = include_str!("../Cargo.toml");
+    let targets = [
+        ("app", "tests/app.rs"),
+        ("core", "tests/suite_core.rs"),
+        ("ghostty_build", "tests/ghostty_build.rs"),
+        ("terminal", "tests/suite_terminal.rs"),
+        ("presentation", "tests/suite_presentation.rs"),
+        ("speech", "tests/suite_speech.rs"),
+        ("tmux", "tests/suite_tmux.rs"),
+        ("live_pty", "tests/live_pty.rs"),
+        ("tmux_adversary_live", "tests/tmux_adversary_live.rs"),
+    ];
+
+    assert!(manifest.contains("autotests = false"));
+    assert_eq!(manifest.matches("[[test]]").count(), targets.len());
+    for (name, path) in targets {
+        assert!(
+            manifest.contains(&format!("name = \"{name}\"\npath = \"{path}\"")),
+            "missing consolidated integration target {name} at {path}"
+        );
+    }
+    assert!(manifest.contains("[profile.test]\ndebug = \"line-tables-only\""));
+}
+
+#[test]
 fn cargo_build_automatically_bootstraps_and_validates_the_native_cache() {
     let wrapper_build = include_str!("../crates/lector-ghostty/build.rs");
     assert!(wrapper_build.contains("GHOSTTY_PREBUILT_ROOT"));

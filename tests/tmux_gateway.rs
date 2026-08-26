@@ -302,6 +302,7 @@ fn portal_is_read_only_and_enter_targets_its_connection() {
 
 #[test]
 fn real_local_tmux_control_client_crosses_the_pty_gateway_harness() {
+    let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")
         .arg("-V")
         .output()

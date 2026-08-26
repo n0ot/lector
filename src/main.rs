@@ -2594,7 +2594,12 @@ fn drain_scheduled_output_until(
             return Ok(true);
         }
         if report.blocked {
-            return Ok(false);
+            // The ordinary event loop waits for a writable readiness edge,
+            // but EOF and shutdown paths call this helper after leaving that
+            // loop. Give the physical reader a bounded chance to drain so the
+            // child's final accepted frame is not discarded just because the
+            // first nonblocking write filled the terminal queue.
+            thread::sleep(STDOUT_WRITABLE_RETRY_INTERVAL);
         }
         app.notify_scheduled_output_writable();
     }
