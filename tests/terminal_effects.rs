@@ -126,13 +126,13 @@ fn unknown_sequences_are_fragment_safe_bounded_and_abortable() {
     );
 
     let mut oversized = b"\x1B_".to_vec();
-    oversized.extend(std::iter::repeat_n(b'x', 400));
+    oversized.extend(std::iter::repeat_n(b'x', 5_000));
     oversized.extend_from_slice(b"\x1B\\");
     let update = engine.advance(&oversized);
     assert_eq!(
         update.effects.events,
         [TerminalEvent::UnknownSequence {
-            content: vec![b'x'; 256],
+            content: vec![b'x'; 4_096],
             truncated: true,
         }]
     );
@@ -144,6 +144,14 @@ fn unknown_sequences_are_fragment_safe_bounded_and_abortable() {
             .events
             .is_empty()
     );
+}
+
+#[test]
+fn terminal_reset_boundaries_are_exact() {
+    let mut engine = engine(2, 20, 10);
+    assert!(!engine.advance(b"\x1B[0m\x1B[2J").terminal_reset);
+    assert!(engine.advance(b"\x1B[!p").terminal_reset);
+    assert!(engine.advance(b"\x1Bc").terminal_reset);
 }
 
 #[test]
@@ -551,7 +559,7 @@ fn ghostty_fragmented_queries_and_bounded_unknowns_match_the_contract() {
     );
 
     let mut oversized = b"\x1B_".to_vec();
-    oversized.extend(std::iter::repeat_n(b'z', 400));
+    oversized.extend(std::iter::repeat_n(b'z', 5_000));
     oversized.extend_from_slice(b"\x1B\\");
     assert_eq!(
         engine
@@ -560,7 +568,7 @@ fn ghostty_fragmented_queries_and_bounded_unknowns_match_the_contract() {
             .effects
             .events,
         [TerminalEvent::UnknownSequence {
-            content: vec![b'z'; 256],
+            content: vec![b'z'; 4_096],
             truncated: true,
         }]
     );

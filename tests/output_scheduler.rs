@@ -61,6 +61,8 @@ fn accessibility_bundle(marker: u64) -> PresentedAccessibilityBundle {
             history_basis: Default::default(),
             history: None,
             accessibility_epoch: Default::default(),
+            application_auto_read_suppressed: false,
+            application_cursor_tracking_suppressed: false,
             explicitly_stable: false,
             cursor_visibility_restored: false,
         }],

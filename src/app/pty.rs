@@ -3332,10 +3332,14 @@ impl App {
                 } else {
                     self.view_stack.root_mut().model()
                 };
-                (
-                    sr.resolve_confirmed_pending_delete(view)?,
-                    view.accessibility_revision(),
-                )
+                let policy = view.application_accessibility_policy();
+                let announced = if policy.suppress_cursor_tracking {
+                    sr.clear_pending_delete();
+                    false
+                } else {
+                    sr.resolve_confirmed_pending_delete(view)?
+                };
+                (announced, view.accessibility_revision())
             };
             if announced {
                 self.log_latency_stage("delete-announced", || {
@@ -3365,6 +3369,10 @@ impl App {
             } else {
                 self.view_stack.root_mut().model()
             };
+            let application_policy = consume_application_accessibility(sr, view, !overlay_active)?;
+            if application_policy.suppress_auto_read {
+                sr.clear_pending_history_navigation();
+            }
             let presented_screen_identity_changed =
                 view.prev_screen().screen != view.screen().screen;
             if !overlay_active && presented_screen_identity_changed {
@@ -3385,9 +3393,15 @@ impl App {
                     // cross that context boundary. Read a settled alternate
                     // screen in full, then only the current line when its
                     // already-heard primary context is restored.
-                    announce_screen_transition(sr, view)?;
+                    if !application_policy.suppress_auto_read {
+                        announce_screen_transition(sr, view)?;
+                    }
                 } else if !overlay_active {
-                    let mut read_text = sr.resolve_pending_delete(view)?;
+                    let mut read_text = if application_policy.suppress_cursor_tracking {
+                        false
+                    } else {
+                        sr.resolve_pending_delete(view)?
+                    };
                     // A shell's OSC 133 B marker can remain attached to the
                     // primary grid while a temporary interface owns that same
                     // screen. First honor an exact, key-caused visual focus
@@ -3396,12 +3410,14 @@ impl App {
                     let visual_focus_read = sr.has_pending_history_navigation()
                         && history_focus_presentation == Some(true)
                         && sr.auto_read_enabled()
+                        && !application_policy.suppress_auto_read
                         && recent_input
                         && sr.read_visual_focus_transfer(view)?;
                     let navigation_read = if visual_focus_read {
                         sr.clear_pending_history_navigation();
                         true
-                    } else if !history_waits_for_presentation
+                    } else if !application_policy.suppress_auto_read
+                        && !history_waits_for_presentation
                         && sr.take_pending_history_navigation()
                     {
                         if let Some(input) = view.active_semantic_input() {
@@ -3418,21 +3434,23 @@ impl App {
                     if navigation_read {
                         read_text = true;
                     } else {
-                        if sr.highlight_tracking_enabled() {
+                        if sr.highlight_tracking_enabled() && !application_policy.suppress_auto_read
+                        {
                             sr.track_highlighting(view)?;
                         }
-                        let auto_read_text = if sr.auto_read_enabled() {
-                            if recent_input {
-                                sr.auto_read_after_input(view)?
+                        let auto_read_text =
+                            if sr.auto_read_enabled() && !application_policy.suppress_auto_read {
+                                if recent_input {
+                                    sr.auto_read_after_input(view)?
+                                } else {
+                                    sr.auto_read(view)?
+                                }
                             } else {
-                                sr.auto_read(view)?
-                            }
-                        } else {
-                            false
-                        };
+                                false
+                            };
                         read_text |= auto_read_text;
                     }
-                    if recent_input && !read_text {
+                    if recent_input && !read_text && !application_policy.suppress_cursor_tracking {
                         sr.track_cursor(view)?;
                     }
                 }

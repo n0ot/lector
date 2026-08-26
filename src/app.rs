@@ -1,4 +1,5 @@
 use crate::{
+    application_accessibility::ApplicationAccessibilityPolicy,
     commands,
     keymap::Binding,
     output_scheduler::{DrainReport, OutputScheduler, OutputSchedulerConfig, ScheduledOutputClass},
@@ -99,6 +100,38 @@ fn prepare_review_cursor_for_active_context(sr: &mut ScreenReader, view: &mut Vi
         sr.hook_on_review_cursor_move(old, new)?;
     }
     Ok(())
+}
+
+fn consume_application_accessibility(
+    sr: &mut ScreenReader,
+    view: &mut View,
+    allow_speech: bool,
+) -> Result<ApplicationAccessibilityPolicy> {
+    let policy = view.application_accessibility_policy();
+    let messages = view.take_presented_application_speech();
+    if policy.suppress_cursor_tracking {
+        // A delete intent may have been captured before the application's
+        // suppression reached the physical presentation boundary.
+        sr.clear_pending_delete();
+    }
+    let speak = allow_speech && sr.auto_read_enabled();
+    for message in messages {
+        let indentation_changed = message
+            .indentation
+            .is_some_and(|level| view.application_semantic_indentation_changed(level));
+        if speak {
+            if let Some(level) = message
+                .indentation
+                .filter(|_| indentation_changed && sr.indentation_reporting_enabled())
+            {
+                sr.speak(&format!("indent {level}"), false)?;
+            }
+            // `speak` applies the outer-terminal focus policy. Unfocused
+            // messages are consumed here and are never replayed later.
+            sr.speak(&message.text, false)?;
+        }
+    }
+    Ok(policy)
 }
 
 #[cfg(test)]

@@ -565,6 +565,8 @@ pub struct UpdateSnapshot {
     /// structural output, another semantic phase, or an incomplete parser
     /// continuation clears the boundary.
     pub semantic_input_boundary: bool,
+    /// This update contained a full (RIS) or soft (DECSTR) terminal reset.
+    pub terminal_reset: bool,
     /// This update ended exactly at a real hidden-to-visible cursor
     /// transition. This records application painting behavior; it is not a
     /// transaction or accessibility commit boundary.
@@ -789,7 +791,7 @@ impl Drop for SnapshotDecoderHandle {
     }
 }
 
-const UNKNOWN_SEQUENCE_MAX_BYTES: usize = 256;
+const UNKNOWN_SEQUENCE_MAX_BYTES: usize = 4 * 1024;
 const CONTINUATION_MAX_BYTES: usize = 64 * 1024;
 const KITTY_IMAGE_STORAGE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -1521,6 +1523,7 @@ struct StreamObserver {
     synchronized_output_boundary: Option<bool>,
     cursor_visibility_boundary: Option<bool>,
     semantic_input_boundary: bool,
+    terminal_reset: bool,
     unbrokered_private_mode_boundary: u8,
 }
 
@@ -1798,6 +1801,7 @@ impl StreamObserver {
             printed_runs: std::mem::take(&mut self.printed_runs),
             output_report_structural: std::mem::take(&mut self.output_report_structural),
             semantic_input_boundary: std::mem::take(&mut self.semantic_input_boundary),
+            terminal_reset: std::mem::take(&mut self.terminal_reset),
             operations,
             cursor_operations: std::mem::take(&mut self.cursor_operations),
             cursor_operations_after_last_line_feed: std::mem::take(
@@ -1814,6 +1818,7 @@ struct StreamUpdate {
     printed_runs: Vec<PrintedRunSnapshot>,
     output_report_structural: bool,
     semantic_input_boundary: bool,
+    terminal_reset: bool,
     operations: Vec<OperationSnapshot>,
     cursor_operations: usize,
     cursor_operations_after_last_line_feed: usize,
@@ -1936,6 +1941,9 @@ impl vte::Perform for StreamObserver {
         action: char,
     ) {
         self.flush_print();
+        if !ignore && intermediates == b"!" && action == 'p' {
+            self.terminal_reset = true;
+        }
         let output_neutral_private_mode = !ignore
             && intermediates == b"?"
             && matches!(action, 'h' | 'l')
@@ -2220,6 +2228,7 @@ impl vte::Perform for StreamObserver {
                 }
             }
             b'c' => {
+                self.terminal_reset = true;
                 self.scroll_region = None;
                 self.origin_mode = false;
                 self.left_right_margin_mode = false;
@@ -2495,6 +2504,7 @@ impl Terminal {
             synchronized_output_closed: !self.snapshot.modes.synchronized_output
                 && synchronized_output_close_end == Some(bytes.len()),
             semantic_input_boundary: stream.semantic_input_boundary && !parser_continuation,
+            terminal_reset: stream.terminal_reset,
             cursor_visibility_restored: self.snapshot.cursor.visible
                 && cursor_visibility_restore_end == Some(bytes.len()),
             synchronized_output_open_snapshot,

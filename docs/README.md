@@ -15,6 +15,10 @@ read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
   configuration, NDJSON JSON-RPC framing, initialization, discovery, deadlines,
   restart policy, and process cleanup. Its machine-readable method schema is
   the repository-root [`openrpc.json`](../openrpc.json).
+- [Application-authored accessibility](application-accessibility.md) defines
+  the generic terminal protocol, fail-safe lifecycle, and pane isolation. The
+  standalone [`lector.nvim`](https://github.com/n0ot/lector.nvim) plugin is its
+  Neovim producer.
 
 ## tmux control mode
 

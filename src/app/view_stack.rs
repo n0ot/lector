@@ -749,12 +749,15 @@ impl App {
         };
         let now_ms = self.clock.now_ms();
         let view = self.view_stack.active_mut().model();
+        let application_policy = consume_application_accessibility(sr, view, true)?;
         prepare_review_cursor_for_active_context(sr, view)?;
         view.with_live_screen(|view| -> Result<()> {
             if let Some(title) = &title {
                 sr.speak(title, false)?;
             }
-            speak_application_cursor_line(sr, view)?;
+            if !application_policy.suppress_cursor_tracking {
+                speak_application_cursor_line(sr, view)?;
+            }
             view.complete_accessibility_screen_transition();
             view.finalize_changes(now_ms);
             Ok(())
@@ -778,6 +781,7 @@ impl App {
         } else {
             self.view_stack.active_mut().model()
         };
+        let application_policy = consume_application_accessibility(sr, view, !overlay_active)?;
         let presented_screen_identity_changed = view.prev_screen().screen != view.screen().screen;
         if presented_screen_identity_changed {
             sr.retain_pending_key_echo_for_screen(view.screen().screen);
@@ -795,20 +799,27 @@ impl App {
                 // suppress text in the next. A settled alternate screen is a
                 // new reading context, while the restored primary screen has
                 // already been heard and only needs its current line.
-                announce_screen_transition(sr, view)?;
+                if !application_policy.suppress_auto_read {
+                    announce_screen_transition(sr, view)?;
+                }
             } else {
-                let mut read_text = sr.resolve_pending_delete(view)?;
-                let auto_read_text = if sr.auto_read_enabled() {
-                    if recent_input {
-                        sr.auto_read_after_input(view)?
-                    } else {
-                        sr.auto_read(view)?
-                    }
-                } else {
+                let mut read_text = if application_policy.suppress_cursor_tracking {
                     false
+                } else {
+                    sr.resolve_pending_delete(view)?
                 };
+                let auto_read_text =
+                    if sr.auto_read_enabled() && !application_policy.suppress_auto_read {
+                        if recent_input {
+                            sr.auto_read_after_input(view)?
+                        } else {
+                            sr.auto_read(view)?
+                        }
+                    } else {
+                        false
+                    };
                 read_text |= auto_read_text;
-                if recent_input && !read_text {
+                if recent_input && !read_text && !application_policy.suppress_cursor_tracking {
                     sr.track_cursor(view)?;
                 }
             }

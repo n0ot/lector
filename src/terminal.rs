@@ -291,6 +291,9 @@ pub struct UpdateSummary {
     /// This batch ended at an OSC 133 input-start boundary with no subsequent
     /// visible, structural, semantic, or incomplete parser output.
     pub semantic_input_boundary: bool,
+    /// The batch contained RIS or DECSTR. View-owned application policy must
+    /// return to its safe default at this boundary.
+    pub terminal_reset: bool,
     pub cursor_visibility_restored: bool,
     pub batch_count: usize,
 }
@@ -319,6 +322,7 @@ impl Default for UpdateSummary {
             synchronized_output_opened: false,
             synchronized_output_closed: false,
             semantic_input_boundary: false,
+            terminal_reset: false,
             cursor_visibility_restored: false,
             batch_count: 0,
         }
@@ -340,6 +344,7 @@ impl UpdateSummary {
         self.synchronized_output_opened |= next.synchronized_output_opened;
         self.synchronized_output_closed = next.synchronized_output_closed;
         self.semantic_input_boundary = next.semantic_input_boundary;
+        self.terminal_reset |= next.terminal_reset;
         self.cursor_visibility_restored = next.cursor_visibility_restored;
         self.batch_count = self.batch_count.saturating_add(next.batch_count);
         self.effects.bells = self.effects.bells.saturating_add(next.effects.bells);
@@ -1501,6 +1506,7 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         synchronized_output_opened: false,
         synchronized_output_closed: update.synchronized_output_closed,
         semantic_input_boundary: update.semantic_input_boundary,
+        terminal_reset: update.terminal_reset,
         cursor_visibility_restored: update.cursor_visibility_restored,
         batch_count: 1,
     }

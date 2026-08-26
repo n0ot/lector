@@ -169,6 +169,126 @@ fn make_app() -> (App, ScreenReader, Recorder, FakeClock) {
     (app, screen_reader, recorder, clock)
 }
 
+fn application_accessibility(payload: &str) -> Vec<u8> {
+    format!("\x1B_Lector;A11y;1;{payload}\x1B\\").into_bytes()
+}
+
+#[test]
+fn application_semantic_speech_replaces_automatic_reading() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut output = application_accessibility("set;auto=0;cursor=0");
+    output.extend(application_accessibility("say;73656d616e746963206c696e65"));
+    output.extend_from_slice(b"visual implementation detail\r\n");
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, &output, &mut term_out)
+        .expect("handle semantic application output");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks,
+        [("semantic line".into(), false)]
+    );
+}
+
+#[test]
+fn application_semantic_lines_report_only_changed_indentation_when_enabled() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut output = application_accessibility("set;auto=0;cursor=0");
+    output.extend(application_accessibility("line;indent=0;6669727374"));
+    output.extend(application_accessibility("line;indent=4;7365636f6e64"));
+    output.extend(application_accessibility("line;indent=4;7468697264"));
+    output.extend(application_accessibility("line;indent=0;666f75727468"));
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, &output, &mut term_out)
+        .expect("handle semantic lines");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks,
+        [
+            ("first".into(), false),
+            ("indent 4".into(), false),
+            ("second".into(), false),
+            ("third".into(), false),
+            ("indent 0".into(), false),
+            ("fourth".into(), false),
+        ]
+    );
+}
+
+#[test]
+fn application_semantic_line_indentation_obeys_the_user_option() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    sr.set_indentation_reporting_enabled(false);
+    let mut output = application_accessibility("set;auto=0;cursor=0");
+    output.extend(application_accessibility("line;indent=8;696e64656e746564"));
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, &output, &mut term_out)
+        .expect("handle semantic line");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
+
+    assert_eq!(recorder.inner.borrow().speaks, [("indented".into(), false)]);
+}
+
+#[test]
+fn application_speech_is_dropped_while_the_outer_terminal_is_unfocused() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
+        .expect("lose outer focus");
+
+    let mut output = application_accessibility("set;auto=0;cursor=0");
+    output.extend(application_accessibility("say;6e6f7420717565756564"));
+    app.handle_pty(&mut sr, &output, &mut term_out)
+        .expect("handle unfocused application speech");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
+
+    assert!(recorder.inner.borrow().speaks.is_empty());
+    app.handle_stdin(&mut sr, b"\x1B[I", &mut pty_out, &mut term_out)
+        .expect("regain outer focus");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
+fn cursor_suppression_includes_deferred_backspace_announcements() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"abc", &mut term_out)
+        .expect("establish editable text");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    let _ = app
+        .maybe_finalize_changes(&mut sr)
+        .expect("finalize baseline");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(
+        &mut sr,
+        &application_accessibility("set;auto=0;cursor=0"),
+        &mut term_out,
+    )
+    .expect("suppress cursor tracking");
+    app.handle_stdin(&mut sr, b"\x7F", &mut pty_out, &mut term_out)
+        .expect("forward backspace");
+    app.handle_pty(&mut sr, b"\x08 \x08", &mut term_out)
+        .expect("apply backspace redraw");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    let _ = app
+        .maybe_finalize_changes(&mut sr)
+        .expect("finalize deletion");
+
+    assert_eq!(pty_out, b"\x7F");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+}
+
 #[test]
 fn indentation_reporting_option_covers_both_cursors_and_auto_read() {
     let (_app, mut sr, recorder, _clock) = make_app();

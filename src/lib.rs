@@ -1,4 +1,5 @@
 pub mod app;
+mod application_accessibility;
 mod attributes;
 mod clipboard;
 mod commands;

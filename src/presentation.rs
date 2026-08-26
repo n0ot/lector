@@ -67,6 +67,11 @@ pub struct PresentedViewFrame {
     /// `revision`. The evidence itself stays out of replaceable render frames,
     /// avoiding a clone of a growing update summary on every enqueue.
     pub accessibility_epoch: AccessibilityEpoch,
+    /// Application-requested suppressions represented by this exact frame.
+    /// These travel with presentation so one tmux pane or render generation
+    /// cannot affect another.
+    pub application_auto_read_suppressed: bool,
+    pub application_cursor_tracking_suppressed: bool,
     /// The source update for this exact revision ended at an explicit
     /// synchronized-output or semantic prompt commit boundary.
     pub explicitly_stable: bool,

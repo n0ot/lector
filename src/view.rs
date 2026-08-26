@@ -1,4 +1,8 @@
 use super::{
+    application_accessibility::{
+        ApplicationAccessibilityCommand, ApplicationAccessibilityPolicy,
+        ApplicationAccessibilitySpeech, parse as parse_application_accessibility,
+    },
     ext::{CellExt, ScreenExt},
     presentation::{
         AccessibilityEpoch, PaneMediaStore, PresentationError, PresentedHistoryBasis,
@@ -6,8 +10,8 @@ use super::{
     },
     terminal::{
         GhosttyEngine, GhosttyReviewMark, HistoryPosition, SemanticKind as Osc133Kind,
-        SemanticMark as Osc133Mark, TerminalEngine, TerminalGeometry, TerminalSnapshot,
-        UpdateSummary, Viewport,
+        SemanticMark as Osc133Mark, TerminalEngine, TerminalEvent, TerminalGeometry,
+        TerminalSnapshot, UpdateSummary, Viewport,
     },
 };
 use std::{
@@ -32,6 +36,14 @@ const ACCESSIBILITY_JOURNAL_MAX_ENTRIES: usize = 1_024;
 const ACCESSIBILITY_JOURNAL_MAX_BYTES: usize = 1024 * 1024;
 const PRESENTED_HISTORY_MAX_DELTA_DEPTH: usize = 256;
 const PRESENTED_HISTORY_MAX_RETAINED_ROWS: usize = SCROLLBACK_LINES * 2;
+const APPLICATION_SPEECH_MAX_ENTRIES: usize = 32;
+const APPLICATION_SPEECH_MAX_BYTES: usize = 32 * 1024;
+
+struct PendingApplicationSpeech {
+    epoch_generation: u64,
+    revision: ViewRevision,
+    speech: ApplicationAccessibilitySpeech,
+}
 
 struct AccessibilityJournalEntry {
     epoch: AccessibilityEpoch,
@@ -261,6 +273,10 @@ pub struct View {
     presented_accessibility_evidence_revision: ViewRevision,
     presented_accessibility_evidence_exact: bool,
     presented_accessibility_requires_snapshot_diff: bool,
+    live_application_accessibility_policy: ApplicationAccessibilityPolicy,
+    presented_application_accessibility_policy: ApplicationAccessibilityPolicy,
+    pending_application_speech: VecDeque<PendingApplicationSpeech>,
+    pending_application_speech_bytes: usize,
     accessibility_journal: VecDeque<AccessibilityJournalEntry>,
     accessibility_journal_bytes: usize,
     accessibility_journal_gap_start: Option<ViewRevision>,
@@ -305,6 +321,7 @@ pub struct View {
     review_mark: Option<GhosttyReviewMark>,
     review_cursor_indent_level: u16,
     application_cursor_indent_level: u16,
+    application_semantic_indent_level: u16,
     cached_full: String,
     cached_prev_full: String,
     cached_full_valid: bool,
@@ -346,6 +363,10 @@ impl View {
             presented_accessibility_evidence_revision: ViewRevision(0),
             presented_accessibility_evidence_exact: true,
             presented_accessibility_requires_snapshot_diff: false,
+            live_application_accessibility_policy: ApplicationAccessibilityPolicy::default(),
+            presented_application_accessibility_policy: ApplicationAccessibilityPolicy::default(),
+            pending_application_speech: VecDeque::new(),
+            pending_application_speech_bytes: 0,
             accessibility_journal: VecDeque::new(),
             accessibility_journal_bytes: 0,
             accessibility_journal_gap_start: None,
@@ -382,6 +403,7 @@ impl View {
             review_mark: None,
             review_cursor_indent_level: 0,
             application_cursor_indent_level: 0,
+            application_semantic_indent_level: 0,
             cached_full: String::new(),
             cached_prev_full: String::new(),
             cached_full_valid: false,
@@ -458,6 +480,7 @@ impl View {
         let live_scrollback_extent = self.engine.snapshot().scrollback_extent;
         let live_snapshot = needs_live_snapshot_copy.then(|| self.engine.snapshot().clone());
         let screen_transition = update.screen_before != update.screen_after;
+        let application_context_reset = screen_transition || update.terminal_reset;
         let batch_history_changed = update.history_changed
             || live_scrollback_extent != old_scrollback_extent
             || live_history_origin != old_history_origin
@@ -471,13 +494,26 @@ impl View {
         if screen_transition {
             self.review_cursor_screen_transition_pending = true;
         }
-        if self.presentation_tracking && screen_transition {
-            // A primary/alternate handoff is a new accessibility context. Keep
-            // older journal entries alive for already-captured receipts, but
-            // tag this update and every later one with a fresh epoch so their
-            // evidence can never be merged across the transition.
+        if self.presentation_tracking && application_context_reset {
+            // A primary/alternate handoff or terminal reset is a new
+            // accessibility context. Keep older journal entries alive for
+            // already-captured receipts, but tag this update and every later
+            // one with a fresh epoch so evidence cannot cross the boundary.
             self.begin_accessibility_epoch();
         }
+        if application_context_reset {
+            self.reset_application_accessibility();
+        }
+        let application_revision = if self.presentation_tracking {
+            ViewRevision(self.live_revision.0.saturating_add(1))
+        } else {
+            self.live_revision
+        };
+        self.consume_application_accessibility(
+            &mut update,
+            retain_for_accessibility,
+            application_revision,
+        );
         // This boundary flag drives the scheduler for the just-observed PTY
         // batch; unlike damage and printed runs it must not stay sticky until
         // speech finalization.
@@ -832,6 +868,12 @@ impl View {
             history_basis,
             history,
             accessibility_epoch: self.live_accessibility_epoch,
+            application_auto_read_suppressed: self
+                .live_application_accessibility_policy
+                .suppress_auto_read,
+            application_cursor_tracking_suppressed: self
+                .live_application_accessibility_policy
+                .suppress_cursor_tracking,
             explicitly_stable: self.live_revision_explicitly_stable,
             cursor_visibility_restored: self.live_revision_cursor_restored,
         }
@@ -856,6 +898,12 @@ impl View {
             history_basis,
             history: None,
             accessibility_epoch: self.presented_accessibility_epoch,
+            application_auto_read_suppressed: self
+                .presented_application_accessibility_policy
+                .suppress_auto_read,
+            application_cursor_tracking_suppressed: self
+                .presented_application_accessibility_policy
+                .suppress_cursor_tracking,
             explicitly_stable: false,
             cursor_visibility_restored: false,
         }
@@ -947,6 +995,14 @@ impl View {
             accessibility_epoch_is_current && frame.explicitly_stable;
         self.presented_revision_cursor_restored =
             accessibility_epoch_is_current && frame.cursor_visibility_restored;
+        self.presented_application_accessibility_policy = if accessibility_epoch_is_current {
+            ApplicationAccessibilityPolicy {
+                suppress_auto_read: frame.application_auto_read_suppressed,
+                suppress_cursor_tracking: frame.application_cursor_tracking_suppressed,
+            }
+        } else {
+            ApplicationAccessibilityPolicy::default()
+        };
         self.install_presented_snapshot(snapshot, caught_up);
         self.publish_accessibility_evidence(accessibility_epoch, frame_revision);
         if self.unpresented_synchronized_output {
@@ -1065,6 +1121,128 @@ impl View {
         // speaking that transient stream.
         self.standalone_update.printed_runs.clear();
         self.invalidate_visible_cache();
+    }
+
+    pub(crate) fn application_accessibility_policy(&self) -> ApplicationAccessibilityPolicy {
+        if self.presentation_tracking {
+            self.presented_application_accessibility_policy
+        } else {
+            self.live_application_accessibility_policy
+        }
+    }
+
+    /// Takes semantic speech whose owning view and presentation revision are
+    /// currently active. Callers deliberately discard this result when global
+    /// automatic reading is disabled or the terminal is unfocused; messages
+    /// are never replayed after focus returns.
+    pub(crate) fn take_presented_application_speech(
+        &mut self,
+    ) -> Vec<ApplicationAccessibilitySpeech> {
+        let through_revision = if self.presentation_tracking {
+            self.presented_revision
+        } else {
+            self.live_revision
+        };
+        let epoch_generation = if self.presentation_tracking {
+            self.presented_accessibility_epoch.generation
+        } else {
+            self.live_accessibility_epoch.generation
+        };
+        let mut speech = Vec::new();
+        while self
+            .pending_application_speech
+            .front()
+            .is_some_and(|pending| {
+                pending.epoch_generation < epoch_generation
+                    || pending.epoch_generation == epoch_generation
+                        && pending.revision <= through_revision
+            })
+        {
+            let pending = self
+                .pending_application_speech
+                .pop_front()
+                .expect("front was present");
+            self.pending_application_speech_bytes = self
+                .pending_application_speech_bytes
+                .saturating_sub(pending.speech.text.len());
+            if pending.epoch_generation == epoch_generation {
+                speech.push(pending.speech);
+            }
+        }
+        speech
+    }
+
+    fn consume_application_accessibility(
+        &mut self,
+        update: &mut UpdateSummary,
+        retain_speech: bool,
+        revision: ViewRevision,
+    ) {
+        let mut unclaimed = Vec::with_capacity(update.effects.events.len());
+        for event in std::mem::take(&mut update.effects.events) {
+            let command = match &event {
+                TerminalEvent::UnknownSequence { content, truncated } => {
+                    parse_application_accessibility(content, *truncated)
+                }
+                _ => None,
+            };
+            let Some(command) = command else {
+                unclaimed.push(event);
+                continue;
+            };
+            match command {
+                ApplicationAccessibilityCommand::Set(policy) => {
+                    self.live_application_accessibility_policy = policy;
+                }
+                ApplicationAccessibilityCommand::Speak(speech) if retain_speech => {
+                    self.push_application_speech(revision, speech);
+                }
+                ApplicationAccessibilityCommand::Speak(_) => {}
+                ApplicationAccessibilityCommand::End => {
+                    self.live_application_accessibility_policy =
+                        ApplicationAccessibilityPolicy::default();
+                }
+            }
+        }
+        update.effects.events = unclaimed;
+    }
+
+    fn push_application_speech(
+        &mut self,
+        revision: ViewRevision,
+        speech: ApplicationAccessibilitySpeech,
+    ) {
+        self.pending_application_speech_bytes = self
+            .pending_application_speech_bytes
+            .saturating_add(speech.text.len());
+        self.pending_application_speech
+            .push_back(PendingApplicationSpeech {
+                epoch_generation: self.live_accessibility_epoch.generation,
+                revision,
+                speech,
+            });
+        while self.pending_application_speech.len() > APPLICATION_SPEECH_MAX_ENTRIES
+            || self.pending_application_speech_bytes > APPLICATION_SPEECH_MAX_BYTES
+        {
+            let Some(discarded) = self.pending_application_speech.pop_front() else {
+                break;
+            };
+            self.pending_application_speech_bytes = self
+                .pending_application_speech_bytes
+                .saturating_sub(discarded.speech.text.len());
+        }
+    }
+
+    fn reset_application_accessibility(&mut self) {
+        self.live_application_accessibility_policy = ApplicationAccessibilityPolicy::default();
+        self.pending_application_speech.clear();
+        self.pending_application_speech_bytes = 0;
+    }
+
+    pub(crate) fn application_semantic_indentation_changed(&mut self, level: u16) -> bool {
+        let changed = level != self.application_semantic_indent_level;
+        self.application_semantic_indent_level = level;
+        changed
     }
 
     fn advance_live_revision(&mut self) {
@@ -2812,6 +2990,75 @@ mod tests {
         terminal::{HistoryPosition, SemanticKind as Osc133Kind, Viewport},
     };
     use std::sync::Arc;
+
+    fn accessibility_apc(payload: &str) -> Vec<u8> {
+        let mut sequence = b"\x1B_".to_vec();
+        sequence.extend_from_slice(payload.as_bytes());
+        sequence.extend_from_slice(b"\x1B\\");
+        sequence
+    }
+
+    #[test]
+    fn application_accessibility_is_generic_bounded_and_fails_safe() {
+        let mut view = View::new(3, 20);
+        view.process_changes(&accessibility_apc("Lector;A11y;1;set;auto=0;cursor=0"));
+        let policy = view.application_accessibility_policy();
+        assert!(policy.suppress_auto_read);
+        assert!(policy.suppress_cursor_tracking);
+
+        view.process_changes(&accessibility_apc("Lector;A11y;1;say;68656c6c6f"));
+        let speech = view.take_presented_application_speech();
+        assert_eq!(speech.len(), 1);
+        assert_eq!(speech[0].text, "hello");
+        assert_eq!(speech[0].indentation, None);
+        assert!(view.take_presented_application_speech().is_empty());
+
+        view.process_changes(&accessibility_apc("Lector;A11y;1;end"));
+        assert_eq!(view.application_accessibility_policy(), Default::default());
+
+        view.process_changes(&accessibility_apc("Lector;A11y;1;set;auto=0;cursor=0"));
+        view.process_changes(b"\x1B[!p");
+        assert_eq!(view.application_accessibility_policy(), Default::default());
+
+        // A client may reassert immediately after terminal initialization in
+        // the same PTY batch.
+        let mut reset_and_reassert = b"\x1Bc".to_vec();
+        reset_and_reassert.extend(accessibility_apc("Lector;A11y;1;set;auto=0;cursor=0"));
+        view.process_changes(&reset_and_reassert);
+        assert!(
+            view.application_accessibility_policy()
+                .suppress_cursor_tracking
+        );
+
+        view.process_changes(b"\x1B[?1049h");
+        assert_eq!(view.application_accessibility_policy(), Default::default());
+    }
+
+    #[test]
+    fn application_accessibility_follows_presentation_and_drops_hidden_speech() {
+        let mut view = View::new(3, 20);
+        view.enable_presentation_tracking();
+        view.process_changes(&accessibility_apc("Lector;A11y;1;set;auto=0;cursor=0"));
+        view.process_changes(&accessibility_apc("Lector;A11y;1;say;7265616479"));
+
+        assert_eq!(view.application_accessibility_policy(), Default::default());
+        assert!(view.take_presented_application_speech().is_empty());
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(frame));
+        assert!(
+            view.application_accessibility_policy()
+                .suppress_cursor_tracking
+        );
+        let speech = view.take_presented_application_speech();
+        assert_eq!(speech.len(), 1);
+        assert_eq!(speech[0].text, "ready");
+
+        let hidden = accessibility_apc("Lector;A11y;1;say;68696464656e");
+        view.process_changes_with_batch(&hidden, false);
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(frame));
+        assert!(view.take_presented_application_speech().is_empty());
+    }
 
     #[test]
     fn resize_clamps_review_cursor_and_clears_displaced_mark() {

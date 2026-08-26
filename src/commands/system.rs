@@ -69,13 +69,23 @@ pub(super) fn toggle_help(sr: &mut ScreenReader) -> Result<CommandResult> {
 }
 
 pub(super) fn backspace(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> {
-    sr.defer_backspace(view);
-    sr.suppress_cursor_tracking_once();
+    if !view
+        .application_accessibility_policy()
+        .suppress_cursor_tracking
+    {
+        sr.defer_backspace(view);
+        sr.suppress_cursor_tracking_once();
+    }
     Ok(CommandResult::ForwardInput)
 }
 
 pub(super) fn delete(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> {
-    sr.defer_delete(view);
+    if !view
+        .application_accessibility_policy()
+        .suppress_cursor_tracking
+    {
+        sr.defer_delete(view);
+    }
     Ok(CommandResult::ForwardInput)
 }
 
