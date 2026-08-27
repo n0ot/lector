@@ -728,6 +728,85 @@ fn window_and_session_changes_announce_the_new_location_concisely() {
 }
 
 #[test]
+fn entering_a_previously_unattached_session_recaptures_its_visible_panes() {
+    let (mut app, mut sr, _recorder, mut physical) = ready_app();
+
+    assert!(
+        app.debug_tmux_pane_contents(1, 22)
+            .unwrap()
+            .contains("other-session")
+    );
+    app.handle_pty(&mut sr, b"%session-changed $2 remote\n", &mut physical)
+        .unwrap();
+
+    assert_eq!(
+        app.debug_tmux_pane_flow_state(1, 22).unwrap().status,
+        lector::app::TmuxFlowStatus::Resynchronizing
+    );
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::pane_capture_metadata_command(PaneId(22))
+    );
+
+    let metadata = b"R\t%22\t0\t0\t80\t24\t0\t12\t3\t1\t0\t0\t0\t5".to_vec();
+    app.handle_pty(
+        &mut sr,
+        &reply(40, std::slice::from_ref(&metadata), true),
+        &mut physical,
+    )
+    .unwrap();
+    let parsed = lector::tmux_model::parse_pane_capture_metadata(&metadata, PaneId(22)).unwrap();
+    let expected_capture = [
+        lector::tmux_panes::capture_command_for_metadata(&parsed),
+        lector::tmux_panes::pending_escape_capture_command(PaneId(22)),
+        lector::tmux_model::pane_capture_metadata_command(PaneId(22)),
+    ]
+    .concat();
+    assert_eq!(tick(&mut app, &mut sr, &mut physical), expected_capture);
+
+    app.handle_pty(
+        &mut sr,
+        &reply(41, &[b"task complete\r\nnew prompt".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    app.handle_pty(&mut sr, &reply(42, &[], true), &mut physical)
+        .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &reply(43, std::slice::from_ref(&metadata), true),
+        &mut physical,
+    )
+    .unwrap();
+
+    assert_eq!(
+        app.debug_tmux_pane_flow_state(1, 22).unwrap().status,
+        lector::app::TmuxFlowStatus::Running
+    );
+    let contents = app.debug_tmux_pane_contents(1, 22).unwrap();
+    assert!(contents.contains("task complete"), "{contents:?}");
+    assert!(contents.contains("new prompt"), "{contents:?}");
+
+    app.handle_pty(&mut sr, b"%session-changed $1 work\n", &mut physical)
+        .unwrap();
+    for pane_id in [20, 21, 23] {
+        assert_eq!(
+            app.debug_tmux_pane_flow_state(1, pane_id).unwrap().status,
+            lector::app::TmuxFlowStatus::Resynchronizing
+        );
+    }
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        [
+            lector::tmux_model::pane_capture_metadata_command(PaneId(20)),
+            lector::tmux_model::pane_capture_metadata_command(PaneId(23)),
+        ]
+        .concat(),
+        "only the returned session's visible split panes should capture immediately"
+    );
+}
+
+#[test]
 fn scheduled_location_changes_wait_for_their_receipt_and_stay_concise() {
     let (mut app, mut sr, recorder, mut physical) = ready_app();
     app.enable_output_scheduler(OutputSchedulerConfig {
@@ -792,7 +871,10 @@ fn scheduled_location_changes_wait_for_their_receipt_and_stay_concise() {
         1
     );
     assert!(recorder.0.borrow().is_empty());
-    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::pane_capture_metadata_command(PaneId(22))
+    );
     assert_eq!(
         &*recorder.0.borrow(),
         &["remote", "duplicate", "other-session"]
@@ -1005,7 +1087,12 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         &receiver,
         writer.as_mut(),
         &mut physical,
-        |app| app.debug_active_view_contents().contains("SECOND"),
+        |app| {
+            app.debug_active_view_contents().contains("SECOND")
+                && app.debug_tmux_pane_flow_state(1, 1).is_some_and(|flow| {
+                    flow.status == lector::app::TmuxFlowStatus::Running && flow.resync_count > 0
+                })
+        },
     );
     writer
         .write_all(format!("switch-client -t {first_session}\n").as_bytes())
@@ -1018,7 +1105,12 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         &receiver,
         writer.as_mut(),
         &mut physical,
-        |app| app.debug_active_view_contents().contains("FIRST"),
+        |app| {
+            app.debug_active_view_contents().contains("FIRST")
+                && app.debug_tmux_pane_flow_state(1, 0).is_some_and(|flow| {
+                    flow.status == lector::app::TmuxFlowStatus::Running && flow.resync_count > 0
+                })
+        },
     );
 
     input(&mut app, &mut sr, &mut physical, b"\x01s");
@@ -1033,7 +1125,12 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         &receiver,
         writer.as_mut(),
         &mut physical,
-        |app| app.debug_active_view_contents().contains("SECOND"),
+        |app| {
+            app.debug_active_view_contents().contains("SECOND")
+                && app.debug_tmux_pane_flow_state(1, 1).is_some_and(|flow| {
+                    flow.status == lector::app::TmuxFlowStatus::Running && flow.resync_count > 1
+                })
+        },
     );
 
     input(

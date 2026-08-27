@@ -29,6 +29,14 @@ bootstrapped. Background captures continue through the same ordered control
 FIFO, but cannot delay the first prompt or cause an otherwise unrelated visible
 redraw when they finish.
 
+A control client receives pane output only from its attached session. When that
+attached session changes, Lector therefore treats every pane in the session
+being entered as stale. It authoritatively recaptures the visible window at
+once and retains the same stale marker on hidden windows until they are
+visited. Returning to a session consequently restores output produced while
+the control client was attached elsewhere, even when that output stopped before
+the return.
+
 The captured rows are reconstructed into a fresh pane engine and the inventory
 cursor metadata is applied afterward. This artificial reconstruction is then
 finalized before the pane becomes accessible, so bootstrap text cannot be

@@ -716,6 +716,7 @@ impl App {
         let mut notification_popup = None;
         let mut inventory_terminal_failure = None;
         let location_changed;
+        let attached_session_changed;
         let mut destroyed_gateway_panes = Vec::new();
         let mut destroyed_gateway_windows = Vec::new();
         let mut native_copy_mode_panes = Vec::new();
@@ -728,6 +729,8 @@ impl App {
             else {
                 return Ok(());
             };
+            let had_inventory = connection.has_inventory;
+            let previous_attached_session = connection.topology.attached_session();
             let previous_location = connection.topology.attached_location();
             match event {
                 crate::tmux_control::ControlEvent::Command { status, output, .. } => {
@@ -1193,6 +1196,35 @@ impl App {
             }
             location_changed =
                 sync_topology && previous_location != connection.topology.attached_location();
+            attached_session_changed = had_inventory
+                && sync_topology
+                && previous_attached_session != connection.topology.attached_session();
+            if attached_session_changed {
+                // A control client receives pane output only for its attached
+                // session. Every pane in the session being entered may
+                // therefore have advanced since Lector last observed it.
+                // Mark the complete session stale: sync_tmux_panes queues an
+                // authoritative capture for its visible panes now and leaves
+                // hidden windows to be captured when they are presented.
+                let attached_windows = connection
+                    .topology
+                    .attached_session()
+                    .and_then(|session_id| connection.topology.session(session_id))
+                    .map(|session| session.windows.values().copied().collect::<BTreeSet<_>>())
+                    .unwrap_or_default();
+                let stale_panes = connection
+                    .topology
+                    .panes()
+                    .values()
+                    .filter(|pane| attached_windows.contains(&pane.window_id))
+                    .filter(|pane| !active_gateway_path.contains(&(connection_id, pane.id)))
+                    .map(|pane| pane.id)
+                    .collect::<Vec<_>>();
+                for pane_id in stale_panes {
+                    let flow = connection.pane_flow.entry(pane_id).or_default();
+                    Self::mark_tmux_pane_capture_required(flow);
+                }
+            }
         }
         let connection_is_user_visible = self.active_tmux_connection == Some(connection_id)
             && self
