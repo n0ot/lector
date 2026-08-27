@@ -3,7 +3,6 @@ use super::*;
 #[derive(Clone, Copy)]
 struct TmuxGatewayHop {
     parent_connection_id: u64,
-    session_id: crate::tmux_model::SessionId,
     window_id: crate::tmux_model::WindowId,
     pane_id: crate::tmux_model::PaneId,
 }
@@ -299,13 +298,12 @@ impl App {
                 Some(GatewayOrigin::Direct) => break,
                 Some(GatewayOrigin::Pane {
                     parent_connection_id,
-                    session_id,
+                    session_id: _,
                     window_id,
                     pane_id,
                 }) => {
                     gateway_path.push(TmuxGatewayHop {
                         parent_connection_id,
-                        session_id: crate::tmux_model::SessionId(session_id),
                         window_id: crate::tmux_model::WindowId(window_id),
                         pane_id: crate::tmux_model::PaneId(pane_id),
                     });
@@ -355,6 +353,429 @@ impl App {
         })
     }
 
+    fn live_tmux_gateway_windows(
+        &self,
+        parent_connection_id: u64,
+    ) -> BTreeSet<crate::tmux_model::WindowId> {
+        self.tmux_connections
+            .iter()
+            .filter_map(
+                |connection| match self.tmux_hierarchy.origin(connection.id) {
+                    Some(GatewayOrigin::Pane {
+                        parent_connection_id: candidate_parent,
+                        window_id,
+                        ..
+                    }) if candidate_parent == parent_connection_id => {
+                        Some(crate::tmux_model::WindowId(window_id))
+                    }
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    /// Queue a client session change only after every live nested carrier
+    /// window has a verified winlink in the destination session. The switch
+    /// itself is gated behind those replies, so a collision or stale topology
+    /// cannot silently strand a nested control stream.
+    pub(super) fn queue_tmux_session_switch(
+        &mut self,
+        connection_id: u64,
+        destination_session_id: crate::tmux_model::SessionId,
+        following_commands: Vec<String>,
+    ) -> bool {
+        let destination_exists = self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+            .is_some_and(|connection| {
+                connection
+                    .topology
+                    .session(destination_session_id)
+                    .is_some()
+            });
+        if !destination_exists
+            || self
+                .pending_tmux_session_switches
+                .contains_key(&connection_id)
+        {
+            return false;
+        }
+        self.pending_tmux_session_switches.insert(
+            connection_id,
+            PendingTmuxSessionSwitch {
+                destination_session_id,
+                following_commands,
+                rejected_indices: BTreeSet::new(),
+                stage: TmuxSessionSwitchStage::Planning,
+            },
+        );
+        self.advance_tmux_session_switch(connection_id)
+    }
+
+    fn advance_tmux_session_switch(&mut self, connection_id: u64) -> bool {
+        let Some(pending) = self.pending_tmux_session_switches.get(&connection_id) else {
+            return false;
+        };
+        if pending.stage != TmuxSessionSwitchStage::Planning {
+            return true;
+        }
+        let destination_session_id = pending.destination_session_id;
+        let carrier_windows = self.live_tmux_gateway_windows(connection_id);
+        let Some(connection) = self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+        else {
+            self.pending_tmux_session_switches.remove(&connection_id);
+            return false;
+        };
+        let Some(destination) = connection.topology.session(destination_session_id) else {
+            self.pending_tmux_session_switches.remove(&connection_id);
+            return false;
+        };
+
+        if let Some(window_id) = carrier_windows.iter().copied().find(|window_id| {
+            !destination
+                .windows
+                .values()
+                .any(|candidate| candidate == window_id)
+        }) {
+            let pending = self
+                .pending_tmux_session_switches
+                .get(&connection_id)
+                .expect("session switch remains pending while choosing carrier index");
+            let leased_indices = self
+                .tmux_carrier_leases
+                .values()
+                .filter(|lease| {
+                    lease.parent_connection_id == connection_id
+                        && lease.session_id == destination_session_id
+                })
+                .map(|lease| lease.index)
+                .collect::<BTreeSet<_>>();
+            let candidate = (TMUX_CARRIER_INDEX_BASE..=TMUX_CARRIER_INDEX_LIMIT).find(|index| {
+                !destination.windows.contains_key(index)
+                    && !leased_indices.contains(index)
+                    && !pending.rejected_indices.contains(index)
+            });
+            let Some(index) = candidate else {
+                self.log_event(&format!(
+                    "tmux carrier index band exhausted connection={connection_id} session=${}",
+                    destination_session_id.0
+                ));
+                self.pending_tmux_session_switches.remove(&connection_id);
+                return false;
+            };
+            self.pending_tmux_session_switches
+                .get_mut(&connection_id)
+                .expect("session switch remains pending while linking carrier")
+                .stage = TmuxSessionSwitchStage::Creating { window_id, index };
+            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+                connection_id,
+                bytes: format!(
+                    "link-window -d -s @{} -t ${}:{}\n",
+                    window_id.0, destination_session_id.0, index
+                )
+                .into_bytes(),
+                expected_replies: vec![ExpectedTmuxReply::CarrierLeaseCreate {
+                    session_id: destination_session_id,
+                    window_id,
+                    index,
+                }],
+                kind: PendingTmuxCommandKind::Ordinary,
+            });
+            return true;
+        }
+
+        if connection.topology.attached_session() == Some(destination_session_id) {
+            self.finish_tmux_session_switch(connection_id);
+            return true;
+        }
+        let source_session_id = connection.topology.attached_session();
+        self.pending_tmux_session_switches
+            .get_mut(&connection_id)
+            .expect("session switch remains pending before switch-client")
+            .stage = TmuxSessionSwitchStage::Switching {
+            source_session_id,
+            command_succeeded: false,
+            notification_observed: false,
+        };
+        self.pending_tmux_commands.push_back(PendingTmuxCommand {
+            connection_id,
+            bytes: format!("switch-client -t ${}\n", destination_session_id.0).into_bytes(),
+            expected_replies: vec![ExpectedTmuxReply::CarrierSessionSwitch {
+                session_id: destination_session_id,
+            }],
+            kind: PendingTmuxCommandKind::Ordinary,
+        });
+        true
+    }
+
+    fn finish_tmux_session_switch(&mut self, connection_id: u64) {
+        let Some(pending) = self.pending_tmux_session_switches.remove(&connection_id) else {
+            return;
+        };
+        for command in pending.following_commands {
+            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+                connection_id,
+                bytes: format!("{command}\n").into_bytes(),
+                expected_replies: vec![ExpectedTmuxReply::Ignored],
+                kind: PendingTmuxCommandKind::Ordinary,
+            });
+        }
+        self.queue_obsolete_tmux_carrier_unlinks(connection_id, pending.destination_session_id);
+    }
+
+    pub(super) fn queue_obsolete_tmux_carrier_unlinks(
+        &mut self,
+        parent_connection_id: u64,
+        retained_session_id: crate::tmux_model::SessionId,
+    ) {
+        let live_windows = self.live_tmux_gateway_windows(parent_connection_id);
+        let obsolete = self
+            .tmux_carrier_leases
+            .values()
+            .copied()
+            .filter(|lease| {
+                lease.parent_connection_id == parent_connection_id
+                    && (lease.session_id != retained_session_id
+                        || !live_windows.contains(&lease.window_id))
+            })
+            .collect::<Vec<_>>();
+        for lease in obsolete {
+            self.queue_tmux_carrier_unlink(lease);
+        }
+    }
+
+    fn queue_tmux_carrier_unlink(&mut self, lease: TmuxCarrierLease) {
+        self.pending_tmux_commands.push_back(PendingTmuxCommand {
+            connection_id: lease.parent_connection_id,
+            // The format guard makes cleanup conditional on the target index
+            // still naming the exact window Lector linked. A user replacement
+            // at the same index is never unlinked.
+            bytes: format!(
+                "if-shell -F -t '${}:{}' '#{{==:#{{window_id}},@{}}}' 'unlink-window -t ${}:{}'\n",
+                lease.session_id.0, lease.index, lease.window_id.0, lease.session_id.0, lease.index
+            )
+            .into_bytes(),
+            expected_replies: vec![ExpectedTmuxReply::CarrierLeaseUnlink {
+                session_id: lease.session_id,
+                window_id: lease.window_id,
+                index: lease.index,
+            }],
+            kind: PendingTmuxCommandKind::Ordinary,
+        });
+    }
+
+    pub(super) fn handle_tmux_carrier_lease_create_reply(
+        &mut self,
+        connection_id: u64,
+        session_id: crate::tmux_model::SessionId,
+        window_id: crate::tmux_model::WindowId,
+        index: u32,
+        success: bool,
+    ) {
+        let expected_stage = TmuxSessionSwitchStage::Creating { window_id, index };
+        let Some(pending) = self.pending_tmux_session_switches.get_mut(&connection_id) else {
+            return;
+        };
+        if pending.destination_session_id != session_id || pending.stage != expected_stage {
+            return;
+        }
+        if !success {
+            pending.rejected_indices.insert(index);
+            pending.stage = TmuxSessionSwitchStage::Planning;
+            self.advance_tmux_session_switch(connection_id);
+            return;
+        }
+
+        let lease = TmuxCarrierLease {
+            parent_connection_id: connection_id,
+            session_id,
+            window_id,
+            index,
+            verified: false,
+        };
+        self.tmux_carrier_leases
+            .insert((connection_id, session_id, window_id), lease);
+        self.pending_tmux_session_switches
+            .get_mut(&connection_id)
+            .expect("carrier session switch remains pending after link success")
+            .stage = TmuxSessionSwitchStage::Verifying { window_id, index };
+        self.pending_tmux_commands.push_back(PendingTmuxCommand {
+            connection_id,
+            bytes: format!(
+                "list-windows -t ${} -F 'L\t#{{window_id}}\t#{{window_index}}'\n",
+                session_id.0
+            )
+            .into_bytes(),
+            expected_replies: vec![ExpectedTmuxReply::CarrierLeaseVerify {
+                session_id,
+                window_id,
+                index,
+            }],
+            kind: PendingTmuxCommandKind::Ordinary,
+        });
+    }
+
+    pub(super) fn handle_tmux_carrier_lease_verify_reply(
+        &mut self,
+        connection_id: u64,
+        session_id: crate::tmux_model::SessionId,
+        window_id: crate::tmux_model::WindowId,
+        index: u32,
+        success: bool,
+        output: &[Vec<u8>],
+    ) {
+        let expected_stage = TmuxSessionSwitchStage::Verifying { window_id, index };
+        let stage_matches = self
+            .pending_tmux_session_switches
+            .get(&connection_id)
+            .is_some_and(|pending| {
+                pending.destination_session_id == session_id && pending.stage == expected_stage
+            });
+        if !stage_matches {
+            return;
+        }
+        let expected = format!("L\t@{}\t{}", window_id.0, index);
+        let verified = success
+            && output
+                .iter()
+                .any(|line| line.as_slice() == expected.as_bytes());
+        let key = (connection_id, session_id, window_id);
+        if !verified {
+            self.log_event(&format!(
+                "tmux carrier verification failed connection={connection_id} session=${} window=@{} index={index}",
+                session_id.0, window_id.0
+            ));
+            self.pending_tmux_session_switches.remove(&connection_id);
+            if let Some(lease) = self.tmux_carrier_leases.get(&key).copied() {
+                self.queue_tmux_carrier_unlink(lease);
+            }
+            self.queue_tmux_inventory(connection_id);
+            return;
+        }
+        let topology_updated = self
+            .tmux_connections
+            .iter_mut()
+            .find(|connection| connection.id == connection_id)
+            .is_some_and(|connection| {
+                connection
+                    .topology
+                    .mark_internal_window_link(session_id, index, window_id)
+                    .is_ok()
+            });
+        if !topology_updated {
+            self.pending_tmux_session_switches.remove(&connection_id);
+            if let Some(lease) = self.tmux_carrier_leases.get(&key).copied() {
+                self.queue_tmux_carrier_unlink(lease);
+            }
+            self.queue_tmux_inventory(connection_id);
+            return;
+        }
+        if let Some(lease) = self.tmux_carrier_leases.get_mut(&key) {
+            lease.verified = true;
+        }
+        self.pending_tmux_session_switches
+            .get_mut(&connection_id)
+            .expect("carrier session switch remains pending after verification")
+            .stage = TmuxSessionSwitchStage::Planning;
+        self.advance_tmux_session_switch(connection_id);
+    }
+
+    pub(super) fn handle_tmux_carrier_session_switch_reply(
+        &mut self,
+        connection_id: u64,
+        session_id: crate::tmux_model::SessionId,
+        success: bool,
+    ) {
+        let mut finish = false;
+        let mut failed_source = None;
+        let Some(pending) = self.pending_tmux_session_switches.get_mut(&connection_id) else {
+            return;
+        };
+        if pending.destination_session_id != session_id {
+            return;
+        }
+        let TmuxSessionSwitchStage::Switching {
+            source_session_id,
+            command_succeeded,
+            notification_observed,
+        } = &mut pending.stage
+        else {
+            return;
+        };
+        if success {
+            *command_succeeded = true;
+            finish = *notification_observed;
+        } else {
+            failed_source = *source_session_id;
+        }
+        if finish {
+            self.finish_tmux_session_switch(connection_id);
+        } else if let Some(source_session_id) = failed_source {
+            self.pending_tmux_session_switches.remove(&connection_id);
+            self.queue_obsolete_tmux_carrier_unlinks(connection_id, source_session_id);
+        } else if !success {
+            self.pending_tmux_session_switches.remove(&connection_id);
+        }
+    }
+
+    pub(super) fn observe_tmux_carrier_session_change(
+        &mut self,
+        connection_id: u64,
+        session_id: crate::tmux_model::SessionId,
+    ) {
+        let mut finish = false;
+        if let Some(pending) = self.pending_tmux_session_switches.get_mut(&connection_id)
+            && pending.destination_session_id == session_id
+            && let TmuxSessionSwitchStage::Switching {
+                command_succeeded,
+                notification_observed,
+                ..
+            } = &mut pending.stage
+        {
+            *notification_observed = true;
+            finish = *command_succeeded;
+        }
+        if finish {
+            self.finish_tmux_session_switch(connection_id);
+        }
+    }
+
+    pub(super) fn handle_tmux_carrier_unlink_reply(
+        &mut self,
+        connection_id: u64,
+        session_id: crate::tmux_model::SessionId,
+        window_id: crate::tmux_model::WindowId,
+        index: u32,
+        success: bool,
+    ) {
+        let key = (connection_id, session_id, window_id);
+        if !self
+            .tmux_carrier_leases
+            .get(&key)
+            .is_some_and(|lease| lease.index == index)
+        {
+            return;
+        }
+        if !success {
+            self.queue_tmux_inventory(connection_id);
+            return;
+        }
+        self.tmux_carrier_leases.remove(&key);
+        if let Some(connection) = self
+            .tmux_connections
+            .iter_mut()
+            .find(|connection| connection.id == connection_id)
+        {
+            connection
+                .topology
+                .forget_internal_window_link(session_id, index, window_id);
+        }
+    }
+
     /// Queue the transport route to a connection before restoring that
     /// connection's own last user-visible tmux location. Routing an inner
     /// connection through an ancestor must not replace the ancestor's memory.
@@ -387,7 +808,7 @@ impl App {
     }
 
     fn queue_preferred_tmux_location(&mut self, connection_id: u64) {
-        let commands = self
+        let plan = self
             .tmux_connections
             .iter()
             .find(|connection| connection.id == connection_id)
@@ -412,9 +833,6 @@ impl App {
                 }
 
                 let mut commands = Vec::new();
-                if topology.attached_session() != Some(preferred.session_id) {
-                    commands.push(format!("switch-client -t ${}", preferred.session_id.0));
-                }
                 if session.active_window != Some(preferred.window_id) {
                     commands.push(format!("select-window -t @{}", preferred.window_id.0));
                 }
@@ -423,9 +841,18 @@ impl App {
                 {
                     commands.push(format!("select-pane -t %{}", pane_id.0));
                 }
-                Some(commands)
+                Some((
+                    preferred.session_id,
+                    topology.attached_session() != Some(preferred.session_id),
+                    commands,
+                ))
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| (crate::tmux_model::SessionId(u64::MAX), false, Vec::new()));
+        let (session_id, switch_session, commands) = plan;
+        if switch_session {
+            self.queue_tmux_session_switch(connection_id, session_id, commands);
+            return;
+        }
         for command in commands {
             self.pending_tmux_commands.push_back(PendingTmuxCommand {
                 connection_id,
@@ -460,7 +887,6 @@ impl App {
                 flow.pause_requested = false;
             }
         }
-        let mut restore_commands = Vec::new();
         for hop in &gateway_path {
             let Some(connection) = self
                 .tmux_connections
@@ -470,51 +896,26 @@ impl App {
                 return false;
             };
             let topology = &connection.topology;
-            let Some(session) = topology.session(hop.session_id) else {
+            let Some(attached_session) = topology
+                .attached_session()
+                .and_then(|session_id| topology.session(session_id))
+            else {
                 return false;
             };
-            let Some(window) = topology.window(hop.window_id) else {
+            let Some(_window) = topology.window(hop.window_id) else {
                 return false;
             };
             let Some(pane) = topology.pane(hop.pane_id) else {
                 return false;
             };
             if pane.window_id != hop.window_id
-                || !session
+                || !attached_session
                     .windows
                     .values()
                     .any(|window_id| *window_id == hop.window_id)
             {
                 return false;
             }
-            if topology.attached_session() != Some(hop.session_id) {
-                restore_commands.push((
-                    hop.parent_connection_id,
-                    format!("switch-client -t ${}", hop.session_id.0),
-                ));
-            }
-            if session.active_window != Some(hop.window_id) {
-                restore_commands.push((
-                    hop.parent_connection_id,
-                    format!("select-window -t @{}", hop.window_id.0),
-                ));
-            }
-            if window.active_pane != Some(hop.pane_id) {
-                restore_commands.push((
-                    hop.parent_connection_id,
-                    format!("select-pane -t %{}", hop.pane_id.0),
-                ));
-            }
-        }
-        for (parent_connection_id, command) in restore_commands {
-            let mut bytes = command.into_bytes();
-            bytes.push(b'\n');
-            self.pending_tmux_commands.push_back(PendingTmuxCommand {
-                connection_id: parent_connection_id,
-                bytes,
-                expected_replies: vec![ExpectedTmuxReply::Ignored],
-                kind: PendingTmuxCommandKind::Ordinary,
-            });
         }
         for hop in gateway_path {
             let parent_connection_id = hop.parent_connection_id;
@@ -765,15 +1166,28 @@ impl App {
         target: views::TmuxChooserTarget,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        if let views::TmuxChooserTarget::Session(session_id) = target {
+            let exists = self
+                .tmux_connections
+                .iter()
+                .find(|connection| connection.id == connection_id)
+                .is_some_and(|connection| connection.topology.session(session_id).is_some());
+            if !exists {
+                self.emit_physical_bells(term_out, 1)?;
+                return Ok(());
+            }
+            self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
+            if !self.queue_tmux_session_switch(connection_id, session_id, Vec::new()) {
+                self.emit_physical_bells(term_out, 1)?;
+            }
+            return Ok(());
+        }
         let command = self
             .tmux_connections
             .iter()
             .find(|connection| connection.id == connection_id)
             .and_then(|connection| match target {
-                views::TmuxChooserTarget::Session(session_id) => connection
-                    .topology
-                    .session(session_id)
-                    .map(|_| format!("switch-client -t {}{}", '$', session_id.0)),
+                views::TmuxChooserTarget::Session(_) => unreachable!("handled above"),
                 views::TmuxChooserTarget::Window(window_id) => {
                     let session = connection
                         .topology

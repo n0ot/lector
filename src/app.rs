@@ -63,6 +63,8 @@ const TMUX_ROUTED_COMMAND_LIMIT_BYTES: usize = 1024 * 1024;
 const TMUX_ROUTED_COMMAND_LIMIT_COUNT: usize = 4_096;
 const TMUX_INVENTORY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const TMUX_INVENTORY_LIMIT_LINES: usize = 65_536;
+const TMUX_CARRIER_INDEX_BASE: u32 = 1_000_000;
+const TMUX_CARRIER_INDEX_LIMIT: u32 = TMUX_CARRIER_INDEX_BASE + 4_095;
 const KITTY_CTRL_C_RELEASE_HANDOFF_MS: u128 = 100;
 const KITTY_CTRL_C_INPUT_HANDOFF_MS: u128 = 500;
 const MAX_DEFERRED_KITTY_RELEASES: usize = 64;
@@ -1163,6 +1165,15 @@ pub struct App {
     tmux_hierarchy: ConnectionHierarchy,
     tmux_connections: Vec<TmuxConnectionState>,
     pending_tmux_commands: VecDeque<PendingTmuxCommand>,
+    tmux_carrier_leases: BTreeMap<
+        (
+            u64,
+            crate::tmux_model::SessionId,
+            crate::tmux_model::WindowId,
+        ),
+        TmuxCarrierLease,
+    >,
+    pending_tmux_session_switches: BTreeMap<u64, PendingTmuxSessionSwitch>,
     active_tmux_connection: Option<u64>,
     pending_tmux_confirmation: Option<PendingTmuxConfirmation>,
     pending_gateway_confirmation: Option<PendingGatewayConfirmation>,
@@ -1222,6 +1233,40 @@ struct TmuxConnectionState {
     capture_line_flags_supported: Option<bool>,
     last_announced_location: Option<crate::tmux_model::TmuxLocation>,
     preferred_location: Option<crate::tmux_model::TmuxLocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TmuxCarrierLease {
+    parent_connection_id: u64,
+    session_id: crate::tmux_model::SessionId,
+    window_id: crate::tmux_model::WindowId,
+    index: u32,
+    verified: bool,
+}
+
+struct PendingTmuxSessionSwitch {
+    destination_session_id: crate::tmux_model::SessionId,
+    following_commands: Vec<String>,
+    rejected_indices: BTreeSet<u32>,
+    stage: TmuxSessionSwitchStage,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxSessionSwitchStage {
+    Planning,
+    Creating {
+        window_id: crate::tmux_model::WindowId,
+        index: u32,
+    },
+    Verifying {
+        window_id: crate::tmux_model::WindowId,
+        index: u32,
+    },
+    Switching {
+        source_session_id: Option<crate::tmux_model::SessionId>,
+        command_succeeded: bool,
+        notification_observed: bool,
+    },
 }
 
 struct PendingTmuxPaneCapture {
@@ -1309,6 +1354,24 @@ enum ExpectedTmuxReply {
     PaneResyncContinue(crate::tmux_model::PaneId),
     PanePause(crate::tmux_model::PaneId),
     PaneContinue(crate::tmux_model::PaneId),
+    CarrierLeaseCreate {
+        session_id: crate::tmux_model::SessionId,
+        window_id: crate::tmux_model::WindowId,
+        index: u32,
+    },
+    CarrierLeaseVerify {
+        session_id: crate::tmux_model::SessionId,
+        window_id: crate::tmux_model::WindowId,
+        index: u32,
+    },
+    CarrierLeaseUnlink {
+        session_id: crate::tmux_model::SessionId,
+        window_id: crate::tmux_model::WindowId,
+        index: u32,
+    },
+    CarrierSessionSwitch {
+        session_id: crate::tmux_model::SessionId,
+    },
     Ignored,
     UserCommand {
         description: String,
@@ -1459,6 +1522,8 @@ impl App {
             tmux_hierarchy: ConnectionHierarchy::new(),
             tmux_connections: Vec::new(),
             pending_tmux_commands: VecDeque::new(),
+            tmux_carrier_leases: BTreeMap::new(),
+            pending_tmux_session_switches: BTreeMap::new(),
             active_tmux_connection: None,
             pending_tmux_confirmation: None,
             pending_gateway_confirmation: None,

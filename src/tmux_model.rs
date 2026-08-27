@@ -204,6 +204,10 @@ pub struct TmuxTopology {
     client_info: BTreeMap<String, String>,
     bindings: BTreeMap<String, TmuxBinding>,
     key_tables: BTreeMap<String, BTreeMap<String, TmuxBinding>>,
+    /// Winlinks created by Lector solely to keep nested control transports in
+    /// the attached session. They remain part of tmux's real topology, but
+    /// are omitted from Lector's user-facing window chooser.
+    internal_window_links: BTreeSet<(SessionId, u32, WindowId)>,
     needs_resync: bool,
 }
 
@@ -222,6 +226,7 @@ impl TmuxTopology {
             client_info: BTreeMap::new(),
             bindings: BTreeMap::new(),
             key_tables: BTreeMap::new(),
+            internal_window_links: BTreeSet::new(),
             needs_resync: false,
         }
     }
@@ -278,6 +283,71 @@ impl TmuxTopology {
     #[must_use]
     pub fn windows(&self) -> &BTreeMap<WindowId, Window> {
         &self.windows
+    }
+
+    #[must_use]
+    pub fn is_internal_window_link(
+        &self,
+        session_id: SessionId,
+        index: u32,
+        window_id: WindowId,
+    ) -> bool {
+        self.internal_window_links
+            .contains(&(session_id, index, window_id))
+    }
+
+    /// Record a successfully verified carrier alias and predict the exact
+    /// topology change before the next full inventory arrives.
+    pub fn mark_internal_window_link(
+        &mut self,
+        session_id: SessionId,
+        index: u32,
+        window_id: WindowId,
+    ) -> Result<(), TopologyError> {
+        let session =
+            self.sessions
+                .get_mut(&session_id)
+                .ok_or(TopologyError::ContradictoryInventory(
+                    "carrier link references a missing session",
+                ))?;
+        if session
+            .windows
+            .get(&index)
+            .is_some_and(|candidate| *candidate != window_id)
+        {
+            return Err(TopologyError::ContradictoryInventory(
+                "carrier link index is occupied by another window",
+            ));
+        }
+        let window =
+            self.windows
+                .get_mut(&window_id)
+                .ok_or(TopologyError::ContradictoryInventory(
+                    "carrier link references a missing window",
+                ))?;
+        session.windows.insert(index, window_id);
+        window.links.insert(WindowLink { session_id, index });
+        self.internal_window_links
+            .insert((session_id, index, window_id));
+        Ok(())
+    }
+
+    pub fn forget_internal_window_link(
+        &mut self,
+        session_id: SessionId,
+        index: u32,
+        window_id: WindowId,
+    ) {
+        self.internal_window_links
+            .remove(&(session_id, index, window_id));
+        if let Some(session) = self.sessions.get_mut(&session_id)
+            && session.windows.get(&index) == Some(&window_id)
+        {
+            session.windows.remove(&index);
+        }
+        if let Some(window) = self.windows.get_mut(&window_id) {
+            window.links.remove(&WindowLink { session_id, index });
+        }
     }
 
     #[must_use]
@@ -405,6 +475,16 @@ impl TmuxTopology {
             next.apply_inventory_line(line)?;
         }
         next.validate_inventory()?;
+        next.internal_window_links = self
+            .internal_window_links
+            .iter()
+            .copied()
+            .filter(|(session_id, index, window_id)| {
+                next.session(*session_id)
+                    .and_then(|session| session.windows.get(index))
+                    == Some(window_id)
+            })
+            .collect();
         *self = next;
         Ok(())
     }

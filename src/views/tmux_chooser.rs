@@ -144,6 +144,9 @@ impl TmuxChooserView {
                 .session(session_id)
                 .into_iter()
                 .flat_map(|session| &session.windows)
+                .filter(|(index, window_id)| {
+                    !topology.is_internal_window_link(session_id, **index, **window_id)
+                })
                 .filter_map(|(index, window_id)| {
                     let window = topology.window(*window_id)?;
                     Some(ChooserItem {

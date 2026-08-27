@@ -220,6 +220,19 @@ fn drain_root(app: &mut App) -> Vec<u8> {
     bytes
 }
 
+fn acknowledge_root_replies(
+    app: &mut App,
+    sr: &mut ScreenReader,
+    physical: &mut Vec<u8>,
+    first_serial: usize,
+) {
+    let count = app.debug_tmux_expected_reply_count(1).unwrap_or_default();
+    for serial in first_serial..first_serial + count {
+        app.handle_pty(sr, &reply(serial, &[], true), physical)
+            .unwrap();
+    }
+}
+
 fn decode_send_keys(stream: &[u8], pane_id: u64) -> Vec<u8> {
     let prefix = format!("send-keys -H -t %{pane_id} ");
     let mut decoded = Vec::new();
@@ -590,7 +603,7 @@ fn parent_controls_render_and_announce_when_focus_returns_to_a_nested_pane_porta
 }
 
 #[test]
-fn manager_activation_keeps_every_nested_gateway_carrier_resumed() {
+fn carrier_pause_drops_the_nested_protocol_instead_of_resuming_after_loss() {
     let (mut app, mut sr, mut physical) = app();
     ready_root(&mut app, &mut sr, &mut physical);
     start_nested(&mut app, &mut sr, &mut physical, 1);
@@ -602,7 +615,6 @@ fn manager_activation_keeps_every_nested_gateway_carrier_resumed() {
         "inner",
         "/dev/ttys-inner",
     );
-
     assert!(
         app.activate_tmux_connection(1, &mut sr, &mut physical)
             .unwrap()
@@ -625,16 +637,13 @@ fn manager_activation_keeps_every_nested_gateway_carrier_resumed() {
         .unwrap();
     app.handle_pty(&mut sr, b"%pause %20\n", &mut physical)
         .unwrap();
-    assert_eq!(
-        drain_root(&mut app),
-        b"refresh-client -A '%20:continue'\n",
-        "an active descendant did not keep its carrier flowing"
-    );
-
-    input(&mut app, &mut sr, &mut physical, b"Z");
-    assert_eq!(
-        decode_send_keys(&drain_root(&mut app), 20),
-        b"send-keys -H -t %20 5a\n"
+    assert_eq!(app.tmux_connection_count(), 1);
+    assert_eq!(app.active_tmux_connection(), Some(1));
+    assert!(
+        !drain_root(&mut app)
+            .windows(b"%20:continue".len())
+            .any(|window| window == b"%20:continue"),
+        "Lector tried to continue a carrier after tmux confirmed byte loss"
     );
 }
 
@@ -674,7 +683,7 @@ fn an_inactive_nested_carrier_is_drained_instead_of_flow_paused() {
 }
 
 #[test]
-fn returning_to_a_parent_restores_its_user_session_window_and_pane() {
+fn parent_session_switch_links_the_nested_carrier_before_switching() {
     let (mut app, mut sr, mut physical) = app();
     ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
     start_nested(&mut app, &mut sr, &mut physical, 1);
@@ -686,41 +695,227 @@ fn returning_to_a_parent_restores_its_user_session_window_and_pane() {
         "inner",
         "/dev/ttys-inner",
     );
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_000);
 
     assert!(
         app.activate_tmux_connection(1, &mut sr, &mut physical)
             .unwrap()
     );
+    assert!(
+        app.show_tmux_session_chooser(&mut sr, &mut physical)
+            .unwrap()
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    assert_eq!(
+        drain_root(&mut app),
+        b"link-window -d -s @10 -t $2:1000000\n",
+        "the client switched before creating a carrier in the destination"
+    );
+    assert_eq!(app.debug_tmux_expected_reply_count(1), Some(1));
+    app.handle_pty(&mut sr, &reply(90, &[], true), &mut physical)
+        .unwrap();
+    assert_eq!(
+        drain_root(&mut app),
+        b"list-windows -t $2 -F 'L\t#{window_id}\t#{window_index}'\n"
+    );
+    app.handle_pty(
+        &mut sr,
+        &reply(91, &[b"L\t@10\t1000000".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    assert_eq!(drain_root(&mut app), b"switch-client -t $2\n");
     app.handle_pty(&mut sr, b"%session-changed $2 foo\n", &mut physical)
         .unwrap();
+    app.handle_pty(&mut sr, &reply(92, &[], true), &mut physical)
+        .unwrap();
+    let recovery = drain_root(&mut app);
+    assert!(
+        !recovery
+            .windows(b"unlink-window".len())
+            .any(|window| window == b"unlink-window"),
+        "the active carrier alias was removed immediately: {recovery:?}"
+    );
+    assert!(
+        app.show_tmux_window_chooser(&mut sr, &mut physical)
+            .unwrap()
+    );
+    let chooser = app.debug_active_view_contents();
+    assert!(chooser.contains("@11 1 foo"), "{chooser:?}");
+    assert!(chooser.contains("@12 2 other"), "{chooser:?}");
+    assert!(
+        !chooser.contains("1000000") && !chooser.contains("@10"),
+        "Lector's carrier alias leaked into its window chooser: {chooser:?}"
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
 
-    // Entering the child temporarily routes its parent through bar, where the
-    // nested control stream lives.
+    // Activating the child no longer switches its parent back to the original
+    // carrier session. The linked window is the same @window and pane stream,
+    // so resuming it in foo preserves the exact control-mode byte offset.
     assert!(
         app.activate_tmux_connection(2, &mut sr, &mut physical)
             .unwrap()
     );
+    let routed = drain_root(&mut app);
+    assert!(
+        !routed
+            .windows(b"switch-client".len())
+            .any(|window| window == b"switch-client"),
+        "child activation changed the parent's user session: {routed:?}"
+    );
+    assert!(
+        routed
+            .windows(b"refresh-client -A '%20:continue'".len())
+            .any(|window| window == b"refresh-client -A '%20:continue'")
+    );
+}
+
+#[test]
+fn carrier_link_collision_retries_inside_the_reserved_high_index_band() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_100);
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    app.show_tmux_session_chooser(&mut sr, &mut physical)
+        .unwrap();
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
     assert_eq!(
         drain_root(&mut app),
-        b"switch-client -t $1\nrefresh-client -A '%20:continue'\n"
+        b"link-window -d -s @10 -t $2:1000000\n"
+    );
+
+    app.handle_pty(
+        &mut sr,
+        &reply(1_200, &[b"index in use".to_vec()], false),
+        &mut physical,
+    )
+    .unwrap();
+    assert_eq!(
+        drain_root(&mut app),
+        b"link-window -d -s @10 -t $2:1000001\n"
+    );
+    app.handle_pty(&mut sr, &reply(1_201, &[], true), &mut physical)
+        .unwrap();
+    assert_eq!(
+        drain_root(&mut app),
+        b"list-windows -t $2 -F 'L\t#{window_id}\t#{window_index}'\n"
     );
     app.handle_pty(
         &mut sr,
-        b"%session-changed $1 bar\n%session-window-changed $2 @12\n%window-pane-changed @11 %22\n",
+        &reply(1_202, &[b"L\t@10\t1000001".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    assert_eq!(drain_root(&mut app), b"switch-client -t $2\n");
+}
+
+#[test]
+fn failed_carrier_verification_aborts_the_switch_and_queues_guarded_cleanup() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_300);
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    app.show_tmux_session_chooser(&mut sr, &mut physical)
+        .unwrap();
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    let _ = drain_root(&mut app);
+    app.handle_pty(&mut sr, &reply(1_400, &[], true), &mut physical)
+        .unwrap();
+    let _ = drain_root(&mut app);
+    app.handle_pty(
+        &mut sr,
+        &reply(1_401, &[b"L\t@99\t1000000".to_vec()], true),
         &mut physical,
     )
     .unwrap();
 
-    // Route-induced topology changes did not replace the parent's user
-    // preference. Even if its old session changed in the background, all
-    // three stable tmux IDs are restored when that connection is selected.
+    let cleanup = drain_root(&mut app);
     assert!(
-        app.activate_tmux_connection(1, &mut sr, &mut physical)
-            .unwrap()
+        cleanup.starts_with(
+            b"if-shell -F -t '$2:1000000' '#{==:#{window_id},@10}' 'unlink-window -t $2:1000000'\n"
+        ),
+        "missing ownership-guarded carrier cleanup: {cleanup:?}"
     );
+    assert!(
+        !cleanup
+            .windows(b"switch-client".len())
+            .any(|window| window == b"switch-client"),
+        "verification failure still switched sessions: {cleanup:?}"
+    );
+}
+
+#[test]
+fn switching_back_to_the_original_carrier_session_unlinks_only_the_owned_alias() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_500);
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    app.show_tmux_session_chooser(&mut sr, &mut physical)
+        .unwrap();
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    let _ = drain_root(&mut app);
+    app.handle_pty(&mut sr, &reply(1_600, &[], true), &mut physical)
+        .unwrap();
+    let _ = drain_root(&mut app);
+    app.handle_pty(
+        &mut sr,
+        &reply(1_601, &[b"L\t@10\t1000000".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    assert_eq!(drain_root(&mut app), b"switch-client -t $2\n");
+    app.handle_pty(&mut sr, b"%session-changed $2 foo\n", &mut physical)
+        .unwrap();
+    app.handle_pty(&mut sr, &reply(1_602, &[], true), &mut physical)
+        .unwrap();
+    let _ = drain_root(&mut app);
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_700);
+
+    app.show_tmux_session_chooser(&mut sr, &mut physical)
+        .unwrap();
+    input(&mut app, &mut sr, &mut physical, b"\x1b[A\r");
     assert_eq!(
         drain_root(&mut app),
-        b"switch-client -t $2\nselect-window -t @11\nselect-pane -t %23\n"
+        b"switch-client -t $1\n",
+        "the original user winlink should need no second carrier alias"
+    );
+    app.handle_pty(&mut sr, b"%session-changed $1 bar\n", &mut physical)
+        .unwrap();
+    app.handle_pty(&mut sr, &reply(1_800, &[], true), &mut physical)
+        .unwrap();
+    assert_eq!(
+        drain_root(&mut app),
+        b"if-shell -F -t '$2:1000000' '#{==:#{window_id},@10}' 'unlink-window -t $2:1000000'\n"
     );
 }
 
@@ -1289,8 +1484,12 @@ impl RealNestedHarness {
                     let child_status = self.child.try_wait();
                     let outer_pane = capture_pane(&self.outer_socket);
                     let inner_pane = capture_pane(&self.inner_socket);
+                    let active_connection = app.active_tmux_connection();
+                    let connection_count = app.tmux_connection_count();
+                    let active_contents = app.debug_active_view_contents();
+                    let outer_topology = app.debug_tmux_topology(1);
                     panic!(
-                        "{case}: {error}; child={child_status:?}; outer={outer_pane:?}; inner={inner_pane:?}"
+                        "{case}: {error}; child={child_status:?}; outer={outer_pane:?}; inner={inner_pane:?}; active={active_connection:?}; count={connection_count}; contents={active_contents:?}; topology={outer_topology:?}"
                     )
                 });
             app.handle_pty(sr, &chunk, physical).unwrap();
@@ -1413,19 +1612,50 @@ fn real_tmux_nested_loopback_routes_control_and_child_input() {
                 && app.debug_tmux_expected_reply_count(1) == Some(0)
         },
     );
-    harness
-        .writer
-        .write_all(b"switch-client -t nested-away\n")
+    assert!(
+        app.show_tmux_session_chooser(&mut sr, &mut physical)
+            .unwrap()
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    app.drain_tmux_commands_for(1, harness.writer.as_mut())
         .unwrap();
     harness.writer.flush().unwrap();
     harness.drive(
-        "outer alternate-session switch",
+        "link carrier and switch the outer client",
         &mut app,
         &mut sr,
         &mut physical,
         |app| {
             app.debug_tmux_topology(1)
                 .is_some_and(|dump| dump.contains("[attached]: nested-away"))
+                && app.debug_tmux_expected_reply_count(1) == Some(0)
+        },
+    );
+
+    // Stand in for five hours of inactivity without sleeping or locking the
+    // test machine. The child produces bytes while Lector presents the parent
+    // in another session; those bytes must still reach the nested parser.
+    let produced = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            harness.inner_socket.to_str().unwrap(),
+            "send-keys",
+            "-t",
+            ":",
+            "-l",
+            "FIVE-HOURS-LATER",
+        ])
+        .output()
+        .unwrap();
+    assert!(produced.status.success(), "{produced:?}");
+    harness.drive(
+        "nested output while the parent remains in another session",
+        &mut app,
+        &mut sr,
+        &mut physical,
+        |app| {
+            app.debug_tmux_pane_contents(2, 0)
+                .is_some_and(|contents| contents.contains("FIVE-HOURS-LATER"))
         },
     );
 
@@ -1438,15 +1668,10 @@ fn real_tmux_nested_loopback_routes_control_and_child_input() {
     app.drain_tmux_commands_for(1, harness.writer.as_mut())
         .unwrap();
     harness.writer.flush().unwrap();
-    harness.drive(
-        "restore nested carrier session",
-        &mut app,
-        &mut sr,
-        &mut physical,
-        |app| {
-            app.debug_tmux_topology(1)
-                .is_some_and(|dump| dump.contains("[attached]: nested-outer"))
-        },
+    assert!(
+        app.debug_tmux_topology(1)
+            .is_some_and(|dump| dump.contains("[attached]: nested-away")),
+        "activating the child changed the parent's session"
     );
 
     input(&mut app, &mut sr, &mut physical, b"X");
@@ -1458,7 +1683,10 @@ fn real_tmux_nested_loopback_routes_control_and_child_input() {
         &mut app,
         &mut sr,
         &mut physical,
-        |app| app.debug_active_view_contents().contains("INNER-READYX"),
+        |app| {
+            app.debug_active_view_contents()
+                .contains("FIVE-HOURS-LATERX")
+        },
     );
 
     assert!(
@@ -1467,17 +1695,9 @@ fn real_tmux_nested_loopback_routes_control_and_child_input() {
     );
     input(&mut app, &mut sr, &mut physical, b"\x1b[A\r");
     assert_eq!(app.active_tmux_connection(), Some(1));
-    app.drain_tmux_commands_for(1, harness.writer.as_mut())
-        .unwrap();
-    harness.writer.flush().unwrap();
-    harness.drive(
-        "restore outer user session",
-        &mut app,
-        &mut sr,
-        &mut physical,
-        |app| {
-            app.debug_tmux_topology(1)
-                .is_some_and(|dump| dump.contains("[attached]: nested-away"))
-        },
+    assert!(
+        app.debug_tmux_topology(1)
+            .is_some_and(|dump| dump.contains("[attached]: nested-away")),
+        "returning to the parent did not preserve its user session"
     );
 }
