@@ -1341,10 +1341,7 @@ impl App {
         {
             self.handle_tmux_carrier_move_verify_reply(
                 connection_id,
-                session_id,
-                window_id,
-                old_index,
-                new_index,
+                (session_id, window_id, old_index, new_index),
                 success,
                 &output,
             );

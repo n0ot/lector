@@ -7,6 +7,13 @@ and `%extended-output` bytes are delivered only to that engine. Escape, UTF-8,
 and graphics parser fragments can consequently remain unfinished while another
 pane or window is active and resume in their original owner later.
 
+That same pane-owned `View` also owns user and application accessibility state:
+the Review cursor and modes, APC auto-read and cursor-tracking policy, pending
+speech metadata, and image namespace. A tmux winlink is only another address
+for the stable `@window`; it never creates another pane `View`. Manual
+`link-window`, `move-window`, renumbering, and selection through a different
+session consequently preserve one in-memory copy of all of this state.
+
 ## Initial-state bootstrap
 
 After a complete inventory, Lector sends one machine-generated `capture-pane`

@@ -409,7 +409,7 @@ impl App {
             };
         }
         if matches!(program, "attach-session" | "attach")
-            || matches!(program, "new-session" | "new") && !words.iter().any(|word| *word == "-d")
+            || matches!(program, "new-session" | "new") && !words.contains(&"-d")
         {
             return TmuxSessionChange::Unsafe;
         }
@@ -417,7 +417,7 @@ impl App {
             // tmux bindings may contain command lists. We only rewrite a
             // single, completely understood switch below; a later session
             // command in a compound list must not bypass the carrier gate.
-            return command
+            return if command
                 .split(';')
                 .skip(1)
                 .filter_map(|segment| segment.split_ascii_whitespace().next())
@@ -434,9 +434,11 @@ impl App {
                             | "new-session"
                             | "new"
                     )
-                })
-                .then_some(TmuxSessionChange::Unsafe)
-                .unwrap_or(TmuxSessionChange::NotApplicable);
+                }) {
+                TmuxSessionChange::Unsafe
+            } else {
+                TmuxSessionChange::NotApplicable
+            };
         }
         if words
             .iter()
@@ -489,7 +491,7 @@ impl App {
             let previous = position.checked_sub(1).unwrap_or(sessions.len() - 1);
             return TmuxSessionChange::Target(sessions[previous].id);
         }
-        if words.iter().any(|word| *word == "-l") {
+        if words.contains(&"-l") {
             return TmuxSessionChange::Unsafe;
         }
         let simple_target = words.len() == 3 && words[1] == "-t"
@@ -1132,13 +1134,16 @@ impl App {
     pub(super) fn handle_tmux_carrier_move_verify_reply(
         &mut self,
         connection_id: u64,
-        session_id: crate::tmux_model::SessionId,
-        window_id: crate::tmux_model::WindowId,
-        old_index: u32,
-        new_index: u32,
+        move_target: (
+            crate::tmux_model::SessionId,
+            crate::tmux_model::WindowId,
+            u32,
+            u32,
+        ),
         success: bool,
         output: &[Vec<u8>],
     ) {
+        let (session_id, window_id, old_index, new_index) = move_target;
         let key = (connection_id, session_id, window_id);
         let expected = format!("L\t@{}\t{}", window_id.0, new_index);
         if !success
@@ -1653,14 +1658,13 @@ impl App {
             .tmux_connections
             .iter_mut()
             .find(|connection| connection.id == connection_id)
+            && connection.command_history.last() != Some(&command)
         {
-            if connection.command_history.last() != Some(&command) {
-                connection.command_history.push(command.clone());
-                const MAX_HISTORY: usize = 100;
-                if connection.command_history.len() > MAX_HISTORY {
-                    let excess = connection.command_history.len() - MAX_HISTORY;
-                    connection.command_history.drain(..excess);
-                }
+            connection.command_history.push(command.clone());
+            const MAX_HISTORY: usize = 100;
+            if connection.command_history.len() > MAX_HISTORY {
+                let excess = connection.command_history.len() - MAX_HISTORY;
+                connection.command_history.drain(..excess);
             }
         }
         let session_change = self.classify_tmux_session_change(connection_id, &command);

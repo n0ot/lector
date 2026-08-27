@@ -72,9 +72,9 @@ Lector classifies commands that require local accessible interaction:
   `@window` ID, title, window, and session captured when it opens. Acceptance
   sends an explicitly targeted command, even if focus changed in the meantime;
   if that target disappeared, Lector reports it and sends nothing.
-- `detach-client` detaches immediately. Lector sends the ordinary unqualified
-  command on the selected control connection, whose invoking client provides
-  the scope even when other local or nested connections are live.
+- `detach-client` uses the selected connection's unqualified control channel.
+  If that connection owns nested descendants, Lector turns it into the same
+  deepest-first graceful cascade as the connection manager.
 - `send-prefix` sends the configured prefix bytes to the attached active pane
   through the binary-safe hexadecimal input path.
 - `choose-tree -s`, `choose-tree -w`, `display-panes`, and `command-prompt`
@@ -85,11 +85,14 @@ Lector classifies commands that require local accessible interaction:
   state remains scoped to its connection and is replaced transactionally when
   tmux reports refreshed bindings.
 
-Number selection, previous/next/last window and session commands, pane
-directions, next/last pane, window creation, configured splits, command
-chains, and any other safe ordinary binding preserve the server's discovered
-command text except for the numeric scoping described above. This keeps tmux
-authoritative over the semantics while making numbered targets unambiguous.
+Number selection, previous/next/last window commands, pane directions,
+next/last pane, window creation, configured splits, command chains, and any
+other safe ordinary binding preserve the server's discovered command text
+except for the numeric scoping described above. Session-changing commands are
+the additional exception while nested carriers exist: understood destinations
+use the verified carrier transaction, and ambiguous destinations are refused.
+This keeps tmux authoritative over ordinary semantics while making numbered
+targets and nested byte ownership unambiguous.
 
 ## Destructive lifecycle behavior
 
@@ -124,9 +127,11 @@ particular, after all tmux connections end, the next connection is `1`.
 Graceful detach is sent as an unqualified `detach-client` on the selected
 connection's own control channel. The channel already identifies the invoking
 tmux client, so no cross-server client-name lookup or retargeting is needed.
-Before detaching a nested connection, Lector resumes every gateway pane from
-the outermost connection inward so `pause-after` flow control cannot hide the
-child's `%exit` and strand the deepest-first cascade behind the manager.
+Every healthy gateway pane remains continuously drained. Before detaching a
+nested connection, Lector cancels any unsent pause and continues only a route
+which was actually awaiting a pause/continue transition; activating a healthy
+connection does not perturb its pane-output offset. The child's `%exit` can
+then advance the deepest-first cascade behind the manager.
 
 Uppercase `D` is the confirmation-gated escape hatch. Lector first sends
 Control-backslash to the transport which owns the selected control client. If
@@ -193,14 +198,33 @@ live connection records and 4,096 pane gateway detectors. Destroying a gateway
 pane or window removes every descendant deepest-first and releases its detector.
 
 tmux itself has no nested-control-session metadata: the outer server sees only
-opaque pane bytes, and a remote server knows only its own client. Reattaching
-an outer tmux client yields a rendered pane capture, not the original framed
-byte stream or its initial control marker, so Lector cannot reliably rediscover
-an already-running nested `-CC` client. Graceful teardown therefore ends nested
-control clients before their parents. Their tmux servers and sessions survive;
-after reattaching, rerun `tmux -CC` from the returned shell. Users who need a
-nested client to remain continuously attached should run nested tmux normally
-instead of in control mode.
+opaque pane bytes, and a remote server knows only its own client. Lector keeps
+that byte route continuously observable without a tunnel, remote helper, or
+second local control client. Before switching an outer control client to
+another session, it links every live gateway `@window` into the destination
+session, verifies the exact stable window ID and index, and only then issues
+`switch-client`. The child continues to arrive through the same `%pane` stream
+while the user works elsewhere. Activating the child later uses that already
+linked pane; it does not switch the parent back or reconstruct a stream from a
+capture.
+
+Carrier winlinks use the reserved index band 1,000,000 through 1,004,095 and
+are hidden from Lector's window chooser. Collisions are retried inside the
+band. A full inventory reidentifies a carrier by stable `@window` ID; if
+`renumber-windows` moves its winlink down, Lector conditionally moves only that
+exact window back into the band and verifies the result. After returning to a
+session which already owns the gateway window, or after the child exits,
+Lector unlinks obsolete aliases with a stable-ID guard so a user replacement
+at the same index cannot be removed. Detaching a parent first detaches every
+nested connection and then removes its carrier aliases.
+
+Session chooser actions and simple previous, next, or explicit
+`switch-client` commands all use this transaction. Ambiguous, compound, last
+session, attach, and foreground new-session commands are refused while live
+carriers exist because Lector cannot prove their destination before tmux moves
+the client. A `%pause` for a gateway pane is also a hard connection failure:
+tmux has positively reported discarded protocol bytes, and neither a capture
+nor `continue` can reconstruct the missing framed stream.
 
 ## Accessible choosers and command entry
 

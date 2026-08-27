@@ -1094,6 +1094,27 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
                 })
         },
     );
+
+    // Produce a final update in the session the control client left, then
+    // leave it quiet. No incremental record for these bytes can reach Lector;
+    // returning must recover them from the authoritative session-entry
+    // capture rather than waiting for a later key or pane update.
+    let completed_while_away = std::process::Command::new("tmux")
+        .args([
+            "-S",
+            socket.to_str().unwrap(),
+            "send-keys",
+            "-t",
+            &first_session,
+            "-l",
+            "COMPLETED-WHILE-AWAY",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        completed_while_away.status.success(),
+        "failed to update the unattached session: {completed_while_away:?}"
+    );
     writer
         .write_all(format!("switch-client -t {first_session}\n").as_bytes())
         .unwrap();
@@ -1106,7 +1127,8 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         writer.as_mut(),
         &mut physical,
         |app| {
-            app.debug_active_view_contents().contains("FIRST")
+            app.debug_active_view_contents()
+                .contains("COMPLETED-WHILE-AWAY")
                 && app.debug_tmux_pane_flow_state(1, 0).is_some_and(|flow| {
                     flow.status == lector::app::TmuxFlowStatus::Running && flow.resync_count > 0
                 })

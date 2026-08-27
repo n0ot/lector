@@ -76,6 +76,15 @@ multiple servers, and nested SSH/tmux connections use the same compositor as
 ordinary terminal mode. Lector discovers the server's actual prefix and
 bindings instead of assuming `C-b` or `C-a`.
 
+Pane state follows tmux's stable `%pane` and `@window` IDs rather than session
+names or window indexes. Moving or linking a window therefore preserves the
+same Review cursor, terminal and media state, modes, and APC accessibility
+settings. Returning to an ordinary session authoritatively refreshes panes
+which may have changed while its control client was elsewhere. For a nested
+`tmux -CC` running through SSH, Lector first creates and verifies a hidden
+high-index carrier winlink in the destination session, so the framed child
+stream remains live for hours without a tunnel or remote helper.
+
 Press `M-C` while any tmux connection exists to open Lector's connection
 manager. It can switch to another local, nested, or remote connection even
 when the selected control process is silent or flooding. Its active row starts

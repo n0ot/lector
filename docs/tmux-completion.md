@@ -79,6 +79,14 @@ Failed resume or capture commands remain stale and retry with a bounded delay
 while the pane is visible; they cannot leave a visible pane permanently paused
 without another wakeup.
 
+A pane carrying a nested `tmux -CC` stream is never treated as an ordinary
+recoverable terminal. Lector continuously drains it, including while another
+connection or overlay is visible, and links its stable window into the outer
+client's attached session before a session switch. If tmux nevertheless emits
+`%pause` for that pane, it has positively discarded framed protocol bytes.
+Lector drops that nested connection instead of issuing `continue` and guessing
+at an unrecoverable byte boundary.
+
 Lector accepts every valid `%extended-output` record normally and records its
 reported age as delivery-latency telemetry. The age is not a loss marker: tmux
 uses `%pause` to report the lossy boundary, and a large age can also mean only

@@ -22,11 +22,15 @@ either side of the boundary.
 The router has explicit direct, control, and awaiting-terminator lifecycle
 states. `%exit` starts a one-second bounded wait for DCS ST. Missing `%exit`, a
 missing or timed-out ST, malformed records, and transport EOF produce typed
-connection failures and reset the router instead of poisoning Lector. A
-non-protocol line which reveals that SSH or another nested launcher died is
-replayed through the preserved parent pane parser; malformed `%` records remain
-private protocol data. Repeated EOF, timeout, pane removal, and descendant
-cleanup calls are idempotent.
+connection failures and reset the logical connection instead of poisoning
+Lector. Malformed control-looking records remain in a bounded quarantine; they
+are never replayed as terminal output, and Lector never automatically sends a
+termination byte into the possibly returned transport. A complete ordinary
+line which positively reveals that SSH or another nested launcher died ends
+the quarantine and is replayed through the preserved parent pane parser.
+Repeated EOF, timeout, pane removal, and descendant cleanup calls are
+idempotent. Mere silence, including hours with the UI covered or the computer
+asleep, is not treated as connection loss.
 
 ## Connection and portal surfaces
 

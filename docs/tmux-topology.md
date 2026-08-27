@@ -6,6 +6,15 @@ IDs as identity. Human names and per-session window and pane indexes remain
 presentation metadata, so duplicate names, one-based configurations, and a
 window linked into multiple sessions do not collapse distinct objects.
 
+Sessions contain winlinks from an index to an `@window` ID; windows and panes
+are stored once per control connection. The terminal and accessibility object
+is keyed by `%pane` ID, not by session or window index. Linking a window into a
+second session, moving it to another session or index, or selecting a different
+winlink therefore does not copy or hand off state. It selects the same pane
+object, preserving its terminal parser, history and media, Review cursor and
+modes, APC auto-read policy, and application-cursor tracking state. Only a
+genuine pane removal releases that object.
+
 The attached session is tracked separately from the set of sessions known to
 the server. Each connection starts with the deterministic label `tmux N`; the
 label may be replaced with 1 to 256 bytes of user-supplied text. No hostname or
@@ -33,9 +42,12 @@ Command output is arbitrary text. Only `%end` or `%error` carrying the exact
 tag from the surrounding `%begin` terminates a block; block-looking lines with
 other tags remain payload. This matters when `capture-pane` contains the text
 of a nested control client. A genuinely malformed protocol-looking record is
-quarantined rather than exposed as terminal text: Lector sends
-Control-backslash to terminate that control client, preserves its tmux
-sessions, and drains through DCS ST before restoring the parent shell.
+quarantined rather than exposed as terminal text. Lector immediately drops its
+logical connection state but does not write speculative recovery bytes into a
+transport which may already be an SSH client or returned shell. Control-looking
+records remain quarantined until a complete ordinary line positively identifies
+the parent transport, which is then replayed through its preserved terminal
+parser.
 
 `list-windows -a` and `list-panes -a` repeat objects linked into more than one
 session. Identical pane records are deduplicated by stable ID; conflicting
