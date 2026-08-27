@@ -35,9 +35,13 @@ after the physical output flush succeeds.
   waiting for flush, invalidates incremental rendering for its successor.
 - Accessibility stabilization is boundary-first. A DEC 2026 close is carried
   with its exact render receipt and becomes readable immediately after that
-  receipt flushes. An OSC 133 prompt-start marker holds prompt auto-read until
-  its `B` input boundary, which is another immediate semantic commit. Output
-  after either boundary uses ordinary stabilization again.
+  receipt flushes. If the compositor's 100 ms idle or 2-second hard watchdog
+  instead abandons the transaction, review follows the exact fail-open receipt
+  immediately and auto-read restarts ordinary stabilization from that receipt.
+  An OSC 133 prompt-start marker prefers its `B` input boundary, which is
+  another immediate semantic commit, but falls back after ordinary quiet if
+  the integration omits it. Output after either boundary uses ordinary
+  stabilization again.
 - A confirmed Backspace or Delete result can be announced immediately after
   its physical receipt without finalizing the surrounding accessibility
   update. Confirmation requires both the expected logical cursor position and

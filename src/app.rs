@@ -78,7 +78,6 @@ const ADAPTIVE_DIFF_MARGIN: u16 = 4;
 const ADAPTIVE_DIFF_DECAY: u16 = 2;
 const ADAPTIVE_DIFF_CLEAN_BURSTS: u8 = 3;
 const LATE_CONTINUATION_WINDOW_MS: u128 = 100;
-const SEMANTIC_INPUT_REPAINT_SETTLE_MS: u128 = 120;
 const ESC_TIMEOUT_MS: u128 = 50;
 static ANSI_CSI_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$")
@@ -183,41 +182,36 @@ mod stabilization_tests {
     }
 
     #[test]
-    fn open_prompt_gates_exact_commits_until_the_hard_boundary() {
+    fn explicit_boundary_commits_even_if_an_older_prompt_start_remains_open() {
         let update = PresentedUpdateStatus {
             explicitly_stable: true,
             prompt_transaction_open: true,
             ..PresentedUpdateStatus::default()
         };
         assert_eq!(
-            stabilization_decision(399, burst(100, 390, 8), update, false),
-            StabilizationDecision::WaitUntil(400)
-        );
-        assert_eq!(
-            stabilization_decision(400, burst(100, 390, 8), update, false),
+            stabilization_decision(100, burst(100, 100, 30), update, false),
             StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable)
         );
     }
 
     #[test]
-    fn structural_semantic_input_repaint_waits_for_a_later_interface_frame() {
+    fn prompt_without_an_end_marker_uses_the_quiet_fallback() {
         let update = PresentedUpdateStatus {
-            explicitly_stable: true,
-            structural_semantic_input_repaint: true,
+            prompt_transaction_open: true,
             ..PresentedUpdateStatus::default()
         };
         assert_eq!(
-            stabilization_decision(219, burst(100, 120, 8), update, false),
-            StabilizationDecision::WaitUntil(220)
+            stabilization_decision(129, burst(100, 100, 30), update, false),
+            StabilizationDecision::WaitUntil(130)
         );
         assert_eq!(
-            stabilization_decision(220, burst(100, 120, 8), update, false),
-            StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable)
+            stabilization_decision(130, burst(100, 100, 30), update, false),
+            StabilizationDecision::Commit(StabilizationCommitReason::QuietWindow)
         );
     }
 
     #[test]
-    fn exact_commit_reasons_have_stable_precedence_after_the_prompt_gate() {
+    fn exact_commit_reasons_have_stable_precedence_over_fallback_timers() {
         let mut update = PresentedUpdateStatus {
             explicitly_stable: true,
             completes_linear_output_record: true,
@@ -596,7 +590,6 @@ struct PresentedUpdateStatus {
     prompt_transaction_open: bool,
     parser_continuation: bool,
     adaptive_quiet_trainable: bool,
-    structural_semantic_input_repaint: bool,
 }
 
 fn adaptive_quiet_is_trainable(update: &UpdateSummary) -> bool {
@@ -604,29 +597,6 @@ fn adaptive_quiet_is_trainable(update: &UpdateSummary) -> bool {
         && !update.parser_continuation
         && update.screen_before == update.screen_after
         && !update.changed_rows.is_empty()
-}
-
-fn structural_semantic_input_repaint_needs_settling(view: &View, update: &UpdateSummary) -> bool {
-    if !update.output_report_structural
-        || update.semantic_input_boundary
-        || !view.accessibility_semantic_input_active()
-    {
-        return false;
-    }
-    let hinted_rows = update.changed_rows.iter().fold(0usize, |count, rows| {
-        count.saturating_add(usize::from(
-            rows.end().saturating_sub(*rows.start()).saturating_add(1),
-        ))
-    });
-    if hinted_rows > 0 {
-        hinted_rows == 1
-    } else {
-        // Renderer damage hints may be discarded under backpressure. Retained
-        // stream provenance still identifies a local cursor-line rewrite;
-        // a TUI which prints rows and then places its cursor is ready for the
-        // interface classifier instead of this settling gate.
-        update.line_feed_boundaries == 0 && update.cursor_operations_after_last_line_feed <= 1
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -696,16 +666,6 @@ fn stabilization_decision(
     let hard_deadline = burst
         .first_output_ms
         .saturating_add(u128::from(MAX_DIFF_DELAY));
-    if update.prompt_transaction_open && now_ms < hard_deadline {
-        return StabilizationDecision::WaitUntil(hard_deadline);
-    }
-    let semantic_repaint_deadline = burst
-        .first_output_ms
-        .saturating_add(SEMANTIC_INPUT_REPAINT_SETTLE_MS)
-        .min(hard_deadline);
-    if update.structural_semantic_input_repaint && now_ms < semantic_repaint_deadline {
-        return StabilizationDecision::WaitUntil(semantic_repaint_deadline);
-    }
     if update.explicitly_stable {
         return StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable);
     }
@@ -1182,6 +1142,10 @@ pub struct App {
     physical_profile: PhysicalTerminalProfile,
     startup_probe_broker: Option<StartupProbeBroker>,
     output_scheduler: Option<OutputScheduler>,
+    /// A DEC 2026 watchdog has abandoned the application's atomicity promise,
+    /// but accessibility has not yet rebased ordinary stabilization on the
+    /// exact fail-open render receipt.
+    pending_synchronization_timeout_stabilization: bool,
     /// Exact scheduler bypass generation which owns a still-pending logical
     /// compositor transition. A receipt for an older generation must not
     /// clear a newer overlay/session handoff.
@@ -1484,6 +1448,7 @@ impl App {
             physical_profile,
             startup_probe_broker: None,
             output_scheduler: None,
+            pending_synchronization_timeout_stabilization: false,
             compositor_transition_bypass_owner: None,
             compositor_transition_retry: None,
             compositor_transition_retry_attempt: None,
@@ -1753,6 +1718,7 @@ impl App {
             config,
             self.physical_profile.synchronized_output,
         ));
+        self.pending_synchronization_timeout_stabilization = false;
         self.compositor_transition_bypass_owner = None;
         self.compositor_transition_retry = None;
         self.compositor_transition_retry_attempt = None;
@@ -1791,10 +1757,7 @@ impl App {
         }
         let update = view.accessibility_update_summary();
         let parser_continuation = update.parser_continuation;
-        let output_report_structural = update.output_report_structural;
         let adaptive_quiet_trainable = adaptive_quiet_is_trainable(update);
-        let structural_semantic_input_repaint = output_report_structural
-            && structural_semantic_input_repaint_needs_settling(view, update);
         PresentedUpdateStatus {
             context: Some(AccessibilityContext {
                 view_id: logical_view,
@@ -1807,8 +1770,18 @@ impl App {
             prompt_transaction_open: view.accessibility_prompt_transaction_open(),
             parser_continuation,
             adaptive_quiet_trainable,
-            structural_semantic_input_repaint,
         }
+    }
+
+    /// A live DEC 2026 mode blocks accessibility only while the compositor is
+    /// still honoring that transaction. Once the shared watchdog abandons the
+    /// epoch, review and speech must not be frozen by the stale parser mode.
+    fn application_transaction_blocks_stabilization(&self, transaction_open: bool) -> bool {
+        transaction_open
+            && self
+                .output_scheduler
+                .as_ref()
+                .is_none_or(|scheduler| !scheduler.application_synchronization_is_ignored())
     }
 
     fn note_pty_update(
@@ -1970,6 +1943,9 @@ impl App {
                 return Err(error).context("drain scheduled terminal output");
             }
         };
+        if report.synchronization_timed_out {
+            self.pending_synchronization_timeout_stabilization = true;
+        }
         for completed in &report.completed_renders {
             self.scene_renderer.confirm(&completed.predicted);
             self.presented_scene = completed.predicted.clone();
@@ -2003,6 +1979,29 @@ impl App {
             {
                 self.presented_accessibility_label =
                     Some(format_terminal_accessibility_label(title));
+            }
+        }
+        let application_synchronization_ignored = self
+            .output_scheduler
+            .as_ref()
+            .is_some_and(OutputScheduler::application_synchronization_is_ignored);
+        if !application_synchronization_ignored {
+            self.pending_synchronization_timeout_stabilization = false;
+        } else if self.pending_synchronization_timeout_stabilization
+            && !report.completed_renders.is_empty()
+            && !self.view_stack.has_overlay()
+        {
+            // The watchdog releases pixels and accessibility together. Begin
+            // the ordinary quiet/hard fallback at that receipt rather than at
+            // the much older hidden PTY output, which would otherwise speak a
+            // partial frame immediately upon fail-open.
+            let update = self.active_presented_update_status();
+            if let Some(context) = update.context.filter(|_| update.finalization_pending) {
+                self.rebase_stabilization_burst_deadline(context, self.clock.now_ms());
+                self.pending_synchronization_timeout_stabilization = false;
+                self.log_latency_stage("synchronization-timeout-presented", || {
+                    format!("view_id={}", context.view_id.0)
+                });
             }
         }
         if let Some(completed_generation) = report.application_synchronization_bypass_completed
@@ -2085,18 +2084,16 @@ impl App {
             .map(|last_at| last_at.saturating_add(ESC_TIMEOUT_MS));
         let presented_update = self.active_presented_update_status();
         let now_ms = self.clock.now_ms();
+        let accessibility_blocked = self.application_transaction_blocks_stabilization(
+            presented_update.application_transaction_open,
+        );
         let accessibility_deadline = if presented_update.finalization_pending {
             presented_update
                 .context
                 .and_then(|context| self.stabilization_burst(context))
                 .and_then(|burst| {
-                    stabilization_decision(
-                        now_ms,
-                        burst,
-                        presented_update,
-                        presented_update.application_transaction_open,
-                    )
-                    .deadline_ms(now_ms)
+                    stabilization_decision(now_ms, burst, presented_update, accessibility_blocked)
+                        .deadline_ms(now_ms)
                 })
         } else {
             None

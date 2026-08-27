@@ -149,9 +149,13 @@ If a frame is idle for 100 ms or remains continuously open for the 2-second
 hard cap, the scheduler releases the newest partial render so physical output
 cannot remain wedged. Accessibility stays on the previous frame while that
 render is backpressured, then advances to precisely the partial generation that
-flushed. Further output in the broken epoch follows the same presentation
-fence, and a later real close ends the epoch only when its close-or-newer render
-flushes. A visible tmux split is one composed generation, so one pane's hold
+flushed. Review may inspect that generation immediately. Its receipt rebases
+auto-read onto the ordinary adaptive quiet window and 300 ms streaming cap, so
+the stale parser mode cannot silence speech indefinitely; it is not treated as
+a successful atomic close. Further output in the broken epoch follows the same
+presentation fence, and a later real close ends the epoch only when its
+close-or-newer render flushes. A visible tmux split is one composed generation,
+so one pane's hold
 also prevents ordinary changes in another visible pane from being read early.
 
 Overlay and base transitions carry the active accessibility view in the same

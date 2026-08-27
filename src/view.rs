@@ -1063,16 +1063,6 @@ impl View {
         current_count != previous_count || current_latest != previous_latest
     }
 
-    /// Whether the accessible primary-screen frame is still in the editable
-    /// OSC 133 input phase. Structural repainting in this phase can be a
-    /// transient Readline macro rather than content meant for auto-reading.
-    pub(crate) fn accessibility_semantic_input_active(&self) -> bool {
-        let alternate = self.screen().screen == crate::terminal::ScreenIdentity::Alternate;
-        semantic_mark_summary(&self.screen().semantic_marks, alternate)
-            .1
-            .is_some_and(|mark| matches!(mark.kind, Osc133Kind::InputStart))
-    }
-
     /// Returns the live viewport from the last committed application frame.
     ///
     /// This is distinct from [`Self::screen`]: a user may navigate the frozen

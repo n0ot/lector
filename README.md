@@ -138,8 +138,11 @@ the final candidate eligible but does not make it readable before its physical
 flush. A frame idle for 100 ms, or continuously open for 2 seconds, is released
 as a bounded failure case so a broken application cannot freeze the terminal.
 Once that exact partial render flushes, accessibility advances to the same
-partial generation a sighted user sees; newer parser state cannot leak ahead of
-it. Visible tmux panes commit as one composed generation, and overlay/base
+partial generation a sighted user sees; review can inspect it immediately and
+auto-read resumes through the ordinary quiet/streaming fallback from that
+receipt. The stale opening marker is ignored until its real close, and newer
+parser state cannot leak ahead of its pixels. Visible tmux panes commit as one
+composed generation, and overlay/base
 announcements follow the physically completed active view. On outer terminals
 that support synchronized output, Lector owns one global update boundary.
 Audible bells follow the completed visual transaction.

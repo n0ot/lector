@@ -3259,9 +3259,11 @@ impl App {
             .active_tmux_connection_mut()
             .is_some_and(|view| view.is_ready() && !view.is_showing_portal());
         let overlay_active = !tmux_base_active && self.view_stack.has_overlay();
-        let (accessibility_blocked, mut update_status) = if presentation_tracking {
+        let (accessibility_blocked, update_status) = if presentation_tracking {
             (
-                presented_update.application_transaction_open,
+                self.application_transaction_blocks_stabilization(
+                    presented_update.application_transaction_open,
+                ),
                 presented_update,
             )
         } else {
@@ -3272,10 +3274,10 @@ impl App {
             };
             let update = view.accessibility_update_summary();
             let parser_continuation = update.parser_continuation;
-            let output_report_structural = update.output_report_structural;
             let adaptive_quiet_trainable = adaptive_quiet_is_trainable(update);
-            let structural_semantic_input_repaint = output_report_structural
-                && structural_semantic_input_repaint_needs_settling(view, update);
+            let explicitly_stable = update.synchronized_output_closed
+                || (update.semantic_input_boundary
+                    && update.screen_after == ScreenIdentity::Primary);
             let context = AccessibilityContext {
                 view_id: view.view_id(),
                 screen: view.screen().screen,
@@ -3285,12 +3287,12 @@ impl App {
                 PresentedUpdateStatus {
                     context: Some(context),
                     application_transaction_open: view.application_transaction_open(),
+                    explicitly_stable,
                     completes_linear_output_record: view
                         .accessibility_completes_linear_output_record(),
                     prompt_transaction_open: view.accessibility_prompt_transaction_open(),
                     parser_continuation,
                     adaptive_quiet_trainable,
-                    structural_semantic_input_repaint,
                     ..PresentedUpdateStatus::default()
                 },
             )
@@ -3312,9 +3314,6 @@ impl App {
         };
         if sr.has_pending_history_navigation() && history_focus_presentation.is_none() {
             sr.clear_pending_history_navigation();
-        }
-        if history_focus_presentation == Some(true) {
-            update_status.structural_semantic_input_repaint = false;
         }
         let Some(burst) = self.stabilization_burst(context) else {
             return Ok(false);

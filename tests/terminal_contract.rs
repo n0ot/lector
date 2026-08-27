@@ -104,7 +104,8 @@ fn osc133_input_boundary_is_exact_across_visible_suffixes_and_fragmentation() {
     assert!(exact.semantic_input_boundary);
 
     let mut neutral_engine = engine(3, 40, 20);
-    let neutral = neutral_engine.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[32m\x1b[?2004h");
+    let neutral = neutral_engine
+        .advance(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[32m\x1b[?2004h\x1b[5 q\x1b]2;cwd\x07");
     assert!(neutral.semantic_input_boundary);
 
     let mut same_read_engine = engine(3, 40, 20);

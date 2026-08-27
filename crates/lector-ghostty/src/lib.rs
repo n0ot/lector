@@ -1948,8 +1948,13 @@ impl vte::Perform for StreamObserver {
             && intermediates == b"?"
             && matches!(action, 'h' | 'l')
             && Self::private_modes_are_output_neutral(params);
+        // DECSCUSR changes only the cursor's appearance. It neither changes
+        // text cells nor moves the cursor, so it cannot invalidate an exact
+        // OSC 133 input-start boundary which immediately precedes it.
+        let output_neutral_cursor_style = !ignore && intermediates == b" " && action == 'q';
         if !(!ignore && intermediates.is_empty() && matches!(action, 'm' | 'n' | 'c'))
             && !output_neutral_private_mode
+            && !output_neutral_cursor_style
         {
             self.mark_structural_output();
         }

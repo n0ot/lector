@@ -3005,10 +3005,9 @@ fn synchronized_output_waits_for_the_complete_screen_update_before_speaking() {
 
     app.handle_pty(&mut sr, b" complete\x1B[?2026l", &mut term_out)
         .expect("end synchronized output");
-    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(
         app.maybe_finalize_changes(&mut sr)
-            .expect("finalize synchronized update")
+            .expect("the exact close finalizes immediately")
     );
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
@@ -3195,7 +3194,7 @@ fn synchronized_close_becomes_readable_only_after_its_render_flushes() {
 }
 
 #[test]
-fn osc133_prompt_waits_for_b_then_commits_without_the_diff_delay() {
+fn osc133_prompt_commits_at_b_without_the_diff_delay() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig::default());
     let mut term_out = Vec::new();
@@ -3217,15 +3216,18 @@ fn osc133_prompt_waits_for_b_then_commits_without_the_diff_delay() {
     clock.advance_ms(4);
     app.drain_scheduled_output(&mut term_out, false)
         .expect("present partial prompt");
-    clock.advance_ms(u128::from(DIFF_DELAY));
     assert!(
         !app.maybe_finalize_changes(&mut sr)
-            .expect("hold partial prompt")
+            .expect("hold a prompt which has not yet reached quiet")
     );
     assert!(recorder.inner.borrow().speaks.is_empty());
 
-    app.handle_pty(&mut sr, b"ready\x1b]133;B\x07", &mut term_out)
-        .expect("queue completed prompt");
+    app.handle_pty(
+        &mut sr,
+        b"ready\x1b]133;B\x07\x1b[5 q\x1b]2;cwd\x07",
+        &mut term_out,
+    )
+    .expect("queue completed prompt");
     clock.advance_ms(4);
     app.drain_scheduled_output(&mut term_out, false)
         .expect("present completed prompt");
@@ -3236,6 +3238,42 @@ fn osc133_prompt_waits_for_b_then_commits_without_the_diff_delay() {
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         [("$ ready".into(), false)]
+    );
+}
+
+#[test]
+fn osc133_prompt_without_b_uses_the_quiet_fallback() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b]133;A\x07fallback prompt\x1b[5 q\x1b]2;cwd\x07",
+        &mut term_out,
+    )
+    .expect("queue a prompt whose integration omitted the input-start marker");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the unterminated semantic prompt");
+
+    clock.advance_ms(u128::from(DIFF_DELAY - 1));
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("the prompt has not been quiet for the fallback interval")
+    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    clock.advance_ms(1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("quiet fallback finalizes the prompt")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("fallback prompt".into(), false)]
     );
 }
 
@@ -3319,22 +3357,22 @@ fn osc133_input_boundary_does_not_commit_an_alternate_screen_redraw() {
 }
 
 #[test]
-fn abandoned_osc133_prompt_boundary_falls_back_at_the_maximum_delay() {
+fn abandoned_osc133_prompt_boundary_falls_back_after_quiet() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut term_out = Vec::new();
 
     app.handle_pty(&mut sr, b"\x1b]133;A\x07$ partial", &mut term_out)
         .expect("draw prompt without its input boundary");
-    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    clock.advance_ms(u128::from(DIFF_DELAY - 1));
     assert!(
         !app.maybe_finalize_changes(&mut sr)
-            .expect("hold partial prompt")
+            .expect("hold a prompt before the quiet deadline")
     );
 
-    clock.advance_ms(u128::from(MAX_DIFF_DELAY - DIFF_DELAY));
+    clock.advance_ms(1);
     assert!(
         app.maybe_finalize_changes(&mut sr)
-            .expect("release abandoned semantic transaction")
+            .expect("release the prompt after a quiet interval")
     );
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
@@ -3598,45 +3636,27 @@ fn reverse_search_interface_reads_its_settled_contents() {
 }
 
 #[test]
-fn reverse_search_discards_a_transient_semantic_input_macro() {
+fn fallback_stabilization_resets_after_each_update() {
     let (mut app, mut sr, recorder, clock) = make_app();
-    let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
 
-    app.handle_pty(&mut sr, b"\x1b]133;A\x07$ \x1b]133;B\x07", &mut term_out)
-        .expect("draw semantic shell prompt");
-    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
-    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
-    recorder.inner.borrow_mut().speaks.clear();
-
-    app.handle_stdin(&mut sr, b"\x12", &mut pty_out, &mut term_out)
-        .expect("launch reverse history search");
-    app.handle_pty(&mut sr, b"\r\x1b[2K$ `__fzf_history__`", &mut term_out)
-        .expect("draw transient Readline macro");
-    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.handle_pty(&mut sr, b"\r\x1b[2Kpartial", &mut term_out)
+        .expect("draw the first part of a structural repaint");
+    clock.advance_ms(u128::from(DIFF_DELAY - 1));
     assert!(!app.maybe_finalize_changes(&mut sr).unwrap());
     assert!(recorder.inner.borrow().speaks.is_empty());
 
-    app.handle_pty(
-        &mut sr,
-        b"\x1b[2J\x1b[Hhistory one\r\nhistory two\r\n\x1b[4;1H>\x1b[4;1H",
-        &mut term_out,
-    )
-    .expect("draw final cursor-addressed history interface");
-    clock.advance_ms(u128::from(MAX_DIFF_DELAY));
-    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    app.handle_pty(&mut sr, b" prompt", &mut term_out)
+        .expect("finish the repaint just before the first quiet deadline");
+    clock.advance_ms(u128::from(DIFF_DELAY - 1));
+    assert!(!app.maybe_finalize_changes(&mut sr).unwrap());
+    assert!(recorder.inner.borrow().speaks.is_empty());
 
+    clock.advance_ms(1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("history one\n\nhistory two\n\n greater ".into(), false)]
-    );
-    assert!(
-        recorder
-            .inner
-            .borrow()
-            .speaks
-            .iter()
-            .all(|(text, _)| !text.contains("__fzf_history__"))
+        &[("partial prompt".into(), false)]
     );
 }
 
@@ -5069,7 +5089,7 @@ fn popping_an_overlay_after_synchronized_timeout_reveals_the_live_frame() {
 }
 
 #[test]
-fn synchronized_timeout_does_not_auto_read_the_exposed_partial_frame() {
+fn synchronized_timeout_returns_auto_read_to_ordinary_stabilization() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig::default());
     let mut term_out = Vec::new();
@@ -5092,24 +5112,28 @@ fn synchronized_timeout_does_not_auto_read_the_exposed_partial_frame() {
     );
     app.drain_scheduled_output(&mut term_out, false)
         .expect("publish the authoritative timeout recovery scene");
-    assert!(!app.maybe_finalize_changes(&mut sr).expect("remain blocked"));
-    clock.advance_ms(1_000);
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("start a fresh quiet window at the timeout receipt")
+    );
+    clock.advance_ms(u128::from(DIFF_DELAY - 1));
     assert_eq!(
         app.scheduled_output_timeout(),
-        None,
-        "the blocked accessibility frame must not create a zero-timeout spin"
+        Some(std::time::Duration::from_millis(1)),
+        "the abandoned marker must no longer suppress the ordinary deadline"
     );
     assert!(
         !app.maybe_finalize_changes(&mut sr)
-            .expect("remain blocked past the hard accessibility deadline")
+            .expect("remain quiet until the exact fallback boundary")
     );
+    clock.advance_ms(1);
     assert!(
-        recorder
-            .inner
-            .borrow()
-            .speaks
-            .iter()
-            .all(|(text, _)| !text.contains("exposed partial"))
+        app.maybe_finalize_changes(&mut sr)
+            .expect("read the fail-open frame after ordinary stabilization")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("exposed partial".into(), false)]
     );
 
     app.handle_pty(&mut sr, b"\x1b[?2026l", &mut term_out)
@@ -5120,6 +5144,73 @@ fn synchronized_timeout_does_not_auto_read_the_exposed_partial_frame() {
     assert!(
         app.maybe_finalize_changes(&mut sr)
             .expect("finalize only the real close")
+    );
+}
+
+#[test]
+fn synchronized_hard_timeout_returns_continuous_output_to_progressive_auto_read() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        synchronization_timeout_ms: 10_000,
+        synchronization_hard_timeout_ms: 200,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut term_out = Vec::new();
+
+    app.handle_pty(
+        &mut sr,
+        b"\x1b[?2026h\x1b[2J\x1b[Hcontinuous frame 0",
+        &mut term_out,
+    )
+    .expect("open a continuously changing transaction");
+    for frame in 1..=10 {
+        clock.advance_ms(20);
+        app.handle_pty(
+            &mut sr,
+            format!("\r\x1b[2Kcontinuous frame {frame}").as_bytes(),
+            &mut term_out,
+        )
+        .expect("replace the held frame");
+        let report = app
+            .drain_scheduled_output(&mut term_out, false)
+            .expect("honor the hard transaction deadline");
+        assert_eq!(report.synchronization_timed_out, frame == 10);
+    }
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("start ordinary stabilization at the hard-timeout receipt")
+    );
+
+    for frame in 11..=24 {
+        clock.advance_ms(20);
+        app.handle_pty(
+            &mut sr,
+            format!("\r\x1b[2Kcontinuous frame {frame}").as_bytes(),
+            &mut term_out,
+        )
+        .expect("continue the abandoned transaction");
+        app.drain_scheduled_output(&mut term_out, false)
+            .expect("publish the newest fail-open frame");
+        assert!(
+            !app.maybe_finalize_changes(&mut sr)
+                .expect("continuous output has not reached its speech cap")
+        );
+    }
+
+    clock.advance_ms(19);
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        Some(std::time::Duration::from_millis(1))
+    );
+    assert!(!app.maybe_finalize_changes(&mut sr).unwrap());
+    clock.advance_ms(1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("the ordinary streaming cap prevents indefinite silence")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.last(),
+        Some(&("continuous frame 24".into(), false))
     );
 }
 
