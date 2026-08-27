@@ -1,4 +1,5 @@
 use super::document::{SearchDirection, WordMove, WordStyle};
+use super::table::CellMove;
 use crate::clipboard::ClipboardRegister;
 
 const MAX_COUNT: usize = 10_000;
@@ -80,6 +81,12 @@ pub(crate) enum Command {
         reverse: bool,
         count: usize,
     },
+    DetectTable,
+    StartTableSetup,
+    MarkTableBottom,
+    MarkTableRight,
+    ToggleTableRowHeader,
+    MoveTableCell(CellMove, usize),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -102,6 +109,9 @@ enum Prefix {
     G,
     Z,
     Bracket {
+        forward: bool,
+    },
+    Brace {
         forward: bool,
     },
     Find {
@@ -230,6 +240,14 @@ impl Parser {
                 self.prefix = Prefix::Bracket { forward: true };
                 Command::None
             }
+            Key::Char('{') => {
+                self.prefix = Prefix::Brace { forward: false };
+                Command::None
+            }
+            Key::Char('}') => {
+                self.prefix = Prefix::Brace { forward: true };
+                Command::None
+            }
             Key::Char('f') => self.start_find(FindDirection::Forward, false),
             Key::Char('F') => self.start_find(FindDirection::Backward, false),
             Key::Char('t') => self.start_find(FindDirection::Forward, true),
@@ -343,6 +361,31 @@ impl Parser {
             });
         }
         let count = pending_count.unwrap_or(1).max(1);
+        if self.visual.is_none() {
+            let command = match (prefix, key) {
+                (Prefix::G, Key::Char('t')) => Some(Command::DetectTable),
+                (Prefix::G, Key::Char('T')) => Some(Command::StartTableSetup),
+                (Prefix::G, Key::Char('B')) => Some(Command::MarkTableBottom),
+                (Prefix::G, Key::Char('R')) => Some(Command::MarkTableRight),
+                (Prefix::G, Key::Char('H')) => Some(Command::ToggleTableRowHeader),
+                (Prefix::Bracket { forward: false }, Key::Char('|')) => {
+                    Some(Command::MoveTableCell(CellMove::Previous, count))
+                }
+                (Prefix::Bracket { forward: true }, Key::Char('|')) => {
+                    Some(Command::MoveTableCell(CellMove::Next, count))
+                }
+                (Prefix::Brace { forward: false }, Key::Char('|')) => {
+                    Some(Command::MoveTableCell(CellMove::Up, count))
+                }
+                (Prefix::Brace { forward: true }, Key::Char('|')) => {
+                    Some(Command::MoveTableCell(CellMove::Down, count))
+                }
+                _ => None,
+            };
+            if let Some(command) = command {
+                return self.finish(command);
+            }
+        }
         let motion = match (prefix, key) {
             (Prefix::G, Key::Char('g')) => Some(Motion::DocumentStart),
             (Prefix::Bracket { forward }, Key::Char('p')) => Some(Motion::Prompt { forward }),
@@ -352,6 +395,7 @@ impl Parser {
                 target,
             }),
             (Prefix::Z, _) => None,
+            (Prefix::Brace { .. }, _) => None,
             _ => None,
         };
         let Some(motion) = motion else {
@@ -426,6 +470,7 @@ impl Parser {
                     target,
                 }),
                 (Prefix::Z, _) => None,
+                (Prefix::Brace { .. }, _) => None,
                 _ => None,
             };
             let Some(motion) = motion else {
@@ -614,6 +659,7 @@ mod tests {
     };
     use crate::clipboard::ClipboardRegister;
     use crate::review::document::{SearchDirection, WordMove, WordStyle};
+    use crate::review::table::CellMove;
 
     fn feed(parser: &mut Parser, keys: &[Key]) -> Vec<Command> {
         keys.iter().copied().map(|key| parser.feed(key)).collect()
@@ -678,6 +724,46 @@ mod tests {
                 forward: true,
                 count: 1
             }
+        );
+    }
+
+    #[test]
+    fn parses_review_table_commands_and_cell_motions() {
+        let mut parser = Parser::default();
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('g'), Key::Char('t')]),
+            vec![Command::None, Command::DetectTable]
+        );
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('g'), Key::Char('T')]),
+            vec![Command::None, Command::StartTableSetup]
+        );
+        assert_eq!(
+            feed(
+                &mut parser,
+                &[Key::Char('3'), Key::Char(']'), Key::Char('|')]
+            ),
+            vec![
+                Command::None,
+                Command::None,
+                Command::MoveTableCell(CellMove::Next, 3)
+            ]
+        );
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('{'), Key::Char('|')]),
+            vec![Command::None, Command::MoveTableCell(CellMove::Up, 1)]
+        );
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('g'), Key::Char('B')]),
+            vec![Command::None, Command::MarkTableBottom]
+        );
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('g'), Key::Char('R')]),
+            vec![Command::None, Command::MarkTableRight]
+        );
+        assert_eq!(
+            feed(&mut parser, &[Key::Char('g'), Key::Char('H')]),
+            vec![Command::None, Command::ToggleTableRowHeader]
         );
     }
 

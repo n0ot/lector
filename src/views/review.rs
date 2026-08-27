@@ -1,10 +1,12 @@
 use super::{Result, ViewAction, ViewController, ViewKind};
 use crate::{
+    line_editor::{EditorAction, LineEditor},
     review::{
         document::{ReviewDocument, SearchDirection},
         parser::{
             Command, FindDirection, Key, Motion, Parser, TextObject, ViewportPlacement, VisualKind,
         },
+        table::{CellAddress, CellMove, MarkerChange, ReviewTable, TableSetup},
     },
     screen_reader::ScreenReader,
     terminal::HistoryPosition,
@@ -14,6 +16,7 @@ use crate::{
 use std::{any::Any, io::Write};
 use terminput::{KeyCode, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Copy, Clone, Debug)]
 struct LastFind {
@@ -35,6 +38,12 @@ struct SearchPrompt {
     direction: SearchDirection,
 }
 
+struct NamePrompt {
+    tabstop: u16,
+    logical_column: usize,
+    editor: LineEditor,
+}
+
 pub struct ReviewView {
     view: View,
     title: String,
@@ -51,6 +60,9 @@ pub struct ReviewView {
     last_find: Option<LastFind>,
     last_search: Option<LastSearch>,
     search_prompt: Option<SearchPrompt>,
+    table: Option<ReviewTable>,
+    table_setup: Option<TableSetup>,
+    name_prompt: Option<NamePrompt>,
 }
 
 impl ReviewView {
@@ -90,6 +102,9 @@ impl ReviewView {
             last_find: None,
             last_search: None,
             search_prompt: None,
+            table: None,
+            table_setup: None,
+            name_prompt: None,
         };
         review.ensure_cursor_visible();
         review.render();
@@ -97,7 +112,9 @@ impl ReviewView {
     }
 
     fn document_height(&self) -> usize {
-        usize::from(self.rows).saturating_sub(usize::from(self.search_prompt.is_some()))
+        usize::from(self.rows).saturating_sub(usize::from(
+            self.search_prompt.is_some() || self.name_prompt.is_some(),
+        ))
     }
 
     fn ensure_cursor_visible(&mut self) {
@@ -153,6 +170,22 @@ impl ReviewView {
                 .saturating_add(prompt.query.graphemes(true).count())
                 .min(usize::from(self.cols).max(1));
             bytes.extend_from_slice(format!("\x1B[{row};{col}H\x1B[?25h").as_bytes());
+        } else if let Some(prompt) = &self.name_prompt {
+            let row = self.rows.max(1);
+            let prefix = format!("Column {} name: ", prompt.logical_column + 1);
+            bytes.extend_from_slice(format!("\x1B[{row};1H\x1B[2K{prefix}").as_bytes());
+            bytes.extend_from_slice(prompt.editor.input().as_bytes());
+            let before_cursor = prompt
+                .editor
+                .input()
+                .graphemes(true)
+                .take(prompt.editor.cursor())
+                .collect::<String>();
+            let col = 1usize
+                .saturating_add(prefix.width())
+                .saturating_add(before_cursor.width())
+                .min(usize::from(self.cols).max(1));
+            bytes.extend_from_slice(format!("\x1B[{row};{col}H\x1B[?25h").as_bytes());
         } else {
             let row = self
                 .cursor
@@ -174,7 +207,7 @@ impl ReviewView {
         self.view.clear_update_summary();
     }
 
-    fn handle_search_key(&mut self, key: Key) -> Result<ViewAction> {
+    fn handle_search_key(&mut self, sr: &mut ScreenReader, key: Key) -> Result<ViewAction> {
         match key {
             Key::Escape => {
                 self.search_prompt = None;
@@ -199,7 +232,7 @@ impl ReviewView {
                 self.render();
                 Ok(ViewAction::Redraw)
             }
-            Key::Enter => self.finish_search(),
+            Key::Enter => self.finish_search(sr),
             Key::Char(ch) if !ch.is_control() => {
                 self.search_prompt
                     .as_mut()
@@ -213,7 +246,7 @@ impl ReviewView {
         }
     }
 
-    fn finish_search(&mut self) -> Result<ViewAction> {
+    fn finish_search(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
         let prompt = self.search_prompt.as_ref().expect("search prompt");
         let query = if prompt.query.is_empty() {
             let Some(last) = &self.last_search else {
@@ -229,7 +262,7 @@ impl ReviewView {
         };
         self.last_search = Some(LastSearch { query, direction });
         self.search_prompt = None;
-        Ok(self.move_to(target))
+        self.move_with_table_context(sr, target)
     }
 
     fn handle_command(&mut self, sr: &mut ScreenReader, command: Command) -> Result<ViewAction> {
@@ -258,14 +291,24 @@ impl ReviewView {
                 let Some(target) = self.motion_target(motion, count) else {
                     return Ok(ViewAction::Bell);
                 };
-                Ok(self.move_to(target))
+                self.move_with_table_context(sr, target)
             }
-            Command::ScrollPage { forward, count } => Ok(self.scroll_page(forward, count)),
+            Command::ScrollPage { forward, count } => {
+                let old = self.current_table_cell();
+                let action = self.scroll_page(forward, count);
+                self.announce_table_transition(sr, old)?;
+                Ok(action)
+            }
             Command::RepositionViewport {
                 placement,
                 line,
                 first_nonblank,
-            } => Ok(self.reposition_viewport(placement, line, first_nonblank)),
+            } => {
+                let old = self.current_table_cell();
+                let action = self.reposition_viewport(placement, line, first_nonblank);
+                self.announce_table_transition(sr, old)?;
+                Ok(action)
+            }
             Command::YankMotion(motion, count, register) => {
                 let Some(target) = self.motion_target(motion, count) else {
                     return Ok(ViewAction::Bell);
@@ -341,9 +384,270 @@ impl ReviewView {
                 else {
                     return Ok(ViewAction::Bell);
                 };
-                Ok(self.move_to(target))
+                self.move_with_table_context(sr, target)
             }
+            Command::DetectTable => self.detect_table(sr),
+            Command::StartTableSetup => self.start_table_setup(sr),
+            Command::MarkTableBottom => self.mark_table_bottom(sr),
+            Command::MarkTableRight => self.mark_table_right(sr),
+            Command::ToggleTableRowHeader => self.toggle_table_row_header(sr),
+            Command::MoveTableCell(movement, count) => self.move_table_cell(sr, movement, count),
         }
+    }
+
+    fn detect_table(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        self.table = None;
+        self.table_setup = None;
+        self.name_prompt = None;
+        let Some(table) = ReviewTable::detect(&self.document, self.cursor) else {
+            sr.speak("no table found", false)?;
+            return Ok(ViewAction::None);
+        };
+        let Some(address) = table
+            .cell_at(self.cursor)
+            .or_else(|| table.nearest_cell(self.cursor))
+        else {
+            sr.speak("no table found", false)?;
+            return Ok(ViewAction::None);
+        };
+        let target = table.position_for_cell(&self.document, address);
+        let moved = target != self.cursor;
+        self.table = Some(table);
+        if moved {
+            self.cursor = target;
+            self.render();
+        }
+        let table = self.table.as_ref().expect("installed table");
+        let (rows, columns) = table.dimensions();
+        sr.speak("table", false)?;
+        sr.speak(&format!("{rows} rows"), false)?;
+        sr.speak(&format!("{columns} columns"), false)?;
+        Self::speak_full_cell(sr, table, address, true)?;
+        Ok(if moved {
+            ViewAction::RedrawSilently
+        } else {
+            ViewAction::None
+        })
+    }
+
+    fn start_table_setup(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        self.parser = Parser::default();
+        self.table = None;
+        self.name_prompt = None;
+        self.table_setup = Some(TableSetup::new(self.cursor.row));
+        sr.speak("table setup", false)?;
+        sr.speak("headers from first row", false)?;
+        Ok(ViewAction::None)
+    }
+
+    fn mark_table_bottom(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        let Some(setup) = self.table_setup.as_mut() else {
+            return Ok(ViewAction::Bell);
+        };
+        if self.cursor.row < setup.top_row() {
+            sr.speak("bottom row cannot be above the first row", false)?;
+            return Ok(ViewAction::None);
+        }
+        let row_number = self
+            .cursor
+            .row
+            .saturating_sub(setup.top_row())
+            .saturating_add(1)
+            .saturating_sub(usize::from(
+                setup.header_mode() == crate::review::table::HeaderMode::FirstRow,
+            ));
+        match setup.toggle_bottom(self.cursor.row) {
+            MarkerChange::Set => {
+                sr.speak("bottom row set", false)?;
+                if row_number > 0 {
+                    sr.speak(&format!("row {row_number}"), false)?;
+                }
+            }
+            MarkerChange::Cleared => sr.speak("bottom row automatic", false)?,
+        }
+        Ok(ViewAction::None)
+    }
+
+    fn mark_table_right(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        let Some(setup) = self.table_setup.as_mut() else {
+            return Ok(ViewAction::Bell);
+        };
+        if setup
+            .tabstops()
+            .last()
+            .is_some_and(|last| self.cursor.col < *last)
+        {
+            sr.speak("right edge cannot be before the last tabstop", false)?;
+            return Ok(ViewAction::None);
+        }
+        match setup.toggle_right_edge(self.cursor.col) {
+            MarkerChange::Set => {
+                sr.speak("right edge set", false)?;
+                sr.speak(
+                    &format!("display column {}", self.cursor.col.saturating_add(1)),
+                    false,
+                )?;
+            }
+            MarkerChange::Cleared => sr.speak("right edge cleared", false)?,
+        }
+        Ok(ViewAction::None)
+    }
+
+    fn toggle_table_row_header(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        let Some(table) = self.table.as_mut() else {
+            sr.speak("no active table", false)?;
+            return Ok(ViewAction::None);
+        };
+        let Some(address) = table.cell_at(self.cursor) else {
+            sr.speak("outside table", false)?;
+            return Ok(ViewAction::None);
+        };
+        let label = table.label(address).to_owned();
+        if table.toggle_row_header(address.column) {
+            sr.speak("row headers from", false)?;
+            sr.speak(&label, false)?;
+        } else {
+            sr.speak("row headers off", false)?;
+        }
+        Ok(ViewAction::None)
+    }
+
+    fn move_table_cell(
+        &mut self,
+        sr: &mut ScreenReader,
+        movement: CellMove,
+        count: usize,
+    ) -> Result<ViewAction> {
+        let Some(table) = self.table.as_ref() else {
+            sr.speak("no active table", false)?;
+            return Ok(ViewAction::None);
+        };
+        let (target, include_row) = if let Some(current) = table.cell_at(self.cursor) {
+            let Some(target) = table.move_cell(current, movement, count) else {
+                let (edge, row) = table.boundary_announcement(movement, current);
+                sr.speak(edge, false)?;
+                if let Some(row) = row {
+                    sr.speak(&format!("row {row}"), false)?;
+                }
+                return Ok(ViewAction::None);
+            };
+            (target, current.row != target.row)
+        } else {
+            let Some(entry) = table.reentry_cell(self.cursor, movement) else {
+                sr.speak(table.edge_announcement(movement), false)?;
+                return Ok(ViewAction::None);
+            };
+            let target = count
+                .checked_sub(1)
+                .filter(|remaining| *remaining > 0)
+                .and_then(|remaining| table.move_cell(entry, movement, remaining))
+                .unwrap_or(entry);
+            (target, true)
+        };
+        self.cursor = table.position_for_cell(&self.document, target);
+        self.render();
+        let table = self.table.as_ref().expect("active table");
+        Self::speak_full_cell(sr, table, target, include_row)?;
+        Ok(ViewAction::RedrawSilently)
+    }
+
+    fn speak_full_cell(
+        sr: &mut ScreenReader,
+        table: &ReviewTable,
+        address: CellAddress,
+        include_row: bool,
+    ) -> Result<()> {
+        if include_row {
+            Self::speak_row_identity(sr, table, address)?;
+        }
+        sr.speak(table.label(address), false)?;
+        let text = table.text(address).trim();
+        sr.speak(if text.is_empty() { "blank" } else { text }, false)?;
+        Ok(())
+    }
+
+    fn speak_row_identity(
+        sr: &mut ScreenReader,
+        table: &ReviewTable,
+        address: CellAddress,
+    ) -> Result<()> {
+        if table.is_header(address) {
+            sr.speak("header row", false)?;
+            return Ok(());
+        }
+        if let Some(row) = table.row_number(address) {
+            sr.speak(&format!("row {row}"), false)?;
+        }
+        if table
+            .row_header_column()
+            .is_some_and(|column| column != address.column)
+            && let Some(text) = table.row_header_text(address)
+        {
+            let text = text.trim();
+            sr.speak(if text.is_empty() { "blank" } else { text }, false)?;
+        }
+        Ok(())
+    }
+
+    fn move_with_table_context(
+        &mut self,
+        sr: &mut ScreenReader,
+        target: HistoryPosition,
+    ) -> Result<ViewAction> {
+        let old = self.current_table_cell();
+        let action = self.move_to(target);
+        self.announce_table_transition(sr, old)?;
+        Ok(action)
+    }
+
+    fn current_table_cell(&self) -> Option<CellAddress> {
+        self.table
+            .as_ref()
+            .and_then(|table| table.cell_at(self.cursor))
+    }
+
+    fn announce_table_transition(
+        &self,
+        sr: &mut ScreenReader,
+        old: Option<CellAddress>,
+    ) -> Result<()> {
+        if self.table_setup.is_some() {
+            return Ok(());
+        }
+        let Some(table) = self.table.as_ref() else {
+            return Ok(());
+        };
+        let new = table.cell_at(self.cursor);
+        if old == new {
+            return Ok(());
+        }
+        match (old, new) {
+            (None, Some(address)) => {
+                sr.speak("table", false)?;
+                Self::speak_row_identity(sr, table, address)?;
+                sr.speak(table.label(address), false)?;
+            }
+            (Some(_), None) => {
+                sr.speak(
+                    if table.is_structural_row(self.cursor.row) {
+                        "table separator"
+                    } else {
+                        "out of table"
+                    },
+                    false,
+                )?;
+            }
+            (Some(previous), Some(address)) => {
+                if previous.row != address.row {
+                    Self::speak_row_identity(sr, table, address)?;
+                }
+                if previous.column != address.column {
+                    sr.speak(table.label(address), false)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn motion_target(&mut self, motion: Motion, count: usize) -> Option<HistoryPosition> {
@@ -538,9 +842,203 @@ impl ReviewView {
         Ok(ViewAction::None)
     }
 
+    fn handle_setup_key(&mut self, sr: &mut ScreenReader, key: Key) -> Result<ViewAction> {
+        match key {
+            Key::Escape => {
+                self.parser = Parser::default();
+                self.table_setup = None;
+                sr.speak("table setup cancelled", false)?;
+                Ok(ViewAction::None)
+            }
+            Key::Enter => self.commit_table_setup(sr),
+            Key::Char(' ') => self.toggle_setup_tabstop(sr),
+            Key::Char('H') => {
+                let mode = self
+                    .table_setup
+                    .as_mut()
+                    .expect("active table setup")
+                    .toggle_header_mode();
+                sr.speak(mode.announcement(), false)?;
+                Ok(ViewAction::None)
+            }
+            Key::Char('c') => self.start_name_prompt(sr),
+            _ => {
+                let command = self.parser.feed(key);
+                self.handle_command(sr, command)
+            }
+        }
+    }
+
+    fn toggle_setup_tabstop(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        let setup = self.table_setup.as_mut().expect("active table setup");
+        if setup
+            .right_edge()
+            .is_some_and(|right| self.cursor.col > right)
+        {
+            sr.speak("tabstop cannot be after the right edge", false)?;
+            return Ok(ViewAction::None);
+        }
+        match setup.toggle_tabstop(self.cursor.col) {
+            MarkerChange::Set => sr.speak("tabstop set", false)?,
+            MarkerChange::Cleared => sr.speak("tabstop cleared", false)?,
+        }
+        sr.speak(
+            &format!("display column {}", self.cursor.col.saturating_add(1)),
+            false,
+        )?;
+        Ok(ViewAction::None)
+    }
+
+    fn start_name_prompt(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        let setup = self.table_setup.as_ref().expect("active table setup");
+        let Some((logical_column, tabstop)) = setup.tabstop_at_or_before(self.cursor.col) else {
+            sr.speak("no tabstop at or before cursor", false)?;
+            return Ok(ViewAction::None);
+        };
+        let mut editor = LineEditor::new();
+        if let Some(name) = setup.name(tabstop) {
+            editor.handle_text(name);
+        }
+        self.name_prompt = Some(NamePrompt {
+            tabstop,
+            logical_column,
+            editor,
+        });
+        self.render();
+        Ok(ViewAction::Redraw)
+    }
+
+    fn commit_table_setup(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        let setup = self.table_setup.as_ref().expect("active table setup");
+        let table = match ReviewTable::from_setup(&self.document, setup) {
+            Ok(table) => table,
+            Err(message) => {
+                sr.speak(message, false)?;
+                return Ok(ViewAction::None);
+            }
+        };
+        let address = table
+            .cell_at(self.cursor)
+            .or_else(|| table.nearest_cell(self.cursor))
+            .expect("valid table has a cell");
+        self.cursor = table.position_for_cell(&self.document, address);
+        self.table = Some(table);
+        self.table_setup = None;
+        self.parser = Parser::default();
+        self.render();
+        sr.speak("table setup saved", false)?;
+        let table = self.table.as_ref().expect("installed table");
+        Self::speak_full_cell(sr, table, address, true)?;
+        Ok(ViewAction::RedrawSilently)
+    }
+
+    fn cancel_name_prompt(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        self.name_prompt = None;
+        self.render();
+        sr.speak("name edit cancelled", false)?;
+        Ok(ViewAction::Redraw)
+    }
+
+    fn clear_name_prompt(&mut self) -> ViewAction {
+        let prompt = self.name_prompt.as_mut().expect("active name prompt");
+        if prompt.editor.input().is_empty() {
+            return ViewAction::Bell;
+        }
+        prompt.editor.clear();
+        self.render();
+        ViewAction::Redraw
+    }
+
+    fn finish_name_prompt(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
+        let prompt = self.name_prompt.take().expect("active name prompt");
+        let value = prompt.editor.input().to_owned();
+        let logical_column = prompt.logical_column;
+        self.table_setup
+            .as_mut()
+            .expect("name prompt belongs to setup")
+            .set_name(prompt.tabstop, value.clone());
+        self.render();
+        let value = value.trim();
+        if value.is_empty() {
+            sr.speak(
+                &format!("column {} uses column number", logical_column + 1),
+                false,
+            )?;
+        } else {
+            sr.speak("column name saved", false)?;
+            sr.speak(value, false)?;
+        }
+        Ok(ViewAction::Redraw)
+    }
+
+    fn handle_name_editor_action(
+        &mut self,
+        sr: &mut ScreenReader,
+        action: EditorAction,
+    ) -> Result<ViewAction> {
+        match action {
+            EditorAction::None => Ok(ViewAction::None),
+            EditorAction::Changed => {
+                self.render();
+                Ok(ViewAction::Redraw)
+            }
+            EditorAction::Submit => self.finish_name_prompt(sr),
+            EditorAction::Bell => Ok(ViewAction::Bell),
+        }
+    }
+
+    fn handle_name_key(&mut self, sr: &mut ScreenReader, key: Key) -> Result<ViewAction> {
+        match key {
+            Key::Escape => self.cancel_name_prompt(sr),
+            Key::Ctrl('u') => Ok(self.clear_name_prompt()),
+            Key::Enter => self.finish_name_prompt(sr),
+            Key::Backspace => {
+                let action = self
+                    .name_prompt
+                    .as_mut()
+                    .expect("active name prompt")
+                    .editor
+                    .handle_bytes(b"\x7f");
+                self.handle_name_editor_action(sr, action)
+            }
+            Key::Left => {
+                let action = self
+                    .name_prompt
+                    .as_mut()
+                    .expect("active name prompt")
+                    .editor
+                    .handle_bytes(b"\x1b[D");
+                self.handle_name_editor_action(sr, action)
+            }
+            Key::Right => {
+                let action = self
+                    .name_prompt
+                    .as_mut()
+                    .expect("active name prompt")
+                    .editor
+                    .handle_bytes(b"\x1b[C");
+                self.handle_name_editor_action(sr, action)
+            }
+            Key::Char(ch) if !ch.is_control() => {
+                let action = self
+                    .name_prompt
+                    .as_mut()
+                    .expect("active name prompt")
+                    .editor
+                    .handle_text(&ch.to_string());
+                self.handle_name_editor_action(sr, action)
+            }
+            _ => Ok(ViewAction::Bell),
+        }
+    }
+
     fn handle_review_key(&mut self, sr: &mut ScreenReader, key: Key) -> Result<ViewAction> {
-        if self.search_prompt.is_some() {
-            self.handle_search_key(key)
+        if self.name_prompt.is_some() {
+            self.handle_name_key(sr, key)
+        } else if self.search_prompt.is_some() {
+            self.handle_search_key(sr, key)
+        } else if self.table_setup.is_some() {
+            self.handle_setup_key(sr, key)
         } else {
             let command = self.parser.feed(key);
             self.handle_command(sr, command)
@@ -558,6 +1056,7 @@ impl ReviewView {
             match action {
                 ViewAction::Pop | ViewAction::Bell => return Ok(action),
                 ViewAction::Redraw => result = ViewAction::Redraw,
+                ViewAction::RedrawSilently => result = ViewAction::RedrawSilently,
                 ViewAction::None => {}
                 ViewAction::PtyInput
                 | ViewAction::Push(_)
@@ -567,8 +1066,7 @@ impl ReviewView {
                 | ViewAction::TmuxConnectionRename { .. }
                 | ViewAction::TmuxChooserSelect { .. }
                 | ViewAction::TmuxCommandSubmit { .. }
-                | ViewAction::TmuxInput { .. }
-                | ViewAction::RedrawSilently => {
+                | ViewAction::TmuxInput { .. } => {
                     unreachable!()
                 }
             }
@@ -613,6 +1111,21 @@ impl ViewController for ReviewView {
         input: &[u8],
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
+        if self.name_prompt.is_some() {
+            if input == b"\x1b" {
+                return self.cancel_name_prompt(sr);
+            }
+            if input == b"\x15" {
+                return Ok(self.clear_name_prompt());
+            }
+            let action = self
+                .name_prompt
+                .as_mut()
+                .expect("active name prompt")
+                .editor
+                .handle_bytes(input);
+            return self.handle_name_editor_action(sr, action);
+        }
         let keys = input.iter().copied().map(raw_key);
         self.handle_keys(sr, keys)
     }
@@ -626,6 +1139,22 @@ impl ViewController for ReviewView {
     ) -> Result<ViewAction> {
         if key.is_release() {
             return Ok(ViewAction::None);
+        }
+        if self.name_prompt.is_some() {
+            let semantic = semantic_key(key);
+            if semantic == Key::Escape {
+                return self.cancel_name_prompt(sr);
+            }
+            if semantic == Key::Ctrl('u') {
+                return Ok(self.clear_name_prompt());
+            }
+            let action = self
+                .name_prompt
+                .as_mut()
+                .expect("active name prompt")
+                .editor
+                .handle_key_input(key);
+            return self.handle_name_editor_action(sr, action);
         }
         let semantic = semantic_key(key);
         if semantic != Key::Unknown {
@@ -646,6 +1175,10 @@ impl ViewController for ReviewView {
         contents: &str,
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
+        if let Some(prompt) = self.name_prompt.as_mut() {
+            let action = prompt.editor.handle_text(contents);
+            return self.handle_name_editor_action(sr, action);
+        }
         if self.search_prompt.is_none() {
             return Ok(ViewAction::Bell);
         }
@@ -842,6 +1375,194 @@ mod tests {
         ));
         assert_eq!(view.cursor.col, 1);
         assert_eq!(view.model().review_cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn custom_table_setup_and_cell_jumps_use_separate_utterances() {
+        let mut source = View::new(4, 40);
+        source.process_changes(b"NAME      AGE\r\nAlice     37\r\nBob       42");
+        source.set_review_history_position(HistoryPosition { row: 0, col: 0 });
+        let spoken = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(RecordingDriver(
+            spoken.clone(),
+        ))));
+        let mut view = ReviewView::new(&mut source);
+
+        assert!(matches!(input(&mut view, &mut sr, b"gT"), ViewAction::None));
+        assert!(matches!(input(&mut view, &mut sr, b" "), ViewAction::None));
+        assert!(matches!(
+            input(&mut view, &mut sr, b"10l "),
+            ViewAction::Redraw
+        ));
+        assert!(matches!(
+            input(&mut view, &mut sr, b"2jgB"),
+            ViewAction::Redraw
+        ));
+        assert!(matches!(
+            input(&mut view, &mut sr, b"k\r"),
+            ViewAction::RedrawSilently
+        ));
+
+        assert!(spoken.borrow().ends_with(&[
+            "table setup saved".to_owned(),
+            "row 1".to_owned(),
+            "AGE".to_owned(),
+            "37".to_owned(),
+        ]));
+
+        spoken.borrow_mut().clear();
+        assert!(matches!(
+            input(&mut view, &mut sr, b"}|"),
+            ViewAction::RedrawSilently
+        ));
+        assert_eq!(spoken.borrow().as_slice(), ["row 2", "AGE", "42"]);
+
+        spoken.borrow_mut().clear();
+        assert!(matches!(input(&mut view, &mut sr, b"}|"), ViewAction::None));
+        assert_eq!(spoken.borrow().as_slice(), ["bottom of table", "row 2"]);
+
+        spoken.borrow_mut().clear();
+        assert!(matches!(
+            input(&mut view, &mut sr, b"k"),
+            ViewAction::Redraw
+        ));
+        assert_eq!(spoken.borrow().as_slice(), ["row 1"]);
+
+        spoken.borrow_mut().clear();
+        assert!(matches!(
+            input(&mut view, &mut sr, b"10h"),
+            ViewAction::Redraw
+        ));
+        assert_eq!(spoken.borrow().as_slice(), ["NAME"]);
+
+        spoken.borrow_mut().clear();
+        assert!(matches!(input(&mut view, &mut sr, b"gH"), ViewAction::None));
+        assert_eq!(spoken.borrow().as_slice(), ["row headers from", "NAME"]);
+
+        input(&mut view, &mut sr, b"10l");
+        spoken.borrow_mut().clear();
+        assert!(matches!(
+            input(&mut view, &mut sr, b"}|"),
+            ViewAction::RedrawSilently
+        ));
+        assert_eq!(spoken.borrow().as_slice(), ["row 2", "Bob", "AGE", "42"]);
+
+        spoken.borrow_mut().clear();
+        input(&mut view, &mut sr, b"10h");
+        assert!(matches!(input(&mut view, &mut sr, b"gH"), ViewAction::None));
+        assert_eq!(
+            spoken.borrow().last().map(String::as_str),
+            Some("row headers off")
+        );
+    }
+
+    #[test]
+    fn cell_motions_directionally_reenter_the_active_table() {
+        let mut source = View::new(8, 40);
+        source.process_changes(
+            b"| NAME | AGE |\r\n| ---- | --- |\r\n| Alice | 37 |\r\n| Bob | 42 |\r\n\r\nafter\r\nlater",
+        );
+        source.set_review_history_position(HistoryPosition { row: 0, col: 2 });
+        let spoken = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(RecordingDriver(
+            spoken.clone(),
+        ))));
+        let mut view = ReviewView::new(&mut source);
+
+        input(&mut view, &mut sr, b"gt");
+        input(&mut view, &mut sr, b"j");
+        spoken.borrow_mut().clear();
+        assert!(matches!(
+            input(&mut view, &mut sr, b"}|"),
+            ViewAction::RedrawSilently
+        ));
+        assert_eq!(spoken.borrow().as_slice(), ["row 1", "NAME", "Alice"]);
+
+        input(&mut view, &mut sr, b"G");
+        spoken.borrow_mut().clear();
+        assert!(matches!(
+            input(&mut view, &mut sr, b"{|"),
+            ViewAction::RedrawSilently
+        ));
+        assert_eq!(spoken.borrow().as_slice(), ["row 2", "NAME", "Bob"]);
+    }
+
+    #[test]
+    fn starting_detection_or_setup_discards_the_active_table() {
+        let mut source = View::new(8, 40);
+        source.process_changes(
+            b"| NAME | AGE |\r\n| ---- | --- |\r\n| Alice | 37 |\r\n\r\nplain\r\ntext\r\nhere",
+        );
+        source.set_review_history_position(HistoryPosition { row: 0, col: 2 });
+        let spoken = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(RecordingDriver(
+            spoken.clone(),
+        ))));
+        let mut view = ReviewView::new(&mut source);
+
+        input(&mut view, &mut sr, b"gt");
+        assert!(view.table.is_some());
+        input(&mut view, &mut sr, b"Ggt");
+        assert!(view.table.is_none());
+        assert_eq!(
+            spoken.borrow().last().map(String::as_str),
+            Some("no table found")
+        );
+
+        input(&mut view, &mut sr, b"gggt");
+        assert!(view.table.is_some());
+        input(&mut view, &mut sr, b"gT");
+        assert!(view.table.is_none());
+        assert!(view.table_setup.is_some());
+        input(&mut view, &mut sr, b"\x1b");
+        assert!(view.table.is_none());
+        assert!(view.table_setup.is_none());
+    }
+
+    #[test]
+    fn name_edit_escape_is_transactional_and_control_u_clears() {
+        let mut source = View::new(3, 40);
+        source.process_changes(b"Alice     37\r\nBob       42");
+        source.set_review_history_position(HistoryPosition { row: 0, col: 0 });
+        let spoken = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(RecordingDriver(spoken))));
+        let mut view = ReviewView::new(&mut source);
+
+        input(&mut view, &mut sr, b"gTH c");
+        input(&mut view, &mut sr, b"name\r");
+        input(&mut view, &mut sr, b"cs\x1b");
+        assert_eq!(view.table_setup.as_ref().unwrap().name(0), Some("name"));
+
+        input(&mut view, &mut sr, b"c\x15\r");
+        assert_eq!(view.table_setup.as_ref().unwrap().name(0), None);
+
+        input(&mut view, &mut sr, b"\x1b");
+        assert!(view.table_setup.is_none());
+        input(&mut view, &mut sr, b"gTH ");
+        assert_eq!(view.table_setup.as_ref().unwrap().name(0), None);
+    }
+
+    #[test]
+    fn automatic_table_detection_uses_offscreen_scrollback_cursor() {
+        let mut source = View::new(3, 40);
+        source.process_changes(
+            b"| NAME | AGE |\r\n| ---- | --- |\r\n| Alice | 37 |\r\n\r\nlater\r\nlatest",
+        );
+        source.set_review_history_position(HistoryPosition { row: 0, col: 2 });
+        let spoken = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(RecordingDriver(
+            spoken.clone(),
+        ))));
+        let mut view = ReviewView::new(&mut source);
+
+        assert_eq!(view.cursor.row, 0);
+        assert!(view.document.row_count() > 3);
+        assert!(matches!(
+            input(&mut view, &mut sr, b"gt"),
+            ViewAction::None | ViewAction::RedrawSilently
+        ));
+        assert!(view.table.is_some());
+        assert!(spoken.borrow().iter().any(|utterance| utterance == "table"));
     }
 
     #[test]

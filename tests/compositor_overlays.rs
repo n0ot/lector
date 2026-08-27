@@ -159,16 +159,18 @@ fn nested_overlay_push_pop_and_hidden_output_match_the_ghostty_physical_oracle()
 }
 
 #[test]
-fn table_setup_freezes_a_compositor_layer_but_keeps_the_source_engine_live() {
+fn review_table_setup_freezes_a_compositor_layer_but_keeps_the_source_engine_live() {
     let (mut app, mut reader) = application(5, 30);
     let mut pty_input = Vec::new();
     let mut physical = Vec::new();
 
     app.handle_pty(&mut reader, b"Name  Value\r\none   1\x1b[H", &mut physical)
         .expect("draw table");
-    app.handle_stdin(&mut reader, b"\x1bT", &mut pty_input, &mut physical)
-        .expect("enter table setup");
-    assert_eq!(reader.input_mode().as_str(), "table_setup");
+    app.handle_stdin(&mut reader, b"\x1br", &mut pty_input, &mut physical)
+        .expect("enter review");
+    app.handle_stdin(&mut reader, b"gT", &mut pty_input, &mut physical)
+        .expect("enter review table setup");
+    assert_eq!(reader.input_mode().as_str(), "normal");
 
     app.handle_pty(&mut reader, b"\x1b[2J\x1b[Hnew source state", &mut physical)
         .expect("update source during setup");
@@ -189,8 +191,17 @@ fn table_setup_freezes_a_compositor_layer_but_keeps_the_source_engine_live() {
     );
 
     app.handle_stdin(&mut reader, b"\x1b[27;1u", &mut pty_input, &mut physical)
-        .expect("leave table setup");
+        .expect("cancel review table setup");
     assert_eq!(reader.input_mode().as_str(), "normal");
+    assert_eq!(
+        app.composed_scene()
+            .expect("compose review after setup cancellation")
+            .overlays
+            .len(),
+        1
+    );
+    app.handle_stdin(&mut reader, b"q", &mut pty_input, &mut physical)
+        .expect("leave review");
     assert_eq!(
         app.composed_scene()
             .expect("compose live source")

@@ -179,7 +179,6 @@ impl ReviewDocument {
             .unwrap_or(0) as u16
     }
 
-    #[cfg(test)]
     pub(crate) fn line_text(&self, row: usize) -> String {
         let Some(row) = self.rows.get(row) else {
             return String::new();
@@ -196,6 +195,55 @@ impl ReviewDocument {
             }
         }
         text
+    }
+
+    pub(crate) fn capture_cols(&self) -> u16 {
+        self.capture_cols
+    }
+
+    pub(crate) fn line_end(&self, row: usize) -> u16 {
+        self.rows.get(row).map_or(0, |row| row.end)
+    }
+
+    pub(crate) fn is_wrapped_row(&self, row: usize) -> bool {
+        self.rows.get(row).is_some_and(|row| row.wrapped)
+    }
+
+    pub(crate) fn text_between(&self, row: usize, start: u16, end: u16) -> String {
+        let Some(source) = self.rows.get(row) else {
+            return String::new();
+        };
+        let mut text = String::new();
+        for cell in source
+            .cells
+            .iter()
+            .skip(usize::from(start.min(self.capture_cols)))
+            .take(usize::from(
+                end.min(self.capture_cols)
+                    .saturating_sub(start.min(self.capture_cols)),
+            ))
+        {
+            if cell.wide_continuation {
+                continue;
+            }
+            if cell.text.is_empty() {
+                text.push(' ');
+            } else {
+                text.push_str(&cell.text);
+            }
+        }
+        text.trim().to_owned()
+    }
+
+    pub(crate) fn first_text_col(&self, row: usize, start: u16, end: u16) -> Option<u16> {
+        let source = self.rows.get(row)?;
+        (start.min(self.capture_cols)..end.min(self.capture_cols)).find(|col| {
+            source.cells.get(usize::from(*col)).is_some_and(|cell| {
+                !cell.wide_continuation
+                    && !cell.text.is_empty()
+                    && !cell.text.chars().all(char::is_whitespace)
+            })
+        })
     }
 
     pub(crate) fn cell_text(&self, position: HistoryPosition) -> &str {

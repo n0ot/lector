@@ -1,14 +1,31 @@
-Scenario: table header toggle
+Scenario: review table navigation announces row label and cell separately
 Given pty-stdout: Name | Age\r\n-----|-----\r\nAlice|30\r\nBob  |40
 And settled:
-When stdin: \x1Bt
-And stdin: h
-And stdin: \x1Bh
-And stdin: l
+When stdin: \x1Br
+And stdin: gg
+And stdin: gt
+And stdin: }|
+And stdin: gH
+And stdin: ]|
+And stdin: }|
 Then expect-speak-contains: Name | Age
-And expect-speak: table mode on
-And expect-speak: 40
+And expect-speak: Review
+And expect-speak-contains: Bob  |40
+And expect-speak-contains: Name | Age
+And expect-speak: table
+And expect-speak: 2 rows
+And expect-speak: 2 columns
+And expect-speak: header row
 And expect-speak: Name
+And expect-speak: Name
+And expect-speak: row 1
+And expect-speak: Name
+And expect-speak: Alice
+And expect-speak: row headers from
+And expect-speak: Name
+And expect-speak: Age
+And expect-speak: 30
+And expect-speak: row 2
 And expect-speak: Bob
-And expect-speak: table headers off
+And expect-speak: Age
 And expect-speak: 40

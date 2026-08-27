@@ -120,10 +120,8 @@ const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("M-c", Action::SayClipboard),
     ("M-[", Action::PreviousClipboard),
     ("M-]", Action::NextClipboard),
-    ("M-t", Action::ToggleTableMode),
     ("M-{", Action::LeftClick),
     ("M-}", Action::RightClick),
-    ("M-T", Action::StartTableSetupMode),
     ("M-g", Action::ToggleStopSpeechOnFocusLoss),
 ];
 

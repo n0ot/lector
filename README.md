@@ -61,10 +61,11 @@ graphics protocol.
 
 The application and every Lector overlay are independent scene layers. The
 application terminal engine continues consuming output while
-Message, Review, Lua REPL, table setup, or popup layers are visible, so closing
+Message, Review, Lua REPL, or popup layers are visible, so closing
 an overlay reveals the current composed source scene without replaying deferred
-PTY bytes. Review and table setup retain frozen, independently navigable
-snapshots. Reviewable announcement, error, and confirmation popups close with
+PTY bytes. Review retains a frozen, independently navigable snapshot, and its
+table setup operates within that same full-history document. Reviewable
+announcement, error, and confirmation popups close with
 `Enter` or `Escape`; confirmations report accept and cancel separately.
 
 ### tmux control mode
@@ -382,7 +383,7 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 - **Toggle stop on focus loss** (interrupt speech when terminal focus leaves). Default: `M-g`.
 - **Move and read** by line/word/character using the review cursor.
 - **Set a mark and copy** text between the mark and the review cursor.
-- **Toggle table mode** to navigate tables by row/column.
+- **Navigate terminal tables** from the frozen Review overlay.
 
 You don’t need to memorize everything. Help Mode will tell you what each key does.
 
@@ -473,44 +474,58 @@ Lector table mode supports:
 
 - Pipe tables with `|` separators (with or without leading/trailing `|`), including separator/banner rows.
 - Fixed-width terminal tables where columns are separated by vertical blank gutters.
-- Manually-marked fixed-width tables using tabstops from a chosen header row.
+- Manually-marked fixed-width tables with custom column names and optional bounds.
 
 ### How to use table mode
 
-1. Move the review cursor onto a row inside a table.
-2. Press `M-t` to enter table mode.
-3. Navigate and read:
+1. Open Review with `M-r`. Its Vim cursor can reach every retained scrollback
+   row, not only the visible page.
+2. Move the Review overlay application cursor onto a table and press `gt` to
+   detect it. `gt` always discards the previous active table before attempting
+   detection; if detection fails, no table remains active. `gT` has the same
+   replacement behavior before starting manual setup.
+3. Move by logical cell:
 
-- Move rows with `j`/`k`.
-- Move rows with review-style keys `M-u` / `M-o`.
-- Jump to top/bottom table row with `g` / `G`.
-- Move columns with `h`/`l`.
-- Jump to first/last column with `^` / `$`.
-- Read the current cell with `i`.
-- Read the current cell with review-style key `M-i`.
-- Read the current column header with `H`.
-- Move by word inside the current cell with `M-j` / `M-l`.
-- Read current word inside the current cell with `M-k`.
-- Move by character inside the current cell with `M-m` / `M-.`.
-- Read current character inside the current cell with `M-,`.
+- `[|`: previous cell, wrapping to the preceding row.
+- `]|`: next cell, wrapping to the following row.
+- `{|`: same column in the row above.
+- `}|`: same column in the row below.
 
-4. Toggle automatic header speaking with `M-h` if needed.
-5. Press `Esc` to exit table mode.
+Cell jumps temporarily suppress ordinary cursor tracking and speak the row,
+column label, and complete cell as separate utterances. Ordinary Vim motions
+remain available and announce table, row, and column boundaries when crossed.
+If an ordinary motion leaves the active table, a cell motion re-enters at the
+first cell in its requested direction. The active table lasts until Review
+closes or `gt` or `gT` replaces it.
+
+Press `gH` on a column to use its cells as optional row headers. On a row
+change, Lector speaks the row number, row-header cell, destination column, and
+destination cell as separate utterances. Press `gH` on that column again to
+turn row headers off, or press it on another column to move the designation.
 
 ### Manual table setup (tabstops)
 
-Use this when auto fixed-width detection is wrong for a screen layout.
+Use this when automatic detection is wrong for a screen layout.
 
-1. Move the review cursor to the line you want to use as the header.
-2. Press `M-T` to start tabstop setup mode.
-3. On that header line:
-- Move with `h` / `l`.
-- Move by word with `w` / `b`.
-- Jump to beginning/end with `^` / `$`.
-- Toggle a tabstop with `t` (press again to remove).
-4. Press `Enter` to commit tabstops and enter table mode, or `Esc` to cancel.
+1. In Review, move to the table's header row or first data row and press `gT`.
+2. Navigate with ordinary Vim motions and press `Space` at the start of each
+   column. The first tabstop is the table's left boundary; the final column
+   consumes the rest of each row by default.
+3. Press `H` to switch between “headers from first row” and “no header row; use
+   custom names or column numbers.”
+4. Press `c` anywhere at or after a tabstop to edit that column's name. `Enter`
+   saves the name, `Escape` discards the current edit, and `C-u` clears the
+   field. Unnamed columns are announced as `column N`.
+5. Optionally move to the final data row and press `gB` to mark the bottom.
+   Move to the final display column that should be included and press `gR` to
+   set an optional right edge. Repeating either command on its marker clears
+   it.
+6. Press `Enter` to save and begin cell navigation, or `Escape` to cancel the
+   entire setup.
 
-Manual tabstops are temporary and cleared when table mode exits.
+Manual setup, column names, and the row-header designation last for the active
+Review table only. Cancelling a fresh `gT` setup does not restore the table it
+replaced.
 
 ## Clipboard history
 
@@ -704,7 +719,7 @@ Lector has a built‑in Lua REPL so you can try commands while it’s running. O
 ## Tips
 
 - If you want Lector to read *only* what you ask for, turn off auto‑read.
-- Use table mode when terminal output is column‑structured (CSV, tables, list views).
+- Use Review table navigation when terminal output is column‑structured (CSV, tables, list views).
 - If speech feels too fast or slow, adjust `lector.o.speech_rate`.
 
 ## Troubleshooting

@@ -33,19 +33,12 @@ And expect-speak: copied
 And expect-speak: pasted
 And expect-pty-stdin: three four
 
-Scenario: table setup can be cancelled cleanly
+Scenario: former Meta table keys are no longer global Lector bindings
 Given pty-stdout: A    B\r\n1    2
-When stdin: \x1BT
-And stdin: \x1B
-And tick: 51
-Then expect-speak: table setup on
-And expect-speak: table setup off
-
-Scenario: table mode can be exited with escape
-Given pty-stdout: A    B\r\n1    2
+And settled:
+And clear-speech:
 When stdin: \x1Bt
-And stdin: \x1B
-And tick: 51
-Then expect-speak: table mode on
-And expect-speak: A
-And expect-speak: table mode off
+And stdin: \x1BT
+And stdin: gT
+Then expect-pty-stdin: \x1Bt\x1BTgT
+And expect-no-speak:

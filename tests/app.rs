@@ -2157,7 +2157,7 @@ fn click_without_mouse_reporting_is_not_forwarded() {
 }
 
 #[test]
-fn table_navigation_preserves_direction_and_boundary_behavior() {
+fn review_table_navigation_preserves_direction_boundaries_and_utterance_order() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -2170,22 +2170,13 @@ fn table_navigation_preserves_direction_and_boundary_behavior() {
     .expect("draw table");
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(app.maybe_finalize_changes(&mut sr).expect("finalize table"));
-    app.handle_stdin(&mut sr, b"\x1Bt", &mut pty_out, &mut term_out)
-        .expect("enter table mode");
+    app.handle_stdin(&mut sr, b"\x1Br", &mut pty_out, &mut term_out)
+        .expect("open Review");
+    app.handle_stdin(&mut sr, b"gt", &mut pty_out, &mut term_out)
+        .expect("detect table");
     recorder.inner.borrow_mut().speaks.clear();
 
-    for key in [
-        b"h".as_slice(),
-        b"l",
-        b"$",
-        b"$",
-        b"^",
-        b"j",
-        b"G",
-        b"k",
-        b"g",
-        b"k",
-    ] {
+    for key in [b"[|".as_slice(), b"]|", b"}|", b"]|", b"]|", b"{|"] {
         app.handle_stdin(&mut sr, key, &mut pty_out, &mut term_out)
             .expect("navigate table");
     }
@@ -2199,7 +2190,22 @@ fn table_navigation_preserves_direction_and_boundary_behavior() {
         .collect();
     assert_eq!(
         spoken,
-        ["left", "B", "C", "right", "A", "1", "4", "1", "A", "top"]
+        [
+            "top of table",
+            "B",
+            "B",
+            "row 1",
+            "B",
+            "2",
+            "C",
+            "3",
+            "row 2",
+            "A",
+            "4",
+            "row 1",
+            "A",
+            "1",
+        ]
     );
     assert!(pty_out.is_empty());
 }
