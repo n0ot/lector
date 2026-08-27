@@ -1227,6 +1227,11 @@ struct TmuxConnectionState {
     pending_inventory_lines: usize,
     inventory_failed: bool,
     inventory_failure_detail: Option<String>,
+    /// A topology notification arrived while this inventory generation was in
+    /// flight. Its multi-command snapshot may straddle that change and must be
+    /// drained for reply correlation but never published.
+    inventory_invalidated: bool,
+    inventory_phase: TmuxInventoryPhase,
     expected_replies: VecDeque<ExpectedTmuxReply>,
     has_inventory: bool,
     inventory_retry_count: u8,
@@ -1352,6 +1357,24 @@ impl TmuxConnectionState {
         self.inventory_failed = false;
         self.inventory_failure_detail = None;
     }
+
+    fn begin_inventory_attempt(&mut self) -> bool {
+        if self.inventory_phase != TmuxInventoryPhase::Idle {
+            return false;
+        }
+        self.inventory_phase = TmuxInventoryPhase::Queued;
+        self.inventory_replies_remaining = crate::tmux_model::INVENTORY_REPLY_COUNT;
+        self.inventory_invalidated = false;
+        self.reset_inventory_attempt();
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxInventoryPhase {
+    Idle,
+    Queued,
+    InFlight,
 }
 
 #[derive(Clone)]

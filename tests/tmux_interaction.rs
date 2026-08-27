@@ -496,6 +496,17 @@ fn chooser_tracks_external_rename_and_destruction_without_losing_scope() {
     );
     app.handle_pty(&mut sr, b"%window-close @11\n", &mut physical)
         .unwrap();
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+    let mut after_close = inventory_groups("work");
+    after_close[1].retain(|line| !line.starts_with(b"W\t$1\t@11\t"));
+    after_close[2].retain(|line| !line.starts_with(b"P\t@11\t"));
+    for (index, group) in after_close.iter().enumerate() {
+        app.handle_pty(&mut sr, &reply(100 + index, group, true), &mut physical)
+            .unwrap();
+    }
     let contents = app.debug_active_view_contents();
     assert!(!contents.contains("@11"));
     assert!(!contents.contains("@12"));

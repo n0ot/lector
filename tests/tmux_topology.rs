@@ -142,19 +142,15 @@ fn notifications_reconcile_renames_focus_close_and_out_of_order_ids() {
     assert!(topology.pane(PaneId(888)).is_some());
     assert!(topology.needs_resync());
 
-    topology
-        .apply_notification(b"window-close", b"@10")
-        .unwrap();
-    assert!(
-        !topology
-            .session(SessionId(2))
-            .unwrap()
-            .windows
-            .contains_key(&3)
+    assert_eq!(
+        topology
+            .apply_notification(b"window-close", b"@10")
+            .unwrap(),
+        ReconcileOutcome::ResyncRequired
     );
     assert!(
         topology.window(WindowId(10)).is_some(),
-        "window linked into another session was destroyed"
+        "ambiguous window-close mutated topology before inventory"
     );
 }
 

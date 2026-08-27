@@ -1048,6 +1048,25 @@ fn switching_back_to_the_original_carrier_session_unlinks_only_the_owned_alias()
         unlink,
         b"if-shell -F -t '$2:1000000' '#{==:#{window_id},@10}' 'unlink-window -t $2:1000000'\n"
     );
+
+    // tmux 3.7b reports the removal of this winlink as `%window-close
+    // @10`, even though @10 remains linked in the newly attached $1 session.
+    // The notification does not identify the session which lost its link, so
+    // it must not destroy the stable window, its carrier pane, or the child.
+    app.handle_pty(&mut sr, &reply(1_801, &[], true), &mut physical)
+        .unwrap();
+    app.handle_pty(&mut sr, b"%window-close @10\n", &mut physical)
+        .unwrap();
+    assert_eq!(app.tmux_connection_count(), 2);
+    assert_eq!(app.debug_tmux_pane_portal_target(1, 20), Some(2));
+    assert!(
+        app.debug_tmux_pane_contents(2, 20)
+            .is_some_and(|contents| contents.contains("inner-READY"))
+    );
+    assert_eq!(
+        drain_root(&mut app),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
 }
 
 #[test]

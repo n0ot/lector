@@ -582,7 +582,17 @@ impl TmuxTopology {
                     .or_insert_with(|| empty_window(window_id));
                 Ok(self.require_resync())
             }
-            b"window-close" => self.close_attached_window(arguments),
+            b"window-close" => {
+                // tmux also emits this notification when a winlink is removed
+                // from a session other than the one currently attached to the
+                // control client. The record contains only the stable window
+                // ID, so applying it to the attached session can delete a
+                // still-live linked window and every pane beneath it. Preserve
+                // the last valid topology until an inventory identifies the
+                // exact link which disappeared.
+                parse_window_id(single_field(arguments)?)?;
+                Ok(self.require_resync())
+            }
             b"unlinked-window-close" => {
                 let window_id = parse_window_id(single_field(arguments)?)?;
                 if self
@@ -956,29 +966,6 @@ impl TmuxTopology {
             }
         }
         Ok(())
-    }
-
-    fn close_attached_window(
-        &mut self,
-        arguments: &[u8],
-    ) -> Result<ReconcileOutcome, TopologyError> {
-        let window_id = parse_window_id(single_field(arguments)?)?;
-        let Some(session_id) = self.attached_session else {
-            return Ok(self.require_resync());
-        };
-        if let Some(session) = self.sessions.get_mut(&session_id) {
-            session.windows.retain(|_, id| *id != window_id);
-            if session.active_window == Some(window_id) {
-                session.active_window = None;
-            }
-        }
-        if let Some(window) = self.windows.get_mut(&window_id) {
-            window.links.retain(|link| link.session_id != session_id);
-            if window.links.is_empty() {
-                self.remove_window(window_id);
-            }
-        }
-        Ok(ReconcileOutcome::Applied)
     }
 
     fn apply_layout_change(&mut self, arguments: &[u8]) -> Result<ReconcileOutcome, TopologyError> {

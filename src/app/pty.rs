@@ -485,12 +485,14 @@ impl App {
             id: connection_id,
             topology: crate::tmux_model::TmuxTopology::new(connection_id),
             initial_command_seen: false,
-            inventory_replies_remaining: crate::tmux_model::INVENTORY_REPLY_COUNT,
+            inventory_replies_remaining: 0,
             pending_inventory: Vec::new(),
             pending_inventory_bytes: 0,
             pending_inventory_lines: 0,
             inventory_failed: false,
             inventory_failure_detail: None,
+            inventory_invalidated: false,
+            inventory_phase: TmuxInventoryPhase::Idle,
             expected_replies: VecDeque::new(),
             has_inventory: false,
             inventory_retry_count: 0,
@@ -733,7 +735,10 @@ impl App {
                                 connection.record_inventory_error(&output);
                             }
                             if connection.inventory_replies_remaining == 0 {
+                                connection.inventory_phase = TmuxInventoryPhase::Idle;
                                 let inventory = connection.take_inventory();
+                                let inventory_invalidated =
+                                    std::mem::take(&mut connection.inventory_invalidated);
                                 let previous_panes = connection
                                     .topology
                                     .panes()
@@ -746,23 +751,35 @@ impl App {
                                     .keys()
                                     .copied()
                                     .collect::<Vec<_>>();
-                                let inventory_result = if connection.inventory_failed {
-                                    Err(connection.inventory_failure_detail.clone().unwrap_or_else(
-                                        || "tmux inventory transaction failed".to_owned(),
-                                    ))
+                                let inventory_error = if inventory_invalidated {
+                                    None
+                                } else if connection.inventory_failed {
+                                    Some(
+                                        connection.inventory_failure_detail.clone().unwrap_or_else(
+                                            || "tmux inventory transaction failed".to_owned(),
+                                        ),
+                                    )
                                 } else {
                                     connection
                                         .topology
                                         .replace_inventory(&inventory)
-                                        .map_err(|error| error.to_string())
+                                        .err()
+                                        .map(|error| error.to_string())
                                 };
-                                if let Err(detail) = inventory_result {
+                                if inventory_invalidated {
+                                    // Inventory is a sequence of independent
+                                    // tmux commands. A topology notification
+                                    // between their replies proves this
+                                    // generation may be a mixed snapshot. Drain
+                                    // it, retain the last valid model, and begin
+                                    // a fresh generation after the notification.
+                                    connection.topology.mark_resync_required();
+                                    connection.inventory_retry_count = 0;
+                                    request_resync = true;
+                                } else if let Some(detail) = inventory_error {
                                     connection.topology.mark_resync_required();
                                     if connection.inventory_retry_count == 0 {
                                         connection.inventory_retry_count = 1;
-                                        connection.inventory_replies_remaining =
-                                            crate::tmux_model::INVENTORY_REPLY_COUNT;
-                                        connection.reset_inventory_attempt();
                                         request_resync = true;
                                     } else {
                                         inventory_terminal_failure =
@@ -1120,12 +1137,9 @@ impl App {
                         }) => {
                             if crate::tmux_prefix::command_may_change_key_configuration(
                                 &description,
-                            ) && connection.inventory_replies_remaining == 0
+                            ) && connection.inventory_phase == TmuxInventoryPhase::Idle
                             {
                                 connection.topology.mark_resync_required();
-                                connection.inventory_replies_remaining =
-                                    crate::tmux_model::INVENTORY_REPLY_COUNT;
-                                connection.reset_inventory_attempt();
                                 connection.inventory_retry_count = 0;
                                 request_resync = true;
                             }
@@ -1224,6 +1238,7 @@ impl App {
                             String::from_utf8_lossy(&arguments).into_owned(),
                         ));
                     } else {
+                        let inventory_phase = connection.inventory_phase;
                         let previous_panes = connection
                             .topology
                             .panes()
@@ -1247,14 +1262,21 @@ impl App {
                                 |window_id| connection.topology.window(*window_id).is_none(),
                             ));
                         }
-                        request_resync = outcome
-                            == crate::tmux_model::ReconcileOutcome::ResyncRequired
-                            && connection.inventory_replies_remaining == 0;
-                        if request_resync {
-                            connection.inventory_replies_remaining =
-                                crate::tmux_model::INVENTORY_REPLY_COUNT;
-                            connection.reset_inventory_attempt();
+                        if inventory_phase == TmuxInventoryPhase::InFlight
+                            && outcome != crate::tmux_model::ReconcileOutcome::Ignored
+                        {
+                            // Even an incrementally applicable notification is
+                            // newer than some unknown subset of the current
+                            // multi-command inventory. Do not let that older
+                            // generation overwrite the applied rename, focus,
+                            // pane exit, or other topology change.
+                            connection.inventory_invalidated = true;
+                        }
+                        if outcome == crate::tmux_model::ReconcileOutcome::ResyncRequired
+                            && inventory_phase == TmuxInventoryPhase::Idle
+                        {
                             connection.inventory_retry_count = 0;
+                            request_resync = true;
                         }
                         sync_topology = connection.has_inventory
                             && outcome == crate::tmux_model::ReconcileOutcome::Applied;
@@ -2806,6 +2828,22 @@ impl App {
     }
 
     pub(super) fn queue_tmux_inventory(&mut self, connection_id: u64) {
+        let Some(connection) = self
+            .tmux_connections
+            .iter_mut()
+            .find(|connection| connection.id == connection_id)
+        else {
+            return;
+        };
+        if !connection.begin_inventory_attempt() {
+            // A request made while tmux is already producing a generation
+            // cannot be satisfied by assuming that generation is new enough.
+            // Invalidate it; completion will queue exactly one successor.
+            if connection.inventory_phase == TmuxInventoryPhase::InFlight {
+                connection.inventory_invalidated = true;
+            }
+            return;
+        }
         for command in crate::tmux_model::INVENTORY_COMMANDS {
             self.pending_tmux_commands.push_back(PendingTmuxCommand {
                 connection_id,
@@ -3236,6 +3274,9 @@ impl App {
             return;
         };
         for expected in expected_replies {
+            if matches!(expected, ExpectedTmuxReply::Inventory) {
+                connection.inventory_phase = TmuxInventoryPhase::InFlight;
+            }
             let pane_id = match expected {
                 ExpectedTmuxReply::PaneResyncProbe(pane_id)
                 | ExpectedTmuxReply::PaneResyncCapture(pane_id)

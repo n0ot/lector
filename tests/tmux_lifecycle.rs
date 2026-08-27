@@ -296,6 +296,21 @@ fn only_window_destruction_renders_an_understandable_waiting_scene_and_can_recov
         ready_app(single_inventory(10, 20, "only-window"));
     app.handle_pty(&mut sr, b"%window-close @10\n", &mut physical)
         .unwrap();
+    assert!(
+        app.debug_active_view_contents().contains("ready-%20"),
+        "ambiguous close mutated the last valid scene before inventory"
+    );
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+    let mut destroyed = single_inventory(10, 20, "only-window");
+    destroyed[1].clear();
+    destroyed[2].clear();
+    for (index, group) in destroyed.iter().enumerate() {
+        app.handle_pty(&mut sr, &reply(80 + index, group, true), &mut physical)
+            .unwrap();
+    }
     let waiting = app.debug_active_view_contents();
     assert!(waiting.contains("session $1 only-session"), "{waiting:?}");
     assert!(waiting.contains("no active window"), "{waiting:?}");
@@ -310,7 +325,7 @@ fn only_window_destruction_renders_an_understandable_waiting_scene_and_can_recov
     );
     let replacement = single_inventory(30, 40, "replacement");
     for (index, group) in replacement.iter().enumerate() {
-        app.handle_pty(&mut sr, &reply(80 + index, group, true), &mut physical)
+        app.handle_pty(&mut sr, &reply(100 + index, group, true), &mut physical)
             .unwrap();
     }
     assert_eq!(
@@ -319,13 +334,91 @@ fn only_window_destruction_renders_an_understandable_waiting_scene_and_can_recov
     );
     app.handle_pty(
         &mut sr,
-        &reply(100, &[b"replacement-ready".to_vec()], true),
+        &reply(120, &[b"replacement-ready".to_vec()], true),
         &mut physical,
     )
     .unwrap();
     assert!(
         app.debug_active_view_contents()
             .contains("replacement-ready")
+    );
+}
+
+#[test]
+fn window_close_during_inventory_discards_the_mixed_snapshot_and_refreshes_again() {
+    let (mut app, mut sr, _recorder, mut physical) =
+        ready_app(single_inventory(10, 20, "only-window"));
+    app.handle_pty(&mut sr, b"%sessions-changed\n", &mut physical)
+        .unwrap();
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+
+    // This generation began before the close and still contains the old
+    // window. Interleave the notification with its replies exactly as tmux may
+    // do when a process exits during the multi-command inventory transaction.
+    let stale = single_inventory(10, 20, "only-window");
+    for (index, group) in stale.iter().enumerate() {
+        if index == 4 {
+            app.handle_pty(&mut sr, b"%window-close @10\n", &mut physical)
+                .unwrap();
+        }
+        app.handle_pty(&mut sr, &reply(200 + index, group, true), &mut physical)
+            .unwrap();
+    }
+
+    assert!(
+        app.debug_active_view_contents().contains("ready-%20"),
+        "an invalidated inventory replaced the last valid scene"
+    );
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
+        "the invalidated generation did not force a fresh inventory"
+    );
+
+    let mut authoritative = single_inventory(10, 20, "only-window");
+    authoritative[1].clear();
+    authoritative[2].clear();
+    for (index, group) in authoritative.iter().enumerate() {
+        app.handle_pty(&mut sr, &reply(300 + index, group, true), &mut physical)
+            .unwrap();
+    }
+    let waiting = app.debug_active_view_contents();
+    assert!(waiting.contains("session $1 only-session"), "{waiting:?}");
+    assert!(waiting.contains("no active window"), "{waiting:?}");
+}
+
+#[test]
+fn applied_pane_exit_during_inventory_cannot_be_overwritten_by_the_old_snapshot() {
+    let (mut app, mut sr, _recorder, mut physical) = ready_app(multi_inventory());
+    app.handle_pty(&mut sr, b"%sessions-changed\n", &mut physical)
+        .unwrap();
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+
+    let stale = multi_inventory();
+    for (index, group) in stale.iter().enumerate() {
+        if index == 4 {
+            app.handle_pty(&mut sr, b"%pane-exited %20\n", &mut physical)
+                .unwrap();
+            assert!(app.debug_tmux_pane_contents(1, 20).is_none());
+        }
+        app.handle_pty(&mut sr, &reply(400 + index, group, true), &mut physical)
+            .unwrap();
+    }
+
+    assert!(
+        app.debug_tmux_pane_contents(1, 20).is_none(),
+        "the stale inventory resurrected an exited pane"
+    );
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes(),
+        "the applied notification did not invalidate the older inventory"
     );
 }
 
