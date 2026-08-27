@@ -4,6 +4,7 @@ use crate::tmux_control::{ControlEvent, ControlParseError, TmuxControlParser};
 use thiserror::Error;
 
 pub const TMUX_CONTROL_START_MARKER: &[u8] = b"\x1bP1000p";
+const MAX_RECOVERY_RECORD_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GatewayEvent {
@@ -83,6 +84,7 @@ struct ActiveControl {
     saw_exit: bool,
     terminator_escape_seen: bool,
     recovering: bool,
+    recovery_record_truncated: bool,
 }
 
 #[derive(Debug)]
@@ -148,8 +150,45 @@ impl TmuxGatewayRouter {
                     self.active = None;
                     self.next_connection_id = connection_id;
                     events.push(GatewayEvent::ConnectionEnded { connection_id });
+                    continue;
+                }
+                if active.terminator_escape_seen {
+                    if active.current_record.len() < MAX_RECOVERY_RECORD_BYTES {
+                        active.current_record.push(b'\x1b');
+                    } else {
+                        active.recovery_record_truncated = true;
+                    }
+                    active.terminator_escape_seen = false;
+                }
+                if byte == b'\x1b' {
+                    active.terminator_escape_seen = true;
+                    continue;
+                }
+                if active.current_record.len() < MAX_RECOVERY_RECORD_BYTES {
+                    active.current_record.push(byte);
                 } else {
-                    active.terminator_escape_seen = byte == b'\x1b';
+                    active.recovery_record_truncated = true;
+                }
+                if byte == b'\n' {
+                    let ordinary_parent_record = !active.recovery_record_truncated
+                        && active
+                            .current_record
+                            .first()
+                            .is_some_and(|byte| *byte != b'%' && *byte != b'\x1b');
+                    if ordinary_parent_record {
+                        let recovered = self
+                            .active
+                            .take()
+                            .expect("recovery record belongs to an active connection");
+                        self.next_connection_id = recovered.connection_id;
+                        events.push(GatewayEvent::ConnectionEnded {
+                            connection_id: recovered.connection_id,
+                        });
+                        direct.extend_from_slice(&recovered.current_record);
+                    } else {
+                        active.current_record.clear();
+                        active.recovery_record_truncated = false;
+                    }
                 }
                 continue;
             }
@@ -210,6 +249,7 @@ impl TmuxGatewayRouter {
                             // bounded recovery state drains through DCS ST.
                             failed.current_record.clear();
                             failed.recovering = true;
+                            failed.recovery_record_truncated = false;
                             failed.saw_exit = false;
                             failed.terminator_escape_seen = false;
                             self.active = Some(failed);
@@ -371,6 +411,7 @@ impl TmuxGatewayRouter {
             saw_exit: false,
             terminator_escape_seen: false,
             recovering: false,
+            recovery_record_truncated: false,
         });
         Ok(())
     }

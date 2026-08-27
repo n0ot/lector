@@ -201,6 +201,26 @@ impl App {
                 self.open_review(sr, page_up, term_out)
             }
             crate::tmux_prefix::BindingAction::Execute(command) => {
+                match self.classify_tmux_session_change(connection_id, &command) {
+                    TmuxSessionChange::Target(session_id) => {
+                        if !self.queue_tmux_session_switch(connection_id, session_id, Vec::new()) {
+                            sr.speak("tmux session switch is already in progress", true)?;
+                        }
+                        return Ok(());
+                    }
+                    TmuxSessionChange::Detach => {
+                        return self.begin_graceful_tmux_teardown(connection_id, sr, term_out);
+                    }
+                    TmuxSessionChange::Unsafe => {
+                        return self.show_popup_error(
+                            sr,
+                            "nested tmux transport",
+                            "this command could move the control client without first linking its nested carrier windows; use Lector's session chooser",
+                            term_out,
+                        );
+                    }
+                    TmuxSessionChange::NotApplicable => {}
+                }
                 let scope = self
                     .tmux_connections
                     .iter()

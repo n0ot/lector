@@ -1174,6 +1174,14 @@ pub struct App {
         TmuxCarrierLease,
     >,
     pending_tmux_session_switches: BTreeMap<u64, PendingTmuxSessionSwitch>,
+    rejected_tmux_carrier_indices: BTreeMap<
+        (
+            u64,
+            crate::tmux_model::SessionId,
+            crate::tmux_model::WindowId,
+        ),
+        BTreeSet<u32>,
+    >,
     active_tmux_connection: Option<u64>,
     pending_tmux_confirmation: Option<PendingTmuxConfirmation>,
     pending_gateway_confirmation: Option<PendingGatewayConfirmation>,
@@ -1267,6 +1275,14 @@ enum TmuxSessionSwitchStage {
         command_succeeded: bool,
         notification_observed: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxSessionChange {
+    NotApplicable,
+    Target(crate::tmux_model::SessionId),
+    Detach,
+    Unsafe,
 }
 
 struct PendingTmuxPaneCapture {
@@ -1368,6 +1384,18 @@ enum ExpectedTmuxReply {
         session_id: crate::tmux_model::SessionId,
         window_id: crate::tmux_model::WindowId,
         index: u32,
+    },
+    CarrierLeaseMove {
+        session_id: crate::tmux_model::SessionId,
+        window_id: crate::tmux_model::WindowId,
+        old_index: u32,
+        new_index: u32,
+    },
+    CarrierLeaseMoveVerify {
+        session_id: crate::tmux_model::SessionId,
+        window_id: crate::tmux_model::WindowId,
+        old_index: u32,
+        new_index: u32,
     },
     CarrierSessionSwitch {
         session_id: crate::tmux_model::SessionId,
@@ -1524,6 +1552,7 @@ impl App {
             pending_tmux_commands: VecDeque::new(),
             tmux_carrier_leases: BTreeMap::new(),
             pending_tmux_session_switches: BTreeMap::new(),
+            rejected_tmux_carrier_indices: BTreeMap::new(),
             active_tmux_connection: None,
             pending_tmux_confirmation: None,
             pending_gateway_confirmation: None,

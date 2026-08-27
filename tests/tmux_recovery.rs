@@ -168,7 +168,7 @@ fn eof_at_every_protocol_byte_is_bounded_idempotent_and_never_poisoned() {
 }
 
 #[test]
-fn malformed_control_replays_shell_returns_but_quarantines_live_protocol_channels() {
+fn malformed_control_replays_shell_returns_and_quarantines_until_positive_parent_output() {
     let mut router = TmuxGatewayRouter::new();
     let events = router
         .push(b"\x1bP1000pConnection to host closed.\r\nshell$ ready\r\n")
@@ -191,7 +191,7 @@ fn malformed_control_replays_shell_returns_but_quarantines_live_protocol_channel
 
     let mut invalid_protocol = TmuxGatewayRouter::new();
     let events = invalid_protocol
-        .push(b"\x1bP1000p%output invalid\nshell$ after\r\n")
+        .push(b"\x1bP1000p%output invalid\n")
         .unwrap();
     assert!(matches!(
         failure(&events),
@@ -211,8 +211,10 @@ fn malformed_control_replays_shell_returns_but_quarantines_live_protocol_channel
         GatewayLifecycleState::Recovering
     );
     let recovered = invalid_protocol
-        .push(b"discarded control output\r\n\x1b\\shell$ after\r\n")
+        .push(b"%output %1 discarded-control-output\n")
         .unwrap();
+    assert!(recovered.is_empty());
+    let recovered = invalid_protocol.push(b"shell$ after\r\n").unwrap();
     assert!(
         recovered
             .iter()
@@ -229,7 +231,7 @@ fn malformed_control_replays_shell_returns_but_quarantines_live_protocol_channel
 }
 
 #[test]
-fn app_terminates_a_live_control_channel_after_a_protocol_error() {
+fn app_drops_an_impossible_protocol_without_writing_into_a_returned_shell() {
     let (mut app, mut sr, recorder, _clock, mut physical) = app_with_clock();
     start_connection(&mut app, &mut sr, &mut physical);
     let mut transport = Vec::new();
@@ -239,23 +241,26 @@ fn app_terminates_a_live_control_channel_after_a_protocol_error() {
 
     app.handle_pty(&mut sr, b"%output invalid\n", &mut physical)
         .unwrap();
-    assert_eq!(app.tmux_connection_count(), 1);
-    assert!(app.has_overlay(), "protocol recovery was not presented");
+    assert_eq!(app.tmux_connection_count(), 0);
+    assert!(!app.has_overlay());
 
     app.handle_tick(&mut sr, &mut transport, &mut physical)
         .unwrap();
-    assert_eq!(transport, b"\x1c");
+    assert!(
+        transport.is_empty(),
+        "Lector wrote recovery bytes into an untrusted transport: {transport:?}"
+    );
     assert!(
         recorder
             .0
             .borrow()
             .iter()
-            .any(|message| message.contains("terminating the control client"))
+            .any(|message| message.contains("invalid control protocol"))
     );
 
     app.handle_pty(
         &mut sr,
-        b"discarded control bytes\r\n\x1b\\shell$ recovered\r\n",
+        b"%output %1 discarded-control-output\nshell$ recovered\r\n",
         &mut physical,
     )
     .unwrap();
@@ -424,6 +429,37 @@ fn nested_ssh_death_reconstructs_parent_pane_and_parent_exit_cleans_once() {
         .unwrap();
     assert_eq!(app.tmux_connection_count(), 1);
     assert_eq!(app.debug_nested_tmux_gateway_count(), 0);
+}
+
+#[test]
+fn malformed_nested_protocol_never_writes_recovery_bytes_to_its_parent_pane() {
+    let (mut app, mut sr, _recorder, _clock, mut physical) = app_with_clock();
+    ready_parent(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical);
+
+    app.handle_pty(
+        &mut sr,
+        &pane_output(20, b"%output invalid\n"),
+        &mut physical,
+    )
+    .unwrap();
+    assert_eq!(app.tmux_connection_count(), 1);
+    let mut transport = Vec::new();
+    app.drain_tmux_commands_for(1, &mut transport).unwrap();
+    assert!(
+        transport.is_empty(),
+        "nested protocol recovery wrote to its parent transport: {transport:?}"
+    );
+
+    app.handle_pty(
+        &mut sr,
+        &pane_output(20, b"%output %1 quarantined\nshell$ recovered\r\n"),
+        &mut physical,
+    )
+    .unwrap();
+    let parent = app.debug_tmux_pane_contents(1, 20).unwrap();
+    assert!(parent.contains("shell$ recovered"), "{parent:?}");
+    assert!(!parent.contains("quarantined"), "{parent:?}");
 }
 
 #[test]

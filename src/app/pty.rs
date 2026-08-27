@@ -302,56 +302,8 @@ impl App {
             crate::tmux_gateway::GatewayEvent::ConnectionFailed {
                 connection_id,
                 reason,
-            } => {
-                if matches!(reason, crate::tmux_gateway::GatewayFailure::Protocol(_))
-                    && self.tmux_gateway.lifecycle_state()
-                        == crate::tmux_gateway::GatewayLifecycleState::Recovering
-                {
-                    self.begin_tmux_protocol_recovery(sr, connection_id, &reason, term_out)
-                } else {
-                    self.fail_tmux_connection(sr, connection_id, &reason, term_out)
-                }
-            }
+            } => self.fail_tmux_connection(sr, connection_id, &reason, term_out),
         }
-    }
-
-    fn begin_tmux_protocol_recovery(
-        &mut self,
-        sr: &mut ScreenReader,
-        connection_id: u64,
-        reason: &crate::tmux_gateway::GatewayFailure,
-        term_out: &mut dyn Write,
-    ) -> Result<()> {
-        if !self.tmux_hierarchy.contains(connection_id) {
-            return Ok(());
-        }
-        let affected_connections = self.tmux_hierarchy.teardown_order(connection_id);
-        self.pending_tmux_commands
-            .retain(|command| !affected_connections.contains(&command.connection_id));
-        self.pending_direct_gateway_input
-            .retain(|input| !affected_connections.contains(&input.connection_id));
-        self.queue_gateway_transport_input(
-            connection_id,
-            crate::tmux_lifecycle::GatewayControlAction::ForceAbandon,
-        )?;
-        self.pending_force_abandon = Some(PendingForceAbandon {
-            connection_id,
-            deadline_ms: self
-                .clock
-                .now_ms()
-                .saturating_add(TMUX_FORCE_ABANDON_GRACE_MS),
-        });
-        self.show_popup_error(
-            sr,
-            "tmux protocol recovery",
-            &format!("{reason}. Lector is terminating this control client and preserving its tmux sessions."),
-            term_out,
-        )?;
-        sr.speak(
-            "invalid tmux control protocol; terminating the control client",
-            true,
-        )?;
-        Ok(())
     }
 
     fn fail_tmux_connection(
@@ -655,6 +607,10 @@ impl App {
             .retain(|(parent_connection_id, _, _), _| {
                 !removed_connections.contains(parent_connection_id)
             });
+        self.rejected_tmux_carrier_indices
+            .retain(|(parent_connection_id, _, _), _| {
+                !removed_connections.contains(parent_connection_id)
+            });
         self.pending_direct_gateway_input
             .retain(|input| !removed_connections.contains(&input.connection_id));
         self.discard_deferred_tmux_connections(&removed_connections);
@@ -740,7 +696,10 @@ impl App {
         let mut carrier_lease_verify_reply = None;
         let mut carrier_unlink_reply = None;
         let mut carrier_session_switch_reply = None;
+        let mut carrier_move_reply = None;
+        let mut carrier_move_verify_reply = None;
         let mut lost_gateway_carrier = None;
+        let mut inventory_applied = false;
         let location_changed;
         let attached_session_changed;
         let mut destroyed_gateway_panes = Vec::new();
@@ -839,6 +798,7 @@ impl App {
                                     );
                                     connection.has_inventory = true;
                                     connection.inventory_retry_count = 0;
+                                    inventory_applied = true;
                                     sync_topology = true;
                                     render_topology = true;
                                     if connection.flow_control_verified == Some(false)
@@ -1124,6 +1084,35 @@ impl App {
                                 status == crate::tmux_control::CommandStatus::Success,
                             ));
                         }
+                        Some(ExpectedTmuxReply::CarrierLeaseMove {
+                            session_id,
+                            window_id,
+                            old_index,
+                            new_index,
+                        }) => {
+                            carrier_move_reply = Some((
+                                session_id,
+                                window_id,
+                                old_index,
+                                new_index,
+                                status == crate::tmux_control::CommandStatus::Success,
+                            ));
+                        }
+                        Some(ExpectedTmuxReply::CarrierLeaseMoveVerify {
+                            session_id,
+                            window_id,
+                            old_index,
+                            new_index,
+                        }) => {
+                            carrier_move_verify_reply = Some((
+                                session_id,
+                                window_id,
+                                old_index,
+                                new_index,
+                                status == crate::tmux_control::CommandStatus::Success,
+                                output,
+                            ));
+                        }
                         Some(ExpectedTmuxReply::Ignored) => {}
                         Some(ExpectedTmuxReply::UserCommand {
                             description,
@@ -1336,6 +1325,32 @@ impl App {
         }
         if let Some((session_id, success)) = carrier_session_switch_reply {
             self.handle_tmux_carrier_session_switch_reply(connection_id, session_id, success);
+        }
+        if let Some((session_id, window_id, old_index, new_index, success)) = carrier_move_reply {
+            self.handle_tmux_carrier_move_reply(
+                connection_id,
+                session_id,
+                window_id,
+                old_index,
+                new_index,
+                success,
+            );
+        }
+        if let Some((session_id, window_id, old_index, new_index, success, output)) =
+            carrier_move_verify_reply
+        {
+            self.handle_tmux_carrier_move_verify_reply(
+                connection_id,
+                session_id,
+                window_id,
+                old_index,
+                new_index,
+                success,
+                &output,
+            );
+        }
+        if inventory_applied {
+            self.reconcile_tmux_carrier_leases(connection_id);
         }
         if attached_session_changed
             && let Some(session_id) = self
@@ -2306,9 +2321,10 @@ impl App {
                         .filter(|gateway| {
                             gateway.active_local_connection_id == Some(local_connection_id)
                         })
-                        .and_then(|gateway| gateway.active_global_connection_id)
-                        .context("nested tmux end event has no active global connection")?;
-                    self.end_tmux_connection(sr, connection_id, term_out)?;
+                        .and_then(|gateway| gateway.active_global_connection_id);
+                    if let Some(connection_id) = connection_id {
+                        self.end_tmux_connection(sr, connection_id, term_out)?;
+                    }
                     if let Some(gateway) = self.nested_tmux_gateways.get_mut(&key) {
                         gateway.active_local_connection_id = None;
                         gateway.active_global_connection_id = None;
@@ -2330,18 +2346,7 @@ impl App {
                             == crate::tmux_gateway::GatewayLifecycleState::Recovering
                     });
                     if let Some(connection_id) = connection_id {
-                        if matches!(reason, crate::tmux_gateway::GatewayFailure::Protocol(_))
-                            && recovering
-                        {
-                            self.begin_tmux_protocol_recovery(
-                                sr,
-                                connection_id,
-                                &reason,
-                                term_out,
-                            )?;
-                        } else {
-                            self.fail_tmux_connection(sr, connection_id, &reason, term_out)?;
-                        }
+                        self.fail_tmux_connection(sr, connection_id, &reason, term_out)?;
                     }
                     if !recovering && let Some(gateway) = self.nested_tmux_gateways.get_mut(&key) {
                         gateway.active_local_connection_id = None;
@@ -2856,6 +2861,21 @@ impl App {
         show_success: bool,
     ) -> Result<()> {
         let _ = crate::tmux_prefix::classify_binding(command)?;
+        match self.classify_tmux_session_change(connection_id, command) {
+            TmuxSessionChange::Target(session_id) => {
+                anyhow::ensure!(
+                    self.queue_tmux_session_switch(connection_id, session_id, Vec::new()),
+                    "tmux session switch is already in progress"
+                );
+                return Ok(());
+            }
+            TmuxSessionChange::Detach | TmuxSessionChange::Unsafe => {
+                anyhow::bail!(
+                    "tmux session-changing command must use Lector's nested-safe session or detach path"
+                );
+            }
+            TmuxSessionChange::NotApplicable => {}
+        }
         let command = command.to_owned();
         let mut bytes = command.as_bytes().to_vec();
         bytes.push(b'\n');

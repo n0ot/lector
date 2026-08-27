@@ -769,6 +769,23 @@ mod tests {
         connection
     }
 
+    fn topology_with_first_window_linked_into_another_session(index: u32) -> TmuxTopology {
+        let lines = [
+            b"S\t$1\twork".to_vec(),
+            b"S\t$2\tlinked".to_vec(),
+            b"W\t$1\t@10\t7\t0\taaaa,20x4,0,0,20\taaaa,20x4,0,0,20\t-\tleft".to_vec(),
+            format!("W\t$2\t@10\t{index}\t1\taaaa,20x4,0,0,20\taaaa,20x4,0,0,20\t*\tleft")
+                .into_bytes(),
+            b"W\t$1\t@11\t8\t1\tbbbb,20x4,0,0,30\tbbbb,20x4,0,0,30\t*\tright".to_vec(),
+            b"P\t@10\t%20\t1\t1\t0\t0\t20\t4\t0\t0\t0\t1\t0\t0\t0\t0\t0\tleft-pane".to_vec(),
+            b"P\t@11\t%30\t1\t1\t0\t0\t20\t4\t0\t0\t0\t1\t0\t0\t0\t0\t0\tright-pane".to_vec(),
+            b"A\t$2".to_vec(),
+        ];
+        let mut topology = TmuxTopology::new(1);
+        topology.replace_inventory(&lines).expect("linked topology");
+        topology
+    }
+
     #[test]
     fn switching_away_and_back_drops_stale_active_update_metadata() {
         let mut connection = ready_connection();
@@ -966,5 +983,41 @@ mod tests {
             .pane_view_mut(PaneId(30))
             .expect("second window pane");
         assert_eq!(second.review_cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn relinking_and_moving_a_window_preserves_its_single_pane_view_object() {
+        let mut connection = ready_two_window_connection();
+        let surface_id = connection.surface_id(PaneId(20)).expect("first surface");
+        let pane = connection
+            .panes
+            .pane_view_mut(PaneId(20))
+            .expect("first window pane");
+        pane.prepare_review_cursor_for_activation();
+        pane.set_review_cursor_position((1, 0));
+        pane.process_changes(b"\x1b_Lector;A11y;1;set;auto=0;cursor=0\x1b\\");
+        assert!(
+            pane.application_accessibility_policy()
+                .suppress_cursor_tracking
+        );
+
+        for index in [99, 3, 1_000_000] {
+            let topology = topology_with_first_window_linked_into_another_session(index);
+            assert!(
+                connection
+                    .sync_topology(&topology)
+                    .expect("relink stable window")
+                    .is_empty(),
+                "a surviving %pane ID was rebuilt after moving its @window"
+            );
+            assert_eq!(connection.surface_id(PaneId(20)), Some(surface_id));
+            let pane = connection
+                .panes
+                .pane_view_mut(PaneId(20))
+                .expect("same linked window pane");
+            assert_eq!(pane.review_cursor_position(), (1, 0));
+            let policy = pane.application_accessibility_policy();
+            assert!(policy.suppress_auto_read && policy.suppress_cursor_tracking);
+        }
     }
 }

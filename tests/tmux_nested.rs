@@ -161,6 +161,36 @@ fn inventory_with_remembered_session() -> Vec<Vec<Vec<u8>>> {
     ]
 }
 
+fn inventory_with_renumbered_carrier() -> Vec<Vec<Vec<u8>>> {
+    vec![
+        vec![b"S\t$1\tbar".to_vec(), b"S\t$2\tfoo".to_vec()],
+        vec![
+            format!("W\t$1\t@10\t1\t1\t{SINGLE_LAYOUT}\t{SINGLE_LAYOUT}\t*\tbar").into_bytes(),
+            format!(
+                "W\t$2\t@11\t1\t1\t{REMEMBERED_SPLIT_LAYOUT}\t{REMEMBERED_SPLIT_LAYOUT}\t*\tfoo"
+            )
+            .into_bytes(),
+            b"W\t$2\t@12\t2\t0\tb25f,80x24,0,0,24\tb25f,80x24,0,0,24\t-\tother".to_vec(),
+            format!("W\t$2\t@10\t3\t0\t{SINGLE_LAYOUT}\t{SINGLE_LAYOUT}\t-\tbar").into_bytes(),
+        ],
+        vec![
+            b"P\t@10\t%20\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tgateway".to_vec(),
+            b"P\t@11\t%22\t1\t0\t0\t0\t40\t24\t0\t0\t0\t1\t0\t0\t0\t0\tleft".to_vec(),
+            b"P\t@11\t%23\t2\t1\t41\t0\t39\t24\t0\t0\t0\t1\t0\t0\t0\t0\tremembered".to_vec(),
+            b"P\t@12\t%24\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tother".to_vec(),
+        ],
+        vec![b"A\t$2".to_vec()],
+        vec![b"O\tbase-index\t1".to_vec()],
+        vec![b"O\tpane-base-index\t1".to_vec()],
+        vec![b"C\tclient_name\t/dev/ttys-outer".to_vec()],
+        vec![b"O\tprefix\tC-a".to_vec()],
+        vec![b"O\tprefix2\tNone".to_vec()],
+        vec![b"O\tkey-table\troot".to_vec()],
+        vec![b"O\trepeat-time\t500".to_vec()],
+        vec![b"B\td\t0\tdetach-client".to_vec()],
+    ]
+}
+
 fn reply(serial: usize, lines: &[Vec<u8>], success: bool) -> Vec<u8> {
     let mut bytes = format!("%begin {serial} {serial} 0\n").into_bytes();
     for line in lines {
@@ -509,11 +539,9 @@ fn nested_connection_routes_commands_through_its_parent_portal_and_preserves_sib
     assert_eq!(app.active_tmux_connection(), Some(2));
     assert_eq!(
         drain_root(&mut app),
-        b"refresh-client -A '%20:continue'\n",
-        "activating the nested connection must resume its parent carrier"
+        b"",
+        "activating a running carrier must not perturb its stream"
     );
-    app.handle_pty(&mut sr, &reply(91, &[], true), &mut physical)
-        .unwrap();
 
     input(&mut app, &mut sr, &mut physical, b"Z");
     let child_command = decode_send_keys(&drain_root(&mut app), 20);
@@ -629,12 +657,10 @@ fn carrier_pause_drops_the_nested_protocol_instead_of_resuming_after_loss() {
     assert_eq!(app.active_tmux_connection(), Some(2));
     assert_eq!(
         drain_root(&mut app),
-        b"refresh-client -A '%20:continue'\n",
-        "manager activation did not resume the parent carrier"
+        b"",
+        "manager activation perturbed a carrier that had never paused"
     );
 
-    app.handle_pty(&mut sr, b"%continue %20\n", &mut physical)
-        .unwrap();
     app.handle_pty(&mut sr, b"%pause %20\n", &mut physical)
         .unwrap();
     assert_eq!(app.tmux_connection_count(), 1);
@@ -680,6 +706,45 @@ fn an_inactive_nested_carrier_is_drained_instead_of_flow_paused() {
     assert!(!flow.is_paused);
     assert_eq!(app.debug_tmux_background_pending_bytes(), 0);
     assert!(drain_root(&mut app).is_empty());
+}
+
+#[test]
+fn five_hours_of_silence_and_a_covered_ui_do_not_drop_a_nested_connection() {
+    let (mut app, mut sr, clock, mut physical) = app_with_clock();
+    ready_root(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    app.show_tmux_connection_chooser(&mut sr, &mut physical)
+        .unwrap();
+
+    clock.set(5 * 60 * 60 * 1_000);
+    let mut transport = Vec::new();
+    app.handle_tick(&mut sr, &mut transport, &mut physical)
+        .unwrap();
+    assert_eq!(app.tmux_connection_count(), 2);
+
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &pane_output(20, b"AFTER-FIVE-HOURS"),
+    );
+    assert_eq!(app.tmux_connection_count(), 2);
+    assert!(
+        app.debug_tmux_pane_contents(2, 20)
+            .unwrap()
+            .contains("AFTER-FIVE-HOURS")
+    );
 }
 
 #[test]
@@ -764,9 +829,8 @@ fn parent_session_switch_links_the_nested_carrier_before_switching() {
         "child activation changed the parent's user session: {routed:?}"
     );
     assert!(
-        routed
-            .windows(b"refresh-client -A '%20:continue'".len())
-            .any(|window| window == b"refresh-client -A '%20:continue'")
+        routed.is_empty(),
+        "activating a healthy linked carrier changed its stream: {routed:?}"
     );
 }
 
@@ -865,6 +929,71 @@ fn failed_carrier_verification_aborts_the_switch_and_queues_guarded_cleanup() {
 }
 
 #[test]
+fn command_prompt_session_changes_use_the_same_carrier_gate() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_450);
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    app.show_tmux_command_prompt(&mut sr, &mut physical)
+        .unwrap();
+    input(&mut app, &mut sr, &mut physical, b"switch-client -t $2\r");
+    assert_eq!(
+        drain_root(&mut app),
+        b"link-window -d -s @10 -t $2:1000000\n",
+        "the command prompt bypassed Lector's carrier transaction"
+    );
+}
+
+#[test]
+fn ambiguous_and_compound_session_commands_cannot_bypass_the_carrier_gate() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_470);
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+
+    for command in [
+        "new -A -s surprise",
+        "display-message safe ; switchc -t $2",
+        "switchc -O activity -n",
+    ] {
+        app.show_tmux_command_prompt(&mut sr, &mut physical)
+            .unwrap();
+        let mut submission = command.as_bytes().to_vec();
+        submission.push(b'\r');
+        input(&mut app, &mut sr, &mut physical, &submission);
+        assert!(
+            drain_root(&mut app).is_empty(),
+            "unsafe session command reached tmux: {command}"
+        );
+        assert!(
+            app.has_overlay(),
+            "unsafe session command was rejected without an explanation: {command}"
+        );
+        input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    }
+}
+
+#[test]
 fn switching_back_to_the_original_carrier_session_unlinks_only_the_owned_alias() {
     let (mut app, mut sr, mut physical) = app();
     ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
@@ -913,10 +1042,156 @@ fn switching_back_to_the_original_carrier_session_unlinks_only_the_owned_alias()
         .unwrap();
     app.handle_pty(&mut sr, &reply(1_800, &[], true), &mut physical)
         .unwrap();
+    let cleanup = drain_root(&mut app);
+    let (unlink, _) = split_first_command(&cleanup);
     assert_eq!(
-        drain_root(&mut app),
+        unlink,
         b"if-shell -F -t '$2:1000000' '#{==:#{window_id},@10}' 'unlink-window -t $2:1000000'\n"
     );
+}
+
+#[test]
+fn detaching_a_nested_connection_unlinks_its_carrier_after_the_child_exits() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_820);
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    app.show_tmux_session_chooser(&mut sr, &mut physical)
+        .unwrap();
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    let _ = drain_root(&mut app);
+    app.handle_pty(&mut sr, &reply(1_830, &[], true), &mut physical)
+        .unwrap();
+    let _ = drain_root(&mut app);
+    app.handle_pty(
+        &mut sr,
+        &reply(1_831, &[b"L\t@10\t1000000".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    let _ = drain_root(&mut app);
+    app.handle_pty(&mut sr, b"%session-changed $2 foo\n", &mut physical)
+        .unwrap();
+    app.handle_pty(&mut sr, &reply(1_832, &[], true), &mut physical)
+        .unwrap();
+    let _ = drain_root(&mut app);
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_840);
+
+    app.activate_tmux_connection(2, &mut sr, &mut physical)
+        .unwrap();
+    let _ = drain_root(&mut app);
+    input(&mut app, &mut sr, &mut physical, b"\x01d");
+    let routed = drain_root(&mut app);
+    let detach_route = decode_send_keys(&routed, 20);
+    assert_eq!(detach_route, b"detach-client\n");
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        b"%exit inner detached\n\x1b\\",
+    );
+    let cleanup = drain_root(&mut app);
+    let (unlink, _) = split_first_command(&cleanup);
+    assert_eq!(
+        unlink,
+        b"if-shell -F -t '$2:1000000' '#{==:#{window_id},@10}' 'unlink-window -t $2:1000000'\n"
+    );
+    assert_eq!(app.tmux_connection_count(), 1);
+}
+
+#[test]
+fn renumbered_carrier_is_reidentified_by_window_id_and_moved_back_to_the_high_band() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 1_900);
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    app.show_tmux_session_chooser(&mut sr, &mut physical)
+        .unwrap();
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    let _ = drain_root(&mut app);
+    app.handle_pty(&mut sr, &reply(2_000, &[], true), &mut physical)
+        .unwrap();
+    let _ = drain_root(&mut app);
+    app.handle_pty(
+        &mut sr,
+        &reply(2_001, &[b"L\t@10\t1000000".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    let _ = drain_root(&mut app);
+    app.handle_pty(&mut sr, b"%session-changed $2 foo\n", &mut physical)
+        .unwrap();
+    app.handle_pty(&mut sr, &reply(2_002, &[], true), &mut physical)
+        .unwrap();
+    let _ = drain_root(&mut app);
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 2_100);
+
+    // This inventory is the result tmux produces after `renumber-windows on`
+    // collapses the owned @10 winlink from 1000000 to 3.
+    app.handle_pty(&mut sr, b"%sessions-changed\n", &mut physical)
+        .unwrap();
+    assert_eq!(
+        drain_root(&mut app),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+    for (offset, group) in inventory_with_renumbered_carrier().iter().enumerate() {
+        app.handle_pty(&mut sr, &reply(2_200 + offset, group, true), &mut physical)
+            .unwrap();
+    }
+    let relocation = drain_root(&mut app);
+    let (move_command, pane_recovery) = split_first_command(&relocation);
+    assert_eq!(
+        move_command,
+        b"if-shell -F -t '$2:3' '#{==:#{window_id},@10}' 'move-window -d -s $2:3 -t $2:1000000'\n"
+    );
+    assert!(
+        pane_recovery
+            .windows(b"display-message -p -t %22".len())
+            .any(|window| window == b"display-message -p -t %22")
+    );
+    app.handle_pty(&mut sr, &reply(2_300, &[], true), &mut physical)
+        .unwrap();
+    assert_eq!(
+        drain_root(&mut app),
+        b"list-windows -t $2 -F 'L\t#{window_id}\t#{window_index}'\n"
+    );
+    app.handle_pty(&mut sr, &reply(2_301, &[], true), &mut physical)
+        .unwrap();
+    app.handle_pty(&mut sr, &reply(2_302, &[], true), &mut physical)
+        .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &reply(2_303, &[b"L\t@10\t1000000".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    let topology = app.debug_tmux_topology(1).unwrap();
+    assert!(
+        topology.contains("window @10 index 1000000: bar"),
+        "{topology}"
+    );
+    assert!(!topology.contains("window @10 index 3: bar"), "{topology}");
 }
 
 #[test]
@@ -987,6 +1262,72 @@ fn two_nested_levels_keep_identical_ids_separate_and_route_recursively() {
 }
 
 #[test]
+fn a_linked_outer_carrier_preserves_a_byte_fragmented_level_three_stream() {
+    let (mut app, mut sr, mut physical) = app();
+    ready_root_with_remembered_session(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    start_nested(&mut app, &mut sr, &mut physical, 2);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        2,
+        "grandchild",
+        "/dev/ttys-grandchild",
+    );
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 3_000);
+
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    app.show_tmux_session_chooser(&mut sr, &mut physical)
+        .unwrap();
+    input(&mut app, &mut sr, &mut physical, b"\x1b[B\r");
+    assert_eq!(
+        drain_root(&mut app),
+        b"link-window -d -s @10 -t $2:1000000\n"
+    );
+    app.handle_pty(&mut sr, &reply(3_100, &[], true), &mut physical)
+        .unwrap();
+    let _ = drain_root(&mut app);
+    app.handle_pty(
+        &mut sr,
+        &reply(3_101, &[b"L\t@10\t1000000".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    let _ = drain_root(&mut app);
+    app.handle_pty(&mut sr, b"%session-changed $2 foo\n", &mut physical)
+        .unwrap();
+    app.handle_pty(&mut sr, &reply(3_102, &[], true), &mut physical)
+        .unwrap();
+
+    let payload = b"SEQ:000001|SEQ:000002|SEQ:000003";
+    let routed = wrap_at_depth(pane_output(20, payload), 2);
+    for byte in routed {
+        app.handle_pty(&mut sr, std::slice::from_ref(&byte), &mut physical)
+            .unwrap();
+    }
+    let grandchild = app.debug_tmux_pane_contents(3, 20).unwrap();
+    assert!(
+        grandchild.contains(std::str::from_utf8(payload).unwrap()),
+        "fragmented level-three output had a gap or duplicate: {grandchild:?}"
+    );
+    assert!(
+        app.debug_tmux_topology(1)
+            .is_some_and(|dump| dump.contains("[attached]: foo")),
+        "level-three routing switched the outer client back"
+    );
+}
+
+#[test]
 fn graceful_root_teardown_waits_for_each_descendant_deepest_first() {
     let (mut app, mut sr, mut physical) = app();
     ready_root(&mut app, &mut sr, &mut physical);
@@ -1022,12 +1363,8 @@ fn graceful_root_teardown_waits_for_each_descendant_deepest_first() {
         .unwrap()
     );
     let routed = drain_root(&mut app);
-    let (root_resume, routed) = split_first_command(&routed);
-    assert_eq!(root_resume, b"refresh-client -A '%20:continue'\n");
-    let routed = decode_send_keys(routed, 20);
-    let (inner_resume, routed) = split_first_command(&routed);
-    assert_eq!(inner_resume, b"refresh-client -A '%20:continue'\n");
-    let routed = decode_send_keys(routed, 20);
+    let routed = decode_send_keys(&routed, 20);
+    let routed = decode_send_keys(&routed, 20);
     assert_eq!(
         routed, b"detach-client\n",
         "the deepest connection must detach first"
@@ -1042,9 +1379,7 @@ fn graceful_root_teardown_waits_for_each_descendant_deepest_first() {
         b"%exit grandchild detached\n\x1b\\",
     );
     let routed = drain_root(&mut app);
-    let (root_resume, routed) = split_first_command(&routed);
-    assert_eq!(root_resume, b"refresh-client -A '%20:continue'\n");
-    let routed = decode_send_keys(routed, 20);
+    let routed = decode_send_keys(&routed, 20);
     assert_eq!(routed, b"detach-client\n");
     assert_eq!(app.tmux_connection_count(), 2);
 
@@ -1092,12 +1427,8 @@ fn prefix_detach_cascades_through_the_current_connection_subtree() {
 
     input(&mut app, &mut sr, &mut physical, b"\x01d");
     let routed = drain_root(&mut app);
-    let (root_resume, routed) = split_first_command(&routed);
-    assert_eq!(root_resume, b"refresh-client -A '%20:continue'\n");
-    let routed = decode_send_keys(routed, 20);
-    let (inner_resume, routed) = split_first_command(&routed);
-    assert_eq!(inner_resume, b"refresh-client -A '%20:continue'\n");
-    assert_eq!(decode_send_keys(routed, 20), b"detach-client\n");
+    let routed = decode_send_keys(&routed, 20);
+    assert_eq!(decode_send_keys(&routed, 20), b"detach-client\n");
 
     feed_at_depth(
         &mut app,
@@ -1107,9 +1438,7 @@ fn prefix_detach_cascades_through_the_current_connection_subtree() {
         b"%exit grandchild detached\n\x1b\\",
     );
     let routed = drain_root(&mut app);
-    let (root_resume, routed) = split_first_command(&routed);
-    assert_eq!(root_resume, b"refresh-client -A '%20:continue'\n");
-    assert_eq!(decode_send_keys(routed, 20), b"detach-client\n");
+    assert_eq!(decode_send_keys(&routed, 20), b"detach-client\n");
 
     feed_at_depth(
         &mut app,
@@ -1149,12 +1478,8 @@ fn prefix_detach_from_an_inner_connection_leaves_its_parent_attached() {
 
     input(&mut app, &mut sr, &mut physical, b"\x01d");
     let routed = drain_root(&mut app);
-    let (root_resume, routed) = split_first_command(&routed);
-    assert_eq!(root_resume, b"refresh-client -A '%20:continue'\n");
-    let routed = decode_send_keys(routed, 20);
-    let (inner_resume, routed) = split_first_command(&routed);
-    assert_eq!(inner_resume, b"refresh-client -A '%20:continue'\n");
-    assert_eq!(decode_send_keys(routed, 20), b"detach-client\n");
+    let routed = decode_send_keys(&routed, 20);
+    assert_eq!(decode_send_keys(&routed, 20), b"detach-client\n");
 
     feed_at_depth(
         &mut app,
@@ -1164,9 +1489,7 @@ fn prefix_detach_from_an_inner_connection_leaves_its_parent_attached() {
         b"%exit grandchild detached\n\x1b\\",
     );
     let routed = drain_root(&mut app);
-    let (root_resume, routed) = split_first_command(&routed);
-    assert_eq!(root_resume, b"refresh-client -A '%20:continue'\n");
-    assert_eq!(decode_send_keys(routed, 20), b"detach-client\n");
+    assert_eq!(decode_send_keys(&routed, 20), b"detach-client\n");
 
     feed_at_depth(
         &mut app,
@@ -1214,10 +1537,8 @@ fn shutdown_skips_each_stuck_connection_after_two_hundred_milliseconds() {
         Some(Duration::from_millis(200))
     );
     let routed = &transport;
-    let (_, routed) = split_first_command(routed);
     let routed = decode_send_keys(routed, 20);
-    let (_, routed) = split_first_command(&routed);
-    assert_eq!(decode_send_keys(routed, 20), b"detach-client\n");
+    assert_eq!(decode_send_keys(&routed, 20), b"detach-client\n");
 
     clock.set(199);
     transport.clear();
@@ -1228,8 +1549,7 @@ fn shutdown_skips_each_stuck_connection_after_two_hundred_milliseconds() {
     clock.set(200);
     app.handle_tmux_shutdown_tick(&mut sr, &mut transport, &mut physical)
         .unwrap();
-    let (_, routed) = split_first_command(&transport);
-    assert_eq!(decode_send_keys(routed, 20), b"detach-client\n");
+    assert_eq!(decode_send_keys(&transport, 20), b"detach-client\n");
 
     transport.clear();
     clock.set(400);
