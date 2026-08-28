@@ -9,7 +9,7 @@ use lector::{
         RenderBatch, RenderCapabilities, RenderOracle, RenderStrategy, RendererBackend,
         SceneDamage,
     },
-    screen_reader::ScreenReader,
+    screen_reader::{ScreenReader, TmuxBellMode},
     speech,
     terminal::TerminalGeometry,
     terminal_protocol::{PhysicalTerminalProfile, VirtualTerminalColors},
@@ -1260,6 +1260,116 @@ fn pane_default_colour_queries_use_the_control_client_report_channel() {
         drain(&mut app, &mut sr, &mut physical),
         b"refresh-client -r '%20:\x1b]10;rgb:ffff/ffff/ffff\x1b\\'\n\
           refresh-client -r '%20:\x1b]11;rgb:0000/0000/0000\x1b\\'\n"
+    );
+}
+
+#[test]
+fn stale_pane_bytes_are_inert_until_an_authoritative_capture_boundary() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app(false);
+    sr.set_tmux_bell_mode(TmuxBellMode::Spoken);
+    recorder.0.borrow_mut().clear();
+    physical.clear();
+    let before = app.debug_tmux_pane_contents(1, 20).unwrap();
+
+    // A tmux pause is one representative loss boundary. Session absence and
+    // local deferred-output overflow enter the same pane flow state.
+    app.handle_pty(&mut sr, b"%pause %20\n", &mut physical)
+        .unwrap();
+    for bytes in [
+        b"dex\x07".as_slice(),
+        b"\x1b[2JSTALE".as_slice(),
+        b"\x1b]10;?\x1b\\".as_slice(),
+        b"\x98\x80\x07".as_slice(),
+    ] {
+        app.handle_pty(&mut sr, &pane_output_record(20, bytes), &mut physical)
+            .unwrap();
+    }
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(20, b"\x1bP1000p%begin 1 1 0\n%end 1 1 0\n"),
+        &mut physical,
+    )
+    .unwrap();
+    assert!(
+        app.debug_tmux_gateway_origin(2).is_none(),
+        "stale bytes fabricated a nested tmux connection"
+    );
+    app.handle_pty(&mut sr, &pane_output_record(20, b"\x1bP100"), &mut physical)
+        .unwrap();
+
+    assert_eq!(app.debug_tmux_pane_contents(1, 20).unwrap(), before);
+    assert!(recorder.0.borrow().is_empty());
+    assert!(app.last_tmux_bell_source().is_none());
+    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 0);
+    assert!(
+        app.debug_tmux_pane_flow_state(1, 20)
+            .unwrap()
+            .skipped_incremental_bytes
+            > 0
+    );
+    assert_eq!(
+        drain(&mut app, &mut sr, &mut physical),
+        b"refresh-client -A '%20:continue'\n",
+        "stale terminal queries or effects escaped into control commands"
+    );
+
+    app.handle_pty(&mut sr, &reply(40, &[]), &mut physical)
+        .unwrap();
+    start_capture_after_probe(&mut app, &mut sr, &mut physical, 41, 20);
+    finish_capture(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        42,
+        20,
+        &[b"authoritative screen".to_vec()],
+    );
+    assert_eq!(
+        app.debug_tmux_pane_flow_state(1, 20).unwrap().status,
+        TmuxFlowStatus::Running
+    );
+    let captured = app.debug_tmux_pane_contents(1, 20).unwrap();
+    let compact = captured
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    assert!(compact.contains("authoritativescreen"), "{captured:?}");
+    assert!(!captured.contains("STALE"), "{captured:?}");
+
+    // A partial nested-control marker from before the capture must not combine
+    // with a post-capture suffix to create a connection across the gap.
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(20, b"0p%begin 1 1 0\n%end 1 1 0\n"),
+        &mut physical,
+    )
+    .unwrap();
+    assert!(app.debug_tmux_gateway_origin(2).is_none());
+
+    // Once capture establishes the new parser continuation, ordinary bytes
+    // and effects become authoritative again.
+    recorder.0.borrow_mut().clear();
+    physical.clear();
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(20, b"\x07AFTER\x1b]10;?\x1b\\"),
+        &mut physical,
+    )
+    .unwrap();
+    let after = app.debug_tmux_pane_contents(1, 20).unwrap();
+    assert!(
+        after
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .contains("AFTER"),
+        "{after:?}"
+    );
+    assert_eq!(recorder.0.borrow().len(), 1, "post-capture BEL was lost");
+    assert_eq!(
+        drain(&mut app, &mut sr, &mut physical),
+        b"refresh-client -r '%20:\x1b]10;rgb:ffff/ffff/ffff\x1b\\'\n",
+        "post-capture terminal query was not restored"
     );
 }
 

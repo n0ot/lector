@@ -572,6 +572,66 @@ fn audible_bells_speak_only_background_tmux_indexes_and_latch_that_window() {
 }
 
 #[test]
+fn session_reentry_discards_all_raw_effects_from_stale_background_panes() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = make_app(true);
+    let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
+    sr.set_tmux_bell_mode(TmuxBellMode::Audible);
+    let before = app.debug_tmux_pane_contents(1, 20).unwrap();
+
+    // Match the live failure: leave Codex in window 1, select window 2, move
+    // to another session, then return. Entering the session marks every pane
+    // stale until its capture completes, so any intervening pane output takes
+    // the skipped-output path.
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%session-window-changed $1 @11\n%session-changed $2 other\n%session-changed $1 work\n",
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    physical.clear();
+    recorder.clear();
+
+    // The first record can be a suffix of an OSC whose introducer was emitted
+    // while this control client was attached elsewhere. Complete controls are
+    // equally unsafe: without the missing prefix there is no trustworthy
+    // parser state in which to interpret any raw byte or terminal side effect.
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(20, "dex\\007"),
+        &mut physical,
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(20, "\\033[2JSTALE"),
+        &mut physical,
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(20, "\\007"),
+        &mut physical,
+    );
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    assert_eq!(app.debug_tmux_pane_contents(1, 20).unwrap(), before);
+    assert_eq!(physical.iter().filter(|byte| **byte == b'\x07').count(), 0);
+    assert!(recorder.messages().is_empty());
+    assert!(app.last_tmux_bell_source().is_none());
+    assert!(
+        app.debug_tmux_pane_flow_state(1, 20)
+            .unwrap()
+            .skipped_incremental_bytes
+            > 0
+    );
+}
+
+#[test]
 fn bells_are_scoped_by_connection_even_when_the_source_connection_is_not_presented() {
     let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
     let mut first = add_ready_connection(&mut app, &mut sr, &mut physical, 1);

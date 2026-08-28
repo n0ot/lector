@@ -13,6 +13,13 @@ connections, and output received while a Lector overlay is open. tmux normally
 does not deliver pane streams for unattached sessions to one control client, so
 Lector does not claim that broader scope.
 
+Bell monitoring applies only while a pane's byte stream is contiguous. After a
+session absence, tmux flow-control loss, or local overflow marks a pane stale,
+Lector discards every raw byte and terminal side effect until an authoritative
+capture restores the screen and parser continuation. A genuine bell in that
+unknowable interval may be lost; interpreting any suffix would risk inventing
+a bell or another terminal effect from a sequence whose prefix was not seen.
+
 The Lua option `lector.o.tmux_bells` accepts exactly three values:
 
 - `"off"` discards tmux pane bells.

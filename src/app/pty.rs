@@ -1594,6 +1594,7 @@ impl App {
                         pane_id,
                     )
                 });
+            let mut bootstrap_resync_completed = false;
             if let Some(flow) = self
                 .tmux_connections
                 .iter_mut()
@@ -1630,6 +1631,7 @@ impl App {
                     flow.resync_count = flow.resync_count.saturating_add(1);
                     flow.consecutive_resync_failures = 0;
                     flow.resync_failure_announced = false;
+                    bootstrap_resync_completed = true;
                 } else if status == crate::tmux_control::CommandStatus::Error {
                     flow.status = TmuxFlowStatus::ResyncFailed;
                     flow.recapture_hard_deadline_ms = None;
@@ -1640,6 +1642,9 @@ impl App {
                 } else {
                     flow.status = TmuxFlowStatus::Resynchronizing;
                 }
+            }
+            if bootstrap_resync_completed {
+                self.reset_inactive_tmux_pane_gateway(connection_id, pane_id);
             }
         }
         if let Some((metadata, output, pending_escape, line_flags, parser_continuation_available)) =
@@ -1708,6 +1713,7 @@ impl App {
                     }
                 }
                 if resync_completed {
+                    self.reset_inactive_tmux_pane_gateway(connection_id, pane_id);
                     let parser_note = if parser_continuation_available {
                         "terminal parser continuation restored"
                     } else {
@@ -1932,6 +1938,49 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         let key = (connection_id, pane_id);
+        let pane_is_transport_critical = self.is_live_tmux_gateway_carrier(connection_id, pane_id);
+        let pane_is_visible = pane_is_transport_critical
+            || self
+                .view_stack
+                .presented_tmux_connection_mut()
+                .is_some_and(|view| {
+                    view.connection_id() == connection_id
+                        && !view.is_showing_portal()
+                        && view.is_pane_visible(pane_id)
+                });
+
+        // The outer PTY drain bounds foreground work by bytes and wall-clock
+        // time, and the presentation batch composes its final state only once.
+        // A second, smaller pane-local budget can discard ordinary foreground
+        // output and pause the pane without a notification that guarantees a
+        // matching resume. Model visible bytes immediately within the outer
+        // bounded turn.
+        if pane_is_visible {
+            return self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out);
+        }
+
+        let has_deferred_output = self.pending_tmux_background_output.contains_key(&key);
+        let exceeds_immediate_budget = self
+            .tmux_hidden_output_bytes_this_turn
+            .saturating_add(bytes.len())
+            > TMUX_HIDDEN_IMMEDIATE_BUDGET_BYTES;
+        if !has_deferred_output && !exceeds_immediate_budget {
+            self.tmux_hidden_output_bytes_this_turn = self
+                .tmux_hidden_output_bytes_this_turn
+                .saturating_add(bytes.len());
+            return self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out);
+        }
+
+        self.defer_tmux_pane_output(connection_id, pane_id, bytes);
+        Ok(())
+    }
+
+    fn discard_stale_tmux_pane_output(
+        &mut self,
+        connection_id: u64,
+        pane_id: crate::tmux_model::PaneId,
+        bytes: &[u8],
+    ) -> bool {
         // A carrier can be outside the attached session while its child is
         // selected. Its direct terminal bytes are still part of the same pane
         // stream as the nested control protocol, so applying pause-after to
@@ -1970,74 +2019,33 @@ impl App {
                 true
             });
         if pane_needs_resync {
-            self.present_bell_from_skipped_tmux_output(
-                sr,
-                connection_id,
-                pane_id,
-                pane_is_visible,
-                bytes,
-                term_out,
-            )?;
+            // Once any bytes are missing, the pane parser's starting state is
+            // unknowable. Do not interpret even apparently self-contained
+            // controls or terminal side effects until an authoritative capture
+            // restores the screen and pending parser continuation.
+            self.reset_inactive_tmux_pane_gateway(connection_id, pane_id);
             if !pane_is_visible {
                 self.queue_tmux_background_pause(connection_id, pane_id);
             }
-            return Ok(());
+            return true;
         }
-
-        // The outer PTY drain bounds foreground work by bytes and wall-clock
-        // time, and the presentation batch composes its final state only once.
-        // A second, smaller pane-local budget can discard ordinary foreground
-        // output and pause the pane without a notification that guarantees a
-        // matching resume. Model visible bytes immediately within the outer
-        // bounded turn.
-        if pane_is_visible {
-            return self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out);
-        }
-
-        let has_deferred_output = self.pending_tmux_background_output.contains_key(&key);
-        let exceeds_immediate_budget = self
-            .tmux_hidden_output_bytes_this_turn
-            .saturating_add(bytes.len())
-            > TMUX_HIDDEN_IMMEDIATE_BUDGET_BYTES;
-        if !has_deferred_output && !exceeds_immediate_budget {
-            self.tmux_hidden_output_bytes_this_turn = self
-                .tmux_hidden_output_bytes_this_turn
-                .saturating_add(bytes.len());
-            return self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out);
-        }
-
-        let dropped_bell = self.defer_tmux_pane_output(connection_id, pane_id, bytes);
-        if dropped_bell {
-            self.present_bell_from_skipped_tmux_output(
-                sr,
-                connection_id,
-                pane_id,
-                false,
-                b"\x07",
-                term_out,
-            )?;
-        }
-        Ok(())
+        false
     }
 
-    fn present_bell_from_skipped_tmux_output(
+    fn reset_inactive_tmux_pane_gateway(
         &mut self,
-        sr: &mut ScreenReader,
         connection_id: u64,
         pane_id: crate::tmux_model::PaneId,
-        pane_is_visible: bool,
-        bytes: &[u8],
-        term_out: &mut dyn Write,
-    ) -> Result<()> {
-        if !bytes.contains(&b'\x07') {
-            return Ok(());
+    ) {
+        let key = (connection_id, pane_id.0);
+        if self
+            .nested_tmux_gateways
+            .get(&key)
+            .is_some_and(|gateway| gateway.active_global_connection_id.is_none())
+        {
+            self.nested_tmux_gateways
+                .insert(key, NestedTmuxGatewayState::new());
         }
-        let audible =
-            self.present_tmux_bell(sr, connection_id, pane_id, pane_is_visible, term_out)?;
-        if audible != 0 {
-            self.emit_physical_bells(term_out, audible)?;
-        }
-        Ok(())
     }
 
     fn mark_tmux_pane_for_resync(
@@ -2070,18 +2078,13 @@ impl App {
         connection_id: u64,
         pane_id: crate::tmux_model::PaneId,
         bytes: &[u8],
-    ) -> bool {
+    ) {
         let key = (connection_id, pane_id);
         let would_exceed_limit = self
             .pending_tmux_background_bytes
             .saturating_add(bytes.len())
             > TMUX_BACKGROUND_OUTPUT_LIMIT_BYTES;
         if would_exceed_limit {
-            let dropped_bell = bytes.contains(&b'\x07')
-                || self
-                    .pending_tmux_background_output
-                    .get(&key)
-                    .is_some_and(|queued| queued.contains(&b'\x07'));
             let dropped = self.discard_deferred_tmux_pane_output(key);
             self.log_event(&format!(
                 "tmux deferred pane output overflow connection={connection_id} pane={} dropped={} rejected={}",
@@ -2094,7 +2097,7 @@ impl App {
                 pane_id,
                 dropped.saturating_add(bytes.len()),
             );
-            return dropped_bell;
+            return;
         }
 
         if !self.pending_tmux_background_output.contains_key(&key) {
@@ -2114,7 +2117,6 @@ impl App {
         {
             self.queue_tmux_background_pause(connection_id, pane_id);
         }
-        false
     }
 
     fn queue_tmux_background_pause(
@@ -2200,7 +2202,9 @@ impl App {
             self.pending_tmux_background_bytes =
                 self.pending_tmux_background_bytes.saturating_sub(count);
             remaining = remaining.saturating_sub(count);
-            self.process_tmux_pane_output(sr, key.0, key.1, &bytes, term_out)?;
+            if !self.discard_stale_tmux_pane_output(key.0, key.1, &bytes) {
+                self.process_tmux_pane_output(sr, key.0, key.1, &bytes, term_out)?;
+            }
         }
         Ok(())
     }
@@ -2213,6 +2217,12 @@ impl App {
         bytes: &[u8],
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        // A missing prefix can fabricate both terminal controls and Lector's
+        // nested-control marker. Establish the pane's loss boundary before
+        // either stateful parser sees another byte.
+        if self.discard_stale_tmux_pane_output(parent_connection_id, pane_id, bytes) {
+            return Ok(());
+        }
         let key = (parent_connection_id, pane_id.0);
         if !self.nested_tmux_gateways.contains_key(&key) {
             if self.nested_tmux_gateways.len() == MAX_NESTED_TMUX_GATEWAYS {

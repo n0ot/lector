@@ -100,13 +100,13 @@ announces that automatic loss-bounded recovery is unavailable. Ordinary
 
 Lector also enforces fairness below tmux's flow control. One event-loop turn
 reads at most 32 KiB from the root PTY, then gives terminal input, signals,
-protocol replies, and queued commands another chance to run. Raw pane bytes are
-always scanned for nested `tmux -CC` lifecycle markers. Ordinary terminal bytes
-for the presented window are modeled immediately. Visible damage from one
-bounded root-PTY drain is then composed and rendered once before ready user
-input is dispatched. Background pane engines get a 4 KiB immediate allowance
-and a round-robin 4 KiB drain turn. This is a single-threaded bounded scheduler,
-not one worker thread per pane.
+protocol replies, and queued commands another chance to run. While a pane stream
+is contiguous, raw pane bytes are scanned for nested `tmux -CC` lifecycle
+markers before ordinary terminal bytes for the presented window are modeled.
+Visible damage from one bounded root-PTY drain is then composed and rendered
+once before ready user input is dispatched. Background pane engines get a 4 KiB
+immediate allowance and a round-robin 4 KiB drain turn. This is a single-threaded
+bounded scheduler, not one worker thread per pane.
 
 Once one pane's deferred terminal payload reaches 16 KiB, Lector proactively
 requests tmux's documented `pane:pause` state instead of waiting for the
@@ -117,17 +117,30 @@ Lector.
 
 The aggregate deferred background-terminal queue is limited to 64 KiB. If it
 would exceed that limit, Lector drops the affected pane's queued terminal
-payload, records a text-resynchronization requirement, and continues scanning
-its transport for nested control markers. The recovery capture is delayed
-while the pane stays in the background. Selecting that window or connection
-discards any older deferred payload and queues one authoritative capture before
-normal incremental presentation resumes. Foreground input and control commands
-therefore do not sit behind an unbounded hidden-pane parse workload.
+payload and records a text-resynchronization requirement. Further raw bytes are
+inert until recovery, including bytes that resemble nested control markers. The
+recovery capture is delayed while the pane stays in the background. Selecting
+that window or connection discards any older deferred payload and queues one
+authoritative capture before normal incremental presentation resumes.
+Foreground input and control commands therefore do not sit behind an unbounded
+hidden-pane parse workload.
 
 ## Authoritative text resynchronization
 
-For one stale interval Lector coalesces all further pane output. Recovery is an
-ordered snapshot transaction:
+For one stale interval Lector discards all further pane output without feeding
+it to a terminal or side-effect parser. Once any bytes are missing, later bytes
+may begin inside OSC, CSI, DCS, APC, UTF-8, or another stateful sequence; even a
+standalone-looking control has no trustworthy meaning. Bells, terminal queries,
+clipboard requests, notifications, and every other effect in that interval are
+therefore suppressed together with screen mutations.
+
+For an ordinary pane this discard happens before nested-control marker
+detection as well, and the inactive marker detector is reset at the capture
+boundary. A pane carrying a live nested tmux connection is transport-critical:
+Lector keeps that carrier observable, and a reported loss fails the nested
+connection rather than attempting to reconstruct its control protocol.
+
+Recovery is an ordered snapshot transaction:
 
 ```text
 display-message -p -t %N -F <pane capture metadata>
