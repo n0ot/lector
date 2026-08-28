@@ -698,6 +698,9 @@ impl App {
     }
 
     pub(super) fn announce_view_change(&mut self, sr: &mut ScreenReader) -> Result<()> {
+        // A complete view handoff supersedes any title/location update that
+        // was waiting for an older physical frame.
+        self.pending_tmux_location_announcement = None;
         if !self.accessibility_announcement_ready() {
             self.pending_view_announcement = true;
             return Ok(());
@@ -708,6 +711,7 @@ impl App {
 
     pub(super) fn announce_view_contents(&mut self, sr: &mut ScreenReader) -> Result<()> {
         if !self.accessibility_announcement_ready() {
+            self.pending_tmux_location_announcement = None;
             self.pending_view_announcement = true;
             return Ok(());
         }

@@ -1869,8 +1869,13 @@ impl App {
         connection_id: u64,
     ) -> Result<()> {
         if !self.accessibility_announcement_ready() {
-            self.pending_view_announcement = true;
+            if !self.pending_view_announcement {
+                self.pending_tmux_location_announcement = Some(connection_id);
+            }
             return Ok(());
+        }
+        if self.pending_tmux_location_announcement == Some(connection_id) {
+            self.pending_tmux_location_announcement = None;
         }
         let Some((previous, current)) = self
             .tmux_connections
@@ -1916,31 +1921,6 @@ impl App {
             Some(_) => {}
         }
         Ok(())
-    }
-
-    fn announce_deferred_view_change(&mut self, sr: &mut ScreenReader) -> Result<()> {
-        let active_connection_id = self
-            .view_stack
-            .active_tmux_connection_mut()
-            .map(|connection| connection.connection_id());
-        let tmux_location_pending = active_connection_id.is_some_and(|connection_id| {
-            self.tmux_connections
-                .iter()
-                .find(|connection| connection.id == connection_id)
-                .and_then(|connection| {
-                    let current = connection.topology.attached_location()?;
-                    Some(connection.last_announced_location.as_ref() != Some(&current))
-                })
-                .unwrap_or(false)
-        });
-        if tmux_location_pending {
-            self.pending_view_announcement = false;
-            return self.announce_tmux_location_change(
-                sr,
-                active_connection_id.expect("a pending tmux location has a connection"),
-            );
-        }
-        self.announce_view_change(sr)
     }
 
     fn process_or_defer_tmux_pane_output(
@@ -2956,7 +2936,11 @@ impl App {
         self.handle_view_action(sr, tick_action, term_out)?;
         self.drain_tmux_background_output(sr, term_out)?;
         if self.pending_view_announcement && self.accessibility_announcement_ready() {
-            self.announce_deferred_view_change(sr)?;
+            self.announce_view_change(sr)?;
+        } else if let Some(connection_id) = self.pending_tmux_location_announcement
+            && self.accessibility_announcement_ready()
+        {
+            self.announce_tmux_location_change(sr, connection_id)?;
         }
         if let Some(target) = self.pending_active_view_read {
             let logical = self.view_stack.logical_active_view_id();

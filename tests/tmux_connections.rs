@@ -554,6 +554,46 @@ fn tmux_title_change_in_place_stays_silent_after_the_matching_physical_frame() {
 }
 
 #[test]
+fn transient_tmux_title_change_that_reverts_before_flush_stays_silent() {
+    let (mut app, mut sr, recorder, mut physical) = app();
+    let mut router = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        inventory("work", "bash", "pane", "/dev/ttys-one"),
+        "PANE CONTENTS",
+    );
+    recorder.0.borrow_mut().clear();
+    physical.clear();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+
+    // tmux's automatic-rename option commonly performs exactly this pair
+    // around a short-lived command: name the window for the command, then
+    // restore the shell name before Lector's pending frame is presented.
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%window-renamed @10 transient-command\n%window-renamed @10 bash\n",
+        &mut physical,
+    );
+    assert!(recorder.0.borrow().is_empty());
+
+    let report = app
+        .drain_scheduled_output(&mut physical, false)
+        .expect("present the reverted title");
+    assert!(!report.completed_renders.is_empty());
+    let mut root = Vec::new();
+    app.handle_tick(&mut sr, &mut root, &mut physical)
+        .expect("finish the reverted title update");
+    assert!(recorder.0.borrow().is_empty());
+}
+
+#[test]
 fn connection_chooser_switches_connections_and_survives_selected_removal() {
     let (mut app, mut sr, _recorder, mut physical) = app();
     let mut first = TmuxGatewayRouter::with_first_connection_id(1);

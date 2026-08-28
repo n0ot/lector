@@ -1140,6 +1140,7 @@ pub struct App {
     presented_accessibility_label: Option<String>,
     presented_accessibility_label_tracks_terminal_title: bool,
     pending_view_announcement: bool,
+    pending_tmux_location_announcement: Option<u64>,
     pending_active_view_read: Option<ViewId>,
     physical_profile: PhysicalTerminalProfile,
     startup_probe_broker: Option<StartupProbeBroker>,
@@ -1558,6 +1559,7 @@ impl App {
             presented_accessibility_label: None,
             presented_accessibility_label_tracks_terminal_title: false,
             pending_view_announcement: false,
+            pending_tmux_location_announcement: None,
             pending_active_view_read: None,
             physical_profile,
             startup_probe_broker: None,
@@ -2375,8 +2377,9 @@ impl App {
     }
 
     pub fn wants_tick(&mut self) -> bool {
-        let presented_transition_ready =
-            self.pending_view_announcement && self.accessibility_announcement_ready();
+        let presented_transition_ready = (self.pending_view_announcement
+            || self.pending_tmux_location_announcement.is_some())
+            && self.accessibility_announcement_ready();
         let pending_read_ready = self.pending_active_view_read.is_some()
             && self.pending_active_view_read == self.presented_accessibility_view
             && self.logical_accessibility_view_is_presented();
