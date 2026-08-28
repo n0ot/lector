@@ -403,14 +403,33 @@ impl LuaReplView {
         self.rendered_cursor = 0;
     }
 
-    fn apply_editor_action(&mut self, action: EditorAction) -> Result<ViewAction> {
+    fn apply_editor_action(
+        &mut self,
+        action: EditorAction,
+        deleted_text: Option<String>,
+        sr: &mut ScreenReader,
+    ) -> Result<ViewAction> {
         match action {
             EditorAction::Submit => self.submit_input(),
             EditorAction::Changed => {
                 if !self.try_append_input() {
                     self.apply_editor_update();
                 }
-                Ok(ViewAction::Redraw)
+                if let Some(text) = deleted_text {
+                    // The global Backspace binding may have captured a
+                    // screen-derived candidate before dispatch reached this
+                    // overlay. The owned buffer is authoritative here; do not
+                    // announce both candidates.
+                    sr.clear_pending_delete();
+                    sr.speak(&text, false)?;
+                    // The exact removed grapheme came from the owned editor
+                    // buffer. Reading the visual replacement as well is both
+                    // redundant and wrong for a horizontally scrolling input
+                    // window, where the cursor can remain at the margin.
+                    Ok(ViewAction::RedrawSilently)
+                } else {
+                    Ok(ViewAction::Redraw)
+                }
             }
             EditorAction::Bell => Ok(ViewAction::Bell),
             EditorAction::None => Ok(ViewAction::None),
@@ -467,8 +486,12 @@ impl ViewController for LuaReplView {
         if input == b"\x15" {
             return Ok(self.clear_current_line());
         }
+        let deleted_text = {
+            let state = self.session.state.borrow();
+            legacy_deleted_text(&state.editor, input)
+        };
         let action = self.session.state.borrow_mut().editor.handle_bytes(input);
-        self.apply_editor_action(action)
+        self.apply_editor_action(action, deleted_text, sr)
     }
 
     fn handle_key_input(
@@ -501,8 +524,12 @@ impl ViewController for LuaReplView {
         if matches!(key.control_code(), Some(0x15)) {
             return Ok(self.clear_current_line());
         }
+        let deleted_text = {
+            let state = self.session.state.borrow();
+            key_deleted_text(&state.editor, key)
+        };
         let action = self.session.state.borrow_mut().editor.handle_key_input(key);
-        self.apply_editor_action(action)
+        self.apply_editor_action(action, deleted_text, sr)
     }
 
     fn handle_paste(
@@ -522,7 +549,7 @@ impl ViewController for LuaReplView {
             .borrow_mut()
             .editor
             .handle_text(&contents);
-        self.apply_editor_action(action)
+        self.apply_editor_action(action, None, sr)
     }
 
     fn tick(&mut self, sr: &mut ScreenReader, _pty_stream: &mut dyn Write) -> Result<ViewAction> {
@@ -551,6 +578,47 @@ impl ViewController for LuaReplView {
         self.view.set_size(rows, cols);
         self.render_full();
     }
+}
+
+fn legacy_deleted_text(editor: &LineEditor, input: &[u8]) -> Option<String> {
+    match input {
+        b"\x7f" | b"\x08" => grapheme_before_cursor(editor),
+        b"\x1b[3~" => grapheme_at_cursor(editor),
+        _ => None,
+    }
+}
+
+fn key_deleted_text(editor: &LineEditor, key: &KeyInput) -> Option<String> {
+    use terminput::{KeyCode, KeyModifiers};
+
+    let event = key.normalized_event();
+    match event.code {
+        KeyCode::Backspace
+            if !event
+                .modifiers
+                .intersects(KeyModifiers::CTRL | KeyModifiers::ALT | KeyModifiers::META) =>
+        {
+            grapheme_before_cursor(editor)
+        }
+        KeyCode::Delete => grapheme_at_cursor(editor),
+        _ => None,
+    }
+}
+
+fn grapheme_before_cursor(editor: &LineEditor) -> Option<String> {
+    editor
+        .cursor()
+        .checked_sub(1)
+        .and_then(|index| editor.input().graphemes(true).nth(index))
+        .map(str::to_owned)
+}
+
+fn grapheme_at_cursor(editor: &LineEditor) -> Option<String> {
+    editor
+        .input()
+        .graphemes(true)
+        .nth(editor.cursor())
+        .map(str::to_owned)
 }
 
 enum CompileOutcome {
@@ -796,6 +864,22 @@ mod tests {
             .handle_input(&mut sr, b"\x04", &mut Vec::new())
             .expect("handle ctrl-d");
         assert!(matches!(action, crate::views::ViewAction::None));
+    }
+
+    #[test]
+    fn lua_repl_backspace_speaks_the_owned_character_when_input_scrolls_horizontally() {
+        let mut repl = LuaReplView::new(4, 8, Vec::new()).expect("create lua repl");
+        let (mut sr, speaks) = make_screen_reader();
+        enter(&mut repl, &mut sr, b"aaaaaam");
+        speaks.borrow_mut().clear();
+
+        let action = repl
+            .handle_input(&mut sr, b"\x7f", &mut Vec::new())
+            .expect("handle backspace");
+
+        assert!(matches!(action, crate::views::ViewAction::RedrawSilently));
+        assert_eq!(repl.session.state.borrow().editor.input(), "aaaaaa");
+        assert_eq!(speaks.borrow().as_slice(), ["m"]);
     }
 
     #[test]

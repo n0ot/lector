@@ -6447,6 +6447,30 @@ fn lua_repl_editing_is_protocol_invariant() {
 }
 
 #[test]
+fn lua_repl_horizontally_scrolled_backspace_speaks_the_deleted_character_only() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_stdin(&mut sr, b"\x1BL", &mut pty_out, &mut term_out)
+        .expect("open simulated REPL");
+    let mut input = vec![b'l'; 78];
+    input.push(b'm');
+    app.handle_stdin(&mut sr, &input, &mut pty_out, &mut term_out)
+        .expect("fill and horizontally scroll the simulated input widget");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x7f", &mut pty_out, &mut term_out)
+        .expect("delete at the stationary right margin");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("m".into(), false)]
+    );
+    assert!(pty_out.is_empty());
+}
+
+#[test]
 fn lua_repl_handles_kitty_special_keys_and_ignores_releases() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
@@ -6611,6 +6635,85 @@ fn backspace_waits_for_cursor_movement_before_speaking() {
     let _ = app.maybe_finalize_changes(&mut sr).expect("finalize");
 
     assert!(recorder.inner.borrow().speaks.is_empty());
+}
+
+#[test]
+fn a_only_prompt_boundary_ignores_empty_backspace_but_preserves_real_deletions() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    // Model the split prompt observed from Bash after a screen-filling
+    // command: OSC 133 A arrives, the visible prompt follows later, and this
+    // prompt cycle omits B.
+    app.handle_pty(&mut sr, b"\x1b[24;1H\x1b]133;A\x07", &mut term_out)
+        .expect("queue prompt start");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present prompt start");
+    app.handle_pty(&mut sr, b"$ ", &mut term_out)
+        .expect("queue visible prompt");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present visible prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize prompt")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x7f\r", &mut pty_out, &mut term_out)
+        .expect("press Backspace then Enter at empty input");
+    app.handle_pty(&mut sr, b"\x07\r\n", &mut term_out)
+        .expect("queue ignored Backspace and Enter response");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present ignored Backspace and Enter response");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    let _ = app
+        .maybe_finalize_changes(&mut sr)
+        .expect("finalize ignored Backspace and Enter response");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    app.handle_pty(&mut sr, b"\x1b]133;A\x07$ ", &mut term_out)
+        .expect("queue next A-only prompt");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present next A-only prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize next prompt")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"x", &mut pty_out, &mut term_out)
+        .expect("type real input");
+    app.handle_pty(&mut sr, b"x", &mut term_out)
+        .expect("queue real input echo");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present real input echo");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).expect("finalize x"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x7f", &mut pty_out, &mut term_out)
+        .expect("delete real input");
+    app.handle_pty(&mut sr, b"\x08\x1b[P", &mut term_out)
+        .expect("queue real deletion echo");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present real deletion echo");
+    assert!(
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("announce deletion before quiet finalization")
+    );
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("x".into(), false)]
+    );
+    assert_eq!(pty_out, b"\x7f\rx\x7f");
 }
 
 #[test]

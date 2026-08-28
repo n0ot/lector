@@ -67,6 +67,14 @@ struct ReviewSelection {
     cursor: (u16, u16),
 }
 
+#[derive(Clone, Copy)]
+struct FallbackSemanticInput {
+    prompt_count: usize,
+    prompt_mark: Osc133Mark,
+    position: HistoryPosition,
+    frozen: bool,
+}
+
 enum AccessibilityReadState {
     Live,
     /// Accessibility keeps reading the last committed model while the parser
@@ -322,6 +330,7 @@ pub struct View {
     review_cursor_indent_level: u16,
     application_cursor_indent_level: u16,
     application_semantic_indent_level: u16,
+    fallback_semantic_input: Option<FallbackSemanticInput>,
     cached_full: String,
     cached_prev_full: String,
     cached_full_valid: bool,
@@ -404,6 +413,7 @@ impl View {
             review_cursor_indent_level: 0,
             application_cursor_indent_level: 0,
             application_semantic_indent_level: 0,
+            fallback_semantic_input: None,
             cached_full: String::new(),
             cached_prev_full: String::new(),
             cached_full_valid: false,
@@ -717,6 +727,9 @@ impl View {
         if review_cursor_position != self.review_cursor_position {
             self.clear_review_mark();
         }
+        if !self.presentation_tracking {
+            self.refresh_fallback_semantic_input();
+        }
         batch_update
     }
 
@@ -1004,6 +1017,7 @@ impl View {
             ApplicationAccessibilityPolicy::default()
         };
         self.install_presented_snapshot(snapshot, caught_up);
+        self.refresh_fallback_semantic_input();
         self.publish_accessibility_evidence(accessibility_epoch, frame_revision);
         if self.unpresented_synchronized_output {
             // Exact journal entries from an atomic transaction already require
@@ -2400,6 +2414,85 @@ impl View {
         &self.screen().semantic_marks
     }
 
+    fn active_semantic_input_start(&self) -> Option<HistoryPosition> {
+        let alternate_screen = self.screen().alternate_screen();
+        let latest_mark = self
+            .osc133_marks()
+            .iter()
+            .rev()
+            .find(|mark| mark.alternate_screen == alternate_screen)?;
+        matches!(latest_mark.kind, Osc133Kind::InputStart).then_some(latest_mark.position)
+    }
+
+    fn refresh_fallback_semantic_input(&mut self) {
+        let alternate_screen = self.screen().alternate_screen();
+        let (prompt_count, latest_mark) =
+            semantic_mark_summary(&self.screen().semantic_marks, alternate_screen);
+        let Some(prompt_mark) = latest_mark.copied() else {
+            self.fallback_semantic_input = None;
+            return;
+        };
+        if !matches!(prompt_mark.kind, Osc133Kind::PromptStart) {
+            self.fallback_semantic_input = None;
+            return;
+        }
+
+        let (row, col) = self.screen().cursor_position();
+        let position = HistoryPosition {
+            row: self.scrollback_len() + usize::from(row),
+            col,
+        };
+        match &mut self.fallback_semantic_input {
+            Some(fallback)
+                if fallback.prompt_count == prompt_count && fallback.prompt_mark == prompt_mark =>
+            {
+                if !fallback.frozen {
+                    fallback.position = position;
+                }
+            }
+            fallback => {
+                *fallback = Some(FallbackSemanticInput {
+                    prompt_count,
+                    prompt_mark,
+                    position,
+                    frozen: false,
+                });
+            }
+        }
+    }
+
+    /// Freezes an inferred input boundary before application-caused output can
+    /// move the cursor. Some shell integrations emit OSC 133 A but omit B on
+    /// later prompts; until the first forwarded input, each presented prompt
+    /// fragment can safely advance the inferred end of that prompt.
+    pub(crate) fn note_forwarded_application_input(&mut self) {
+        if let Some(fallback) = &mut self.fallback_semantic_input {
+            fallback.frozen = true;
+        }
+    }
+
+    /// Whether a screen-relative cursor position is at or before the active
+    /// OSC 133 input boundary. Readline leaves the prompt immediately before
+    /// this boundary, so Backspace must not treat a prompt cell as editable
+    /// input when the command line is empty (including queued Backspaces
+    /// whose earlier echoes have not reached presentation yet).
+    pub(crate) fn position_at_or_before_active_semantic_input(
+        &self,
+        (row, col): (u16, u16),
+    ) -> bool {
+        let input_start = self.active_semantic_input_start().or_else(|| {
+            self.fallback_semantic_input
+                .map(|fallback| fallback.position)
+        });
+        let Some(input_start) = input_start else {
+            return false;
+        };
+        HistoryPosition {
+            row: self.scrollback_len() + usize::from(row),
+            col,
+        } <= input_start
+    }
+
     /// Returns the most recently submitted command line delimited by OSC 133
     /// B/C, excluding the prompt. This describes submitted input, not a
     /// transient Readline history selection that has not been executed.
@@ -2434,25 +2527,7 @@ impl View {
     /// history selection, but the original marker remains a reliable prompt
     /// boundary while Up/Down redraw the text after it.
     pub fn active_semantic_input(&mut self) -> Option<String> {
-        let alternate_screen = self.screen().alternate_screen();
-        let current_marks: Vec<_> = self
-            .osc133_marks()
-            .iter()
-            .filter(|mark| mark.alternate_screen == alternate_screen)
-            .collect();
-        let input_start = current_marks
-            .iter()
-            .rev()
-            .find_map(|mark| match mark.kind {
-                Osc133Kind::InputStart => Some(mark.position),
-                Osc133Kind::PromptStart
-                | Osc133Kind::CommandStart
-                | Osc133Kind::CommandFinished { .. } => None,
-            })?;
-        let latest_phase = current_marks.last()?.kind;
-        if !matches!(latest_phase, Osc133Kind::InputStart) {
-            return None;
-        }
+        let input_start = self.active_semantic_input_start()?;
         let (cursor_row, cursor_col) = self.screen().cursor_position();
         let last_col = self.size().1.saturating_sub(1);
         let input_end_col = self

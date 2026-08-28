@@ -1189,6 +1189,139 @@ mod tests {
     }
 
     #[test]
+    fn backspace_at_empty_semantic_input_does_not_delete_the_prompt_space() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(1, 10);
+
+        // Some Bash/Ghostty prompt cycles emit A but omit B, and the visible
+        // prompt can arrive in a later PTY read.
+        view.process_changes(b"\x1b]133;A\x07");
+        view.finalize_changes(0);
+        view.process_changes(b"$ ");
+        view.finalize_changes(0);
+        sr.defer_backspace(&view);
+
+        // Enter at the bottom of the screen scrolls away the prompt before
+        // the replacement prompt is drawn. That changed row and leftward
+        // cursor used to confirm a deletion of the prompt's trailing space.
+        view.process_changes(b"\r\n");
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert!(speaks.borrow().is_empty());
+        assert!(sr.pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn incompatible_redraw_discards_an_unobserved_markerless_backspace() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(1, 10);
+
+        // With no semantic markers, the prompt's trailing space is initially
+        // indistinguishable from editable input. An unrelated redraw changes
+        // the protected prefix, so it cannot be evidence for that deletion.
+        view.process_changes(b"$ ");
+        view.finalize_changes(0);
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        assert_eq!(sr.pending_deletes.len(), 1);
+
+        view.process_changes(b"\r#");
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert!(sr.pending_deletes.is_empty());
+        assert!(speaks.borrow().is_empty());
+
+        // Once contradicted, the stale intent cannot be resurrected by a
+        // later frame which happens to resemble a deletion.
+        view.process_changes(b"\r$ ");
+        view.process_changes(b"\x08\x1b[P");
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn backspace_crossing_a_soft_wrap_announces_the_preceding_row_character() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(3, 5);
+
+        // "abcde" soft-wraps, with the cursor moved before "f" at the
+        // beginning of the continuation row.
+        view.process_changes(b"abcdef\x1b[D");
+        view.finalize_changes(0);
+        assert_eq!(view.screen().cursor_position(), (1, 0));
+        assert!(view.screen().row_wrapped(0));
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        // Simulate removing "e", shifting "f" left, and placing the cursor
+        // where the removed character began.
+        view.process_changes(b"\x1b[1;5Hf\x1b[2;1H \x1b[1;5H");
+
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["e"]);
+    }
+
+    #[test]
+    fn backspace_crossing_an_explicitly_drawn_wrap_announces_the_previous_row_character() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(3, 8);
+
+        // Simulate a full-screen input widget. Its first row reaches the
+        // margin, but it explicitly positions the cursor after a two-cell
+        // indentation on an unwrapped terminal row.
+        view.process_changes(b"> aaaaaa\x1b[2;1H  ");
+        view.finalize_changes(0);
+        assert_eq!(view.screen().cursor_position(), (1, 2));
+        assert!(!view.screen().row_wrapped(0));
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        view.process_changes(b"\x1b[1;8H \x1b[1;8H");
+
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["a"]);
+    }
+
+    #[test]
+    fn backspace_in_a_horizontally_scrolling_editor_uses_the_changed_margin_cell() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(1, 8);
+
+        // The editor pins its cursor to the right margin. Deleting "m" keeps
+        // the cursor stationary and reveals another "a" in that cell. The
+        // character to the cursor's left is also "a" and must not be spoken.
+        view.process_changes(b"> aaaaam");
+        view.finalize_changes(0);
+        assert_eq!(view.screen().cursor_position(), (0, 7));
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        view.process_changes(b"\r> aaaaaa");
+
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["m"]);
+    }
+
+    #[test]
+    fn queued_backspaces_stop_at_the_semantic_input_boundary() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(1, 10);
+
+        view.process_changes(b"\x1b]133;A\x07$ ");
+        view.finalize_changes(0);
+        view.note_forwarded_application_input();
+        view.process_changes(b"x");
+        view.finalize_changes(1);
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        view.process_changes(b"\x08\x1b[P");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["x"]);
+        assert!(sr.pending_deletes.is_empty());
+    }
+
+    #[test]
     fn deferred_backspace_stays_pending_after_cursor_only_partial_echo() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
@@ -1332,6 +1465,64 @@ mod tests {
         assert!(sr.resolve_pending_delete(&view).unwrap());
         assert!(!sr.resolve_pending_delete(&view).unwrap());
         assert_eq!(speaks.borrow().as_slice(), ["c", "b"]);
+    }
+
+    #[test]
+    fn queued_backspaces_can_settle_in_multiple_multi_delete_frames() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 12);
+        view.process_changes(b"abcde");
+        view.finalize_changes(0);
+
+        for _ in 0..5 {
+            sr.record_last_key(b"\x7f");
+            sr.defer_backspace(&view);
+        }
+
+        // The application publishes only the first three deletions. The
+        // remaining two intents have not started; they are neither confirmed
+        // nor contradicted by this frame.
+        view.process_changes(b"\x08\x1b[P\x08\x1b[P\x08\x1b[P");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["e", "d", "c"]);
+        assert_eq!(sr.pending_deletes.len(), 2);
+
+        view.process_changes(b"\x08\x1b[P\x08\x1b[P");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["e", "d", "c", "b", "a"]);
+        assert!(sr.pending_deletes.is_empty());
+    }
+
+    #[test]
+    fn queued_backspaces_can_settle_across_an_explicitly_drawn_row_boundary() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(3, 8);
+
+        // Simulate a TUI input widget with a hard terminal row and a two-cell
+        // continuation indent. The logical input is "abcdefgh".
+        view.process_changes(b"> abcde\x1b[2;1H  fgh");
+        view.finalize_changes(0);
+        assert_eq!(view.screen().cursor_position(), (1, 5));
+        assert!(!view.screen().row_wrapped(0));
+
+        for _ in 0..5 {
+            sr.record_last_key(b"\x7f");
+            sr.defer_backspace(&view);
+        }
+
+        // The first presentation removes h, g, and f, stopping at the
+        // continuation origin without changing the preceding hard row.
+        view.process_changes(b"\x1b[2;3H   \x1b[2;3H");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["h", "g", "f"]);
+        assert_eq!(sr.pending_deletes.len(), 2);
+
+        // The next presentation traverses the drawn row boundary and removes
+        // e and d from the preceding row.
+        view.process_changes(b"\x1b[1;6H  \x1b[1;6H");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["h", "g", "f", "e", "d"]);
+        assert!(sr.pending_deletes.is_empty());
     }
 
     #[test]

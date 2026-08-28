@@ -91,6 +91,15 @@ impl App {
         action: views::ViewAction,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        if matches!(
+            &action,
+            views::ViewAction::PtyInput | views::ViewAction::TmuxInput { .. }
+        ) {
+            self.view_stack
+                .active_mut()
+                .model()
+                .note_forwarded_application_input();
+        }
         match action {
             views::ViewAction::PtyInput => {
                 self.last_stdin_update = Some(self.clock.now_ms());
