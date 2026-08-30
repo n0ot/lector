@@ -332,11 +332,12 @@ types are ignored. A host MUST preserve event order on stdout.
 ## 9. Lector playback and queue semantics
 
 Lector's manager has at most one host-active utterance and a queue of
-never-submitted utterances. The queue retains at most 32 utterances and 256 KiB
-of text; adding beyond either limit evicts the oldest pending utterances. Its
-evidence-backed states distinguish natural idle, active playback, explicit
-suspension, replacement, cancellation, paragraph delay, and suspension before
-the next paragraph.
+never-submitted utterances. The queue retains at most 256 KiB of accounted
+storage—including text, IDs, and per-item bookkeeping—without an independent
+utterance-count limit; adding beyond the byte limit evicts the oldest pending
+utterances. Its evidence-backed states distinguish natural idle, active
+playback, explicit suspension, replacement, cancellation, paragraph delay, and
+suspension before the next paragraph.
 
 - Reliable `ended` evidence transitions active playback to the next queued
   item.

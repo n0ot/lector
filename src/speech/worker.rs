@@ -19,7 +19,6 @@ use std::{
 
 use super::SpeechServerSpec;
 
-const MAX_PENDING_SPEECH_ITEMS: usize = 32;
 const MAX_PENDING_SPEECH_BYTES: usize = 256 * 1024;
 const MAX_SPEECH_ITEM_BYTES: usize = 64 * 1024;
 const TRUNCATION_SUFFIX: &str = " … speech truncated";
@@ -45,7 +44,9 @@ enum Request {
 impl Request {
     fn speech_bytes(&self) -> usize {
         match self {
-            Self::Speak { text, .. } => text.len(),
+            Self::Speak { id, text, .. } => std::mem::size_of::<Self>()
+                .saturating_add(id.as_str().len())
+                .saturating_add(text.len()),
             Self::Cancel
             | Self::Pause
             | Self::Resume
@@ -124,7 +125,13 @@ impl Mailbox {
         boundary: UtteranceBoundary,
     ) -> DriverResult<()> {
         let text = bounded_text(text, MAX_SPEECH_ITEM_BYTES);
-        let text_bytes = text.len();
+        let request = Request::Speak {
+            id: id.clone(),
+            text,
+            interrupt,
+            boundary,
+        };
+        let speech_bytes = request.speech_bytes();
         let mut state = self.lock()?;
         if state.shutdown {
             return Ok(());
@@ -140,9 +147,7 @@ impl Mailbox {
             });
         }
         let mut dropped = 0usize;
-        while state.speech_items == MAX_PENDING_SPEECH_ITEMS
-            || state.speech_bytes.saturating_add(text_bytes) > MAX_PENDING_SPEECH_BYTES
-        {
+        while state.speech_bytes.saturating_add(speech_bytes) > MAX_PENDING_SPEECH_BYTES {
             let Some(index) = state.requests.iter().position(Request::is_speech) else {
                 break;
             };
@@ -152,13 +157,8 @@ impl Mailbox {
         }
 
         state.speech_items = state.speech_items.saturating_add(1);
-        state.speech_bytes = state.speech_bytes.saturating_add(text_bytes);
-        state.requests.push_back(Request::Speak {
-            id: id.clone(),
-            text,
-            interrupt,
-            boundary,
-        });
+        state.speech_bytes = state.speech_bytes.saturating_add(speech_bytes);
+        state.requests.push_back(request);
         let dropped_total = state.dropped_speech_items;
         drop(state);
         self.available.notify_one();
@@ -579,8 +579,8 @@ fn bounded_text(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedAsyncDriver, Driver, MAX_PENDING_SPEECH_BYTES, MAX_PENDING_SPEECH_ITEMS,
-        MAX_SPEECH_ITEM_BYTES, Mailbox, NextRequest, Request, UtteranceId,
+        BoundedAsyncDriver, Driver, MAX_PENDING_SPEECH_BYTES, MAX_SPEECH_ITEM_BYTES, Mailbox,
+        NextRequest, Request, UtteranceId,
     };
     use std::{
         sync::mpsc,
@@ -639,8 +639,7 @@ mod tests {
                 .unwrap();
         }
         assert!(start.elapsed() < Duration::from_secs(1));
-        let (items, bytes, dropped) = driver.mailbox.usage();
-        assert!(items <= MAX_PENDING_SPEECH_ITEMS);
+        let (_, bytes, dropped) = driver.mailbox.usage();
         assert!(bytes <= MAX_PENDING_SPEECH_BYTES);
         assert!(dropped > 0);
 
@@ -648,6 +647,29 @@ mod tests {
         drop(driver);
         assert!(drop_started.elapsed() < Duration::from_millis(100));
         shutdown_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn blocked_backend_preserves_more_than_thirty_two_small_announcements() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let mut driver = BoundedAsyncDriver::new(BlockingDriver {
+            started: started_tx,
+            release: release_rx,
+        })
+        .unwrap();
+        driver.speak("block", false).unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        for index in 0..64 {
+            driver.speak(&format!("message {index}"), false).unwrap();
+        }
+        let (items, bytes, dropped) = driver.mailbox.usage();
+        assert_eq!(items, 64);
+        assert!(bytes < MAX_PENDING_SPEECH_BYTES);
+        assert_eq!(dropped, 0);
+
+        release_tx.send(()).unwrap();
     }
 
     #[test]
@@ -677,6 +699,22 @@ mod tests {
 
     #[test]
     fn truncation_preserves_utf8_and_rate_validation_is_local() {
+        let mailbox = Mailbox::new();
+        mailbox
+            .enqueue_speech(
+                &UtteranceId::new("long"),
+                &"é".repeat(MAX_SPEECH_ITEM_BYTES),
+                false,
+            )
+            .unwrap();
+        let NextRequest::Request(Request::Speak { text, .. }) =
+            mailbox.next_request(Duration::ZERO)
+        else {
+            panic!("bounded speech request was not queued");
+        };
+        assert!(text.len() <= MAX_SPEECH_ITEM_BYTES);
+        assert!(text.is_char_boundary(text.len()));
+
         let (started_tx, _started_rx) = mpsc::sync_channel(1);
         let (_release_tx, release_rx) = mpsc::sync_channel(1);
         let mut driver = BoundedAsyncDriver::new(BlockingDriver {
@@ -684,10 +722,6 @@ mod tests {
             release: release_rx,
         })
         .unwrap();
-        driver
-            .speak(&"é".repeat(MAX_SPEECH_ITEM_BYTES), false)
-            .unwrap();
-        assert!(driver.mailbox.usage().1 <= MAX_SPEECH_ITEM_BYTES);
         assert!(driver.set_rate(f32::NAN).is_err());
         assert_eq!(driver.get_rate(), 1.0);
     }

@@ -22,7 +22,6 @@ use std::{
 
 const CRASH_WINDOW: Duration = Duration::from_secs(30);
 const MAX_EVENTS: usize = 32;
-const MAX_PENDING_SPEECH_ITEMS: usize = 32;
 const MAX_PENDING_SPEECH_BYTES: usize = 256 * 1024;
 const MAX_PENDING_SPEECH_ITEM_BYTES: usize = 64 * 1024;
 const TRUNCATION_SUFFIX: &str = " … speech truncated";
@@ -269,6 +268,14 @@ struct PendingSpeech {
     boundary: UtteranceBoundary,
 }
 
+impl PendingSpeech {
+    fn queue_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.id.as_str().len())
+            .saturating_add(self.text.len())
+    }
+}
+
 /// Owns the selected process-backed speech server and its recovery policy.
 ///
 /// Construction is deferred: no process is created until [`Driver::start`].
@@ -405,8 +412,9 @@ impl Supervisor {
 
     fn flush_pending_speech(&mut self) -> DriverResult<()> {
         while let Some(pending) = self.pending_speech.pop_front() {
-            self.pending_speech_bytes =
-                self.pending_speech_bytes.saturating_sub(pending.text.len());
+            self.pending_speech_bytes = self
+                .pending_speech_bytes
+                .saturating_sub(pending.queue_bytes());
             if let Err(error) = self.call_managed("speak", move |manager, host| {
                 manager.submit_with_boundary(
                     host,
@@ -452,21 +460,23 @@ impl Supervisor {
             self.pending_speech_paused = false;
         }
         let text = bounded_text(text, MAX_PENDING_SPEECH_ITEM_BYTES);
-        while self.pending_speech.len() == MAX_PENDING_SPEECH_ITEMS
-            || self.pending_speech_bytes.saturating_add(text.len()) > MAX_PENDING_SPEECH_BYTES
-        {
-            let Some(stale) = self.pending_speech.pop_front() else {
-                break;
-            };
-            self.pending_speech_bytes = self.pending_speech_bytes.saturating_sub(stale.text.len());
-        }
-        self.pending_speech_bytes = self.pending_speech_bytes.saturating_add(text.len());
-        self.pending_speech.push_back(PendingSpeech {
+        let pending = PendingSpeech {
             id,
             text,
             interrupt,
             boundary,
-        });
+        };
+        let pending_bytes = pending.queue_bytes();
+        while self.pending_speech_bytes.saturating_add(pending_bytes) > MAX_PENDING_SPEECH_BYTES {
+            let Some(stale) = self.pending_speech.pop_front() else {
+                break;
+            };
+            self.pending_speech_bytes = self
+                .pending_speech_bytes
+                .saturating_sub(stale.queue_bytes());
+        }
+        self.pending_speech_bytes = self.pending_speech_bytes.saturating_add(pending_bytes);
+        self.pending_speech.push_back(pending);
     }
 
     fn ensure_available(&self) -> DriverResult<()> {
@@ -1149,18 +1159,15 @@ mod tests {
     }
 
     #[test]
-    fn prestart_speech_is_bounded_flushed_and_cleared_by_cancel() {
+    fn prestart_speech_preserves_more_than_thirty_two_items_and_is_cleared_by_cancel() {
         let mut harness = Harness::new();
-        for index in 0..(MAX_PENDING_SPEECH_ITEMS + 5) {
+        for index in 0..64 {
             harness
                 .supervisor
                 .speak(&format!("message {index}"), false)
                 .unwrap();
         }
-        assert_eq!(
-            harness.supervisor.pending_speech.len(),
-            MAX_PENDING_SPEECH_ITEMS
-        );
+        assert_eq!(harness.supervisor.pending_speech.len(), 64);
         harness.supervisor.stop().unwrap();
         assert!(harness.supervisor.pending_speech.is_empty());
 

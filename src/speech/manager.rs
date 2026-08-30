@@ -15,7 +15,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_PENDING_UTTERANCES: usize = 32;
 const MAX_PENDING_BYTES: usize = 256 * 1024;
 pub(crate) const PARAGRAPH_PAUSE: Duration = Duration::from_millis(200);
 
@@ -46,6 +45,12 @@ struct Utterance {
 impl Utterance {
     fn new(id: UtteranceId, text: String, boundary: UtteranceBoundary) -> Self {
         Self { id, text, boundary }
+    }
+
+    fn queue_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.id.as_str().len())
+            .saturating_add(self.text.len())
     }
 }
 
@@ -570,26 +575,32 @@ impl SpeechManager {
     }
 
     fn enqueue(&mut self, utterance: Utterance) {
-        while self.pending.len() == MAX_PENDING_UTTERANCES
-            || self.pending_bytes.saturating_add(utterance.text.len()) > MAX_PENDING_BYTES
-        {
+        let utterance_bytes = utterance.queue_bytes();
+        while self.pending_bytes.saturating_add(utterance_bytes) > MAX_PENDING_BYTES {
             let Some(stale) = self.pending.pop_front() else {
                 break;
             };
-            self.pending_bytes = self.pending_bytes.saturating_sub(stale.text.len());
+            self.pending_bytes = self.pending_bytes.saturating_sub(stale.queue_bytes());
         }
-        self.pending_bytes = self.pending_bytes.saturating_add(utterance.text.len());
+        self.pending_bytes = self.pending_bytes.saturating_add(utterance_bytes);
         self.pending.push_back(utterance);
     }
 
     fn pop_pending(&mut self) -> Option<Utterance> {
         let next = self.pending.pop_front()?;
-        self.pending_bytes = self.pending_bytes.saturating_sub(next.text.len());
+        self.pending_bytes = self.pending_bytes.saturating_sub(next.queue_bytes());
         Some(next)
     }
 
     fn enqueue_front(&mut self, utterance: Utterance) {
-        self.pending_bytes = self.pending_bytes.saturating_add(utterance.text.len());
+        let utterance_bytes = utterance.queue_bytes();
+        while self.pending_bytes.saturating_add(utterance_bytes) > MAX_PENDING_BYTES {
+            let Some(stale) = self.pending.pop_back() else {
+                break;
+            };
+            self.pending_bytes = self.pending_bytes.saturating_sub(stale.queue_bytes());
+        }
+        self.pending_bytes = self.pending_bytes.saturating_add(utterance_bytes);
         self.pending.push_front(utterance);
     }
 
@@ -852,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_queue_evicts_the_oldest_utterance_at_its_item_limit() {
+    fn pending_queue_preserves_more_than_thirty_two_utterances_within_its_byte_budget() {
         let mut manager = SpeechManager::default();
         let mut host = FakeHost::full();
         let active = UtteranceId::new("active");
@@ -860,7 +871,7 @@ mod tests {
             .submit(&mut host, active.clone(), "active".to_owned(), false)
             .unwrap();
 
-        for index in 0..=MAX_PENDING_UTTERANCES {
+        for index in 0..64 {
             manager
                 .submit(
                     &mut host,
@@ -870,13 +881,47 @@ mod tests {
                 )
                 .unwrap();
         }
+        assert_eq!(manager.pending.len(), 64);
+        assert_eq!(manager.pending.front().unwrap().id.as_str(), "pending-0");
+        assert_eq!(manager.pending.back().unwrap().id.as_str(), "pending-63");
         host.events.push(FakeHost::ended(&active, 1));
         manager.poll(&mut host).unwrap();
 
         assert_eq!(
             host.calls[1],
-            Call::Speak(UtteranceId::new("pending-1"), "pending 1".to_owned())
+            Call::Speak(UtteranceId::new("pending-0"), "pending 0".to_owned())
         );
+    }
+
+    #[test]
+    fn pending_queue_remains_byte_bounded_and_evicts_the_oldest_text() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+        manager
+            .submit(
+                &mut host,
+                UtteranceId::new("active"),
+                "active".to_owned(),
+                false,
+            )
+            .unwrap();
+
+        let text = "x".repeat(MAX_UTTERANCE_TEXT_BYTES);
+        for index in 0..5 {
+            manager
+                .submit(
+                    &mut host,
+                    UtteranceId::new(format!("pending-{index}")),
+                    text.clone(),
+                    false,
+                )
+                .unwrap();
+        }
+
+        assert!(manager.pending.len() < 5);
+        assert!(manager.pending_bytes <= MAX_PENDING_BYTES);
+        assert_ne!(manager.pending.front().unwrap().id.as_str(), "pending-0");
+        assert_eq!(manager.pending.back().unwrap().id.as_str(), "pending-4");
     }
 
     #[test]

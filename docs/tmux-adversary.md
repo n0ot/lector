@@ -85,7 +85,7 @@ The principal limits are:
 | Unanswered tmux commands | 512 replies per connection | Discard new commands until replies resume |
 | Recursively encoded nested command | 1 MiB / 4,096 commands | Discard that command; later input remains usable |
 | Accumulated tmux inventory | 8 MiB / 65,536 lines per connection | Reject inventory and retry/resync |
-| Proc speech mailbox | 256 KiB / 32 announcements | Drop oldest stale speech |
+| Proc speech mailbox | 256 KiB of accounted speech storage | Drop oldest stale speech |
 | Physical-output scheduler | 2 MiB by default | Replace/drop unstarted visual work; cap bells |
 | Diagnostic memory/file | 2 MiB / 16 MiB | Keep newest queue/file generation |
 
