@@ -442,20 +442,17 @@ impl UpdateSummary {
         &self,
         text: &mut String,
     ) -> Option<&LinearOutputReport> {
-        if self.parser_continuation {
-            return None;
-        }
-        let report = match &self.linear_output_effect {
-            LinearOutputEffect::Append(report) => report,
-            LinearOutputEffect::Replace(report) if report.independently_completes_record() => {
-                report
-            }
-            LinearOutputEffect::Preserve
-            | LinearOutputEffect::Replace(_)
-            | LinearOutputEffect::Clear => return None,
-        };
+        let report = self.readable_linear_output_report()?;
         printed_runs_text_into(&report.printed_runs, text);
         Some(report)
+    }
+
+    /// Whether the independently readable report accounts for every printable
+    /// run in this update. A suffix after an ambiguity barrier is safe to
+    /// announce, but it cannot by itself consume earlier printable output.
+    pub fn readable_linear_output_covers_printed_output(&self) -> bool {
+        self.readable_linear_output_report()
+            .is_some_and(|report| report.printed_runs == self.printed_runs)
     }
 
     /// Whether the parallel print observer retains ordinary primary-screen
@@ -473,6 +470,21 @@ impl UpdateSummary {
             LinearOutputEffect::Append(report) => report.completes_record(),
             LinearOutputEffect::Replace(report) => report.independently_completes_record(),
             LinearOutputEffect::Preserve | LinearOutputEffect::Clear => false,
+        }
+    }
+
+    fn readable_linear_output_report(&self) -> Option<&LinearOutputReport> {
+        if self.parser_continuation {
+            return None;
+        }
+        match &self.linear_output_effect {
+            LinearOutputEffect::Append(report) => Some(report),
+            LinearOutputEffect::Replace(report) if report.independently_completes_record() => {
+                Some(report)
+            }
+            LinearOutputEffect::Preserve
+            | LinearOutputEffect::Replace(_)
+            | LinearOutputEffect::Clear => None,
         }
     }
 }

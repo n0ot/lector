@@ -2798,6 +2798,11 @@ impl View {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn document_contents_cache_is_prepared_for_test(&self) -> bool {
+        self.cached_document_valid || self.cached_prev_document_valid
+    }
+
     /// Whether the active visible grid belongs to a newly introduced terminal
     /// context. These transitions invalidate the meaning of every visible row,
     /// so accessibility must read the new grid in full rather than diff it.

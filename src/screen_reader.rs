@@ -743,6 +743,48 @@ mod tests {
     }
 
     #[test]
+    fn completed_linear_output_after_history_growth_keeps_document_diff_lazy() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new_with_scrollback_for_test(2, 24, 128);
+        view.process_changes(b"first record\r\nsecond record\r\n");
+        view.finalize_changes(0);
+
+        view.process_changes(b"new tail record\r\n");
+
+        assert!(view.accessibility_document_changed());
+        assert!(view.accessibility_completes_linear_output_record());
+        assert!(!view.document_contents_cache_is_prepared_for_test());
+        assert!(sr.auto_read(&mut view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["new tail record"]);
+        assert!(
+            !view.document_contents_cache_is_prepared_for_test(),
+            "a validated tail record must not serialize retained history"
+        );
+    }
+
+    #[test]
+    fn completed_output_with_ambiguous_prefix_diffs_every_printed_line() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 40);
+        view.process_changes(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        view.finalize_changes(0);
+
+        // A horizontal tab is an ambiguity barrier because its destination
+        // depends on terminal tab stops. The suffix after the final tab is
+        // independently valid, but even a semantic command boundary cannot
+        // make it account for earlier output from the command.
+        view.process_changes(
+            b"cat ~/.bashrc\r\n\x1b]133;C;\x07first\tvalue\r\nsecond\r\n\ttail\r\n",
+        );
+
+        assert!(view.accessibility_completes_linear_output_record());
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("first"), "{spoken:?}");
+        assert!(spoken.contains("second"), "{spoken:?}");
+    }
+
+    #[test]
     fn structural_output_that_only_extends_the_visible_grid_reads_the_new_text() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(6, 40);

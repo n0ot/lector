@@ -7,6 +7,7 @@ pub(super) struct AutoReadBuffers {
     diff_text: String,
     graphemes: String,
     live_text: String,
+    printed_text: String,
     cursor_line: String,
     interface_state: String,
     interface_state_candidate: String,
@@ -59,9 +60,6 @@ impl ScreenReader {
         // unavailable, so fall back to an explicit visible-grid diff.
         let compare_document =
             view.accessibility_document_changed() && view.accessibility_document_is_continuous();
-        if compare_document {
-            view.prepare_document_contents_cache();
-        }
         let prev_cursor = view.prev_screen().cursor_position();
         let cursor = view.screen().cursor_position();
         if prefer_cursor && self.read_visual_focus_transfer(view)? {
@@ -78,6 +76,30 @@ impl ScreenReader {
             view.accessibility_update_summary()
                 .printed_text_into(&mut live_text);
         }
+        let linear_output_covers_printed_output = linear_output_report
+            && view
+                .accessibility_update_summary()
+                .readable_linear_output_covers_printed_output();
+        // A semantic command-start marker proves that the exact submitted
+        // input immediately before it is an echo, not application output. A
+        // safe suffix may consume that prefix. No other omitted print text is
+        // discardable: it may be ordinary output hidden by a later ambiguity
+        // barrier such as a tab.
+        let linear_output_omits_only_submitted_input =
+            if linear_output_report && !linear_output_covers_printed_output {
+                let mut printed_text = std::mem::take(&mut self.auto_read_buffers.printed_text);
+                view.accessibility_update_summary()
+                    .printed_text_into(&mut printed_text);
+                let submitted_input = printed_text
+                    .strip_suffix(&live_text)
+                    .and_then(|prefix| prefix.strip_suffix('\n'))
+                    .and_then(|prefix| view.last_submitted_input().filter(|input| input == prefix))
+                    .is_some();
+                self.auto_read_buffers.printed_text = printed_text;
+                submitted_input
+            } else {
+                false
+            };
         let validated_structural_line_report = {
             let update = view.accessibility_update_summary();
             let report = live_text.trim();
@@ -94,7 +116,9 @@ impl ScreenReader {
                     &mut self.auto_read_buffers.cursor_line,
                 )
         };
-        let readable_print_report = linear_output_report || validated_structural_line_report;
+        let readable_print_report = linear_output_covers_printed_output
+            || linear_output_omits_only_submitted_input
+            || validated_structural_line_report;
         let (print_cursor_moves, print_scrolled) =
             linear_output_metrics.unwrap_or((cursor_moves, scrolled));
         let completed_linear_record = view.accessibility_completes_linear_output_record();
@@ -103,7 +127,10 @@ impl ScreenReader {
         // boundary. Consume any matching echo and report it as handled so a
         // recent Enter does not fall through to cursor tracking or a
         // whitespace-only screen diff.
-        if completed_linear_record && live_text.trim().is_empty() {
+        if completed_linear_record
+            && (linear_output_covers_printed_output || linear_output_omits_only_submitted_input)
+            && live_text.trim().is_empty()
+        {
             self.should_suppress_key_echo(&live_text);
             self.auto_read_buffers.live_text = live_text;
             return Ok(true);
@@ -115,6 +142,7 @@ impl ScreenReader {
         // queued input character before a later word arrives.
         if !completed_linear_record {
             let presented_contents_unchanged = if compare_document {
+                view.prepare_document_contents_cache();
                 let (previous, current, previous_hashes, current_hashes) =
                     view.document_contents_cached();
                 previous_hashes == current_hashes && previous == current
@@ -177,6 +205,12 @@ impl ScreenReader {
         }
         self.auto_read_buffers.live_text = live_text;
 
+        // Everything above this boundary is independently validated live
+        // output. Only ambiguous updates which fall through to the snapshot
+        // diff may need retained history.
+        if compare_document {
+            view.prepare_document_contents_cache();
+        }
         let mut diff_text = std::mem::take(&mut self.auto_read_buffers.diff_text);
         diff_text.clear();
         let cursor_shape_changed = view.prev_screen().cursor.shape != view.screen().cursor.shape;
