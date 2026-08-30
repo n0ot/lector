@@ -337,6 +337,12 @@ pub struct View {
     cached_prev_full_valid: bool,
     cached_full_row_hashes: Vec<u64>,
     cached_prev_full_row_hashes: Vec<u64>,
+    cached_document: String,
+    cached_prev_document: String,
+    cached_document_valid: bool,
+    cached_prev_document_valid: bool,
+    cached_document_row_hashes: Vec<u64>,
+    cached_prev_document_row_hashes: Vec<u64>,
 }
 
 impl View {
@@ -350,9 +356,9 @@ impl View {
                 .unwrap_or_else(|error| {
                     panic!("could not create Ghostty terminal engine: {error}")
                 });
-        let cursor_position = engine.snapshot().cursor_position();
-        let prev_screen = engine.snapshot().clone();
         let committed_snapshot = engine.snapshot_with_history();
+        let cursor_position = committed_snapshot.cursor_position();
+        let prev_screen = committed_snapshot.clone();
         let presented_history_basis = PresentedHistoryBasis::from_snapshot(&committed_snapshot);
         View {
             view_id: ViewId(NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed)),
@@ -420,7 +426,22 @@ impl View {
             cached_prev_full_valid: false,
             cached_full_row_hashes: Vec::new(),
             cached_prev_full_row_hashes: Vec::new(),
+            cached_document: String::new(),
+            cached_prev_document: String::new(),
+            cached_document_valid: false,
+            cached_prev_document_valid: false,
+            cached_document_row_hashes: Vec::new(),
+            cached_prev_document_row_hashes: Vec::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_scrollback_for_test(
+        rows: u16,
+        cols: u16,
+        scrollback_lines: usize,
+    ) -> Self {
+        Self::new_with_scrollback(rows, cols, scrollback_lines)
     }
 
     /// Processes new changes, updating the internal screen representation
@@ -749,11 +770,11 @@ impl View {
             // The parser may already be drawing a newer frame. Advance the
             // speech baseline only to the snapshot whose render receipt has
             // completed, never to that newer live engine state.
-            self.prev_screen = self.screen().clone();
+            self.prev_screen = self.committed_snapshot.clone();
         } else {
             let visible_offset = self.review_scrollback;
             self.engine.select_viewport(Viewport::Live);
-            self.prev_screen = self.engine.snapshot().clone();
+            self.prev_screen = self.engine.snapshot_with_history();
             self.engine
                 .select_viewport(Viewport::Scrollback(visible_offset));
         }
@@ -779,6 +800,15 @@ impl View {
         } else {
             self.cached_prev_full_valid = false;
             self.cached_prev_full_row_hashes.clear();
+        }
+        if self.cached_document_valid {
+            self.cached_prev_document.clone_from(&self.cached_document);
+            self.cached_prev_document_valid = true;
+            self.cached_prev_document_row_hashes
+                .clone_from(&self.cached_document_row_hashes);
+        } else {
+            self.cached_prev_document_valid = false;
+            self.cached_prev_document_row_hashes.clear();
         }
     }
 
@@ -2317,6 +2347,8 @@ impl View {
     fn invalidate_visible_cache(&mut self) {
         self.cached_full_valid = false;
         self.cached_full_row_hashes.clear();
+        self.cached_document_valid = false;
+        self.cached_document_row_hashes.clear();
     }
 
     /// Gets the indentation level of the line under the review cursor,
@@ -2731,14 +2763,100 @@ impl View {
     }
 
     pub fn full_contents_cached(&mut self) -> (&str, &str, &[u64], &[u64]) {
+        self.prepare_full_contents_cache();
+        self.full_contents_from_cache()
+    }
+
+    pub(crate) fn prepare_full_contents_cache(&mut self) {
         self.ensure_cached_full();
         self.ensure_cached_prev_full();
+    }
+
+    pub(crate) fn full_contents_from_cache(&self) -> (&str, &str, &[u64], &[u64]) {
+        debug_assert!(self.cached_full_valid);
+        debug_assert!(self.cached_prev_full_valid);
         (
             &self.cached_prev_full,
             &self.cached_full,
             &self.cached_prev_full_row_hashes,
             &self.cached_full_row_hashes,
         )
+    }
+
+    /// Returns the previous and current complete review documents: retained
+    /// history followed by the visible grid. The accompanying hashes use the
+    /// same physical-row coordinates as the strings.
+    pub(crate) fn prepare_document_contents_cache(&mut self) {
+        self.ensure_cached_document();
+        self.ensure_cached_prev_document();
+    }
+
+    pub(crate) fn document_contents_cached(&self) -> (&str, &str, &[u64], &[u64]) {
+        debug_assert!(self.cached_document_valid);
+        debug_assert!(self.cached_prev_document_valid);
+        // Align the two retained documents by absolute history row. When the
+        // history cap evicts a prefix, comparing the raw strings could mistake
+        // a repeated new tail for unchanged text. Removing that known-deleted
+        // prefix preserves row identity even when every row has equal text.
+        let evicted_rows = self
+            .screen()
+            .history_origin
+            .saturating_sub(self.prev_screen.history_origin)
+            .min(self.cached_prev_document_row_hashes.len());
+        let previous_byte_offset = row_byte_offset(&self.cached_prev_document, evicted_rows);
+        (
+            &self.cached_prev_document[previous_byte_offset..],
+            &self.cached_document,
+            &self.cached_prev_document_row_hashes[evicted_rows..],
+            &self.cached_document_row_hashes,
+        )
+    }
+
+    /// Whether the active visible grid belongs to a newly introduced terminal
+    /// context. These transitions invalidate the meaning of every visible row,
+    /// so accessibility must read the new grid in full rather than diff it.
+    pub(crate) fn accessibility_requires_screen_reintroduction(&self) -> bool {
+        let previous = &self.prev_screen;
+        let current = self.screen();
+        self.accessibility_update_summary().terminal_reset
+            || previous.screen != current.screen
+            || previous.geometry != current.geometry
+    }
+
+    /// Whether retained history has a continuous row identity across the
+    /// current accessibility boundary. A history-only gap prevents a complete
+    /// document diff, but does not invalidate fixed visible-grid coordinates;
+    /// callers can still fall back to an explicit visible-grid diff.
+    pub(crate) fn accessibility_document_is_continuous(&self) -> bool {
+        if self.accessibility_requires_screen_reintroduction() {
+            return false;
+        }
+        let previous = &self.prev_screen;
+        let current = self.screen();
+
+        let Some(previous_end) = previous
+            .history_origin
+            .checked_add(previous.scrollback_extent)
+        else {
+            return false;
+        };
+        let Some(current_end) = current
+            .history_origin
+            .checked_add(current.scrollback_extent)
+        else {
+            return false;
+        };
+        previous.history_origin <= current.history_origin
+            && current.history_origin <= previous_end
+            && current_end >= previous_end
+    }
+
+    pub(crate) fn accessibility_document_changed(&self) -> bool {
+        let previous = &self.prev_screen;
+        let current = self.screen();
+        previous.history_origin != current.history_origin
+            || previous.scrollback_extent != current.scrollback_extent
+            || self.accessibility_update_summary().history_changed
     }
 
     fn ensure_cached_full(&mut self) {
@@ -2762,6 +2880,43 @@ impl View {
         self.cached_prev_full = cached_prev_full;
         self.cached_prev_full_valid = true;
     }
+
+    fn ensure_cached_document(&mut self) {
+        if self.cached_document_valid {
+            return;
+        }
+        let mut cached_document = std::mem::take(&mut self.cached_document);
+        self.snapshot_with_history()
+            .document_contents_into(&mut cached_document);
+        compute_row_hashes(&cached_document, &mut self.cached_document_row_hashes);
+        self.cached_document = cached_document;
+        self.cached_document_valid = true;
+    }
+
+    fn ensure_cached_prev_document(&mut self) {
+        if self.cached_prev_document_valid {
+            return;
+        }
+        let mut cached_prev_document = std::mem::take(&mut self.cached_prev_document);
+        self.prev_screen
+            .document_contents_into(&mut cached_prev_document);
+        compute_row_hashes(
+            &cached_prev_document,
+            &mut self.cached_prev_document_row_hashes,
+        );
+        self.cached_prev_document = cached_prev_document;
+        self.cached_prev_document_valid = true;
+    }
+}
+
+fn row_byte_offset(contents: &str, row: usize) -> usize {
+    if row == 0 {
+        return 0;
+    }
+    contents
+        .match_indices('\n')
+        .nth(row - 1)
+        .map_or(contents.len(), |(offset, _)| offset + 1)
 }
 
 /// Transfers print provenance to accessibility and copies changed-row ranges

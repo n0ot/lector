@@ -72,10 +72,22 @@ pub trait Driver {
 
     fn stop(&mut self) -> DriverResult<()>;
 
-    /// Toggle the resumable-pause state. Drivers without word-position support
-    /// may conservatively restart the current utterance from its beginning.
-    fn toggle_pause(&mut self) -> DriverResult<()> {
+    /// Suspend speech without discarding retained work. Compatibility drivers
+    /// have no retained state and degrade to a one-way backend stop.
+    fn pause(&mut self) -> DriverResult<()> {
         self.stop()
+    }
+
+    /// Resume explicitly suspended speech. Compatibility drivers which cannot
+    /// retain speech have nothing to resume.
+    fn resume(&mut self) -> DriverResult<()> {
+        Ok(())
+    }
+
+    /// Toggle explicit suspension. Managed drivers override this so the
+    /// current logical state, rather than backend audio timing, is decisive.
+    fn toggle(&mut self) -> DriverResult<()> {
+        self.pause()
     }
 
     /// Let an asynchronous backend consume lifecycle events while idle.
@@ -283,12 +295,20 @@ impl Speech {
         result.map(|()| id)
     }
 
-    pub fn stop(&mut self) -> Result<()> {
+    pub fn cancel(&mut self) -> Result<()> {
         self.driver.stop().map_err(Error::Driver)
     }
 
-    pub fn toggle_pause(&mut self) -> Result<()> {
-        self.driver.toggle_pause().map_err(Error::Driver)
+    pub fn pause(&mut self) -> Result<()> {
+        self.driver.pause().map_err(Error::Driver)
+    }
+
+    pub fn resume(&mut self) -> Result<()> {
+        self.driver.resume().map_err(Error::Driver)
+    }
+
+    pub fn toggle(&mut self) -> Result<()> {
+        self.driver.toggle().map_err(Error::Driver)
     }
 
     pub fn get_rate(&self) -> f32 {
@@ -673,7 +693,10 @@ mod tests {
     #[derive(Default)]
     struct DriverState {
         speaks: Vec<(String, bool)>,
-        stops: usize,
+        cancels: usize,
+        pauses: usize,
+        resumes: usize,
+        toggles: usize,
         rate: f32,
     }
 
@@ -689,7 +712,22 @@ mod tests {
         }
 
         fn stop(&mut self) -> anyhow::Result<()> {
-            self.0.borrow_mut().stops += 1;
+            self.0.borrow_mut().cancels += 1;
+            Ok(())
+        }
+
+        fn pause(&mut self) -> anyhow::Result<()> {
+            self.0.borrow_mut().pauses += 1;
+            Ok(())
+        }
+
+        fn resume(&mut self) -> anyhow::Result<()> {
+            self.0.borrow_mut().resumes += 1;
+            Ok(())
+        }
+
+        fn toggle(&mut self) -> anyhow::Result<()> {
+            self.0.borrow_mut().toggles += 1;
             Ok(())
         }
 
@@ -713,11 +751,17 @@ mod tests {
 
         assert_eq!(speech.get_rate(), 1.0);
         speech.set_rate(1.75).unwrap();
-        speech.stop().unwrap();
+        speech.cancel().unwrap();
+        speech.pause().unwrap();
+        speech.resume().unwrap();
+        speech.toggle().unwrap();
         speech.speak("hello", true).unwrap();
 
         assert_eq!(speech.get_rate(), 1.75);
-        assert_eq!(state.borrow().stops, 1);
+        assert_eq!(state.borrow().cancels, 1);
+        assert_eq!(state.borrow().pauses, 1);
+        assert_eq!(state.borrow().resumes, 1);
+        assert_eq!(state.borrow().toggles, 1);
         assert_eq!(state.borrow().speaks.as_slice(), [("hello".into(), true)]);
 
         speech.set_symbol_level(symbols::Level::Character);
@@ -732,7 +776,19 @@ mod tests {
         }
 
         fn stop(&mut self) -> anyhow::Result<()> {
-            anyhow::bail!("stop failed")
+            anyhow::bail!("cancel failed")
+        }
+
+        fn pause(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("pause failed")
+        }
+
+        fn resume(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("resume failed")
+        }
+
+        fn toggle(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("toggle failed")
         }
 
         fn get_rate(&self) -> f32 {
@@ -750,7 +806,10 @@ mod tests {
 
         for error in [
             speech.speak("text", false).unwrap_err(),
-            speech.stop().unwrap_err(),
+            speech.cancel().unwrap_err(),
+            speech.pause().unwrap_err(),
+            speech.resume().unwrap_err(),
+            speech.toggle().unwrap_err(),
             speech.set_rate(2.0).unwrap_err(),
         ] {
             assert!(matches!(error, Error::Driver(_)));

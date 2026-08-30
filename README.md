@@ -114,9 +114,9 @@ is physically stable; it does not read the full `tmux session index title`
 label. Pane switches read only the new cursor line. Alternate-screen,
 overlay/base, window, session, and pane handoffs reset auto-read diff state so
 hidden or previous-context changes cannot replay as a whole-screen diff. A
-settled alternate screen is read in full because it is a new application
-context; restoring the already-seen primary screen reads only its current
-application-cursor line.
+primary/alternate handoff reads the newly active visible screen in full because
+the two screens have independent row identities. Resize/reflow and terminal
+reset boundaries use the same conservative full-visible-screen behavior.
 
 For crash and hang diagnosis, the repository includes a socket-free hostile
 control peer and a kill-bounded live suite covering malformed records, silent
@@ -142,6 +142,14 @@ independent of presentation. Consequently, reading a cell and then sending
 coordinate-based input has the normal UI time-of-check to time-of-use race.
 The latency design, live direct/tmux gates, and diagnostic timeline are in
 [docs/performance.md](docs/performance.md).
+
+Auto-read treats retained history followed by the visible grid as one terminal
+document. Ordinary bottom-margin scrolling is therefore an append: rows moving
+from the grid into history keep their document position and are not announced
+again. The parallel print observer remains a fast, causally precise path for
+validated line-oriented output; structural or ambiguous output falls back to
+the authoritative document diff. Cursor-addressed TUIs normally replace the
+visible suffix, so they retain the existing fine-grained TUI diff behavior.
 
 DEC private mode 2026 gates when a scene may be presented. A real close makes
 the final candidate eligible but does not make it readable before its physical
@@ -379,11 +387,12 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 
 ### Core actions (with defaults)
 
-- **Cancel speech** with `M-x`. Cancellation also discards unsent paragraphs.
-- **Pause/resume speech** with `M-X`. A capable host resumes at the beginning
-  of the interrupted word; hosts with safe stop-completion evidence can instead
-  restart the current utterance from its beginning. Pausing between paragraphs
-  preserves the remaining paragraphs.
+- **Pause/resume speech** with `M-x`. Ordinary input also pauses speech. A
+  capable host resumes at the beginning of the interrupted word; hosts with
+  safe stop-completion evidence can instead restart the current utterance from
+  its beginning. Pausing preserves queued announcements and paragraphs.
+- **Cancel speech** has no default binding. Cancellation stops speech and
+  discards the current utterance and everything queued behind it.
 - **Say the current overlay name**. Default: `M-w`.
 - **Toggle auto‑read** if you want to hear only on demand. Default: `M-'`.
 - **Toggle stop on focus loss** (interrupt speech when terminal focus leaves). Default: `M-g`.
@@ -632,9 +641,13 @@ configured default register.
 You can remap keys or add your own Lua functions:
 
 ```lua
--- these are the default cancel and pause/resume bindings
-lector.bindings["M-x"] = "lector.stop_speaking"
-lector.bindings["M-X"] = "lector.pause_speaking"
+-- this is the default pause/resume binding
+lector.bindings["M-x"] = "lector.toggle_speaking"
+
+-- optional one-way controls; these keys are otherwise unbound by Lector
+lector.bindings["M-z"] = "lector.pause_speaking"
+lector.bindings["M-Z"] = "lector.resume_speaking"
+lector.bindings["C-M-z"] = "lector.cancel_speaking"
 
 -- toggle stop-on-focus-loss behavior
 lector.bindings["M-g"] = "lector.toggle_stop_speech_on_focus_loss"
@@ -659,6 +672,15 @@ With reliable terminal events, one logical request can contain several
 protocol utterances at paragraph boundaries. Otherwise Lector conservatively
 submits one normalized utterance. Treat the returned ID as a string; its
 format is not an API.
+
+The four speech controls above are binding action names, not functions in
+`lector.api`. `pause_speaking` and `resume_speaking` are idempotent one-way
+actions, `toggle_speaking` switches between them, and `cancel_speaking` is the
+only action that deliberately discards retained speech. A non-interrupting
+`speak` appends while speech is playing. If speech has been paused, any new
+`speak` request replaces the retained speech and begins the new request;
+`interrupt = true` always performs that replacement even while speech is
+playing.
 
 ### Lua hooks
 

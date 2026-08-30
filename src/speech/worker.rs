@@ -33,8 +33,10 @@ enum Request {
         interrupt: bool,
         boundary: UtteranceBoundary,
     },
-    Stop,
-    TogglePause,
+    Cancel,
+    Pause,
+    Resume,
+    Toggle,
     SetRate(f32),
     ConfigureServer(SpeechServerSpec),
     Start(mpsc::SyncSender<std::result::Result<(), String>>),
@@ -44,8 +46,10 @@ impl Request {
     fn speech_bytes(&self) -> usize {
         match self {
             Self::Speak { text, .. } => text.len(),
-            Self::Stop
-            | Self::TogglePause
+            Self::Cancel
+            | Self::Pause
+            | Self::Resume
+            | Self::Toggle
             | Self::SetRate(_)
             | Self::ConfigureServer(_)
             | Self::Start(_) => 0,
@@ -128,9 +132,12 @@ impl Mailbox {
 
         if interrupt {
             let _ = Self::discard_speech(&mut state);
-            state
-                .requests
-                .retain(|request| !matches!(request, Request::TogglePause));
+            state.requests.retain(|request| {
+                !matches!(
+                    request,
+                    Request::Cancel | Request::Pause | Request::Resume | Request::Toggle
+                )
+            });
         }
         let mut dropped = 0usize;
         while state.speech_items == MAX_PENDING_SPEECH_ITEMS
@@ -166,22 +173,25 @@ impl Mailbox {
         Ok(())
     }
 
-    fn enqueue_stop(&self) -> DriverResult<()> {
+    fn enqueue_cancel(&self) -> DriverResult<()> {
         let mut state = self.lock()?;
         if state.shutdown {
             return Ok(());
         }
         let _ = Self::discard_speech(&mut state);
-        state
-            .requests
-            .retain(|request| !matches!(request, Request::Stop | Request::TogglePause));
-        state.requests.push_front(Request::Stop);
+        state.requests.retain(|request| {
+            !matches!(
+                request,
+                Request::Cancel | Request::Pause | Request::Resume | Request::Toggle
+            )
+        });
+        state.requests.push_front(Request::Cancel);
         drop(state);
         self.available.notify_one();
         Ok(())
     }
 
-    fn enqueue_toggle_pause(&self) -> DriverResult<()> {
+    fn enqueue_pause(&self) -> DriverResult<()> {
         let mut state = self.lock()?;
         if state.shutdown {
             return Ok(());
@@ -189,18 +199,55 @@ impl Mailbox {
         if state
             .requests
             .iter()
-            .any(|request| matches!(request, Request::Stop))
+            .any(|request| matches!(request, Request::Cancel))
         {
-            // A preceding cancellation makes this toggle inert even if the
+            // A preceding cancellation makes this pause inert even if the
             // worker has not observed the cancellation yet.
             return Ok(());
         }
-        // Preserve request order. In particular, a toggle submitted just
-        // after speech must observe that speech rather than running while the
-        // worker still appears idle. Version 2 speech submissions behind the
-        // first only update Lector's local queue, so this does not add one RPC
-        // round trip per queued paragraph.
-        state.requests.push_back(Request::TogglePause);
+        if !matches!(state.requests.back(), Some(Request::Pause)) {
+            state.requests.push_back(Request::Pause);
+        }
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn enqueue_resume(&self) -> DriverResult<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Ok(());
+        }
+        if state
+            .requests
+            .iter()
+            .any(|request| matches!(request, Request::Cancel))
+        {
+            return Ok(());
+        }
+        if !matches!(state.requests.back(), Some(Request::Resume)) {
+            state.requests.push_back(Request::Resume);
+        }
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn enqueue_toggle(&self) -> DriverResult<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Ok(());
+        }
+        if state
+            .requests
+            .iter()
+            .any(|request| matches!(request, Request::Cancel))
+        {
+            return Ok(());
+        }
+        // Preserve request order so a toggle submitted just after speech sees
+        // that speech rather than an apparently idle worker.
+        state.requests.push_back(Request::Toggle);
         drop(state);
         self.available.notify_one();
         Ok(())
@@ -387,11 +434,19 @@ impl Driver for BoundedAsyncDriver {
     }
 
     fn stop(&mut self) -> DriverResult<()> {
-        self.mailbox.enqueue_stop()
+        self.mailbox.enqueue_cancel()
     }
 
-    fn toggle_pause(&mut self) -> DriverResult<()> {
-        self.mailbox.enqueue_toggle_pause()
+    fn pause(&mut self) -> DriverResult<()> {
+        self.mailbox.enqueue_pause()
+    }
+
+    fn resume(&mut self) -> DriverResult<()> {
+        self.mailbox.enqueue_resume()
+    }
+
+    fn toggle(&mut self) -> DriverResult<()> {
+        self.mailbox.enqueue_toggle()
     }
 
     fn supports_ordered_utterances(&self) -> bool {
@@ -473,8 +528,10 @@ fn run_worker(mut driver: impl Driver, mailbox: &Mailbox, ordered_utterances: &A
                 interrupt,
                 boundary,
             }) => driver.speak_utterance_with_boundary(&id, &text, interrupt, boundary),
-            NextRequest::Request(Request::Stop) => driver.stop(),
-            NextRequest::Request(Request::TogglePause) => driver.toggle_pause(),
+            NextRequest::Request(Request::Cancel) => driver.stop(),
+            NextRequest::Request(Request::Pause) => driver.pause(),
+            NextRequest::Request(Request::Resume) => driver.resume(),
+            NextRequest::Request(Request::Toggle) => driver.toggle(),
             NextRequest::Request(Request::SetRate(rate)) => driver.set_rate(rate),
             NextRequest::Request(Request::ConfigureServer(spec)) => driver.configure_server(spec),
             NextRequest::Request(Request::Start(completed)) => {
@@ -677,11 +734,11 @@ mod tests {
     #[test]
     fn cancellation_barriers_cannot_be_overtaken_by_pause_toggles() {
         let mailbox = Mailbox::new();
-        mailbox.enqueue_stop().unwrap();
-        mailbox.enqueue_toggle_pause().unwrap();
+        mailbox.enqueue_cancel().unwrap();
+        mailbox.enqueue_toggle().unwrap();
         assert!(matches!(
             mailbox.next_request(Duration::ZERO),
-            NextRequest::Request(Request::Stop)
+            NextRequest::Request(Request::Cancel)
         ));
         assert!(matches!(
             mailbox.next_request(Duration::ZERO),
@@ -690,7 +747,7 @@ mod tests {
 
         let id = UtteranceId::new("new");
         mailbox.enqueue_speech(&id, "new words", true).unwrap();
-        mailbox.enqueue_toggle_pause().unwrap();
+        mailbox.enqueue_toggle().unwrap();
         assert!(matches!(
             mailbox.next_request(Duration::ZERO),
             NextRequest::Request(Request::Speak {
@@ -700,16 +757,18 @@ mod tests {
         ));
         assert!(matches!(
             mailbox.next_request(Duration::ZERO),
-            NextRequest::Request(Request::TogglePause)
+            NextRequest::Request(Request::Toggle)
         ));
     }
 
     #[test]
-    fn pause_toggle_observes_preceding_noninterrupting_speech() {
+    fn playback_controls_observe_preceding_noninterrupting_speech() {
         let mailbox = Mailbox::new();
         let id = UtteranceId::new("new");
         mailbox.enqueue_speech(&id, "new words", false).unwrap();
-        mailbox.enqueue_toggle_pause().unwrap();
+        mailbox.enqueue_pause().unwrap();
+        mailbox.enqueue_resume().unwrap();
+        mailbox.enqueue_toggle().unwrap();
 
         assert!(matches!(
             mailbox.next_request(Duration::ZERO),
@@ -720,7 +779,15 @@ mod tests {
         ));
         assert!(matches!(
             mailbox.next_request(Duration::ZERO),
-            NextRequest::Request(Request::TogglePause)
+            NextRequest::Request(Request::Pause)
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::Resume)
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::Toggle)
         ));
     }
 }

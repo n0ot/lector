@@ -49,12 +49,20 @@ impl Utterance {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum PlaybackState {
     Speaking,
     Paused,
-    StoppingForRestart,
-    RestartAfterStop,
+    Stopping(AfterStop),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AfterStop {
+    SuspendCurrent,
+    ResumeCurrent,
+    Replace(Utterance),
+    SuspendReplacement(Utterance),
+    Cancel,
 }
 
 #[derive(Clone, Debug)]
@@ -68,7 +76,7 @@ struct ActiveUtterance {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeferredStart {
     ParagraphDelay { ready_at: Instant },
-    PausedBetweenParagraphs,
+    PausedBeforeNext,
 }
 
 /// The host-independent state machine for one speech-server generation.
@@ -110,27 +118,26 @@ impl SpeechManager {
         let utterance = Utterance::new(id, text, boundary);
 
         if interrupt {
-            self.clear_waiting();
-            if let Some(active) = self.active.take() {
-                host.stop(&active.utterance.id)?;
-            }
-            // Interruption is implemented once here: clear Lector's queue,
-            // stop the active host utterance, then submit normally. Passing a
-            // second interrupt flag would make legacy hosts stop twice.
-            return self.start(host, utterance, false);
+            return self.replace_with(host, utterance);
+        }
+
+        // Non-interrupting speech appends while logical playback is active,
+        // but replaces speech the user explicitly suspended. Silence caused
+        // by a paragraph deadline is still active playback, not suspension.
+        if self.paused_restart.is_some()
+            || self.deferred_start == Some(DeferredStart::PausedBeforeNext)
+            || self.active.as_ref().is_some_and(|active| {
+                matches!(
+                    &active.state,
+                    PlaybackState::Paused | PlaybackState::Stopping(_)
+                )
+            })
+        {
+            return self.replace_with(host, utterance);
         }
 
         if self.active.is_none() && self.paused_restart.is_none() && self.deferred_start.is_none() {
             return self.start(host, utterance, false);
-        }
-        if self.paused_restart.is_some() || self.deferred_start.is_some() {
-            if !self.can_sequence(host) {
-                return Err(anyhow!(
-                    "speech host cannot queue behind paused speech without reliable terminal events"
-                ));
-            }
-            self.enqueue(utterance);
-            return Ok(());
         }
         if host.has_legacy_queue() {
             host.speak(&utterance.id, &utterance.text, false)?;
@@ -145,64 +152,77 @@ impl SpeechManager {
         Ok(())
     }
 
-    pub fn stop(&mut self, host: &mut dyn Host) -> Result<()> {
+    /// Stop the active host utterance and discard every retained or queued
+    /// item. Cancellation is the only transition which deliberately leaves
+    /// no speech resumable.
+    pub fn cancel(&mut self, host: &mut dyn Host) -> Result<()> {
         self.clear_waiting();
-        let Some(active) = self.active.take() else {
+        let Some(mut active) = self.active.take() else {
             return Ok(());
         };
-        host.stop(&active.utterance.id)
+        if matches!(&active.state, PlaybackState::Stopping(_)) {
+            if self.has_reliable_terminal(host) {
+                active.state = PlaybackState::Stopping(AfterStop::Cancel);
+                self.active = Some(active);
+            }
+            return Ok(());
+        }
+        self.stop_for(host, active, AfterStop::Cancel)
     }
 
-    /// Pause or resume without discarding queued speech. A host with word
-    /// positions resumes the same logical utterance; other hosts stop it and
-    /// restart the complete utterance under a fresh protocol ID.
-    pub fn toggle_pause(&mut self, host: &mut dyn Host) -> Result<()> {
+    /// Suspend playback without discarding the active or queued speech.
+    pub fn pause(&mut self, host: &mut dyn Host) -> Result<()> {
         self.drain_events(host)?;
+        self.pause_ready(host)
+    }
 
-        if let Some(deferred) = self.deferred_start {
-            match deferred {
-                DeferredStart::ParagraphDelay { .. } => {
-                    self.deferred_start = Some(DeferredStart::PausedBetweenParagraphs);
-                    return Ok(());
-                }
-                DeferredStart::PausedBetweenParagraphs => {
-                    self.deferred_start = None;
-                    return self.start_next_now(host);
-                }
-            }
+    /// Resume speech only when it was explicitly suspended.
+    pub fn resume(&mut self, host: &mut dyn Host) -> Result<()> {
+        self.drain_events(host)?;
+        self.resume_ready(host)
+    }
+
+    /// Toggle between explicit suspension and active playback. Natural idle
+    /// has no retained speech and is therefore inert.
+    pub fn toggle(&mut self, host: &mut dyn Host) -> Result<()> {
+        self.drain_events(host)?;
+        if self.is_suspended() {
+            self.resume_ready(host)
+        } else if self.is_playing() {
+            self.pause_ready(host)
+        } else {
+            Ok(())
         }
+    }
 
-        if let Some(utterance) = self.paused_restart.take() {
-            let utterance = self.restarted(utterance)?;
-            self.start(host, utterance, false)?;
-            return self.flush_legacy_pending(host);
+    fn pause_ready(&mut self, host: &mut dyn Host) -> Result<()> {
+        match self.deferred_start {
+            Some(DeferredStart::ParagraphDelay { .. }) => {
+                self.deferred_start = Some(DeferredStart::PausedBeforeNext);
+                return Ok(());
+            }
+            Some(DeferredStart::PausedBeforeNext) => return Ok(()),
+            None => {}
+        }
+        if self.paused_restart.is_some() {
+            return Ok(());
         }
 
         let Some(mut active) = self.active.take() else {
             return Ok(());
         };
 
-        match active.state {
+        match &mut active.state {
             PlaybackState::Paused => {
-                if let Err(resume_error) = host.resume(&active.utterance.id) {
-                    return match self.pause_by_restart(host, active) {
-                        Ok(()) => Err(resume_error),
-                        Err(stop_error) => Err(stop_error.context(format!(
-                            "speech resume failed ({resume_error:#}) and stopping it for restart also failed"
-                        ))),
-                    };
-                }
-                active.state = PlaybackState::Speaking;
                 self.active = Some(active);
                 return Ok(());
             }
-            PlaybackState::StoppingForRestart => {
-                active.state = PlaybackState::RestartAfterStop;
-                self.active = Some(active);
-                return Ok(());
-            }
-            PlaybackState::RestartAfterStop => {
-                active.state = PlaybackState::StoppingForRestart;
+            PlaybackState::Stopping(after) => {
+                *after = match std::mem::replace(after, AfterStop::Cancel) {
+                    AfterStop::ResumeCurrent => AfterStop::SuspendCurrent,
+                    AfterStop::Replace(next) => AfterStop::SuspendReplacement(next),
+                    other => other,
+                };
                 self.active = Some(active);
                 return Ok(());
             }
@@ -210,13 +230,13 @@ impl SpeechManager {
         }
 
         if !host.capabilities().supports_resumable_pause() {
-            return self.pause_by_restart(host, active);
+            return self.stop_for(host, active, AfterStop::SuspendCurrent);
         }
 
         let PauseResult { paused, position } = match host.pause(&active.utterance.id) {
             Ok(result) => result,
             Err(pause_error) => {
-                return match self.pause_by_restart(host, active) {
+                return match self.stop_for(host, active, AfterStop::SuspendCurrent) {
                     Ok(()) => Err(pause_error),
                     Err(stop_error) => Err(stop_error.context(format!(
                         "speech pause failed ({pause_error:#}) and stopping it for restart also failed"
@@ -225,12 +245,12 @@ impl SpeechManager {
             }
         };
         if !paused {
-            return self.pause_by_restart(host, active);
+            return self.stop_for(host, active, AfterStop::SuspendCurrent);
         }
         let Some(position) = position.filter(|position| position.valid_for(&active.utterance.text))
         else {
             let error = anyhow!("speech host paused without a valid UTF-8 resume position");
-            return match self.pause_by_restart(host, active) {
+            return match self.stop_for(host, active, AfterStop::SuspendCurrent) {
                 Ok(()) => Err(error),
                 Err(stop_error) => {
                     Err(stop_error
@@ -244,6 +264,44 @@ impl SpeechManager {
         Ok(())
     }
 
+    fn resume_ready(&mut self, host: &mut dyn Host) -> Result<()> {
+        if self.deferred_start == Some(DeferredStart::PausedBeforeNext) {
+            self.deferred_start = None;
+            return self.start_next_now(host);
+        }
+        if let Some(utterance) = self.paused_restart.take() {
+            let utterance = self.restarted(utterance)?;
+            return self.start(host, utterance, false);
+        }
+
+        let Some(mut active) = self.active.take() else {
+            return Ok(());
+        };
+        match &mut active.state {
+            PlaybackState::Paused => {
+                if let Err(resume_error) = host.resume(&active.utterance.id) {
+                    return match self.stop_for(host, active, AfterStop::ResumeCurrent) {
+                        Ok(()) => Err(resume_error),
+                        Err(stop_error) => Err(stop_error.context(format!(
+                            "speech resume failed ({resume_error:#}) and stopping it for restart also failed"
+                        ))),
+                    };
+                }
+                active.state = PlaybackState::Speaking;
+            }
+            PlaybackState::Stopping(after) => {
+                *after = match std::mem::replace(after, AfterStop::Cancel) {
+                    AfterStop::SuspendCurrent => AfterStop::ResumeCurrent,
+                    AfterStop::SuspendReplacement(next) => AfterStop::Replace(next),
+                    other => other,
+                };
+            }
+            PlaybackState::Speaking => {}
+        }
+        self.active = Some(active);
+        Ok(())
+    }
+
     pub fn poll(&mut self, host: &mut dyn Host) -> Result<()> {
         self.poll_at(host, Instant::now())
     }
@@ -251,7 +309,26 @@ impl SpeechManager {
     /// Abandon only work whose delivery is now uncertain. Pending utterances
     /// were never sent and can be started on a replacement host.
     pub fn host_lost(&mut self) {
-        self.active = None;
+        let Some(active) = self.active.take() else {
+            return;
+        };
+        match active.state {
+            PlaybackState::Stopping(AfterStop::Replace(next)) => self.enqueue_front(next),
+            PlaybackState::Stopping(AfterStop::SuspendReplacement(next)) => {
+                self.enqueue_front(next);
+                self.deferred_start = Some(DeferredStart::PausedBeforeNext);
+            }
+            PlaybackState::Paused | PlaybackState::Stopping(AfterStop::SuspendCurrent)
+                if !self.pending.is_empty() =>
+            {
+                self.deferred_start = Some(DeferredStart::PausedBeforeNext);
+            }
+            PlaybackState::Speaking
+            | PlaybackState::Paused
+            | PlaybackState::Stopping(
+                AfterStop::SuspendCurrent | AfterStop::ResumeCurrent | AfterStop::Cancel,
+            ) => {}
+        }
     }
 
     pub fn host_ready(&mut self, host: &mut dyn Host) -> Result<()> {
@@ -308,14 +385,13 @@ impl SpeechManager {
                     .take()
                     .expect("active utterance was validated above");
                 match ended.state {
-                    PlaybackState::StoppingForRestart => {
+                    PlaybackState::Paused => {
                         self.paused_restart = Some(ended.utterance);
                     }
-                    PlaybackState::RestartAfterStop => {
-                        let restarted = self.restarted(ended.utterance)?;
-                        self.start(host, restarted, false)?;
+                    PlaybackState::Stopping(after) => {
+                        self.apply_after_stop(host, ended.utterance, after)?;
                     }
-                    PlaybackState::Speaking | PlaybackState::Paused => {
+                    PlaybackState::Speaking => {
                         self.start_due(host, now)?;
                     }
                 }
@@ -340,22 +416,75 @@ impl SpeechManager {
         Ok(())
     }
 
-    fn pause_by_restart(&mut self, host: &mut dyn Host, mut active: ActiveUtterance) -> Result<()> {
+    fn replace_with(&mut self, host: &mut dyn Host, utterance: Utterance) -> Result<()> {
+        self.clear_waiting();
+        let Some(mut active) = self.active.take() else {
+            return self.start(host, utterance, false);
+        };
+        if matches!(&active.state, PlaybackState::Stopping(_)) {
+            if self.has_reliable_terminal(host) {
+                active.state = PlaybackState::Stopping(AfterStop::Replace(utterance));
+                self.active = Some(active);
+                return Ok(());
+            }
+            return self.start(host, utterance, false);
+        }
+        self.stop_for(host, active, AfterStop::Replace(utterance))
+    }
+
+    fn stop_for(
+        &mut self,
+        host: &mut dyn Host,
+        mut active: ActiveUtterance,
+        after: AfterStop,
+    ) -> Result<()> {
         if let Err(error) = host.stop(&active.utterance.id) {
             self.active = Some(active);
             return Err(error);
         }
         active.utterance.boundary = UtteranceBoundary::Immediate;
-        if host.capabilities().controls.stop == super::protocol::StopSupport::Confirmed {
-            self.paused_restart = Some(active.utterance);
+        let confirmed =
+            host.capabilities().controls.stop == super::protocol::StopSupport::Confirmed;
+        let may_apply_without_evidence =
+            matches!(&after, AfterStop::Replace(_) | AfterStop::Cancel)
+                && !self.has_reliable_terminal(host);
+        if confirmed || may_apply_without_evidence {
+            self.apply_after_stop(host, active.utterance, after)
         } else {
             // A best-effort stop response cannot prove that old audio is gone.
-            // Reliable terminal evidence makes the transition restart-safe;
-            // without it this state deliberately remains held.
-            active.state = PlaybackState::StoppingForRestart;
+            // Reliable terminal evidence makes suspension and replay safe;
+            // without it a suspended item deliberately remains held. Hard
+            // cancellation and replacement retain their legacy best-effort
+            // behavior so basic speech cannot deadlock.
+            active.state = PlaybackState::Stopping(after);
             self.active = Some(active);
+            Ok(())
         }
-        Ok(())
+    }
+
+    fn apply_after_stop(
+        &mut self,
+        host: &mut dyn Host,
+        current: Utterance,
+        after: AfterStop,
+    ) -> Result<()> {
+        match after {
+            AfterStop::SuspendCurrent => {
+                self.paused_restart = Some(current);
+                Ok(())
+            }
+            AfterStop::ResumeCurrent => {
+                let restarted = self.restarted(current)?;
+                self.start(host, restarted, false)
+            }
+            AfterStop::Replace(next) => self.start(host, next, false),
+            AfterStop::SuspendReplacement(next) => {
+                self.enqueue_front(next);
+                self.deferred_start = Some(DeferredStart::PausedBeforeNext);
+                Ok(())
+            }
+            AfterStop::Cancel => Ok(()),
+        }
     }
 
     fn restarted(&mut self, mut utterance: Utterance) -> Result<Utterance> {
@@ -373,7 +502,7 @@ impl SpeechManager {
             return Ok(());
         }
         match self.deferred_start {
-            Some(DeferredStart::PausedBetweenParagraphs) => return Ok(()),
+            Some(DeferredStart::PausedBeforeNext) => return Ok(()),
             Some(DeferredStart::ParagraphDelay { ready_at }) if now < ready_at => return Ok(()),
             Some(DeferredStart::ParagraphDelay { .. }) => {
                 self.deferred_start = None;
@@ -398,28 +527,46 @@ impl SpeechManager {
         let Some(next) = self.pop_pending() else {
             return Ok(());
         };
-        self.start(host, next, false)?;
-        self.flush_legacy_pending(host)
+        self.start(host, next, false)
     }
 
-    fn flush_legacy_pending(&mut self, host: &mut dyn Host) -> Result<()> {
-        if !host.has_legacy_queue() || self.active.is_none() {
-            return Ok(());
-        }
-        while let Some(next) = self.pop_pending() {
-            host.speak(&next.id, &next.text, false)?;
-        }
-        Ok(())
+    fn has_reliable_terminal(&self, host: &dyn Host) -> bool {
+        host.capabilities()
+            .lifecycle
+            .terminal
+            .delivery
+            .is_reliable()
     }
 
     fn can_sequence(&self, host: &dyn Host) -> bool {
-        host.has_legacy_queue()
-            || host
-                .capabilities()
-                .lifecycle
-                .terminal
-                .delivery
-                .is_reliable()
+        host.has_legacy_queue() || self.has_reliable_terminal(host)
+    }
+
+    fn is_suspended(&self) -> bool {
+        self.paused_restart.is_some()
+            || self.deferred_start == Some(DeferredStart::PausedBeforeNext)
+            || self.active.as_ref().is_some_and(|active| {
+                matches!(
+                    &active.state,
+                    PlaybackState::Paused
+                        | PlaybackState::Stopping(
+                            AfterStop::SuspendCurrent | AfterStop::SuspendReplacement(_)
+                        )
+                )
+            })
+    }
+
+    fn is_playing(&self) -> bool {
+        matches!(
+            self.deferred_start,
+            Some(DeferredStart::ParagraphDelay { .. })
+        ) || self.active.as_ref().is_some_and(|active| {
+            matches!(
+                &active.state,
+                PlaybackState::Speaking
+                    | PlaybackState::Stopping(AfterStop::ResumeCurrent | AfterStop::Replace(_))
+            )
+        })
     }
 
     fn enqueue(&mut self, utterance: Utterance) {
@@ -439,6 +586,11 @@ impl SpeechManager {
         let next = self.pending.pop_front()?;
         self.pending_bytes = self.pending_bytes.saturating_sub(next.text.len());
         Some(next)
+    }
+
+    fn enqueue_front(&mut self, utterance: Utterance) {
+        self.pending_bytes = self.pending_bytes.saturating_add(utterance.text.len());
+        self.pending.push_front(utterance);
     }
 
     fn clear_pending(&mut self) {
@@ -615,6 +767,158 @@ mod tests {
     }
 
     #[test]
+    fn pause_preserves_the_queue_and_resume_continues_it() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+        host.pause_result.position = Some(TextPosition::Utf8ByteOffset { offset: 0 });
+        let first = UtteranceId::new("first");
+        let second = UtteranceId::new("second");
+        manager
+            .submit(&mut host, first.clone(), "first".to_owned(), false)
+            .unwrap();
+        manager
+            .submit(&mut host, second.clone(), "second".to_owned(), false)
+            .unwrap();
+
+        manager.pause(&mut host).unwrap();
+        manager.pause(&mut host).unwrap();
+        manager.resume(&mut host).unwrap();
+        manager.resume(&mut host).unwrap();
+        host.events.push(FakeHost::ended(&first, 1));
+        manager.poll(&mut host).unwrap();
+
+        assert_eq!(
+            host.calls,
+            [
+                Call::Speak(first.clone(), "first".to_owned()),
+                Call::Pause(first.clone()),
+                Call::Resume(first),
+                Call::Speak(second, "second".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn playback_controls_are_inert_at_natural_idle() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+
+        manager.pause(&mut host).unwrap();
+        manager.resume(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.cancel(&mut host).unwrap();
+
+        assert!(host.calls.is_empty());
+    }
+
+    #[test]
+    fn noninterrupting_speech_replaces_suspended_speech_and_its_queue() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+        host.pause_result.position = Some(TextPosition::Utf8ByteOffset { offset: 0 });
+        let old = UtteranceId::new("old");
+        let queued = UtteranceId::new("queued");
+        let replacement = UtteranceId::new("replacement");
+        manager
+            .submit(&mut host, old.clone(), "old".to_owned(), false)
+            .unwrap();
+        manager
+            .submit(&mut host, queued, "queued".to_owned(), false)
+            .unwrap();
+        manager.pause(&mut host).unwrap();
+
+        manager
+            .submit(
+                &mut host,
+                replacement.clone(),
+                "replacement".to_owned(),
+                false,
+            )
+            .unwrap();
+        host.events.push(FakeHost::ended(&old, 1));
+        host.events.push(FakeHost::ended(&replacement, 1));
+        manager.poll(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+
+        assert_eq!(
+            host.calls,
+            [
+                Call::Speak(old.clone(), "old".to_owned()),
+                Call::Pause(old.clone()),
+                Call::Stop(old),
+                Call::Speak(replacement, "replacement".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_queue_evicts_the_oldest_utterance_at_its_item_limit() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+        let active = UtteranceId::new("active");
+        manager
+            .submit(&mut host, active.clone(), "active".to_owned(), false)
+            .unwrap();
+
+        for index in 0..=MAX_PENDING_UTTERANCES {
+            manager
+                .submit(
+                    &mut host,
+                    UtteranceId::new(format!("pending-{index}")),
+                    format!("pending {index}"),
+                    false,
+                )
+                .unwrap();
+        }
+        host.events.push(FakeHost::ended(&active, 1));
+        manager.poll(&mut host).unwrap();
+
+        assert_eq!(
+            host.calls[1],
+            Call::Speak(UtteranceId::new("pending-1"), "pending 1".to_owned())
+        );
+    }
+
+    #[test]
+    fn interrupting_speech_replaces_active_speech_and_its_queue() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+        let old = UtteranceId::new("old");
+        let replacement = UtteranceId::new("replacement");
+        manager
+            .submit(&mut host, old.clone(), "old".to_owned(), false)
+            .unwrap();
+        manager
+            .submit(
+                &mut host,
+                UtteranceId::new("queued"),
+                "queued".to_owned(),
+                false,
+            )
+            .unwrap();
+
+        manager
+            .submit(
+                &mut host,
+                replacement.clone(),
+                "replacement".to_owned(),
+                true,
+            )
+            .unwrap();
+        host.events.push(FakeHost::ended(&replacement, 1));
+        manager.poll(&mut host).unwrap();
+
+        assert_eq!(
+            host.calls,
+            [
+                Call::Speak(old.clone(), "old".to_owned()),
+                Call::Stop(old),
+                Call::Speak(replacement, "replacement".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn stale_and_duplicate_terminal_events_cannot_advance_the_queue() {
         let mut manager = SpeechManager::default();
         let mut host = FakeHost::full();
@@ -646,8 +950,8 @@ mod tests {
         manager
             .submit(&mut host, id.clone(), "hello world again".to_owned(), false)
             .unwrap();
-        manager.toggle_pause(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
 
         assert_eq!(
             host.calls,
@@ -668,10 +972,10 @@ mod tests {
         manager
             .submit(&mut host, id.clone(), "hello".to_owned(), false)
             .unwrap();
-        manager.toggle_pause(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
 
         assert_eq!(
             host.calls,
@@ -706,8 +1010,8 @@ mod tests {
             )
             .unwrap();
 
-        manager.toggle_pause(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
         let restarted = UtteranceId::new("lector-resume:1");
         host.events.push(FakeHost::ended(&restarted, 1));
         manager.poll_at(&mut host, now).unwrap();
@@ -735,8 +1039,8 @@ mod tests {
             .submit(&mut host, id.clone(), "hello".to_owned(), false)
             .unwrap();
 
-        manager.toggle_pause(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
         assert_eq!(
             host.calls,
             [
@@ -769,8 +1073,8 @@ mod tests {
             .submit(&mut host, id.clone(), "hello".to_owned(), false)
             .unwrap();
 
-        manager.toggle_pause(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
         manager.poll(&mut host).unwrap();
 
         assert_eq!(
@@ -796,9 +1100,9 @@ mod tests {
                 .submit(&mut host, id.clone(), "hello world".to_owned(), false)
                 .unwrap();
 
-            let result = manager.toggle_pause(&mut host);
+            let result = manager.toggle(&mut host);
             assert_eq!(result.is_err(), fail_pause);
-            manager.toggle_pause(&mut host).unwrap();
+            manager.toggle(&mut host).unwrap();
             assert_eq!(
                 host.calls,
                 [
@@ -822,11 +1126,10 @@ mod tests {
         manager
             .submit(&mut host, id.clone(), "hello world".to_owned(), false)
             .unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.pause(&mut host).unwrap();
         host.fail_resume = true;
 
-        assert!(manager.toggle_pause(&mut host).is_err());
-        manager.toggle_pause(&mut host).unwrap();
+        assert!(manager.resume(&mut host).is_err());
         assert_eq!(
             host.calls,
             [
@@ -843,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_stop_discards_paused_resume_state_and_pending_speech() {
+    fn cancellation_discards_host_paused_state_and_pending_speech() {
         let mut manager = SpeechManager::default();
         let mut host = FakeHost::full();
         let id = UtteranceId::new("u");
@@ -858,9 +1161,9 @@ mod tests {
                 false,
             )
             .unwrap();
-        manager.toggle_pause(&mut host).unwrap();
-        manager.stop(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.cancel(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
 
         assert_eq!(
             host.calls,
@@ -868,6 +1171,35 @@ mod tests {
                 Call::Speak(id.clone(), "hello world".to_owned()),
                 Call::Pause(id.clone()),
                 Call::Stop(id)
+            ]
+        );
+    }
+
+    #[test]
+    fn cancellation_discards_actively_playing_speech_and_its_queue() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+        let active = UtteranceId::new("active");
+        manager
+            .submit(&mut host, active.clone(), "active".to_owned(), false)
+            .unwrap();
+        manager
+            .submit(
+                &mut host,
+                UtteranceId::new("queued"),
+                "queued".to_owned(),
+                false,
+            )
+            .unwrap();
+
+        manager.cancel(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+
+        assert_eq!(
+            host.calls,
+            [
+                Call::Speak(active.clone(), "active".to_owned()),
+                Call::Stop(active),
             ]
         );
     }
@@ -882,9 +1214,9 @@ mod tests {
             .submit(&mut host, id.clone(), "hello world".to_owned(), false)
             .unwrap();
 
-        manager.toggle_pause(&mut host).unwrap();
-        manager.stop(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
+        manager.cancel(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
 
         assert_eq!(
             host.calls,
@@ -904,11 +1236,11 @@ mod tests {
         manager
             .submit(&mut host, old.clone(), "old words".to_owned(), false)
             .unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
         manager
             .submit(&mut host, new.clone(), "new words".to_owned(), true)
             .unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
 
         assert_eq!(
             host.calls,
@@ -946,9 +1278,9 @@ mod tests {
             .submit(&mut host, id.clone(), "aé word".to_owned(), false)
             .unwrap();
 
-        let error = manager.toggle_pause(&mut host).unwrap_err();
+        let error = manager.toggle(&mut host).unwrap_err();
         assert!(error.to_string().contains("valid UTF-8 resume position"));
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
         assert_eq!(
             host.calls,
             [
@@ -998,6 +1330,46 @@ mod tests {
     }
 
     #[test]
+    fn noninterrupting_speech_appends_during_a_paragraph_delay() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+        let first = UtteranceId::new("first");
+        let second = UtteranceId::new("second");
+        let third = UtteranceId::new("third");
+        let now = Instant::now() + Duration::from_secs(60);
+        manager
+            .submit(&mut host, first.clone(), "first".to_owned(), false)
+            .unwrap();
+        manager
+            .submit_with_boundary(
+                &mut host,
+                second.clone(),
+                "second".to_owned(),
+                false,
+                UtteranceBoundary::Paragraph,
+            )
+            .unwrap();
+        host.events.push(FakeHost::ended(&first, 1));
+        manager.poll_at(&mut host, now).unwrap();
+
+        manager
+            .submit(&mut host, third.clone(), "third".to_owned(), false)
+            .unwrap();
+        manager.poll_at(&mut host, now + PARAGRAPH_PAUSE).unwrap();
+        host.events.push(FakeHost::ended(&second, 1));
+        manager.poll_at(&mut host, now + PARAGRAPH_PAUSE).unwrap();
+
+        assert_eq!(
+            host.calls,
+            [
+                Call::Speak(first, "first".to_owned()),
+                Call::Speak(second, "second".to_owned()),
+                Call::Speak(third, "third".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn pause_during_paragraph_gap_holds_then_starts_the_next_paragraph() {
         let mut manager = SpeechManager::default();
         let mut host = FakeHost::full();
@@ -1019,13 +1391,13 @@ mod tests {
         host.events.push(FakeHost::ended(&first, 1));
         manager.poll_at(&mut host, now).unwrap();
 
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
         manager
             .poll_at(&mut host, now + Duration::from_secs(120))
             .unwrap();
         assert_eq!(host.calls, [Call::Speak(first, "first".to_owned())]);
 
-        manager.toggle_pause(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
         assert_eq!(
             host.calls,
             [
@@ -1056,8 +1428,8 @@ mod tests {
         host.events.push(FakeHost::ended(&first, 1));
         manager.poll_at(&mut host, now).unwrap();
 
-        manager.stop(&mut host).unwrap();
-        manager.toggle_pause(&mut host).unwrap();
+        manager.cancel(&mut host).unwrap();
+        manager.toggle(&mut host).unwrap();
         manager
             .poll_at(&mut host, now + Duration::from_secs(120))
             .unwrap();

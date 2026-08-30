@@ -127,8 +127,8 @@ the adapter and reject positions inside a surrogate pair.
 Capabilities describe independently usable evidence and controls. A host MUST
 advertise only behavior it provides for every accepted utterance in that
 process generation. Version 2 requires `controls.stop` to be `confirmed` or
-`bestEffort`, because interruption and the M-X restart fallback are
-fundamental. All other capability families are optional.
+`bestEffort`, because cancellation, replacement, and whole-utterance pause
+fallback are fundamental. All other capability families are optional.
 
 ### 5.1 Lifecycle
 
@@ -260,9 +260,10 @@ identify the active utterance, the host SHOULD return `-32602`. A reliable
 lifecycle host MUST emit one `ended` event with a cancellation or failure
 reason unless it already emitted the terminal event.
 
-Lector clears its pending queue and paused state before ordinary interruption,
-then calls this method. It never resumes an utterance cancelled by typing or by
-new interrupting speech.
+This is a host primitive, not a declaration of Lector's queue policy. Lector
+uses it for cancellation, replacement, and whole-utterance pause fallback. The
+client-side transition determines whether the current item and pending queue
+are discarded or retained.
 
 ### 7.4 `speech.pause`
 
@@ -276,9 +277,9 @@ Only a host advertising resumable pause implements this method. On success,
 `paused: false` means there is no resumable paused utterance and MUST omit the
 position. Lector conservatively follows `paused: false`, an RPC failure, or an
 invalid position with `speech.stop`. It retains the stopped text and its
-never-submitted queue; after confirmed stop or reliable terminal evidence, the
-next M-X resubmits that complete utterance under a fresh opaque ID. Repeating
-pause while already paused is idempotent.
+never-submitted queue; after confirmed stop or reliable terminal evidence, a
+later resume resubmits that complete utterance under a fresh opaque ID.
+Repeating pause while already paused is idempotent.
 
 ### 7.5 `speech.resume`
 
@@ -328,29 +329,40 @@ Events for an unknown ID, an already-ended ID, an older process generation, or
 a non-increasing sequence number MUST NOT advance Lector's queue. Unknown event
 types are ignored. A host MUST preserve event order on stdout.
 
-## 9. Lector cancellation and pause semantics
+## 9. Lector playback and queue semantics
 
-Lector's manager has at most one host-active utterance and a bounded queue of
-never-submitted utterances. Its evidence-backed states include `idle`,
-`speaking`, host-paused, restart-paused, paragraph-delay, and
-paused-between-paragraphs.
+Lector's manager has at most one host-active utterance and a queue of
+never-submitted utterances. The queue retains at most 32 utterances and 256 KiB
+of text; adding beyond either limit evicts the oldest pending utterances. Its
+evidence-backed states distinguish natural idle, active playback, explicit
+suspension, replacement, cancellation, paragraph delay, and suspension before
+the next paragraph.
 
-- Reliable `ended` evidence transitions `speaking` to the next queued item.
-- `speech.speak` with interruption clears the queue, stops the active or paused
-  item, and starts only the new item.
-- Typing and other ordinary interruptions clear the queue and stop the active
-  or paused item. They leave nothing resumable.
-- M-x is always cancellation. It performs the same queue-clearing stop and a
-  later M-X cannot resurrect that speech.
-- If resumable pause is advertised, the first M-X pauses and retains the item;
-  the next M-X resumes it at the beginning of the interrupted word.
-- Otherwise, the first M-X stops and retains the complete active utterance.
-  Once a confirmed stop response or reliable terminal event proves that old
-  audio is gone, the next M-X resubmits it from the beginning with a fresh
-  opaque ID. A resume requested while a best-effort stop is awaiting its
-  terminal event is remembered. Unsent paragraphs remain queued.
-- During the paragraph-delay state, M-X freezes the queue without contacting
-  the host. The next M-X immediately starts the first word of the next
+- Reliable `ended` evidence transitions active playback to the next queued
+  item.
+- A non-interrupting public `speak` appends while logical playback is active.
+  A paragraph delay is active playback even though it is temporarily silent.
+- A non-interrupting `speak` received while explicitly suspended discards the
+  retained current item and its queue, then starts the new request. At natural
+  idle it simply starts the new request.
+- An interrupting `speak` always clears retained speech and replaces it with
+  the new request, whether playback is active or suspended.
+- `pause_speaking` suspends in one direction, `resume_speaking` resumes in one
+  direction, and `toggle_speaking` selects between them. They are idempotent
+  where applicable and do nothing at natural idle. Typing and other ordinary
+  input invoke the one-way pause transition. `M-x` invokes the toggle action;
+  `M-X` has no default speech binding.
+- `cancel_speaking` clears the active or paused item and every pending item,
+  then stops host playback. It is deliberately unbound by default.
+- If resumable pause is advertised, suspension retains the item and resume
+  restarts at the beginning of the interrupted word.
+- Otherwise, suspension stops and retains the complete active utterance. Once
+  a confirmed stop response or reliable terminal event proves that old audio
+  is gone, resume resubmits it from the beginning with a fresh opaque ID. A
+  resume requested while a best-effort stop is awaiting its terminal event is
+  remembered. Pending announcements and paragraphs remain queued.
+- During the paragraph-delay state, suspension freezes the queue without
+  contacting the host. Resume immediately starts the first word of the next
   paragraph.
 - A missing, unknown, out-of-range, or non-UTF-8 pause position is
   conservatively handled by the same whole-utterance restart fallback instead
@@ -394,13 +406,14 @@ published version 1.0 initialization and old method names (`speak`, `stop`, and
 unversioned legacy host.
 
 Legacy hosts have no correlated lifecycle or progress evidence, do not support
-word-position resume, and retain backend-owned queueing. M-x remains one-way
-cancellation. M-X can stop and retain Lector's currently tracked utterance for
-a whole-utterance restart only if safe completion evidence arrives; an
-unversioned host supplies none, so Lector never guesses that resubmission is
-safe. Lector also cannot reliably reconstruct other items already accepted
-into an opaque legacy queue. Multi-paragraph logical requests are therefore
-flattened into one utterance for legacy hosts. New
+word-position resume, and retain backend-owned queueing. Lector can request a
+stop and retain its currently tracked utterance, but an unversioned host
+supplies no safe completion evidence, so Lector never guesses that
+resubmission is safe. A later new speech request may replace the suspended
+item, but resume can remain unavailable. Lector also cannot reliably
+reconstruct other items already accepted into an opaque legacy queue.
+Multi-paragraph logical requests are therefore flattened into one utterance
+for legacy hosts. New
 implementations MUST implement version 2 and MUST NOT depend on the
 unversioned escape hatch.
 

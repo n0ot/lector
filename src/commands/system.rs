@@ -1,13 +1,23 @@
 use super::{CommandResult, Result};
 use crate::{screen_reader::ScreenReader, view::View};
 
-pub(super) fn stop(sr: &mut ScreenReader) -> Result<CommandResult> {
-    sr.stop_speaking()?;
+pub(super) fn pause(sr: &mut ScreenReader) -> Result<CommandResult> {
+    sr.pause_speaking()?;
     Ok(CommandResult::Handled)
 }
 
-pub(super) fn pause(sr: &mut ScreenReader) -> Result<CommandResult> {
-    sr.toggle_speech_pause()?;
+pub(super) fn cancel(sr: &mut ScreenReader) -> Result<CommandResult> {
+    sr.cancel_speaking()?;
+    Ok(CommandResult::Handled)
+}
+
+pub(super) fn resume(sr: &mut ScreenReader) -> Result<CommandResult> {
+    sr.resume_speaking()?;
+    Ok(CommandResult::Handled)
+}
+
+pub(super) fn toggle_speaking(sr: &mut ScreenReader) -> Result<CommandResult> {
+    sr.toggle_speaking()?;
     Ok(CommandResult::Handled)
 }
 
@@ -109,9 +119,9 @@ pub(super) fn toggle_symbol_level(sr: &mut ScreenReader) -> Result<CommandResult
 #[cfg(test)]
 mod tests {
     use super::{
-        backspace, delete, pass_next_key, pause, say_overlay, say_time, stop, toggle_auto_read,
-        toggle_help, toggle_review_follows_screen_cursor, toggle_stop_speech_on_focus_loss,
-        toggle_symbol_level,
+        backspace, cancel, delete, pass_next_key, pause, resume, say_overlay, say_time,
+        toggle_auto_read, toggle_help, toggle_review_follows_screen_cursor, toggle_speaking,
+        toggle_stop_speech_on_focus_loss, toggle_symbol_level,
     };
     use crate::{
         commands::CommandResult,
@@ -183,11 +193,16 @@ mod tests {
     }
 
     #[test]
-    fn system_commands_update_flags_delegate_stop_and_announce_state() {
+    fn system_commands_update_flags_delegate_speech_controls_and_announce_state() {
         let (mut sr, output) = screen_reader();
 
-        assert!(matches!(stop(&mut sr).unwrap(), CommandResult::Handled));
         assert!(matches!(pause(&mut sr).unwrap(), CommandResult::Handled));
+        assert!(matches!(cancel(&mut sr).unwrap(), CommandResult::Handled));
+        assert!(matches!(resume(&mut sr).unwrap(), CommandResult::Handled));
+        assert!(matches!(
+            toggle_speaking(&mut sr).unwrap(),
+            CommandResult::Handled
+        ));
         assert!(matches!(
             say_overlay(&mut sr, "Terminal").unwrap(),
             CommandResult::Handled

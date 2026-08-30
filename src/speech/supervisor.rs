@@ -654,18 +654,18 @@ impl Driver for Supervisor {
             if let Some(error) = &self.startup_error {
                 return Err(anyhow!(error.clone()));
             }
+            if self.pending_speech_paused {
+                self.pending_speech.clear();
+                self.pending_speech_bytes = 0;
+                self.pending_speech_paused = false;
+            }
             self.buffer_speech(id.clone(), text, interrupt, boundary);
             return Ok(());
         }
         if self.pending_speech_paused {
-            if interrupt {
-                self.pending_speech.clear();
-                self.pending_speech_bytes = 0;
-                self.pending_speech_paused = false;
-            } else {
-                self.buffer_speech(id.clone(), text, false, boundary);
-                return Ok(());
-            }
+            self.pending_speech.clear();
+            self.pending_speech_bytes = 0;
+            self.pending_speech_paused = false;
         }
         self.call_managed("speak", |manager, host| {
             manager.submit_with_boundary(host, id.clone(), text.to_owned(), interrupt, boundary)
@@ -679,19 +679,40 @@ impl Driver for Supervisor {
         if !self.started {
             return Ok(());
         }
-        self.call_managed("stop", SpeechManager::stop)
+        self.call_managed("cancel", SpeechManager::cancel)
     }
 
-    fn toggle_pause(&mut self) -> DriverResult<()> {
+    fn pause(&mut self) -> DriverResult<()> {
         if self.pending_speech_paused {
-            self.pending_speech_paused = false;
-            return self.flush_pending_speech_if_playing();
+            return Ok(());
         }
         if !self.started {
             self.pending_speech_paused = !self.pending_speech.is_empty();
             return Ok(());
         }
-        self.call_managed("toggle pause", SpeechManager::toggle_pause)
+        self.call_managed("pause", SpeechManager::pause)
+    }
+
+    fn resume(&mut self) -> DriverResult<()> {
+        if self.pending_speech_paused {
+            self.pending_speech_paused = false;
+            return self.flush_pending_speech_if_playing();
+        }
+        if !self.started {
+            return Ok(());
+        }
+        self.call_managed("resume", SpeechManager::resume)
+    }
+
+    fn toggle(&mut self) -> DriverResult<()> {
+        if self.pending_speech_paused {
+            return self.resume();
+        }
+        if !self.started {
+            self.pending_speech_paused = !self.pending_speech.is_empty();
+            return Ok(());
+        }
+        self.call_managed("toggle", SpeechManager::toggle)
     }
 
     fn supports_ordered_utterances(&self) -> bool {
@@ -1128,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn prestart_speech_is_bounded_flushed_and_cleared_by_stop() {
+    fn prestart_speech_is_bounded_flushed_and_cleared_by_cancel() {
         let mut harness = Harness::new();
         for index in 0..(MAX_PENDING_SPEECH_ITEMS + 5) {
             harness
@@ -1157,10 +1178,10 @@ mod tests {
     }
 
     #[test]
-    fn prestart_pause_holds_buffered_speech_until_the_next_toggle() {
+    fn prestart_pause_holds_buffered_speech_until_resume() {
         let mut harness = Harness::new();
         harness.supervisor.speak("held", false).unwrap();
-        harness.supervisor.toggle_pause().unwrap();
+        harness.supervisor.pause().unwrap();
         let active = fake_state();
         harness.push_driver(Arc::clone(&active));
 
@@ -1170,12 +1191,32 @@ mod tests {
             [Call::SetRate(1.0f32.to_bits())]
         );
 
-        harness.supervisor.toggle_pause().unwrap();
+        harness.supervisor.resume().unwrap();
         assert_eq!(
             active.lock().unwrap().calls,
             [
                 Call::SetRate(1.0f32.to_bits()),
                 Call::Speak("held".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn noninterrupting_prestart_speech_replaces_a_suspended_buffer() {
+        let mut harness = Harness::new();
+        harness.supervisor.speak("discarded", false).unwrap();
+        harness.supervisor.pause().unwrap();
+        harness.supervisor.speak("replacement", false).unwrap();
+        let active = fake_state();
+        harness.push_driver(Arc::clone(&active));
+
+        harness.supervisor.start().unwrap();
+
+        assert_eq!(
+            active.lock().unwrap().calls,
+            [
+                Call::SetRate(1.0f32.to_bits()),
+                Call::Speak("replacement".to_owned(), false),
             ]
         );
     }

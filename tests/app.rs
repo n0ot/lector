@@ -18,8 +18,10 @@ use std::{
 #[derive(Default)]
 struct RecorderState {
     speaks: Vec<(String, bool)>,
-    stops: usize,
-    pause_toggles: usize,
+    cancels: usize,
+    pauses: usize,
+    resumes: usize,
+    toggles: usize,
     rate: f32,
 }
 
@@ -43,12 +45,22 @@ impl speech::Driver for FakeDriver {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
-        self.recorder.inner.borrow_mut().stops += 1;
+        self.recorder.inner.borrow_mut().cancels += 1;
         Ok(())
     }
 
-    fn toggle_pause(&mut self) -> anyhow::Result<()> {
-        self.recorder.inner.borrow_mut().pause_toggles += 1;
+    fn pause(&mut self) -> anyhow::Result<()> {
+        self.recorder.inner.borrow_mut().pauses += 1;
+        Ok(())
+    }
+
+    fn resume(&mut self) -> anyhow::Result<()> {
+        self.recorder.inner.borrow_mut().resumes += 1;
+        Ok(())
+    }
+
+    fn toggle(&mut self) -> anyhow::Result<()> {
+        self.recorder.inner.borrow_mut().toggles += 1;
         Ok(())
     }
 
@@ -893,33 +905,33 @@ fn stdin_unmapped_forwards_to_pty() {
     assert_eq!(pty_out, b"a");
     assert!(term_out.is_empty());
     assert_eq!(sr.last_key(), b"a");
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pauses, 1);
 }
 
 #[test]
-fn meta_x_cancels_and_meta_shift_x_toggles_pause() {
+fn meta_x_toggles_speech_and_meta_shift_x_is_ordinary_input() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
     sr.speak("alpha beta", false).unwrap();
 
     app.handle_stdin(&mut sr, b"\x1bx", &mut pty_out, &mut term_out)
-        .expect("cancel with Meta-x");
-    assert_eq!(recorder.inner.borrow().stops, 1);
-    assert_eq!(recorder.inner.borrow().pause_toggles, 0);
+        .expect("pause with Meta-x");
+    app.handle_stdin(&mut sr, b"\x1bx", &mut pty_out, &mut term_out)
+        .expect("resume with Meta-x");
+    assert_eq!(recorder.inner.borrow().toggles, 2);
+    assert_eq!(recorder.inner.borrow().pauses, 0);
+    assert!(pty_out.is_empty());
 
-    sr.speak("gamma delta", false).unwrap();
     app.handle_stdin(&mut sr, b"\x1bX", &mut pty_out, &mut term_out)
-        .expect("pause with Meta-Shift-x");
-    app.handle_stdin(&mut sr, b"\x1bX", &mut pty_out, &mut term_out)
-        .expect("resume with Meta-Shift-x");
-    assert_eq!(recorder.inner.borrow().pause_toggles, 2);
-    assert_eq!(recorder.inner.borrow().stops, 1);
+        .expect("forward unbound Meta-Shift-x");
+    assert_eq!(recorder.inner.borrow().pauses, 1);
+    assert_eq!(pty_out, b"\x1bX");
 
     app.handle_stdin(&mut sr, b"a", &mut pty_out, &mut term_out)
-        .expect("ordinary typing interrupts speech");
-    assert_eq!(recorder.inner.borrow().stops, 2);
-    assert_eq!(pty_out, b"a");
+        .expect("ordinary typing pauses speech");
+    assert_eq!(recorder.inner.borrow().pauses, 2);
+    assert_eq!(pty_out, b"\x1bXa");
 }
 
 #[test]
@@ -2262,6 +2274,103 @@ fn pty_output_writes_terminal_and_autoreads() {
 }
 
 #[test]
+fn structural_long_run_reads_the_complete_presented_terminal_document() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut term_out = Vec::new();
+    let mut output = Vec::new();
+    for line in 0..80 {
+        output.extend_from_slice(format!("record-{line:02}\tvalue-{line:02}\r\n").as_bytes());
+    }
+
+    app.handle_pty(&mut sr, &output, &mut term_out)
+        .expect("present a structural run larger than the visible grid");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("flush the structural run to the physical terminal");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the complete structural run")
+    );
+
+    let spoken = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for line in 0..80 {
+        assert!(
+            spoken.contains(&format!("record-{line:02}")),
+            "record {line} was absent from {spoken:?}"
+        );
+    }
+}
+
+#[test]
+fn terminal_reset_reintroduces_the_complete_visible_grid() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut term_out = Vec::new();
+    app.handle_pty(
+        &mut sr,
+        b"reset first\r\nreset second\r\nreset third",
+        &mut term_out,
+    )
+    .expect("seed the screen before reset");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_pty(&mut sr, b"\x1b[!p\x1b[2;1Hchanged second", &mut term_out)
+        .expect("soft-reset and repaint one row");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("reset first changed second reset third".into(), false)]
+    );
+}
+
+#[test]
+fn resize_without_pty_output_reintroduces_the_complete_visible_grid() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut term_out = Vec::new();
+    app.handle_pty(
+        &mut sr,
+        b"resize first\r\nresize second\r\nresize third",
+        &mut term_out,
+    )
+    .expect("seed the screen before resize");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the initial geometry");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.on_resize(12, 40, &mut term_out)
+        .expect("resize without application output");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the resized geometry");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        &[("resize first resize second resize third".into(), false)]
+    );
+}
+
+#[test]
 fn complete_linear_output_reads_immediately_without_waiting_for_quiet() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut term_out = Vec::new();
@@ -2839,7 +2948,7 @@ fn alternate_screen_transition_realigns_review_cursor_even_at_the_same_position(
 }
 
 #[test]
-fn alternate_screen_entry_reads_the_settled_view_and_primary_restore_reads_its_cursor_line() {
+fn alternate_screen_entry_and_primary_restore_read_the_settled_visible_screen() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig {
         latency_budget_ms: 0,
@@ -3472,7 +3581,7 @@ fn alternate_screen_restores_the_primary_review_cursor() {
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("primary application line".into(), false)]
+        &[("saved review target primary application line".into(), false)]
     );
 
     recorder.inner.borrow_mut().speaks.clear();
@@ -5610,7 +5719,7 @@ fn kitty_meta_key_interrupts_speech() {
     app.handle_stdin(&mut sr, b"\x1B[117;3u", &mut pty_out, &mut term_out)
         .expect("handle Kitty Meta-u");
 
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pauses, 1);
     assert_eq!(sr.last_key(), b"\x1B[117;3u");
 }
 
@@ -5623,7 +5732,7 @@ fn kitty_control_key_interrupts_speech() {
     app.handle_stdin(&mut sr, b"\x1B[108;5u", &mut pty_out, &mut term_out)
         .expect("handle Kitty Control-l");
 
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pauses, 1);
     assert_eq!(sr.last_key(), b"\x1B[108;5u");
 }
 
@@ -5647,7 +5756,7 @@ fn kitty_release_does_not_repeat_lector_binding() {
         recorder.inner.borrow().speaks.as_slice(),
         [("auto read disabled".into(), false)]
     );
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pauses, 1);
 }
 
 #[test]
@@ -5673,7 +5782,7 @@ fn kitty_repeat_repeats_lector_binding_but_release_does_not() {
             ("auto read enabled".into(), false),
         ]
     );
-    assert_eq!(recorder.inner.borrow().stops, 2);
+    assert_eq!(recorder.inner.borrow().pauses, 2);
 }
 
 #[test]
@@ -5881,7 +5990,7 @@ fn osc_sequence_forwards_to_pty() {
     assert_eq!(pty_out, osc);
     assert!(term_out.is_empty());
     assert_eq!(sr.last_key(), osc);
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pauses, 1);
 }
 
 #[test]
@@ -5897,7 +6006,7 @@ fn osc_sequence_with_st_terminator_forwards_to_pty() {
     assert_eq!(pty_out, osc);
     assert!(term_out.is_empty());
     assert_eq!(sr.last_key(), osc);
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pauses, 1);
 }
 
 #[test]
@@ -5924,7 +6033,7 @@ fn focus_events_not_forwarded_without_app_request() {
 
     assert!(pty_out.is_empty());
     assert!(!sr.terminal_focused());
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pauses, 1);
 }
 
 #[test]
@@ -6012,7 +6121,7 @@ fn focus_out_does_not_stop_when_option_disabled() {
         .expect("handle stdin");
 
     assert!(!sr.terminal_focused());
-    assert_eq!(recorder.inner.borrow().stops, 0);
+    assert_eq!(recorder.inner.borrow().pauses, 0);
 }
 
 #[test]
@@ -6035,7 +6144,7 @@ fn toggle_stop_on_focus_loss_hotkey_disables_stopping() {
             .iter()
             .any(|(text, _)| text == "stop on focus loss disabled")
     );
-    assert_eq!(state.stops, 1);
+    assert_eq!(state.pauses, 1);
 }
 
 #[test]
@@ -6810,7 +6919,7 @@ fn lone_escape_flushes_at_the_exact_timeout_boundary() {
     assert_eq!(pty_out, b"\x1B");
     assert_eq!(app.scheduled_output_timeout(), None);
     assert_eq!(sr.last_key(), b"\x1B");
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pauses, 1);
 }
 
 #[test]
@@ -6829,7 +6938,7 @@ fn unterminated_control_sequence_flushes_as_raw_input_after_timeout() {
 
     assert_eq!(pty_out, input);
     assert_eq!(sr.last_key(), input);
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pauses, 1);
 }
 
 #[test]

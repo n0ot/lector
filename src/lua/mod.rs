@@ -348,7 +348,7 @@ mod tests {
                 lector.o.clipboard.system_provider = "osc52"
                 lector.o.symbol_level = "all"
                 lector.symbols = { ["?"] = {"query", "all", "never", false} }
-                lector.bindings["M-z"] = "lector.stop_speaking"
+                lector.bindings["M-z"] = "lector.cancel_speaking"
                 lector.bindings["M-v"] = {
                     "custom binding",
                     function() lector.o.review_follows_screen_cursor = false end,
@@ -409,7 +409,7 @@ mod tests {
             assert!(sr.speech().symbol_level() == Level::All);
             assert!(matches!(
                 sr.key_bindings().binding_for_mode(InputMode::Normal, "M-z"),
-                Some(Binding::Builtin(crate::commands::Action::StopSpeaking))
+                Some(Binding::Builtin(crate::commands::Action::CancelSpeaking))
             ));
 
             let binding = sr

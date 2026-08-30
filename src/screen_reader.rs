@@ -232,13 +232,23 @@ impl ScreenReader {
         &mut self.speech
     }
 
-    pub fn stop_speaking(&mut self) -> Result<()> {
-        self.speech.stop()?;
+    pub fn cancel_speaking(&mut self) -> Result<()> {
+        self.speech.cancel()?;
         Ok(())
     }
 
-    pub fn toggle_speech_pause(&mut self) -> Result<()> {
-        self.speech.toggle_pause()?;
+    pub fn pause_speaking(&mut self) -> Result<()> {
+        self.speech.pause()?;
+        Ok(())
+    }
+
+    pub fn resume_speaking(&mut self) -> Result<()> {
+        self.speech.resume()?;
+        Ok(())
+    }
+
+    pub fn toggle_speaking(&mut self) -> Result<()> {
+        self.speech.toggle()?;
         Ok(())
     }
 
@@ -516,7 +526,7 @@ impl ScreenReader {
     pub(crate) fn set_terminal_focused(&mut self, focused: bool) -> Result<()> {
         self.terminal_focused = focused;
         if !focused && self.stop_speech_on_focus_loss() {
-            self.stop_speaking()?;
+            self.pause_speaking()?;
         }
         Ok(())
     }
@@ -708,6 +718,194 @@ mod tests {
         let speaks = speaks.borrow();
         assert_eq!(speaks.len(), 1);
         assert_eq!(speaks[0], "hi");
+    }
+
+    #[test]
+    fn structural_long_output_reads_rows_that_scrolled_out_of_the_visible_grid() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 24);
+        view.finalize_changes(0);
+
+        let mut output = Vec::new();
+        for line in 0..20 {
+            output.extend_from_slice(format!("item-{line:02}\tvalue-{line:02}\r\n").as_bytes());
+        }
+        view.process_changes(&output);
+
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        for line in 0..20 {
+            assert!(
+                spoken.contains(&format!("item-{line:02}")),
+                "missing line {line} from {spoken:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn structural_output_that_only_extends_the_visible_grid_reads_the_new_text() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(6, 40);
+        view.process_changes(b"existing");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\r\nfirst\tvalue\r\nsecond\tvalue");
+
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("first"), "{spoken:?}");
+        assert!(spoken.contains("second"), "{spoken:?}");
+        assert!(!spoken.contains("existing"), "{spoken:?}");
+    }
+
+    #[test]
+    fn bounded_history_eviction_does_not_repeat_retained_rows() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new_with_scrollback_for_test(2, 24, 2);
+        view.process_changes(b"old-0\r\nold-1\r\nold-2");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\r\nnew-3\tvalue");
+
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("new-3"), "{spoken:?}");
+        assert!(!spoken.contains("old-1"), "{spoken:?}");
+        assert!(!spoken.contains("old-2"), "{spoken:?}");
+    }
+
+    #[test]
+    fn bounded_history_eviction_reads_a_new_tail_identical_to_the_evicted_head() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new_with_scrollback_for_test(2, 24, 2);
+        view.process_changes(b"same\tvalue\r\nsame\tvalue\r\nsame\tvalue");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\r\nsame\tvalue");
+
+        assert!(sr.auto_read(&mut view).unwrap());
+        assert!(
+            speaks.borrow().iter().any(|spoken| spoken.contains("same")),
+            "the textually identical new row still has a distinct document identity"
+        );
+    }
+
+    #[test]
+    fn disjoint_history_lineage_diffs_the_still_identified_visible_grid() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new_with_scrollback_for_test(3, 24, 1);
+        view.process_changes(b"header\r\nold-middle\r\nfooter");
+        view.finalize_changes(0);
+
+        // Scroll beyond the retained-history window, then reconstruct two
+        // unchanged visible rows around one changed row. The complete document
+        // no longer has a common retained lineage, but visible row coordinates
+        // remain exact because geometry and screen identity did not change.
+        view.process_changes(
+            b"\r\njunk-1\r\njunk-2\r\njunk-3\x1b[Hheader\x1b[2;1Hnew-middle\x1b[3;1Hfooter",
+        );
+
+        assert!(!view.accessibility_document_is_continuous());
+        assert!(!view.accessibility_requires_screen_reintroduction());
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("new"), "{spoken:?}");
+        assert!(!spoken.contains("header"), "{spoken:?}");
+        assert!(!spoken.contains("footer"), "{spoken:?}");
+    }
+
+    #[test]
+    fn primary_screen_scroll_region_reads_only_the_inserted_tui_row() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(5, 24);
+        view.process_changes(b"header\x1b[2;1Hrow-a\x1b[3;1Hrow-b\x1b[4;1Hrow-c\x1b[5;1Hfooter");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\x1b[2;4r\x1b[4;1H\nrow-d\x1b[r");
+
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("row-d"), "{spoken:?}");
+        assert!(!spoken.contains("header"), "{spoken:?}");
+        assert!(!spoken.contains("footer"), "{spoken:?}");
+    }
+
+    #[test]
+    fn alternate_screen_transition_and_repaint_use_visible_context_then_diff() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 24);
+        view.process_changes(b"primary-one\r\nprimary-two");
+        view.finalize_changes(0);
+
+        view.process_changes(b"\x1b[?1049h\x1b[2J\x1b[Hmenu-one\x1b[2;1Hmenu-two\x1b[4;1Hstatus-a");
+        assert!(sr.auto_read(&mut view).unwrap());
+        view.finalize_changes(1);
+
+        view.process_changes(b"\x1b[2;1Hmenu-next\x1b[4;1Hstatus-b");
+        assert!(sr.auto_read(&mut view).unwrap());
+
+        let spoken = speaks.borrow();
+        assert_eq!(spoken.len(), 2, "{spoken:?}");
+        assert!(spoken[0].contains("menu-one"), "{spoken:?}");
+        assert!(spoken[0].contains("menu-two"), "{spoken:?}");
+        assert!(spoken[0].contains("status-a"), "{spoken:?}");
+        assert!(spoken[1].contains("menu-next"), "{spoken:?}");
+        assert!(spoken[1].contains("status-b"), "{spoken:?}");
+        assert!(!spoken[1].contains("menu-one"), "{spoken:?}");
+    }
+
+    #[test]
+    fn returning_from_alternate_screen_reintroduces_the_entire_primary_grid() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 24);
+        view.process_changes(b"primary-one\r\nprimary-two\r\nprimary-three");
+        view.finalize_changes(0);
+        view.process_changes(b"\x1b[?1049h\x1b[2J\x1b[Halternate");
+        assert!(sr.auto_read(&mut view).unwrap());
+        view.finalize_changes(1);
+        speaks.borrow_mut().clear();
+
+        view.process_changes(b"\x1b[?1049l");
+
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("primary-one"), "{spoken:?}");
+        assert!(spoken.contains("primary-two"), "{spoken:?}");
+        assert!(spoken.contains("primary-three"), "{spoken:?}");
+    }
+
+    #[test]
+    fn resize_reintroduces_the_entire_visible_grid() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 24);
+        view.process_changes(b"resize-one\r\nresize-two\r\nresize-three");
+        view.finalize_changes(0);
+
+        view.set_size(5, 18);
+
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("resize-one"), "{spoken:?}");
+        assert!(spoken.contains("resize-two"), "{spoken:?}");
+        assert!(spoken.contains("resize-three"), "{spoken:?}");
+    }
+
+    #[test]
+    fn terminal_reset_reintroduces_the_entire_visible_grid() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 24);
+        view.process_changes(b"reset-one\r\nreset-two\r\nreset-three");
+        view.finalize_changes(0);
+
+        // DECSTR preserves the grid but invalidates terminal-state continuity;
+        // changing one row must therefore reintroduce all visible rows.
+        view.process_changes(b"\x1b[!p\x1b[2;1Hchanged-two");
+
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("reset-one"), "{spoken:?}");
+        assert!(spoken.contains("changed-two"), "{spoken:?}");
+        assert!(spoken.contains("reset-three"), "{spoken:?}");
     }
 
     #[test]

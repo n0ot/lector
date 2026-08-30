@@ -135,8 +135,10 @@ define_actions! {
     DetachTmuxConnection => ("gracefully detach the active tmux connection", "detach_tmux_connection"),
     ForceAbandonTmuxGateway => ("expose a stuck active tmux gateway as raw terminal input", "force_abandon_tmux_gateway"),
     PassNextKey => ("forward next key press", "pass_next_key"),
-    StopSpeaking => ("stop speaking", "stop_speaking"),
-    PauseSpeaking => ("pause or resume speaking", "pause_speaking"),
+    PauseSpeaking => ("pause speaking", "pause_speaking"),
+    CancelSpeaking => ("cancel speaking", "cancel_speaking"),
+    ResumeSpeaking => ("resume speaking", "resume_speaking"),
+    ToggleSpeaking => ("pause or resume speaking", "toggle_speaking"),
     RevLinePrev => ("previous line", "review_line_prev"),
     RevLineNext => ("next line", "review_line_next"),
     RevLinePrevNonBlank => ("previous non blank line", "review_line_prev_non_blank"),
@@ -234,8 +236,10 @@ pub fn handle(
         Action::ToggleSymbolLevel => system::toggle_symbol_level(sr),
         Action::SayOverlay => system::say_overlay(sr, title),
         Action::PassNextKey => system::pass_next_key(sr),
-        Action::StopSpeaking => system::stop(sr),
         Action::PauseSpeaking => system::pause(sr),
+        Action::CancelSpeaking => system::cancel(sr),
+        Action::ResumeSpeaking => system::resume(sr),
+        Action::ToggleSpeaking => system::toggle_speaking(sr),
         Action::RevLinePrev => review::line_previous(sr, view, false),
         Action::RevLineNext => review::line_next(sr, view, false),
         Action::RevLinePrevNonBlank => review::line_previous(sr, view, true),
@@ -342,6 +346,20 @@ mod tests {
             assert_eq!(builtin_action_from_name(name), Some(action));
             assert_eq!(builtin_action_name(action), name);
         }
+    }
+
+    #[test]
+    fn speech_actions_have_stable_configuration_names() {
+        for (name, action) in [
+            ("pause_speaking", Action::PauseSpeaking),
+            ("cancel_speaking", Action::CancelSpeaking),
+            ("resume_speaking", Action::ResumeSpeaking),
+            ("toggle_speaking", Action::ToggleSpeaking),
+        ] {
+            assert_eq!(builtin_action_from_name(name), Some(action));
+            assert_eq!(builtin_action_name(action), name);
+        }
+        assert_eq!(builtin_action_from_name("stop_speaking"), None);
     }
 
     #[test]

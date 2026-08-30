@@ -565,14 +565,12 @@ fn speak_application_cursor_line(sr: &mut ScreenReader, view: &View) -> Result<(
 }
 
 fn announce_screen_transition(sr: &mut ScreenReader, view: &View) -> Result<()> {
-    match view.screen().screen {
-        ScreenIdentity::Alternate => {
-            sr.speak_application_screen(view)?;
-        }
-        ScreenIdentity::Primary => {
-            sr.speak_application_cursor_line(view)?;
-        }
-    }
+    // Primary and alternate screens are independent terminal documents. No
+    // row identity survives either handoff, so the visible grid is the only
+    // conservative description of the newly active context. This deliberately
+    // also reintroduces a restored primary screen instead of guessing which
+    // parts the user remembers from before the alternate-screen session.
+    sr.speak_application_screen(view)?;
     Ok(())
 }
 
@@ -1903,7 +1901,7 @@ impl App {
                 .is_none_or(|scheduler| !scheduler.application_synchronization_is_ignored())
     }
 
-    fn note_pty_update(
+    fn note_accessibility_update(
         &mut self,
         context: AccessibilityContext,
         now_ms: u128,
@@ -2602,6 +2600,22 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.view_stack.on_resize_with_geometry(geometry);
+        let context = {
+            let view = if self.output_scheduler.is_some() {
+                self.presented_accessibility_model_mut()
+            } else {
+                self.view_stack.active_mut().model()
+            };
+            AccessibilityContext {
+                view_id: view.view_id(),
+                screen: view.live_screen().screen,
+            }
+        };
+        // A resize/reflow is an accessibility update even without PTY bytes.
+        // Start the same presentation-aligned stabilization path used by
+        // application output; auto-read will conservatively introduce the new
+        // visible grid once its resized frame reaches the physical terminal.
+        self.note_accessibility_update(context, self.clock.now_ms(), false, false);
         if let Some(connection_id) = self.active_tmux_connection
             && self.view_stack.tmux_connection_mut(connection_id).is_some()
         {

@@ -34,6 +34,13 @@ impl ScreenReader {
     }
 
     fn auto_read_impl(&mut self, view: &mut View, prefer_cursor: bool) -> Result<bool> {
+        // Geometry changes, screen handoffs, and terminal resets introduce a
+        // new visible context. No visible row identity survives, so read the
+        // new grid in full rather than guessing at an incremental mapping.
+        if view.accessibility_requires_screen_reintroduction() {
+            return self.speak_application_screen(view);
+        }
+
         // Text entry can move an editor's application cursor between wrapped
         // rows or onto a command line. Classify the pending echo before
         // reporting that physical layout change as indentation. The queued
@@ -47,6 +54,14 @@ impl ScreenReader {
         let cursor_operations_after_last_line_feed = update.cursor_operations_after_last_line_feed;
         let scrolled = update.scroll_operations > 0;
         let structural_repaint = update.output_report_structural && !scrolled;
+        // A history-only lineage gap does not invalidate fixed visible-grid
+        // coordinates. It merely makes the retained-document comparison
+        // unavailable, so fall back to an explicit visible-grid diff.
+        let compare_document =
+            view.accessibility_document_changed() && view.accessibility_document_is_continuous();
+        if compare_document {
+            view.prepare_document_contents_cache();
+        }
         let prev_cursor = view.prev_screen().cursor_position();
         let cursor = view.screen().cursor_position();
         let linear_output_report = view
@@ -94,15 +109,20 @@ impl ScreenReader {
         // is still an echo acknowledgement and must consume the corresponding
         // queued input character before a later word arrives.
         if !completed_linear_record {
-            let screen_contents_unchanged = {
+            let presented_contents_unchanged = if compare_document {
+                let (previous, current, previous_hashes, current_hashes) =
+                    view.document_contents_cached();
+                previous_hashes == current_hashes && previous == current
+            } else {
                 // Populate View's reusable full-screen buffers here instead
                 // of allocating throwaway normalized strings. A validated LF
                 // record does not need a screen diff at all, so it bypasses
                 // this whole-screen scan.
-                let (previous, current, _, _) = view.full_contents_cached();
-                previous == current
+                let (previous, current, previous_hashes, current_hashes) =
+                    view.full_contents_cached();
+                previous_hashes == current_hashes && previous == current
             };
-            if screen_contents_unchanged {
+            if presented_contents_unchanged {
                 let suppressed_echo = self.should_suppress_key_echo(&live_text);
                 self.auto_read_buffers.live_text = live_text;
                 return Ok(suppressed_echo
@@ -164,9 +184,11 @@ impl ScreenReader {
         } else {
             false
         };
-        let (old_text, new_text, prev_hashes, curr_hashes) = view.full_contents_cached();
+        view.prepare_full_contents_cache();
+        let (old_text, new_text, prev_hashes, curr_hashes) = view.full_contents_from_cache();
 
-        if prev_hashes.len() == curr_hashes.len()
+        if !compare_document
+            && prev_hashes.len() == curr_hashes.len()
             && prev_hashes == curr_hashes
             && old_text == new_text
         {
@@ -388,6 +410,9 @@ impl ScreenReader {
                     .nth(inline_row)
                     .unwrap_or(""),
             )
+        } else if compare_document {
+            let (previous, current, _, _) = view.document_contents_cached();
+            (previous, current)
         } else {
             (old_text, new_text)
         };

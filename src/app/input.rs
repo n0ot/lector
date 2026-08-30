@@ -344,7 +344,10 @@ impl App {
                 matches!(
                     binding,
                     Binding::Builtin(
-                        commands::Action::StopSpeaking | commands::Action::PauseSpeaking
+                        commands::Action::PauseSpeaking
+                            | commands::Action::CancelSpeaking
+                            | commands::Action::ResumeSpeaking
+                            | commands::Action::ToggleSpeaking
                     )
                 )
             });
@@ -352,8 +355,8 @@ impl App {
         if sr.take_pass_through() {
             if is_speech_control_command {
                 // Pass-through makes this physical key ordinary application
-                // input, so it retains ordinary interruption semantics.
-                sr.stop_speaking()?;
+                // input, so it retains ordinary suspension semantics.
+                sr.pause_speaking()?;
             }
             self.consumed_key_presses.remove(&key_id);
             return self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out);
@@ -783,7 +786,7 @@ impl App {
         if decoded_key_event || !ANSI_CSI_RE.is_match(raw) {
             sr.record_last_key(raw);
             if interrupt_speech {
-                sr.stop_speaking()?;
+                sr.pause_speaking()?;
             }
         }
         Ok(())

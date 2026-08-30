@@ -438,7 +438,7 @@ impl App {
         }
         let now_ms = self.clock.now_ms();
         let view_id = self.view_stack.root_mut().model().view_id();
-        self.note_pty_update(
+        self.note_accessibility_update(
             AccessibilityContext {
                 view_id,
                 screen: output_screen.0,
@@ -2426,7 +2426,7 @@ impl App {
                 let view_id = self.view_stack.active_mut().model().view_id();
                 let (screen, screen_context_changed) =
                     output_screen.expect("visible output retained its screen identity");
-                self.note_pty_update(
+                self.note_accessibility_update(
                     AccessibilityContext { view_id, screen },
                     now_ms,
                     screen_context_changed,

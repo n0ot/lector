@@ -1802,7 +1802,7 @@ fn main() -> Result<()> {
             // A broken init.lua must still leave the error UI accessible. Drop
             // any partially queued startup announcements, then start the
             // built-in backend using default process selection.
-            screen_reader.stop_speaking()?;
+            screen_reader.cancel_speaking()?;
             match start_configured_speech(
                 &mut screen_reader,
                 speech::SpeechServerSpec::Native,

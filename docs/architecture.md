@@ -16,7 +16,7 @@ Bounded workers isolate side effects that may block:
 
 - The speech supervisor owns both native and custom process backends behind the
   bounded asynchronous speech worker. Its mailbox drops stale speech under
-  overload and prioritizes stop and rate changes. JSON-RPC pipe readiness and
+  overload and prioritizes cancellation and rate changes. JSON-RPC pipe readiness and
   absolute deadlines are worker-local; completion or fatal failure reaches the
   main loop through an event-driven control path rather than a polling timer.
   The default native backend is hosted by a hidden instance of the current
@@ -42,14 +42,18 @@ lifecycle:
 
 Runtime speech sequencing is owned by a host-independent manager. It sends at
 most one active utterance to a version 2 host, advances its bounded queue only
-from correlated terminal evidence, and retains resumable state only across an
-explicit `M-X` pause/resume toggle. `M-x`, typing, and interrupting speech clear
-that state and the unsent queue. Paragraph gaps are nonblocking manager
-deadlines which `M-X` can freeze. Runtime speech replacement is transactional. A
-candidate process initializes and restores the configured rate while the old
-generation remains owned for rollback; only then is the active generation
-swapped and the old child terminated and reaped. Transport failures never
-replay an uncertain in-flight speech call.
+from correlated terminal evidence, and models playing, suspended, replacing,
+and cancelling as distinct transitions. `M-x` toggles suspension; typing and
+other ordinary input suspend in one direction. Both preserve the active item
+and unsent queue. New non-interrupting speech appends while playback is active,
+but replaces retained speech while suspended. Interrupting speech and the
+explicit, unbound cancel action always replace or discard the retained queue.
+Paragraph gaps are nonblocking manager deadlines which suspension can freeze.
+Runtime speech-host replacement is transactional. A candidate process
+initializes and restores the configured rate while the old generation remains
+owned for rollback; only then is the active generation swapped and the old
+child terminated and reaped. Transport failures never replay an uncertain
+in-flight speech call.
 The supervisor permits a restart only when the preceding recorded crash was at
 least 30 seconds earlier, and otherwise asks the event loop to restore the
 terminal and exit nonzero. The exact process and protocol contract is in
@@ -198,6 +202,27 @@ input is a conservative legacy boundary. Everything else uses the per-view
 adaptive quiet deadline and the bounded hard deadline. Incomplete escape
 sequences cannot quiet-commit, structural and title-only bursts do not train
 the timer, and context switches discard transient deadline state.
+
+Auto-read's authoritative comparison document is the retained history followed
+by the live grid—the same complete terminal document exposed by Review. This
+ordering encodes the central scrolling invariant directly: when a bottom row is
+added, older visible rows move into history without moving within the combined
+document, so only the new tail is inserted. A primary-screen TUI normally edits
+the visible suffix; an alternate-screen TUI has its own history-and-grid
+identity. The bounded parallel print observer supplies immediate record
+boundaries and exact causal text when it can validate ordinary line-oriented
+output, but structural output such as tabs and cursor-addressed painting falls
+back to the combined document rather than a visible-grid-only diff.
+
+History origin and extent provide continuity across append and bounded head
+eviction. Geometry/reflow changes, primary/alternate handoffs, and terminal
+resets invalidate every visible row identity; after the corresponding physical
+frame is presented, Lector reads the complete visible grid and establishes that
+generation as the next baseline. A disjoint history interval invalidates only
+the complete-document comparison: unchanged geometry and screen identity still
+provide exact visible-grid coordinates, so Lector explicitly diffs the previous
+and current visible grids. Resize is itself an accessibility update even when
+the application emits no PTY bytes.
 
 The invariant is exact at completed presentation boundaries. When the outer
 terminal supports DEC 2026, Lector's global wrapper also hides partial VT

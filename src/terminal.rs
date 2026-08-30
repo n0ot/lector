@@ -842,11 +842,21 @@ impl TerminalSnapshot {
         out.clear();
         let (_, cols) = self.size();
         for row in self.rows.iter() {
-            let row_start = out.len();
-            append_row_contents(row, 0, cols, out);
-            let trimmed_row_len = out[row_start..].trim_end().len();
-            out.truncate(row_start + trimmed_row_len);
-            out.push('\n');
+            append_full_row(row, cols, out);
+        }
+    }
+
+    /// Writes the complete reviewable terminal document into `out`.
+    ///
+    /// Retained primary-screen history precedes the visible grid. Keeping the
+    /// two regions in one sequence makes an ordinary bottom-margin scroll an
+    /// append: a row which moves from the grid into history retains the same
+    /// position in this document and must not be reported as new output.
+    pub fn document_contents_into(&self, out: &mut String) {
+        out.clear();
+        let (_, cols) = self.size();
+        for row in self.scrollback.iter().chain(self.rows.iter()) {
+            append_full_row(row, cols, out);
         }
     }
 
@@ -865,6 +875,14 @@ impl TerminalSnapshot {
             })
         })
     }
+}
+
+fn append_full_row(row: &Row, cols: u16, out: &mut String) {
+    let row_start = out.len();
+    append_row_contents(row, 0, cols, out);
+    let trimmed_row_len = out[row_start..].trim_end().len();
+    out.truncate(row_start + trimmed_row_len);
+    out.push('\n');
 }
 
 fn row_contents(row: &Row, start: u16, width: u16) -> String {
@@ -1674,5 +1692,24 @@ mod tests {
             (2, 1),
             "reselecting the live viewport must be a no-op"
         );
+    }
+
+    #[test]
+    fn terminal_document_keeps_scrolled_rows_in_place_and_appends_the_new_tail() {
+        let mut engine =
+            GhosttyEngine::new_with_scrollback(2, 8, 32).expect("create Ghostty engine");
+        engine.advance(b"one\r\ntwo").expect("seed visible rows");
+        let before = engine.snapshot_with_history();
+        let mut before_document = String::new();
+        before.document_contents_into(&mut before_document);
+
+        engine.advance(b"\r\nthree").expect("scroll one row");
+        let after = engine.snapshot_with_history();
+        let mut after_document = String::new();
+        after.document_contents_into(&mut after_document);
+
+        assert_eq!(before_document, "one\ntwo\n");
+        assert_eq!(after_document, "one\ntwo\nthree\n");
+        assert!(after_document.starts_with(&before_document));
     }
 }

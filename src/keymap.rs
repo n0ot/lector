@@ -90,8 +90,7 @@ const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("M-r", Action::OpenReview),
     ("M-w", Action::SayOverlay),
     ("M-n", Action::PassNextKey),
-    ("M-x", Action::StopSpeaking),
-    ("M-X", Action::PauseSpeaking),
+    ("M-x", Action::ToggleSpeaking),
     ("M-u", Action::RevLinePrev),
     ("M-o", Action::RevLineNext),
     ("M-U", Action::RevLinePrevNonBlank),
@@ -368,6 +367,21 @@ mod tests {
                 "key={key}"
             );
         }
+    }
+
+    #[test]
+    fn meta_x_toggles_speech_and_meta_shift_x_is_unbound() {
+        let bindings = KeyBindings::new();
+
+        assert!(matches!(
+            bindings.binding_for_mode(InputMode::Normal, "M-x"),
+            Some(Binding::Builtin(Action::ToggleSpeaking))
+        ));
+        assert!(
+            bindings
+                .binding_for_mode(InputMode::Normal, "M-X")
+                .is_none()
+        );
     }
 
     #[test]
