@@ -90,18 +90,33 @@ impl Nvda {
             warn!(%error, "loading the NVDA controller client failed");
             Error::BackendUnavailable("the NVDA controller client DLL failed to load")
         })?;
-        if let Err(error) = WIN32_ERROR(unsafe { (controller.test_if_running)() }).ok() {
-            warn!(%error, "NVDA did not respond to testIfRunning");
-            return Err(Error::BackendUnavailable("NVDA is not running"));
-        }
         // A DLL that exports `isSpeaking` may still talk to an NVDA too old to
         // implement it, so probe once and drop the symbol if the call fails.
+        // NVDA itself is a transient external service: explicit backend
+        // selection remains valid while it is stopped and future speech calls
+        // probe it again.
         controller.is_speaking = controller.is_speaking.filter(|is_speaking| {
             let mut speaking = 0u8;
             unsafe { is_speaking(&raw mut speaking) == 0 }
         });
-        info!("Connected to NVDA");
+        info!("Loaded the NVDA controller client");
         Ok(Self(Arc::new(controller)))
+    }
+
+    fn ensure_running(&self) -> Result<(), Error> {
+        if unsafe { (self.0.test_if_running)() } == 0 {
+            Ok(())
+        } else {
+            Err(Error::BackendUnavailable("NVDA is not running"))
+        }
+    }
+
+    fn check_operation(&self, status: u32) -> Result<(), Error> {
+        if status == 0 {
+            return Ok(());
+        }
+        self.ensure_running()?;
+        check(status)
     }
 }
 
@@ -117,11 +132,12 @@ impl Backend for Nvda {
 
     #[instrument(level = "debug", skip(self), err)]
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<Option<UtteranceId>, Error> {
+        self.ensure_running()?;
         if interrupt {
-            check(unsafe { (self.0.cancel_speech)() })?;
+            self.check_operation(unsafe { (self.0.cancel_speech)() })?;
         }
         let text = HSTRING::from(text);
-        check(unsafe { (self.0.speak_text)(text.as_ptr()) })?;
+        self.check_operation(unsafe { (self.0.speak_text)(text.as_ptr()) })?;
         Ok(None)
     }
 
@@ -132,7 +148,8 @@ impl Backend for Nvda {
 
     #[instrument(level = "debug", skip(self), err)]
     fn stop(&mut self) -> Result<(), Error> {
-        check(unsafe { (self.0.cancel_speech)() })
+        self.ensure_running()?;
+        self.check_operation(unsafe { (self.0.cancel_speech)() })
     }
 
     #[instrument(level = "debug", skip(self), err)]

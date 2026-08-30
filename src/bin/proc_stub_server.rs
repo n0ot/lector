@@ -2,8 +2,9 @@ use anyhow::Result;
 use lector::{
     proc_server_common::{Request, RpcError, ServerNotification, run_server_with_tick},
     speech::protocol::{
-        AcceptedResult, ControlCapabilities, SettingCapabilities, SettingSupport,
-        SpeechCapabilities, SpeechEventNotification, SpeechEventPayload, StopSupport, UtteranceId,
+        AcceptedResult, BackendInfo, ControlCapabilities, CurrentVoiceResult, SettingCapabilities,
+        SettingSupport, SpeechCapabilities, SpeechEventNotification, SpeechEventPayload,
+        StopSupport, UtteranceId, VoiceCapabilities, VoiceInfo, VoiceListResult,
     },
 };
 use serde_json::{Value, json};
@@ -18,6 +19,7 @@ use std::{
 
 struct State {
     rate: f32,
+    voice_id: String,
     speech_log: Option<File>,
     rpc_log: Option<File>,
     stall_speech: bool,
@@ -101,6 +103,7 @@ fn main() -> Result<()> {
         .transpose()?;
     let state = State {
         rate: 1.0,
+        voice_id: "stub-a".to_owned(),
         speech_log,
         rpc_log,
         stall_speech: std::env::var_os("LECTOR_PROC_STUB_STALL_SPEECH").is_some(),
@@ -180,11 +183,13 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
             "speech server is already initialized",
         ));
     }
+    let backend = stub_backend_info();
     if !state.legacy_protocol
         && let Some(result) = lector::proc_server_common::handle_protocol_request(
             &request,
             "lector-proc-stub",
             env!("CARGO_PKG_VERSION"),
+            Some(&backend),
             &stub_capabilities(),
         )
     {
@@ -257,8 +262,57 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
                 Ok(json!({ "rate": state.rate }))
             }
         }
+        "speech.listVoices" => serde_json::to_value(VoiceListResult {
+            voices: stub_voices(),
+        })
+        .map_err(|error| RpcError::internal_error(error.to_string())),
+        "speech.getVoice" => serde_json::to_value(CurrentVoiceResult {
+            voice: stub_voices()
+                .into_iter()
+                .find(|voice| voice.id == state.voice_id),
+        })
+        .map_err(|error| RpcError::internal_error(error.to_string())),
+        "speech.setVoice" => {
+            let voice_id = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("voiceId"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::invalid_params("missing voiceId"))?;
+            let voice = stub_voices()
+                .into_iter()
+                .find(|voice| voice.id == voice_id)
+                .ok_or_else(|| RpcError::invalid_params("voice not found"))?;
+            state.voice_id.clone_from(&voice.id);
+            serde_json::to_value(CurrentVoiceResult { voice: Some(voice) })
+                .map_err(|error| RpcError::internal_error(error.to_string()))
+        }
         _ => Err(RpcError::method_not_found(request.method)),
     }
+}
+
+fn stub_backend_info() -> BackendInfo {
+    BackendInfo {
+        id: "stub".to_owned(),
+        name: "Deterministic stub".to_owned(),
+        extensions: BTreeMap::new(),
+    }
+}
+
+fn stub_voices() -> Vec<VoiceInfo> {
+    [
+        ("stub-a", "Stub voice A", "en-US"),
+        ("stub-b", "Stub voice B", "en-GB"),
+    ]
+    .into_iter()
+    .map(|(id, name, language)| VoiceInfo {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        language: language.to_owned(),
+        gender: None,
+        extensions: BTreeMap::new(),
+    })
+    .collect()
 }
 
 fn stub_capabilities() -> SpeechCapabilities {
@@ -284,6 +338,12 @@ fn stub_capabilities() -> SpeechCapabilities {
         },
         settings: SettingCapabilities {
             rate: SettingSupport::ReadWrite,
+            ..Default::default()
+        },
+        voices: VoiceCapabilities {
+            list: true,
+            current: true,
+            select: true,
             ..Default::default()
         },
         ..Default::default()

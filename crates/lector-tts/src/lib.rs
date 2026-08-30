@@ -9,7 +9,7 @@
 //!  * * Android (`minSdkVersion` 26 and above; see the README for its one setup requirement)
 //!  * * WebAssembly
 
-use std::{boxed::Box, fmt, sync::Arc};
+use std::{boxed::Box, fmt, str::FromStr, sync::Arc};
 
 #[cfg(any(windows, target_os = "android", target_vendor = "apple"))]
 use std::io::Cursor;
@@ -26,6 +26,9 @@ use thiserror::Error;
 use tracing::instrument;
 
 mod backends;
+pub mod host;
+pub mod protocol;
+pub mod server;
 
 /// Android-specific configuration with no counterpart on the other platforms.
 #[cfg(target_os = "android")]
@@ -56,6 +59,50 @@ pub enum Backends {
 }
 
 impl Backends {
+    fn compiled() -> Vec<Self> {
+        vec![
+            #[cfg(windows)]
+            Backends::Nvda,
+            #[cfg(all(windows, feature = "tolk"))]
+            Backends::Tolk,
+            #[cfg(windows)]
+            Backends::WinRt,
+            #[cfg(target_os = "linux")]
+            Backends::Orca,
+            #[cfg(target_os = "linux")]
+            Backends::SpeechDispatcher,
+            #[cfg(target_vendor = "apple")]
+            Backends::AvFoundation,
+            #[cfg(target_os = "android")]
+            Backends::Android,
+            #[cfg(target_arch = "wasm32")]
+            Backends::Web,
+        ]
+    }
+
+    /// Stable identifier accepted by the standalone speech host.
+    #[must_use]
+    pub const fn id(self) -> &'static str {
+        match self {
+            #[cfg(target_os = "android")]
+            Backends::Android => "android",
+            #[cfg(target_vendor = "apple")]
+            Backends::AvFoundation => "av-foundation",
+            #[cfg(windows)]
+            Backends::Nvda => "nvda",
+            #[cfg(target_os = "linux")]
+            Backends::Orca => "orca",
+            #[cfg(target_os = "linux")]
+            Backends::SpeechDispatcher => "speech-dispatcher",
+            #[cfg(all(windows, feature = "tolk"))]
+            Backends::Tolk => "tolk",
+            #[cfg(target_arch = "wasm32")]
+            Backends::Web => "web",
+            #[cfg(windows)]
+            Backends::WinRt => "winrt",
+        }
+    }
+
     /// Returns this backend's human-readable name.
     #[instrument(level = "trace")]
     #[must_use]
@@ -107,6 +154,21 @@ impl Backends {
         }
     }
 }
+
+impl FromStr for Backends {
+    type Err = UnknownBackend;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::compiled()
+            .into_iter()
+            .find(|backend| backend.id() == value)
+            .ok_or_else(|| UnknownBackend(value.to_owned()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("unknown or unavailable-in-this-build speech backend: {0}")]
+pub struct UnknownBackend(String);
 
 impl fmt::Display for Backends {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
@@ -496,6 +558,13 @@ pub struct Tts {
 }
 
 impl Tts {
+    /// All backends compiled for this target, whether or not their external
+    /// service is currently running.
+    #[must_use]
+    pub fn compiled_backends() -> Vec<Backends> {
+        Backends::compiled()
+    }
+
     /// Create a new `TTS` instance with the specified backend.
     ///
     /// # Errors
@@ -540,27 +609,8 @@ impl Tts {
     #[instrument(level = "debug", ret)]
     #[must_use]
     pub fn backends() -> Vec<Backends> {
-        let candidates: &[Backends] = &[
-            #[cfg(windows)]
-            Backends::Nvda,
-            #[cfg(all(windows, feature = "tolk"))]
-            Backends::Tolk,
-            #[cfg(windows)]
-            Backends::WinRt,
-            #[cfg(target_os = "linux")]
-            Backends::Orca,
-            #[cfg(target_os = "linux")]
-            Backends::SpeechDispatcher,
-            #[cfg(target_vendor = "apple")]
-            Backends::AvFoundation,
-            #[cfg(target_os = "android")]
-            Backends::Android,
-            #[cfg(target_arch = "wasm32")]
-            Backends::Web,
-        ];
-        candidates
-            .iter()
-            .copied()
+        Backends::compiled()
+            .into_iter()
             .filter(|backend| backend.is_available())
             .collect()
     }

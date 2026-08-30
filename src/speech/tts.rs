@@ -18,22 +18,25 @@ fn backend_error(error: impl std::fmt::Display) -> Error {
 pub struct TtsDriver {
     tts: Tts,
     rate: f32,
-    min_rate: f32,
-    max_rate: f32,
+    rate_bounds: Option<(f32, f32)>,
 }
 
 impl TtsDriver {
     pub fn new() -> Result<Self> {
         let tts = Tts::default().map_err(backend_error)?;
-        let min_rate = tts.min_rate().map_err(backend_error)?;
-        let max_rate = tts.max_rate().map_err(backend_error)?;
-        let rate = tts.normal_rate().map_err(backend_error)?;
-        tts.set_rate(rate).map_err(backend_error)?;
+        let (rate, rate_bounds) = if tts.supported_features().rate {
+            let min_rate = tts.min_rate().map_err(backend_error)?;
+            let max_rate = tts.max_rate().map_err(backend_error)?;
+            let rate = tts.normal_rate().map_err(backend_error)?;
+            tts.set_rate(rate).map_err(backend_error)?;
+            (rate, Some((min_rate, max_rate)))
+        } else {
+            (1.0, None)
+        };
         Ok(TtsDriver {
             tts,
             rate,
-            min_rate,
-            max_rate,
+            rate_bounds,
         })
     }
 }
@@ -60,7 +63,10 @@ impl Driver for TtsDriver {
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
-        let clamped = rate.clamp(self.min_rate, self.max_rate);
+        let Some((min_rate, max_rate)) = self.rate_bounds else {
+            return Ok(());
+        };
+        let clamped = rate.clamp(min_rate, max_rate);
         self.tts.set_rate(clamped).map_err(backend_error)?;
         self.rate = clamped;
         Ok(())
@@ -78,7 +84,9 @@ mod tests {
     #[test]
     fn native_speech_enqueue_does_not_wait_for_utterance_completion() {
         let native = TtsDriver::new().expect("create native speech driver");
-        native.tts.set_volume(0.0).expect("mute native speech test");
+        if native.tts.supported_features().volume {
+            native.tts.set_volume(0.0).expect("mute native speech test");
+        }
         let mut driver = BoundedAsyncDriver::new(native).expect("start native speech worker");
         let deliberately_long = "Lector native speech remains asynchronous. ".repeat(40);
 

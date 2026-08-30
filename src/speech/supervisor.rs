@@ -248,8 +248,8 @@ fn command_for_spec(spec: &SpeechServerSpec) -> DriverResult<ServerCommand> {
         SpeechServerSpec::Native => Ok(ServerCommand {
             program: std::env::current_exe().context("locate Lector native speech host")?,
             args: vec![
-                "--native-speech-server".to_owned(),
-                "--native-speech-parent-pid".to_owned(),
+                "tts".to_owned(),
+                "--parent-pid".to_owned(),
                 std::process::id().to_string(),
             ],
         }),
@@ -1100,11 +1100,7 @@ mod tests {
         assert_eq!(command.program, std::env::current_exe().unwrap());
         assert_eq!(
             command.args,
-            [
-                "--native-speech-server",
-                "--native-speech-parent-pid",
-                &std::process::id().to_string(),
-            ]
+            ["tts", "--parent-pid", &std::process::id().to_string(),]
         );
     }
 

@@ -839,7 +839,7 @@ dependencies = [
  "dirs",
  "emojis",
  "lector-ghostty",
- "lector-tts-backend",
+ "lector-tts",
  "mio",
  "mlua",
  "nix",
@@ -867,21 +867,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "lector-tts-backend"
+name = "lector-tts"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "block2",
+ "clap",
+ "core-foundation",
  "dyn-clonable",
  "hound",
  "jni",
  "libloading",
  "ndk-context",
+ "nix",
  "objc2",
  "objc2-avf-audio",
  "objc2-foundation",
  "oxilangtag",
  "parking_lot",
  "serde",
+ "serde_json",
  "ssip",
  "ssip-client-async",
  "tempfile",

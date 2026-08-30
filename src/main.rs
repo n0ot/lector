@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use lector::{
     app, diagnostics, lua,
     presentation::PhysicalTerminalLifecycle,
@@ -835,7 +835,7 @@ fn default_config_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, INPUT_DRAIN_BUDGET_BYTES, INPUT_READ_BUFFER_BYTES, InputDrainState,
+        Cli, CliCommand, INPUT_DRAIN_BUDGET_BYTES, INPUT_READ_BUFFER_BYTES, InputDrainState,
         NonblockingFdGuard, PTY_DRAIN_BUDGET_BYTES, PTY_READ_BUFFER_BYTES, PtyDrainState,
         SetupFailureAction, ShutdownFenceBroker, ShutdownFenceOutcome, TerminalSignalAction,
         drain_available_input, drain_available_pty, drain_shutdown_fence_input,
@@ -1134,6 +1134,19 @@ mod tests {
                 .render_long_help()
                 .to_string()
                 .contains("native-speech-server")
+        );
+    }
+
+    #[test]
+    fn public_tts_subcommand_does_not_require_a_terminal_shell() {
+        let cli = Cli::try_parse_from(["lector", "tts", "--list-backends"])
+            .expect("parse public standalone-compatible speech host");
+        assert!(matches!(cli.command, Some(CliCommand::Tts(_))));
+        assert!(
+            Cli::command()
+                .render_long_help()
+                .to_string()
+                .contains("tts")
         );
     }
 
@@ -1560,12 +1573,7 @@ mod tests {
 #[clap(author, version, about)]
 struct Cli {
     /// Lector will spawn this shell when it starts
-    #[clap(
-        long,
-        short = 's',
-        env,
-        required_unless_present = "native_speech_server"
-    )]
+    #[clap(long, short = 's', env)]
     shell: Option<std::path::PathBuf>,
     /// Load Lua configuration from this file
     #[clap(long, conflicts_with = "no_config")]
@@ -1585,6 +1593,14 @@ struct Cli {
     /// Expected parent process for the internal native speech host
     #[clap(long, hide = true, requires = "native_speech_server")]
     native_speech_parent_pid: Option<u32>,
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand)]
+enum CliCommand {
+    /// Run the cross-platform Lector speech host over stdin/stdout.
+    Tts(tts::host::Options),
 }
 
 struct DiagnosticsShutdownGuard;
@@ -1667,6 +1683,9 @@ fn install_second_termination_signal_exit() -> Result<Arc<AtomicBool>> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(CliCommand::Tts(options)) = cli.command.as_ref() {
+        return tts::host::run_with_options(options);
+    }
     if cli.native_speech_server {
         return lector::native_tts_server::run(cli.native_speech_parent_pid);
     }

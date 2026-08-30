@@ -1,9 +1,10 @@
 use super::{
     manager::Host,
     protocol::{
-        AcceptedResult, ClientCapabilities, ControlCapabilities, MAX_JSON_SAFE_INTEGER,
-        PauseResult, ProtocolRange, SettingCapabilities, SettingSupport, SpeechCapabilities,
-        SpeechEventNotification, StopSupport, UtteranceId, UtteranceParams,
+        AcceptedResult, BackendInfo, ClientCapabilities, ControlCapabilities, CurrentVoiceResult,
+        MAX_JSON_SAFE_INTEGER, PauseResult, ProtocolRange, SetVoiceParams, SettingCapabilities,
+        SettingSupport, SpeechCapabilities, SpeechEventNotification, StopSupport, UtteranceId,
+        UtteranceParams, VoiceInfo, VoiceListResult,
     },
 };
 use crate::proc_server_common::{
@@ -146,6 +147,7 @@ pub struct ProcDriver {
     rate: f32,
     timeouts: RpcTimeouts,
     legacy_protocol: bool,
+    backend: Option<BackendInfo>,
     capabilities: SpeechCapabilities,
     pending_events: VecDeque<SpeechEventNotification>,
     next_compatibility_id: u64,
@@ -299,6 +301,7 @@ impl ProcDriver {
             rate: 1.0,
             timeouts,
             legacy_protocol: false,
+            backend: None,
             capabilities: SpeechCapabilities::default(),
             pending_events: VecDeque::new(),
             next_compatibility_id: 1,
@@ -388,9 +391,19 @@ impl ProcDriver {
                 "initialize result has an empty server name or version".to_owned(),
             ));
         }
+        if initialized
+            .backend
+            .as_ref()
+            .is_some_and(|backend| backend.id.is_empty() || backend.name.is_empty())
+        {
+            return Err(Error::InvalidResponse(
+                "initialize result has an empty backend ID or name".to_owned(),
+            ));
+        }
         if !initialized.capabilities.controls.stop.is_supported() {
             return Err(Error::MissingCapability("controls.stop"));
         }
+        self.backend = initialized.backend;
         self.capabilities = initialized.capabilities;
         Ok(())
     }
@@ -733,6 +746,10 @@ impl Host for ProcDriver {
         &self.capabilities
     }
 
+    fn backend_info(&self) -> Option<&BackendInfo> {
+        self.backend.as_ref()
+    }
+
     fn has_legacy_queue(&self) -> bool {
         self.legacy_protocol
     }
@@ -821,6 +838,42 @@ impl Host for ProcDriver {
         };
         self.rate = actual;
         Ok(actual)
+    }
+
+    fn list_voices(&mut self) -> DriverResult<Vec<VoiceInfo>> {
+        let result = self.call("speech.listVoices", None)?;
+        serde_json::from_value::<VoiceListResult>(result)
+            .map(|result| result.voices)
+            .map_err(|error| {
+                Error::InvalidResponse(format!("invalid speech.listVoices result: {error}"))
+            })
+            .map_err(Into::into)
+    }
+
+    fn current_voice(&mut self) -> DriverResult<CurrentVoiceResult> {
+        let result = self.call("speech.getVoice", None)?;
+        serde_json::from_value(result)
+            .map_err(|error| {
+                Error::InvalidResponse(format!("invalid speech.getVoice result: {error}"))
+            })
+            .map_err(Into::into)
+    }
+
+    fn set_voice(&mut self, voice_id: &str) -> DriverResult<CurrentVoiceResult> {
+        let result = self.call(
+            "speech.setVoice",
+            Some(
+                serde_json::to_value(SetVoiceParams {
+                    voice_id: voice_id.to_owned(),
+                })
+                .map_err(Error::Serialize)?,
+            ),
+        )?;
+        serde_json::from_value(result)
+            .map_err(|error| {
+                Error::InvalidResponse(format!("invalid speech.setVoice result: {error}"))
+            })
+            .map_err(Into::into)
     }
 
     fn take_events(&mut self) -> DriverResult<Vec<SpeechEventNotification>> {

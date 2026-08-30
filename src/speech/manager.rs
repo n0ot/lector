@@ -6,8 +6,9 @@
 
 use super::UtteranceBoundary;
 use super::protocol::{
-    KnownEventKind, MAX_JSON_SAFE_INTEGER, MAX_UTTERANCE_TEXT_BYTES, PauseResult,
-    SpeechCapabilities, SpeechEventNotification, TextPosition, UtteranceId,
+    BackendInfo, CurrentVoiceResult, KnownEventKind, MAX_JSON_SAFE_INTEGER,
+    MAX_UTTERANCE_TEXT_BYTES, PauseResult, SpeechCapabilities, SpeechEventNotification,
+    TextPosition, UtteranceId, VoiceInfo,
 };
 use anyhow::{Result, anyhow};
 use std::{
@@ -21,6 +22,10 @@ pub(crate) const PARAGRAPH_PAUSE: Duration = Duration::from_millis(200);
 pub trait Host {
     fn capabilities(&self) -> &SpeechCapabilities;
 
+    fn backend_info(&self) -> Option<&BackendInfo> {
+        None
+    }
+
     /// Version 1 hosts retain their historical backend-owned queue. This is a
     /// compatibility exception and is never enabled by a version 2 capability.
     fn has_legacy_queue(&self) -> bool {
@@ -32,6 +37,15 @@ pub trait Host {
     fn pause(&mut self, id: &UtteranceId) -> Result<PauseResult>;
     fn resume(&mut self, id: &UtteranceId) -> Result<()>;
     fn set_rate(&mut self, rate: f32) -> Result<f32>;
+    fn list_voices(&mut self) -> Result<Vec<VoiceInfo>> {
+        Err(anyhow!("speech host cannot list voices"))
+    }
+    fn current_voice(&mut self) -> Result<CurrentVoiceResult> {
+        Err(anyhow!("speech host cannot report its current voice"))
+    }
+    fn set_voice(&mut self, _voice_id: &str) -> Result<CurrentVoiceResult> {
+        Err(anyhow!("speech host cannot select voices"))
+    }
     fn take_events(&mut self) -> Result<Vec<SpeechEventNotification>>;
 }
 

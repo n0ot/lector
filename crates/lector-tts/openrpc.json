@@ -2,7 +2,7 @@
   "openrpc": "1.4.0",
   "info": {
     "title": "Lector speech-host protocol",
-    "description": "Version 2.0 of the bidirectional JSON-RPC interface between Lector and a spawned speech host. Messages are UTF-8 NDJSON over stdio. See docs/speech-driver-protocol.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
+    "description": "Version 2.0 of the bidirectional JSON-RPC interface between Lector and a speech host. Messages are UTF-8 NDJSON over stdio. See docs/speech-driver-protocol.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/license/mit"
@@ -11,7 +11,7 @@
   },
   "externalDocs": {
     "description": "Normative RFC-style protocol specification",
-    "url": "./docs/speech-driver-protocol.md"
+    "url": "../../docs/speech-driver-protocol.md"
   },
   "methods": [
     {
@@ -251,6 +251,68 @@
           "$ref": "#/components/errors/BackendError"
         }
       ]
+    },
+    {
+      "name": "speech.listVoices",
+      "summary": "List voices exposed by the selected backend",
+      "description": "Implemented only when voices.list is true.",
+      "params": [],
+      "result": {
+        "name": "voiceList",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/VoiceListResult"
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/MethodNotFound" },
+        { "$ref": "#/components/errors/BackendError" }
+      ]
+    },
+    {
+      "name": "speech.getVoice",
+      "summary": "Return the selected backend voice",
+      "description": "Implemented only when voices.current is true. A null voice represents the backend default when the backend can report that state without identifying a concrete voice.",
+      "params": [],
+      "result": {
+        "name": "currentVoice",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/CurrentVoiceResult"
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/MethodNotFound" },
+        { "$ref": "#/components/errors/BackendError" }
+      ]
+    },
+    {
+      "name": "speech.setVoice",
+      "summary": "Select a backend voice by ID",
+      "description": "Implemented only when voices.select is true and returns the effective current voice.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "voiceId",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      ],
+      "result": {
+        "name": "currentVoice",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/CurrentVoiceResult"
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/MethodNotFound" },
+        { "$ref": "#/components/errors/BackendError" }
+      ]
     }
   ],
   "components": {
@@ -373,6 +435,9 @@
           "server": {
             "$ref": "#/components/schemas/PeerInfo"
           },
+          "backend": {
+            "$ref": "#/components/schemas/BackendInfo"
+          },
           "capabilities": {
             "$ref": "#/components/schemas/SpeechCapabilities"
           }
@@ -393,6 +458,9 @@
           },
           "settings": {
             "$ref": "#/components/schemas/SettingCapabilities"
+          },
+          "voices": {
+            "$ref": "#/components/schemas/VoiceCapabilities"
           }
         },
         "additionalProperties": true,
@@ -541,6 +609,63 @@
         "properties": {
           "rate": {
             "$ref": "#/components/schemas/SettingSupport"
+          }
+        },
+        "additionalProperties": true
+      },
+      "BackendInfo": {
+        "type": "object",
+        "required": ["id", "name"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": true
+      },
+      "VoiceCapabilities": {
+        "type": "object",
+        "properties": {
+          "list": { "type": "boolean" },
+          "current": { "type": "boolean" },
+          "select": { "type": "boolean" }
+        },
+        "additionalProperties": true,
+        "description": "Missing voice-operation flags are false. Backends whose voice is managed externally advertise none of them."
+      },
+      "VoiceInfo": {
+        "type": "object",
+        "required": ["id", "name", "language"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "name": { "type": "string", "minLength": 1 },
+          "language": { "type": "string", "minLength": 1 },
+          "gender": {
+            "type": "string",
+            "examples": ["male", "female"]
+          }
+        },
+        "additionalProperties": true
+      },
+      "VoiceListResult": {
+        "type": "object",
+        "required": ["voices"],
+        "properties": {
+          "voices": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/VoiceInfo" }
+          }
+        },
+        "additionalProperties": true
+      },
+      "CurrentVoiceResult": {
+        "type": "object",
+        "required": ["voice"],
+        "properties": {
+          "voice": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/VoiceInfo" },
+              { "type": "null" }
+            ]
           }
         },
         "additionalProperties": true

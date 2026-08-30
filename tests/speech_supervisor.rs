@@ -299,11 +299,7 @@ fn real_process_reconfiguration_is_transactional_and_preserves_exact_args() {
 fn native_speech_parent_watchdog_rejects_a_mismatched_parent_promptly() {
     let started = Instant::now();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_lector"))
-        .args([
-            "--native-speech-server",
-            "--native-speech-parent-pid",
-            &u32::MAX.to_string(),
-        ])
+        .args(["tts", "--parent-pid", &u32::MAX.to_string()])
         .env("LECTOR_SPEECH_TEST_MUTE", "1")
         .spawn()
         .expect("spawn native speech helper with mismatched parent");

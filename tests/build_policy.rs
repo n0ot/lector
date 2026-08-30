@@ -32,16 +32,18 @@ fn ghostty_dependency_and_source_revisions_are_exactly_pinned() {
 }
 
 #[test]
-fn tts_backend_is_registry_publishable_and_matches_the_pinned_upstream() {
+fn tts_host_is_registry_publishable_and_matches_the_pinned_upstream() {
     let root_manifest = include_str!("../Cargo.toml");
     assert!(root_manifest.contains(
-        "tts = { package = \"lector-tts-backend\", version = \"0.1.0\", path = \"crates/lector-tts-backend\" }"
+        "tts = { package = \"lector-tts\", version = \"0.1.0\", path = \"crates/lector-tts\" }"
     ));
+    assert!(!root_manifest.contains("lector-tts-backend"));
     assert!(!root_manifest.contains("git = \"https://github.com/ndarilek/tts-rs\""));
 
-    let backend_manifest = include_str!("../crates/lector-tts-backend/Cargo.toml");
-    assert!(backend_manifest.contains("name = \"lector-tts-backend\""));
+    let backend_manifest = include_str!("../crates/lector-tts/Cargo.toml");
+    assert!(backend_manifest.contains("name = \"lector-tts\""));
     assert!(backend_manifest.contains("name = \"tts\""));
+    assert!(backend_manifest.contains("name = \"lector-tts\"\npath = \"src/main.rs\""));
     assert!(backend_manifest.contains("version = \"0.27.0\""));
     assert!(backend_manifest.contains("revision = \"8fbcb720cb86c5166a9ed46272e3777f742da18e\""));
     assert!(!backend_manifest.contains("publish = false"));
@@ -303,8 +305,8 @@ fn every_workspace_package_declares_its_license() {
             include_str!("../crates/lector-ghostty/Cargo.toml"),
         ),
         (
-            "lector-tts-backend",
-            include_str!("../crates/lector-tts-backend/Cargo.toml"),
+            "lector-tts",
+            include_str!("../crates/lector-tts/Cargo.toml"),
         ),
         ("lector-xtask", include_str!("../xtask/Cargo.toml")),
     ] {

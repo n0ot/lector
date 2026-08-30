@@ -1739,8 +1739,15 @@ fn nested_lector_output_and_bells_are_visible_to_the_outer_lector() {
     lector.clear_speech_logs();
     lector.send(b"q");
     assert!(
+        lector.wait_for_outer_speech(Duration::from_secs(2), "terminal"),
+        "the outer Lector did not announce the document revealed after Review; speech={:?}",
+        lector.outer_speech()
+    );
+    lector.clear_speech_logs();
+    lector.send(b"\x1bi");
+    assert!(
         lector.wait_for_outer_speech(Duration::from_secs(2), SPOKEN_READY),
-        "the outer Lector did not return from Review to the nested terminal; speech={:?}",
+        "the unchanged returning document was no longer reviewable; speech={:?}",
         lector.outer_speech()
     );
 

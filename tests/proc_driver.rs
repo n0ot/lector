@@ -30,8 +30,45 @@ fn proc_driver_smoke() {
 #[test]
 fn proc_driver_negotiates_the_current_protocol() {
     let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
-    let driver = ProcDriver::new(&server_path).expect("spawn proc stub server");
+    let mut driver = ProcDriver::new(&server_path).expect("spawn proc stub server");
     assert!(!driver.is_legacy_protocol());
+    assert_eq!(Host::backend_info(&driver).unwrap().id, "stub");
+    assert!(Host::capabilities(&driver).voices.list);
+    assert!(Host::capabilities(&driver).voices.current);
+    assert!(Host::capabilities(&driver).voices.select);
+
+    let voices = Host::list_voices(&mut driver).expect("list voices");
+    assert_eq!(
+        voices
+            .iter()
+            .map(|voice| voice.id.as_str())
+            .collect::<Vec<_>>(),
+        ["stub-a", "stub-b"]
+    );
+    assert_eq!(
+        Host::current_voice(&mut driver)
+            .expect("get current voice")
+            .voice
+            .unwrap()
+            .id,
+        "stub-a"
+    );
+    assert_eq!(
+        Host::set_voice(&mut driver, "stub-b")
+            .expect("select voice")
+            .voice
+            .unwrap()
+            .id,
+        "stub-b"
+    );
+    assert_eq!(
+        Host::current_voice(&mut driver)
+            .expect("get selected voice")
+            .voice
+            .unwrap()
+            .id,
+        "stub-b"
+    );
 }
 
 #[test]
@@ -64,6 +101,15 @@ fn rpc_discover_is_available_before_initialize() {
     let response: Value = serde_json::from_str(&response).unwrap();
     assert_eq!(response["result"]["openrpc"], "1.4.0");
     assert!(response["result"]["methods"].is_array());
+    for method in ["speech.listVoices", "speech.getVoice", "speech.setVoice"] {
+        assert!(
+            response["result"]["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["name"] == method)
+        );
+    }
     drop(child.stdin.take());
     assert!(child.wait().unwrap().success());
 }
@@ -283,7 +329,7 @@ fn proc_server_can_record_the_rpc_requests_used_for_real_speech() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn native_tts_server_advances_past_its_first_utterance() {
+fn lector_tts_host_advances_past_its_first_utterance() {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -293,7 +339,7 @@ fn native_tts_server_advances_past_its_first_utterance() {
         std::process::id()
     ));
     let mut child = Command::new(env!("CARGO_BIN_EXE_lector"))
-        .arg("--native-speech-server")
+        .arg("tts")
         .env("LECTOR_SPEECH_TEST_MUTE", "1")
         .env("LECTOR_SPEECH_EVENT_LOG", &event_log)
         .stdin(Stdio::piped())

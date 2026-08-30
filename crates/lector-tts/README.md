@@ -1,4 +1,39 @@
-# TTS-RS
+# lector-tts
+
+This crate combines Lector's cross-platform TTS library with its standalone
+stdio speech host. The library remains available as `tts`, while the
+`lector-tts` binary speaks the versioned protocol documented in
+[`../../docs/speech-driver-protocol.md`](../../docs/speech-driver-protocol.md).
+The implementation is shared with `lector tts`, so installing the main Lector
+binary is sufficient when the terminal and speech host run on the same
+machine.
+
+```shell
+lector-tts --list-backends
+lector-tts --backend av-foundation --list-voices
+lector-tts --backend av-foundation --voice VOICE_ID
+```
+
+With no listing option, stdin and stdout are reserved for bounded NDJSON
+JSON-RPC. `--backend auto` (the default) selects the first currently available
+engine. Stable backend IDs, selected backend metadata, rate support, and the
+three voice operations are reported explicitly rather than inferred.
+
+The host is portable independently of the full Lector application. It may be
+launched locally, across an SSH stdio bridge, or through another transport
+chosen by the user. The bridge owns authentication and reconnection policy.
+
+For NVDA, the controller-client DLL must be loadable. NVDA itself may start or
+stop while the host remains alive: speech and interruption requests received
+while it is absent are dropped rather than queued for replay. Voice and rate
+controls are not advertised for NVDA, and this protocol version does not
+expose `is_speaking`.
+
+The underlying library is based on
+[`tts-rs`](https://github.com/ndarilek/tts-rs); exact provenance is recorded in
+[`UPSTREAM.md`](UPSTREAM.md).
+
+## Library backends
 
 This library provides a high-level Text-To-Speech (TTS) interface supporting various backends. Currently supported backends are:
 

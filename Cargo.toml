@@ -10,7 +10,7 @@ license = "MIT"
 repository = "https://github.com/n0ot/lector"
 
 [workspace]
-members = ["crates/lector-ghostty", "crates/lector-tts-backend", "xtask"]
+members = ["crates/lector-ghostty", "crates/lector-tts", "xtask"]
 resolver = "3"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -39,7 +39,7 @@ similar = { version = "2.5.0", features = ["unicode"] }
 unicode-segmentation = "1.11.0"
 unicode-width = "0.2.2"
 mlua = { version = "0.11", features = ["luajit", "vendored"] }
-tts = { package = "lector-tts-backend", version = "0.1.0", path = "crates/lector-tts-backend" }
+tts = { package = "lector-tts", version = "0.1.0", path = "crates/lector-tts" }
 terminput = "0.5.12"
 thiserror = "2.0.17"
 lector-ghostty = { version = "0.1.0", path = "crates/lector-ghostty" }
