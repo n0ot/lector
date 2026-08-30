@@ -149,10 +149,38 @@ pub struct ProcDriver {
     legacy_protocol: bool,
     backend: Option<BackendInfo>,
     capabilities: SpeechCapabilities,
-    pending_events: VecDeque<SpeechEventNotification>,
+    event_inbox: EventInbox,
     next_compatibility_id: u64,
     last_compatibility_id: Option<UtteranceId>,
     unavailable: bool,
+}
+
+#[derive(Default)]
+struct EventInbox {
+    pending: VecDeque<SpeechEventNotification>,
+    deferred_error: Option<Error>,
+}
+
+impl EventInbox {
+    fn push(&mut self, event: SpeechEventNotification) {
+        self.pending.push_back(event);
+    }
+
+    fn defer_error(&mut self, error: Error) {
+        self.deferred_error = Some(error);
+    }
+
+    /// Takes the next observable event-stream state, preserving wire order.
+    ///
+    /// A transport error can only be observed after every notification that
+    /// was decoded before it. `None` means the caller must probe the pipe for
+    /// more input.
+    fn take_ready(&mut self) -> Option<Result<Vec<SpeechEventNotification>>> {
+        if !self.pending.is_empty() {
+            return Some(Ok(self.pending.drain(..).collect()));
+        }
+        self.deferred_error.take().map(Err)
+    }
 }
 
 #[derive(Clone)]
@@ -303,7 +331,7 @@ impl ProcDriver {
             legacy_protocol: false,
             backend: None,
             capabilities: SpeechCapabilities::default(),
-            pending_events: VecDeque::new(),
+            event_inbox: EventInbox::default(),
             next_compatibility_id: 1,
             last_compatibility_id: None,
             unavailable: false,
@@ -694,7 +722,7 @@ impl ProcDriver {
                 "speech.event sequence exceeds the JSON safe-integer range".to_owned(),
             ));
         }
-        self.pending_events.push_back(event);
+        self.event_inbox.push(event);
         Ok(())
     }
 
@@ -877,8 +905,24 @@ impl Host for ProcDriver {
     }
 
     fn take_events(&mut self) -> DriverResult<Vec<SpeechEventNotification>> {
-        self.read_available_notifications()?;
-        Ok(self.pending_events.drain(..).collect())
+        if let Some(result) = self.event_inbox.take_ready() {
+            return result.map_err(Into::into);
+        }
+        if self.unavailable {
+            return Err(Error::Unavailable.into());
+        }
+
+        if let Err(error) = self.read_available_notifications() {
+            if error.is_transport_failure() {
+                self.fail_transport();
+            }
+            self.event_inbox.defer_error(error);
+        }
+
+        self.event_inbox
+            .take_ready()
+            .unwrap_or_else(|| Ok(Vec::new()))
+            .map_err(Into::into)
     }
 }
 
@@ -1034,7 +1078,7 @@ fn legacy_capabilities() -> SpeechCapabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, TerminationHandle, parse_response};
+    use super::{Error, EventInbox, TerminationHandle, parse_response};
     use serde_json::json;
     use std::{
         process::Command,
@@ -1042,6 +1086,34 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    #[test]
+    fn decoded_events_precede_a_later_transport_error() {
+        let mut inbox = EventInbox::default();
+        inbox.push(
+            serde_json::from_value(json!({
+                "utteranceId": "queued",
+                "sequence": 0,
+                "event": {"type": "started"},
+            }))
+            .expect("simulated speech event"),
+        );
+        inbox.defer_error(Error::Closed);
+
+        let events = inbox
+            .take_ready()
+            .expect("queued state")
+            .expect("event batch precedes EOF");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].utterance_id.as_str(), "queued");
+
+        let error = inbox
+            .take_ready()
+            .expect("deferred EOF")
+            .expect_err("EOF follows the decoded event batch");
+        assert!(matches!(error, Error::Closed));
+        assert!(inbox.take_ready().is_none());
+    }
 
     #[test]
     fn asynchronous_termination_never_waits_for_a_worker_reap_lock() {
