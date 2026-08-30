@@ -764,7 +764,12 @@ impl App {
         let view = self.view_stack.active_mut().model();
         let application_policy = consume_application_accessibility(sr, view, true)?;
         prepare_review_cursor_for_active_context(sr, view)?;
-        let context_activated = view.activate_accessible_document_context();
+        // No document owns the accessibility context while the outer
+        // terminal is unfocused. Logical and visual view transitions continue
+        // normally; the physically presented document is activated when focus
+        // returns so its departure checkpoint can supply the catch-up diff.
+        let context_activated =
+            sr.terminal_focused() && view.activate_accessible_document_context();
         view.with_live_screen(|view| -> Result<()> {
             if let Some(title) = &title {
                 sr.speak(title, false)?;
@@ -773,6 +778,43 @@ impl App {
                 sr.auto_read(view)?;
             } else if !context_activated && !application_policy.suppress_cursor_tracking {
                 speak_application_cursor_line(sr, view)?;
+            }
+            view.complete_accessibility_screen_transition();
+            view.finalize_changes(now_ms);
+            Ok(())
+        })
+    }
+
+    pub(super) fn deactivate_accessible_document_for_focus_loss(&mut self) {
+        let view = if self.output_scheduler.is_some() {
+            self.presented_accessibility_model_mut()
+        } else {
+            self.view_stack.active_mut().model()
+        };
+        view.deactivate_accessible_document_context();
+    }
+
+    pub(super) fn reactivate_accessible_document_after_focus_gain(
+        &mut self,
+        sr: &mut ScreenReader,
+    ) -> Result<()> {
+        let now_ms = self.clock.now_ms();
+        let view = if self.output_scheduler.is_some() {
+            self.presented_accessibility_model_mut()
+        } else {
+            self.view_stack.active_mut().model()
+        };
+        // Semantic speech is event-like and remains non-replayable. Consume
+        // any messages presented while focus was elsewhere, then reconstruct
+        // only the terminal document changes from the saved checkpoint.
+        let application_policy = consume_application_accessibility(sr, view, false)?;
+        prepare_review_cursor_for_active_context(sr, view)?;
+        if !view.activate_accessible_document_context() {
+            return Ok(());
+        }
+        view.with_live_screen(|view| -> Result<()> {
+            if !application_policy.suppress_auto_read {
+                sr.auto_read(view)?;
             }
             view.complete_accessibility_screen_transition();
             view.finalize_changes(now_ms);

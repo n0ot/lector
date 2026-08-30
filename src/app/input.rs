@@ -169,6 +169,7 @@ impl App {
         // A focus notification can independently repaint the child. Never
         // attribute that later frame to an earlier key press.
         sr.clear_pending_visual_focus_input();
+        let was_focused = sr.terminal_focused();
         let forward_to_app = self
             .view_stack
             .active_mut()
@@ -182,7 +183,13 @@ impl App {
                 forward_to_app,
             ));
         }
+        if was_focused && !focused {
+            self.deactivate_accessible_document_for_focus_loss();
+        }
         sr.set_terminal_focused(focused)?;
+        if !was_focused && focused {
+            self.reactivate_accessible_document_after_focus_gain(sr)?;
+        }
         if forward_to_app {
             let raw = if focused {
                 FOCUS_IN_EVENT

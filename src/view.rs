@@ -349,6 +349,7 @@ pub struct View {
     accessible_alternate_checkpoint: Option<AccessibleDocumentCheckpoint>,
     accessible_document_screen: crate::terminal::ScreenIdentity,
     accessible_document_context_active: bool,
+    accessible_document_activation_unfinalized: bool,
     accessible_document_reintroduction_pending: bool,
     review_scrollback: usize,
     retained_history_len: usize,
@@ -446,6 +447,7 @@ impl View {
             accessible_alternate_checkpoint: None,
             accessible_document_screen: committed_screen,
             accessible_document_context_active: false,
+            accessible_document_activation_unfinalized: false,
             accessible_document_reintroduction_pending: false,
             review_scrollback: 0,
             retained_history_len: 0,
@@ -798,8 +800,12 @@ impl View {
             self.accessibility_read_state,
             AccessibilityReadState::Frozen { .. }
         );
-        if (frozen && !self.presentation_tracking)
-            || (self.presentation_tracking && !self.accessibility_has_unfinalized_presentation())
+        if frozen && !self.presentation_tracking {
+            return;
+        }
+        if self.presentation_tracking
+            && !self.accessibility_has_unfinalized_presentation()
+            && !self.accessible_document_activation_unfinalized
         {
             return;
         }
@@ -816,6 +822,7 @@ impl View {
                 .select_viewport(Viewport::Scrollback(visible_offset));
         }
         self.prev_screen_time = now_ms;
+        self.accessible_document_activation_unfinalized = false;
         self.completed_linear_record_cache = None;
         self.standalone_update = UpdateSummary::default();
         self.presented_update = UpdateSummary::default();
@@ -2025,6 +2032,7 @@ impl View {
     pub(crate) fn mark_accessible_document_context_active(&mut self) {
         self.accessible_document_screen = self.screen().screen;
         self.accessible_document_context_active = true;
+        self.accessible_document_activation_unfinalized = false;
         self.accessible_document_reintroduction_pending = false;
     }
 
@@ -2055,6 +2063,7 @@ impl View {
         };
         self.set_accessible_document_checkpoint(self.accessible_document_screen, checkpoint);
         self.accessible_document_context_active = false;
+        self.accessible_document_activation_unfinalized = false;
         self.accessible_document_reintroduction_pending = false;
         true
     }
@@ -2086,6 +2095,11 @@ impl View {
         }
         self.discard_current_accessibility_evidence();
         self.accessible_document_context_active = true;
+        // A presentation-tracked document may have been independently
+        // finalized while it did not own accessibility. Its restored
+        // departure baseline still needs one finalization after the catch-up
+        // read even though no newer render receipt is outstanding.
+        self.accessible_document_activation_unfinalized = true;
         true
     }
 
@@ -3534,6 +3548,36 @@ mod tests {
         assert!(
             view.accessibility_has_unfinalized_presentation(),
             "covering a document must preserve its stabilization boundary"
+        );
+    }
+
+    #[test]
+    fn reactivated_document_finalizes_its_restored_baseline_without_a_new_receipt() {
+        let mut view = View::new(2, 20);
+        view.enable_presentation_tracking();
+        view.mark_accessible_document_context_active();
+
+        view.process_changes(b"before");
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(frame));
+        view.finalize_changes(1);
+        assert!(view.deactivate_accessible_document_context());
+
+        view.process_changes(b"\r\nafter");
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(frame));
+        view.finalize_changes(2);
+        assert!(!view.accessibility_has_unfinalized_presentation());
+
+        assert!(view.activate_accessible_document_context());
+        let (previous, current, _, _) = view.full_contents_cached();
+        assert_ne!(previous, current);
+        view.finalize_changes(3);
+
+        let (previous, current, previous_hashes, current_hashes) = view.full_contents_cached();
+        assert!(
+            previous == current && previous_hashes == current_hashes,
+            "the catch-up boundary must be consumed even when the hidden frame was already finalized"
         );
     }
 

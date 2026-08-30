@@ -6138,6 +6138,64 @@ fn auto_read_does_not_speak_when_terminal_unfocused() {
 }
 
 #[test]
+fn focus_return_reads_background_changes_without_pausing_visual_presentation() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let mut physical = GhosttyEngine::new(24, 80).expect("physical oracle");
+
+    app.handle_pty(&mut sr, b"before", &mut term_out)
+        .expect("draw the initial document");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the initial document");
+    physical
+        .advance(&term_out)
+        .expect("parse the initial physical frame");
+    term_out.clear();
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
+        .expect("lose outer focus");
+    app.handle_pty(&mut sr, b"\r\narrived while away", &mut term_out)
+        .expect("draw while unfocused");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present while unfocused");
+    physical
+        .advance(&term_out)
+        .expect("parse the background physical frame");
+    assert!(
+        physical
+            .normalized_snapshot()
+            .contents()
+            .contains("arrived while away"),
+        "outer focus must not gate the visual renderer"
+    );
+
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    app.handle_stdin(&mut sr, b"\x1B[I", &mut pty_out, &mut term_out)
+        .expect("regain outer focus");
+    let spoken = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(text, _)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(spoken.contains("arrived while away"), "{spoken:?}");
+    assert!(!spoken.contains("before"), "{spoken:?}");
+}
+
+#[test]
 fn focus_out_does_not_stop_when_option_disabled() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
