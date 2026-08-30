@@ -1099,17 +1099,6 @@ impl TmuxPaneSet {
             .map(|state| state.view.update_summary())
     }
 
-    /// Drops update metadata at an accessibility ownership handoff without
-    /// changing any pane's terminal contents or parser state.
-    pub(crate) fn clear_update_summaries(&mut self) {
-        for state in self.panes.values_mut() {
-            state.view.clear_update_summary();
-            if let Some(portal) = &mut state.portal {
-                portal.view.clear_update_summary();
-            }
-        }
-    }
-
     #[must_use]
     pub fn surface_id(&self, pane_id: PaneId) -> Option<SurfaceId> {
         self.panes.get(&pane_id).map(|state| state.surface_id)

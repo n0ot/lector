@@ -627,7 +627,10 @@ fn parent_controls_render_and_announce_when_focus_returns_to_a_nested_pane_porta
         app.debug_active_view_contents()
             .contains("tmux control mode is running")
     );
-    assert_eq!(&*recorder.0.borrow(), &["ion in this pane."]);
+    assert!(
+        recorder.0.borrow().is_empty(),
+        "an unchanged returning pane portal must not replay its cursor line"
+    );
 }
 
 #[test]

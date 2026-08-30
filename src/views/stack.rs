@@ -30,6 +30,7 @@ impl ViewStack {
         // its independent review cursor must not be mistaken for an
         // uninitialized overlay on the first later compositor announcement.
         root.model().mark_review_context_active();
+        root.model().mark_accessible_document_context_active();
         Self {
             views: vec![root],
             retired_views: Vec::new(),
@@ -69,12 +70,17 @@ impl ViewStack {
             view.enable_presentation_tracking();
         }
         if view.as_any().is::<crate::views::TmuxConnectionView>() {
+            let had_overlay = self.has_overlay();
             self.clear_overlays();
+            if !had_overlay {
+                self.deactivate_active_document_context();
+            }
             self.views.insert(self.base_count, view);
             self.active_base = self.base_count;
             self.base_count = self.base_count.saturating_add(1);
             self.begin_compositor_transition();
         } else {
+            self.deactivate_active_document_context();
             self.views.push(view);
         }
     }
@@ -100,6 +106,7 @@ impl ViewStack {
         if !self.has_overlay() {
             return false;
         }
+        self.deactivate_active_document_context();
         let removed = self.views.pop();
         if self.presentation_tracking
             && let Some(view) = removed
@@ -114,6 +121,7 @@ impl ViewStack {
 
     pub(crate) fn clear_overlays(&mut self) {
         if self.has_overlay() {
+            self.deactivate_active_document_context();
             self.begin_compositor_transition();
         }
         if self.presentation_tracking {
@@ -167,6 +175,12 @@ impl ViewStack {
             .as_any()
             .downcast_ref::<crate::views::TmuxConnectionView>()
             .map(crate::views::TmuxConnectionView::connection_id);
+        if !self.has_overlay()
+            && active_connection
+                .is_some_and(|connection_id| connection_ids.contains(&connection_id))
+        {
+            self.deactivate_active_document_context();
+        }
         let mut removed_base_count = 0usize;
         let mut retained = Vec::with_capacity(self.views.len());
         for (original_index, mut view) in std::mem::take(&mut self.views).into_iter().enumerate() {
@@ -200,8 +214,12 @@ impl ViewStack {
     }
 
     pub(crate) fn activate_terminal(&mut self) {
+        let had_overlay = self.has_overlay();
         self.clear_overlays();
         if self.active_base != 0 {
+            if !had_overlay {
+                self.deactivate_active_document_context();
+            }
             self.begin_compositor_transition();
         }
         self.active_base = 0;
@@ -211,12 +229,22 @@ impl ViewStack {
         let Some(index) = self.tmux_connection_index(connection_id) else {
             return false;
         };
+        let had_overlay = self.has_overlay();
         self.clear_overlays();
         if self.active_base != index {
+            if !had_overlay {
+                self.deactivate_active_document_context();
+            }
             self.begin_compositor_transition();
         }
         self.active_base = index;
         true
+    }
+
+    fn deactivate_active_document_context(&mut self) {
+        self.active_mut()
+            .model()
+            .deactivate_accessible_document_context();
     }
 
     fn tmux_connection_index(&mut self, connection_id: u64) -> Option<usize> {

@@ -2978,7 +2978,7 @@ fn alternate_screen_transition_realigns_review_cursor_even_at_the_same_position(
 }
 
 #[test]
-fn alternate_screen_entry_and_primary_restore_read_the_settled_visible_screen() {
+fn alternate_screen_entry_reads_fresh_content_and_primary_restore_uses_its_checkpoint() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig {
         latency_budget_ms: 0,
@@ -3024,10 +3024,7 @@ fn alternate_screen_entry_and_primary_restore_read_the_settled_visible_screen() 
         .expect("present the restored primary screen");
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
-    assert_eq!(
-        recorder.inner.borrow().speaks.as_slice(),
-        &[("primary line".into(), false)]
-    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
 }
 
 #[test]
@@ -3611,10 +3608,7 @@ fn alternate_screen_restores_the_primary_review_cursor() {
         .expect("restore primary screen");
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
-    assert_eq!(
-        recorder.inner.borrow().speaks.as_slice(),
-        &[("saved review target primary application line".into(), false)]
-    );
+    assert!(recorder.inner.borrow().speaks.is_empty());
 
     recorder.inner.borrow_mut().speaks.clear();
     app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
@@ -4932,7 +4926,8 @@ fn review_commands_follow_the_physically_presented_view_across_overlay_backpress
             .borrow()
             .speaks
             .iter()
-            .any(|(text, _)| text.contains("base"))
+            .all(|(text, _)| !text.contains("base")),
+        "an unchanged returning document must not be introduced again"
     );
     recorder.inner.borrow_mut().speaks.clear();
     app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)

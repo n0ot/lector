@@ -3609,27 +3609,20 @@ impl App {
                 screen_transition_observed = screen_transition;
                 let screen_transition_stable =
                     screen_transition && view.screen().has_visible_non_whitespace_content();
-                if !overlay_active && screen_transition {
-                    // A screen identity handoff is a new reading context, not
-                    // a whole-screen diff. Input echo acknowledgements cannot
-                    // cross that context boundary. Read a settled alternate
-                    // screen in full, then only the current line when its
-                    // already-heard primary context is restored.
-                    if !application_policy.suppress_auto_read {
-                        announce_screen_transition(sr, view)?;
-                    }
-                } else if !overlay_active {
-                    let mut read_text = if application_policy.suppress_cursor_tracking {
-                        false
-                    } else {
-                        sr.resolve_pending_delete(view)?
-                    };
+                if !overlay_active {
+                    let mut read_text =
+                        if screen_transition || application_policy.suppress_cursor_tracking {
+                            false
+                        } else {
+                            sr.resolve_pending_delete(view)?
+                        };
                     // A shell's OSC 133 B marker can remain attached to the
                     // primary grid while a temporary interface owns that same
                     // screen. First honor an exact, key-caused visual focus
                     // transfer; only then interpret Up/Down as Readline history.
                     let history_waits_for_presentation = history_focus_presentation == Some(false);
-                    let visual_focus_read = sr.has_pending_history_navigation()
+                    let visual_focus_read = !screen_transition
+                        && sr.has_pending_history_navigation()
                         && history_focus_presentation == Some(true)
                         && sr.auto_read_enabled()
                         && !application_policy.suppress_auto_read
@@ -3638,7 +3631,8 @@ impl App {
                     let navigation_read = if visual_focus_read {
                         sr.clear_pending_history_navigation();
                         true
-                    } else if !application_policy.suppress_auto_read
+                    } else if !screen_transition
+                        && !application_policy.suppress_auto_read
                         && !history_waits_for_presentation
                         && sr.take_pending_history_navigation()
                     {
@@ -3656,7 +3650,9 @@ impl App {
                     if navigation_read {
                         read_text = true;
                     } else {
-                        if sr.highlight_tracking_enabled() && !application_policy.suppress_auto_read
+                        if !screen_transition
+                            && sr.highlight_tracking_enabled()
+                            && !application_policy.suppress_auto_read
                         {
                             sr.track_highlighting(view)?;
                         }
@@ -3672,7 +3668,11 @@ impl App {
                             };
                         read_text |= auto_read_text;
                     }
-                    if recent_input && !read_text && !application_policy.suppress_cursor_tracking {
+                    if recent_input
+                        && !screen_transition
+                        && !read_text
+                        && !application_policy.suppress_cursor_tracking
+                    {
                         sr.track_cursor(view)?;
                     }
                 }

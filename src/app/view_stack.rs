@@ -764,11 +764,14 @@ impl App {
         let view = self.view_stack.active_mut().model();
         let application_policy = consume_application_accessibility(sr, view, true)?;
         prepare_review_cursor_for_active_context(sr, view)?;
+        let context_activated = view.activate_accessible_document_context();
         view.with_live_screen(|view| -> Result<()> {
             if let Some(title) = &title {
                 sr.speak(title, false)?;
             }
-            if !application_policy.suppress_cursor_tracking {
+            if context_activated && !application_policy.suppress_auto_read {
+                sr.auto_read(view)?;
+            } else if !context_activated && !application_policy.suppress_cursor_tracking {
                 speak_application_cursor_line(sr, view)?;
             }
             view.complete_accessibility_screen_transition();
@@ -806,21 +809,13 @@ impl App {
                 screen_identity_changed || view.accessibility_screen_transition_pending();
             let screen_transition_stable =
                 screen_transition && view.screen().has_visible_non_whitespace_content();
-            if screen_transition {
-                // Primary and alternate screens are separate accessibility
-                // contexts. Do not let an acknowledgement from one context
-                // suppress text in the next. A settled alternate screen is a
-                // new reading context, while the restored primary screen has
-                // already been heard and only needs its current line.
-                if !application_policy.suppress_auto_read {
-                    announce_screen_transition(sr, view)?;
-                }
-            } else {
-                let mut read_text = if application_policy.suppress_cursor_tracking {
-                    false
-                } else {
-                    sr.resolve_pending_delete(view)?
-                };
+            {
+                let mut read_text =
+                    if screen_transition || application_policy.suppress_cursor_tracking {
+                        false
+                    } else {
+                        sr.resolve_pending_delete(view)?
+                    };
                 let auto_read_text =
                     if sr.auto_read_enabled() && !application_policy.suppress_auto_read {
                         if recent_input {
@@ -832,7 +827,11 @@ impl App {
                         false
                     };
                 read_text |= auto_read_text;
-                if recent_input && !read_text && !application_policy.suppress_cursor_tracking {
+                if recent_input
+                    && !screen_transition
+                    && !read_text
+                    && !application_policy.suppress_cursor_tracking
+                {
                     sr.track_cursor(view)?;
                 }
             }

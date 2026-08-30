@@ -53,6 +53,14 @@ struct ActiveWindow {
     title: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveDocument {
+    Placeholder,
+    ConnectionPortal,
+    Pane(PaneId),
+    PanePortal(PaneId),
+}
+
 impl ActiveWindowProjection {
     fn from_topology(topology: &TmuxTopology) -> Self {
         let Some(session) = topology
@@ -141,7 +149,11 @@ impl TmuxConnectionView {
         topology: &TmuxTopology,
     ) -> std::result::Result<Vec<BootstrapRequest>, TmuxPaneError> {
         let next_active_window = ActiveWindowProjection::from_topology(topology);
-        let previous_active_pane = self.active_window.active_pane();
+        let previous_document = self.active_document();
+        let next_document = self.document_for(&next_active_window, topology);
+        if previous_document != next_document {
+            self.model().deactivate_accessible_document_context();
+        }
         let mut requests = self.panes.reconcile(topology)?;
         let active_pane = next_active_window.active_pane();
         let visible_layout = next_active_window.ready().map(|active| &active.layout);
@@ -157,17 +169,59 @@ impl TmuxConnectionView {
                 2
             }
         });
-        if previous_active_pane != active_pane {
-            // A pane handoff is announced from the new pane's complete model.
-            // Neither the old pane's unfinalized speech metadata nor metadata
-            // retained from an earlier visit belongs to that announcement.
-            self.panes.clear_update_summaries();
-        }
         self.topology.clone_from(topology);
         self.active_window = next_active_window;
         self.inventory_error = None;
         self.render_placeholder();
         Ok(requests)
+    }
+
+    fn active_document(&self) -> ActiveDocument {
+        self.document_for(&self.active_window, &self.topology)
+    }
+
+    fn document_for(
+        &self,
+        projection: &ActiveWindowProjection,
+        topology: &TmuxTopology,
+    ) -> ActiveDocument {
+        if self.showing_portal {
+            return ActiveDocument::ConnectionPortal;
+        }
+        let Some(active) = projection.ready() else {
+            return ActiveDocument::Placeholder;
+        };
+        let ready = !active.layout.panes().is_empty()
+            && active.layout.panes().iter().all(|pane| {
+                topology.pane(pane.pane_id).is_some()
+                    && self.panes.pane_is_bootstrapped(pane.pane_id)
+            });
+        let Some(pane_id) = ready.then_some(active.active_pane).flatten() else {
+            return ActiveDocument::Placeholder;
+        };
+        if self.panes.pane_portal_target(pane_id).is_some() {
+            ActiveDocument::PanePortal(pane_id)
+        } else {
+            ActiveDocument::Pane(pane_id)
+        }
+    }
+
+    fn deactivate_document(&mut self, document: ActiveDocument) {
+        let view = match document {
+            ActiveDocument::Placeholder => Some(&mut self.placeholder),
+            ActiveDocument::ConnectionPortal => Some(&mut self.portal),
+            ActiveDocument::Pane(pane_id) => self.panes.pane_view_mut(pane_id),
+            ActiveDocument::PanePortal(pane_id) => self.panes.pane_portal_view_mut(pane_id),
+        };
+        if let Some(view) = view {
+            view.deactivate_accessible_document_context();
+        }
+    }
+
+    fn finish_document_model_change(&mut self, previous: ActiveDocument) {
+        if previous != self.active_document() {
+            self.deactivate_document(previous);
+        }
     }
 
     pub(crate) fn process_output(
@@ -194,7 +248,12 @@ impl TmuxConnectionView {
         output: &[Vec<u8>],
         now_ms: u128,
     ) -> std::result::Result<Vec<u8>, TmuxPaneError> {
-        self.panes.apply_bootstrap(pane_id, status, output, now_ms)
+        let previous = self.active_document();
+        let result = self.panes.apply_bootstrap(pane_id, status, output, now_ms);
+        if result.is_ok() {
+            self.finish_document_model_change(previous);
+        }
+        result
     }
 
     pub fn apply_bootstrap_with_line_flags(
@@ -205,8 +264,14 @@ impl TmuxConnectionView {
         line_flags: bool,
         now_ms: u128,
     ) -> std::result::Result<Vec<u8>, TmuxPaneError> {
-        self.panes
-            .apply_bootstrap_with_line_flags(pane_id, status, output, line_flags, now_ms)
+        let previous = self.active_document();
+        let result = self
+            .panes
+            .apply_bootstrap_with_line_flags(pane_id, status, output, line_flags, now_ms);
+        if result.is_ok() {
+            self.finish_document_model_change(previous);
+        }
+        result
     }
 
     pub fn apply_resync_capture(
@@ -284,10 +349,22 @@ impl TmuxConnectionView {
         pane_id: PaneId,
         child_connection_id: u64,
     ) -> std::result::Result<(), TmuxPaneError> {
+        if !self.showing_portal
+            && self.active_window.active_pane() == Some(pane_id)
+            && self.panes.pane_portal_target(pane_id).is_none()
+        {
+            self.model().deactivate_accessible_document_context();
+        }
         self.panes.set_pane_portal(pane_id, child_connection_id)
     }
 
     pub(crate) fn clear_pane_portal(&mut self, pane_id: PaneId, child_connection_id: u64) {
+        if !self.showing_portal
+            && self.active_window.active_pane() == Some(pane_id)
+            && self.panes.pane_portal_target(pane_id) == Some(child_connection_id)
+        {
+            self.model().deactivate_accessible_document_context();
+        }
         self.panes.clear_pane_portal(pane_id, child_connection_id);
     }
 
@@ -411,14 +488,16 @@ impl TmuxConnectionView {
     }
 
     pub fn show_portal(&mut self) {
-        self.panes.clear_update_summaries();
+        if !self.showing_portal {
+            self.model().deactivate_accessible_document_context();
+        }
         self.showing_portal = true;
     }
 
     pub fn show_connection(&mut self) {
-        // Re-entering a connection is a full accessibility handoff even when
-        // its tmux topology did not change while it was in the background.
-        self.panes.clear_update_summaries();
+        if self.showing_portal {
+            self.portal.deactivate_accessible_document_context();
+        }
         self.showing_portal = false;
     }
 
@@ -677,12 +756,13 @@ fn render_text(view: &mut View, text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::TmuxConnectionView;
+    use super::{TmuxConnectionView, ViewController};
     use crate::{
         presentation::CursorOwner,
         terminal::TerminalGeometry,
         tmux_control::CommandStatus,
         tmux_model::{PaneId, TmuxTopology},
+        view::AccessibleDocumentComparison,
     };
 
     const SPLIT_LAYOUT: &str = "abcd,20x4,0,0{10x4,0,0,20,9x4,11,0,21}";
@@ -789,6 +869,7 @@ mod tests {
     #[test]
     fn switching_away_and_back_drops_stale_active_update_metadata() {
         let mut connection = ready_connection();
+        connection.model().mark_accessible_document_context_active();
         connection
             .process_output(PaneId(20), b"old", true)
             .expect("old output");
@@ -803,6 +884,7 @@ mod tests {
 
         connection.show_portal();
         connection.show_connection();
+        assert!(connection.model().activate_accessible_document_context());
         assert_eq!(
             connection
                 .panes
@@ -824,6 +906,29 @@ mod tests {
                 .unwrap()
                 .printed_text(),
             "new"
+        );
+    }
+
+    #[test]
+    fn active_pane_keeps_exact_print_evidence_after_document_activation() {
+        let mut connection = ready_connection();
+        connection.enable_presentation_tracking();
+        assert!(connection.model().activate_accessible_document_context());
+
+        connection
+            .process_output(PaneId(20), b"\n\nwrapped\r\n", true)
+            .expect("active pane output");
+        let (_, frames) = connection.capture_live_presentation_frames();
+        for frame in frames {
+            connection.apply_presented_frame(&frame);
+        }
+
+        assert_eq!(
+            connection
+                .model()
+                .accessibility_update_summary()
+                .printed_text(),
+            "wrapped\n"
         );
     }
 
@@ -983,6 +1088,41 @@ mod tests {
             .pane_view_mut(PaneId(30))
             .expect("second window pane");
         assert_eq!(second.review_cursor_position(), (0, 2));
+    }
+
+    #[test]
+    fn active_tmux_windows_restore_their_document_departure_checkpoints() {
+        let mut connection = ready_two_window_connection();
+        connection.model().mark_accessible_document_context_active();
+
+        connection
+            .sync_topology(&topology_with_two_windows(11))
+            .expect("activate second window");
+        assert!(connection.model().activate_accessible_document_context());
+        connection.model().finalize_changes(1);
+
+        connection
+            .process_output(PaneId(20), b" hidden", false)
+            .expect("update hidden first window");
+        connection
+            .panes
+            .pane_view_mut(PaneId(20))
+            .expect("first window pane")
+            .finalize_changes(2);
+
+        connection
+            .sync_topology(&topology_with_two_windows(10))
+            .expect("return to first window");
+        let first = connection.model();
+        assert!(first.activate_accessible_document_context());
+        assert_eq!(
+            first.prepare_accessible_document_comparison(),
+            AccessibleDocumentComparison::CompleteDocument
+        );
+        first.prepare_document_contents_cache();
+        let (previous, current, _, _) = first.document_contents_cached();
+        assert!(!previous.contains("hidden"));
+        assert!(current.contains("hidden"));
     }
 
     #[test]

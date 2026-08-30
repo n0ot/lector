@@ -1,5 +1,5 @@
 use super::{Result, ScreenReader};
-use crate::view::View;
+use crate::view::{AccessibleDocumentComparison, View};
 use similar::{Algorithm, ChangeTag, TextDiff};
 
 #[derive(Default)]
@@ -35,10 +35,8 @@ impl ScreenReader {
     }
 
     fn auto_read_impl(&mut self, view: &mut View, prefer_cursor: bool) -> Result<bool> {
-        // Geometry changes, screen handoffs, and terminal resets introduce a
-        // new visible context. No visible row identity survives, so read the
-        // new grid in full rather than guessing at an incremental mapping.
-        if view.accessibility_requires_screen_reintroduction() {
+        let document_comparison = view.prepare_accessible_document_comparison();
+        if document_comparison == AccessibleDocumentComparison::Reintroduce {
             return self.speak_application_screen(view);
         }
 
@@ -58,8 +56,9 @@ impl ScreenReader {
         // A history-only lineage gap does not invalidate fixed visible-grid
         // coordinates. It merely makes the retained-document comparison
         // unavailable, so fall back to an explicit visible-grid diff.
-        let compare_document =
-            view.accessibility_document_changed() && view.accessibility_document_is_continuous();
+        let compare_document = document_comparison
+            == AccessibleDocumentComparison::CompleteDocument
+            && view.accessibility_document_changed();
         let prev_cursor = view.prev_screen().cursor_position();
         let cursor = view.screen().cursor_position();
         if prefer_cursor && self.read_visual_focus_transfer(view)? {
@@ -122,7 +121,6 @@ impl ScreenReader {
         let (print_cursor_moves, print_scrolled) =
             linear_output_metrics.unwrap_or((cursor_moves, scrolled));
         let completed_linear_record = view.accessibility_completes_linear_output_record();
-
         // A completed blank record is still an authoritative presentation
         // boundary. Consume any matching echo and report it as handled so a
         // recent Enter does not fall through to cursor tracking or a
@@ -166,7 +164,9 @@ impl ScreenReader {
         let mut live_read_result = None;
         {
             let text = live_text.trim();
-            if readable_print_report && (print_cursor_moves == 0 || print_scrolled) {
+            if readable_print_report
+                && (completed_linear_record || print_cursor_moves == 0 || print_scrolled)
+            {
                 let mut spoken = false;
                 // Match against the verbatim print stream. Trimming is a
                 // speech concern; dropping spaces here desynchronizes the

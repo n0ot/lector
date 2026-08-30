@@ -67,6 +67,25 @@ struct ReviewSelection {
     cursor: (u16, u16),
 }
 
+#[derive(Clone)]
+struct AccessibleDocumentCheckpoint {
+    comparison_epoch: u64,
+    snapshot: TerminalSnapshot,
+}
+
+/// The strongest comparison which can be made between the last accessible
+/// document checkpoint and the document currently being presented.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AccessibleDocumentComparison {
+    /// Retained history has continuous row identity, so the complete review
+    /// document may be compared.
+    CompleteDocument,
+    /// Only fixed visible-grid coordinates remain comparable.
+    VisibleGrid,
+    /// There is no trustworthy mapping. Introduce the current visible grid.
+    Reintroduce,
+}
+
 #[derive(Clone, Copy)]
 struct FallbackSemanticInput {
     prompt_count: usize,
@@ -320,10 +339,17 @@ pub struct View {
     prev_screen_time: u128,
     review_cursor_position: (u16, u16),
     review_context_initialized: bool,
+    review_context_screen: crate::terminal::ScreenIdentity,
     saved_primary_review_selection: Option<ReviewSelection>,
     review_cursor_follow_pending: bool,
     review_cursor_screen_transition_pending: bool,
     accessibility_screen_transition_pending: bool,
+    accessible_document_comparison_epoch: u64,
+    accessible_primary_checkpoint: Option<AccessibleDocumentCheckpoint>,
+    accessible_alternate_checkpoint: Option<AccessibleDocumentCheckpoint>,
+    accessible_document_screen: crate::terminal::ScreenIdentity,
+    accessible_document_context_active: bool,
+    accessible_document_reintroduction_pending: bool,
     review_scrollback: usize,
     retained_history_len: usize,
     review_mark: Option<GhosttyReviewMark>,
@@ -358,6 +384,7 @@ impl View {
                 });
         let committed_snapshot = engine.snapshot_with_history();
         let cursor_position = committed_snapshot.cursor_position();
+        let committed_screen = committed_snapshot.screen;
         let prev_screen = committed_snapshot.clone();
         let presented_history_basis = PresentedHistoryBasis::from_snapshot(&committed_snapshot);
         View {
@@ -409,10 +436,17 @@ impl View {
             prev_screen_time: 0,
             review_cursor_position: cursor_position,
             review_context_initialized: false,
+            review_context_screen: committed_screen,
             saved_primary_review_selection: None,
             review_cursor_follow_pending: false,
             review_cursor_screen_transition_pending: false,
             accessibility_screen_transition_pending: false,
+            accessible_document_comparison_epoch: 1,
+            accessible_primary_checkpoint: None,
+            accessible_alternate_checkpoint: None,
+            accessible_document_screen: committed_screen,
+            accessible_document_context_active: false,
+            accessible_document_reintroduction_pending: false,
             review_scrollback: 0,
             retained_history_len: 0,
             review_mark: None,
@@ -510,6 +544,11 @@ impl View {
         let live_snapshot = needs_live_snapshot_copy.then(|| self.engine.snapshot().clone());
         let screen_transition = update.screen_before != update.screen_after;
         let application_context_reset = screen_transition || update.terminal_reset;
+        if update.terminal_reset {
+            // Reset destroys the backend's row identity even when the visible
+            // geometry and screen selector happen to remain unchanged.
+            self.invalidate_accessible_document_comparison();
+        }
         let batch_history_changed = update.history_changed
             || live_scrollback_extent != old_scrollback_extent
             || live_history_origin != old_history_origin
@@ -1921,7 +1960,10 @@ impl View {
     /// announcement.
     pub(crate) fn prepare_review_cursor_for_activation(&mut self) -> ((u16, u16), (u16, u16)) {
         let old = self.review_cursor_position;
-        let previous_screen = self.prev_screen().screen;
+        // Review context remembers the screen which was active when this view
+        // was last visited even if hidden output has since advanced the speech
+        // baseline independently.
+        let previous_screen = self.review_context_screen;
         let current_screen = self.screen().screen;
 
         if previous_screen != current_screen {
@@ -1955,6 +1997,7 @@ impl View {
             }
             self.clear_review_mark();
             self.review_context_initialized = true;
+            self.review_context_screen = current_screen;
             self.cancel_pending_screen_transition_follow();
         } else if !self.review_context_initialized {
             self.follow_application_cursor();
@@ -1973,6 +2016,165 @@ impl View {
 
     pub(crate) fn mark_review_context_active(&mut self) {
         self.review_context_initialized = true;
+        self.review_context_screen = self.screen().screen;
+    }
+
+    /// Marks the document which existed before the compositor was created as
+    /// already active. It must retain the ordinary startup diff baseline, not
+    /// be introduced as though it were a newly pushed overlay.
+    pub(crate) fn mark_accessible_document_context_active(&mut self) {
+        self.accessible_document_screen = self.screen().screen;
+        self.accessible_document_context_active = true;
+        self.accessible_document_reintroduction_pending = false;
+    }
+
+    /// Saves the exact document which was accessible when this context lost
+    /// ownership. Output may continue changing the terminal model while it is
+    /// hidden; that output is compared with this checkpoint on reactivation.
+    pub(crate) fn deactivate_accessible_document_context(&mut self) -> bool {
+        if !self.accessible_document_context_active {
+            return false;
+        }
+
+        let current_screen = self.screen().screen;
+        if self.accessible_document_screen != current_screen {
+            let departure = AccessibleDocumentCheckpoint {
+                comparison_epoch: self.accessible_document_comparison_epoch,
+                snapshot: self.prev_screen.clone(),
+            };
+            self.set_accessible_document_checkpoint(self.accessible_document_screen, departure);
+            self.accessible_document_screen = current_screen;
+        }
+        // Capture document ownership independently from speech finalization.
+        // A compositor transition must not consume an outstanding
+        // stabilization deadline merely because another context covered it.
+        let snapshot = self.snapshot_with_history();
+        let checkpoint = AccessibleDocumentCheckpoint {
+            comparison_epoch: self.accessible_document_comparison_epoch,
+            snapshot,
+        };
+        self.set_accessible_document_checkpoint(self.accessible_document_screen, checkpoint);
+        self.accessible_document_context_active = false;
+        self.accessible_document_reintroduction_pending = false;
+        true
+    }
+
+    /// Restores a context's departure checkpoint. A missing or invalidated
+    /// checkpoint deliberately establishes the current document as a baseline
+    /// and requests a visible introduction instead of guessing row identity.
+    pub(crate) fn activate_accessible_document_context(&mut self) -> bool {
+        if self.accessible_document_context_active {
+            return false;
+        }
+
+        let screen = self.screen().screen;
+        self.accessible_document_screen = screen;
+        let checkpoint = self.accessible_document_checkpoint(screen).cloned();
+        let current_geometry = self.screen().geometry;
+        let comparable = checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.comparison_epoch == self.accessible_document_comparison_epoch
+                && checkpoint.snapshot.screen == screen
+                && checkpoint.snapshot.geometry == current_geometry
+        });
+        if let Some(checkpoint) = checkpoint.filter(|_| comparable) {
+            self.install_accessible_document_baseline(checkpoint.snapshot);
+            self.accessible_document_reintroduction_pending = false;
+        } else {
+            let current = self.snapshot_with_history();
+            self.install_accessible_document_baseline(current);
+            self.accessible_document_reintroduction_pending = true;
+        }
+        self.discard_current_accessibility_evidence();
+        self.accessible_document_context_active = true;
+        true
+    }
+
+    fn accessible_document_checkpoint(
+        &self,
+        screen: crate::terminal::ScreenIdentity,
+    ) -> Option<&AccessibleDocumentCheckpoint> {
+        match screen {
+            crate::terminal::ScreenIdentity::Primary => self.accessible_primary_checkpoint.as_ref(),
+            crate::terminal::ScreenIdentity::Alternate => {
+                self.accessible_alternate_checkpoint.as_ref()
+            }
+        }
+    }
+
+    fn set_accessible_document_checkpoint(
+        &mut self,
+        screen: crate::terminal::ScreenIdentity,
+        checkpoint: AccessibleDocumentCheckpoint,
+    ) {
+        match screen {
+            crate::terminal::ScreenIdentity::Primary => {
+                self.accessible_primary_checkpoint = Some(checkpoint);
+            }
+            crate::terminal::ScreenIdentity::Alternate => {
+                self.accessible_alternate_checkpoint = Some(checkpoint);
+            }
+        }
+    }
+
+    fn install_accessible_document_baseline(&mut self, snapshot: TerminalSnapshot) {
+        self.prev_screen = snapshot;
+        self.completed_linear_record_cache = None;
+        self.cached_prev_full_valid = false;
+        self.cached_prev_full_row_hashes.clear();
+        self.cached_prev_document_valid = false;
+        self.cached_prev_document_row_hashes.clear();
+    }
+
+    /// Selects the checkpoint belonging to a primary/alternate-screen context
+    /// at the common document layer. The screen reader therefore need not know
+    /// which terminal sequence caused the handoff.
+    fn synchronize_accessible_document_screen(&mut self) {
+        let current_screen = self.screen().screen;
+        if self.accessible_document_screen == current_screen {
+            return;
+        }
+
+        let departure = AccessibleDocumentCheckpoint {
+            comparison_epoch: self.accessible_document_comparison_epoch,
+            snapshot: self.prev_screen.clone(),
+        };
+        self.set_accessible_document_checkpoint(self.accessible_document_screen, departure);
+        self.accessible_document_screen = current_screen;
+
+        let checkpoint = self.accessible_document_checkpoint(current_screen).cloned();
+        let current_geometry = self.screen().geometry;
+        if let Some(checkpoint) = checkpoint.filter(|checkpoint| {
+            checkpoint.comparison_epoch == self.accessible_document_comparison_epoch
+                && checkpoint.snapshot.screen == current_screen
+                && checkpoint.snapshot.geometry == current_geometry
+        }) {
+            self.install_accessible_document_baseline(checkpoint.snapshot);
+            self.accessible_document_reintroduction_pending = false;
+        } else {
+            let current = self.snapshot_with_history();
+            self.install_accessible_document_baseline(current);
+            self.accessible_document_reintroduction_pending = true;
+        }
+        // Output provenance cannot cross document ownership. Snapshot diffing
+        // below remains exact even when the hidden document changed.
+        self.discard_current_accessibility_evidence();
+    }
+
+    fn invalidate_accessible_document_comparison(&mut self) {
+        self.accessible_document_comparison_epoch = self
+            .accessible_document_comparison_epoch
+            .wrapping_add(1)
+            .max(1);
+        self.accessible_document_reintroduction_pending = true;
+    }
+
+    /// Discards only evidence paired with the currently accessible snapshot.
+    /// Parser revisions which have not reached the physical terminal remain
+    /// journaled, so a context handoff cannot erase their stabilization wake.
+    fn discard_current_accessibility_evidence(&mut self) {
+        self.standalone_update = UpdateSummary::default();
+        self.presented_update = UpdateSummary::default();
+        self.completed_linear_record_cache = None;
     }
 
     pub(crate) fn cancel_pending_screen_transition_follow(&mut self) {
@@ -2265,6 +2467,12 @@ impl View {
             geometry.cell_width_px,
             geometry.cell_height_px,
         );
+        if self.live_screen().geometry != geometry {
+            // Reflow changes the mapping from document rows to the visible
+            // grid. Invalidate at the model boundary so every consumer sees a
+            // fresh document without needing a resize-specific speech rule.
+            self.invalidate_accessible_document_comparison();
+        }
         if self.presentation_tracking {
             self.freeze_current_accessibility();
         }
@@ -2803,25 +3011,40 @@ impl View {
         self.cached_document_valid || self.cached_prev_document_valid
     }
 
-    /// Whether the active visible grid belongs to a newly introduced terminal
-    /// context. These transitions invalidate the meaning of every visible row,
-    /// so accessibility must read the new grid in full rather than diff it.
-    pub(crate) fn accessibility_requires_screen_reintroduction(&self) -> bool {
+    /// Resolves document identity before automatic reading. Context switches,
+    /// resize, reset, and history continuity all reduce to one comparison
+    /// contract; consumers only choose between complete-document comparison,
+    /// visible-grid comparison, and visible introduction.
+    pub(crate) fn prepare_accessible_document_comparison(
+        &mut self,
+    ) -> AccessibleDocumentComparison {
+        self.synchronize_accessible_document_screen();
         let previous = &self.prev_screen;
         let current = self.screen();
-        self.accessibility_update_summary().terminal_reset
+        let reintroduce = self.accessible_document_reintroduction_pending
+            || self.accessibility_screen_transition_pending
             || previous.screen != current.screen
-            || previous.geometry != current.geometry
+            || previous.geometry != current.geometry;
+        if reintroduce {
+            // `prepare_accessible_document_comparison` is the consumption
+            // boundary: a context can already be physically finalized before
+            // its deferred announcement runs, so ordinary revision
+            // finalization cannot own this transition.
+            self.accessible_document_reintroduction_pending = false;
+            return AccessibleDocumentComparison::Reintroduce;
+        }
+
+        if self.accessibility_document_is_continuous() {
+            AccessibleDocumentComparison::CompleteDocument
+        } else {
+            AccessibleDocumentComparison::VisibleGrid
+        }
     }
 
     /// Whether retained history has a continuous row identity across the
     /// current accessibility boundary. A history-only gap prevents a complete
-    /// document diff, but does not invalidate fixed visible-grid coordinates;
-    /// callers can still fall back to an explicit visible-grid diff.
-    pub(crate) fn accessibility_document_is_continuous(&self) -> bool {
-        if self.accessibility_requires_screen_reintroduction() {
-            return false;
-        }
+    /// document diff, but does not invalidate fixed visible-grid coordinates.
+    fn accessibility_document_is_continuous(&self) -> bool {
         let previous = &self.prev_screen;
         let current = self.screen();
 
@@ -3294,6 +3517,24 @@ mod tests {
 
         assert_eq!(view.review_cursor_position(), (1, 4));
         assert_eq!(view.review_mark_position(), None);
+    }
+
+    #[test]
+    fn document_deactivation_does_not_finalize_a_presented_update() {
+        let mut view = View::new(2, 20);
+        view.enable_presentation_tracking();
+        view.mark_accessible_document_context_active();
+        view.process_changes(b"presented but pending speech");
+        let frame = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(frame));
+        assert!(view.accessibility_has_unfinalized_presentation());
+
+        assert!(view.deactivate_accessible_document_context());
+
+        assert!(
+            view.accessibility_has_unfinalized_presentation(),
+            "covering a document must preserve its stabilization boundary"
+        );
     }
 
     #[test]

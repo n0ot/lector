@@ -599,16 +599,6 @@ fn speak_application_cursor_line(sr: &mut ScreenReader, view: &View) -> Result<(
     Ok(())
 }
 
-fn announce_screen_transition(sr: &mut ScreenReader, view: &View) -> Result<()> {
-    // Primary and alternate screens are independent terminal documents. No
-    // row identity survives either handoff, so the visible grid is the only
-    // conservative description of the newly active context. This deliberately
-    // also reintroduces a restored primary screen instead of guessing which
-    // parts the user remembers from before the alternate-screen session.
-    sr.speak_application_screen(view)?;
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct AccessibilityContext {
     view_id: ViewId,

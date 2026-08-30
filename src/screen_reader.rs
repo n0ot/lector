@@ -656,7 +656,10 @@ mod tests {
     use super::{
         ClipboardMove, MAX_PENDING_DELETE_INTENTS, MAX_PENDING_DELETE_PRESENTATIONS, ScreenReader,
     };
-    use crate::{speech, view::View};
+    use crate::{
+        speech,
+        view::{AccessibleDocumentComparison, View},
+    };
     use mlua::{Lua, Value};
     use std::{
         cell::{Cell, RefCell},
@@ -860,6 +863,48 @@ mod tests {
     }
 
     #[test]
+    fn returning_document_reads_only_output_since_its_departure_checkpoint() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(3, 30);
+        view.process_changes(b"already heard");
+        view.finalize_changes(0);
+        view.mark_accessible_document_context_active();
+        assert!(view.deactivate_accessible_document_context());
+
+        // Hidden contexts may still be independently finalized. Reactivation
+        // must restore the departure checkpoint rather than that newer global
+        // speech baseline.
+        view.process_changes(b"\r\narrived while hidden");
+        view.finalize_changes(1);
+        assert!(view.activate_accessible_document_context());
+
+        assert!(sr.auto_read(&mut view).unwrap());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("arrived while hidden"), "{spoken:?}");
+        assert!(!spoken.contains("already heard"), "{spoken:?}");
+    }
+
+    #[test]
+    fn resize_invalidates_a_suspended_document_checkpoint() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(3, 30);
+        view.process_changes(b"visible before resize");
+        view.finalize_changes(0);
+        view.mark_accessible_document_context_active();
+        assert!(view.deactivate_accessible_document_context());
+
+        view.set_size(4, 20);
+        assert!(view.activate_accessible_document_context());
+        assert!(sr.auto_read(&mut view).unwrap());
+        assert!(
+            speaks
+                .borrow()
+                .iter()
+                .any(|spoken| spoken.contains("visible before resize"))
+        );
+    }
+
+    #[test]
     fn disjoint_history_lineage_diffs_the_still_identified_visible_grid() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new_with_scrollback_for_test(3, 24, 1);
@@ -874,8 +919,10 @@ mod tests {
             b"\r\njunk-1\r\njunk-2\r\njunk-3\x1b[Hheader\x1b[2;1Hnew-middle\x1b[3;1Hfooter",
         );
 
-        assert!(!view.accessibility_document_is_continuous());
-        assert!(!view.accessibility_requires_screen_reintroduction());
+        assert_eq!(
+            view.prepare_accessible_document_comparison(),
+            AccessibleDocumentComparison::VisibleGrid
+        );
         assert!(sr.auto_read(&mut view).unwrap());
         let spoken = speaks.borrow().join(" ");
         assert!(spoken.contains("new"), "{spoken:?}");
@@ -924,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn returning_from_alternate_screen_reintroduces_the_entire_primary_grid() {
+    fn returning_from_alternate_screen_uses_the_primary_document_checkpoint() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 24);
         view.process_changes(b"primary-one\r\nprimary-two\r\nprimary-three");
@@ -936,11 +983,8 @@ mod tests {
 
         view.process_changes(b"\x1b[?1049l");
 
-        assert!(sr.auto_read(&mut view).unwrap());
-        let spoken = speaks.borrow().join(" ");
-        assert!(spoken.contains("primary-one"), "{spoken:?}");
-        assert!(spoken.contains("primary-two"), "{spoken:?}");
-        assert!(spoken.contains("primary-three"), "{spoken:?}");
+        assert!(!sr.auto_read(&mut view).unwrap());
+        assert!(speaks.borrow().is_empty());
     }
 
     #[test]
