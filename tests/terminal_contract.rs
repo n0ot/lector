@@ -153,6 +153,45 @@ fn terminal_updates_are_invariant_to_byte_fragmentation() {
     assert_eq!(fragmented, whole);
 }
 
+#[test]
+fn safe_suffix_after_a_structural_boundary_is_invariant_to_byte_fragmentation() {
+    let bytes = b"\x1b[Hfirst\r\nsecond\r\n";
+    let mut whole_engine = engine(4, 40, 20);
+    let whole = whole_engine.advance(bytes);
+
+    let mut fragmented_engine = engine(4, 40, 20);
+    let mut fragmented = UpdateSummary::default();
+    for byte in bytes {
+        fragmented.merge(fragmented_engine.advance(std::slice::from_ref(byte)));
+    }
+
+    assert_eq!(fragmented_engine.snapshot(), whole_engine.snapshot());
+    assert_eq!(fragmented.linear_output_effect, whole.linear_output_effect);
+    assert!(whole.completes_linear_output_record());
+    let mut text = String::new();
+    whole
+        .linear_output_text_into(&mut text)
+        .expect("retain output after the structural boundary");
+    assert_eq!(text, "first\nsecond\n");
+}
+
+#[test]
+fn ambiguous_mid_record_suffix_is_invariant_to_byte_fragmentation() {
+    let bytes = b"item\tvalue\r\n";
+    let mut whole_engine = engine(4, 40, 20);
+    let whole = whole_engine.advance(bytes);
+
+    let mut fragmented_engine = engine(4, 40, 20);
+    let mut fragmented = UpdateSummary::default();
+    for byte in bytes {
+        fragmented.merge(fragmented_engine.advance(std::slice::from_ref(byte)));
+    }
+
+    assert_eq!(fragmented_engine.snapshot(), whole_engine.snapshot());
+    assert_eq!(fragmented.linear_output_effect, whole.linear_output_effect);
+    assert!(!whole.completes_linear_output_record());
+}
+
 fn synthetic_fragment(index: usize) -> UpdateSummary {
     let col = u16::try_from(index).expect("fragment column fits in u16");
     let changed_row = u16::try_from(index % 64).expect("fragment row fits in u16");
@@ -378,7 +417,7 @@ fn linear_output_completion_survives_fragmented_crlf_and_rejects_ambiguity() {
 
     let addressed = engine.advance(b"\x1b[Hscreen row\r\n");
     assert!(addressed.output_report_structural);
-    assert!(!addressed.completes_linear_output_record());
+    assert!(addressed.completes_linear_output_record());
 
     let incomplete_escape = engine.advance(b"record\r\n\x1b[");
     assert!(incomplete_escape.parser_continuation);
@@ -430,7 +469,10 @@ fn linear_output_completion_survives_fragmented_crlf_and_rejects_ambiguity() {
             !fragmented_unicode.output_report_structural,
             "UTF-8 continuation byte was mistaken for C1 APC at split {split}"
         );
-        assert!(fragmented_unicode.completes_linear_output_record());
+        assert!(
+            fragmented_unicode.completes_linear_output_record(),
+            "Unicode record did not complete at split {split}: {fragmented_unicode:?}"
+        );
     }
 
     let alternate = engine.advance(b"\x1b[?1049hrecord\r\n");

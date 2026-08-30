@@ -16,7 +16,7 @@ pub(super) struct AutoReadBuffers {
     lcs: Vec<usize>,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum DiffState {
     NoChanges,
     OneDeletion,
@@ -64,17 +64,20 @@ impl ScreenReader {
         }
         let prev_cursor = view.prev_screen().cursor_position();
         let cursor = view.screen().cursor_position();
-        let linear_output_report = view
-            .accessibility_update_summary()
-            .has_linear_output_report();
-
         if prefer_cursor && self.read_visual_focus_transfer(view)? {
             return Ok(true);
         }
 
         let mut live_text = std::mem::take(&mut self.auto_read_buffers.live_text);
-        view.accessibility_update_summary()
-            .printed_text_into(&mut live_text);
+        let linear_output_metrics = view
+            .accessibility_update_summary()
+            .readable_linear_output_text_into(&mut live_text)
+            .map(|report| (report.cursor_operations, report.scroll_operations > 0));
+        let linear_output_report = linear_output_metrics.is_some();
+        if !linear_output_report {
+            view.accessibility_update_summary()
+                .printed_text_into(&mut live_text);
+        }
         let validated_structural_line_report = {
             let update = view.accessibility_update_summary();
             let report = live_text.trim();
@@ -92,6 +95,8 @@ impl ScreenReader {
                 )
         };
         let readable_print_report = linear_output_report || validated_structural_line_report;
+        let (print_cursor_moves, print_scrolled) =
+            linear_output_metrics.unwrap_or((cursor_moves, scrolled));
         let completed_linear_record = view.accessibility_completes_linear_output_record();
 
         // A completed blank record is still an authoritative presentation
@@ -133,7 +138,7 @@ impl ScreenReader {
         let mut live_read_result = None;
         {
             let text = live_text.trim();
-            if readable_print_report && (cursor_moves == 0 || scrolled) {
+            if readable_print_report && (print_cursor_moves == 0 || print_scrolled) {
                 let mut spoken = false;
                 // Match against the verbatim print stream. Trimming is a
                 // speech concern; dropping spaces here desynchronizes the
@@ -141,7 +146,8 @@ impl ScreenReader {
                 let suppress_echo = self.should_suppress_key_echo(&live_text);
                 if !suppress_echo
                     && !text.is_empty()
-                    && let Some(text) = self.hook_on_live_read(text, cursor_moves, scrolled)?
+                    && let Some(text) =
+                        self.hook_on_live_read(text, print_cursor_moves, print_scrolled)?
                     && !text.is_empty()
                 {
                     if crate::diagnostics::enabled() {
@@ -903,7 +909,6 @@ fn collect_auto_read_diff(
             && let Some(change_str) = change.as_str()
         {
             diff_text.push_str(change_str);
-            diff_text.push('\n');
         }
     }
 
@@ -1141,7 +1146,45 @@ fn is_word_char(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_extended_transcript_lines, collect_inserted_fields, field_replacement};
+    use super::{
+        DiffState, collect_auto_read_diff, collect_extended_transcript_lines,
+        collect_inserted_fields, field_replacement,
+    };
+
+    #[test]
+    fn multiline_diff_preserves_each_source_line_boundary_once() {
+        let mut output = String::new();
+        let mut graphemes = String::new();
+        let mut lcs = Vec::new();
+
+        let state = collect_auto_read_diff(
+            "prompt\n",
+            "prompt\nfirst\nsecond\n",
+            &mut output,
+            &mut graphemes,
+            &mut lcs,
+        );
+
+        assert_eq!(state, DiffState::Multi);
+        assert_eq!(output, "first\nsecond\n");
+    }
+
+    #[test]
+    fn multiline_diff_retains_real_blank_lines() {
+        let mut output = String::new();
+        let mut graphemes = String::new();
+        let mut lcs = Vec::new();
+
+        collect_auto_read_diff(
+            "prompt\n",
+            "prompt\nfirst\n\nsecond\n",
+            &mut output,
+            &mut graphemes,
+            &mut lcs,
+        );
+
+        assert_eq!(output, "first\n\nsecond\n");
+    }
 
     #[test]
     fn extended_transcript_lines_exclude_parallel_status_replacements() {

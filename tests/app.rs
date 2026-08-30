@@ -2399,6 +2399,44 @@ fn complete_linear_output_reads_immediately_without_waiting_for_quiet() {
 }
 
 #[test]
+fn fragmented_shell_metadata_cannot_delay_a_later_completed_output_block() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1b]133;A\x07$ \x1b]133;B\x07", &mut term_out)
+        .expect("draw semantic prompt");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present semantic prompt");
+    clock.advance_ms(u128::from(DIFF_DELAY));
+    assert!(app.maybe_finalize_changes(&mut sr).expect("quiet prompt"));
+    recorder.inner.borrow_mut().speaks.clear();
+
+    for bytes in [
+        b"run\r\n\x1b[?2004l\r".as_slice(),
+        b"\x01\x1b[0 q\x02\x1b]2;run\x07\x1b]133;C;\x07".as_slice(),
+        b"first line\r\nsecond line\r\n".as_slice(),
+    ] {
+        app.handle_pty(&mut sr, bytes, &mut term_out)
+            .expect("receive fragmented shell output");
+        app.drain_scheduled_output(&mut term_out, false)
+            .expect("present fragmented shell output");
+    }
+
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("completed output suffix finalizes immediately")
+    );
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("first line second line".into(), false)]
+    );
+}
+
+#[test]
 fn readline_wrapped_linear_output_reads_immediately() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut term_out = Vec::new();
@@ -2423,7 +2461,7 @@ fn readline_wrapped_linear_output_reads_immediately() {
 }
 
 #[test]
-fn trailing_partial_and_structural_output_keep_the_stabilization_fallback() {
+fn trailing_partial_and_mid_record_structural_output_keep_the_stabilization_fallback() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut term_out = Vec::new();
 
@@ -2445,11 +2483,11 @@ fn trailing_partial_and_structural_output_keep_the_stabilization_fallback() {
     );
 
     recorder.inner.borrow_mut().speaks.clear();
-    app.handle_pty(&mut sr, b"\x1b[2J\x1b[Hscreen row\r\n", &mut term_out)
-        .expect("receive structural redraw");
+    app.handle_pty(&mut sr, b"\x1b[2J\x1b[5Gscreen row\r\n", &mut term_out)
+        .expect("receive a structural redraw whose output begins mid-record");
     assert!(
         !app.maybe_finalize_changes(&mut sr)
-            .expect("structural output remains timer-driven")
+            .expect("mid-record structural output remains timer-driven")
     );
 }
 
@@ -2752,7 +2790,7 @@ fn spaces_only_record_does_not_bypass_stale_suffix_validation() {
 }
 
 #[test]
-fn structural_taint_survives_a_later_plain_line_fragment() {
+fn completed_linear_suffix_recovers_after_an_earlier_structural_update() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut term_out = Vec::new();
 
@@ -2769,22 +2807,14 @@ fn structural_taint_survives_a_later_plain_line_fragment() {
         .expect("start structural redraw");
     clock.advance_ms(25);
     app.handle_pty(&mut sr, b"final row\r\n", &mut term_out)
-        .expect("finish redraw with a line-like fragment");
+        .expect("finish redraw with an independently complete record");
     assert!(
-        !app.maybe_finalize_changes(&mut sr)
-            .expect("earlier structural activity taints the full burst")
+        app.maybe_finalize_changes(&mut sr)
+            .expect("the completed suffix recovers progressive reading")
     );
-    assert!(recorder.inner.borrow().speaks.is_empty());
-
-    clock.advance_ms(u128::from(MAX_DIFF_DELAY) + 1);
-    assert!(app.maybe_finalize_changes(&mut sr).expect("diff fallback"));
-    assert!(
-        recorder
-            .inner
-            .borrow()
-            .speaks
-            .iter()
-            .any(|(text, _)| text.contains("final row"))
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("final row".into(), false)]
     );
 }
 
@@ -3340,7 +3370,7 @@ fn synchronized_close_becomes_readable_only_after_its_render_flushes() {
 }
 
 #[test]
-fn osc133_prompt_commits_at_b_without_the_diff_delay() {
+fn osc133_prompt_end_uses_the_ordinary_quiet_window() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig::default());
     let mut term_out = Vec::new();
@@ -3378,9 +3408,11 @@ fn osc133_prompt_commits_at_b_without_the_diff_delay() {
     app.drain_scheduled_output(&mut term_out, false)
         .expect("present completed prompt");
     assert!(
-        app.maybe_finalize_changes(&mut sr)
-            .expect("commit prompt at semantic boundary")
+        !app.maybe_finalize_changes(&mut sr)
+            .expect("semantic metadata is not a stabilization boundary")
     );
+    clock.advance_ms(u128::from(DIFF_DELAY));
+    assert!(app.maybe_finalize_changes(&mut sr).expect("quiet prompt"));
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         [("$ ready".into(), false)]
@@ -3459,7 +3491,7 @@ fn osc133_input_boundary_does_not_commit_trailing_partial_text() {
         assert!(
             !app.maybe_finalize_changes(&mut sr)
                 .expect("trailing text keeps ordinary stabilization"),
-            "OSC 133 B committed a partial frame (fragmented={fragmented})"
+            "OSC 133 B bypassed ordinary stabilization (fragmented={fragmented})"
         );
         assert!(recorder.inner.borrow().speaks.is_empty());
 
@@ -3775,7 +3807,7 @@ fn reverse_search_interface_reads_its_settled_contents() {
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         &[(
-            "history item ---------------- greater 1 slash 100".into(),
+            "history item ----------------  greater  1 slash 100".into(),
             false,
         )]
     );

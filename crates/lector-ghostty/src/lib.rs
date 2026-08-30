@@ -532,6 +532,10 @@ pub struct UpdateSnapshot {
     pub effects: Vec<EffectSnapshot>,
     pub pty_replies: Vec<u8>,
     pub printed_runs: Vec<PrintedRunSnapshot>,
+    /// Ordered effect of this update on an older safe linear-output suffix.
+    /// Unlike `output_report_structural`, a structural operation can be
+    /// followed by a new independently safe suffix in the same update.
+    pub linear_output_effect: LinearOutputEffectSnapshot,
     /// The observed stream used cursor-addressed or otherwise structural
     /// terminal operations, so its printed runs are not a linear output
     /// record. This is accessibility provenance only; Ghostty's snapshot
@@ -578,6 +582,23 @@ pub struct UpdateSnapshot {
     /// included only when the prefix before this opener changed it; callers
     /// can otherwise reuse their previous committed history allocation.
     pub synchronized_output_open_snapshot: Option<TerminalSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinearOutputReportSnapshot {
+    pub printed_runs: Vec<PrintedRunSnapshot>,
+    pub starts_at_record_boundary: bool,
+    pub cursor_operations: usize,
+    pub scroll_operations: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum LinearOutputEffectSnapshot {
+    #[default]
+    Preserve,
+    Append(LinearOutputReportSnapshot),
+    Replace(LinearOutputReportSnapshot),
+    Clear,
 }
 
 /// Ghostty state normalized for Lector's engine-neutral consumers.
@@ -1496,6 +1517,8 @@ struct StreamObserver {
     printed_runs: Vec<PrintedRunSnapshot>,
     current_print: String,
     output_report_structural: bool,
+    linear_output_replaced: bool,
+    linear_output_start: Option<LinearOutputStart>,
     raw_escape_pending: bool,
     raw_utf8_continuations: u8,
     raw_utf8_next_min: u8,
@@ -1527,19 +1550,36 @@ struct StreamObserver {
     unbrokered_private_mode_boundary: u8,
 }
 
+#[derive(Clone, Copy)]
+struct LinearOutputStart {
+    run_index: usize,
+    starts_at_record_boundary: bool,
+    cursor_operations: usize,
+    scroll_operations: usize,
+}
+
 impl StreamObserver {
     fn begin_update(&mut self, snapshot: &TerminalSnapshot) {
         self.operations.clear();
         self.semantic_input_boundary = false;
-        self.output_report_structural = snapshot.alternate_screen
+        let structurally_unsafe = snapshot.alternate_screen
             || !snapshot.cursor.visible
             || snapshot.modes.synchronized_output
             || snapshot.modes.application_keypad
             || snapshot.modes.application_cursor
+            || snapshot.modes.focus_reporting
             || snapshot.modes.mouse_protocol != MouseProtocol::None
             || self.scroll_region.is_some()
             || self.origin_mode
             || self.left_right_margin_mode;
+        self.output_report_structural = structurally_unsafe;
+        self.linear_output_replaced = structurally_unsafe;
+        self.linear_output_start = (!structurally_unsafe).then_some(LinearOutputStart {
+            run_index: 0,
+            starts_at_record_boundary: snapshot.cursor.col == 0,
+            cursor_operations: self.cursor_operations,
+            scroll_operations: self.scroll_operations,
+        });
         self.operation_rows = snapshot.rows.len().try_into().unwrap_or(u16::MAX);
         self.operation_cols = snapshot
             .rows
@@ -1636,10 +1676,19 @@ impl StreamObserver {
 
     fn mark_visible_output(&mut self) {
         self.semantic_input_boundary = false;
+        self.linear_output_start.get_or_insert(LinearOutputStart {
+            run_index: self.printed_runs.len(),
+            starts_at_record_boundary: self.operation_col == 0,
+            cursor_operations: self.cursor_operations,
+            scroll_operations: self.scroll_operations,
+        });
     }
 
     fn mark_structural_output(&mut self) {
+        self.flush_print();
         self.output_report_structural = true;
+        self.linear_output_replaced = true;
+        self.linear_output_start = None;
         self.semantic_input_boundary = false;
     }
 
@@ -1785,8 +1834,57 @@ impl StreamObserver {
         });
     }
 
+    fn linear_output_permitted(&self, snapshot: &TerminalSnapshot) -> bool {
+        !snapshot.alternate_screen
+            && snapshot.cursor.visible
+            && !snapshot.modes.synchronized_output
+            && !snapshot.modes.application_keypad
+            && !snapshot.modes.application_cursor
+            && !snapshot.modes.focus_reporting
+            && snapshot.modes.mouse_protocol == MouseProtocol::None
+            && self.scroll_region.is_none()
+            && !self.origin_mode
+            && !self.left_right_margin_mode
+    }
+
+    fn linear_output_effect(&self, snapshot: &TerminalSnapshot) -> LinearOutputEffectSnapshot {
+        if !self.linear_output_permitted(snapshot) {
+            return LinearOutputEffectSnapshot::Clear;
+        }
+        let Some(start) = self.linear_output_start else {
+            return if self.linear_output_replaced {
+                LinearOutputEffectSnapshot::Clear
+            } else {
+                LinearOutputEffectSnapshot::Preserve
+            };
+        };
+        if start.run_index >= self.printed_runs.len() {
+            return if self.linear_output_replaced {
+                LinearOutputEffectSnapshot::Clear
+            } else {
+                LinearOutputEffectSnapshot::Preserve
+            };
+        }
+        let report = LinearOutputReportSnapshot {
+            printed_runs: self.printed_runs[start.run_index..].to_vec(),
+            starts_at_record_boundary: start.starts_at_record_boundary,
+            cursor_operations: self
+                .cursor_operations
+                .saturating_sub(start.cursor_operations),
+            scroll_operations: self
+                .scroll_operations
+                .saturating_sub(start.scroll_operations),
+        };
+        if self.linear_output_replaced {
+            LinearOutputEffectSnapshot::Replace(report)
+        } else {
+            LinearOutputEffectSnapshot::Append(report)
+        }
+    }
+
     fn take_update(&mut self, snapshot: &TerminalSnapshot) -> StreamUpdate {
         self.flush_print();
+        let linear_output_effect = self.linear_output_effect(snapshot);
         let history_changed = self.take_history_checkpoint_change();
         let operations = if self.operation_reliable
             && self.operation_row == snapshot.cursor.row
@@ -1799,6 +1897,7 @@ impl StreamObserver {
         };
         StreamUpdate {
             printed_runs: std::mem::take(&mut self.printed_runs),
+            linear_output_effect,
             output_report_structural: std::mem::take(&mut self.output_report_structural),
             semantic_input_boundary: std::mem::take(&mut self.semantic_input_boundary),
             terminal_reset: std::mem::take(&mut self.terminal_reset),
@@ -1816,6 +1915,7 @@ impl StreamObserver {
 #[derive(Default)]
 struct StreamUpdate {
     printed_runs: Vec<PrintedRunSnapshot>,
+    linear_output_effect: LinearOutputEffectSnapshot,
     output_report_structural: bool,
     semantic_input_boundary: bool,
     terminal_reset: bool,
@@ -2492,6 +2592,7 @@ impl Terminal {
             effects,
             pty_replies,
             printed_runs: stream.printed_runs,
+            linear_output_effect: stream.linear_output_effect,
             output_report_structural: stream.output_report_structural,
             parser_continuation,
             operations: stream.operations,
@@ -4174,9 +4275,30 @@ mod tests {
     use std::{borrow::Cow, sync::Arc};
 
     use super::{
-        CellSnapshot, OperationSnapshot, RenderDamageSnapshot, RowSnapshot, StreamObserver,
-        Terminal,
+        CellSnapshot, LinearOutputEffectSnapshot, OperationSnapshot, RenderDamageSnapshot,
+        RowSnapshot, StreamObserver, Terminal,
     };
+
+    #[test]
+    fn observer_retains_safe_output_after_the_latest_structural_boundary() {
+        let mut terminal = Terminal::new(4, 40).expect("create terminal");
+        let update = terminal
+            .advance(b"\x1b[Hfirst\r\nsecond\r\n")
+            .expect("apply structural prefix and output");
+
+        let LinearOutputEffectSnapshot::Replace(report) = update.linear_output_effect else {
+            panic!("structural prefix must be followed by a replacement suffix");
+        };
+        assert!(report.starts_at_record_boundary);
+        assert_eq!(
+            report
+                .printed_runs
+                .iter()
+                .map(|run| run.text.as_str())
+                .collect::<String>(),
+            "firstsecond"
+        );
+    }
 
     #[test]
     fn row_content_appenders_share_range_and_trailing_blank_semantics() {

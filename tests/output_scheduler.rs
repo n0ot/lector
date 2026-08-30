@@ -63,7 +63,7 @@ fn accessibility_bundle(marker: u64) -> PresentedAccessibilityBundle {
             accessibility_epoch: Default::default(),
             application_auto_read_suppressed: false,
             application_cursor_tracking_suppressed: false,
-            explicitly_stable: false,
+            synchronized_output_closed: false,
             cursor_visibility_restored: false,
         }],
     )

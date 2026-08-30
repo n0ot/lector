@@ -235,6 +235,35 @@ pub struct PrintedRun {
     pub boundary: PrintBoundary,
 }
 
+/// A print-observer suffix which began after the newest structural or
+/// otherwise ambiguous terminal update. The cumulative [`UpdateSummary`]
+/// retains whole-frame provenance for screen diffing, while this report keeps
+/// later ordinary output independently eligible for progressive reading.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinearOutputReport {
+    pub printed_runs: Vec<PrintedRun>,
+    pub starts_at_record_boundary: bool,
+    pub cursor_operations: usize,
+    pub scroll_operations: usize,
+}
+
+/// How an update transforms a linear-output candidate retained by an older
+/// update. This composes associatively, so fragmented parser updates and
+/// presentation-journal entries produce the same suffix as one combined
+/// update.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum LinearOutputEffect {
+    /// No printable or invalidating evidence; preserve an older candidate.
+    #[default]
+    Preserve,
+    /// Safe output which directly extends an older candidate.
+    Append(LinearOutputReport),
+    /// An ambiguity barrier followed by a new independently safe suffix.
+    Replace(LinearOutputReport),
+    /// An ambiguity barrier with no later safe output.
+    Clear,
+}
+
 /// A renderer optimization hint recorded alongside Ghostty mutation. Ghostty's
 /// resulting snapshot remains authoritative; consumers must validate an
 /// operation before translating it to physical-terminal bytes. Engine-produced
@@ -259,6 +288,10 @@ pub struct UpdateSummary {
     pub damage: TerminalDamage,
     pub pty_replies: Vec<u8>,
     pub printed_runs: Vec<PrintedRun>,
+    /// Independently composable safe suffix of `printed_runs`. Unlike
+    /// `output_report_structural`, this is deliberately not sticky: ordinary
+    /// output after an earlier structural batch can start a new candidate.
+    pub linear_output_effect: LinearOutputEffect,
     /// At least one update since the last accessibility commit used
     /// structural terminal output, so `printed_runs` must not be treated as a
     /// completed linear record.
@@ -305,6 +338,7 @@ impl Default for UpdateSummary {
             damage: TerminalDamage::None,
             pty_replies: Vec::new(),
             printed_runs: Vec::new(),
+            linear_output_effect: LinearOutputEffect::Preserve,
             output_report_structural: false,
             parser_continuation: false,
             operations: Vec::new(),
@@ -334,6 +368,8 @@ impl UpdateSummary {
         if next.batch_count == 0 {
             return;
         }
+        self.linear_output_effect
+            .merge(std::mem::take(&mut next.linear_output_effect));
         if self.batch_count == 0 {
             self.cursor_before = next.cursor_before;
             self.screen_before = next.screen_before;
@@ -387,52 +423,117 @@ impl UpdateSummary {
     }
 
     pub fn printed_text_into(&self, text: &mut String) {
-        text.clear();
-        for run in &self.printed_runs {
-            match run.boundary {
-                PrintBoundary::Continue => {}
-                PrintBoundary::LineFeed => {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                }
-                PrintBoundary::CarriageReturn => {
-                    let line_start = text.rfind('\n').map_or(0, |index| index + 1);
-                    text.truncate(line_start);
-                }
+        printed_runs_text_into(&self.printed_runs, text);
+    }
+
+    /// Writes the independently safe linear-output suffix into `text` and
+    /// returns its presentation metadata, if one exists.
+    pub fn linear_output_text_into(&self, text: &mut String) -> Option<&LinearOutputReport> {
+        let report = self.linear_output_effect.report()?;
+        printed_runs_text_into(&report.printed_runs, text);
+        Some(report)
+    }
+
+    /// Writes a suffix which is safe to announce independently of the whole
+    /// frame. A fragment that follows an ambiguity barrier still needs the
+    /// authoritative screen diff; a completed record provides its own
+    /// validation boundary and may be reported immediately.
+    pub fn readable_linear_output_text_into(
+        &self,
+        text: &mut String,
+    ) -> Option<&LinearOutputReport> {
+        if self.parser_continuation {
+            return None;
+        }
+        let report = match &self.linear_output_effect {
+            LinearOutputEffect::Append(report) => report,
+            LinearOutputEffect::Replace(report) if report.independently_completes_record() => {
+                report
             }
-            text.push_str(&run.text);
+            LinearOutputEffect::Preserve
+            | LinearOutputEffect::Replace(_)
+            | LinearOutputEffect::Clear => return None,
+        };
+        printed_runs_text_into(&report.printed_runs, text);
+        Some(report)
+    }
+
+    /// Whether the parallel print observer retains ordinary primary-screen
+    /// output after the newest ambiguity barrier.
+    pub fn has_linear_output_report(&self) -> bool {
+        self.linear_output_effect.report().is_some()
+    }
+
+    /// Whether the safe linear-output suffix ends at a completed record.
+    pub fn completes_linear_output_record(&self) -> bool {
+        if self.parser_continuation {
+            return false;
+        }
+        match &self.linear_output_effect {
+            LinearOutputEffect::Append(report) => report.completes_record(),
+            LinearOutputEffect::Replace(report) => report.independently_completes_record(),
+            LinearOutputEffect::Preserve | LinearOutputEffect::Clear => false,
+        }
+    }
+}
+
+impl LinearOutputEffect {
+    fn report(&self) -> Option<&LinearOutputReport> {
+        match self {
+            Self::Append(report) | Self::Replace(report) => Some(report),
+            Self::Preserve | Self::Clear => None,
         }
     }
 
-    /// Whether this cumulative update is safe to finalize as a completed
-    /// line-oriented output record without waiting for screen quiet.
-    pub fn completes_linear_output_record(&self) -> bool {
-        self.has_linear_output_report()
-            && self.residual_carriage_returns_are_record_prefixes()
+    fn merge(&mut self, next: Self) {
+        match next {
+            Self::Preserve => {}
+            Self::Clear => *self = Self::Clear,
+            Self::Replace(report) => *self = Self::Replace(report),
+            Self::Append(next_report) => match self {
+                Self::Preserve => *self = Self::Append(next_report),
+                Self::Append(report) | Self::Replace(report) => report.append(next_report),
+                Self::Clear => *self = Self::Replace(next_report),
+            },
+        }
+    }
+}
+
+impl LinearOutputReport {
+    fn append(&mut self, next: Self) {
+        append_printed_runs(&mut self.printed_runs, next.printed_runs);
+        self.cursor_operations = self
+            .cursor_operations
+            .saturating_add(next.cursor_operations);
+        self.scroll_operations = self
+            .scroll_operations
+            .saturating_add(next.scroll_operations);
+    }
+
+    fn completes_record(&self) -> bool {
+        self.residual_carriage_returns_are_record_prefixes()
             && self
                 .printed_runs
                 .last()
                 .is_some_and(|run| run.boundary == PrintBoundary::LineFeed && run.text.is_empty())
     }
 
-    /// Whether the parallel print observer describes ordinary primary-screen
-    /// output rather than a structural redraw. Ambiguous reports must fall
-    /// back to the authoritative screen diff even after the quiet timer.
-    pub fn has_linear_output_report(&self) -> bool {
-        self.batch_count > 0
-            && !self.output_report_structural
-            && !self.parser_continuation
-            && self.screen_before == ScreenIdentity::Primary
-            && self.screen_after == ScreenIdentity::Primary
+    /// A suffix which follows ambiguous cursor state can only stand on its
+    /// own when it starts at a physical record boundary. Starting in a later
+    /// column (for example, after an unmodeled tab) requires the authoritative
+    /// document diff so earlier text in the same record cannot disappear.
+    fn independently_completes_record(&self) -> bool {
+        self.starts_at_record_boundary && self.completes_record()
     }
 
     fn residual_carriage_returns_are_record_prefixes(&self) -> bool {
-        let mut content_since_line_feed = self.cursor_before.col != 0;
+        let mut content_since_line_feed = !self.starts_at_record_boundary;
         for run in &self.printed_runs {
             match run.boundary {
                 PrintBoundary::Continue => {}
-                PrintBoundary::LineFeed => content_since_line_feed = false,
+                PrintBoundary::LineFeed => {
+                    content_since_line_feed = false;
+                }
                 PrintBoundary::CarriageReturn if content_since_line_feed => return false,
                 PrintBoundary::CarriageReturn => {}
             }
@@ -444,15 +545,34 @@ impl UpdateSummary {
     }
 }
 
+fn printed_runs_text_into(runs: &[PrintedRun], text: &mut String) {
+    text.clear();
+    for run in runs {
+        match run.boundary {
+            PrintBoundary::Continue => {}
+            PrintBoundary::LineFeed => {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+            }
+            PrintBoundary::CarriageReturn => {
+                let line_start = text.rfind('\n').map_or(0, |index| index + 1);
+                text.truncate(line_start);
+            }
+        }
+        text.push_str(&run.text);
+    }
+}
+
 fn append_printed_runs(target: &mut Vec<PrintedRun>, source: Vec<PrintedRun>) {
     for run in source {
         if run.boundary == PrintBoundary::LineFeed
-            && run.text.is_empty()
             && let Some(previous) = target.last_mut()
             && previous.boundary == PrintBoundary::CarriageReturn
             && previous.text.is_empty()
         {
             previous.boundary = PrintBoundary::LineFeed;
+            previous.text.push_str(&run.text);
             continue;
         }
         if run.boundary == PrintBoundary::Continue
@@ -1341,6 +1461,7 @@ impl TerminalEngine for GhosttyEngine {
             .unwrap_or_else(|error| panic!("Ghostty terminal resize failed: {error}"));
         UpdateSummary {
             damage: TerminalDamage::Full,
+            linear_output_effect: LinearOutputEffect::Clear,
             changed_rows: full_row_range(self.snapshot.geometry.rows),
             cursor_before: before.cursor,
             cursor_after: self.snapshot.cursor,
@@ -1360,6 +1481,7 @@ impl TerminalEngine for GhosttyEngine {
             .unwrap_or_else(|error| panic!("Ghostty terminal reset failed: {error}"));
         UpdateSummary {
             damage: TerminalDamage::Full,
+            linear_output_effect: LinearOutputEffect::Clear,
             changed_rows: full_row_range(self.snapshot.geometry.rows),
             cursor_before: before.cursor,
             cursor_after: self.snapshot.cursor,
@@ -1460,6 +1582,47 @@ fn refresh_normalized_ghostty_metadata(
     normalized.viewport = Viewport::Live;
 }
 
+fn normalize_ghostty_printed_runs(
+    runs: Vec<lector_ghostty::PrintedRunSnapshot>,
+) -> Vec<PrintedRun> {
+    let source = runs
+        .into_iter()
+        .map(|run| PrintedRun {
+            text: run.text,
+            boundary: match run.boundary {
+                GhosttyPrintBoundary::Continue => PrintBoundary::Continue,
+                GhosttyPrintBoundary::LineFeed => PrintBoundary::LineFeed,
+                GhosttyPrintBoundary::CarriageReturn => PrintBoundary::CarriageReturn,
+            },
+        })
+        .collect();
+    let mut normalized = Vec::new();
+    append_printed_runs(&mut normalized, source);
+    normalized
+}
+
+fn normalize_ghostty_linear_output_effect(
+    effect: lector_ghostty::LinearOutputEffectSnapshot,
+) -> LinearOutputEffect {
+    let normalize_report =
+        |report: lector_ghostty::LinearOutputReportSnapshot| LinearOutputReport {
+            printed_runs: normalize_ghostty_printed_runs(report.printed_runs),
+            starts_at_record_boundary: report.starts_at_record_boundary,
+            cursor_operations: report.cursor_operations,
+            scroll_operations: report.scroll_operations,
+        };
+    match effect {
+        lector_ghostty::LinearOutputEffectSnapshot::Preserve => LinearOutputEffect::Preserve,
+        lector_ghostty::LinearOutputEffectSnapshot::Append(report) => {
+            LinearOutputEffect::Append(normalize_report(report))
+        }
+        lector_ghostty::LinearOutputEffectSnapshot::Replace(report) => {
+            LinearOutputEffect::Replace(normalize_report(report))
+        }
+        lector_ghostty::LinearOutputEffectSnapshot::Clear => LinearOutputEffect::Clear,
+    }
+}
+
 fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
     let damage = match update.damage {
         GhosttyDamage::None => TerminalDamage::None,
@@ -1478,6 +1641,7 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         .iter()
         .filter(|run| run.boundary == GhosttyPrintBoundary::LineFeed)
         .count();
+    let linear_output_effect = normalize_ghostty_linear_output_effect(update.linear_output_effect);
     UpdateSummary {
         effects: TerminalEffects {
             bells: effects
@@ -1491,18 +1655,7 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         },
         pty_replies: update.pty_replies,
         damage,
-        printed_runs: update
-            .printed_runs
-            .into_iter()
-            .map(|run| PrintedRun {
-                text: run.text,
-                boundary: match run.boundary {
-                    GhosttyPrintBoundary::Continue => PrintBoundary::Continue,
-                    GhosttyPrintBoundary::LineFeed => PrintBoundary::LineFeed,
-                    GhosttyPrintBoundary::CarriageReturn => PrintBoundary::CarriageReturn,
-                },
-            })
-            .collect(),
+        printed_runs: normalize_ghostty_printed_runs(update.printed_runs),
         output_report_structural: update.output_report_structural,
         parser_continuation: update.parser_continuation,
         operations: update
@@ -1527,6 +1680,7 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         terminal_reset: update.terminal_reset,
         cursor_visibility_restored: update.cursor_visibility_restored,
         batch_count: 1,
+        linear_output_effect,
     }
 }
 
@@ -1651,6 +1805,33 @@ fn normalize_ghostty_mouse_encoding(value: lector_ghostty::MouseEncoding) -> Mou
 #[cfg(test)]
 mod tests {
     use super::{GhosttyEngine, TerminalEngine, Viewport};
+
+    #[test]
+    fn structural_prefix_does_not_taint_a_later_complete_linear_suffix() {
+        let mut engine = GhosttyEngine::new(4, 40).expect("create Ghostty engine");
+        let mut combined = engine
+            .advance(b"\x1b[2J\x1b[H")
+            .expect("apply structural prefix");
+        combined.merge(
+            engine
+                .advance(b"\x1b]133;C\x07")
+                .expect("apply semantic metadata"),
+        );
+        combined.merge(
+            engine
+                .advance(b"first\r\nsecond\r\n")
+                .expect("apply completed output suffix"),
+        );
+
+        assert!(combined.output_report_structural);
+        assert!(combined.has_linear_output_report());
+        assert!(combined.completes_linear_output_record());
+        let mut text = String::new();
+        combined
+            .linear_output_text_into(&mut text)
+            .expect("retain safe suffix");
+        assert_eq!(text, "first\nsecond\n");
+    }
 
     #[test]
     fn viewport_selection_canonicalizes_zero_and_skips_unchanged_snapshots() {

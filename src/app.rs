@@ -171,7 +171,7 @@ mod stabilization_tests {
     #[test]
     fn application_transaction_blocks_every_commit_reason_and_deadline() {
         let update = PresentedUpdateStatus {
-            explicitly_stable: true,
+            synchronized_output_closed: true,
             completes_linear_output_record: true,
             ..PresentedUpdateStatus::default()
         };
@@ -184,24 +184,20 @@ mod stabilization_tests {
     }
 
     #[test]
-    fn explicit_boundary_commits_even_if_an_older_prompt_start_remains_open() {
+    fn synchronized_output_close_commits_immediately() {
         let update = PresentedUpdateStatus {
-            explicitly_stable: true,
-            prompt_transaction_open: true,
+            synchronized_output_closed: true,
             ..PresentedUpdateStatus::default()
         };
         assert_eq!(
             stabilization_decision(100, burst(100, 100, 30), update, false),
-            StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable)
+            StabilizationDecision::Commit(StabilizationCommitReason::SynchronizedOutput)
         );
     }
 
     #[test]
-    fn prompt_without_an_end_marker_uses_the_quiet_fallback() {
-        let update = PresentedUpdateStatus {
-            prompt_transaction_open: true,
-            ..PresentedUpdateStatus::default()
-        };
+    fn ordinary_output_uses_the_quiet_fallback() {
+        let update = PresentedUpdateStatus::default();
         assert_eq!(
             stabilization_decision(129, burst(100, 100, 30), update, false),
             StabilizationDecision::WaitUntil(130)
@@ -215,16 +211,16 @@ mod stabilization_tests {
     #[test]
     fn exact_commit_reasons_have_stable_precedence_over_fallback_timers() {
         let mut update = PresentedUpdateStatus {
-            explicitly_stable: true,
+            synchronized_output_closed: true,
             completes_linear_output_record: true,
             ..PresentedUpdateStatus::default()
         };
         let current_burst = burst(100, 190, 30);
         assert_eq!(
             stabilization_decision(200, current_burst, update, false),
-            StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable)
+            StabilizationDecision::Commit(StabilizationCommitReason::SynchronizedOutput)
         );
-        update.explicitly_stable = false;
+        update.synchronized_output_closed = false;
         assert_eq!(
             stabilization_decision(200, current_burst, update, false),
             StabilizationDecision::Commit(StabilizationCommitReason::LinearOutputRecord)
@@ -285,7 +281,7 @@ mod stabilization_tests {
     }
 
     #[test]
-    fn quiet_wins_at_a_shared_boundary_but_prompt_commits_never_train() {
+    fn quiet_wins_at_a_shared_boundary_and_only_quiet_commits_train() {
         let update = PresentedUpdateStatus {
             adaptive_quiet_trainable: true,
             ..PresentedUpdateStatus::default()
@@ -294,14 +290,9 @@ mod stabilization_tests {
             stabilization_decision(400, burst(100, 370, 30), update, false),
             StabilizationDecision::Commit(StabilizationCommitReason::QuietWindow)
         );
-        assert!(!StabilizationCommitReason::ExplicitlyStable.trains_adaptive_quiet(update));
+        assert!(!StabilizationCommitReason::SynchronizedOutput.trains_adaptive_quiet(update));
         assert!(!StabilizationCommitReason::HardDeadline.trains_adaptive_quiet(update));
-        assert!(
-            !StabilizationCommitReason::QuietWindow.trains_adaptive_quiet(PresentedUpdateStatus {
-                prompt_transaction_open: true,
-                ..update
-            })
-        );
+        assert!(StabilizationCommitReason::QuietWindow.trains_adaptive_quiet(update));
         assert!(stabilization_input_is_recent(400, Some(100)));
         assert!(!stabilization_input_is_recent(401, Some(100)));
     }
@@ -416,18 +407,62 @@ mod stabilization_tests {
         let mut explicit = app_with_presented_update(b"\x1b[?2026hworking\x1b[?2026l");
         let status = explicit.active_presented_update_status();
         assert!(status.finalization_pending);
-        assert!(status.explicitly_stable);
+        assert!(status.synchronized_output_closed);
 
         let mut prompt = app_with_presented_update(b"\x1b]133;A\x07prompt");
         let status = prompt.active_presented_update_status();
         assert!(status.finalization_pending);
-        assert!(status.prompt_transaction_open);
+        assert!(!status.synchronized_output_closed);
 
         let mut continuation = app_with_presented_update(b"visible\x1b[");
         let status = continuation.active_presented_update_status();
         assert!(status.finalization_pending);
         assert!(status.parser_continuation);
         assert!(!status.adaptive_quiet_trainable);
+    }
+
+    #[test]
+    fn shell_semantics_do_not_hide_a_completed_linear_output_record() {
+        let mut app = app_with_presented_update(
+            b"\x1b]133;A\x07$ \x1b]133;B\x07run\r\n\x1b]133;C\x07first\r\nsecond\r\n",
+        );
+        let status = app.active_presented_update_status();
+
+        assert!(status.completes_linear_output_record);
+    }
+
+    #[test]
+    fn fragmented_shell_semantics_do_not_hide_a_completed_linear_output_record() {
+        let mut app = app_with_presented_update(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        {
+            let view = app.view_stack.root_mut().model();
+            view.finalize_changes(0);
+            for bytes in [
+                b"run\r\n\x1b[?2004l\r".as_slice(),
+                b"\x01\x1b[0 q\x02\x1b]2;run\x07\x1b]133;C;\x07".as_slice(),
+                b"first\r\nsecond\r\n".as_slice(),
+            ] {
+                view.process_changes(bytes);
+                let frame = view.capture_live_presentation_frame(SurfaceId(1));
+                assert!(view.apply_presented_frame(frame));
+            }
+        }
+
+        let update = app
+            .view_stack
+            .root_mut()
+            .model()
+            .accessibility_update_summary();
+        assert!(
+            update.has_linear_output_report(),
+            "fragmented semantic stream lost linear provenance: {update:?}"
+        );
+        assert!(
+            update.completes_linear_output_record(),
+            "fragmented semantic stream lost its completed record: {update:?}"
+        );
+        let status = app.active_presented_update_status();
+        assert!(status.completes_linear_output_record);
     }
 
     #[test]
@@ -585,9 +620,8 @@ struct PresentedUpdateStatus {
     context: Option<AccessibilityContext>,
     finalization_pending: bool,
     application_transaction_open: bool,
-    explicitly_stable: bool,
+    synchronized_output_closed: bool,
     completes_linear_output_record: bool,
-    prompt_transaction_open: bool,
     parser_continuation: bool,
     adaptive_quiet_trainable: bool,
 }
@@ -608,7 +642,7 @@ struct StabilizationBurst {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StabilizationCommitReason {
-    ExplicitlyStable,
+    SynchronizedOutput,
     LinearOutputRecord,
     QuietWindow,
     HardDeadline,
@@ -617,7 +651,7 @@ enum StabilizationCommitReason {
 impl StabilizationCommitReason {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::ExplicitlyStable => "explicitly-stable",
+            Self::SynchronizedOutput => "synchronized-output",
             Self::LinearOutputRecord => "linear-output-record",
             Self::QuietWindow => "quiet-window",
             Self::HardDeadline => "hard-deadline",
@@ -625,9 +659,7 @@ impl StabilizationCommitReason {
     }
 
     const fn trains_adaptive_quiet(self, update: PresentedUpdateStatus) -> bool {
-        matches!(self, Self::QuietWindow)
-            && update.adaptive_quiet_trainable
-            && !update.prompt_transaction_open
+        matches!(self, Self::QuietWindow) && update.adaptive_quiet_trainable
     }
 }
 
@@ -666,8 +698,8 @@ fn stabilization_decision(
     let hard_deadline = burst
         .first_output_ms
         .saturating_add(u128::from(MAX_DIFF_DELAY));
-    if update.explicitly_stable {
-        return StabilizationDecision::Commit(StabilizationCommitReason::ExplicitlyStable);
+    if update.synchronized_output_closed {
+        return StabilizationDecision::Commit(StabilizationCommitReason::SynchronizedOutput);
     }
     if update.completes_linear_output_record {
         return StabilizationDecision::Commit(StabilizationCommitReason::LinearOutputRecord);
@@ -1882,9 +1914,9 @@ impl App {
             }),
             finalization_pending: true,
             application_transaction_open: view.screen().modes.synchronized_output,
-            explicitly_stable: view.accessibility_presentation_explicitly_stable(),
+            synchronized_output_closed: view
+                .accessibility_presentation_synchronized_output_closed(),
             completes_linear_output_record: view.accessibility_completes_linear_output_record(),
-            prompt_transaction_open: view.accessibility_prompt_transaction_open(),
             parser_continuation,
             adaptive_quiet_trainable,
         }

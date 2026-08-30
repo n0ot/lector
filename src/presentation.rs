@@ -72,9 +72,9 @@ pub struct PresentedViewFrame {
     /// cannot affect another.
     pub application_auto_read_suppressed: bool,
     pub application_cursor_tracking_suppressed: bool,
-    /// The source update for this exact revision ended at an explicit
-    /// synchronized-output or semantic prompt commit boundary.
-    pub explicitly_stable: bool,
+    /// The source update for this exact revision ended at an explicit DEC
+    /// 2026 synchronized-output close.
+    pub synchronized_output_closed: bool,
     /// The source update ended at a hidden-to-visible cursor transition. This
     /// is painting provenance, not an application transaction or accessibility
     /// commit boundary.

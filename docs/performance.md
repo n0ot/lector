@@ -39,10 +39,10 @@ after the physical output flush succeeds.
   receipt flushes. If the compositor's 100 ms idle or 2-second hard watchdog
   instead abandons the transaction, review follows the exact fail-open receipt
   immediately and auto-read restarts ordinary stabilization from that receipt.
-  An OSC 133 prompt-start marker prefers its `B` input boundary, which is
-  another immediate semantic commit, but falls back after ordinary quiet if
-  the integration omits it. Output after either boundary uses ordinary
-  stabilization again.
+  OSC 133 marks annotate prompt, input, and command history for Review and
+  input tracking; they never open, close, or accelerate a screen-stabilization
+  transaction. Prompt painting therefore follows the same output-evidence,
+  quiet-window, and hard-deadline rules as any other terminal update.
 - A confirmed Backspace or Delete result can be announced immediately after
   its physical receipt without finalizing the surrounding accessibility
   update. Confirmation requires both the expected logical cursor position and
@@ -58,6 +58,15 @@ after the physical output flush succeeds.
   continuation, alternate screen, or missing journal range falls back to the
   screen model and stabilization policy. This is output-driven and has no
   Enter-key heuristic.
+- Structural provenance remains sticky for the authoritative whole-frame diff,
+  but it cannot taint ordinary output forever. The terminal update model also
+  retains an independently composable safe print suffix: a completed suffix
+  which begins at a physical record boundary after the newest structural
+  ambiguity can validate and read immediately. Incomplete or mid-record
+  suffixes still fall back to the full terminal-document diff. The stream
+  observer records this ordering before cumulative update flags can erase it;
+  parser fragmentation and presentation-journal merging therefore preserve
+  the same result as one update.
 - Truly unmarked output uses a per-view adaptive quiet window. It starts at 30
   ms, is bounded between 8 and 60 ms, decreases only after repeated clean
   bursts, and increases immediately when a continuation arrives shortly after

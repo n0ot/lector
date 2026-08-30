@@ -3506,9 +3506,7 @@ impl App {
             let update = view.accessibility_update_summary();
             let parser_continuation = update.parser_continuation;
             let adaptive_quiet_trainable = adaptive_quiet_is_trainable(update);
-            let explicitly_stable = update.synchronized_output_closed
-                || (update.semantic_input_boundary
-                    && update.screen_after == ScreenIdentity::Primary);
+            let synchronized_output_closed = update.synchronized_output_closed;
             let context = AccessibilityContext {
                 view_id: view.view_id(),
                 screen: view.screen().screen,
@@ -3518,10 +3516,9 @@ impl App {
                 PresentedUpdateStatus {
                     context: Some(context),
                     application_transaction_open: view.application_transaction_open(),
-                    explicitly_stable,
+                    synchronized_output_closed,
                     completes_linear_output_record: view
                         .accessibility_completes_linear_output_record(),
-                    prompt_transaction_open: view.accessibility_prompt_transaction_open(),
                     parser_continuation,
                     adaptive_quiet_trainable,
                     ..PresentedUpdateStatus::default()
@@ -3549,11 +3546,7 @@ impl App {
         let Some(burst) = self.stabilization_burst(context) else {
             return Ok(false);
         };
-        if !overlay_active
-            && !accessibility_blocked
-            && !update_status.prompt_transaction_open
-            && !update_status.parser_continuation
-        {
+        if !overlay_active && !accessibility_blocked && !update_status.parser_continuation {
             let (announced, revision) = {
                 let view = if presentation_tracking {
                     self.presented_accessibility_model_mut()
@@ -3585,10 +3578,9 @@ impl App {
         if let StabilizationDecision::Commit(commit_reason) = decision {
             self.log_latency_stage("accessibility-finalization-start", || {
                 format!(
-                    "reason={} parser_continuation={} prompt_transaction_open={} diff_delay_ms={}",
+                    "reason={} parser_continuation={} diff_delay_ms={}",
                     commit_reason.as_str(),
                     update_status.parser_continuation,
-                    update_status.prompt_transaction_open,
                     burst.delay_ms,
                 )
             });

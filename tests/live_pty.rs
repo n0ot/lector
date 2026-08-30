@@ -871,10 +871,10 @@ fn direct_native_speech_continues_after_startup_and_never_blocks_input() {
         sent_at.elapsed()
     );
 
-    // The screen's blank-line-separated rows are deliberately submitted as
-    // independently sequenced paragraph utterances. Wait until the first
-    // substantial row has reached the native host, then prove that input is
-    // still serviced while that speech and its remaining queue are active.
+    // Adjacent screen rows have one physical line boundary and therefore form
+    // one logical utterance. Wait until that substantial announcement has
+    // reached the native host, then prove that input is still serviced while
+    // the speech is active.
     lector.send(b"s");
     let rpc_log = lector.inner_speech_log.clone();
     assert!(
@@ -885,7 +885,11 @@ fn direct_native_speech_continues_after_startup_and_never_blocks_input() {
                     serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
                         record["method"] == "speech.speak"
                             && record["params"]["text"].as_str().is_some_and(|text| {
-                                text.len() > 64 && text.chars().all(|character| character == 'x')
+                                text.len() > 64
+                                    && text.contains(' ')
+                                    && text
+                                        .chars()
+                                        .all(|character| character == 'x' || character == ' ')
                             })
                     })
                 })

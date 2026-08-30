@@ -292,8 +292,8 @@ pub struct View {
     completed_linear_record_cache: Option<CompletedLinearRecordCache>,
     completed_linear_record_report: String,
     completed_linear_record_presented: String,
-    live_revision_explicitly_stable: bool,
-    presented_revision_explicitly_stable: bool,
+    live_revision_synchronized_output_closed: bool,
+    presented_revision_synchronized_output_closed: bool,
     live_revision_cursor_restored: bool,
     presented_revision_cursor_restored: bool,
     live_history_revision: u64,
@@ -389,8 +389,8 @@ impl View {
             completed_linear_record_cache: None,
             completed_linear_record_report: String::new(),
             completed_linear_record_presented: String::new(),
-            live_revision_explicitly_stable: false,
-            presented_revision_explicitly_stable: false,
+            live_revision_synchronized_output_closed: false,
+            presented_revision_synchronized_output_closed: false,
             live_revision_cursor_restored: false,
             presented_revision_cursor_restored: false,
             live_history_revision: 0,
@@ -501,8 +501,6 @@ impl View {
             self.engine.take_synchronized_output_open_snapshot();
         let synchronized = update.synchronized_output;
         let synchronized_output_closed = update.synchronized_output_closed;
-        let semantic_prompt_committed = update.semantic_input_boundary
-            && update.screen_after == crate::terminal::ScreenIdentity::Primary;
         let cursor_visibility_restored = update.cursor_visibility_restored;
         self.application_transaction_open = synchronized;
         let synchronized_transaction_activity =
@@ -574,6 +572,7 @@ impl View {
                 // print provenance which neither consumer uses. Leave no
                 // cumulative vectors behind.
                 update.printed_runs.clear();
+                update.linear_output_effect = crate::terminal::LinearOutputEffect::Preserve;
                 self.standalone_update = UpdateSummary::default();
                 Some(update)
             }
@@ -588,8 +587,7 @@ impl View {
             None
         };
         if self.presentation_tracking {
-            self.live_revision_explicitly_stable =
-                synchronized_output_closed || semantic_prompt_committed;
+            self.live_revision_synchronized_output_closed = synchronized_output_closed;
             self.live_revision_cursor_restored = cursor_visibility_restored;
             self.advance_live_revision();
             self.unpresented_synchronized_output |= synchronized_transaction_activity;
@@ -784,7 +782,7 @@ impl View {
         self.presented_update = UpdateSummary::default();
         if self.presentation_tracking {
             self.finalized_presented_revision = self.presented_revision;
-            self.presented_revision_explicitly_stable = false;
+            self.presented_revision_synchronized_output_closed = false;
             self.presented_revision_cursor_restored = false;
             self.presented_accessibility_evidence_revision = self.presented_revision;
             self.presented_accessibility_evidence_exact = true;
@@ -917,7 +915,7 @@ impl View {
             application_cursor_tracking_suppressed: self
                 .live_application_accessibility_policy
                 .suppress_cursor_tracking,
-            explicitly_stable: self.live_revision_explicitly_stable,
+            synchronized_output_closed: self.live_revision_synchronized_output_closed,
             cursor_visibility_restored: self.live_revision_cursor_restored,
         }
     }
@@ -947,7 +945,7 @@ impl View {
             application_cursor_tracking_suppressed: self
                 .presented_application_accessibility_policy
                 .suppress_cursor_tracking,
-            explicitly_stable: false,
+            synchronized_output_closed: false,
             cursor_visibility_restored: false,
         }
     }
@@ -1034,8 +1032,8 @@ impl View {
         self.completed_linear_record_cache = None;
         let accessibility_epoch_is_current =
             accessibility_epoch.generation >= self.accessibility_epoch_floor_generation;
-        self.presented_revision_explicitly_stable =
-            accessibility_epoch_is_current && frame.explicitly_stable;
+        self.presented_revision_synchronized_output_closed =
+            accessibility_epoch_is_current && frame.synchronized_output_closed;
         self.presented_revision_cursor_restored =
             accessibility_epoch_is_current && frame.cursor_visibility_restored;
         self.presented_application_accessibility_policy = if accessibility_epoch_is_current {
@@ -1089,22 +1087,9 @@ impl View {
 
     /// Whether the exact unfinalized frame which reached the physical terminal
     /// ended at an application-declared atomic commit boundary.
-    pub(crate) fn accessibility_presentation_explicitly_stable(&self) -> bool {
+    pub(crate) fn accessibility_presentation_synchronized_output_closed(&self) -> bool {
         self.accessibility_has_unfinalized_presentation()
-            && self.presented_revision_explicitly_stable
-    }
-
-    pub(crate) fn accessibility_prompt_transaction_open(&self) -> bool {
-        let active_screen = self.screen().screen;
-        let alternate = active_screen == crate::terminal::ScreenIdentity::Alternate;
-        let (current_count, current_latest) =
-            semantic_mark_summary(&self.screen().semantic_marks, alternate);
-        if !current_latest.is_some_and(|mark| matches!(mark.kind, Osc133Kind::PromptStart)) {
-            return false;
-        }
-        let (previous_count, previous_latest) =
-            semantic_mark_summary(&self.prev_screen().semantic_marks, alternate);
-        current_count != previous_count || current_latest != previous_latest
+            && self.presented_revision_synchronized_output_closed
     }
 
     /// Returns the live viewport from the last committed application frame.
@@ -2145,19 +2130,20 @@ impl View {
         if self.presentation_tracking && !self.accessibility_has_unfinalized_presentation() {
             return false;
         }
-        let update = self.accessibility_update_summary();
         if self.screen().screen != crate::terminal::ScreenIdentity::Primary
             || self.prev_screen.screen != crate::terminal::ScreenIdentity::Primary
-            || update.screen_before != crate::terminal::ScreenIdentity::Primary
-            || update.screen_after != crate::terminal::ScreenIdentity::Primary
-            || !update.completes_linear_output_record()
         {
             return false;
         }
 
         let mut reported = std::mem::take(&mut self.completed_linear_record_report);
-        self.accessibility_update_summary()
-            .printed_text_into(&mut reported);
+        let update = self.accessibility_update_summary();
+        if !update.completes_linear_output_record()
+            || update.linear_output_text_into(&mut reported).is_none()
+        {
+            self.completed_linear_record_report = reported;
+            return false;
+        }
         if reported.trim_end_matches('\n').is_empty() {
             self.completed_linear_record_report = reported;
             return true;
@@ -2931,10 +2917,11 @@ fn take_normalized_accessibility_evidence(
     } else {
         std::mem::take(&mut update.changed_rows)
     };
-    // `completes_linear_output_record` uses the starting column to reject a
-    // carriage-return overwrite of content which predates this evidence span.
+    // `completes_linear_output_record` uses the starting-boundary evidence to
+    // reject a carriage-return overwrite of content predating this span.
     UpdateSummary {
         printed_runs: std::mem::take(&mut update.printed_runs),
+        linear_output_effect: std::mem::take(&mut update.linear_output_effect),
         output_report_structural: update.output_report_structural,
         parser_continuation: update.parser_continuation,
         cursor_operations: update.cursor_operations,
@@ -2957,6 +2944,7 @@ fn take_normalized_accessibility_evidence(
 /// the application produced the committed frame without retaining its text.
 fn snapshot_diff_provenance(update: &UpdateSummary) -> UpdateSummary {
     UpdateSummary {
+        linear_output_effect: crate::terminal::LinearOutputEffect::Clear,
         output_report_structural: update.output_report_structural,
         cursor_operations: update.cursor_operations,
         cursor_operations_after_last_line_feed: update.cursor_operations_after_last_line_feed,
@@ -2972,6 +2960,16 @@ fn snapshot_diff_provenance(update: &UpdateSummary) -> UpdateSummary {
 }
 
 fn accessibility_evidence_retained_bytes(update: &UpdateSummary) -> usize {
+    let linear_output_bytes = match &update.linear_output_effect {
+        crate::terminal::LinearOutputEffect::Append(report)
+        | crate::terminal::LinearOutputEffect::Replace(report) => report
+            .printed_runs
+            .len()
+            .saturating_mul(std::mem::size_of::<crate::terminal::PrintedRun>())
+            .saturating_add(report.printed_runs.iter().map(|run| run.text.len()).sum()),
+        crate::terminal::LinearOutputEffect::Preserve
+        | crate::terminal::LinearOutputEffect::Clear => 0,
+    };
     std::mem::size_of::<AccessibilityJournalEntry>()
         .saturating_add(
             update
@@ -2986,6 +2984,7 @@ fn accessibility_evidence_retained_bytes(update: &UpdateSummary) -> usize {
                 .map(|run| run.text.len())
                 .sum::<usize>(),
         )
+        .saturating_add(linear_output_bytes)
         .saturating_add(
             update
                 .changed_rows
@@ -3423,7 +3422,7 @@ mod tests {
 
         view.process_changes(b"\r\x1b[2Kcommitted\x1b[?2026l");
         let closed = view.capture_live_presentation_frame(SurfaceId(1));
-        assert!(closed.explicitly_stable);
+        assert!(closed.synchronized_output_closed);
         assert!(!view.application_transaction_open());
         assert!(view.accessibility_awaiting_presentation());
         assert_eq!(view.line(0), "old");
@@ -3431,37 +3430,35 @@ mod tests {
         assert!(view.apply_presented_frame(closed));
         assert_eq!(view.line(0), "committed");
         assert!(!view.accessibility_awaiting_presentation());
-        assert!(view.accessibility_presentation_explicitly_stable());
+        assert!(view.accessibility_presentation_synchronized_output_closed());
     }
 
     #[test]
-    fn osc133_prompt_start_waits_for_input_boundary_commit() {
+    fn osc133_prompt_boundaries_do_not_become_stabilization_boundaries() {
         let mut view = View::new(1, 24);
         view.enable_presentation_tracking();
 
         view.process_changes(b"\x1b]133;A\x07$ ");
         let partial = view.capture_live_presentation_frame(SurfaceId(1));
-        assert!(!partial.explicitly_stable);
+        assert!(!partial.synchronized_output_closed);
         assert!(view.apply_presented_frame(partial));
-        assert!(view.accessibility_prompt_transaction_open());
 
         view.process_changes(b"ready \x1b]133;B\x07");
         let complete = view.capture_live_presentation_frame(SurfaceId(1));
-        assert!(complete.explicitly_stable);
+        assert!(!complete.synchronized_output_closed);
         assert!(view.apply_presented_frame(complete));
-        assert!(!view.accessibility_prompt_transaction_open());
-        assert!(view.accessibility_presentation_explicitly_stable());
+        assert!(!view.accessibility_presentation_synchronized_output_closed());
     }
 
     #[test]
-    fn a_new_prompt_marker_at_the_same_cell_opens_a_new_transaction() {
+    fn a_new_prompt_marker_at_the_same_cell_remains_distinct_semantic_history() {
         let mut view = View::new(1, 24);
         view.process_changes(b"\x1b]133;A\x07$ ");
+        let first_count = view.osc133_marks().len();
         view.finalize_changes(1);
-        assert!(!view.accessibility_prompt_transaction_open());
 
         view.process_changes(b"\r\x1b]133;A\x07$ ");
-        assert!(view.accessibility_prompt_transaction_open());
+        assert_eq!(view.osc133_marks().len(), first_count + 1);
     }
 
     #[test]
@@ -3507,9 +3504,9 @@ mod tests {
 
         view.process_changes(b"\x1b[?2026h\rfinal\x1b[?2026l trailing");
         let frame = view.capture_live_presentation_frame(SurfaceId(1));
-        assert!(!frame.explicitly_stable);
+        assert!(!frame.synchronized_output_closed);
         assert!(view.apply_presented_frame(frame));
-        assert!(!view.accessibility_presentation_explicitly_stable());
+        assert!(!view.accessibility_presentation_synchronized_output_closed());
     }
 
     #[test]
@@ -3681,7 +3678,7 @@ mod tests {
 
         view.process_changes(b"stale record\r\n\x1b]133;B\x07");
         let stale = view.capture_live_presentation_frame(SurfaceId(1));
-        assert!(stale.explicitly_stable);
+        assert!(!stale.synchronized_output_closed);
         view.clear_update_summary();
         let handoff_epoch = view.live_accessibility_epoch;
         view.process_changes(b"fresh record\r\n");
@@ -3690,7 +3687,7 @@ mod tests {
         assert!(view.apply_presented_frame(stale));
         assert_eq!(view.presented_accessibility_epoch, handoff_epoch);
         assert_eq!(view.accessibility_update_summary().batch_count, 0);
-        assert!(!view.accessibility_presentation_explicitly_stable());
+        assert!(!view.accessibility_presentation_synchronized_output_closed());
         assert!(!view.accessibility_completes_linear_output_record());
 
         assert!(view.apply_presented_frame(fresh));

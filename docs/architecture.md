@@ -194,14 +194,22 @@ range is baselined, forcing the authoritative snapshot-diff fallback instead
 of guessing.
 
 Accessibility commit policy is one ordered decision table shared by deadline
-scheduling and finalization. Application-declared DEC 2026 and OSC 133
-boundaries come first. A structurally safe, LF-complete primary-screen record
-may commit after its exact physical receipt when its reported text validates
-against the newly presented logical-line tail. Cursor restoration after recent
-input is a conservative legacy boundary. Everything else uses the per-view
-adaptive quiet deadline and the bounded hard deadline. Incomplete escape
-sequences cannot quiet-commit, structural and title-only bursts do not train
-the timer, and context switches discard transient deadline state.
+scheduling and finalization. An application-declared DEC 2026 close comes
+first. OSC 133 prompt, input, command-start, and command-end marks remain
+semantic history only; they do not participate in screen stabilization. A
+structurally safe, LF-complete primary-screen record may commit after its exact
+physical receipt when its reported text validates against the newly presented
+logical-line tail. Whole-frame structural provenance remains sticky for the
+fallback diff, while the terminal adapter separately records the ordered safe
+print suffix after the latest ambiguity. The suffix composes across parser and
+presentation fragmentation, so a later record which begins at a physical
+record boundary can recover progressive reading after an earlier structural
+batch. Mid-record ambiguity remains on the authoritative diff path. Cursor
+restoration after recent input is a conservative legacy
+boundary. Everything else uses the per-view adaptive quiet deadline and the
+bounded hard deadline. Incomplete escape sequences cannot quiet-commit,
+structural and title-only bursts do not train the timer, and context switches
+discard transient deadline state.
 
 Auto-read's authoritative comparison document is the retained history followed
 by the live grid—the same complete terminal document exposed by Review. This
