@@ -1154,44 +1154,40 @@ impl RealTransport {
         physical: &mut Vec<u8>,
         mut done: impl FnMut(&mut App) -> bool,
     ) {
-        for _ in 0..1_000 {
-            if done(app) {
-                return;
-            }
-            let chunk = self
-                .receiver
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap_or_else(|error| {
-                    let child_status = self.child.try_wait();
-                    let clients = std::process::Command::new("tmux")
-                        .args([
-                            "-S",
-                            self.server.socket.to_str().unwrap(),
-                            "list-clients",
-                            "-F",
-                            "#{client_name} #{client_control_mode}",
-                        ])
-                        .output();
-                    let pane = std::process::Command::new("tmux")
-                        .args([
-                            "-S",
-                            self.server.socket.to_str().unwrap(),
-                            "capture-pane",
-                            "-p",
-                            "-t",
-                            ":",
-                        ])
-                        .output();
-                    panic!(
-                        "{case}: {error}; child={child_status:?}; clients={clients:?}; pane={pane:?}"
-                    )
-                });
+        if done(app) {
+            return;
+        }
+        let result = super::drive_real_tmux_phase(|remaining| {
+            let chunk = self.receiver.recv_timeout(remaining)?;
             feed(app, sr, &mut self.router, &chunk, physical);
             app.drain_tmux_commands_for(self.connection_id, self.writer.as_mut())
                 .unwrap();
             self.writer.flush().unwrap();
+            Ok::<_, mpsc::RecvTimeoutError>(done(app))
+        });
+        if let Err(error) = result {
+            let child_status = self.child.try_wait();
+            let clients = std::process::Command::new("tmux")
+                .args([
+                    "-S",
+                    self.server.socket.to_str().unwrap(),
+                    "list-clients",
+                    "-F",
+                    "#{client_name} #{client_control_mode}",
+                ])
+                .output();
+            let pane = std::process::Command::new("tmux")
+                .args([
+                    "-S",
+                    self.server.socket.to_str().unwrap(),
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    ":",
+                ])
+                .output();
+            panic!("{case}: {error:?}; child={child_status:?}; clients={clients:?}; pane={pane:?}");
         }
-        panic!("{case} exceeded its bounded event count");
     }
 
     fn assert_server_pane_contains(&self, case: &str, expected: &str) {

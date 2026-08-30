@@ -20,7 +20,6 @@ use std::{
     rc::Rc,
     sync::mpsc,
     thread,
-    time::Duration,
 };
 
 const LEFT_RIGHT: &str = "abcd,80x24,0,0{40x24,0,0,20,39x24,41,0,21}";
@@ -792,39 +791,42 @@ fn drive_real_tmux_until(
     physical: &mut Vec<u8>,
     mut ready: impl FnMut(&mut App) -> bool,
 ) {
-    for _ in 0..200 {
-        if ready(app) {
-            return;
-        }
-        let chunk = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|error| {
-                panic!(
-                    "timed out in {case}: {error}; active={:?}; topology={:?}",
-                    app.debug_active_view_contents(),
-                    app.debug_tmux_topology(1)
-                )
-            });
+    if ready(app) {
+        return;
+    }
+    let result = super::drive_real_tmux_phase(|remaining| {
+        let chunk = receiver.recv_timeout(remaining)?;
         app.handle_pty(sr, &chunk, physical).unwrap();
         let mut commands = Vec::new();
         app.handle_tick(sr, &mut commands, physical).unwrap();
         if !commands.is_empty() {
-            if let Err(error) = writer.write_all(&commands) {
-                if error.kind() != std::io::ErrorKind::BrokenPipe && error.raw_os_error() != Some(5)
+            match writer.write_all(&commands) {
+                Ok(()) => {
+                    if let Err(error) = writer.flush()
+                        && error.kind() != std::io::ErrorKind::BrokenPipe
+                        && error.raw_os_error() != Some(5)
+                    {
+                        panic!("flush real tmux pane PTY in {case}: {error}");
+                    }
+                }
+                Err(error)
+                    if error.kind() != std::io::ErrorKind::BrokenPipe
+                        && error.raw_os_error() != Some(5) =>
                 {
                     panic!("write real tmux pane PTY in {case}: {error}");
                 }
-                continue;
-            }
-            if let Err(error) = writer.flush()
-                && error.kind() != std::io::ErrorKind::BrokenPipe
-                && error.raw_os_error() != Some(5)
-            {
-                panic!("flush real tmux pane PTY in {case}: {error}");
+                Err(_) => {}
             }
         }
+        Ok::<_, mpsc::RecvTimeoutError>(ready(app))
+    });
+    if let Err(error) = result {
+        panic!(
+            "failed to reach {case}: {error:?}; active={:?}; topology={:?}",
+            app.debug_active_view_contents(),
+            app.debug_tmux_topology(1)
+        );
     }
-    panic!("real tmux pane fixture exceeded its bounded event count in {case}");
 }
 
 fn verify_app_scene(case: &str, app: &mut App, physical: &[u8]) {

@@ -950,21 +950,21 @@ fn drive_real_tmux(
     physical: &mut Vec<u8>,
     mut done: impl FnMut(&mut App) -> bool,
 ) {
+    if done(app) {
+        return;
+    }
     let mut idle_deadline = Instant::now() + Duration::from_secs(5);
-    for _ in 0..800 {
-        if done(app) {
-            return;
-        }
+    let result = super::drive_real_tmux_phase(|phase_remaining| {
         write_real_commands(app, sr, writer, physical);
-        let remaining = idle_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            panic!(
-                "timed out in {case}; contents={:?}; topology={:?}",
-                app.debug_active_view_contents(),
-                app.debug_tmux_topology(1)
-            );
+        let idle_remaining = idle_deadline.saturating_duration_since(Instant::now());
+        if idle_remaining.is_zero() {
+            return Err(RecvTimeoutError::Timeout);
         }
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(10))) {
+        match receiver.recv_timeout(
+            phase_remaining
+                .min(idle_remaining)
+                .min(Duration::from_millis(10)),
+        ) {
             Ok(chunk) => {
                 idle_deadline = Instant::now() + Duration::from_secs(5);
                 app.handle_pty(sr, &chunk, physical).unwrap();
@@ -974,14 +974,17 @@ fn drive_real_tmux(
                 // a quiet recapture while the tmux control channel is idle.
                 // Keep driving Lector's timers until data arrives.
             }
-            Err(error) => panic!(
-                "tmux channel failed in {case}: {error}; contents={:?}; topology={:?}",
-                app.debug_active_view_contents(),
-                app.debug_tmux_topology(1)
-            ),
+            Err(error) => return Err(error),
         }
+        Ok(done(app))
+    });
+    if let Err(error) = result {
+        panic!(
+            "failed to reach {case}: {error:?}; contents={:?}; topology={:?}",
+            app.debug_active_view_contents(),
+            app.debug_tmux_topology(1)
+        );
     }
-    panic!("real tmux interaction fixture exceeded its bounded event count in {case}");
 }
 
 #[test]

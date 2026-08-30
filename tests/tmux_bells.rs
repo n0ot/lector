@@ -16,7 +16,7 @@ use std::{
     rc::Rc,
     sync::mpsc,
     thread,
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 const SPLIT: &str = "b25f,80x24,0,0{40x24,0,0,20,39x24,41,0,23}";
@@ -696,23 +696,22 @@ fn drive_real_tmux(
     physical: &mut Vec<u8>,
     mut done: impl FnMut(&mut App) -> bool,
 ) {
-    for _ in 0..800 {
-        if done(app) {
-            return;
-        }
-        let chunk = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|error| {
-                panic!(
-                    "timed out in {case}: {error}; contents={:?}; topology={:?}",
-                    app.debug_active_view_contents(),
-                    app.debug_tmux_topology(1)
-                )
-            });
+    if done(app) {
+        return;
+    }
+    let result = super::drive_real_tmux_phase(|remaining| {
+        let chunk = receiver.recv_timeout(remaining)?;
         app.handle_pty(sr, &chunk, physical).unwrap();
         write_real_commands(app, sr, writer, physical);
+        Ok::<_, mpsc::RecvTimeoutError>(done(app))
+    });
+    if let Err(error) = result {
+        panic!(
+            "failed to reach {case}: {error:?}; contents={:?}; topology={:?}",
+            app.debug_active_view_contents(),
+            app.debug_tmux_topology(1)
+        );
     }
-    panic!("real tmux bell fixture exceeded its bounded event count in {case}");
 }
 
 fn pane_id_at_index(topology: &str, wanted_index: u64) -> Option<u64> {

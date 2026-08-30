@@ -590,23 +590,22 @@ fn drive_real_tmux_until(
     physical: &mut Vec<u8>,
     mut ready: impl FnMut(&mut App) -> bool,
 ) {
-    for _ in 0..800 {
-        if ready(app) {
-            return;
-        }
-        let chunk = receiver
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|error| {
-                panic!(
-                    "timed out in {case}: {error}; contents={:?}; topology={:?}",
-                    app.debug_active_view_contents(),
-                    app.debug_tmux_topology(1)
-                )
-            });
+    if ready(app) {
+        return;
+    }
+    let result = super::drive_real_tmux_phase(|remaining| {
+        let chunk = receiver.recv_timeout(remaining)?;
         app.handle_pty(sr, &chunk, physical).unwrap();
         write_pending_real_commands(app, sr, writer, physical);
+        Ok::<_, mpsc::RecvTimeoutError>(ready(app))
+    });
+    if let Err(error) = result {
+        panic!(
+            "failed to reach {case}: {error:?}; contents={:?}; topology={:?}",
+            app.debug_active_view_contents(),
+            app.debug_tmux_topology(1)
+        );
     }
-    panic!("real tmux input fixture exceeded its bounded event count in {case}");
 }
 
 fn write_pending_real_commands(

@@ -1815,31 +1815,29 @@ impl RealNestedHarness {
         physical: &mut Vec<u8>,
         mut done: impl FnMut(&mut App) -> bool,
     ) {
-        for _ in 0..1_000 {
-            if done(app) {
-                return;
-            }
-            let chunk = self
-                .receiver
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap_or_else(|error| {
-                    let child_status = self.child.try_wait();
-                    let outer_pane = capture_pane(&self.outer_socket);
-                    let inner_pane = capture_pane(&self.inner_socket);
-                    let active_connection = app.active_tmux_connection();
-                    let connection_count = app.tmux_connection_count();
-                    let active_contents = app.debug_active_view_contents();
-                    let outer_topology = app.debug_tmux_topology(1);
-                    panic!(
-                        "{case}: {error}; child={child_status:?}; outer={outer_pane:?}; inner={inner_pane:?}; active={active_connection:?}; count={connection_count}; contents={active_contents:?}; topology={outer_topology:?}"
-                    )
-                });
+        if done(app) {
+            return;
+        }
+        let result = super::drive_real_tmux_phase(|remaining| {
+            let chunk = self.receiver.recv_timeout(remaining)?;
             app.handle_pty(sr, &chunk, physical).unwrap();
             app.drain_tmux_commands_for(1, self.writer.as_mut())
                 .unwrap();
             self.writer.flush().unwrap();
+            Ok::<_, mpsc::RecvTimeoutError>(done(app))
+        });
+        if let Err(error) = result {
+            let child_status = self.child.try_wait();
+            let outer_pane = capture_pane(&self.outer_socket);
+            let inner_pane = capture_pane(&self.inner_socket);
+            let active_connection = app.active_tmux_connection();
+            let connection_count = app.tmux_connection_count();
+            let active_contents = app.debug_active_view_contents();
+            let outer_topology = app.debug_tmux_topology(1);
+            panic!(
+                "{case}: {error:?}; child={child_status:?}; outer={outer_pane:?}; inner={inner_pane:?}; active={active_connection:?}; count={connection_count}; contents={active_contents:?}; topology={outer_topology:?}"
+            );
         }
-        panic!("{case} exceeded its bounded event count");
     }
 
     fn launch_inner_command(&self) -> Vec<u8> {
