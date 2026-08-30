@@ -340,7 +340,9 @@ the candidate initializes; speech requested during that handshake waits in the
 bounded worker queue. A failed candidate leaves the old setting committed and
 calls `lector.hooks.on_error(message, "speech-reconfigure")`.
 
-Custom servers use bounded UTF-8 NDJSON JSON-RPC 2.0 over stdin/stdout. The
+Custom servers use the bidirectional version 2 speech-host protocol: bounded
+UTF-8 NDJSON JSON-RPC 2.0 over stdin/stdout, with explicit capabilities and
+correlated lifecycle/progress events. The
 canonical [`openrpc.json`](openrpc.json) makes the methods machine-readable,
 and [the speech driver protocol](docs/speech-driver-protocol.md) defines exact
 framing, initialization, deadlines, errors, process cleanup, and the 30-second
@@ -377,7 +379,8 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 
 ### Core actions (with defaults)
 
-- **Stop speech** when it’s too noisy. Default: `M-x`.
+- **Pause/resume speech** with `M-x` when the host supports word positions. On
+  other hosts, the first press stops speech and another press does nothing.
 - **Say the current overlay name**. Default: `M-w`.
 - **Toggle auto‑read** if you want to hear only on demand. Default: `M-'`.
 - **Toggle stop on focus loss** (interrupt speech when terminal focus leaves). Default: `M-g`.
@@ -626,7 +629,7 @@ configured default register.
 You can remap keys or add your own Lua functions:
 
 ```lua
--- map a key to a built-in action
+-- map a key to the pause/resume action (with stop fallback)
 lector.bindings["M-x"] = "lector.stop_speaking"
 
 -- toggle stop-on-focus-loss behavior
@@ -645,6 +648,11 @@ lector.bindings["M-v"] = {
   end,
 }
 ```
+
+`lector.api.speak(text, interrupt)` returns an opaque string logical speech ID
+when speech is submitted, or `nil` when empty/unfocused speech is suppressed.
+One logical request can contain several protocol utterances at paragraph
+boundaries. Treat the returned ID as a string; its format is not an API.
 
 ### Lua hooks
 
@@ -693,6 +701,11 @@ lector.hooks.on_key_unhandled = function(key, mode)          -- return true to c
   return false
 end
 ```
+
+`on_speech_start` and `on_speech_end` bracket submission to Lector's speech
+manager; they do not claim that audible playback started or ended. Playback
+lifecycle is correlated internally by the speech-host events documented in
+the protocol.
 
 `on_startup` is the post-start boundary. It runs only after `init.lua` has
 finished, the selected speech server has initialized, the physical terminal

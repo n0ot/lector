@@ -2,7 +2,7 @@ use super::{CommandResult, Result};
 use crate::{screen_reader::ScreenReader, view::View};
 
 pub(super) fn stop(sr: &mut ScreenReader) -> Result<CommandResult> {
-    sr.stop_speaking()?;
+    sr.toggle_speech_pause()?;
     Ok(CommandResult::Handled)
 }
 

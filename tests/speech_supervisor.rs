@@ -106,7 +106,7 @@ fn records(path: &Path) -> Vec<Value> {
 fn speech_records(path: &Path) -> Vec<Value> {
     records(path)
         .into_iter()
-        .filter(|record| record["method"] == "speak")
+        .filter(|record| matches!(record["method"].as_str(), Some("speak" | "speech.speak")))
         .collect()
 }
 
@@ -128,7 +128,10 @@ fn real_process_startup_retries_once_after_the_first_generation_fails() {
     }));
     assert!(records.iter().any(|record| {
         record["generation"] == 2
-            && record["method"] == "set_rate"
+            && matches!(
+                record["method"].as_str(),
+                Some("set_rate" | "speech.setRate")
+            )
             && record["params"]["rate"].as_f64() == Some(1.75)
     }));
 }
@@ -175,7 +178,10 @@ fn real_process_crash_restarts_without_replaying_uncertain_speech() {
     }));
     assert!(records(&stub.log).iter().any(|record| {
         record["generation"] == 2
-            && record["method"] == "set_rate"
+            && matches!(
+                record["method"].as_str(),
+                Some("set_rate" | "speech.setRate")
+            )
             && record["params"]["rate"].as_f64() == Some(1.625)
     }));
     assert!(handle.take_events().is_empty());
@@ -271,7 +277,10 @@ fn real_process_reconfiguration_is_transactional_and_preserves_exact_args() {
         record["identity"].as_str() == Some(exact_identity) && record["generation"] == 1
     }));
     assert!(replacement_records.iter().any(|record| {
-        record["method"] == "set_rate" && record["params"]["rate"].as_f64() == Some(1.375)
+        matches!(
+            record["method"].as_str(),
+            Some("set_rate" | "speech.setRate")
+        ) && record["params"]["rate"].as_f64() == Some(1.375)
     }));
     assert!(
         speech_records(&replacement.log)

@@ -86,7 +86,9 @@ fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Resu
             }
             // Safety: pointer is set by the main thread before any Lua call.
             let sr = unsafe { &mut *ptr };
-            sr.speak(&text, interrupt).to_lua_result()
+            sr.speak(&text, interrupt)
+                .map(|id| id.map(|id| id.as_str().to_owned()))
+                .to_lua_result()
         }
     })?;
     let set_speech_fn = lua.create_function_mut(move |_, value: Value| {
@@ -260,6 +262,27 @@ mod tests {
                 local active = lector.o.speech
                 assert(active.program == "/second")
                 assert(#active.args == 1 and active.args[1] == "second arg")
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn lua_speak_returns_opaque_string_ids_and_nil_for_suppressed_text() {
+        let mut screen_reader = screen_reader();
+        let lua = Lua::new();
+        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
+        setup_repl(&lua, screen_reader_ptr).unwrap();
+
+        lua.load(
+            r#"
+                local first = lector.api.speak("first", false)
+                local second = lector.api.speak("second", false)
+                assert(type(first) == "string")
+                assert(type(second) == "string")
+                assert(first ~= second)
+                assert(lector.api.speak("", false) == nil)
             "#,
         )
         .exec()

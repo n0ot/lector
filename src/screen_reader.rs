@@ -237,6 +237,11 @@ impl ScreenReader {
         Ok(())
     }
 
+    pub fn toggle_speech_pause(&mut self) -> Result<()> {
+        self.speech.toggle_pause()?;
+        Ok(())
+    }
+
     pub fn last_key(&self) -> &[u8] {
         &self.last_key
     }
@@ -620,15 +625,19 @@ impl ScreenReader {
         &mut self.table_session
     }
 
-    pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
+    pub fn speak(
+        &mut self,
+        text: &str,
+        interrupt: bool,
+    ) -> Result<Option<crate::speech::protocol::UtteranceId>> {
         if text.is_empty() || !self.terminal_focused {
-            return Ok(());
+            return Ok(None);
         }
         self.call_hook_on_speech_start(text, interrupt)?;
         let result = self.speech.speak(text, interrupt);
         let ok = result.is_ok();
         self.call_hook_on_speech_end(text, interrupt, ok)?;
-        Ok(result?)
+        result.map(Some).map_err(Into::into)
     }
 }
 
@@ -864,10 +873,7 @@ mod tests {
         let read = sr.auto_read_after_input(&mut view).unwrap();
 
         assert!(read);
-        assert_eq!(
-            speaks.borrow().as_slice(),
-            ["new history item\n\n2 slash 100"]
-        );
+        assert_eq!(speaks.borrow().as_slice(), ["new history item 2 slash 100"]);
     }
 
     #[test]

@@ -370,6 +370,13 @@ pub trait UtteranceCallback: FnMut(UtteranceId) + 'static {}
 #[cfg(target_arch = "wasm32")]
 impl<T: FnMut(UtteranceId) + 'static> UtteranceCallback for T {}
 
+/// A spoken text range expressed only in UTF-8 byte offsets. Apple backends
+/// convert their native UTF-16 `NSRange` before invoking this callback.
+#[cfg(target_vendor = "apple")]
+pub trait UtteranceRangeCallback: FnMut(UtteranceId, usize, usize) + Send + 'static {}
+#[cfg(target_vendor = "apple")]
+impl<T: FnMut(UtteranceId, usize, usize) + Send + 'static> UtteranceRangeCallback for T {}
+
 #[derive(Default)]
 struct Callbacks {
     begin: Option<Box<dyn UtteranceCallback>>,
@@ -377,6 +384,8 @@ struct Callbacks {
     stop: Option<Box<dyn UtteranceCallback>>,
     pause: Option<Box<dyn UtteranceCallback>>,
     resume: Option<Box<dyn UtteranceCallback>>,
+    #[cfg(target_vendor = "apple")]
+    range: Option<Box<dyn UtteranceRangeCallback>>,
     synthesis_begin: Option<Box<dyn UtteranceCallback>>,
     synthesis_complete: Option<Box<dyn UtteranceCallback>>,
 }
@@ -429,6 +438,14 @@ impl Callbacks {
         }
     }
 
+    #[cfg(target_vendor = "apple")]
+    #[instrument(level = "trace", skip(self))]
+    fn utterance_range(&mut self, utterance_id: UtteranceId, start: usize, length: usize) {
+        if let Some(callback) = self.range.as_mut() {
+            callback(utterance_id, start, length);
+        }
+    }
+
     #[cfg(any(windows, target_os = "android", target_vendor = "apple"))]
     #[instrument(level = "trace", skip(self))]
     fn synthesis_begin(&mut self, utterance_id: UtteranceId) {
@@ -448,12 +465,16 @@ impl Callbacks {
 
 impl fmt::Debug for Callbacks {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
-        f.debug_struct("Callbacks")
+        let mut debug = f.debug_struct("Callbacks");
+        debug
             .field("begin", &self.begin.is_some())
             .field("end", &self.end.is_some())
             .field("stop", &self.stop.is_some())
             .field("pause", &self.pause.is_some())
-            .field("resume", &self.resume.is_some())
+            .field("resume", &self.resume.is_some());
+        #[cfg(target_vendor = "apple")]
+        debug.field("range", &self.range.is_some());
+        debug
             .field("synthesis_begin", &self.synthesis_begin.is_some())
             .field("synthesis_complete", &self.synthesis_complete.is_some())
             .finish()
@@ -1126,6 +1147,29 @@ impl Tts {
         }
     }
 
+    /// Called immediately before the Apple synthesizer speaks a text range.
+    /// `start` and `length` are UTF-8 bytes and always lie on character
+    /// boundaries, regardless of the platform's native indexing convention.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnsupportedFeature`] if the backend cannot report
+    /// utterance lifecycle callbacks.
+    #[cfg(target_vendor = "apple")]
+    #[instrument(level = "debug", skip(self, callback), err)]
+    pub fn on_utterance_range(&self, callback: impl UtteranceRangeCallback) -> Result<(), Error> {
+        let Features {
+            utterance_callbacks,
+            ..
+        } = self.supported_features();
+        if utterance_callbacks {
+            self.callbacks.lock().range = Some(Box::new(callback));
+            Ok(())
+        } else {
+            Err(Error::UnsupportedFeature)
+        }
+    }
+
     /// Clears all registered utterance callbacks.
     #[instrument(level = "debug", skip(self))]
     pub fn clear_utterance_callbacks(&self) {
@@ -1135,6 +1179,10 @@ impl Tts {
         callbacks.stop = None;
         callbacks.pause = None;
         callbacks.resume = None;
+        #[cfg(target_vendor = "apple")]
+        {
+            callbacks.range = None;
+        }
     }
 
     /// Called when this speech synthesizer begins synthesizing an utterance to audio.

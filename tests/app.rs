@@ -19,6 +19,7 @@ use std::{
 struct RecorderState {
     speaks: Vec<(String, bool)>,
     stops: usize,
+    pause_toggles: usize,
     rate: f32,
 }
 
@@ -43,6 +44,11 @@ impl speech::Driver for FakeDriver {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         self.recorder.inner.borrow_mut().stops += 1;
+        Ok(())
+    }
+
+    fn toggle_pause(&mut self) -> anyhow::Result<()> {
+        self.recorder.inner.borrow_mut().pause_toggles += 1;
         Ok(())
     }
 
@@ -891,6 +897,26 @@ fn stdin_unmapped_forwards_to_pty() {
 }
 
 #[test]
+fn meta_x_uses_pause_toggle_while_forwarded_typing_cancels_speech() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    sr.speak("alpha beta", false).unwrap();
+
+    app.handle_stdin(&mut sr, b"\x1bx", &mut pty_out, &mut term_out)
+        .expect("pause with Meta-x");
+    app.handle_stdin(&mut sr, b"\x1bx", &mut pty_out, &mut term_out)
+        .expect("resume with Meta-x");
+    assert_eq!(recorder.inner.borrow().pause_toggles, 2);
+    assert_eq!(recorder.inner.borrow().stops, 0);
+
+    app.handle_stdin(&mut sr, b"a", &mut pty_out, &mut term_out)
+        .expect("ordinary typing interrupts speech");
+    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(pty_out, b"a");
+}
+
+#[test]
 fn semantic_and_scrollback_shortcuts_forward_when_the_feature_is_unavailable() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
@@ -1729,7 +1755,7 @@ fn unwrapped_multirow_interface_repaint_reads_its_stable_diff() {
     assert_eq!(pty_out, b"\x1B[A");
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("Menu new\n\nPanel new\n\nStatus done".into(), false)]
+        &[("Menu new Panel new Status done".into(), false)]
     );
 }
 
@@ -1770,7 +1796,7 @@ fn cursor_addressed_transcript_growth_reads_the_inserted_response() {
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         &[(
-            "Claude:\n\nThe response starts here.\n\nIt continues on this row".into(),
+            "Claude: The response starts here. It continues on this row".into(),
             false,
         )]
     );
@@ -1830,8 +1856,7 @@ fn newly_opened_primary_screen_interface_reads_its_bounded_region() {
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         &[(
-            "Select model\nChoose one\n\nFirst choice\nSecond choice\n\nPress enter to confirm"
-                .into(),
+            "Select model Choose one First choice Second choice Press enter to confirm".into(),
             false,
         )]
     );
@@ -2844,7 +2869,7 @@ fn alternate_screen_entry_reads_the_settled_view_and_primary_restore_reads_its_c
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("not the cursor line\ncursor line".into(), false)]
+        &[("not the cursor line cursor line".into(), false)]
     );
 
     recorder.inner.borrow_mut().speaks.clear();
@@ -3635,7 +3660,7 @@ fn reverse_search_interface_reads_its_settled_contents() {
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         &[(
-            "history item\n\n----------------\n\n greater \n\n1 slash 100".into(),
+            "history item ---------------- greater 1 slash 100".into(),
             false,
         )]
     );
@@ -4127,7 +4152,7 @@ fn lagged_neovim_alternate_screen_receipt_reads_its_settled_view() {
     assert!(app.maybe_finalize_changes(&mut sr).unwrap());
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("file first line\ncursor line".into(), false)]
+        &[("file first line cursor line".into(), false)]
     );
 }
 

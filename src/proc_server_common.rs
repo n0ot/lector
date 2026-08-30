@@ -3,36 +3,31 @@ use serde_json::{Value, json};
 use std::io::{self, Read, Write};
 use std::sync::LazyLock;
 
-pub const SPEECH_PROTOCOL_VERSION: &str = "1.0";
+use crate::speech::protocol::{
+    ClientCapabilities, MAX_JSON_SAFE_INTEGER, ProtocolRange, ProtocolVersion, SpeechCapabilities,
+};
+
+pub const SPEECH_PROTOCOL_VERSION: &str = "2.0";
 pub const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct PeerInfo {
     pub name: String,
     pub version: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct InitializeParams {
-    pub protocol_version: String,
+    pub protocol: ProtocolRange,
     pub client: PeerInfo,
+    #[serde(default)]
+    pub client_capabilities: ClientCapabilities,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SpeechCapabilities {
-    pub speak: bool,
-    pub stop: bool,
-    pub set_rate: bool,
-    pub rpc_discover: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct InitializeResult {
-    pub protocol_version: String,
+    pub protocol: ProtocolVersion,
     pub server: PeerInfo,
     pub capabilities: SpeechCapabilities,
 }
@@ -41,9 +36,15 @@ pub fn handle_protocol_request(
     request: &Request,
     server_name: &str,
     server_version: &str,
+    capabilities: &SpeechCapabilities,
 ) -> Option<std::result::Result<Value, RpcError>> {
     match request.method.as_str() {
-        "initialize" => Some(initialize(request, server_name, server_version)),
+        "initialize" => Some(initialize(
+            request,
+            server_name,
+            server_version,
+            capabilities,
+        )),
         "rpc.discover" => Some(discover(request, server_name, server_version)),
         _ => None,
     }
@@ -53,6 +54,7 @@ fn initialize(
     request: &Request,
     server_name: &str,
     server_version: &str,
+    capabilities: &SpeechCapabilities,
 ) -> std::result::Result<Value, RpcError> {
     let params: InitializeParams = serde_json::from_value(
         request
@@ -61,10 +63,11 @@ fn initialize(
             .ok_or_else(|| RpcError::invalid_params("missing params"))?,
     )
     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
-    if params.protocol_version != SPEECH_PROTOCOL_VERSION {
+    let selected = ProtocolVersion::current();
+    if !params.protocol.supports(selected) {
         return Err(RpcError::unsupported_protocol_version(format!(
-            "unsupported speech protocol version {:?}",
-            params.protocol_version
+            "no compatible Lector speech protocol version for major {} minors {} through {}",
+            params.protocol.major, params.protocol.minimum_minor, params.protocol.maximum_minor
         )));
     }
     if params.client.name.is_empty() || params.client.version.is_empty() {
@@ -73,17 +76,12 @@ fn initialize(
         ));
     }
     serde_json::to_value(InitializeResult {
-        protocol_version: SPEECH_PROTOCOL_VERSION.to_owned(),
+        protocol: selected,
         server: PeerInfo {
             name: server_name.to_owned(),
             version: server_version.to_owned(),
         },
-        capabilities: SpeechCapabilities {
-            speak: true,
-            stop: true,
-            set_rate: true,
-            rpc_discover: true,
-        },
+        capabilities: capabilities.clone(),
     })
     .map_err(|error| RpcError::internal_error(error.to_string()))
 }
@@ -193,29 +191,45 @@ pub fn run_server<F>(mut handler: F) -> Result<()>
 where
     F: FnMut(Request) -> std::result::Result<Value, RpcError>,
 {
-    run_server_with_tick(&mut handler, || {})
+    run_server_with_tick(&mut handler, Vec::new)
 }
 
 pub fn run_server_with_tick<F, T>(mut handler: F, mut tick: T) -> Result<()>
 where
     F: FnMut(Request) -> std::result::Result<Value, RpcError>,
-    T: FnMut(),
+    T: FnMut() -> Vec<ServerNotification>,
 {
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     {
-        run_server_macos(&mut handler, &mut tick)
+        run_server_polled(&mut handler, &mut tick)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(unix))]
     {
         run_server_blocking(&mut handler, &mut tick)
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Debug)]
+pub struct ServerNotification {
+    pub method: &'static str,
+    pub params: Value,
+}
+
+impl ServerNotification {
+    #[must_use]
+    pub fn new(method: &'static str, params: impl Into<Value>) -> Self {
+        Self {
+            method,
+            params: params.into(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
 fn run_server_blocking<F, T>(handler: &mut F, tick: &mut T) -> Result<()>
 where
     F: FnMut(Request) -> std::result::Result<Value, RpcError>,
-    T: FnMut(),
+    T: FnMut() -> Vec<ServerNotification>,
 {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -227,7 +241,7 @@ where
             Ok(0) => return Ok(()),
             Ok(read) => frames.push(&chunk[..read], |frame| {
                 handle_frame(frame, handler, &mut stdout)?;
-                tick();
+                write_notifications(&mut stdout, tick())?;
                 Ok(())
             })?,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -236,11 +250,11 @@ where
     }
 }
 
-#[cfg(target_os = "macos")]
-fn run_server_macos<F, T>(handler: &mut F, tick: &mut T) -> Result<()>
+#[cfg(unix)]
+fn run_server_polled<F, T>(handler: &mut F, tick: &mut T) -> Result<()>
 where
     F: FnMut(Request) -> std::result::Result<Value, RpcError>,
-    T: FnMut(),
+    T: FnMut() -> Vec<ServerNotification>,
 {
     use crate::platform;
     use mio::{Events, Interest, Poll, Token};
@@ -273,7 +287,8 @@ where
         .map_err(io_error("register stdin poll source"))?;
     let mut frames = FrameBuffer::new();
     loop {
-        poll.poll(&mut events, platform::adjust_poll_timeout(None))
+        let timeout = platform::adjust_poll_timeout(Some(std::time::Duration::from_millis(10)));
+        poll.poll(&mut events, timeout)
             .map_err(io_error("poll stdin"))?;
         for event in &events {
             if event.token() != Token(0) {
@@ -290,7 +305,7 @@ where
                         // AVFoundation still needs a run-loop turn between
                         // speech calls rather than only after the pipe drains.
                         platform::tick_runloop();
-                        tick();
+                        write_notifications(&mut stdout, tick())?;
                         Ok(())
                     })?,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -300,7 +315,7 @@ where
             }
         }
         platform::tick_runloop();
-        tick();
+        write_notifications(&mut stdout, tick())?;
     }
 }
 
@@ -422,10 +437,17 @@ fn parse_request(line: &str) -> std::result::Result<Request, RpcError> {
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::invalid_request("missing method"))?;
     let id = match obj.get("id") {
-        Some(Value::Number(n)) => Some(
-            n.as_u64()
-                .ok_or_else(|| RpcError::invalid_request("id must be an unsigned integer"))?,
-        ),
+        Some(Value::Number(n)) => {
+            let id = n
+                .as_u64()
+                .ok_or_else(|| RpcError::invalid_request("id must be an unsigned integer"))?;
+            if id > MAX_JSON_SAFE_INTEGER {
+                return Err(RpcError::invalid_request(
+                    "id exceeds the JSON safe-integer range",
+                ));
+            }
+            Some(id)
+        }
         Some(Value::Null) | None => None,
         Some(_) => return Err(RpcError::invalid_request("id must be a number or null")),
     };
@@ -472,11 +494,28 @@ fn write_response(stdout: &mut dyn Write, response: &Value) -> Result<()> {
     Ok(())
 }
 
+fn write_notifications(
+    stdout: &mut dyn Write,
+    notifications: Vec<ServerNotification>,
+) -> Result<()> {
+    for notification in notifications {
+        write_response(
+            stdout,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": notification.method,
+                "params": notification.params,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         FrameBuffer, MAX_RPC_FRAME_BYTES, Request, RpcError, handle_frame, handle_line,
-        parse_request,
+        openrpc_document, parse_request,
     };
     use serde_json::{Value, json};
 
@@ -493,6 +532,30 @@ mod tests {
             parse_request(r#"{"jsonrpc":"2.0","method":"stop"}"#).expect("parse notification");
         assert_eq!(notification.id, None);
         assert_eq!(notification.method, "stop");
+    }
+
+    #[test]
+    fn discovery_document_covers_version_two_methods_events_and_transport() {
+        let document = openrpc_document("test-host", "1");
+        assert_eq!(document["info"]["version"], "2.0.0");
+        let methods = document["methods"].as_array().unwrap();
+        for required in [
+            "initialize",
+            "rpc.discover",
+            "speech.speak",
+            "speech.stop",
+            "speech.pause",
+            "speech.resume",
+            "speech.setRate",
+        ] {
+            assert!(methods.iter().any(|method| method["name"] == required));
+        }
+        assert_eq!(
+            document["x-lector-notifications"][0]["name"],
+            "speech.event"
+        );
+        assert_eq!(document["x-lector-transport"]["serverNotifications"], true);
+        assert_eq!(document["x-lector-protocol"]["positionEncoding"], "utf-8");
     }
 
     #[test]
@@ -586,6 +649,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":7}"#,
             r#"{"jsonrpc":"2.0","method":"stop","id":-1}"#,
             r#"{"jsonrpc":"2.0","method":"stop","id":1.5}"#,
+            r#"{"jsonrpc":"2.0","method":"stop","id":9007199254740992}"#,
         ] {
             assert_eq!(parse_request(input).unwrap_err().code, -32600);
         }

@@ -463,7 +463,9 @@ impl ReviewView {
                     sr.speak(&format!("row {row_number}"), false)?;
                 }
             }
-            MarkerChange::Cleared => sr.speak("bottom row automatic", false)?,
+            MarkerChange::Cleared => {
+                sr.speak("bottom row automatic", false)?;
+            }
         }
         Ok(ViewAction::None)
     }
@@ -488,7 +490,9 @@ impl ReviewView {
                     false,
                 )?;
             }
-            MarkerChange::Cleared => sr.speak("right edge cleared", false)?,
+            MarkerChange::Cleared => {
+                sr.speak("right edge cleared", false)?;
+            }
         }
         Ok(ViewAction::None)
     }
@@ -881,7 +885,7 @@ impl ReviewView {
         match setup.toggle_tabstop(self.cursor.col) {
             MarkerChange::Set => sr.speak("tabstop set", false)?,
             MarkerChange::Cleared => sr.speak("tabstop cleared", false)?,
-        }
+        };
         sr.speak(
             &format!("display column {}", self.cursor.col.saturating_add(1)),
             false,

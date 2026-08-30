@@ -871,6 +871,10 @@ fn direct_native_speech_continues_after_startup_and_never_blocks_input() {
         sent_at.elapsed()
     );
 
+    // The screen's blank-line-separated rows are deliberately submitted as
+    // independently sequenced paragraph utterances. Wait until the first
+    // substantial row has reached the native host, then prove that input is
+    // still serviced while that speech and its remaining queue are active.
     lector.send(b"s");
     let rpc_log = lector.inner_speech_log.clone();
     assert!(
@@ -879,16 +883,19 @@ fn direct_native_speech_continues_after_startup_and_never_blocks_input() {
             |records| {
                 records.lines().any(|line| {
                     serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
-                        record["method"] == "speak"
-                            && record["params"]["text"]
-                                .as_str()
-                                .is_some_and(|text| text.len() > 1_000)
+                        record["method"] == "speech.speak"
+                            && record["params"]["text"].as_str().is_some_and(|text| {
+                                text.len() > 64 && text.chars().all(|character| character == 'x')
+                            })
                     })
                 })
             },
             &rpc_log,
         ),
-        "native host never received the deliberately long utterance"
+        "native host never received the deliberately long screen announcement; rpc={:?}; speech={:?}; output={:?}",
+        fs::read_to_string(&lector.inner_speech_log).unwrap_or_default(),
+        lector.outer_speech(),
+        String::from_utf8_lossy(&lector.output)
     );
     let input_at = Instant::now();
     lector.send_now(b"p");
@@ -1106,7 +1113,7 @@ fn a_second_speech_crash_wakes_and_terminates_the_live_main_loop() {
         .unwrap_or_default()
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|record| record["method"] == "speak")
+        .filter(|record| record["method"] == "speech.speak")
         .map(|record| record["generation"].as_u64())
         .collect::<Vec<_>>();
     assert_eq!(

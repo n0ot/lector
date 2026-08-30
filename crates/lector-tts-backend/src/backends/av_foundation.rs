@@ -23,7 +23,7 @@ use objc2_avf_audio::{
     AVSpeechSynthesisVoiceGender, AVSpeechSynthesizer, AVSpeechSynthesizerDelegate,
     AVSpeechUtterance,
 };
-use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSRange, NSString};
 use oxilangtag::LanguageTag;
 use parking_lot::Mutex;
 use tracing::{Span, info_span, instrument, trace};
@@ -135,8 +135,73 @@ define_class!(
             }
             ivars.callbacks.lock().utterance_resume(utterance_id);
         }
+
+        #[unsafe(method(speechSynthesizer:willSpeakRangeOfSpeechString:utterance:))]
+        fn speech_synthesizer_will_speak_range(
+            &self,
+            _synthesizer: &AVSpeechSynthesizer,
+            character_range: NSRange,
+            utterance: &AVSpeechUtterance,
+        ) {
+            let ivars = self.ivars();
+            let _entered = ivars.span.enter();
+            let address = ptr::from_ref(utterance) as usize;
+            if ivars.syntheses.lock().contains(&address) {
+                return;
+            }
+            let text = unsafe { utterance.speechString() }.to_string();
+            let Some((start, end)) =
+                utf16_range_to_utf8(&text, character_range.location, character_range.length)
+            else {
+                return;
+            };
+            ivars.callbacks.lock().utterance_range(
+                UtteranceId::AvFoundation(address),
+                start,
+                end.saturating_sub(start),
+            );
+        }
     }
 );
+
+fn utf16_range_to_utf8(text: &str, location: usize, length: usize) -> Option<(usize, usize)> {
+    fn boundary(text: &str, units: usize) -> Option<usize> {
+        let mut consumed = 0usize;
+        for (byte, character) in text.char_indices() {
+            if consumed == units {
+                return Some(byte);
+            }
+            consumed = consumed.checked_add(character.len_utf16())?;
+            if consumed > units {
+                return None;
+            }
+        }
+        (consumed == units).then_some(text.len())
+    }
+
+    let end = location.checked_add(length)?;
+    Some((boundary(text, location)?, boundary(text, end)?))
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::utf16_range_to_utf8;
+
+    #[test]
+    fn converts_native_utf16_ranges_to_utf8_boundaries() {
+        // Apple reports the emoji as two UTF-16 code units, while the public
+        // speech protocol reports its four UTF-8 bytes.
+        assert_eq!(utf16_range_to_utf8("a🙂 z", 1, 2), Some((1, 5)));
+        assert_eq!(utf16_range_to_utf8("a🙂 z", 4, 1), Some((6, 7)));
+    }
+
+    #[test]
+    fn rejects_ranges_inside_surrogate_pairs_or_past_the_text() {
+        assert_eq!(utf16_range_to_utf8("🙂", 1, 1), None);
+        assert_eq!(utf16_range_to_utf8("abc", 4, 0), None);
+        assert_eq!(utf16_range_to_utf8("abc", usize::MAX, 1), None);
+    }
+}
 
 /// Requests handled by the synthesizer thread. Each carries a reply sender so callers can block
 /// until the synthesizer has acted.

@@ -1,8 +1,15 @@
 use anyhow::Result;
-use lector::proc_server_common::{Request, RpcError, run_server};
+use lector::{
+    proc_server_common::{Request, RpcError, ServerNotification, run_server_with_tick},
+    speech::protocol::{
+        AcceptedResult, ControlCapabilities, SettingCapabilities, SettingSupport,
+        SpeechCapabilities, SpeechEventNotification, SpeechEventPayload, StopSupport, UtteranceId,
+    },
+};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{File, OpenOptions},
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
@@ -18,6 +25,8 @@ struct State {
     generation: u64,
     identity: String,
     crash_speak: bool,
+    initialized: bool,
+    notifications: VecDeque<ServerNotification>,
 }
 
 #[derive(Default)]
@@ -90,7 +99,7 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var_os("LECTOR_PROC_STUB_RPC_LOG").map(PathBuf::from))
         .map(|path| OpenOptions::new().create(true).append(true).open(path))
         .transpose()?;
-    let mut state = State {
+    let state = State {
         rate: 1.0,
         speech_log,
         rpc_log,
@@ -99,8 +108,14 @@ fn main() -> Result<()> {
         generation,
         identity: options.identity,
         crash_speak: options.crash_speak_generations.contains(&generation),
+        initialized: false,
+        notifications: VecDeque::new(),
     };
-    run_server(|req| handle_request(req, &mut state))?;
+    let state = RefCell::new(state);
+    run_server_with_tick(
+        |req| handle_request(req, &mut state.borrow_mut()),
+        || state.borrow_mut().notifications.drain(..).collect(),
+    )?;
     Ok(())
 }
 
@@ -160,23 +175,43 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
         writeln!(log).map_err(stub_log_error)?;
         log.flush().map_err(stub_log_error)?;
     }
+    if !state.legacy_protocol && request.method == "initialize" && state.initialized {
+        return Err(RpcError::invalid_request(
+            "speech server is already initialized",
+        ));
+    }
     if !state.legacy_protocol
         && let Some(result) = lector::proc_server_common::handle_protocol_request(
             &request,
             "lector-proc-stub",
             env!("CARGO_PKG_VERSION"),
+            &stub_capabilities(),
         )
     {
+        if request.method == "initialize" && result.is_ok() {
+            state.initialized = true;
+        }
         return result;
     }
+    if !state.legacy_protocol && request.method.starts_with("speech.") && !state.initialized {
+        return Err(RpcError::invalid_request(
+            "speech server is not initialized",
+        ));
+    }
     match request.method.as_str() {
-        "speak" => {
+        "speak" | "speech.speak" => {
             let text = request
                 .params
                 .as_ref()
                 .and_then(|params| params.get("text"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::invalid_params("missing text"))?;
+            let utterance_id = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("utteranceId"))
+                .and_then(Value::as_str)
+                .map(UtteranceId::new);
             if state.crash_speak {
                 // Model the uncertain-delivery case: the server received and
                 // durably logged the request, then died before acknowledging
@@ -195,10 +230,19 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
                 writeln!(log).map_err(stub_log_error)?;
                 log.flush().map_err(stub_log_error)?;
             }
-            Ok(Value::Null)
+            if let Some(utterance_id) = utterance_id {
+                queue_stub_lifecycle(state, utterance_id);
+                serde_json::to_value(AcceptedResult { accepted: true })
+                    .map_err(|error| RpcError::internal_error(error.to_string()))
+            } else {
+                Ok(Value::Null)
+            }
         }
         "stop" => Ok(Value::Null),
-        "set_rate" => {
+        "speech.stop" | "speech.resume" => serde_json::to_value(AcceptedResult { accepted: true })
+            .map_err(|error| RpcError::internal_error(error.to_string())),
+        "speech.pause" => Ok(json!({"paused": false})),
+        "set_rate" | "speech.setRate" => {
             let params = request
                 .params
                 .ok_or_else(|| RpcError::invalid_params("missing params"))?;
@@ -207,13 +251,66 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
                 .and_then(Value::as_f64)
                 .ok_or_else(|| RpcError::invalid_params("missing rate"))?;
             state.rate = rate as f32;
-            if state.legacy_protocol {
+            if state.legacy_protocol || request.method == "set_rate" {
                 Ok(Value::Null)
             } else {
                 Ok(json!({ "rate": state.rate }))
             }
         }
         _ => Err(RpcError::method_not_found(request.method)),
+    }
+}
+
+fn stub_capabilities() -> SpeechCapabilities {
+    use lector::speech::protocol::{
+        DeliveryGuarantee, EventCapability, LifecycleCapabilities, TerminalCapability,
+    };
+    SpeechCapabilities {
+        lifecycle: LifecycleCapabilities {
+            started: EventCapability {
+                delivery: DeliveryGuarantee::Reliable,
+                ..Default::default()
+            },
+            terminal: TerminalCapability {
+                delivery: DeliveryGuarantee::Reliable,
+                distinguishes: vec!["completed".to_owned()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        controls: ControlCapabilities {
+            stop: StopSupport::Confirmed,
+            ..Default::default()
+        },
+        settings: SettingCapabilities {
+            rate: SettingSupport::ReadWrite,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn queue_stub_lifecycle(state: &mut State, utterance_id: UtteranceId) {
+    for (sequence, kind, reason) in [
+        (0, "started", None),
+        (1, "ended", Some("completed".to_owned())),
+    ] {
+        let event = SpeechEventNotification {
+            utterance_id: utterance_id.clone(),
+            sequence,
+            event: SpeechEventPayload {
+                kind: kind.to_owned(),
+                position: None,
+                reason,
+                message: None,
+                extensions: BTreeMap::new(),
+            },
+        };
+        if let Ok(params) = serde_json::to_value(event) {
+            state
+                .notifications
+                .push_back(ServerNotification::new("speech.event", params));
+        }
     }
 }
 
@@ -245,9 +342,15 @@ fn run_adversary(mode: &str) -> Result<()> {
             "jsonrpc": "2.0",
             "id": initialize_id,
             "result": {
-                "protocol_version": "1.0",
+                "protocol": {"major": 2, "minor": 0},
                 "server": {"name": "lector-proc-adversary", "version": env!("CARGO_PKG_VERSION")},
-                "capabilities": {"speak": true, "stop": true, "set_rate": true, "rpc_discover": true},
+                "capabilities": {
+                    "lifecycle": {
+                        "started": {"delivery": "reliable"},
+                        "terminal": {"delivery": "reliable", "distinguishes": ["completed"]}
+                    },
+                    "controls": {"stop": "confirmed"}
+                },
             },
         })
     )?;
@@ -288,6 +391,41 @@ fn run_adversary(mode: &str) -> Result<()> {
                 remaining -= count;
             }
             stdout.write_all(b"\"}\n")?;
+            stdout.flush()?;
+            Ok(())
+        }
+        "event-before-response" => {
+            writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "future.notification",
+                    "params": {"ignored": true}
+                })
+            )?;
+            writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "speech.event",
+                    "params": {
+                        "utteranceId": "direct-1",
+                        "sequence": 0,
+                        "event": {"type": "started", "futureMember": 7}
+                    }
+                })
+            )?;
+            writeln!(
+                stdout,
+                "{}",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"accepted": true, "futureMember": 7}
+                })
+            )?;
             stdout.flush()?;
             Ok(())
         }

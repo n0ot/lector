@@ -1,258 +1,393 @@
-# Speech driver protocol
+# Lector speech-host protocol 2.0
 
-This document is the normative transport and lifecycle contract for a custom
-Lector speech server. The repository-root [`openrpc.json`](../openrpc.json) is
-the machine-readable method schema. Both describe speech protocol version
-`1.0`; when they differ, this document controls transport and lifecycle and the
-OpenRPC document controls method shapes.
+Status: project specification
 
-Lector's default native speech uses this same protocol. It locates its current
-executable rather than trusting `argv[0]`, then starts that executable with the
-hidden internal `--native-speech-server` mode. There is no separate native TTS
-binary to install. The hidden mode is an implementation detail, not a public
-command-line interface for selecting speech.
+Protocol: `2.0`
 
-## Selecting a server
+Machine-readable definition: [`../openrpc.json`](../openrpc.json)
 
-Speech is configured in `init.lua`, before Lector starts the selected server:
+This document is the normative transport, capability, and state-machine
+contract for a Lector speech host. The OpenRPC document is the normative schema
+for methods and messages. If the two disagree, this document controls behavior
+and transport, while OpenRPC controls JSON shape.
+
+## 1. Conventions and goals
+
+The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**,
+and **MAY** are to be interpreted as described by RFC 2119 and RFC 8174.
+
+Version 2 separates three responsibilities:
+
+- Lector owns presentation processing, paragraph splitting, interruption, and
+  the pending-utterance queue.
+- A host owns one active utterance and adapts a platform speech API.
+- Correlated events provide evidence for state transitions. Lector never
+  guesses that an utterance finished.
+
+The protocol is designed for small native hosts, Speech Dispatcher adapters,
+and hosts written outside this repository. It deliberately exposes semantic
+guarantees, not platform API names or native utterance identifiers.
+
+## 2. Selecting and owning a host process
+
+Lector's default `native` host is the running Lector executable in a hidden
+server mode. An external host is selected in `init.lua` with an exact argument
+vector:
 
 ```lua
--- Default: start Lector's native speech host.
-lector.o.speech = "native"
-
--- Start an external server with an exact argument vector.
 lector.o.speech = {
   program = "/opt/lector-speech/bin/server",
-  args = { "--voice", "Alex", "--punctuation=some" },
+  args = { "--voice", "Alex" },
 }
 ```
 
-`program` is passed directly to the operating system and `args` is passed as
-its argument vector. Lector never invokes a shell or splits argument strings.
-The child inherits Lector's environment and working directory. `args` may be
-omitted or empty. Unknown table keys, an empty or NUL-containing program, NUL
-arguments, sparse argument tables, and non-string arguments are configuration
-errors.
+Lector invokes no shell and performs no argument splitting. The direct child
+inherits Lector's environment and working directory. It MUST reserve stdin and
+stdout for this protocol and SHOULD write diagnostics only to stderr. It MUST
+exit promptly on stdin EOF and is responsible for its own descendants.
 
-At runtime, `lector.api.set_speech(spec)` requests a transactional asynchronous
-switch using either form above. The call validates and queues the newest switch
-intent, then returns immediately. Lector retains the old server for rollback
-while the candidate starts; later speech waits in the worker's bounded queue
-during that handshake. Lector commits the new setting only after initialization
-and rate restoration succeed, then terminates and reaps the old server. A
-candidate failure resumes through the old server and invokes
-`lector.hooks.on_error(message, "speech-reconfigure")`. An intentional switch
-neither counts as a server crash nor clears the most recent real crash time
-used for restart-rate limiting.
+`lector.api.set_speech(spec)` starts a candidate asynchronously. Lector commits
+the setting only after initialization and rate restoration succeed; otherwise
+the old host remains selected. An intentional replacement does not count as a
+host crash.
 
-`lector.o.speech` returns the active setting. Assigning it is allowed only in
-the top-level configuration phase; assignment from `on_startup`, another hook,
-or the Lua REPL is an error directing the caller to
-`lector.api.set_speech(spec)`.
+## 3. Transport
 
-## Process and stream ownership
+The transport is UTF-8 NDJSON containing JSON-RPC 2.0 objects:
 
-Lector starts one direct child process for a speech-server generation:
+- stdin carries Lector-to-host requests;
+- stdout carries host responses and host-to-Lector notifications;
+- each frame is one JSON object followed by LF (`0x0a`);
+- an optional CR immediately before LF is accepted;
+- literal newlines in strings MUST be JSON-escaped;
+- every writer MUST flush after a frame;
+- batches and server-to-client requests are not supported; and
+- one encoded frame, including LF, MUST NOT exceed 1,048,576 bytes.
 
-- The child's standard input carries requests from Lector.
-- The child's standard output carries responses to Lector.
-- Standard error is inherited and is not part of the protocol.
-- The child must not use standard input or output for prompts, logs, banners,
-  or any other data.
-- Lector sends one call at a time and waits for its matching response before it
-  sends another. It does not send JSON-RPC notifications or batch requests.
-- The child must stop accepting work and exit promptly when standard input
-  reaches EOF. A custom server is responsible for cleaning up any descendants
-  it creates.
+Lector permits one outstanding request. A host MAY emit notifications before,
+between, or after responses, including while no request is outstanding. It
+MUST emit exactly one response for every request with an ID. Notification
+traffic does not extend the request deadline.
 
-The transport is UTF-8 NDJSON carrying JSON-RPC 2.0 objects. Each request or
-response is exactly one JSON object followed by LF (`0x0a`). Newlines inside a
-string are JSON escapes, never literal framing bytes. Lector emits LF and
-accepts an optional CR immediately before LF. A server must flush standard
-output after every response.
+Lector validates JSON-RPC version, response ID, result/error exclusivity, event
+shape, UTF-8, and frame bounds. EOF, malformed framing, an unexpected response,
+or a missed deadline is a transport failure. Unknown notification methods,
+unknown event types, and additive object members are ignored as described in
+section 5; they are not transport failures.
 
-One encoded frame, including its terminating newline, must not exceed 1 MiB
-(`1,048,576` bytes). An oversized response is a transport failure. Lector
-bounds one speech announcement to 64 KiB before JSON encoding; a local request
-that still cannot fit is rejected rather than partially written.
+Initialization has a five-second absolute deadline. Ordinary calls have a
+one-second absolute deadline. All pipe I/O runs on Lector's speech worker, not
+the interactive terminal thread.
 
-Lector validates every response strictly. It must be a JSON-RPC 2.0 response
-with the outstanding unsigned integer `id`, and it must contain exactly one of
-`result` or `error`. EOF, pipe errors, invalid UTF-8 or JSON, an invalid
-envelope, a wrong version or ID, an oversized frame, and a missed deadline are
-transport failures. A well-formed JSON-RPC `error` response is an operation
-failure, not by itself a process crash or restart trigger.
+### 3.1 Why JSON-RPC over stdio
 
-### Why JSON-RPC over stdio
+JSON-RPC provides stable requests, responses, IDs, errors, and mature tooling;
+OpenRPC supplies a machine-readable contract. Stdio binds connection lifetime
+to the direct child without socket discovery or authentication. Measured JSON
+serialization and pipe round trips are small relative to native speech startup
+and do not run on the input thread. A binary protocol or dynamic library ABI
+would add compatibility and crash-containment costs without improving the
+state model.
 
-JSON-RPC gives custom servers a stable request, response, ID, and error model
-with mature tooling, while OpenRPC supplies machine-readable method schemas.
-Stdio ties the transport lifetime directly to the child and needs no socket
-path, listener, authentication, or connection race. Speech synthesis dominates
-the small serialization cost, and all serialization and pipe I/O are already
-off the interactive thread. A bespoke binary protocol would add compatibility
-and debugging cost without improving terminal latency.
+NDJSON is Lector-specific because JSON-RPC does not define stream framing.
 
-NDJSON is the deliberately small Lector-specific part: JSON-RPC itself does
-not define stream framing. That is why the LF boundary, byte limit, deadlines,
-and process lifecycle are specified here even though the methods are
-self-describing through OpenRPC.
+## 4. Initialization and version negotiation
 
-## Session initialization
-
-On every new process, Lector's first call is `initialize`:
+`rpc.discover` MAY be called before initialization. The first other method MUST
+be `initialize`, exactly once:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol_version":"1.0","client":{"name":"lector","version":"0.4.1"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":0,"maximumMinor":0},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
 ```
 
-A compatible server responds within five seconds:
+The host selects a minor version within the offered range:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"protocol_version":"1.0","server":{"name":"example-speech","version":"2.4.0"},"capabilities":{"speak":true,"stop":true,"set_rate":true,"rpc_discover":true}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":0},"server":{"name":"example-speech","version":"2.4.0"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite"}}}}
 ```
 
-The version must equal `1.0`, the server name and version must be nonempty, and
-all four version 1.0 capabilities must be `true`. An incompatible result makes
-that process-generation startup fail. A server must not perform speech
-operations before initialization succeeds; if one is received, it rejects the
-call as an invalid request (`-32600`) without invoking the speech backend.
+The major version identifies an incompatible contract. Minor versions are
+backward-compatible additions. A host SHOULD select the highest mutually
+supported minor. With no compatible version it MUST return error `-32001`.
+Names and versions MUST be nonempty.
 
-For migration, Lector accepts JSON-RPC method-not-found (`-32601`) from
-`initialize` as an unversioned legacy server. New servers must not rely on this
-escape hatch: it provides no readiness, compatibility, or discovery guarantee
-and may be removed in a future protocol version.
+Protocol 2 clients MUST accept unknown object members, capability families,
+capability values, event types, terminal reasons, and progress-position kinds.
+An unknown or omitted capability is treated as unsupported. An unknown event
+or position MUST NOT change playback state. Extensions SHOULD use a stable,
+vendor-qualified key when a collision is plausible.
 
-After initialization, every ordinary call has a one-second absolute deadline.
-Deadlines and pipe readiness live exclusively on the speech worker; they add no
-polling cadence or wait to Lector's terminal event loop. A response arriving
-early wakes the worker immediately.
+JSON strings are Unicode. Byte positions are always offsets into the UTF-8
+encoding of the exact `speech.speak.text`. UTF-16 code-unit indexes MUST NOT
+cross the host boundary. A platform using UTF-16 internally MUST convert at
+the adapter and reject positions inside a surrogate pair.
 
-## Discovery
+## 5. Capabilities
 
-Protocol 1.0 servers implement `rpc.discover` with no parameters. It returns an
-OpenRPC document compatible with [`openrpc.json`](../openrpc.json). The method
-is available before and after `initialize`, so a protocol tool can inspect a
-server without starting speech:
+Capabilities describe independently usable evidence and controls. A host MUST
+advertise only behavior it provides for every accepted utterance in that
+process generation. Version 2 requires `controls.stop` to be `confirmed` or
+`bestEffort`, because interruption and the M-x fallback are fundamental. All
+other capability families are optional.
+
+### 5.1 Lifecycle
+
+`lifecycle.started.delivery` and `lifecycle.terminal.delivery` are one of:
+
+- `reliable`: the event is emitted exactly as required below;
+- `bestEffort`: the host may omit it; or
+- `unsupported`: callers cannot depend on it.
+
+Unknown values mean `unsupported`. If terminal delivery is `reliable`, every
+accepted utterance MUST produce exactly one `ended` event unless the transport
+dies. This guarantee is what permits Lector to submit its next queued
+utterance. `terminal.distinguishes` lists reasons the host can report
+accurately; currently conventional values are `completed`, `cancelled`, and
+`failed`. Unknown reasons still terminate the utterance.
+
+### 5.2 Progress
+
+`progress.modes` is a list of independent position encodings and granularities.
+Version 2 defines:
+
+- `{"kind":"utf8ByteOffset","granularity":["word"]}`: `offset` is a UTF-8
+  character boundary at the beginning of the word being spoken; and
+- `{"kind":"marker",...}`: `id` is an opaque marker identifier from a text
+  representation understood by both peers.
+
+A mode is usable only when both peers advertise it. Unknown kinds and
+granularities are ignored.
+
+### 5.3 Controls
+
+`controls.stop` is `confirmed`, `bestEffort`, or `unsupported`. `confirmed`
+means that a successful `speech.stop` response is evidence that playback of
+that utterance will not continue. `bestEffort` means a stop was requested but
+the backend cannot confirm the outcome.
+
+`controls.pauseResume` is `restartFromWord` or `unsupported`.
+`restartFromWord` is valid only with word-granularity UTF-8 byte offsets. It
+means:
+
+1. `speech.pause` stops audio and returns the beginning of the word active at
+   the pause boundary;
+2. the logical utterance and ID remain active but paused; and
+3. `speech.resume` starts again at that exact word boundary.
+
+This restart may repeat part of a word; it MUST NOT skip the remainder of the
+word. Unknown modes are unsupported.
+
+### 5.4 Settings
+
+`settings.rate` is `readWrite`, `writeOnly`, or `unsupported`. `readWrite`
+means `speech.setRate` returns the effective value. `writeOnly` exists for
+adapters that can apply but not independently inspect the value. Version 2
+Lector currently invokes `speech.setRate` for either advertised mode.
+
+## 6. Common data types
+
+An `utteranceId` is a nonempty opaque JSON string of at most 128 UTF-8 bytes.
+Clients MUST NOT encode it as a JSON number. Hosts MUST echo it byte-for-byte
+in commands and events and MUST NOT expose a platform-native identifier. The
+client MUST NOT reuse an ID during a host session, so a late event can never be
+mistaken for evidence about newer speech.
+
+An event `sequence` is a nonnegative integer no greater than
+9,007,199,254,740,991. It MUST increase strictly for one utterance. It need not
+be consecutive and has no ordering meaning across utterances. Lector ignores a
+duplicate or older sequence number.
+
+JSON-RPC request and response IDs are also nonnegative safe integers in this
+range. They correlate transport calls only and are unrelated to `utteranceId`.
+
+A UTF-8 position has this form:
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"rpc.discover"}
+{"kind":"utf8ByteOffset","offset":6}
 ```
 
-OpenRPC documents method names and JSON shapes. It does not define this
-stdio/NDJSON transport, deadlines, process ownership, or recovery policy, so
-server authors still need this document. The `x-lector-transport` extension in
-the canonical OpenRPC document provides a machine-readable summary of those
-bounds.
+`offset` MUST be no greater than the original text's byte length and MUST be a
+UTF-8 character boundary. An invalid position is not usable resume evidence.
 
-## Speech methods
+## 7. Methods
 
-All parameters use JSON-RPC's by-name object form.
+All parameters use JSON-RPC by-name objects.
 
-### `speak`
+### 7.1 `rpc.discover`
+
+This method takes no parameters and returns an OpenRPC document compatible
+with [`../openrpc.json`](../openrpc.json). It is available before and after
+initialization. OpenRPC describes JSON shapes; this document still controls
+stdio framing, deadlines, process ownership, and recovery.
+
+### 7.2 `speech.speak`
 
 ```json
-{"jsonrpc":"2.0","id":2,"method":"speak","params":{"text":"build complete","interrupt":false}}
-{"jsonrpc":"2.0","id":2,"result":null}
+{"jsonrpc":"2.0","id":2,"method":"speech.speak","params":{"utteranceId":"41:0","text":"first paragraph"}}
+{"jsonrpc":"2.0","id":2,"result":{"accepted":true}}
 ```
 
-The response acknowledges acceptance; it does not wait for playback to finish.
-With `interrupt: true`, the server stops active speech and discards speech it
-has queued before accepting the new text. With `false`, it preserves speech
-order. Lector also bounds its own pending speech queue and may discard stale
-announcements before they reach the server.
+The host MUST reject this method if another logical utterance is active. A
+successful response transfers responsibility for exactly this utterance to
+the host but does not imply playback started or finished. The host MUST NOT
+queue another Lector utterance internally. Lector submits the next one only
+after reliable terminal evidence.
 
-### `stop`
+The public Lector speech layer assigns a logical ID. A single line boundary is
+normalized to a space before transport. A run of two or more CR/LF line
+boundaries is a paragraph boundary; each nonempty paragraph becomes a separate
+utterance with a stable, opaque child ID and is sequenced by Lector. The Lua
+`lector.api.speak` call returns the parent logical ID; hosts see and echo only
+the individual child IDs and MUST NOT infer their relationship from their
+format. CRLF counts as one line boundary.
+
+### 7.3 `speech.stop`
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"stop"}
-{"jsonrpc":"2.0","id":3,"result":null}
+{"jsonrpc":"2.0","id":3,"method":"speech.stop","params":{"utteranceId":"41:0"}}
+{"jsonrpc":"2.0","id":3,"result":{"accepted":true}}
 ```
 
-The server stops active playback and discards speech it has queued.
+The call is idempotent when no utterance is active. If the supplied ID does not
+identify the active utterance, the host SHOULD return `-32602`. A reliable
+lifecycle host MUST emit one `ended` event with a cancellation or failure
+reason unless it already emitted the terminal event.
 
-### `set_rate`
+Lector clears its pending queue and paused state before ordinary interruption,
+then calls this method. It never resumes an utterance cancelled by typing or by
+new interrupting speech.
+
+### 7.4 `speech.pause`
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"set_rate","params":{"rate":1.25}}
-{"jsonrpc":"2.0","id":4,"result":{"rate":1.25}}
+{"jsonrpc":"2.0","id":4,"method":"speech.pause","params":{"utteranceId":"41:0"}}
+{"jsonrpc":"2.0","id":4,"result":{"paused":true,"position":{"kind":"utf8ByteOffset","offset":6}}}
 ```
 
-`rate` is a finite JSON number in the backend's rate domain. A server may clamp
-it to its supported range and returns the finite effective value. Lector
-restores the configured rate on a replacement process before routing new
-speech to it.
+Only a host advertising resumable pause implements this method. On success,
+`paused: true` MUST include a valid position satisfying the advertised mode.
+`paused: false` means there is no resumable paused utterance and MUST omit the
+position. Lector conservatively follows `paused: false`, an RPC failure, or an
+invalid position with `speech.stop`, clears the pending queue, and retains no
+resume state. Repeating pause while already paused is idempotent.
 
-Servers use the standard JSON-RPC error codes for parsing, envelopes, methods,
-parameters, and internal failures:
+### 7.5 `speech.resume`
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"speech.resume","params":{"utteranceId":"41:0"}}
+{"jsonrpc":"2.0","id":5,"result":{"accepted":true}}
+```
+
+The host resumes the same logical utterance according to its advertised mode.
+For `restartFromWord`, it resynthesizes the original text beginning at the
+position returned by `speech.pause`; later UTF-8 progress positions remain
+relative to the original complete text. It MUST reject an ID that is not the
+paused utterance. If resume fails, Lector cancels the uncertain utterance and
+retains no resume state.
+
+### 7.6 `speech.setRate`
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"speech.setRate","params":{"rate":1.25}}
+{"jsonrpc":"2.0","id":6,"result":{"rate":1.25}}
+```
+
+`rate` MUST be finite and uses the host backend's documented domain. The host
+MAY clamp it and returns the finite effective value. Lector restores this
+value when replacing a host process.
+
+## 8. `speech.event` notifications
+
+Notifications have no ID:
+
+```json
+{"jsonrpc":"2.0","method":"speech.event","params":{"utteranceId":"41:0","sequence":0,"event":{"type":"started"}}}
+{"jsonrpc":"2.0","method":"speech.event","params":{"utteranceId":"41:0","sequence":1,"event":{"type":"progress","position":{"kind":"utf8ByteOffset","offset":6}}}}
+{"jsonrpc":"2.0","method":"speech.event","params":{"utteranceId":"41:0","sequence":2,"event":{"type":"ended","reason":"completed"}}}
+```
+
+Defined event types are:
+
+- `started`: playback began for the logical utterance;
+- `progress`: playback reached `position`;
+- `paused`: playback is paused at `position`;
+- `resumed`: playback resumed, optionally with `position`; and
+- `ended`: the sole terminal event, with nonempty `reason` and an optional
+  human-readable `message`.
+
+Events for an unknown ID, an already-ended ID, an older process generation, or
+a non-increasing sequence number MUST NOT advance Lector's queue. Unknown event
+types are ignored. A host MUST preserve event order on stdout.
+
+## 9. Lector playback and M-x semantics
+
+Lector's manager has at most one host-active utterance and a bounded queue of
+never-submitted utterances. Its state is `idle`, `speaking`, or `paused`.
+
+- Reliable `ended` evidence transitions `speaking` to the next queued item.
+- `speech.speak` with interruption clears the queue, stops the active or paused
+  item, and starts only the new item.
+- Typing and other ordinary interruptions clear the queue and stop the active
+  or paused item. They leave nothing resumable.
+- If resumable pause is advertised, the first M-x pauses and retains the item;
+  the next M-x resumes it at the beginning of the interrupted word.
+- Otherwise, the first M-x performs the stop fallback and removes the item;
+  another M-x is inert until new speech starts.
+- A missing, unknown, out-of-range, or non-UTF-8 pause position is
+  conservatively non-resumable; Lector stops instead of guessing.
+
+If terminal delivery is not reliable, Lector cannot safely sequence a second
+version 2 utterance and rejects that ambiguous queue transition. Other basic
+speech remains available. Version 1 hosts retain their historical internal
+queue as a compatibility exception.
+
+## 10. Errors, failure recovery, and shutdown
+
+Standard JSON-RPC errors apply:
 
 | Code | Meaning |
 | ---: | --- |
 | `-32700` | Parse error |
-| `-32600` | Invalid JSON-RPC request |
-| `-32601` | Method not found |
-| `-32602` | Invalid method parameters |
-| `-32603` | Internal speech-backend error |
-| `-32001` | Unsupported Lector speech protocol version |
+| `-32600` | Invalid JSON-RPC request or state transition |
+| `-32601` | Method or capability not supported |
+| `-32602` | Invalid parameters or utterance ID |
+| `-32603` | Internal speech-backend failure |
+| `-32001` | No compatible Lector speech protocol version |
 
-An error response uses the request ID, except that a parse or envelope error
-whose ID is unavailable uses `null` as required by JSON-RPC 2.0.
+A well-formed RPC error is an operation failure, not automatically a process
+crash. A transport failure terminates and reaps that process generation. An
+in-flight utterance is never replayed because the host might have performed it;
+only queued utterances that were never submitted may survive replacement.
 
-## Failure recovery and shutdown
+Startup is attempted twice. At runtime, Lector allows one automatic restart in
+a rolling 30-second crash interval; a second failure inside the interval, or a
+failed replacement startup, is fatal. On normal shutdown Lector terminates and
+reaps the direct child. The built-in host also watches its parent PID. Custom
+hosts SHOULD use stdin EOF or an equivalent parent-death guard around blocking
+foreign APIs.
 
-Starting the selected server is part of Lector startup. Lector spawns and
-initializes it; if that attempt fails, Lector terminates and reaps the process
-and retries once with a fresh process. If the retry fails, Lector aborts setup
-with a clear error rather than running silently without speech.
+## 11. Version 1 migration
 
-During normal operation, a transport failure records a monotonic crash time,
-terminates and reaps the failed generation, and starts a fresh generation. An
-in-flight request is never replayed because the failed server may already have
-performed it. The configured rate is restored before subsequent speech is
-accepted.
+Lector first offers version 2. If `initialize` returns `-32001`, it retries the
+published version 1.0 initialization and old method names (`speak`, `stop`, and
+`set_rate`). If `initialize` returns `-32601`, it treats the process as an
+unversioned legacy host.
 
-Only one automatic restart is allowed in a rolling 30-second crash interval.
-If there is no previous crash, or the previous crash was at least 30 seconds
-ago, Lector records the new time and attempts a restart. A second failure less
-than 30 seconds after the recorded crash, or any failure to spawn, initialize,
-or restore a restarted server, makes Lector leave its event loop and exit
-nonzero. Exactly 30 seconds is eligible for a restart. This is a timestamp
-comparison performed only on failure, not a periodic timer.
+Legacy hosts have no correlated lifecycle or progress evidence, do not support
+resumable pause, and retain backend-owned queueing. M-x therefore uses the
+one-way stop fallback. New implementations MUST implement version 2 and MUST
+NOT depend on the unversioned escape hatch.
 
-Runtime terminal input, rendering, direct PTYs, ordinary tmux, and tmux control
-mode continue while a speech call is pending. Even a server stuck in native
-code therefore cannot hang Lector as a whole: the speech-worker deadline turns
-the hang into the failure policy above and wakes the main loop through its
-event-driven control path.
+## 12. Implementation checklist
 
-On an ordinary exit Lector requests speech-worker shutdown, terminates the
-direct speech child if necessary, and reaps it. On handled termination signals,
-including one received during the startup handshake, Lector performs speech
-and terminal teardown before re-raising the signal. The built-in native host
-also watches its parent PID so it exits after an abrupt Lector death for which
-destructors or signal cleanup cannot run. Custom servers must additionally
-treat stdin EOF as their parent-death indication; Lector does not own or clean
-up grandchildren created by a custom server.
+A conforming version 2 host must:
 
-No parent can run cleanup after an uncatchable `SIGKILL`. The operating system
-still closes Lector's pipe ends, and the built-in watchdog supplies a second
-parent-death check, but a custom server that is permanently stuck outside its
-read loop or deliberately ignores EOF can remain orphaned. Custom server
-authors should add their own parent-death watchdog when they call blocking
-foreign code.
-
-## Compatibility checklist
-
-A version 1.0 custom server must:
-
-1. Reserve stdin and stdout for 1 MiB-bounded UTF-8 NDJSON JSON-RPC 2.0.
-2. Respond to `initialize` within five seconds with every required capability.
-3. Implement `rpc.discover`, `speak`, `stop`, and `set_rate` with the schemas in
-   `openrpc.json` and respond to ordinary calls within one second.
-4. Flush each response, preserve non-interrupting speech order, and make
-   `stop` and interrupting speech discard its own queued work.
-5. Exit promptly on stdin EOF and own the lifecycle of any descendants.
-
-Protocol evolution changes `protocol_version` and the `info.version` in
-`openrpc.json`. Additive documentation corrections do not change the wire
-version; incompatible method, schema, or lifecycle changes do.
+1. Reserve stdin/stdout for bounded UTF-8 NDJSON JSON-RPC and flush frames.
+2. Implement version-range initialization, discovery, and explicit nested
+   capabilities; omit or mark unsupported anything it cannot guarantee.
+3. Accept at most one active Lector utterance and echo its opaque string ID.
+4. Emit strictly sequenced, correlated events exactly as advertised.
+5. Translate native indexes to markers or valid UTF-8 byte boundaries.
+6. Implement pause/resume only if it restarts the interrupted word; otherwise
+   advertise it as unsupported and provide the stop fallback.
+7. Respond inside the deadlines, exit on EOF, and clean up descendants.

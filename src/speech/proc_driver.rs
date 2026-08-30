@@ -1,4 +1,11 @@
-use super::Driver;
+use super::{
+    manager::Host,
+    protocol::{
+        AcceptedResult, ClientCapabilities, ControlCapabilities, MAX_JSON_SAFE_INTEGER,
+        PauseResult, ProtocolRange, SettingCapabilities, SettingSupport, SpeechCapabilities,
+        SpeechEventNotification, StopSupport, UtteranceId, UtteranceParams,
+    },
+};
 use crate::proc_server_common::{
     InitializeParams, InitializeResult, MAX_RPC_FRAME_BYTES, PeerInfo, SPEECH_PROTOCOL_VERSION,
 };
@@ -7,6 +14,7 @@ use mio::{Events, Interest, Poll, Token};
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -138,6 +146,10 @@ pub struct ProcDriver {
     rate: f32,
     timeouts: RpcTimeouts,
     legacy_protocol: bool,
+    capabilities: SpeechCapabilities,
+    pending_events: VecDeque<SpeechEventNotification>,
+    next_compatibility_id: u64,
+    last_compatibility_id: Option<UtteranceId>,
     unavailable: bool,
 }
 
@@ -287,6 +299,10 @@ impl ProcDriver {
             rate: 1.0,
             timeouts,
             legacy_protocol: false,
+            capabilities: SpeechCapabilities::default(),
+            pending_events: VecDeque::new(),
+            next_compatibility_id: 1,
+            last_compatibility_id: None,
             unavailable: false,
         };
         driver.initialize()?;
@@ -303,16 +319,44 @@ impl ProcDriver {
         self.legacy_protocol
     }
 
+    /// Compatibility convenience for direct process-driver tests and tools.
+    /// Production sequencing uses [`Host`] through `SpeechManager`.
+    pub fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()> {
+        let id = UtteranceId::new(format!("direct-{}", self.next_compatibility_id));
+        self.next_compatibility_id = self.next_compatibility_id.wrapping_add(1);
+        Host::speak(self, &id, text, interrupt)?;
+        self.last_compatibility_id = Some(id);
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> DriverResult<()> {
+        let id = self
+            .last_compatibility_id
+            .take()
+            .unwrap_or_else(|| UtteranceId::new("direct-none"));
+        Host::stop(self, &id)
+    }
+
+    #[must_use]
+    pub fn get_rate(&self) -> f32 {
+        self.rate
+    }
+
+    pub fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
+        Host::set_rate(self, rate).map(|_| ())
+    }
+
     fn initialize(&mut self) -> Result<()> {
         let result = match self.call_with_timeout(
             "initialize",
             Some(
                 serde_json::to_value(InitializeParams {
-                    protocol_version: SPEECH_PROTOCOL_VERSION.to_owned(),
+                    protocol: ProtocolRange::current(),
                     client: PeerInfo {
                         name: "lector".to_owned(),
                         version: env!("CARGO_PKG_VERSION").to_owned(),
                     },
+                    client_capabilities: ClientCapabilities::default(),
                 })
                 .map_err(Error::Serialize)?,
             ),
@@ -320,18 +364,23 @@ impl ProcDriver {
         ) {
             Ok(result) => result,
             Err(Error::Rpc { code: -32601, .. }) => {
-                self.legacy_protocol = true;
-                return Ok(());
+                return self.accept_unversioned_legacy();
+            }
+            Err(Error::Rpc { code: -32001, .. }) => {
+                return self.initialize_version_one();
             }
             Err(error) => return Err(error),
         };
         let initialized: InitializeResult = serde_json::from_value(result).map_err(|error| {
             Error::InvalidResponse(format!("invalid initialize result: {error}"))
         })?;
-        if initialized.protocol_version != SPEECH_PROTOCOL_VERSION {
+        if !ProtocolRange::current().supports(initialized.protocol) {
             return Err(Error::SpeechProtocolVersion {
                 expected: SPEECH_PROTOCOL_VERSION,
-                actual: initialized.protocol_version,
+                actual: format!(
+                    "{}.{}",
+                    initialized.protocol.major, initialized.protocol.minor
+                ),
             });
         }
         if initialized.server.name.is_empty() || initialized.server.version.is_empty() {
@@ -339,16 +388,60 @@ impl ProcDriver {
                 "initialize result has an empty server name or version".to_owned(),
             ));
         }
-        for (supported, name) in [
-            (initialized.capabilities.speak, "speak"),
-            (initialized.capabilities.stop, "stop"),
-            (initialized.capabilities.set_rate, "set_rate"),
-            (initialized.capabilities.rpc_discover, "rpc.discover"),
-        ] {
-            if !supported {
+        if !initialized.capabilities.controls.stop.is_supported() {
+            return Err(Error::MissingCapability("controls.stop"));
+        }
+        self.capabilities = initialized.capabilities;
+        Ok(())
+    }
+
+    fn accept_unversioned_legacy(&mut self) -> Result<()> {
+        self.legacy_protocol = true;
+        self.capabilities = legacy_capabilities();
+        Ok(())
+    }
+
+    fn initialize_version_one(&mut self) -> Result<()> {
+        let result = self.call_with_timeout(
+            "initialize",
+            Some(json!({
+                "protocol_version": "1.0",
+                "client": {
+                    "name": "lector",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            })),
+            self.timeouts.initialize,
+        )?;
+        let protocol = result
+            .get("protocol_version")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                Error::InvalidResponse(
+                    "version 1 initialize result is missing protocol_version".to_owned(),
+                )
+            })?;
+        if protocol != "1.0" {
+            return Err(Error::SpeechProtocolVersion {
+                expected: "1.0",
+                actual: protocol.to_owned(),
+            });
+        }
+        let capabilities = result
+            .get("capabilities")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                Error::InvalidResponse(
+                    "version 1 initialize result is missing capabilities".to_owned(),
+                )
+            })?;
+        for name in ["speak", "stop", "set_rate", "rpc_discover"] {
+            if capabilities.get(name).and_then(Value::as_bool) != Some(true) {
                 return Err(Error::MissingCapability(name));
             }
         }
+        self.legacy_protocol = true;
+        self.capabilities = legacy_capabilities();
         Ok(())
     }
 
@@ -387,7 +480,11 @@ impl ProcDriver {
         let started = Instant::now();
         let deadline = started.checked_add(timeout).unwrap_or(started);
         let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
+        self.next_id = if id >= MAX_JSON_SAFE_INTEGER {
+            1
+        } else {
+            id + 1
+        };
         let request = JsonRpcRequest {
             jsonrpc: "2.0",
             id,
@@ -405,8 +502,15 @@ impl ProcDriver {
         }
 
         self.write_request(deadline, method, timeout)?;
-        let frame = self.read_response(deadline, method, timeout)?;
-        parse_response(&frame, id)
+        loop {
+            let frame = self.read_response(deadline, method, timeout)?;
+            let message: Value = serde_json::from_slice(&frame).map_err(Error::Parse)?;
+            if message.get("method").is_some() {
+                self.handle_notification(message)?;
+                continue;
+            }
+            return parse_response_value(message, id);
+        }
     }
 
     fn write_request(&mut self, deadline: Instant, method: &str, timeout: Duration) -> Result<()> {
@@ -537,41 +641,166 @@ impl ProcDriver {
             }
         }
     }
-}
 
-impl Driver for ProcDriver {
-    fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()> {
-        let result = self.call(
-            "speak",
-            Some(json!({ "text": text, "interrupt": interrupt })),
-        )?;
-        if let Err(error) = expect_null_result("speak", result) {
-            self.fail_transport();
-            return Err(error.into());
+    fn handle_notification(&mut self, message: Value) -> Result<()> {
+        let object = message.as_object().ok_or_else(|| {
+            Error::InvalidResponse("server notification must be an object".to_owned())
+        })?;
+        if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(Error::InvalidResponse(
+                "server notification jsonrpc must be 2.0".to_owned(),
+            ));
         }
-        Ok(())
-    }
-
-    fn stop(&mut self) -> DriverResult<()> {
-        let result = self.call("stop", None)?;
-        if let Err(error) = expect_null_result("stop", result) {
-            self.fail_transport();
-            return Err(error.into());
+        if object.contains_key("id") {
+            return Err(Error::InvalidResponse(
+                "server-to-client requests are not supported".to_owned(),
+            ));
         }
-        Ok(())
-    }
-
-    fn get_rate(&self) -> f32 {
-        self.rate
-    }
-
-    fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
-        let result = self.call("set_rate", Some(json!({ "rate": rate })))?;
-        if self.legacy_protocol && result.is_null() {
-            self.rate = rate;
+        let Some(method) = object.get("method").and_then(Value::as_str) else {
+            return Err(Error::InvalidResponse(
+                "server notification is missing method".to_owned(),
+            ));
+        };
+        if method != "speech.event" {
+            // Additive notifications are deliberately ignorable.
             return Ok(());
         }
-        let actual = match result.as_object().filter(|result| result.len() == 1) {
+        let params = object.get("params").cloned().ok_or_else(|| {
+            Error::InvalidResponse("speech.event notification is missing params".to_owned())
+        })?;
+        let event: SpeechEventNotification = serde_json::from_value(params).map_err(|error| {
+            Error::InvalidResponse(format!("invalid speech.event notification: {error}"))
+        })?;
+        if !event.utterance_id.is_valid() {
+            return Err(Error::InvalidResponse(
+                "speech.event has an invalid utteranceId".to_owned(),
+            ));
+        }
+        if event.sequence > MAX_JSON_SAFE_INTEGER {
+            return Err(Error::InvalidResponse(
+                "speech.event sequence exceeds the JSON safe-integer range".to_owned(),
+            ));
+        }
+        self.pending_events.push_back(event);
+        Ok(())
+    }
+
+    fn read_available_notifications(&mut self) -> Result<()> {
+        loop {
+            while let Some(newline) = self.response_buf.iter().position(|byte| *byte == b'\n') {
+                if newline.saturating_add(1) > MAX_RPC_FRAME_BYTES {
+                    return Err(Error::ResponseFrameTooLarge {
+                        limit: MAX_RPC_FRAME_BYTES,
+                    });
+                }
+                let remaining = self.response_buf.split_off(newline + 1);
+                let frame = std::mem::replace(&mut self.response_buf, remaining);
+                let message: Value = serde_json::from_slice(&frame).map_err(Error::Parse)?;
+                if message.get("method").is_none() {
+                    return Err(Error::InvalidResponse(
+                        "received an RPC response with no outstanding request".to_owned(),
+                    ));
+                }
+                self.handle_notification(message)?;
+            }
+            if self.response_buf.len() >= MAX_RPC_FRAME_BYTES {
+                return Err(Error::ResponseFrameTooLarge {
+                    limit: MAX_RPC_FRAME_BYTES,
+                });
+            }
+
+            let mut chunk = [0u8; 8192];
+            match self.stdout.read(&mut chunk) {
+                Ok(0) => return Err(Error::Closed),
+                Ok(read) => {
+                    if self.response_buf.len().saturating_add(read) > MAX_RPC_FRAME_BYTES {
+                        return Err(Error::ResponseFrameTooLarge {
+                            limit: MAX_RPC_FRAME_BYTES,
+                        });
+                    }
+                    self.response_buf.extend_from_slice(&chunk[..read]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(io_error("read RPC notification")(error)),
+            }
+        }
+    }
+}
+
+impl Host for ProcDriver {
+    fn capabilities(&self) -> &SpeechCapabilities {
+        &self.capabilities
+    }
+
+    fn has_legacy_queue(&self) -> bool {
+        self.legacy_protocol
+    }
+
+    fn speak(&mut self, id: &UtteranceId, text: &str, legacy_interrupt: bool) -> DriverResult<()> {
+        let (method, params) = if self.legacy_protocol {
+            (
+                "speak",
+                json!({ "text": text, "interrupt": legacy_interrupt }),
+            )
+        } else {
+            ("speech.speak", json!({ "utteranceId": id, "text": text }))
+        };
+        let result = self.call(method, Some(params))?;
+        if self.legacy_protocol {
+            expect_null_result("speak", result).map_err(Into::into)
+        } else {
+            expect_accepted_result("speech.speak", result).map_err(Into::into)
+        }
+    }
+
+    fn stop(&mut self, id: &UtteranceId) -> DriverResult<()> {
+        let result = if self.legacy_protocol {
+            self.call("stop", None)?
+        } else {
+            self.call(
+                "speech.stop",
+                Some(
+                    serde_json::to_value(UtteranceParams {
+                        utterance_id: id.clone(),
+                    })
+                    .map_err(Error::Serialize)?,
+                ),
+            )?
+        };
+        if self.legacy_protocol {
+            expect_null_result("stop", result).map_err(Into::into)
+        } else {
+            expect_accepted_result("speech.stop", result).map_err(Into::into)
+        }
+    }
+
+    fn pause(&mut self, id: &UtteranceId) -> DriverResult<PauseResult> {
+        let result = self.call("speech.pause", Some(json!({ "utteranceId": id })))?;
+        serde_json::from_value(result)
+            .map_err(|error| {
+                Error::InvalidResponse(format!("invalid speech.pause result: {error}"))
+            })
+            .map_err(Into::into)
+    }
+
+    fn resume(&mut self, id: &UtteranceId) -> DriverResult<()> {
+        let result = self.call("speech.resume", Some(json!({ "utteranceId": id })))?;
+        expect_accepted_result("speech.resume", result).map_err(Into::into)
+    }
+
+    fn set_rate(&mut self, rate: f32) -> DriverResult<f32> {
+        let method = if self.legacy_protocol {
+            "set_rate"
+        } else {
+            "speech.setRate"
+        };
+        let result = self.call(method, Some(json!({ "rate": rate })))?;
+        if self.legacy_protocol && result.is_null() {
+            self.rate = rate;
+            return Ok(rate);
+        }
+        let actual = match result.as_object() {
             Some(result) => result
                 .get("rate")
                 .and_then(Value::as_f64)
@@ -591,7 +820,12 @@ impl Driver for ProcDriver {
             }
         };
         self.rate = actual;
-        Ok(())
+        Ok(actual)
+    }
+
+    fn take_events(&mut self) -> DriverResult<Vec<SpeechEventNotification>> {
+        self.read_available_notifications()?;
+        Ok(self.pending_events.drain(..).collect())
     }
 }
 
@@ -650,19 +884,16 @@ fn check_deadline(deadline: Instant, method: &str, timeout: Duration) -> Result<
     }
 }
 
+#[cfg(test)]
 fn parse_response(frame: &[u8], expected_id: u64) -> Result<Value> {
     let response: Value = serde_json::from_slice(frame).map_err(Error::Parse)?;
+    parse_response_value(response, expected_id)
+}
+
+fn parse_response_value(response: Value, expected_id: u64) -> Result<Value> {
     let object = response
         .as_object()
         .ok_or_else(|| Error::InvalidResponse("response must be an object".to_owned()))?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "result" | "error"))
-    {
-        return Err(Error::InvalidResponse(
-            "response contains an unknown member".to_owned(),
-        ));
-    }
     let version = object
         .get("jsonrpc")
         .and_then(Value::as_str)
@@ -685,14 +916,6 @@ fn parse_response(frame: &[u8], expected_id: u64) -> Result<Value> {
             let error = error
                 .as_object()
                 .ok_or_else(|| Error::InvalidResponse("error must be an object".to_owned()))?;
-            if error
-                .keys()
-                .any(|key| !matches!(key.as_str(), "code" | "message" | "data"))
-            {
-                return Err(Error::InvalidResponse(
-                    "error contains an unknown member".to_owned(),
-                ));
-            }
             let code = error.get("code").and_then(Value::as_i64).ok_or_else(|| {
                 Error::InvalidResponse("error code must be an integer".to_owned())
             })?;
@@ -727,6 +950,32 @@ fn expect_null_result(method: &str, result: Value) -> Result<()> {
         Err(Error::InvalidResponse(format!(
             "{method} result must be null"
         )))
+    }
+}
+
+fn expect_accepted_result(method: &str, result: Value) -> Result<()> {
+    let accepted: AcceptedResult = serde_json::from_value(result)
+        .map_err(|error| Error::InvalidResponse(format!("invalid {method} result: {error}")))?;
+    if accepted.accepted {
+        Ok(())
+    } else {
+        Err(Error::InvalidResponse(format!(
+            "{method} returned accepted=false without an RPC error"
+        )))
+    }
+}
+
+fn legacy_capabilities() -> SpeechCapabilities {
+    SpeechCapabilities {
+        controls: ControlCapabilities {
+            stop: StopSupport::BestEffort,
+            ..Default::default()
+        },
+        settings: SettingCapabilities {
+            rate: SettingSupport::WriteOnly,
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
@@ -811,5 +1060,22 @@ mod tests {
         let error = parse_response(response.to_string().as_bytes(), 1).unwrap_err();
         assert!(matches!(error, Error::Rpc { code: -32602, .. }));
         assert!(!error.is_transport_failure());
+    }
+
+    #[test]
+    fn additive_response_and_error_members_are_ignored() {
+        let result = parse_response(
+            br#"{"jsonrpc":"2.0","id":1,"result":{"ok":true},"future":7}"#,
+            1,
+        )
+        .unwrap();
+        assert_eq!(result, json!({"ok": true}));
+
+        let error = parse_response(
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"bad","future":7}}"#,
+            1,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Rpc { code: -1, .. }));
     }
 }

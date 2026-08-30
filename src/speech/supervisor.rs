@@ -5,7 +5,12 @@
 //! RPC call on the speech worker while the terminal event loop interacts only
 //! with [`SupervisorHandle`].
 
-use super::{Driver, SpeechServerSpec, proc_driver};
+use super::{
+    Driver, SpeechServerSpec,
+    manager::{Host, SpeechManager},
+    proc_driver,
+    protocol::UtteranceId,
+};
 use anyhow::{Context, Result as DriverResult, anyhow};
 use mio::Waker;
 use std::{
@@ -164,7 +169,7 @@ fn notify(notifier: &Notifier) {
 }
 
 struct ManagedProcess {
-    driver: Box<dyn Driver + Send>,
+    host: Box<dyn Host + Send>,
     terminator: Terminator,
     _ownership: ChildOwnership,
 }
@@ -212,7 +217,7 @@ impl ProcessFactory for ProcFactory {
     ) -> DriverResult<ManagedProcess> {
         let command = command_for_spec(spec)?;
         let mut registered_terminator = None;
-        let driver = proc_driver::ProcDriver::new_with_args_and_registration(
+        let host = proc_driver::ProcDriver::new_with_args_and_registration(
             &command.program,
             &command.args,
             proc_driver::RpcTimeouts::default(),
@@ -226,7 +231,7 @@ impl ProcessFactory for ProcFactory {
         let terminator = registered_terminator
             .expect("ProcDriver registers its termination handle before returning");
         Ok(ManagedProcess {
-            driver: Box::new(driver),
+            host: Box::new(host),
             terminator,
             _ownership: ownership,
         })
@@ -258,6 +263,7 @@ fn command_for_spec(spec: &SpeechServerSpec) -> DriverResult<ServerCommand> {
 
 #[derive(Debug)]
 struct PendingSpeech {
+    id: UtteranceId,
     text: String,
     interrupt: bool,
 }
@@ -273,6 +279,8 @@ pub struct Supervisor {
     desired_rate: f32,
     pending_speech: VecDeque<PendingSpeech>,
     pending_speech_bytes: usize,
+    manager: SpeechManager,
+    next_compatibility_id: u64,
     started: bool,
     startup_error: Option<String>,
     fatal_error: Option<String>,
@@ -313,6 +321,8 @@ impl Supervisor {
             desired_rate: 1.0,
             pending_speech: VecDeque::new(),
             pending_speech_bytes: 0,
+            manager: SpeechManager::default(),
+            next_compatibility_id: 1,
             started: false,
             startup_error: None,
             fatal_error: None,
@@ -339,10 +349,14 @@ impl Supervisor {
             drop(candidate);
             return Err(anyhow!("speech supervisor is shutting down"));
         }
-        candidate
-            .driver
-            .set_rate(self.desired_rate)
-            .context("restore speech rate")?;
+        if candidate.host.has_legacy_queue()
+            || candidate.host.capabilities().settings.rate.can_write()
+        {
+            candidate
+                .host
+                .set_rate(self.desired_rate)
+                .context("restore speech rate")?;
+        }
         Ok(candidate)
     }
 
@@ -390,8 +404,8 @@ impl Supervisor {
         while let Some(pending) = self.pending_speech.pop_front() {
             self.pending_speech_bytes =
                 self.pending_speech_bytes.saturating_sub(pending.text.len());
-            if let Err(error) = self.call_active("speak", move |driver| {
-                driver.speak(&pending.text, pending.interrupt)
+            if let Err(error) = self.call_managed("speak", move |manager, host| {
+                manager.submit(host, pending.id, pending.text, pending.interrupt)
             }) {
                 if self.fatal_error.is_some() {
                     self.pending_speech.clear();
@@ -408,7 +422,7 @@ impl Supervisor {
         Ok(())
     }
 
-    fn buffer_speech(&mut self, text: &str, interrupt: bool) {
+    fn buffer_speech(&mut self, id: UtteranceId, text: &str, interrupt: bool) {
         if interrupt {
             self.pending_speech.clear();
             self.pending_speech_bytes = 0;
@@ -423,8 +437,11 @@ impl Supervisor {
             self.pending_speech_bytes = self.pending_speech_bytes.saturating_sub(stale.text.len());
         }
         self.pending_speech_bytes = self.pending_speech_bytes.saturating_add(text.len());
-        self.pending_speech
-            .push_back(PendingSpeech { text, interrupt });
+        self.pending_speech.push_back(PendingSpeech {
+            id,
+            text,
+            interrupt,
+        });
     }
 
     fn ensure_available(&self) -> DriverResult<()> {
@@ -437,15 +454,15 @@ impl Supervisor {
         Ok(())
     }
 
-    fn call_active(
+    fn call_host(
         &mut self,
         operation: &'static str,
-        call: impl FnOnce(&mut dyn Driver) -> DriverResult<()>,
+        call: impl FnOnce(&mut dyn Host) -> DriverResult<()>,
     ) -> DriverResult<()> {
         self.ensure_available()?;
         let result = {
             let process = self.active.as_mut().expect("active checked above");
-            call(process.driver.as_mut())
+            call(process.host.as_mut())
         };
         let Err(error) = result else {
             return Ok(());
@@ -462,9 +479,32 @@ impl Supervisor {
         Err(error)
     }
 
+    fn call_managed(
+        &mut self,
+        operation: &'static str,
+        call: impl FnOnce(&mut SpeechManager, &mut dyn Host) -> DriverResult<()>,
+    ) -> DriverResult<()> {
+        self.ensure_available()?;
+        let result = {
+            let manager = &mut self.manager;
+            let process = self.active.as_mut().expect("active checked above");
+            call(manager, process.host.as_mut())
+        };
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if !is_transport_failure(&error) {
+            return Err(error);
+        }
+        let failure = format!("speech {operation} transport failure: {error:#}");
+        self.recover_after_transport_failure(failure)?;
+        Err(error)
+    }
+
     fn recover_after_transport_failure(&mut self, failure: String) -> DriverResult<()> {
         let now = (self.now)();
         let may_restart = restart_allowed(self.last_crash, now);
+        self.manager.host_lost();
         let failed = self.clear_active();
         drop(failed);
 
@@ -478,7 +518,14 @@ impl Supervisor {
 
         let spec = self.spec.clone();
         match self.spawn_ready(&spec) {
-            Ok(process) => {
+            Ok(mut process) => {
+                if let Err(error) = self.manager.host_ready(process.host.as_mut()) {
+                    let message = format!(
+                        "{failure}; resume pending speech on restarted server failed: {error:#}"
+                    );
+                    self.enter_fatal(message.clone());
+                    return Err(anyhow!(message));
+                }
                 let _ = self.install_active(process);
                 Ok(())
             }
@@ -511,8 +558,23 @@ impl Supervisor {
         self.ensure_available()?;
 
         match self.spawn_ready(&spec) {
-            Ok(candidate) => {
+            Ok(mut candidate) => {
+                // Prepare the candidate from a clone so failure leaves both
+                // the old process and its evidence-backed manager state
+                // untouched. Active speech is never replayed; only work that
+                // had not yet reached the old host may cross generations.
+                let mut candidate_manager = self.manager.clone();
+                candidate_manager.host_lost();
+                if let Err(error) = candidate_manager.host_ready(candidate.host.as_mut()) {
+                    let message = format!(
+                        "replace speech server: resume pending speech on candidate: {error:#}"
+                    );
+                    self.handle
+                        .push_event(SupervisorEvent::ReconfigureFailed(message.clone()));
+                    return Err(anyhow!(message));
+                }
                 let old = self.install_active(candidate);
+                self.manager = candidate_manager;
                 self.spec = spec.clone();
                 // An intentional replacement is not itself a crash. Preserve
                 // any real crash timestamp so changing servers cannot bypass
@@ -539,6 +601,17 @@ impl Default for Supervisor {
 
 impl Driver for Supervisor {
     fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()> {
+        let id = UtteranceId::new(format!("compat-{}", self.next_compatibility_id));
+        self.next_compatibility_id = self.next_compatibility_id.wrapping_add(1);
+        self.speak_utterance(&id, text, interrupt)
+    }
+
+    fn speak_utterance(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+    ) -> DriverResult<()> {
         if text.is_empty() {
             return Ok(());
         }
@@ -546,10 +619,12 @@ impl Driver for Supervisor {
             if let Some(error) = &self.startup_error {
                 return Err(anyhow!(error.clone()));
             }
-            self.buffer_speech(text, interrupt);
+            self.buffer_speech(id.clone(), text, interrupt);
             return Ok(());
         }
-        self.call_active("speak", |driver| driver.speak(text, interrupt))
+        self.call_managed("speak", |manager, host| {
+            manager.submit(host, id.clone(), text.to_owned(), interrupt)
+        })
     }
 
     fn stop(&mut self) -> DriverResult<()> {
@@ -558,7 +633,36 @@ impl Driver for Supervisor {
             self.pending_speech_bytes = 0;
             return Ok(());
         }
-        self.call_active("stop", |driver| driver.stop())
+        self.call_managed("stop", SpeechManager::stop)
+    }
+
+    fn toggle_pause(&mut self) -> DriverResult<()> {
+        if !self.started {
+            self.pending_speech.clear();
+            self.pending_speech_bytes = 0;
+            return Ok(());
+        }
+        self.call_managed("toggle pause", SpeechManager::toggle_pause)
+    }
+
+    fn supports_ordered_utterances(&self) -> bool {
+        self.active.as_ref().is_some_and(|process| {
+            process.host.has_legacy_queue()
+                || process
+                    .host
+                    .capabilities()
+                    .lifecycle
+                    .terminal
+                    .delivery
+                    .is_reliable()
+        })
+    }
+
+    fn poll(&mut self) -> DriverResult<()> {
+        if !self.started || self.active.is_none() {
+            return Ok(());
+        }
+        self.call_managed("event", SpeechManager::poll)
     }
 
     fn get_rate(&self) -> f32 {
@@ -573,7 +677,13 @@ impl Driver for Supervisor {
         if !self.started {
             return Ok(());
         }
-        self.call_active("set_rate", |driver| driver.set_rate(rate))
+        if self.active.as_ref().is_some_and(|process| {
+            !process.host.has_legacy_queue()
+                && !process.host.capabilities().settings.rate.can_write()
+        }) {
+            return Ok(());
+        }
+        self.call_host("set_rate", |host| host.set_rate(rate).map(|_| ()))
     }
 
     fn start(&mut self) -> DriverResult<()> {
@@ -645,44 +755,81 @@ mod tests {
         Terminate,
     }
 
-    #[derive(Default)]
     struct FakeState {
         calls: Vec<Call>,
         speak_results: VecDeque<DriverResult<()>>,
         stop_results: VecDeque<DriverResult<()>>,
         rate_results: VecDeque<DriverResult<()>>,
+        legacy: bool,
+    }
+
+    impl Default for FakeState {
+        fn default() -> Self {
+            Self {
+                calls: Vec::new(),
+                speak_results: VecDeque::new(),
+                stop_results: VecDeque::new(),
+                rate_results: VecDeque::new(),
+                legacy: true,
+            }
+        }
     }
 
     struct FakeDriver {
         state: Arc<Mutex<FakeState>>,
         rate: f32,
+        capabilities: crate::speech::protocol::SpeechCapabilities,
     }
 
-    impl Driver for FakeDriver {
-        fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()> {
+    impl Host for FakeDriver {
+        fn capabilities(&self) -> &crate::speech::protocol::SpeechCapabilities {
+            &self.capabilities
+        }
+
+        fn has_legacy_queue(&self) -> bool {
+            self.state.lock().unwrap().legacy
+        }
+
+        fn speak(&mut self, _id: &UtteranceId, text: &str, interrupt: bool) -> DriverResult<()> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(Call::Speak(text.to_owned(), interrupt));
             state.speak_results.pop_front().unwrap_or(Ok(()))
         }
 
-        fn stop(&mut self) -> DriverResult<()> {
+        fn stop(&mut self, _id: &UtteranceId) -> DriverResult<()> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(Call::Stop);
             state.stop_results.pop_front().unwrap_or(Ok(()))
         }
 
-        fn get_rate(&self) -> f32 {
-            self.rate
+        fn pause(
+            &mut self,
+            _id: &UtteranceId,
+        ) -> DriverResult<crate::speech::protocol::PauseResult> {
+            Ok(crate::speech::protocol::PauseResult {
+                paused: false,
+                position: None,
+            })
         }
 
-        fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
+        fn resume(&mut self, _id: &UtteranceId) -> DriverResult<()> {
+            Ok(())
+        }
+
+        fn set_rate(&mut self, rate: f32) -> DriverResult<f32> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(Call::SetRate(rate.to_bits()));
             let result = state.rate_results.pop_front().unwrap_or(Ok(()));
             if result.is_ok() {
                 self.rate = rate;
             }
-            result
+            result.map(|()| self.rate)
+        }
+
+        fn take_events(
+            &mut self,
+        ) -> DriverResult<Vec<crate::speech::protocol::SpeechEventNotification>> {
+            Ok(Vec::new())
         }
     }
 
@@ -720,7 +867,11 @@ mod tests {
                     });
                     ownership.register(Arc::clone(&terminator));
                     Ok(ManagedProcess {
-                        driver: Box::new(FakeDriver { state, rate: 1.0 }),
+                        host: Box::new(FakeDriver {
+                            state,
+                            rate: 1.0,
+                            capabilities: Default::default(),
+                        }),
                         terminator,
                         _ownership: ownership,
                     })
@@ -751,9 +902,10 @@ mod tests {
                 });
                 ownership.register(Arc::clone(&terminator));
                 return Ok(ManagedProcess {
-                    driver: Box::new(FakeDriver {
+                    host: Box::new(FakeDriver {
                         state: Arc::clone(&self.active),
                         rate: 1.0,
+                        capabilities: Default::default(),
                     }),
                     terminator,
                     _ownership: ownership,
@@ -896,6 +1048,25 @@ mod tests {
     }
 
     #[test]
+    fn optional_rate_and_terminal_capabilities_degrade_without_blocking_startup() {
+        let mut harness = Harness::new();
+        let active = fake_state();
+        active.lock().unwrap().legacy = false;
+        harness.push_driver(Arc::clone(&active));
+
+        harness.supervisor.set_rate(1.75).unwrap();
+        harness.supervisor.start().unwrap();
+
+        assert!(active.lock().unwrap().calls.is_empty());
+        assert!(!harness.supervisor.supports_ordered_utterances());
+        harness.supervisor.speak("one announcement", false).unwrap();
+        assert_eq!(
+            active.lock().unwrap().calls,
+            [Call::Speak("one announcement".to_owned(), false)]
+        );
+    }
+
+    #[test]
     fn startup_stops_after_two_failures() {
         let mut harness = Harness::new();
         harness.push_error("first");
@@ -966,7 +1137,7 @@ mod tests {
             restarted.lock().unwrap().calls,
             [
                 Call::SetRate(1.5f32.to_bits()),
-                Call::Speak("later".to_owned(), true),
+                Call::Speak("later".to_owned(), false),
             ]
         );
         assert!(harness.supervisor.handle().take_events().is_empty());

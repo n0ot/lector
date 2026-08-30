@@ -11,9 +11,10 @@ read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
 
 ## Speech
 
-- [Speech driver protocol](speech-driver-protocol.md) defines custom-server
-  configuration, NDJSON JSON-RPC framing, initialization, discovery, deadlines,
-  restart policy, and process cleanup. Its machine-readable method schema is
+- [Speech-host protocol](speech-driver-protocol.md) defines custom-host
+  configuration, bidirectional NDJSON JSON-RPC framing, capabilities, events,
+  queue and pause state, deadlines, restart policy, and process cleanup. Its
+  machine-readable method and message schema is
   the repository-root [`openrpc.json`](../openrpc.json).
 - [Application-authored accessibility](application-accessibility.md) defines
   the generic terminal protocol, fail-safe lifecycle, and pane isolation. The

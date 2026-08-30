@@ -14,9 +14,10 @@ after the physical output flush succeeds.
   confined to the host.
 - Native TTS and custom process speech both sit behind the bounded asynchronous
   speech worker. A slow pipe or AVFoundation utterance build cannot block
-  terminal input, tmux processing, rendering, or teardown. On macOS the native
-  host keeps non-interrupting utterances in its own bounded queue instead of
-  flooding `AVSpeechSynthesizer` before lifecycle callbacks arrive.
+  terminal input, tmux processing, rendering, or teardown. Lector's
+  host-independent manager keeps a bounded queue and submits only one active
+  utterance to the native host, so it never floods `AVSpeechSynthesizer`
+  before lifecycle callbacks arrive.
 - Speech transport uses nonblocking readiness and absolute deadlines: five
   seconds for initialization and one second for an ordinary RPC. Those clocks
   exist only while the speech worker has a call in flight. They never cap a
@@ -119,9 +120,9 @@ The native speech regressions mute AVFoundation and exercise the actual Lector
 binary and its internal host. They verify that speech begins again after the
 startup utterance, that a queued utterance can be stopped and replaced, and
 that terminal input still reaches pixels in under 100 ms while the native host
-accepts a deliberately long utterance. The worker's adversarial tests
-separately prove that a permanently blocked backend cannot block or grow the
-foreground mailbox. Protocol regressions cover initialization and ordinary
+is speaking a multi-paragraph screen announcement. The worker's adversarial
+tests separately prove that a permanently blocked backend cannot block or grow
+the foreground mailbox. Protocol regressions cover initialization and ordinary
 deadlines, strict 1 MiB framing, kill-and-reap recovery, and the boundary below,
 at, and above the 30-second restart interval without adding a timer to the
 interactive path.

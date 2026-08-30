@@ -4,7 +4,7 @@ When pty-stdout: alpha\r\n
 And pty-stdout: beta
 And settled:
 Then expect-screen-contains: alpha
-And expect-speak: alpha\nbeta
+And expect-speak: alpha beta
 And expect-no-speak:
 
 Scenario: fragmented cursor redraw announces only inserted completion

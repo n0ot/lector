@@ -22,8 +22,9 @@ Bounded workers isolate side effects that may block:
   The default native backend is hosted by a hidden instance of the current
   Lector executable, so pipe I/O, AVFoundation utterance construction,
   playback, and Core Foundation lifecycle work cannot stall terminal
-  processing. On macOS the host submits only one non-interrupting utterance to
-  AVFoundation at a time and keeps the remaining queue bounded.
+  processing. The host submits only Lector's one active utterance to
+  AVFoundation; the host-independent Lector manager keeps all never-submitted
+  speech bounded.
 - `diagnostics` owns log output. Producers enqueue records into a byte-bounded
   queue, and the event loop never performs the underlying file or stderr I/O.
 
@@ -39,10 +40,14 @@ lifecycle:
    initial child output.
 5. It calls `on_startup` immediately before entering the normal input loop.
 
-Runtime speech replacement is transactional. A candidate process initializes
-and restores the configured rate while the old generation remains owned for rollback;
-only then is the active generation swapped and the old child terminated and
-reaped. Transport failures never replay an uncertain in-flight speech call.
+Runtime speech sequencing is owned by a host-independent manager. It sends at
+most one active utterance to a version 2 host, advances its bounded queue only
+from correlated terminal evidence, and retains resumable state only across an
+explicit pause/resume toggle. Runtime speech replacement is transactional. A
+candidate process initializes and restores the configured rate while the old
+generation remains owned for rollback; only then is the active generation
+swapped and the old child terminated and reaped. Transport failures never
+replay an uncertain in-flight speech call.
 The supervisor permits a restart only when the preceding recorded crash was at
 least 30 seconds earlier, and otherwise asks the event loop to restore the
 terminal and exit nonzero. The exact process and protocol contract is in

@@ -4,10 +4,15 @@
 //! is an external side effect and must never be allowed to stall that owner.
 
 use super::Driver;
+use super::protocol::UtteranceId;
 use anyhow::{Result as DriverResult, anyhow};
 use std::{
     collections::VecDeque,
-    sync::{Arc, Condvar, Mutex, MutexGuard, mpsc},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
@@ -19,10 +24,16 @@ const MAX_PENDING_SPEECH_BYTES: usize = 256 * 1024;
 const MAX_SPEECH_ITEM_BYTES: usize = 64 * 1024;
 const TRUNCATION_SUFFIX: &str = " … speech truncated";
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 enum Request {
-    Speak { text: String, interrupt: bool },
+    Speak {
+        id: UtteranceId,
+        text: String,
+        interrupt: bool,
+    },
     Stop,
+    TogglePause,
     SetRate(f32),
     ConfigureServer(SpeechServerSpec),
     Start(mpsc::SyncSender<std::result::Result<(), String>>),
@@ -32,7 +43,11 @@ impl Request {
     fn speech_bytes(&self) -> usize {
         match self {
             Self::Speak { text, .. } => text.len(),
-            Self::Stop | Self::SetRate(_) | Self::ConfigureServer(_) | Self::Start(_) => 0,
+            Self::Stop
+            | Self::TogglePause
+            | Self::SetRate(_)
+            | Self::ConfigureServer(_)
+            | Self::Start(_) => 0,
         }
     }
 
@@ -92,7 +107,7 @@ impl Mailbox {
         discarded
     }
 
-    fn enqueue_speech(&self, text: &str, interrupt: bool) -> DriverResult<()> {
+    fn enqueue_speech(&self, id: &UtteranceId, text: &str, interrupt: bool) -> DriverResult<()> {
         let text = bounded_text(text, MAX_SPEECH_ITEM_BYTES);
         let text_bytes = text.len();
         let mut state = self.lock()?;
@@ -102,6 +117,9 @@ impl Mailbox {
 
         if interrupt {
             let _ = Self::discard_speech(&mut state);
+            state
+                .requests
+                .retain(|request| !matches!(request, Request::TogglePause));
         }
         let mut dropped = 0usize;
         while state.speech_items == MAX_PENDING_SPEECH_ITEMS
@@ -117,7 +135,11 @@ impl Mailbox {
 
         state.speech_items = state.speech_items.saturating_add(1);
         state.speech_bytes = state.speech_bytes.saturating_add(text_bytes);
-        state.requests.push_back(Request::Speak { text, interrupt });
+        state.requests.push_back(Request::Speak {
+            id: id.clone(),
+            text,
+            interrupt,
+        });
         let dropped_total = state.dropped_speech_items;
         drop(state);
         self.available.notify_one();
@@ -140,8 +162,42 @@ impl Mailbox {
         let _ = Self::discard_speech(&mut state);
         state
             .requests
-            .retain(|request| !matches!(request, Request::Stop));
+            .retain(|request| !matches!(request, Request::Stop | Request::TogglePause));
         state.requests.push_front(Request::Stop);
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn enqueue_toggle_pause(&self) -> DriverResult<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Ok(());
+        }
+        if state
+            .requests
+            .iter()
+            .any(|request| matches!(request, Request::Stop))
+        {
+            // A preceding cancellation makes this toggle inert even if the
+            // worker has not observed the cancellation yet.
+            return Ok(());
+        }
+        if state.requests.iter().any(|request| {
+            matches!(
+                request,
+                Request::Speak {
+                    interrupt: true,
+                    ..
+                }
+            )
+        }) {
+            // The toggle belongs to the new interrupting utterance and must
+            // not overtake it.
+            state.requests.push_back(Request::TogglePause);
+        } else {
+            state.requests.push_front(Request::TogglePause);
+        }
         drop(state);
         self.available.notify_one();
         Ok(())
@@ -191,20 +247,27 @@ impl Mailbox {
         Ok(())
     }
 
-    fn next_request(&self) -> Option<Request> {
-        let mut state = self.state.lock().ok()?;
-        while state.requests.is_empty() && !state.shutdown {
-            state = self.available.wait(state).ok()?;
+    fn next_request(&self, timeout: Duration) -> NextRequest {
+        let Ok(mut state) = self.state.lock() else {
+            return NextRequest::Shutdown;
+        };
+        if state.requests.is_empty() && !state.shutdown {
+            let Ok((next, _)) = self.available.wait_timeout(state, timeout) else {
+                return NextRequest::Shutdown;
+            };
+            state = next;
         }
         if state.shutdown {
-            return None;
+            return NextRequest::Shutdown;
         }
-        let request = state.requests.pop_front()?;
+        let Some(request) = state.requests.pop_front() else {
+            return NextRequest::Idle;
+        };
         if request.is_speech() {
             state.speech_items = state.speech_items.saturating_sub(1);
             state.speech_bytes = state.speech_bytes.saturating_sub(request.speech_bytes());
         }
-        Some(request)
+        NextRequest::Request(request)
     }
 
     fn shut_down(&self) {
@@ -228,6 +291,12 @@ impl Mailbox {
     }
 }
 
+enum NextRequest {
+    Request(Request),
+    Idle,
+    Shutdown,
+}
+
 /// Moves a potentially blocking speech driver off the terminal event loop.
 ///
 /// The worker owns the backend. The foreground owns only a bounded mailbox and
@@ -236,9 +305,11 @@ impl Mailbox {
 /// announcements.
 pub struct BoundedAsyncDriver {
     mailbox: Arc<Mailbox>,
+    ordered_utterances: Arc<AtomicBool>,
     rate: f32,
     worker: Option<thread::JoinHandle<()>>,
     shutdown_backend: Option<Box<dyn FnOnce() + Send>>,
+    next_compatibility_id: u64,
 }
 
 impl BoundedAsyncDriver {
@@ -265,27 +336,52 @@ impl BoundedAsyncDriver {
         D: Driver + Send + 'static,
     {
         let rate = driver.get_rate();
+        let ordered_utterances = Arc::new(AtomicBool::new(driver.supports_ordered_utterances()));
         let mailbox = Arc::new(Mailbox::new());
         let worker_mailbox = Arc::clone(&mailbox);
+        let worker_ordered_utterances = Arc::clone(&ordered_utterances);
         let worker = thread::Builder::new()
             .name("lector-speech-driver".to_owned())
-            .spawn(move || run_worker(driver, &worker_mailbox))?;
+            .spawn(move || {
+                run_worker(driver, &worker_mailbox, &worker_ordered_utterances);
+            })?;
         Ok(Self {
             mailbox,
+            ordered_utterances,
             rate,
             worker: Some(worker),
             shutdown_backend,
+            next_compatibility_id: 1,
         })
     }
 }
 
 impl Driver for BoundedAsyncDriver {
     fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()> {
-        self.mailbox.enqueue_speech(text, interrupt)
+        let id = UtteranceId::new(format!("compat-{}", self.next_compatibility_id));
+        self.next_compatibility_id = self.next_compatibility_id.wrapping_add(1);
+        self.mailbox.enqueue_speech(&id, text, interrupt)
+    }
+
+    fn speak_utterance(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+    ) -> DriverResult<()> {
+        self.mailbox.enqueue_speech(id, text, interrupt)
     }
 
     fn stop(&mut self) -> DriverResult<()> {
         self.mailbox.enqueue_stop()
+    }
+
+    fn toggle_pause(&mut self) -> DriverResult<()> {
+        self.mailbox.enqueue_toggle_pause()
+    }
+
+    fn supports_ordered_utterances(&self) -> bool {
+        self.ordered_utterances.load(Ordering::Acquire)
     }
 
     fn get_rate(&self) -> f32 {
@@ -311,6 +407,10 @@ impl Driver for BoundedAsyncDriver {
     }
 
     fn configure_server(&mut self, spec: SpeechServerSpec) -> DriverResult<()> {
+        // Until the candidate commits, use the conservative one-utterance
+        // presentation path. This prevents foreground speech from being split
+        // according to capabilities that belonged to the old generation.
+        self.ordered_utterances.store(false, Ordering::Release);
         self.mailbox.enqueue_server(spec)
     }
 
@@ -349,16 +449,22 @@ impl BoundedAsyncDriver {
     }
 }
 
-fn run_worker(mut driver: impl Driver, mailbox: &Mailbox) {
+fn run_worker(mut driver: impl Driver, mailbox: &Mailbox, ordered_utterances: &AtomicBool) {
     let mut failures = 0u64;
-    while let Some(request) = mailbox.next_request() {
-        let result = match request {
-            Request::Speak { text, interrupt } => driver.speak(&text, interrupt),
-            Request::Stop => driver.stop(),
-            Request::SetRate(rate) => driver.set_rate(rate),
-            Request::ConfigureServer(spec) => driver.configure_server(spec),
-            Request::Start(completed) => {
+    loop {
+        let result = match mailbox.next_request(EVENT_POLL_INTERVAL) {
+            NextRequest::Request(Request::Speak {
+                id,
+                text,
+                interrupt,
+            }) => driver.speak_utterance(&id, &text, interrupt),
+            NextRequest::Request(Request::Stop) => driver.stop(),
+            NextRequest::Request(Request::TogglePause) => driver.toggle_pause(),
+            NextRequest::Request(Request::SetRate(rate)) => driver.set_rate(rate),
+            NextRequest::Request(Request::ConfigureServer(spec)) => driver.configure_server(spec),
+            NextRequest::Request(Request::Start(completed)) => {
                 let result = driver.start();
+                ordered_utterances.store(driver.supports_ordered_utterances(), Ordering::Release);
                 let report = match &result {
                     Ok(()) => Ok(()),
                     Err(error) => Err(format!("{error:#}")),
@@ -366,7 +472,10 @@ fn run_worker(mut driver: impl Driver, mailbox: &Mailbox) {
                 let _ = completed.send(report);
                 result
             }
+            NextRequest::Idle => driver.poll(),
+            NextRequest::Shutdown => break,
         };
+        ordered_utterances.store(driver.supports_ordered_utterances(), Ordering::Release);
         if let Err(error) = result {
             failures = failures.saturating_add(1);
             if failures.is_power_of_two() {
@@ -399,7 +508,7 @@ fn bounded_text(text: &str, limit: usize) -> String {
 mod tests {
     use super::{
         BoundedAsyncDriver, Driver, MAX_PENDING_SPEECH_BYTES, MAX_PENDING_SPEECH_ITEMS,
-        MAX_SPEECH_ITEM_BYTES,
+        MAX_SPEECH_ITEM_BYTES, Mailbox, NextRequest, Request, UtteranceId,
     };
     use std::{
         sync::mpsc,
@@ -509,5 +618,74 @@ mod tests {
         assert!(driver.mailbox.usage().1 <= MAX_SPEECH_ITEM_BYTES);
         assert!(driver.set_rate(f32::NAN).is_err());
         assert_eq!(driver.get_rate(), 1.0);
+    }
+
+    #[test]
+    fn ordered_utterance_capability_is_published_after_backend_start() {
+        struct CapabilityDriver {
+            started: bool,
+        }
+
+        impl Driver for CapabilityDriver {
+            fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn stop(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn supports_ordered_utterances(&self) -> bool {
+                self.started
+            }
+
+            fn get_rate(&self) -> f32 {
+                1.0
+            }
+
+            fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn start(&mut self) -> anyhow::Result<()> {
+                self.started = true;
+                Ok(())
+            }
+        }
+
+        let mut driver = BoundedAsyncDriver::new(CapabilityDriver { started: false }).unwrap();
+        assert!(!driver.supports_ordered_utterances());
+        driver.start().unwrap();
+        assert!(driver.supports_ordered_utterances());
+    }
+
+    #[test]
+    fn cancellation_barriers_cannot_be_overtaken_by_pause_toggles() {
+        let mailbox = Mailbox::new();
+        mailbox.enqueue_stop().unwrap();
+        mailbox.enqueue_toggle_pause().unwrap();
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::Stop)
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Idle
+        ));
+
+        let id = UtteranceId::new("new");
+        mailbox.enqueue_speech(&id, "new words", true).unwrap();
+        mailbox.enqueue_toggle_pause().unwrap();
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::Speak {
+                interrupt: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::TogglePause)
+        ));
     }
 }

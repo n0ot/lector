@@ -1,7 +1,7 @@
 use lector::{
     proc_server_common::MAX_RPC_FRAME_BYTES,
     speech::{
-        Driver,
+        manager::Host,
         proc_driver::{Error as ProcError, ProcDriver, RpcTimeouts},
     },
 };
@@ -156,6 +156,21 @@ fn proc_driver_rejects_responses_for_another_request() {
 }
 
 #[test]
+fn proc_driver_interleaves_extensible_notifications_with_a_response() {
+    let mut driver = adversarial_driver("event-before-response");
+    driver.speak("hello", false).unwrap();
+
+    let events = Host::take_events(&mut driver).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].utterance_id.as_str(), "direct-1");
+    assert_eq!(events[0].event.kind, "started");
+    assert_eq!(
+        events[0].event.extensions.get("futureMember"),
+        Some(&serde_json::json!(7))
+    );
+}
+
+#[test]
 fn proc_driver_bounds_response_frames() {
     // Generating and transferring a full MiB in an unoptimized test build is
     // intentionally allowed more time than the tiny hang tests. This test is
@@ -289,33 +304,12 @@ fn native_tts_server_advances_past_its_first_utterance() {
     let mut stdout = BufReader::new(child.stdout.take().expect("native TTS stdout"));
 
     {
-        let mut rpc = |id: u64, method: &str, params: Value| -> Value {
-            writeln!(
-                stdin,
-                "{}",
-                serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "method": method,
-                    "params": params,
-                })
-            )
-            .expect("write native TTS request");
-            stdin.flush().expect("flush native TTS request");
-            let mut response = String::new();
-            stdout
-                .read_line(&mut response)
-                .expect("read native TTS response");
-            let response: Value =
-                serde_json::from_str(&response).expect("parse native TTS response");
-            assert_eq!(response["id"], id);
-            response
-        };
-
-        let before_initialize = rpc(
+        let before_initialize = native_rpc(
+            &mut stdin,
+            &mut stdout,
             1,
-            "speak",
-            serde_json::json!({"text": "welcome to Lector", "interrupt": false}),
+            "speech.speak",
+            serde_json::json!({"utteranceId": "before", "text": "welcome to Lector"}),
         );
         assert_eq!(before_initialize["error"]["code"], -32600);
         assert!(
@@ -324,39 +318,61 @@ fn native_tts_server_advances_past_its_first_utterance() {
                 .is_some_and(|message| message.contains("not initialized"))
         );
 
-        let initialized = rpc(
+        let initialized = native_rpc(
+            &mut stdin,
+            &mut stdout,
             2,
             "initialize",
             serde_json::json!({
-                "protocol_version": "1.0",
+                "protocol": {"major": 2, "minimumMinor": 0, "maximumMinor": 0},
                 "client": {"name": "lector-test", "version": "1"},
+                "clientCapabilities": {
+                    "speechEvents": true,
+                    "progressModes": ["marker", "utf8ByteOffset"]
+                }
             }),
         );
-        assert_eq!(initialized["result"]["protocol_version"], "1.0");
+        assert_eq!(
+            initialized["result"]["protocol"],
+            serde_json::json!({"major": 2, "minor": 0})
+        );
 
-        let first = rpc(
+        let first = native_rpc(
+            &mut stdin,
+            &mut stdout,
             3,
-            "speak",
-            serde_json::json!({"text": "welcome to Lector", "interrupt": false}),
+            "speech.speak",
+            serde_json::json!({"utteranceId": "first", "text": "welcome to Lector"}),
         );
         assert!(first.get("error").is_none(), "native TTS error: {first}");
         wait_for_speech_events(&event_log, 1);
-        let second = rpc(
+        wait_for_protocol_end(&mut stdout, "first");
+        let second = native_rpc(
+            &mut stdin,
+            &mut stdout,
             4,
-            "speak",
-            serde_json::json!({"text": "LECTOR dash- BELL dash- READY bar ENV colon: xterm dash- 256color colon: unset", "interrupt": false}),
+            "speech.speak",
+            serde_json::json!({"utteranceId": "second", "text": "LECTOR dash- BELL dash- READY bar ENV colon: xterm dash- 256color colon: unset"}),
         );
         assert!(second.get("error").is_none(), "native TTS error: {second}");
         thread::sleep(Duration::from_millis(100));
-        let stopped = rpc(5, "stop", Value::Null);
+        let stopped = native_rpc(
+            &mut stdin,
+            &mut stdout,
+            5,
+            "speech.stop",
+            serde_json::json!({"utteranceId": "second"}),
+        );
         assert!(
             stopped.get("error").is_none(),
             "native TTS error: {stopped}"
         );
-        let third = rpc(
+        let third = native_rpc(
+            &mut stdin,
+            &mut stdout,
             6,
-            "speak",
-            serde_json::json!({"text": "LECTOR dash- BELL dash- READY bar ENV colon: xterm dash- 256color colon: unset", "interrupt": false}),
+            "speech.speak",
+            serde_json::json!({"utteranceId": "third", "text": "LECTOR dash- BELL dash- READY bar ENV colon: xterm dash- 256color colon: unset"}),
         );
         assert!(third.get("error").is_none(), "native TTS error: {third}");
         wait_for_speech_events(&event_log, 2);
@@ -366,6 +382,52 @@ fn native_tts_server_advances_past_its_first_utterance() {
     let status = child.wait().expect("wait for native TTS server");
     assert!(status.success());
     fs::remove_file(event_log).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn native_rpc(
+    stdin: &mut impl Write,
+    stdout: &mut impl BufRead,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> Value {
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        })
+    )
+    .expect("write native TTS request");
+    stdin.flush().expect("flush native TTS request");
+    loop {
+        let mut frame = String::new();
+        stdout.read_line(&mut frame).expect("read native TTS frame");
+        let message: Value = serde_json::from_str(&frame).expect("parse native TTS frame");
+        if message["id"] == id {
+            return message;
+        }
+        assert_eq!(message["method"], "speech.event");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_protocol_end(stdout: &mut impl BufRead, utterance_id: &str) {
+    loop {
+        let mut frame = String::new();
+        stdout.read_line(&mut frame).expect("read native TTS event");
+        let message: Value = serde_json::from_str(&frame).expect("parse native TTS event");
+        if message["method"] == "speech.event"
+            && message["params"]["utteranceId"] == utterance_id
+            && message["params"]["event"]["type"] == "ended"
+        {
+            return;
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]

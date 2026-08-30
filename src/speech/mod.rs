@@ -3,13 +3,17 @@ use regex::Regex;
 use std::{fmt::Write, sync::LazyLock};
 use unicode_segmentation::UnicodeSegmentation;
 
+use protocol::UtteranceId;
+
 pub mod proc_driver;
+pub mod protocol;
 pub mod supervisor;
 pub mod symbols;
 pub mod tts;
 pub mod worker;
 
 mod config;
+pub mod manager;
 pub use config::SpeechServerSpec;
 
 const MIN_REPEAT_COUNT: usize = 4;
@@ -32,7 +36,38 @@ pub enum Error {
 
 pub trait Driver {
     fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()>;
+
+    /// Submit an utterance carrying Lector's session-wide logical identifier.
+    /// In-process test and compatibility drivers may ignore the identifier.
+    fn speak_utterance(
+        &mut self,
+        _id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+    ) -> DriverResult<()> {
+        self.speak(text, interrupt)
+    }
+
     fn stop(&mut self) -> DriverResult<()>;
+
+    /// Toggle the resumable-pause state. Drivers without that capability use
+    /// the conservative one-way stop fallback.
+    fn toggle_pause(&mut self) -> DriverResult<()> {
+        self.stop()
+    }
+
+    /// Let an asynchronous backend consume lifecycle events while idle.
+    fn poll(&mut self) -> DriverResult<()> {
+        Ok(())
+    }
+
+    /// Whether separate non-interrupting submissions have an evidence-backed
+    /// ordering mechanism. False is the conservative default: callers can
+    /// still speak, but must keep one announcement in one utterance.
+    fn supports_ordered_utterances(&self) -> bool {
+        false
+    }
+
     fn get_rate(&self) -> f32;
     fn set_rate(&mut self, rate: f32) -> DriverResult<()>;
 
@@ -62,6 +97,7 @@ pub struct Speech {
     symbols_map: symbols::SymbolMap,
     processed: String,
     run: String,
+    next_utterance_id: u64,
 }
 
 impl Speech {
@@ -72,12 +108,15 @@ impl Speech {
             symbols_map: symbols::SymbolMap::default_map(),
             processed: String::new(),
             run: String::new(),
+            next_utterance_id: 1,
         }
     }
 
-    pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<()> {
+    pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<UtteranceId> {
+        let id = UtteranceId::new(self.next_utterance_id.to_string());
+        self.next_utterance_id = self.next_utterance_id.wrapping_add(1);
         if text.is_empty() {
-            return Ok(());
+            return Ok(id);
         }
 
         let mut processed = std::mem::take(&mut self.processed);
@@ -186,17 +225,41 @@ impl Speech {
         let result = {
             let expanded_start = EXPAND_START_CAPS.replace_all(&processed, "$1 $2");
             let expanded_end = EXPAND_END_CAPS.replace_all(&expanded_start, "$1 $2");
-            self.driver
-                .speak(expanded_end.as_ref(), interrupt)
-                .map_err(Error::Driver)
+            let chunks = if self.driver.supports_ordered_utterances() {
+                split_paragraphs(expanded_end.as_ref())
+            } else {
+                let text = split_paragraphs(expanded_end.as_ref()).join(" ");
+                (!text.is_empty()).then_some(text).into_iter().collect()
+            };
+            let multiple = chunks.len() > 1;
+            let mut result = Ok(());
+            for (index, chunk) in chunks.iter().enumerate() {
+                let chunk_id = if multiple {
+                    id.chunk(index)
+                } else {
+                    id.clone()
+                };
+                if let Err(error) =
+                    self.driver
+                        .speak_utterance(&chunk_id, chunk, interrupt && index == 0)
+                {
+                    result = Err(Error::Driver(error));
+                    break;
+                }
+            }
+            result
         };
         self.processed = processed;
         self.run = run_string;
-        result
+        result.map(|()| id)
     }
 
     pub fn stop(&mut self) -> Result<()> {
         self.driver.stop().map_err(Error::Driver)
+    }
+
+    pub fn toggle_pause(&mut self) -> Result<()> {
+        self.driver.toggle_pause().map_err(Error::Driver)
     }
 
     pub fn get_rate(&self) -> f32 {
@@ -263,9 +326,48 @@ impl Speech {
     }
 }
 
+/// Collapse one physical line boundary to a space and split a logical
+/// paragraph boundary into independently sequenced utterances. CRLF is one
+/// boundary; lone CR is accepted for terminal-originated text.
+fn split_paragraphs(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    if !text.contains(['\r', '\n']) {
+        return vec![text.to_owned()];
+    }
+
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut chunks = Vec::new();
+    let mut chunk = String::with_capacity(normalized.len());
+    let mut newlines = 0usize;
+    for character in normalized.chars() {
+        if character == '\n' {
+            newlines = newlines.saturating_add(1);
+            continue;
+        }
+        if newlines == 1 {
+            chunk.push(' ');
+        } else if newlines >= 2 {
+            let paragraph = chunk.trim().to_owned();
+            if !paragraph.is_empty() {
+                chunks.push(paragraph);
+            }
+            chunk.clear();
+        }
+        newlines = 0;
+        chunk.push(character);
+    }
+    let paragraph = chunk.trim().to_owned();
+    if !paragraph.is_empty() {
+        chunks.push(paragraph);
+    }
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Driver, Error, Speech, symbols};
+    use super::{Driver, Error, Speech, protocol::UtteranceId, split_paragraphs, symbols};
     use std::{cell::RefCell, rc::Rc};
 
     struct RecordingDriver(Rc<RefCell<Vec<String>>>);
@@ -278,6 +380,10 @@ mod tests {
 
         fn stop(&mut self) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        fn supports_ordered_utterances(&self) -> bool {
+            true
         }
 
         fn get_rate(&self) -> f32 {
@@ -308,6 +414,108 @@ mod tests {
             output.borrow().as_slice(),
             ["camel Case HTTP Server  4  number  ", " space "]
         );
+    }
+
+    #[test]
+    fn one_newline_is_space_and_paragraph_boundaries_are_separate_chunks() {
+        assert_eq!(split_paragraphs("hello\nworld"), ["hello world"]);
+        assert_eq!(
+            split_paragraphs("first\n\nsecond\r\n\r\nthird"),
+            ["first", "second", "third"]
+        );
+        assert_eq!(split_paragraphs("one\rline"), ["one line"]);
+        assert_eq!(split_paragraphs("a\0b"), ["a\0b"]);
+
+        let (mut speech, output) = recorder();
+        speech.speak("hello\nworld", false).unwrap();
+        speech.speak("first\n\nsecond", false).unwrap();
+        assert_eq!(
+            output.borrow().as_slice(),
+            ["hello world", "first", "second"]
+        );
+    }
+
+    struct IdDriver(Rc<RefCell<Vec<(String, String, bool)>>>);
+
+    impl Driver for IdDriver {
+        fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
+            unreachable!("Speech submits identified utterances")
+        }
+
+        fn speak_utterance(
+            &mut self,
+            id: &UtteranceId,
+            text: &str,
+            interrupt: bool,
+        ) -> anyhow::Result<()> {
+            self.0
+                .borrow_mut()
+                .push((id.as_str().to_owned(), text.to_owned(), interrupt));
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_ordered_utterances(&self) -> bool {
+            true
+        }
+
+        fn get_rate(&self) -> f32 {
+            1.0
+        }
+
+        fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn speak_returns_a_logical_id_and_chunks_have_stable_child_ids() {
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut speech = Speech::new(Box::new(IdDriver(Rc::clone(&calls))));
+
+        let id = speech.speak("first\n\nsecond", true).unwrap();
+
+        assert_eq!(id.as_str(), "1");
+        assert_eq!(
+            calls.borrow().as_slice(),
+            [
+                ("1:0".to_owned(), "first".to_owned(), true),
+                ("1:1".to_owned(), "second".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn host_without_terminal_evidence_receives_one_normalized_utterance() {
+        struct Unsequenced(Rc<RefCell<Vec<String>>>);
+
+        impl Driver for Unsequenced {
+            fn speak(&mut self, text: &str, _interrupt: bool) -> anyhow::Result<()> {
+                self.0.borrow_mut().push(text.to_owned());
+                Ok(())
+            }
+
+            fn stop(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn get_rate(&self) -> f32 {
+                1.0
+            }
+
+            fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut speech = Speech::new(Box::new(Unsequenced(Rc::clone(&calls))));
+        speech.speak("first\n\nsecond\nthird", false).unwrap();
+
+        assert_eq!(calls.borrow().as_slice(), ["first second third"]);
     }
 
     #[test]

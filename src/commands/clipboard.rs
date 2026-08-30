@@ -102,8 +102,12 @@ fn paste_from(sr: &mut ScreenReader, register: ClipboardRegister) -> Result<Comm
 
 pub(super) fn previous(sr: &mut ScreenReader) -> Result<CommandResult> {
     match sr.previous_clipboard()? {
-        ClipboardMove::Empty => sr.speak("no clipboard", false)?,
-        ClipboardMove::Boundary => sr.speak("first clipboard", false)?,
+        ClipboardMove::Empty => {
+            sr.speak("no clipboard", false)?;
+        }
+        ClipboardMove::Boundary => {
+            sr.speak("first clipboard", false)?;
+        }
         ClipboardMove::Selected => {
             say(sr)?;
         }
@@ -113,8 +117,12 @@ pub(super) fn previous(sr: &mut ScreenReader) -> Result<CommandResult> {
 
 pub(super) fn next(sr: &mut ScreenReader) -> Result<CommandResult> {
     match sr.next_clipboard()? {
-        ClipboardMove::Empty => sr.speak("no clipboard", false)?,
-        ClipboardMove::Boundary => sr.speak("last clipboard", false)?,
+        ClipboardMove::Empty => {
+            sr.speak("no clipboard", false)?;
+        }
+        ClipboardMove::Boundary => {
+            sr.speak("last clipboard", false)?;
+        }
         ClipboardMove::Selected => {
             say(sr)?;
         }

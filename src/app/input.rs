@@ -336,13 +336,24 @@ impl App {
         }
         self.view_transition_key_presses.remove(&key_id);
 
-        self.update_last_key(sr, raw, true)?;
+        let binding_name = self.key_event_binding_name(key_event);
+        let is_pause_command = binding_name
+            .as_deref()
+            .and_then(|name| sr.key_bindings().binding_for_mode(sr.input_mode(), name))
+            .is_some_and(|binding| {
+                matches!(binding, Binding::Builtin(commands::Action::StopSpeaking))
+            });
+        self.update_last_key(sr, raw, true, !is_pause_command)?;
         if sr.take_pass_through() {
+            if is_pause_command {
+                // Pass-through makes this physical key ordinary application
+                // input, so it retains ordinary interruption semantics.
+                sr.stop_speaking()?;
+            }
             self.consumed_key_presses.remove(&key_id);
             return self.dispatch_key_to_view(sr, &key, raw, pty_out, term_out);
         }
 
-        let binding_name = self.key_event_binding_name(key_event);
         let preempts_tmux_prefix = binding_name
             .as_deref()
             .and_then(|name| sr.key_bindings().binding_for_mode(sr.input_mode(), name))
@@ -748,7 +759,7 @@ impl App {
     ) -> Result<()> {
         self.log_bytes("forwarding raw bytes to active view", raw);
         sr.clear_pending_visual_focus_input();
-        self.update_last_key(sr, raw, false)?;
+        self.update_last_key(sr, raw, false, true)?;
         let _ = sr.take_pass_through();
         self.dispatch_to_view(sr, raw, pty_out, term_out)
     }
@@ -758,6 +769,7 @@ impl App {
         sr: &mut ScreenReader,
         raw: &[u8],
         decoded_key_event: bool,
+        interrupt_speech: bool,
     ) -> Result<()> {
         sr.clear_pending_history_navigation();
         // A decoded key press should always interrupt speech. In particular, Kitty's
@@ -765,7 +777,9 @@ impl App {
         // look like non-key terminal traffic to the raw-byte heuristic below.
         if decoded_key_event || !ANSI_CSI_RE.is_match(raw) {
             sr.record_last_key(raw);
-            sr.stop_speaking()?;
+            if interrupt_speech {
+                sr.stop_speaking()?;
+            }
         }
         Ok(())
     }

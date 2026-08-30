@@ -1,33 +1,30 @@
 {
   "openrpc": "1.4.0",
   "info": {
-    "title": "Lector speech driver protocol",
-    "description": "The version 1.0 JSON-RPC interface between Lector and a spawned speech server. Messages are UTF-8, newline-delimited JSON objects over the child process's stdin and stdout. See docs/speech-driver-protocol.md for transport, lifecycle, timeout, and recovery requirements.",
+    "title": "Lector speech-host protocol",
+    "description": "Version 2.0 of the bidirectional JSON-RPC interface between Lector and a spawned speech host. Messages are UTF-8 NDJSON over stdio. See docs/speech-driver-protocol.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/license/mit"
     },
-    "version": "1.0.0"
+    "version": "2.0.0"
   },
   "externalDocs": {
-    "description": "Normative transport and lifecycle specification",
+    "description": "Normative RFC-style protocol specification",
     "url": "./docs/speech-driver-protocol.md"
   },
   "methods": [
     {
       "name": "initialize",
-      "summary": "Negotiate the speech protocol and identify both peers",
-      "description": "Lector sends initialize once, as the first call in a new server process. The server must return protocol version 1.0 and all required version 1.0 capabilities before Lector sends speech operations.",
+      "summary": "Negotiate a protocol version and host capabilities",
+      "description": "Sent once before speech methods. rpc.discover is the only method also available before initialization.",
       "paramStructure": "by-name",
       "params": [
         {
-          "name": "protocol_version",
+          "name": "protocol",
           "required": true,
           "schema": {
-            "type": "string",
-            "enum": [
-              "1.0"
-            ]
+            "$ref": "#/components/schemas/ProtocolRange"
           }
         },
         {
@@ -35,6 +32,13 @@
           "required": true,
           "schema": {
             "$ref": "#/components/schemas/PeerInfo"
+          }
+        },
+        {
+          "name": "clientCapabilities",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/ClientCapabilities"
           }
         }
       ],
@@ -47,50 +51,47 @@
       },
       "errors": [
         {
-          "code": -32602,
-          "message": "Invalid params"
+          "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "code": -32001,
-          "message": "Unsupported speech protocol version"
+          "$ref": "#/components/errors/UnsupportedProtocol"
         }
       ]
     },
     {
       "name": "rpc.discover",
-      "summary": "Return this server's OpenRPC document",
-      "description": "Returns an OpenRPC document describing the speech interface implemented by the running server. It is available before and after initialize.",
+      "summary": "Return this host's OpenRPC document",
+      "description": "Available before and after initialize. It takes no parameters.",
       "params": [],
       "result": {
-        "name": "openrpc_document",
+        "name": "openrpcDocument",
         "required": true,
         "schema": {
           "type": "object",
-          "description": "An OpenRPC document compatible with the repository's canonical openrpc.json.",
           "additionalProperties": true
         }
       }
     },
     {
-      "name": "speak",
-      "summary": "Submit text for speech",
-      "description": "Accept text for asynchronous speech. A successful response means the request was accepted, not that playback completed. When interrupt is true, the server stops current and queued speech before accepting this text.",
+      "name": "speech.speak",
+      "summary": "Accept one active logical utterance",
+      "description": "The host must reject this call while another logical utterance is active. Lector owns queueing.",
       "paramStructure": "by-name",
       "params": [
+        {
+          "name": "utteranceId",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/UtteranceId"
+          }
+        },
         {
           "name": "text",
           "required": true,
           "schema": {
             "type": "string",
             "minLength": 1,
-            "description": "UTF-8 text to speak. Lector bounds one announcement to 64 KiB before transport encoding."
-          }
-        },
-        {
-          "name": "interrupt",
-          "required": true,
-          "schema": {
-            "type": "boolean"
+            "x-lector-maximumUtf8Bytes": 65536
           }
         }
       ],
@@ -98,51 +99,129 @@
         "name": "accepted",
         "required": true,
         "schema": {
-          "type": "null"
+          "$ref": "#/components/schemas/AcceptedResult"
         }
       },
       "errors": [
         {
-          "code": -32600,
-          "message": "Speech server is not initialized"
+          "$ref": "#/components/errors/InvalidState"
         },
         {
-          "code": -32602,
-          "message": "Invalid params"
+          "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "code": -32603,
-          "message": "Speech backend error"
+          "$ref": "#/components/errors/BackendError"
         }
       ]
     },
     {
-      "name": "stop",
-      "summary": "Stop current and queued speech",
-      "description": "Stop active playback and discard speech queued by the server.",
-      "params": [],
+      "name": "speech.stop",
+      "summary": "Cancel the identified active utterance",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "utteranceId",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/UtteranceId"
+          }
+        }
+      ],
       "result": {
-        "name": "stopped",
+        "name": "accepted",
         "required": true,
         "schema": {
-          "type": "null"
+          "$ref": "#/components/schemas/AcceptedResult"
         }
       },
       "errors": [
         {
-          "code": -32600,
-          "message": "Speech server is not initialized"
+          "$ref": "#/components/errors/InvalidState"
         },
         {
-          "code": -32603,
-          "message": "Speech backend error"
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/BackendError"
         }
       ]
     },
     {
-      "name": "set_rate",
-      "summary": "Set the speaking rate",
-      "description": "Set the backend's speaking rate. A server may clamp the requested number to its supported range and returns the effective rate.",
+      "name": "speech.pause",
+      "summary": "Pause and capture a resumable position",
+      "description": "Implemented only when controls.pauseResume advertises a supported mode.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "utteranceId",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/UtteranceId"
+          }
+        }
+      ],
+      "result": {
+        "name": "pause",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/PauseResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidState"
+        },
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/MethodNotFound"
+        },
+        {
+          "$ref": "#/components/errors/BackendError"
+        }
+      ]
+    },
+    {
+      "name": "speech.resume",
+      "summary": "Resume the identified paused utterance",
+      "description": "For restartFromWord, resynthesis starts at the exact UTF-8 word position returned by speech.pause.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "utteranceId",
+          "required": true,
+          "schema": {
+            "$ref": "#/components/schemas/UtteranceId"
+          }
+        }
+      ],
+      "result": {
+        "name": "accepted",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/AcceptedResult"
+        }
+      },
+      "errors": [
+        {
+          "$ref": "#/components/errors/InvalidState"
+        },
+        {
+          "$ref": "#/components/errors/InvalidParams"
+        },
+        {
+          "$ref": "#/components/errors/MethodNotFound"
+        },
+        {
+          "$ref": "#/components/errors/BackendError"
+        }
+      ]
+    },
+    {
+      "name": "speech.setRate",
+      "summary": "Set the host speaking rate",
+      "description": "The host may clamp the request and returns its finite effective value.",
       "paramStructure": "by-name",
       "params": [
         {
@@ -150,12 +229,12 @@
           "required": true,
           "schema": {
             "type": "number",
-            "description": "Finite backend speaking-rate value requested by Lector."
+            "description": "A finite value in the host backend's rate domain."
           }
         }
       ],
       "result": {
-        "name": "effective_rate",
+        "name": "effectiveRate",
         "required": true,
         "schema": {
           "$ref": "#/components/schemas/SetRateResult"
@@ -163,25 +242,87 @@
       },
       "errors": [
         {
-          "code": -32600,
-          "message": "Speech server is not initialized"
+          "$ref": "#/components/errors/InvalidParams"
         },
         {
-          "code": -32602,
-          "message": "Invalid params"
+          "$ref": "#/components/errors/MethodNotFound"
         },
         {
-          "code": -32603,
-          "message": "Speech backend error"
+          "$ref": "#/components/errors/BackendError"
         }
       ]
     }
   ],
   "components": {
+    "errors": {
+      "InvalidState": {
+        "code": -32600,
+        "message": "Invalid request or state transition"
+      },
+      "MethodNotFound": {
+        "code": -32601,
+        "message": "Method or capability not supported"
+      },
+      "InvalidParams": {
+        "code": -32602,
+        "message": "Invalid params"
+      },
+      "BackendError": {
+        "code": -32603,
+        "message": "Speech backend error"
+      },
+      "UnsupportedProtocol": {
+        "code": -32001,
+        "message": "No compatible Lector speech protocol version"
+      }
+    },
     "schemas": {
+      "ProtocolRange": {
+        "type": "object",
+        "required": [
+          "major",
+          "minimumMinor",
+          "maximumMinor"
+        ],
+        "properties": {
+          "major": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "minimumMinor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "maximumMinor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProtocolVersion": {
+        "type": "object",
+        "required": [
+          "major",
+          "minor"
+        ],
+        "properties": {
+          "major": {
+            "const": 2
+          },
+          "minor": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          }
+        },
+        "additionalProperties": true
+      },
       "PeerInfo": {
         "type": "object",
-        "additionalProperties": false,
         "required": [
           "name",
           "version"
@@ -195,77 +336,382 @@
             "type": "string",
             "minLength": 1
           }
-        }
+        },
+        "additionalProperties": true
       },
-      "Capabilities": {
+      "ClientCapabilities": {
         "type": "object",
-        "additionalProperties": false,
         "required": [
-          "speak",
-          "stop",
-          "set_rate",
-          "rpc_discover"
+          "speechEvents",
+          "progressModes"
         ],
         "properties": {
-          "speak": {
+          "speechEvents": {
             "const": true
           },
-          "stop": {
-            "const": true
-          },
-          "set_rate": {
-            "const": true
-          },
-          "rpc_discover": {
-            "const": true
+          "progressModes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
           }
-        }
+        },
+        "additionalProperties": true
       },
       "InitializeResult": {
         "type": "object",
-        "additionalProperties": false,
         "required": [
-          "protocol_version",
+          "protocol",
           "server",
           "capabilities"
         ],
         "properties": {
-          "protocol_version": {
-            "type": "string",
-            "enum": [
-              "1.0"
-            ]
+          "protocol": {
+            "$ref": "#/components/schemas/ProtocolVersion"
           },
           "server": {
             "$ref": "#/components/schemas/PeerInfo"
           },
           "capabilities": {
-            "$ref": "#/components/schemas/Capabilities"
+            "$ref": "#/components/schemas/SpeechCapabilities"
           }
-        }
+        },
+        "additionalProperties": true
+      },
+      "SpeechCapabilities": {
+        "type": "object",
+        "properties": {
+          "lifecycle": {
+            "$ref": "#/components/schemas/LifecycleCapabilities"
+          },
+          "progress": {
+            "$ref": "#/components/schemas/ProgressCapabilities"
+          },
+          "controls": {
+            "$ref": "#/components/schemas/ControlCapabilities"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/SettingCapabilities"
+          }
+        },
+        "additionalProperties": true,
+        "description": "Missing and unknown capabilities are unsupported."
+      },
+      "DeliveryGuarantee": {
+        "type": "string",
+        "examples": [
+          "reliable",
+          "bestEffort",
+          "unsupported"
+        ],
+        "x-lector-knownValues": [
+          "reliable",
+          "bestEffort",
+          "unsupported"
+        ],
+        "description": "Unknown values are treated as unsupported."
+      },
+      "EventCapability": {
+        "type": "object",
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/DeliveryGuarantee"
+          }
+        },
+        "additionalProperties": true
+      },
+      "TerminalCapability": {
+        "type": "object",
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/DeliveryGuarantee"
+          },
+          "distinguishes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "LifecycleCapabilities": {
+        "type": "object",
+        "properties": {
+          "started": {
+            "$ref": "#/components/schemas/EventCapability"
+          },
+          "terminal": {
+            "$ref": "#/components/schemas/TerminalCapability"
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProgressMode": {
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "examples": [
+              "utf8ByteOffset",
+              "marker"
+            ]
+          },
+          "granularity": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "ProgressCapabilities": {
+        "type": "object",
+        "properties": {
+          "modes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProgressMode"
+            }
+          }
+        },
+        "additionalProperties": true
+      },
+      "StopSupport": {
+        "type": "string",
+        "examples": [
+          "confirmed",
+          "bestEffort",
+          "unsupported"
+        ],
+        "x-lector-knownValues": [
+          "confirmed",
+          "bestEffort",
+          "unsupported"
+        ],
+        "description": "Unknown values are treated as unsupported."
+      },
+      "PauseResumeSupport": {
+        "type": "string",
+        "examples": [
+          "restartFromWord",
+          "unsupported"
+        ],
+        "x-lector-knownValues": [
+          "restartFromWord",
+          "unsupported"
+        ],
+        "description": "restartFromWord also requires word-granularity utf8ByteOffset progress."
+      },
+      "ControlCapabilities": {
+        "type": "object",
+        "properties": {
+          "stop": {
+            "$ref": "#/components/schemas/StopSupport"
+          },
+          "pauseResume": {
+            "$ref": "#/components/schemas/PauseResumeSupport"
+          }
+        },
+        "additionalProperties": true
+      },
+      "SettingSupport": {
+        "type": "string",
+        "examples": [
+          "readWrite",
+          "writeOnly",
+          "unsupported"
+        ],
+        "x-lector-knownValues": [
+          "readWrite",
+          "writeOnly",
+          "unsupported"
+        ],
+        "description": "Unknown values are treated as unsupported."
+      },
+      "SettingCapabilities": {
+        "type": "object",
+        "properties": {
+          "rate": {
+            "$ref": "#/components/schemas/SettingSupport"
+          }
+        },
+        "additionalProperties": true
+      },
+      "UtteranceId": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "x-lector-maximumUtf8Bytes": 128,
+        "description": "Opaque Lector-assigned identifier. It is always a JSON string."
+      },
+      "AcceptedResult": {
+        "type": "object",
+        "required": [
+          "accepted"
+        ],
+        "properties": {
+          "accepted": {
+            "const": true
+          }
+        },
+        "additionalProperties": true
+      },
+      "TextPosition": {
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "examples": [
+              "utf8ByteOffset",
+              "marker"
+            ]
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "A character boundary in the UTF-8 bytes of the original speech.speak text."
+          },
+          "id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "additionalProperties": true,
+        "description": "utf8ByteOffset requires offset; marker requires id. Unknown kinds must be ignored."
+      },
+      "PauseResult": {
+        "type": "object",
+        "required": [
+          "paused"
+        ],
+        "properties": {
+          "paused": {
+            "type": "boolean"
+          },
+          "position": {
+            "$ref": "#/components/schemas/TextPosition"
+          }
+        },
+        "additionalProperties": true,
+        "description": "paused=true requires a valid position; paused=false omits position."
       },
       "SetRateResult": {
         "type": "object",
-        "additionalProperties": false,
         "required": [
           "rate"
         ],
         "properties": {
           "rate": {
             "type": "number",
-            "description": "The finite rate actually selected by the backend."
+            "description": "The finite effective backend rate."
           }
-        }
+        },
+        "additionalProperties": true
+      },
+      "SpeechEvent": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "examples": [
+              "started",
+              "progress",
+              "paused",
+              "resumed",
+              "ended"
+            ]
+          },
+          "position": {
+            "$ref": "#/components/schemas/TextPosition"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "examples": [
+              "completed",
+              "cancelled",
+              "failed"
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": true,
+        "description": "progress and paused require position; ended requires reason. Unknown event types are ignored."
+      },
+      "SpeechEventNotificationParams": {
+        "type": "object",
+        "required": [
+          "utteranceId",
+          "sequence",
+          "event"
+        ],
+        "properties": {
+          "utteranceId": {
+            "$ref": "#/components/schemas/UtteranceId"
+          },
+          "sequence": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "event": {
+            "$ref": "#/components/schemas/SpeechEvent"
+          }
+        },
+        "additionalProperties": true
       }
     }
   },
+  "x-lector-notifications": [
+    {
+      "name": "speech.event",
+      "direction": "server-to-client",
+      "description": "Correlated lifecycle or progress evidence. The JSON-RPC object has no id and receives no response.",
+      "params": {
+        "$ref": "#/components/schemas/SpeechEventNotificationParams"
+      }
+    }
+  ],
   "x-lector-transport": {
     "kind": "stdio",
     "encoding": "utf-8",
     "framing": "ndjson-lf",
     "maximumFrameBytes": 1048576,
     "maximumInFlightRequests": 1,
+    "serverNotifications": true,
+    "serverRequests": false,
+    "batchRequests": false,
     "initializeDeadlineMilliseconds": 5000,
     "requestDeadlineMilliseconds": 1000
+  },
+  "x-lector-protocol": {
+    "major": 2,
+    "minor": 0,
+    "unknownMembers": "ignore",
+    "unknownCapabilities": "unsupported",
+    "unknownNotifications": "ignore",
+    "positionEncoding": "utf-8",
+    "hostMaximumActiveUtterances": 1,
+    "queueOwner": "client",
+    "requiredHostCapabilities": [
+      "controls.stop"
+    ]
   }
 }
