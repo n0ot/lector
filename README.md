@@ -108,15 +108,17 @@ troubleshooting, and recovery are in
 is in [docs/tmux-prefix.md](docs/tmux-prefix.md).
 
 An in-place application title change or tmux rename updates Lector's model but
-is not announced automatically. Switching tmux windows announces only the new
-window title, followed by the application cursor line once the composed frame
-is physically stable; it does not read the full `tmux session index title`
-label. Pane switches read only the new cursor line. Alternate-screen,
-overlay/base, window, session, and pane handoffs reset auto-read diff state so
-hidden or previous-context changes cannot replay as a whole-screen diff. A
-primary/alternate handoff reads the newly active visible screen in full because
-the two screens have independent row identities. Resize/reflow and terminal
-reset boundaries use the same conservative full-visible-screen behavior.
+is not announced automatically. A context handoff announces the current title
+only after the matching composed frame is physically stable; it does not read
+the full `tmux session index title` label. Each overlay, base view, tmux pane,
+and primary or alternate terminal screen is an independently checkpointed
+accessible document. The checkpoint is the exact document presented when the
+user left. Returning compares the current document with that checkpoint, so
+only output which arrived while it was hidden is read; an unchanged return is
+not introduced again. A context with no checkpoint reads its visible screen in
+full. Resize/reflow and terminal reset increment the document's comparison
+epoch, making an older checkpoint incomparable and conservatively introducing
+the current visible screen.
 
 For crash and hang diagnosis, the repository includes a socket-free hostile
 control peer and a kill-bounded live suite covering malformed records, silent
@@ -310,10 +312,32 @@ SHELL=/bin/zsh cargo run
 
 ## Speech
 
-Lector uses native speech by default. It hosts native TTS in an internal
-instance of the current Lector executable, keeping system speech and its macOS
-run loop away from terminal input and rendering. There is no separate native
-speech executable to install.
+Lector uses native speech by default. `lector tts` runs its cross-platform
+speech host, keeping system speech and platform event loops away from terminal
+input and rendering. A normal Lector installation therefore remains
+self-contained; there is no second executable to install on the same machine.
+
+The same implementation is also built as the standalone `lector-tts` binary.
+It is not Windows-specific: it can run wherever its selected backend is
+supported, independently of whether the full Lector terminal application runs
+there. This makes arrangements such as Lector on Linux with speech on macOS or
+Windows possible over a user-provided stdio bridge.
+
+Inspect and select native engines and voices with:
+
+```bash
+lector tts --list-backends
+lector tts --backend av-foundation --list-voices
+lector tts --backend av-foundation --voice VOICE_ID
+
+# The standalone executable has the same options and protocol behavior.
+lector-tts --backend nvda
+```
+
+The host reports its selected backend during protocol initialization. Rate,
+voice listing, current-voice reporting, and voice selection are negotiated
+independently. Lector does not call unsupported rate operations or invent a
+`default` voice for externally managed backends such as NVDA.
 
 Speech selection is Lua configuration, not a command-line driver setting:
 
@@ -323,15 +347,28 @@ lector.o.speech = "native"
 
 -- Or start a custom server with an exact argument vector.
 lector.o.speech = {
-  program = "/opt/lector-speech/bin/server",
-  args = { "--voice", "Alex" },
+  program = "/opt/lector/bin/lector-tts",
+  args = { "--backend", "speech-dispatcher" },
 }
 ```
 
+For example, an SSH stdio bridge can be expressed without any special Lector
+transport support:
+
+```lua
+lector.o.speech = {
+  program = "ssh",
+  args = { "speech-mac", "lector-tts", "--backend", "av-foundation" },
+}
+```
+
+SSH setup, authentication, reconnect behavior, and the security of that link
+remain the user's responsibility.
+
 Lector invokes `program` directly; it does not perform shell parsing. At
 startup it loads `init.lua`, starts and initializes the selected server, and
-then restores the configured speech rate. Assigning `lector.o.speech` is a
-top-level configuration operation.
+then restores the configured speech rate only when the negotiated backend can
+set it. Assigning `lector.o.speech` is a top-level configuration operation.
 
 The Lua REPL and hooks can request a nonblocking, transactional runtime switch:
 
@@ -350,8 +387,9 @@ calls `lector.hooks.on_error(message, "speech-reconfigure")`.
 
 Custom servers use the bidirectional version 2 speech-host protocol: bounded
 UTF-8 NDJSON JSON-RPC 2.0 over stdin/stdout, with explicit capabilities and
-correlated lifecycle/progress events. The
-canonical [`openrpc.json`](openrpc.json) makes the methods machine-readable,
+correlated lifecycle/progress events. The canonical
+[`crates/lector-tts/openrpc.json`](crates/lector-tts/openrpc.json) makes the
+methods machine-readable,
 and [the speech driver protocol](docs/speech-driver-protocol.md) defines exact
 framing, initialization, deadlines, errors, process cleanup, and the 30-second
 restart policy. Speech RPC and deadlines run only on the speech worker, so a

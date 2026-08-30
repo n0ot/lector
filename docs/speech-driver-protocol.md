@@ -4,7 +4,8 @@ Status: project specification
 
 Protocol: `2.0`
 
-Machine-readable definition: [`../openrpc.json`](../openrpc.json)
+Machine-readable definition:
+[`../crates/lector-tts/openrpc.json`](../crates/lector-tts/openrpc.json)
 
 This document is the normative transport, capability, and state-machine
 contract for a Lector speech host. The OpenRPC document is the normative schema
@@ -30,16 +31,29 @@ guarantees, not platform API names or native utterance identifiers.
 
 ## 2. Selecting and owning a host process
 
-Lector's default `native` host is the running Lector executable in a hidden
-server mode. An external host is selected in `init.lua` with an exact argument
-vector:
+Lector's default `native` host runs the same implementation exposed by
+`lector tts` inside the installed Lector executable. The independently
+buildable `lector-tts` executable runs that same library entrypoint, so the
+host can instead run on any supported machine. An external host is selected in
+`init.lua` with an exact argument vector:
 
 ```lua
 lector.o.speech = {
-  program = "/opt/lector-speech/bin/server",
-  args = { "--voice", "Alex" },
+  program = "/opt/lector/bin/lector-tts",
+  args = { "--backend", "av-foundation", "--voice", "VOICE_ID" },
 }
 ```
+
+`lector-tts --list-backends` lists stable backend IDs and current availability.
+`lector-tts --backend ID --list-voices` lists the selected backend's voices.
+Omitting `--backend` selects the first currently available backend. Backend
+selection is a host launch concern; initialization reports the effective
+backend identity so Lector never has to infer it.
+
+Because the protocol is stdio, the configured program may also be a bridge
+such as `ssh`, with its arguments ending in a remote `lector-tts` command.
+Lector does not prescribe or secure that bridge: process placement, transport,
+authentication, and reconnection remain the user's responsibility.
 
 Lector invokes no shell and performs no argument splitting. The direct child
 inherits Lector's environment and working directory. It MUST reserve stdin and
@@ -103,13 +117,16 @@ be `initialize`, exactly once:
 The host selects a minor version within the offered range:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":0},"server":{"name":"example-speech","version":"2.4.0"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite"}}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":0},"server":{"name":"lector-tts","version":"0.1.0"},"backend":{"id":"av-foundation","name":"AVFoundation"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite"},"voices":{"list":true,"current":true,"select":true}}}}
 ```
 
 The major version identifies an incompatible contract. Minor versions are
 backward-compatible additions. A host SHOULD select the highest mutually
 supported minor. With no compatible version it MUST return error `-32001`.
-Names and versions MUST be nonempty.
+Names and versions MUST be nonempty. `backend`, when present, identifies the
+engine selected inside a multi-backend host with a stable nonempty `id` and a
+nonempty display `name`. It is descriptive session metadata, not a claim that
+the backend's external service will remain continuously available.
 
 Protocol 2 clients MUST accept unknown object members, capability families,
 capability values, event types, terminal reasons, and progress-position kinds.
@@ -184,6 +201,20 @@ means `speech.setRate` returns the effective value. `writeOnly` exists for
 adapters that can apply but not independently inspect the value. Version 2
 Lector currently invokes `speech.setRate` for either advertised mode.
 
+### 5.5 Voices
+
+`voices.list`, `voices.current`, and `voices.select` are independent booleans.
+Missing flags are false. A true flag enables `speech.listVoices`,
+`speech.getVoice`, or `speech.setVoice`, respectively. A host MUST NOT invent a
+voice called `default` when the backend cannot identify or control its voice.
+This is particularly important for screen readers such as NVDA, whose voice is
+owned by the external screen reader: the built-in NVDA adapter advertises all
+three flags as false.
+
+This protocol version deliberately has no `isSpeaking` capability or method.
+Playback transitions rely on the negotiated lifecycle evidence described
+above, not on a sampled backend state.
+
 ## 6. Common data types
 
 An `utteranceId` is a nonempty opaque JSON string of at most 128 UTF-8 bytes.
@@ -216,9 +247,11 @@ All parameters use JSON-RPC by-name objects.
 ### 7.1 `rpc.discover`
 
 This method takes no parameters and returns an OpenRPC document compatible
-with [`../openrpc.json`](../openrpc.json). It is available before and after
-initialization. OpenRPC describes JSON shapes; this document still controls
-stdio framing, deadlines, process ownership, and recovery.
+with
+[`../crates/lector-tts/openrpc.json`](../crates/lector-tts/openrpc.json). It is
+available before and after initialization. OpenRPC describes JSON shapes; this
+document still controls stdio framing, deadlines, process ownership, and
+recovery.
 
 ### 7.2 `speech.speak`
 
@@ -304,7 +337,45 @@ retains the complete text for the same fresh-ID restart fallback.
 
 `rate` MUST be finite and uses the host backend's documented domain. The host
 MAY clamp it and returns the finite effective value. Lector restores this
-value when replacing a host process.
+value when replacing a host process. Lector MUST call this method only when
+`settings.rate` is `readWrite` or `writeOnly`; an unsupported host is neither
+queried for rate bounds nor asked to apply a rate.
+
+### 7.7 `speech.listVoices`
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"speech.listVoices"}
+{"jsonrpc":"2.0","id":7,"result":{"voices":[{"id":"voice-1","name":"Samantha","language":"en-US","gender":"female"}]}}
+```
+
+This method is available only when `voices.list` is true. IDs are opaque,
+nonempty backend-provided strings used for selection; names and BCP 47-style
+language strings are display metadata. The optional gender string is
+descriptive and extensible.
+
+### 7.8 `speech.getVoice`
+
+```json
+{"jsonrpc":"2.0","id":8,"method":"speech.getVoice"}
+{"jsonrpc":"2.0","id":8,"result":{"voice":{"id":"voice-1","name":"Samantha","language":"en-US","gender":"female"}}}
+```
+
+This method is available only when `voices.current` is true. `voice` may be
+`null` only when the backend can report that it is using an unnamed backend
+default. A host without current-voice support omits the capability and method;
+it does not return a fabricated default voice.
+
+### 7.9 `speech.setVoice`
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"speech.setVoice","params":{"voiceId":"voice-1"}}
+{"jsonrpc":"2.0","id":9,"result":{"voice":{"id":"voice-1","name":"Samantha","language":"en-US","gender":"female"}}}
+```
+
+This method is available only when `voices.select` is true. It selects an ID
+from the backend's voice namespace and returns the selected voice. Selection
+does not require `voices.current`; the three operations remain independently
+negotiated.
 
 ## 8. `speech.event` notifications
 
@@ -392,6 +463,14 @@ crash. A transport failure terminates and reaps that process generation. An
 in-flight utterance is never replayed because the host might have performed it;
 only queued utterances that were never submitted may survive replacement.
 
+An external service used by a backend may be transient without making the host
+transport fail. In particular, the built-in NVDA backend keeps the selected
+host alive when NVDA stops or is absent. Speak and stop requests made while it
+is absent are consumed without queuing audio for later replay; a failed
+terminal event completes an accepted utterance when correlated completion is
+needed. Future requests probe NVDA again, so speech resumes after NVDA returns.
+The host does not exit merely to renegotiate capabilities.
+
 Startup is attempted twice. At runtime, Lector allows one automatic restart in
 a rolling 30-second crash interval; a second failure inside the interval, or a
 failed replacement startup, is fatal. On normal shutdown Lector terminates and
@@ -430,4 +509,6 @@ A conforming version 2 host must:
 5. Translate native indexes to markers or valid UTF-8 byte boundaries.
 6. Implement pause/resume only if it restarts the interrupted word; otherwise
    advertise it as unsupported and provide stop for Lector's restart fallback.
-7. Respond inside the deadlines, exit on EOF, and clean up descendants.
+7. Invoke rate and voice operations only when their independent capabilities
+   are advertised; never fabricate an externally managed voice.
+8. Respond inside the deadlines, exit on EOF, and clean up descendants.

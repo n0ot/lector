@@ -15,7 +15,7 @@ read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
   configuration, bidirectional NDJSON JSON-RPC framing, capabilities, events,
   queue and pause state, deadlines, restart policy, and process cleanup. Its
   machine-readable method and message schema is
-  the repository-root [`openrpc.json`](../openrpc.json).
+  [`crates/lector-tts/openrpc.json`](../crates/lector-tts/openrpc.json).
 - [Application-authored accessibility](application-accessibility.md) defines
   the generic terminal protocol, fail-safe lifecycle, and pane isolation. The
   standalone [`lector.nvim`](https://github.com/n0ot/lector.nvim) plugin is its

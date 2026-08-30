@@ -9,8 +9,13 @@ pane or window is active and resume in their original owner later.
 
 That same pane-owned `View` also owns user and application accessibility state:
 the Review cursor and modes, APC auto-read and cursor-tracking policy, pending
-speech metadata, and image namespace. A tmux winlink is only another address
-for the stable `@window`; it never creates another pane `View`. Manual
+speech metadata, accessible-document departure checkpoints, and image
+namespace. Selecting another pane deactivates only the old pane document; it
+does not clear every pane's update state. When the pane is selected again,
+Lector compares its current complete document with the exact document which
+was presented at departure and reads only the hidden interval's changes. A
+tmux winlink is only another address for the stable `@window`; it never creates
+another pane `View`. Manual
 `link-window`, `move-window`, renumbering, and selection through a different
 session consequently preserve one in-memory copy of all of this state.
 

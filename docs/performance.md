@@ -140,7 +140,7 @@ Run the focused gates with:
 
 ```sh
 cargo test --locked --test live_pty direct_native_speech_continues_after_startup_and_never_blocks_input
-cargo test --locked --test speech proc_driver::native_tts_server_advances_past_its_first_utterance
+cargo test --locked --test speech proc_driver::lector_tts_host_advances_past_its_first_utterance
 cargo test --locked --test app neovim_atomic_redraw
 cargo test --locked --test live_pty key_to_pixel_latency -- --nocapture
 ```

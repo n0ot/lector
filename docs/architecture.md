@@ -19,12 +19,13 @@ Bounded workers isolate side effects that may block:
   overload and prioritizes cancellation and rate changes. JSON-RPC pipe readiness and
   absolute deadlines are worker-local; completion or fatal failure reaches the
   main loop through an event-driven control path rather than a polling timer.
-  The default native backend is hosted by a hidden instance of the current
-  Lector executable, so pipe I/O, AVFoundation utterance construction,
-  playback, and Core Foundation lifecycle work cannot stall terminal
-  processing. The host submits only Lector's one active utterance to
-  AVFoundation; the host-independent Lector manager keeps all never-submitted
-  speech bounded.
+  The default native backend is hosted by `lector tts`, which imports the same
+  `lector-tts` crate as the independently buildable host binary. Pipe I/O,
+  native utterance construction, playback, and platform lifecycle work cannot
+  stall terminal processing. Initialization identifies the selected backend
+  and independently negotiates rate and voice operations. The host submits
+  only Lector's one active utterance to the backend; the host-independent
+  Lector manager keeps all never-submitted speech bounded.
 - `diagnostics` owns log output. Producers enqueue records into a byte-bounded
   queue, and the event loop never performs the underlying file or stderr I/O.
 
@@ -175,6 +176,45 @@ view until the replacement scene flushes. Coordinate-dependent clicks and raw
 input still target the live logical UI, preserving the ordinary UI
 time-of-check to time-of-use behavior described above.
 
+## Accessible document contexts
+
+`View` is the common accessible-document model used by the terminal, Review,
+the Lua REPL, overlays, and each persistent tmux pane or portal. The compositor
+and tmux topology code report only two ownership transitions to that model:
+deactivation and activation. They do not implement their own screen-diff
+rules.
+
+Deactivation records the exact complete document which was accessible when
+the context lost ownership. This departure checkpoint is independent of
+`prev_screen`, parser update evidence, and the speech-finalization revision.
+Taking it therefore cannot consume pending speech, discard an unpresented
+revision, or move a stabilization deadline. A hidden model may continue to
+parse, render, and even finalize changes without overwriting the checkpoint.
+
+Activation selects the checkpoint for the now-current primary or alternate
+screen and makes it the comparison baseline. Automatic reading receives one
+of three capabilities from the model:
+
+- `CompleteDocument` when retained-history row identity is continuous;
+- `VisibleGrid` when only fixed visible coordinates remain trustworthy; or
+- `Reintroduce` when no mapping is safe.
+
+A first visit has no checkpoint and therefore introduces the visible grid.
+A return uses the departure checkpoint and reads only changes made while the
+context was hidden. Primary and alternate screens have separate checkpoint
+slots, so returning from an unchanged alternate screen to primary is silent
+while a first alternate-screen visit is introduced.
+
+Each `View` also owns a comparison epoch. Resize/reflow and terminal reset
+advance it at the terminal-model boundary. Checkpoints from an older epoch are
+incomparable and yield `Reintroduce`; auto-read does not need a resize-, reset-,
+overlay-, or tmux-specific branch. A complete-history lineage gap yields the
+more limited `VisibleGrid` comparison instead of guessing history identity.
+
+Activation announcements use the title from the completed presentation bundle,
+not a later logical controller value. This keeps both the selected document and
+its spoken name tied to the same physically flushed scene.
+
 Views removed from the logical stack remain owned only while they are named by
 the last presented scene or by a pending/started render receipt. This covers
 overlay dismissal, tmux connection and pane removal, portal teardown, and pane
@@ -274,10 +314,14 @@ replies because tmux is authoritative there.
   overlay stack.
 - `src/tmux_*.rs` contain protocol, topology, pane, input, prefix, and lifecycle
   boundaries.
-- `src/speech/` contains speech backends and their asynchronous isolation.
+- `src/speech/` contains Lector's speech manager, process client, supervisor,
+  and asynchronous isolation.
 - `src/lua/` exposes configuration and the REPL.
 - `crates/lector-ghostty/` is the safe Rust boundary around the native Ghostty
   terminal engine.
+- `crates/lector-tts/` contains the cross-platform TTS library, standalone
+  `lector-tts` host, shared protocol schema, and the entrypoint used by
+  `lector tts`.
 - `src/bin/` contains support tools, test servers, and benchmarks declared
   explicitly in `Cargo.toml`.
 - `tests/` contains integration and policy tests; `tests/fixtures/pty/` contains
