@@ -90,14 +90,12 @@ fn parse_settings(settings: &[u8]) -> Option<ApplicationAccessibilityPolicy> {
 }
 
 fn decode_speech(encoded: &[u8]) -> Option<String> {
-    if encoded.is_empty()
-        || !encoded.len().is_multiple_of(2)
-        || encoded.len() > MAX_SPEECH_BYTES * 2
-    {
+    let (pairs, remainder) = encoded.as_chunks::<2>();
+    if pairs.is_empty() || !remainder.is_empty() || pairs.len() > MAX_SPEECH_BYTES {
         return None;
     }
-    let mut decoded = Vec::with_capacity(encoded.len() / 2);
-    for pair in encoded.chunks_exact(2) {
+    let mut decoded = Vec::with_capacity(pairs.len());
+    for pair in pairs {
         decoded.push(hex_digit(pair[0])?.checked_mul(16)? + hex_digit(pair[1])?);
     }
     let text = String::from_utf8(decoded).ok()?;

@@ -604,10 +604,10 @@ fn backspace_cursor_anchors(
     anchors
 }
 
-fn backspace_cursor_anchor<'a>(
-    intents: &'a std::collections::VecDeque<PendingDelete>,
+fn backspace_cursor_anchor(
+    intents: &std::collections::VecDeque<PendingDelete>,
     anchor: Option<BackspaceCursorAnchor>,
-) -> Option<&'a BackspaceCandidate> {
+) -> Option<&BackspaceCandidate> {
     let anchor = anchor?;
     let intent = intents.get(anchor.intent_index)?;
     let PendingDeleteKind::Backspace { candidates, .. } = &intent.kind else {

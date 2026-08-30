@@ -195,6 +195,7 @@ fn ambiguous_mid_record_suffix_is_invariant_to_byte_fragmentation() {
 fn synthetic_fragment(index: usize) -> UpdateSummary {
     let col = u16::try_from(index).expect("fragment column fits in u16");
     let changed_row = u16::try_from(index % 64).expect("fragment row fits in u16");
+    let changed_rows = std::iter::once(changed_row..=changed_row).collect::<Vec<_>>();
     let text = if index.is_multiple_of(2) { "x" } else { "y" };
     UpdateSummary {
         operations: vec![TerminalOperation::WriteRun {
@@ -202,8 +203,8 @@ fn synthetic_fragment(index: usize) -> UpdateSummary {
             col,
             text: text.to_owned(),
         }],
-        changed_rows: vec![changed_row..=changed_row],
-        damage: TerminalDamage::Rows(vec![changed_row..=changed_row]),
+        changed_rows: changed_rows.clone(),
+        damage: TerminalDamage::Rows(changed_rows),
         cursor_before: Cursor {
             row: 3,
             col,
@@ -275,7 +276,7 @@ fn large_fragmented_summary_merge_is_grouping_invariant_and_exact() {
         );
     }
 
-    let expected_rows = vec![0..=63];
+    let expected_rows = std::iter::once(0..=63).collect::<Vec<_>>();
     assert_eq!(sequential.changed_rows, expected_rows);
     assert_eq!(sequential.damage, TerminalDamage::Rows(expected_rows));
     assert_eq!(sequential.batch_count, FRAGMENTS);

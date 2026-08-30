@@ -143,11 +143,7 @@ impl LuaReplView {
 
     fn drain_print_buffer(&mut self) -> Vec<String> {
         let print_buffer = Rc::clone(&self.session.state.borrow().print_buffer);
-        let added = print_buffer
-            .borrow_mut()
-            .lines
-            .drain(..)
-            .collect::<Vec<_>>();
+        let added = std::mem::take(&mut print_buffer.borrow_mut().lines);
         if !added.is_empty() {
             let mut state = self.session.state.borrow_mut();
             state
