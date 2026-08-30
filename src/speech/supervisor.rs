@@ -6,7 +6,7 @@
 //! with [`SupervisorHandle`].
 
 use super::{
-    Driver, SpeechServerSpec,
+    Driver, SpeechServerSpec, UtteranceBoundary,
     manager::{Host, SpeechManager},
     proc_driver,
     protocol::UtteranceId,
@@ -266,6 +266,7 @@ struct PendingSpeech {
     id: UtteranceId,
     text: String,
     interrupt: bool,
+    boundary: UtteranceBoundary,
 }
 
 /// Owns the selected process-backed speech server and its recovery policy.
@@ -279,6 +280,7 @@ pub struct Supervisor {
     desired_rate: f32,
     pending_speech: VecDeque<PendingSpeech>,
     pending_speech_bytes: usize,
+    pending_speech_paused: bool,
     manager: SpeechManager,
     next_compatibility_id: u64,
     started: bool,
@@ -321,6 +323,7 @@ impl Supervisor {
             desired_rate: 1.0,
             pending_speech: VecDeque::new(),
             pending_speech_bytes: 0,
+            pending_speech_paused: false,
             manager: SpeechManager::default(),
             next_compatibility_id: 1,
             started: false,
@@ -381,7 +384,7 @@ impl Supervisor {
             Ok(process) => {
                 let _ = self.install_active(process);
                 self.started = true;
-                return self.flush_pending_speech();
+                return self.flush_pending_speech_if_playing();
             }
             Err(error) => error,
         };
@@ -389,7 +392,7 @@ impl Supervisor {
             Ok(process) => {
                 let _ = self.install_active(process);
                 self.started = true;
-                return self.flush_pending_speech();
+                return self.flush_pending_speech_if_playing();
             }
             Err(error) => error,
         };
@@ -405,7 +408,13 @@ impl Supervisor {
             self.pending_speech_bytes =
                 self.pending_speech_bytes.saturating_sub(pending.text.len());
             if let Err(error) = self.call_managed("speak", move |manager, host| {
-                manager.submit(host, pending.id, pending.text, pending.interrupt)
+                manager.submit_with_boundary(
+                    host,
+                    pending.id,
+                    pending.text,
+                    pending.interrupt,
+                    pending.boundary,
+                )
             }) {
                 if self.fatal_error.is_some() {
                     self.pending_speech.clear();
@@ -422,10 +431,25 @@ impl Supervisor {
         Ok(())
     }
 
-    fn buffer_speech(&mut self, id: UtteranceId, text: &str, interrupt: bool) {
+    fn flush_pending_speech_if_playing(&mut self) -> DriverResult<()> {
+        if !self.started || self.pending_speech_paused {
+            Ok(())
+        } else {
+            self.flush_pending_speech()
+        }
+    }
+
+    fn buffer_speech(
+        &mut self,
+        id: UtteranceId,
+        text: &str,
+        interrupt: bool,
+        boundary: UtteranceBoundary,
+    ) {
         if interrupt {
             self.pending_speech.clear();
             self.pending_speech_bytes = 0;
+            self.pending_speech_paused = false;
         }
         let text = bounded_text(text, MAX_PENDING_SPEECH_ITEM_BYTES);
         while self.pending_speech.len() == MAX_PENDING_SPEECH_ITEMS
@@ -441,6 +465,7 @@ impl Supervisor {
             id,
             text,
             interrupt,
+            boundary,
         });
     }
 
@@ -612,6 +637,16 @@ impl Driver for Supervisor {
         text: &str,
         interrupt: bool,
     ) -> DriverResult<()> {
+        self.speak_utterance_with_boundary(id, text, interrupt, UtteranceBoundary::Immediate)
+    }
+
+    fn speak_utterance_with_boundary(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+        boundary: UtteranceBoundary,
+    ) -> DriverResult<()> {
         if text.is_empty() {
             return Ok(());
         }
@@ -619,27 +654,41 @@ impl Driver for Supervisor {
             if let Some(error) = &self.startup_error {
                 return Err(anyhow!(error.clone()));
             }
-            self.buffer_speech(id.clone(), text, interrupt);
+            self.buffer_speech(id.clone(), text, interrupt, boundary);
             return Ok(());
         }
+        if self.pending_speech_paused {
+            if interrupt {
+                self.pending_speech.clear();
+                self.pending_speech_bytes = 0;
+                self.pending_speech_paused = false;
+            } else {
+                self.buffer_speech(id.clone(), text, false, boundary);
+                return Ok(());
+            }
+        }
         self.call_managed("speak", |manager, host| {
-            manager.submit(host, id.clone(), text.to_owned(), interrupt)
+            manager.submit_with_boundary(host, id.clone(), text.to_owned(), interrupt, boundary)
         })
     }
 
     fn stop(&mut self) -> DriverResult<()> {
+        self.pending_speech.clear();
+        self.pending_speech_bytes = 0;
+        self.pending_speech_paused = false;
         if !self.started {
-            self.pending_speech.clear();
-            self.pending_speech_bytes = 0;
             return Ok(());
         }
         self.call_managed("stop", SpeechManager::stop)
     }
 
     fn toggle_pause(&mut self) -> DriverResult<()> {
+        if self.pending_speech_paused {
+            self.pending_speech_paused = false;
+            return self.flush_pending_speech_if_playing();
+        }
         if !self.started {
-            self.pending_speech.clear();
-            self.pending_speech_bytes = 0;
+            self.pending_speech_paused = !self.pending_speech.is_empty();
             return Ok(());
         }
         self.call_managed("toggle pause", SpeechManager::toggle_pause)
@@ -647,14 +696,13 @@ impl Driver for Supervisor {
 
     fn supports_ordered_utterances(&self) -> bool {
         self.active.as_ref().is_some_and(|process| {
-            process.host.has_legacy_queue()
-                || process
-                    .host
-                    .capabilities()
-                    .lifecycle
-                    .terminal
-                    .delivery
-                    .is_reliable()
+            process
+                .host
+                .capabilities()
+                .lifecycle
+                .terminal
+                .delivery
+                .is_reliable()
         })
     }
 
@@ -1106,6 +1154,41 @@ mod tests {
                 Call::Speak("kept".to_owned(), false),
             ]
         );
+    }
+
+    #[test]
+    fn prestart_pause_holds_buffered_speech_until_the_next_toggle() {
+        let mut harness = Harness::new();
+        harness.supervisor.speak("held", false).unwrap();
+        harness.supervisor.toggle_pause().unwrap();
+        let active = fake_state();
+        harness.push_driver(Arc::clone(&active));
+
+        harness.supervisor.start().unwrap();
+        assert_eq!(
+            active.lock().unwrap().calls,
+            [Call::SetRate(1.0f32.to_bits())]
+        );
+
+        harness.supervisor.toggle_pause().unwrap();
+        assert_eq!(
+            active.lock().unwrap().calls,
+            [
+                Call::SetRate(1.0f32.to_bits()),
+                Call::Speak("held".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_queue_is_not_paragraph_ordering_evidence() {
+        let mut harness = Harness::new();
+        let active = fake_state();
+        harness.push_driver(active);
+
+        harness.supervisor.start().unwrap();
+
+        assert!(!harness.supervisor.supports_ordered_utterances());
     }
 
     #[test]

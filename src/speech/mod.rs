@@ -34,6 +34,15 @@ pub enum Error {
     Driver(#[source] anyhow::Error),
 }
 
+/// Internal timing relationship between adjacent utterances. This is Lector
+/// presentation metadata and never crosses the speech-host protocol boundary.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UtteranceBoundary {
+    #[default]
+    Immediate,
+    Paragraph,
+}
+
 pub trait Driver {
     fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()>;
 
@@ -48,10 +57,23 @@ pub trait Driver {
         self.speak(text, interrupt)
     }
 
+    /// Submit an identified utterance with host-independent timing metadata.
+    /// Compatibility drivers can ignore the boundary and retain the ordinary
+    /// identified-submission behavior.
+    fn speak_utterance_with_boundary(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+        _boundary: UtteranceBoundary,
+    ) -> DriverResult<()> {
+        self.speak_utterance(id, text, interrupt)
+    }
+
     fn stop(&mut self) -> DriverResult<()>;
 
-    /// Toggle the resumable-pause state. Drivers without that capability use
-    /// the conservative one-way stop fallback.
+    /// Toggle the resumable-pause state. Drivers without word-position support
+    /// may conservatively restart the current utterance from its beginning.
     fn toggle_pause(&mut self) -> DriverResult<()> {
         self.stop()
     }
@@ -239,10 +261,17 @@ impl Speech {
                 } else {
                     id.clone()
                 };
-                if let Err(error) =
-                    self.driver
-                        .speak_utterance(&chunk_id, chunk, interrupt && index == 0)
-                {
+                let boundary = if index == 0 {
+                    UtteranceBoundary::Immediate
+                } else {
+                    UtteranceBoundary::Paragraph
+                };
+                if let Err(error) = self.driver.speak_utterance_with_boundary(
+                    &chunk_id,
+                    chunk,
+                    interrupt && index == 0,
+                    boundary,
+                ) {
                     result = Err(Error::Driver(error));
                     break;
                 }
@@ -367,7 +396,9 @@ fn split_paragraphs(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Driver, Error, Speech, protocol::UtteranceId, split_paragraphs, symbols};
+    use super::{
+        Driver, Error, Speech, UtteranceBoundary, protocol::UtteranceId, split_paragraphs, symbols,
+    };
     use std::{cell::RefCell, rc::Rc};
 
     struct RecordingDriver(Rc<RefCell<Vec<String>>>);
@@ -435,22 +466,28 @@ mod tests {
         );
     }
 
-    struct IdDriver(Rc<RefCell<Vec<(String, String, bool)>>>);
+    type IdentifiedCall = (String, String, bool, UtteranceBoundary);
+
+    struct IdDriver(Rc<RefCell<Vec<IdentifiedCall>>>);
 
     impl Driver for IdDriver {
         fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
             unreachable!("Speech submits identified utterances")
         }
 
-        fn speak_utterance(
+        fn speak_utterance_with_boundary(
             &mut self,
             id: &UtteranceId,
             text: &str,
             interrupt: bool,
+            boundary: UtteranceBoundary,
         ) -> anyhow::Result<()> {
-            self.0
-                .borrow_mut()
-                .push((id.as_str().to_owned(), text.to_owned(), interrupt));
+            self.0.borrow_mut().push((
+                id.as_str().to_owned(),
+                text.to_owned(),
+                interrupt,
+                boundary,
+            ));
             Ok(())
         }
 
@@ -482,8 +519,18 @@ mod tests {
         assert_eq!(
             calls.borrow().as_slice(),
             [
-                ("1:0".to_owned(), "first".to_owned(), true),
-                ("1:1".to_owned(), "second".to_owned(), false),
+                (
+                    "1:0".to_owned(),
+                    "first".to_owned(),
+                    true,
+                    UtteranceBoundary::Immediate,
+                ),
+                (
+                    "1:1".to_owned(),
+                    "second".to_owned(),
+                    false,
+                    UtteranceBoundary::Paragraph,
+                ),
             ]
         );
     }

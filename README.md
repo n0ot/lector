@@ -379,8 +379,11 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 
 ### Core actions (with defaults)
 
-- **Pause/resume speech** with `M-x` when the host supports word positions. On
-  other hosts, the first press stops speech and another press does nothing.
+- **Cancel speech** with `M-x`. Cancellation also discards unsent paragraphs.
+- **Pause/resume speech** with `M-X`. A capable host resumes at the beginning
+  of the interrupted word; hosts with safe stop-completion evidence can instead
+  restart the current utterance from its beginning. Pausing between paragraphs
+  preserves the remaining paragraphs.
 - **Say the current overlay name**. Default: `M-w`.
 - **Toggle auto‑read** if you want to hear only on demand. Default: `M-'`.
 - **Toggle stop on focus loss** (interrupt speech when terminal focus leaves). Default: `M-g`.
@@ -629,8 +632,9 @@ configured default register.
 You can remap keys or add your own Lua functions:
 
 ```lua
--- map a key to the pause/resume action (with stop fallback)
+-- these are the default cancel and pause/resume bindings
 lector.bindings["M-x"] = "lector.stop_speaking"
+lector.bindings["M-X"] = "lector.pause_speaking"
 
 -- toggle stop-on-focus-loss behavior
 lector.bindings["M-g"] = "lector.toggle_stop_speech_on_focus_loss"
@@ -651,8 +655,10 @@ lector.bindings["M-v"] = {
 
 `lector.api.speak(text, interrupt)` returns an opaque string logical speech ID
 when speech is submitted, or `nil` when empty/unfocused speech is suppressed.
-One logical request can contain several protocol utterances at paragraph
-boundaries. Treat the returned ID as a string; its format is not an API.
+With reliable terminal events, one logical request can contain several
+protocol utterances at paragraph boundaries. Otherwise Lector conservatively
+submits one normalized utterance. Treat the returned ID as a string; its
+format is not an API.
 
 ### Lua hooks
 

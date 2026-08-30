@@ -2,6 +2,11 @@ use super::{CommandResult, Result};
 use crate::{screen_reader::ScreenReader, view::View};
 
 pub(super) fn stop(sr: &mut ScreenReader) -> Result<CommandResult> {
+    sr.stop_speaking()?;
+    Ok(CommandResult::Handled)
+}
+
+pub(super) fn pause(sr: &mut ScreenReader) -> Result<CommandResult> {
     sr.toggle_speech_pause()?;
     Ok(CommandResult::Handled)
 }
@@ -104,7 +109,7 @@ pub(super) fn toggle_symbol_level(sr: &mut ScreenReader) -> Result<CommandResult
 #[cfg(test)]
 mod tests {
     use super::{
-        backspace, delete, pass_next_key, say_overlay, say_time, stop, toggle_auto_read,
+        backspace, delete, pass_next_key, pause, say_overlay, say_time, stop, toggle_auto_read,
         toggle_help, toggle_review_follows_screen_cursor, toggle_stop_speech_on_focus_loss,
         toggle_symbol_level,
     };
@@ -182,6 +187,7 @@ mod tests {
         let (mut sr, output) = screen_reader();
 
         assert!(matches!(stop(&mut sr).unwrap(), CommandResult::Handled));
+        assert!(matches!(pause(&mut sr).unwrap(), CommandResult::Handled));
         assert!(matches!(
             say_overlay(&mut sr, "Terminal").unwrap(),
             CommandResult::Handled

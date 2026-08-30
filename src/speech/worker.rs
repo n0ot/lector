@@ -3,8 +3,8 @@
 //! The terminal event loop owns all screen and tmux state.  A speech backend
 //! is an external side effect and must never be allowed to stall that owner.
 
-use super::Driver;
 use super::protocol::UtteranceId;
+use super::{Driver, UtteranceBoundary};
 use anyhow::{Result as DriverResult, anyhow};
 use std::{
     collections::VecDeque,
@@ -31,6 +31,7 @@ enum Request {
         id: UtteranceId,
         text: String,
         interrupt: bool,
+        boundary: UtteranceBoundary,
     },
     Stop,
     TogglePause,
@@ -108,6 +109,16 @@ impl Mailbox {
     }
 
     fn enqueue_speech(&self, id: &UtteranceId, text: &str, interrupt: bool) -> DriverResult<()> {
+        self.enqueue_speech_with_boundary(id, text, interrupt, UtteranceBoundary::Immediate)
+    }
+
+    fn enqueue_speech_with_boundary(
+        &self,
+        id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+        boundary: UtteranceBoundary,
+    ) -> DriverResult<()> {
         let text = bounded_text(text, MAX_SPEECH_ITEM_BYTES);
         let text_bytes = text.len();
         let mut state = self.lock()?;
@@ -139,6 +150,7 @@ impl Mailbox {
             id: id.clone(),
             text,
             interrupt,
+            boundary,
         });
         let dropped_total = state.dropped_speech_items;
         drop(state);
@@ -183,21 +195,12 @@ impl Mailbox {
             // worker has not observed the cancellation yet.
             return Ok(());
         }
-        if state.requests.iter().any(|request| {
-            matches!(
-                request,
-                Request::Speak {
-                    interrupt: true,
-                    ..
-                }
-            )
-        }) {
-            // The toggle belongs to the new interrupting utterance and must
-            // not overtake it.
-            state.requests.push_back(Request::TogglePause);
-        } else {
-            state.requests.push_front(Request::TogglePause);
-        }
+        // Preserve request order. In particular, a toggle submitted just
+        // after speech must observe that speech rather than running while the
+        // worker still appears idle. Version 2 speech submissions behind the
+        // first only update Lector's local queue, so this does not add one RPC
+        // round trip per queued paragraph.
+        state.requests.push_back(Request::TogglePause);
         drop(state);
         self.available.notify_one();
         Ok(())
@@ -372,6 +375,17 @@ impl Driver for BoundedAsyncDriver {
         self.mailbox.enqueue_speech(id, text, interrupt)
     }
 
+    fn speak_utterance_with_boundary(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+        boundary: UtteranceBoundary,
+    ) -> DriverResult<()> {
+        self.mailbox
+            .enqueue_speech_with_boundary(id, text, interrupt, boundary)
+    }
+
     fn stop(&mut self) -> DriverResult<()> {
         self.mailbox.enqueue_stop()
     }
@@ -457,7 +471,8 @@ fn run_worker(mut driver: impl Driver, mailbox: &Mailbox, ordered_utterances: &A
                 id,
                 text,
                 interrupt,
-            }) => driver.speak_utterance(&id, &text, interrupt),
+                boundary,
+            }) => driver.speak_utterance_with_boundary(&id, &text, interrupt, boundary),
             NextRequest::Request(Request::Stop) => driver.stop(),
             NextRequest::Request(Request::TogglePause) => driver.toggle_pause(),
             NextRequest::Request(Request::SetRate(rate)) => driver.set_rate(rate),
@@ -680,6 +695,26 @@ mod tests {
             mailbox.next_request(Duration::ZERO),
             NextRequest::Request(Request::Speak {
                 interrupt: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::TogglePause)
+        ));
+    }
+
+    #[test]
+    fn pause_toggle_observes_preceding_noninterrupting_speech() {
+        let mailbox = Mailbox::new();
+        let id = UtteranceId::new("new");
+        mailbox.enqueue_speech(&id, "new words", false).unwrap();
+        mailbox.enqueue_toggle_pause().unwrap();
+
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::Speak {
+                interrupt: false,
                 ..
             })
         ));

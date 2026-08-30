@@ -135,9 +135,8 @@ define_actions! {
     DetachTmuxConnection => ("gracefully detach the active tmux connection", "detach_tmux_connection"),
     ForceAbandonTmuxGateway => ("expose a stuck active tmux gateway as raw terminal input", "force_abandon_tmux_gateway"),
     PassNextKey => ("forward next key press", "pass_next_key"),
-    // Keep the configuration name for compatibility. The command now toggles
-    // resumable pause when available and otherwise retains its stop behavior.
-    StopSpeaking => ("pause or stop speaking", "stop_speaking"),
+    StopSpeaking => ("stop speaking", "stop_speaking"),
+    PauseSpeaking => ("pause or resume speaking", "pause_speaking"),
     RevLinePrev => ("previous line", "review_line_prev"),
     RevLineNext => ("next line", "review_line_next"),
     RevLinePrevNonBlank => ("previous non blank line", "review_line_prev_non_blank"),
@@ -236,6 +235,7 @@ pub fn handle(
         Action::SayOverlay => system::say_overlay(sr, title),
         Action::PassNextKey => system::pass_next_key(sr),
         Action::StopSpeaking => system::stop(sr),
+        Action::PauseSpeaking => system::pause(sr),
         Action::RevLinePrev => review::line_previous(sr, view, false),
         Action::RevLineNext => review::line_next(sr, view, false),
         Action::RevLinePrevNonBlank => review::line_previous(sr, view, true),

@@ -127,8 +127,8 @@ the adapter and reject positions inside a surrogate pair.
 Capabilities describe independently usable evidence and controls. A host MUST
 advertise only behavior it provides for every accepted utterance in that
 process generation. Version 2 requires `controls.stop` to be `confirmed` or
-`bestEffort`, because interruption and the M-x fallback are fundamental. All
-other capability families are optional.
+`bestEffort`, because interruption and the M-X restart fallback are
+fundamental. All other capability families are optional.
 
 ### 5.1 Lifecycle
 
@@ -239,7 +239,14 @@ boundaries is a paragraph boundary; each nonempty paragraph becomes a separate
 utterance with a stable, opaque child ID and is sequenced by Lector. The Lua
 `lector.api.speak` call returns the parent logical ID; hosts see and echo only
 the individual child IDs and MUST NOT infer their relationship from their
-format. CRLF counts as one line boundary.
+format. CRLF counts as one line boundary. Lector waits on a nonblocking 200 ms
+deadline after the preceding paragraph's reliable terminal event before it
+submits the next paragraph. The delay is presentation policy, not a host timer
+or protocol field.
+
+If reliable terminal delivery is unavailable, Lector cannot know when to
+submit the next paragraph. It therefore replaces paragraph boundaries with
+spaces and submits the logical request as one utterance instead of guessing.
 
 ### 7.3 `speech.stop`
 
@@ -268,8 +275,10 @@ Only a host advertising resumable pause implements this method. On success,
 `paused: true` MUST include a valid position satisfying the advertised mode.
 `paused: false` means there is no resumable paused utterance and MUST omit the
 position. Lector conservatively follows `paused: false`, an RPC failure, or an
-invalid position with `speech.stop`, clears the pending queue, and retains no
-resume state. Repeating pause while already paused is idempotent.
+invalid position with `speech.stop`. It retains the stopped text and its
+never-submitted queue; after confirmed stop or reliable terminal evidence, the
+next M-X resubmits that complete utterance under a fresh opaque ID. Repeating
+pause while already paused is idempotent.
 
 ### 7.5 `speech.resume`
 
@@ -282,8 +291,8 @@ The host resumes the same logical utterance according to its advertised mode.
 For `restartFromWord`, it resynthesizes the original text beginning at the
 position returned by `speech.pause`; later UTF-8 progress positions remain
 relative to the original complete text. It MUST reject an ID that is not the
-paused utterance. If resume fails, Lector cancels the uncertain utterance and
-retains no resume state.
+paused utterance. If resume fails, Lector stops the uncertain utterance and
+retains the complete text for the same fresh-ID restart fallback.
 
 ### 7.6 `speech.setRate`
 
@@ -319,22 +328,33 @@ Events for an unknown ID, an already-ended ID, an older process generation, or
 a non-increasing sequence number MUST NOT advance Lector's queue. Unknown event
 types are ignored. A host MUST preserve event order on stdout.
 
-## 9. Lector playback and M-x semantics
+## 9. Lector cancellation and pause semantics
 
 Lector's manager has at most one host-active utterance and a bounded queue of
-never-submitted utterances. Its state is `idle`, `speaking`, or `paused`.
+never-submitted utterances. Its evidence-backed states include `idle`,
+`speaking`, host-paused, restart-paused, paragraph-delay, and
+paused-between-paragraphs.
 
 - Reliable `ended` evidence transitions `speaking` to the next queued item.
 - `speech.speak` with interruption clears the queue, stops the active or paused
   item, and starts only the new item.
 - Typing and other ordinary interruptions clear the queue and stop the active
   or paused item. They leave nothing resumable.
-- If resumable pause is advertised, the first M-x pauses and retains the item;
-  the next M-x resumes it at the beginning of the interrupted word.
-- Otherwise, the first M-x performs the stop fallback and removes the item;
-  another M-x is inert until new speech starts.
+- M-x is always cancellation. It performs the same queue-clearing stop and a
+  later M-X cannot resurrect that speech.
+- If resumable pause is advertised, the first M-X pauses and retains the item;
+  the next M-X resumes it at the beginning of the interrupted word.
+- Otherwise, the first M-X stops and retains the complete active utterance.
+  Once a confirmed stop response or reliable terminal event proves that old
+  audio is gone, the next M-X resubmits it from the beginning with a fresh
+  opaque ID. A resume requested while a best-effort stop is awaiting its
+  terminal event is remembered. Unsent paragraphs remain queued.
+- During the paragraph-delay state, M-X freezes the queue without contacting
+  the host. The next M-X immediately starts the first word of the next
+  paragraph.
 - A missing, unknown, out-of-range, or non-UTF-8 pause position is
-  conservatively non-resumable; Lector stops instead of guessing.
+  conservatively handled by the same whole-utterance restart fallback instead
+  of guessing a word boundary.
 
 If terminal delivery is not reliable, Lector cannot safely sequence a second
 version 2 utterance and rejects that ambiguous queue transition. Other basic
@@ -374,9 +394,15 @@ published version 1.0 initialization and old method names (`speak`, `stop`, and
 unversioned legacy host.
 
 Legacy hosts have no correlated lifecycle or progress evidence, do not support
-resumable pause, and retain backend-owned queueing. M-x therefore uses the
-one-way stop fallback. New implementations MUST implement version 2 and MUST
-NOT depend on the unversioned escape hatch.
+word-position resume, and retain backend-owned queueing. M-x remains one-way
+cancellation. M-X can stop and retain Lector's currently tracked utterance for
+a whole-utterance restart only if safe completion evidence arrives; an
+unversioned host supplies none, so Lector never guesses that resubmission is
+safe. Lector also cannot reliably reconstruct other items already accepted
+into an opaque legacy queue. Multi-paragraph logical requests are therefore
+flattened into one utterance for legacy hosts. New
+implementations MUST implement version 2 and MUST NOT depend on the
+unversioned escape hatch.
 
 ## 12. Implementation checklist
 
@@ -389,5 +415,5 @@ A conforming version 2 host must:
 4. Emit strictly sequenced, correlated events exactly as advertised.
 5. Translate native indexes to markers or valid UTF-8 byte boundaries.
 6. Implement pause/resume only if it restarts the interrupted word; otherwise
-   advertise it as unsupported and provide the stop fallback.
+   advertise it as unsupported and provide stop for Lector's restart fallback.
 7. Respond inside the deadlines, exit on EOF, and clean up descendants.

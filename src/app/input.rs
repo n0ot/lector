@@ -337,15 +337,20 @@ impl App {
         self.view_transition_key_presses.remove(&key_id);
 
         let binding_name = self.key_event_binding_name(key_event);
-        let is_pause_command = binding_name
+        let is_speech_control_command = binding_name
             .as_deref()
             .and_then(|name| sr.key_bindings().binding_for_mode(sr.input_mode(), name))
             .is_some_and(|binding| {
-                matches!(binding, Binding::Builtin(commands::Action::StopSpeaking))
+                matches!(
+                    binding,
+                    Binding::Builtin(
+                        commands::Action::StopSpeaking | commands::Action::PauseSpeaking
+                    )
+                )
             });
-        self.update_last_key(sr, raw, true, !is_pause_command)?;
+        self.update_last_key(sr, raw, true, !is_speech_control_command)?;
         if sr.take_pass_through() {
-            if is_pause_command {
+            if is_speech_control_command {
                 // Pass-through makes this physical key ordinary application
                 // input, so it retains ordinary interruption semantics.
                 sr.stop_speaking()?;

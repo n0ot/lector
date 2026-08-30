@@ -897,22 +897,28 @@ fn stdin_unmapped_forwards_to_pty() {
 }
 
 #[test]
-fn meta_x_uses_pause_toggle_while_forwarded_typing_cancels_speech() {
+fn meta_x_cancels_and_meta_shift_x_toggles_pause() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
     sr.speak("alpha beta", false).unwrap();
 
     app.handle_stdin(&mut sr, b"\x1bx", &mut pty_out, &mut term_out)
-        .expect("pause with Meta-x");
-    app.handle_stdin(&mut sr, b"\x1bx", &mut pty_out, &mut term_out)
-        .expect("resume with Meta-x");
+        .expect("cancel with Meta-x");
+    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().pause_toggles, 0);
+
+    sr.speak("gamma delta", false).unwrap();
+    app.handle_stdin(&mut sr, b"\x1bX", &mut pty_out, &mut term_out)
+        .expect("pause with Meta-Shift-x");
+    app.handle_stdin(&mut sr, b"\x1bX", &mut pty_out, &mut term_out)
+        .expect("resume with Meta-Shift-x");
     assert_eq!(recorder.inner.borrow().pause_toggles, 2);
-    assert_eq!(recorder.inner.borrow().stops, 0);
+    assert_eq!(recorder.inner.borrow().stops, 1);
 
     app.handle_stdin(&mut sr, b"a", &mut pty_out, &mut term_out)
         .expect("ordinary typing interrupts speech");
-    assert_eq!(recorder.inner.borrow().stops, 1);
+    assert_eq!(recorder.inner.borrow().stops, 2);
     assert_eq!(pty_out, b"a");
 }
 

@@ -43,7 +43,9 @@ lifecycle:
 Runtime speech sequencing is owned by a host-independent manager. It sends at
 most one active utterance to a version 2 host, advances its bounded queue only
 from correlated terminal evidence, and retains resumable state only across an
-explicit pause/resume toggle. Runtime speech replacement is transactional. A
+explicit `M-X` pause/resume toggle. `M-x`, typing, and interrupting speech clear
+that state and the unsent queue. Paragraph gaps are nonblocking manager
+deadlines which `M-X` can freeze. Runtime speech replacement is transactional. A
 candidate process initializes and restores the configured rate while the old
 generation remains owned for rollback; only then is the active generation
 swapped and the old child terminated and reaped. Transport failures never

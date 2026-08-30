@@ -91,6 +91,7 @@ const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("M-w", Action::SayOverlay),
     ("M-n", Action::PassNextKey),
     ("M-x", Action::StopSpeaking),
+    ("M-X", Action::PauseSpeaking),
     ("M-u", Action::RevLinePrev),
     ("M-o", Action::RevLineNext),
     ("M-U", Action::RevLinePrevNonBlank),
