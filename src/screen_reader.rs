@@ -763,6 +763,33 @@ mod tests {
     }
 
     #[test]
+    fn completed_linear_lines_are_read_after_scrolling_out_of_view() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new_with_scrollback_for_test(3, 24, 128);
+        view.finalize_changes(0);
+
+        let mut output = Vec::new();
+        for line in 0..12 {
+            output.extend_from_slice(format!("record-{line:02}\r\n").as_bytes());
+        }
+        view.process_changes(&output);
+
+        assert!(
+            view.scrollback_len() >= 9,
+            "the earliest records must be off-screen"
+        );
+        assert!(sr.auto_read(&mut view).unwrap());
+
+        let spoken = speaks.borrow().join(" ");
+        for line in 0..12 {
+            assert!(
+                spoken.contains(&format!("record-{line:02}")),
+                "missing scrolled record {line} from {spoken:?}"
+            );
+        }
+    }
+
+    #[test]
     fn completed_output_with_ambiguous_prefix_diffs_every_printed_line() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 40);
