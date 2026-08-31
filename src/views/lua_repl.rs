@@ -954,6 +954,29 @@ mod tests {
     }
 
     #[test]
+    fn lua_repl_inspect_builtin_displays_nested_tables() {
+        let mut repl = LuaReplView::new(14, 70, Vec::new()).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+
+        enter(
+            &mut repl,
+            &mut sr,
+            b"lector.inspect({name = \"demo\", nested = {1, 2}})\r",
+        );
+        finish_eval(&mut repl, &mut sr);
+
+        let contents = repl.model().screen().contents();
+        assert!(
+            contents
+                .lines()
+                .any(|line| line.trim() == "name = \"demo\",")
+        );
+        assert!(contents.lines().any(|line| line.trim() == "nested = {"));
+        assert!(contents.lines().any(|line| line.trim() == "1,"));
+        assert!(contents.lines().any(|line| line.trim() == "2,"));
+    }
+
+    #[test]
     fn lua_parser_classifies_general_incomplete_constructs() {
         let session = LuaReplSession::new(Vec::new()).expect("create Lua session");
         let state = session.state.borrow();

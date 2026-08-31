@@ -794,6 +794,7 @@ Lector has a built‑in Lua REPL so you can try commands while it’s running. O
 - Press `C-l` to clear submitted input and output. Unsubmitted input and the `Esc to close` banner remain visible.
 - The transcript, unsubmitted input, history, and Lua environment are preserved after closing and reopening the overlay.
 - Commands that start with a space and consecutive duplicate commands are not added to REPL history.
+- Use `lector.inspect(value)` to pretty-print nested tables. It returns a string, so entering `lector.inspect(my_table)` displays it directly. Cycles are shown as `<cycle>`, and nesting beyond 20 table levels as `<max depth>`.
 
 ## Tips
 

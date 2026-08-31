@@ -5,6 +5,7 @@ use mlua::{Error, Function, Lua, LuaOptions, Result, StdLib, Value};
 use std::{cell::RefCell, fs::File, io::Read, path::PathBuf, rc::Rc};
 
 mod ext;
+mod inspect;
 mod meta;
 
 pub fn setup<F>(
@@ -52,6 +53,7 @@ where
 pub fn setup_repl(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
     install_api_static(lua, Rc::clone(&sr_ptr))?;
     meta::setup_static(lua, sr_ptr)?;
+    inspect::install(lua)?;
     Ok(())
 }
 
