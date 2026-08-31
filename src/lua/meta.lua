@@ -116,7 +116,7 @@ local tbl_lector_clipboard = setmetatable({}, {
 
 local tbl_lector_o_speech = setmetatable({}, {
     __index = function(_, k)
-        if k ~= 'server' and k ~= 'rate' and k ~= 'voice' and k ~= 'voices' and k ~= 'paragraph_pause_ms' then
+        if k ~= 'server' and k ~= 'rate' and k ~= 'pitch' and k ~= 'volume' and k ~= 'voice' and k ~= 'voices' and k ~= 'paragraph_pause_ms' then
             error("unknown speech option: " .. tostring(k), 2)
         end
         return callbacks.get_option('speech.' .. k)
@@ -124,7 +124,7 @@ local tbl_lector_o_speech = setmetatable({}, {
     __newindex = function(_, k, v)
         if k == 'voices' then
             error("lector.o.speech.voices is read-only", 2)
-        elseif k ~= 'server' and k ~= 'rate' and k ~= 'voice' and k ~= 'paragraph_pause_ms' then
+        elseif k ~= 'server' and k ~= 'rate' and k ~= 'pitch' and k ~= 'volume' and k ~= 'voice' and k ~= 'paragraph_pause_ms' then
             error("unknown speech option: " .. tostring(k), 2)
         end
         callbacks.set_option('speech.' .. k, v)

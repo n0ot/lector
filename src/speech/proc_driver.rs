@@ -2,9 +2,9 @@ use super::{
     manager::Host,
     protocol::{
         AcceptedResult, BackendInfo, ClientCapabilities, ControlCapabilities, CurrentVoiceResult,
-        MAX_JSON_SAFE_INTEGER, PauseResult, ProtocolRange, SetVoiceParams, SettingCapabilities,
-        SettingSupport, SpeechCapabilities, SpeechEventNotification, StopSupport, UtteranceId,
-        UtteranceParams, VoiceInfo, VoiceListResult,
+        MAX_JSON_SAFE_INTEGER, PauseResult, PitchResult, ProtocolRange, RateResult, SetVoiceParams,
+        SettingCapabilities, SettingSupport, SpeechCapabilities, SpeechEventNotification,
+        StopSupport, UtteranceId, UtteranceParams, VoiceInfo, VoiceListResult, VolumeResult,
     },
 };
 use crate::proc_server_common::{
@@ -432,7 +432,9 @@ impl ProcDriver {
             return Err(Error::MissingCapability("controls.stop"));
         }
         self.backend = initialized.backend;
-        self.capabilities = initialized.capabilities;
+        self.capabilities = initialized
+            .capabilities
+            .for_protocol_version(initialized.protocol);
         Ok(())
     }
 
@@ -834,6 +836,22 @@ impl Host for ProcDriver {
         expect_accepted_result("speech.resume", result).map_err(Into::into)
     }
 
+    fn get_rate(&mut self) -> DriverResult<f32> {
+        let result = self.call("speech.getRate", None)?;
+        let result = serde_json::from_value::<RateResult>(result)
+            .ok()
+            .filter(|result| result.rate.is_finite());
+        let Some(result) = result else {
+            self.fail_transport();
+            return Err(Error::InvalidResponse(
+                "speech.getRate result must contain a finite rate".to_owned(),
+            )
+            .into());
+        };
+        self.rate = result.rate;
+        Ok(result.rate)
+    }
+
     fn set_rate(&mut self, rate: f32) -> DriverResult<f32> {
         let method = if self.legacy_protocol {
             "set_rate"
@@ -845,27 +863,78 @@ impl Host for ProcDriver {
             self.rate = rate;
             return Ok(rate);
         }
-        let actual = match result.as_object() {
-            Some(result) => result
-                .get("rate")
-                .and_then(Value::as_f64)
-                .filter(|rate| rate.is_finite())
-                .map(|rate| rate as f32)
-                .filter(|rate| rate.is_finite()),
-            None => None,
+        let result = serde_json::from_value::<RateResult>(result)
+            .ok()
+            .filter(|result| result.rate.is_finite());
+        let Some(result) = result else {
+            self.fail_transport();
+            return Err(Error::InvalidResponse(
+                "set_rate result must contain a finite rate".to_owned(),
+            )
+            .into());
         };
-        let actual = match actual {
-            Some(actual) => actual,
-            None => {
-                self.fail_transport();
-                return Err(Error::InvalidResponse(
-                    "set_rate result must contain a finite rate".to_owned(),
-                )
-                .into());
-            }
+        self.rate = result.rate;
+        Ok(result.rate)
+    }
+
+    fn get_pitch(&mut self) -> DriverResult<f32> {
+        let result = self.call("speech.getPitch", None)?;
+        let result = serde_json::from_value::<PitchResult>(result)
+            .ok()
+            .filter(|result| result.pitch.is_finite());
+        let Some(result) = result else {
+            self.fail_transport();
+            return Err(Error::InvalidResponse(
+                "speech.getPitch result must contain a finite pitch".to_owned(),
+            )
+            .into());
         };
-        self.rate = actual;
-        Ok(actual)
+        Ok(result.pitch)
+    }
+
+    fn set_pitch(&mut self, pitch: f32) -> DriverResult<f32> {
+        let result = self.call("speech.setPitch", Some(json!({ "pitch": pitch })))?;
+        let result = serde_json::from_value::<PitchResult>(result)
+            .ok()
+            .filter(|result| result.pitch.is_finite());
+        let Some(result) = result else {
+            self.fail_transport();
+            return Err(Error::InvalidResponse(
+                "speech.setPitch result must contain a finite pitch".to_owned(),
+            )
+            .into());
+        };
+        Ok(result.pitch)
+    }
+
+    fn get_volume(&mut self) -> DriverResult<f32> {
+        let result = self.call("speech.getVolume", None)?;
+        let result = serde_json::from_value::<VolumeResult>(result)
+            .ok()
+            .filter(|result| result.volume.is_finite());
+        let Some(result) = result else {
+            self.fail_transport();
+            return Err(Error::InvalidResponse(
+                "speech.getVolume result must contain a finite volume".to_owned(),
+            )
+            .into());
+        };
+        Ok(result.volume)
+    }
+
+    fn set_volume(&mut self, volume: f32) -> DriverResult<f32> {
+        let result = self.call("speech.setVolume", Some(json!({ "volume": volume })))?;
+        let result = serde_json::from_value::<VolumeResult>(result)
+            .ok()
+            .filter(|result| result.volume.is_finite());
+        let Some(result) = result else {
+            self.fail_transport();
+            return Err(Error::InvalidResponse(
+                "speech.setVolume result must contain a finite volume".to_owned(),
+            )
+            .into());
+        };
+        Ok(result.volume)
     }
 
     fn list_voices(&mut self) -> DriverResult<Vec<VoiceInfo>> {

@@ -12,7 +12,7 @@ use crate::protocol::{
     SpeechCapabilities,
 };
 
-pub const SPEECH_PROTOCOL_VERSION: &str = "2.0";
+pub const SPEECH_PROTOCOL_VERSION: &str = "2.0 through 2.1";
 pub const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -74,13 +74,15 @@ fn initialize(
             .ok_or_else(|| RpcError::invalid_params("missing params"))?,
     )
     .map_err(|error| RpcError::invalid_params(error.to_string()))?;
-    let selected = ProtocolVersion::current();
-    if !params.protocol.supports(selected) {
-        return Err(RpcError::unsupported_protocol_version(format!(
-            "no compatible Lector speech protocol version for major {} minors {} through {}",
-            params.protocol.major, params.protocol.minimum_minor, params.protocol.maximum_minor
-        )));
-    }
+    let selected = params
+        .protocol
+        .highest_mutual(ProtocolRange::current())
+        .ok_or_else(|| {
+            RpcError::unsupported_protocol_version(format!(
+                "no compatible Lector speech protocol version for major {} minors {} through {}",
+                params.protocol.major, params.protocol.minimum_minor, params.protocol.maximum_minor
+            ))
+        })?;
     if params.client.name.is_empty() || params.client.version.is_empty() {
         return Err(RpcError::invalid_params(
             "client name and version must not be empty",
@@ -93,7 +95,7 @@ fn initialize(
             version: server_version.to_owned(),
         },
         backend: backend.cloned(),
-        capabilities: capabilities.clone(),
+        capabilities: capabilities.clone().for_protocol_version(selected),
     })
     .map_err(|error| RpcError::internal_error(error.to_string()))
 }
@@ -512,7 +514,7 @@ fn write_notifications(
 mod tests {
     use super::{
         FrameBuffer, MAX_RPC_FRAME_BYTES, Request, RpcError, handle_frame, handle_line,
-        openrpc_document, parse_request,
+        handle_protocol_request, openrpc_document, parse_request,
     };
     use serde_json::{Value, json};
 
@@ -532,9 +534,48 @@ mod tests {
     }
 
     #[test]
+    fn initialize_selects_the_highest_mutual_protocol_minor() {
+        let capabilities = crate::protocol::SpeechCapabilities {
+            settings: crate::protocol::SettingCapabilities {
+                rate: crate::protocol::SettingSupport::ReadWrite,
+                pitch: crate::protocol::SettingSupport::ReadWrite,
+                volume: crate::protocol::SettingSupport::ReadWrite,
+                ..crate::protocol::SettingCapabilities::default()
+            },
+            ..crate::protocol::SpeechCapabilities::default()
+        };
+        for (maximum_minor, selected_minor) in [(0, 0), (9, 1)] {
+            let request = parse_request(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocol":{{"major":2,"minimumMinor":0,"maximumMinor":{maximum_minor}}},"client":{{"name":"client","version":"1"}}}}}}"#
+            ))
+            .unwrap();
+            let result = handle_protocol_request(&request, "host", "1", None, &capabilities)
+                .unwrap()
+                .unwrap();
+            assert_eq!(result["protocol"]["minor"], selected_minor);
+            assert_eq!(
+                result["capabilities"]["settings"]["rate"],
+                if selected_minor == 0 {
+                    "writeOnly"
+                } else {
+                    "readWrite"
+                }
+            );
+            assert_eq!(
+                result["capabilities"]["settings"]["pitch"],
+                if selected_minor == 0 {
+                    "unsupported"
+                } else {
+                    "readWrite"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn discovery_document_covers_version_two_methods_events_and_transport() {
         let document = openrpc_document("test-host", "1");
-        assert_eq!(document["info"]["version"], "2.0.0");
+        assert_eq!(document["info"]["version"], "2.1.0");
         let methods = document["methods"].as_array().unwrap();
         for required in [
             "initialize",
@@ -543,7 +584,12 @@ mod tests {
             "speech.stop",
             "speech.pause",
             "speech.resume",
+            "speech.getRate",
             "speech.setRate",
+            "speech.getPitch",
+            "speech.setPitch",
+            "speech.getVolume",
+            "speech.setVolume",
             "speech.listVoices",
             "speech.getVoice",
             "speech.setVoice",

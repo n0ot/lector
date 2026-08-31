@@ -37,6 +37,8 @@ enum Request {
     Resume,
     Toggle,
     SetRate(f32),
+    SetPitch(f32),
+    SetVolume(f32),
     SetVoice(String),
     ConfigureServer(SpeechServerSpec),
     Start(mpsc::SyncSender<std::result::Result<(), String>>),
@@ -53,6 +55,8 @@ impl Request {
             | Self::Resume
             | Self::Toggle
             | Self::SetRate(_)
+            | Self::SetPitch(_)
+            | Self::SetVolume(_)
             | Self::SetVoice(_)
             | Self::ConfigureServer(_)
             | Self::Start(_) => 0,
@@ -264,6 +268,34 @@ impl Mailbox {
             .requests
             .retain(|request| !matches!(request, Request::SetRate(_)));
         state.requests.push_front(Request::SetRate(rate));
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn enqueue_pitch(&self, pitch: f32) -> DriverResult<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Ok(());
+        }
+        state
+            .requests
+            .retain(|request| !matches!(request, Request::SetPitch(_)));
+        state.requests.push_front(Request::SetPitch(pitch));
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn enqueue_volume(&self, volume: f32) -> DriverResult<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Ok(());
+        }
+        state
+            .requests
+            .retain(|request| !matches!(request, Request::SetVolume(_)));
+        state.requests.push_front(Request::SetVolume(volume));
         drop(state);
         self.available.notify_one();
         Ok(())
@@ -521,6 +553,48 @@ impl Driver for BoundedAsyncDriver {
         Ok(SetOptionOutcome::Accepted)
     }
 
+    fn set_pitch_option(&mut self, pitch: f32) -> DriverResult<SetOptionOutcome> {
+        if !pitch.is_finite() {
+            return Err(anyhow!("speech pitch must be finite"));
+        }
+        let status = self
+            .option_state
+            .lock()
+            .map(|state| state.pitch_status)
+            .unwrap_or(CapabilityStatus::Unknown);
+        if status == CapabilityStatus::Unsupported {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        self.mailbox.enqueue_pitch(pitch)?;
+        if status == CapabilityStatus::Supported
+            && let Ok(mut state) = self.option_state.lock()
+        {
+            state.pitch = Some(pitch);
+        }
+        Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn set_volume_option(&mut self, volume: f32) -> DriverResult<SetOptionOutcome> {
+        if !volume.is_finite() {
+            return Err(anyhow!("speech volume must be finite"));
+        }
+        let status = self
+            .option_state
+            .lock()
+            .map(|state| state.volume_status)
+            .unwrap_or(CapabilityStatus::Unknown);
+        if status == CapabilityStatus::Unsupported {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        self.mailbox.enqueue_volume(volume)?;
+        if status == CapabilityStatus::Supported
+            && let Ok(mut state) = self.option_state.lock()
+        {
+            state.volume = Some(volume);
+        }
+        Ok(SetOptionOutcome::Accepted)
+    }
+
     fn set_voice_option(&mut self, voice_id: &str) -> DriverResult<SetOptionOutcome> {
         if voice_id.is_empty() {
             return Err(anyhow!("speech voice ID must not be empty"));
@@ -609,6 +683,12 @@ fn run_worker(
             NextRequest::Request(Request::Resume) => driver.resume(),
             NextRequest::Request(Request::Toggle) => driver.toggle(),
             NextRequest::Request(Request::SetRate(rate)) => driver.set_rate(rate),
+            NextRequest::Request(Request::SetPitch(pitch)) => {
+                driver.set_pitch_option(pitch).map(|_| ())
+            }
+            NextRequest::Request(Request::SetVolume(volume)) => {
+                driver.set_volume_option(volume).map(|_| ())
+            }
             NextRequest::Request(Request::SetVoice(voice_id)) => {
                 driver.set_voice_option(&voice_id).map(|_| ())
             }
@@ -783,7 +863,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation_preserves_utf8_and_rate_validation_is_local() {
+    fn truncation_preserves_utf8_and_numeric_setting_validation_is_local() {
         let mailbox = Mailbox::new();
         mailbox
             .enqueue_speech(
@@ -808,6 +888,8 @@ mod tests {
         })
         .unwrap();
         assert!(driver.set_rate(f32::NAN).is_err());
+        assert!(driver.set_pitch_option(f32::INFINITY).is_err());
+        assert!(driver.set_volume_option(f32::NEG_INFINITY).is_err());
         assert_eq!(driver.get_rate(), 1.0);
     }
 

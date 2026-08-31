@@ -110,6 +110,12 @@ fn speech_records(path: &Path) -> Vec<Value> {
         .collect()
 }
 
+fn numeric_param_is(record: &Value, name: &str, expected: f64) -> bool {
+    record["params"][name]
+        .as_f64()
+        .is_some_and(|actual| (actual - expected).abs() < 1.0e-6)
+}
+
 #[test]
 fn real_process_startup_retries_once_after_the_first_generation_fails() {
     let directory = TestDirectory::new("startup-retry");
@@ -117,6 +123,14 @@ fn real_process_startup_retries_once_after_the_first_generation_fails() {
     let mut supervisor = Supervisor::new(stub.spec);
 
     supervisor.set_rate(1.75).unwrap();
+    assert_eq!(
+        supervisor.set_pitch_option(0.75).unwrap(),
+        lector::speech::SetOptionOutcome::Accepted
+    );
+    assert_eq!(
+        supervisor.set_volume_option(0.5).unwrap(),
+        lector::speech::SetOptionOutcome::Accepted
+    );
     supervisor.start().expect("second generation starts");
 
     assert_eq!(generation(&stub.state), 2);
@@ -125,6 +139,16 @@ fn real_process_startup_retries_once_after_the_first_generation_fails() {
         record["generation"] == 2
             && record["method"] == "initialize"
             && record["identity"] == "retry"
+    }));
+    assert!(records.iter().any(|record| {
+        record["generation"] == 2
+            && record["method"] == "speech.setPitch"
+            && numeric_param_is(record, "pitch", 0.75)
+    }));
+    assert!(records.iter().any(|record| {
+        record["generation"] == 2
+            && record["method"] == "speech.setVolume"
+            && numeric_param_is(record, "volume", 0.5)
     }));
     assert!(records.iter().any(|record| {
         record["generation"] == 2
@@ -159,6 +183,8 @@ fn real_process_crash_restarts_without_replaying_uncertain_speech() {
     let mut supervisor = Supervisor::new(stub.spec);
     let handle = supervisor.handle();
     supervisor.set_rate(1.625).unwrap();
+    supervisor.set_pitch_option(0.8).unwrap();
+    supervisor.set_volume_option(0.6).unwrap();
     supervisor.start().unwrap();
 
     supervisor
@@ -183,6 +209,16 @@ fn real_process_crash_restarts_without_replaying_uncertain_speech() {
                 Some("set_rate" | "speech.setRate")
             )
             && record["params"]["rate"].as_f64() == Some(1.625)
+    }));
+    assert!(records(&stub.log).iter().any(|record| {
+        record["generation"] == 2
+            && record["method"] == "speech.setPitch"
+            && numeric_param_is(record, "pitch", 0.8)
+    }));
+    assert!(records(&stub.log).iter().any(|record| {
+        record["generation"] == 2
+            && record["method"] == "speech.setVolume"
+            && numeric_param_is(record, "volume", 0.6)
     }));
     assert!(handle.take_events().is_empty());
 }

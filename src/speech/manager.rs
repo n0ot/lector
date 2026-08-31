@@ -32,7 +32,22 @@ pub trait Host {
     fn stop(&mut self, id: &UtteranceId) -> Result<()>;
     fn pause(&mut self, id: &UtteranceId) -> Result<PauseResult>;
     fn resume(&mut self, id: &UtteranceId) -> Result<()>;
+    fn get_rate(&mut self) -> Result<f32> {
+        Err(anyhow!("speech host cannot report its current rate"))
+    }
     fn set_rate(&mut self, rate: f32) -> Result<f32>;
+    fn get_pitch(&mut self) -> Result<f32> {
+        Err(anyhow!("speech host cannot report its current pitch"))
+    }
+    fn set_pitch(&mut self, _pitch: f32) -> Result<f32> {
+        Err(anyhow!("speech host cannot set pitch"))
+    }
+    fn get_volume(&mut self) -> Result<f32> {
+        Err(anyhow!("speech host cannot report its current volume"))
+    }
+    fn set_volume(&mut self, _volume: f32) -> Result<f32> {
+        Err(anyhow!("speech host cannot set volume"))
+    }
     fn list_voices(&mut self) -> Result<Vec<VoiceInfo>> {
         Err(anyhow!("speech host cannot list voices"))
     }

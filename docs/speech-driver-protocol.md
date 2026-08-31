@@ -1,8 +1,8 @@
-# Lector speech-host protocol 2.0
+# Lector speech-host protocol 2.1
 
 Status: project specification
 
-Protocol: `2.0`
+Protocol: `2.1` (backward compatible with `2.0`)
 
 Machine-readable definition:
 [`../crates/lector-tts/openrpc.json`](../crates/lector-tts/openrpc.json)
@@ -61,9 +61,9 @@ stdout for this protocol and SHOULD write diagnostics only to stderr. It MUST
 exit promptly on stdin EOF and is responsible for its own descendants.
 
 `lector.api.set_speech(spec)` starts a candidate asynchronously. Lector commits
-the setting only after initialization and rate restoration succeed; otherwise
-the old host remains selected. An intentional replacement does not count as a
-host crash.
+the setting only after initialization and configured-setting restoration
+succeed; otherwise the old host remains selected. An intentional replacement
+does not count as a host crash.
 
 ## 3. Transport
 
@@ -111,13 +111,13 @@ NDJSON is Lector-specific because JSON-RPC does not define stream framing.
 be `initialize`, exactly once:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":0,"maximumMinor":0},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":0,"maximumMinor":1},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
 ```
 
 The host selects a minor version within the offered range:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":0},"server":{"name":"lector-tts","version":"0.1.0"},"backend":{"id":"av-foundation","name":"AVFoundation"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite"},"voices":{"list":true,"current":true,"select":true}}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":1},"server":{"name":"lector-tts","version":"0.1.0"},"backend":{"id":"av-foundation","name":"AVFoundation"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite","pitch":"readWrite","volume":"readWrite"},"voices":{"list":true,"current":true,"select":true}}}}
 ```
 
 The major version identifies an incompatible contract. Minor versions are
@@ -196,10 +196,16 @@ word. Unknown modes are unsupported.
 
 ### 5.4 Settings
 
-`settings.rate` is `readWrite`, `writeOnly`, or `unsupported`. `readWrite`
-means `speech.setRate` returns the effective value. `writeOnly` exists for
-adapters that can apply but not independently inspect the value. Version 2
-Lector currently invokes `speech.setRate` for either advertised mode.
+`settings.rate`, `settings.pitch`, and `settings.volume` are independently
+`readWrite`, `writeOnly`, or `unsupported`. Every setter returns the effective
+value. `writeOnly` exists for adapters that can apply but not independently
+inspect a value. In protocol 2.1, `readWrite` enables the corresponding getter
+for rate, pitch, and volume. Pitch, volume, and `speech.getRate` are protocol
+2.1 additions. When 2.0 is selected, rate's historical `readWrite` value is
+interpreted as `writeOnly` because that version defined only the setter, and
+pitch and volume are unsupported. Lector invokes a setter only for an
+advertised writable setting and treats unknown or missing setting members as
+unsupported.
 
 ### 5.5 Voices
 
@@ -329,11 +335,23 @@ relative to the original complete text. It MUST reject an ID that is not the
 paused utterance. If resume fails, Lector stops the uncertain utterance and
 retains the complete text for the same fresh-ID restart fallback.
 
-### 7.6 `speech.setRate`
+### 7.6 `speech.getRate`
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"speech.setRate","params":{"rate":1.25}}
-{"jsonrpc":"2.0","id":6,"result":{"rate":1.25}}
+{"jsonrpc":"2.0","id":6,"method":"speech.getRate"}
+{"jsonrpc":"2.0","id":6,"result":{"rate":1.0}}
+```
+
+This protocol 2.1 method is available only when `settings.rate` is
+`readWrite`. It returns the finite current rate in the host backend's
+documented domain. Lector uses it to expose the active value without imposing
+a client-side default on the backend.
+
+### 7.7 `speech.setRate`
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"speech.setRate","params":{"rate":1.25}}
+{"jsonrpc":"2.0","id":7,"result":{"rate":1.25}}
 ```
 
 `rate` MUST be finite and uses the host backend's documented domain. The host
@@ -342,11 +360,57 @@ value when replacing a host process. Lector MUST call this method only when
 `settings.rate` is `readWrite` or `writeOnly`; an unsupported host is neither
 queried for rate bounds nor asked to apply a rate.
 
-### 7.7 `speech.listVoices`
+### 7.8 `speech.getPitch`
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"speech.listVoices"}
-{"jsonrpc":"2.0","id":7,"result":{"voices":[{"id":"voice-1","name":"Samantha","language":"en-US","gender":"female"}]}}
+{"jsonrpc":"2.0","id":8,"method":"speech.getPitch"}
+{"jsonrpc":"2.0","id":8,"result":{"pitch":1.0}}
+```
+
+This method is available only when `settings.pitch` is `readWrite`. It returns
+the finite current pitch in the host backend's documented domain. Lector uses
+it to expose the active value without changing the backend default.
+
+### 7.9 `speech.setPitch`
+
+```json
+{"jsonrpc":"2.0","id":9,"method":"speech.setPitch","params":{"pitch":1.1}}
+{"jsonrpc":"2.0","id":9,"result":{"pitch":1.1}}
+```
+
+`pitch` MUST be finite and uses the host backend's documented domain. The host
+MAY clamp it and returns the finite effective value. The method is available
+when `settings.pitch` is `readWrite` or `writeOnly`. Lector restores only a
+pitch the user configured; it does not impose one backend's default on another
+backend during replacement.
+
+### 7.10 `speech.getVolume`
+
+```json
+{"jsonrpc":"2.0","id":10,"method":"speech.getVolume"}
+{"jsonrpc":"2.0","id":10,"result":{"volume":1.0}}
+```
+
+This method is available only when `settings.volume` is `readWrite`. It
+returns the finite current volume in the host backend's documented domain.
+
+### 7.11 `speech.setVolume`
+
+```json
+{"jsonrpc":"2.0","id":11,"method":"speech.setVolume","params":{"volume":0.8}}
+{"jsonrpc":"2.0","id":11,"result":{"volume":0.8}}
+```
+
+`volume` MUST be finite and uses the host backend's documented domain. The
+host MAY clamp it and returns the finite effective value. The method is
+available when `settings.volume` is `readWrite` or `writeOnly`. As with pitch,
+Lector restores only an explicitly configured value across host generations.
+
+### 7.12 `speech.listVoices`
+
+```json
+{"jsonrpc":"2.0","id":12,"method":"speech.listVoices"}
+{"jsonrpc":"2.0","id":12,"result":{"voices":[{"id":"voice-1","name":"Samantha","language":"en-US","gender":"female"}]}}
 ```
 
 This method is available only when `voices.list` is true. IDs are opaque,
@@ -354,11 +418,11 @@ nonempty backend-provided strings used for selection; names and BCP 47-style
 language strings are display metadata. The optional gender string is
 descriptive and extensible.
 
-### 7.8 `speech.getVoice`
+### 7.13 `speech.getVoice`
 
 ```json
-{"jsonrpc":"2.0","id":8,"method":"speech.getVoice"}
-{"jsonrpc":"2.0","id":8,"result":{"voice":{"id":"voice-1","name":"Samantha","language":"en-US","gender":"female"}}}
+{"jsonrpc":"2.0","id":13,"method":"speech.getVoice"}
+{"jsonrpc":"2.0","id":13,"result":{"voice":{"id":"voice-1","name":"Samantha","language":"en-US","gender":"female"}}}
 ```
 
 This method is available only when `voices.current` is true. `voice` may be
@@ -366,11 +430,11 @@ This method is available only when `voices.current` is true. `voice` may be
 default. A host without current-voice support omits the capability and method;
 it does not return a fabricated default voice.
 
-### 7.9 `speech.setVoice`
+### 7.14 `speech.setVoice`
 
 ```json
-{"jsonrpc":"2.0","id":9,"method":"speech.setVoice","params":{"voiceId":"voice-1"}}
-{"jsonrpc":"2.0","id":9,"result":{"voice":{"id":"voice-1","name":"Samantha","language":"en-US","gender":"female"}}}
+{"jsonrpc":"2.0","id":14,"method":"speech.setVoice","params":{"voiceId":"voice-1"}}
+{"jsonrpc":"2.0","id":14,"result":{"voice":{"id":"voice-1","name":"Samantha","language":"en-US","gender":"female"}}}
 ```
 
 This method is available only when `voices.select` is true. It selects an ID
@@ -510,6 +574,6 @@ A conforming version 2 host must:
 5. Translate native indexes to markers or valid UTF-8 byte boundaries.
 6. Implement pause/resume only if it restarts the interrupted word; otherwise
    advertise it as unsupported and provide stop for Lector's restart fallback.
-7. Invoke rate and voice operations only when their independent capabilities
-   are advertised; never fabricate an externally managed voice.
+7. Invoke rate, pitch, volume, and voice operations only when their independent
+   capabilities are advertised; never fabricate an externally managed voice.
 8. Respond inside the deadlines, exit on EOF, and clean up descendants.

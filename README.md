@@ -335,9 +335,9 @@ lector-tts --backend nvda
 ```
 
 The host reports its selected backend during protocol initialization. Rate,
-voice listing, current-voice reporting, and voice selection are negotiated
-independently. Lector does not call unsupported rate operations or invent a
-`default` voice for externally managed backends such as NVDA.
+pitch, volume, voice listing, current-voice reporting, and voice selection are
+negotiated independently. Lector does not call unsupported setting operations
+or invent a `default` voice for externally managed backends such as NVDA.
 
 Speech selection is Lua configuration, not a command-line driver setting:
 
@@ -367,14 +367,16 @@ remain the user's responsibility.
 
 Lector invokes `program` directly; it does not perform shell parsing. At
 startup it loads `init.lua`, starts and initializes the selected server, and
-then restores the configured speech rate only when the negotiated backend can
-set it. Assigning `lector.o.speech.server` is a startup-only configuration
+then restores configured speech settings only when the negotiated backend can
+set them. Assigning `lector.o.speech.server` is a startup-only configuration
 operation.
 
-Speech timing, rate, and voice controls live in the same namespace:
+Speech timing, numeric settings, and voice controls live in the same namespace:
 
 ```lua
 lector.o.speech.rate = 1.25
+lector.o.speech.pitch = 1.0
+lector.o.speech.volume = 0.8
 
 -- Delay between paragraphs; 100 milliseconds by default.
 -- Set to 0 to add no paragraph delay.
@@ -394,10 +396,11 @@ Paragraph pause is Lector presentation policy rather than a speech-host
 setting. It must be a non-negative integer number of milliseconds, and changes
 apply to paragraph boundaries in speech submitted after the assignment.
 
-The negotiated operations remain independent. `rate`, `voice`, or `voices`
-returns `nil` when the active host cannot report that value, and `voices` is a
-read-only array of `{id, name, language, gender}` tables when listing is
-available. Assigning an unsupported rate or voice, or selecting an ID absent
+The negotiated operations remain independent. `rate`, `pitch`, `volume`,
+`voice`, or `voices` returns `nil` when the active host cannot report that
+value, and `voices` is a read-only array of `{id, name, language, gender}`
+tables when listing is available. Numeric values use the selected backend's
+domain. Assigning an unsupported setting or voice, or selecting an ID absent
 from an available voice list, raises a Lua error without changing the option.
 In the Lua REPL the submitted chunk stops and the prompt remains available. In
 `init.lua`, an immediately detectable error skips the rest of the chunk while
@@ -661,6 +664,10 @@ lector.o.speech.server = "native"
 
 -- speaking rate
 lector.o.speech.rate = 1.0
+
+-- backend-domain pitch and volume, when negotiated
+lector.o.speech.pitch = 1.0
+lector.o.speech.volume = 0.8
 
 -- milliseconds of additional silence between paragraphs
 lector.o.speech.paragraph_pause_ms = 100

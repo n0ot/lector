@@ -36,6 +36,18 @@ fn proc_driver_negotiates_the_current_protocol() {
     assert!(Host::capabilities(&driver).voices.list);
     assert!(Host::capabilities(&driver).voices.current);
     assert!(Host::capabilities(&driver).voices.select);
+    assert!(Host::capabilities(&driver).settings.pitch.can_write());
+    assert!(Host::capabilities(&driver).settings.volume.can_write());
+
+    assert_eq!(Host::get_rate(&mut driver).unwrap(), 1.0);
+    assert_eq!(Host::set_rate(&mut driver, 1.25).unwrap(), 1.25);
+    assert_eq!(Host::get_rate(&mut driver).unwrap(), 1.25);
+    assert_eq!(Host::get_pitch(&mut driver).unwrap(), 1.0);
+    assert_eq!(Host::set_pitch(&mut driver, 0.75).unwrap(), 0.75);
+    assert_eq!(Host::get_pitch(&mut driver).unwrap(), 0.75);
+    assert_eq!(Host::get_volume(&mut driver).unwrap(), 1.0);
+    assert_eq!(Host::set_volume(&mut driver, 0.5).unwrap(), 0.5);
+    assert_eq!(Host::get_volume(&mut driver).unwrap(), 0.5);
 
     let voices = Host::list_voices(&mut driver).expect("list voices");
     assert_eq!(
@@ -101,7 +113,16 @@ fn rpc_discover_is_available_before_initialize() {
     let response: Value = serde_json::from_str(&response).unwrap();
     assert_eq!(response["result"]["openrpc"], "1.4.0");
     assert!(response["result"]["methods"].is_array());
-    for method in ["speech.listVoices", "speech.getVoice", "speech.setVoice"] {
+    for method in [
+        "speech.getRate",
+        "speech.getPitch",
+        "speech.setPitch",
+        "speech.getVolume",
+        "speech.setVolume",
+        "speech.listVoices",
+        "speech.getVoice",
+        "speech.setVoice",
+    ] {
         assert!(
             response["result"]["methods"]
                 .as_array()

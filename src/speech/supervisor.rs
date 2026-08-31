@@ -9,7 +9,7 @@ use super::{
     CapabilityStatus, Driver, OptionState, SetOptionOutcome, SpeechServerSpec, UtteranceBoundary,
     manager::{Host, SpeechManager},
     proc_driver,
-    protocol::{UtteranceId, VoiceInfo},
+    protocol::{SettingSupport, UtteranceId, VoiceInfo},
 };
 use anyhow::{Context, Result as DriverResult, anyhow};
 use mio::Waker;
@@ -279,6 +279,8 @@ impl PendingSpeech {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConfiguredSpeechOption {
     Rate,
+    Pitch,
+    Volume,
     Voice,
 }
 
@@ -286,6 +288,8 @@ impl ConfiguredSpeechOption {
     const fn lua_name(self) -> &'static str {
         match self {
             Self::Rate => "lector.o.speech.rate",
+            Self::Pitch => "lector.o.speech.pitch",
+            Self::Volume => "lector.o.speech.volume",
             Self::Voice => "lector.o.speech.voice",
         }
     }
@@ -326,6 +330,10 @@ pub struct Supervisor {
     desired_rate: f32,
     desired_rate_configured: bool,
     pending_rate: Option<f32>,
+    desired_pitch: Option<f32>,
+    pending_pitch: Option<f32>,
+    desired_volume: Option<f32>,
+    pending_volume: Option<f32>,
     desired_voice: Option<String>,
     pending_voice: Option<String>,
     option_state: OptionState,
@@ -374,6 +382,10 @@ impl Supervisor {
             desired_rate: 1.0,
             desired_rate_configured: false,
             pending_rate: None,
+            desired_pitch: None,
+            pending_pitch: None,
+            desired_volume: None,
+            pending_volume: None,
             desired_voice: None,
             pending_voice: None,
             option_state: OptionState::default(),
@@ -408,25 +420,70 @@ impl Supervisor {
             drop(candidate);
             return Err(anyhow!("speech supervisor is shutting down"));
         }
-        let requested_rate = self.pending_rate.unwrap_or(self.desired_rate);
-        let applied_rate = if candidate.host.has_legacy_queue()
-            || candidate.host.capabilities().settings.rate.can_write()
-        {
-            candidate.host.set_rate(requested_rate).map_err(|source| {
+        let legacy = candidate.host.has_legacy_queue();
+        let requested_rate = if legacy {
+            Some(self.pending_rate.unwrap_or(self.desired_rate))
+        } else {
+            self.pending_rate
+                .or(self.desired_rate_configured.then_some(self.desired_rate))
+        };
+        let applied_rate = if let Some(rate) = requested_rate {
+            if !legacy && !candidate.host.capabilities().settings.rate.can_write() {
+                return Err(ConfiguredSpeechOptionError::Unsupported {
+                    option: ConfiguredSpeechOption::Rate,
+                    operation: "setting rate",
+                }
+                .into());
+            }
+            Some(candidate.host.set_rate(rate).map_err(|source| {
                 anyhow::Error::new(ConfiguredSpeechOptionError::Rejected {
                     option: ConfiguredSpeechOption::Rate,
-                    value: requested_rate.to_string(),
+                    value: rate.to_string(),
                     source,
                 })
-            })?
-        } else if self.pending_rate.is_some() || self.desired_rate_configured {
-            return Err(ConfiguredSpeechOptionError::Unsupported {
-                option: ConfiguredSpeechOption::Rate,
-                operation: "setting rate",
-            }
-            .into());
+            })?)
         } else {
-            self.desired_rate
+            None
+        };
+        let requested_pitch = self.pending_pitch.or(self.desired_pitch);
+        let applied_pitch = if let Some(pitch) = requested_pitch {
+            if candidate.host.capabilities().settings.pitch.can_write() {
+                Some(candidate.host.set_pitch(pitch).map_err(|source| {
+                    anyhow::Error::new(ConfiguredSpeechOptionError::Rejected {
+                        option: ConfiguredSpeechOption::Pitch,
+                        value: pitch.to_string(),
+                        source,
+                    })
+                })?)
+            } else {
+                return Err(ConfiguredSpeechOptionError::Unsupported {
+                    option: ConfiguredSpeechOption::Pitch,
+                    operation: "setting pitch",
+                }
+                .into());
+            }
+        } else {
+            None
+        };
+        let requested_volume = self.pending_volume.or(self.desired_volume);
+        let applied_volume = if let Some(volume) = requested_volume {
+            if candidate.host.capabilities().settings.volume.can_write() {
+                Some(candidate.host.set_volume(volume).map_err(|source| {
+                    anyhow::Error::new(ConfiguredSpeechOptionError::Rejected {
+                        option: ConfiguredSpeechOption::Volume,
+                        value: volume.to_string(),
+                        source,
+                    })
+                })?)
+            } else {
+                return Err(ConfiguredSpeechOptionError::Unsupported {
+                    option: ConfiguredSpeechOption::Volume,
+                    operation: "setting volume",
+                }
+                .into());
+            }
+        } else {
+            None
         };
         let requested_voice = self
             .pending_voice
@@ -449,9 +506,17 @@ impl Supervisor {
                 .into());
             }
         }
-        self.desired_rate = applied_rate;
+        if let Some(applied_rate) = applied_rate {
+            self.desired_rate = applied_rate;
+        }
         if self.pending_rate.take().is_some() {
             self.desired_rate_configured = true;
+        }
+        if self.pending_pitch.take().is_some() || self.desired_pitch.is_some() {
+            self.desired_pitch = applied_pitch;
+        }
+        if self.pending_volume.take().is_some() || self.desired_volume.is_some() {
+            self.desired_volume = applied_volume;
         }
         if let Some(voice_id) = self.pending_voice.take() {
             self.desired_voice = Some(voice_id);
@@ -476,9 +541,23 @@ impl Supervisor {
         let legacy = process.host.has_legacy_queue();
         let capabilities = process.host.capabilities().clone();
         let rate_supported = legacy || capabilities.settings.rate.can_write();
+        let pitch_supported = capabilities.settings.pitch.can_write();
+        let volume_supported = capabilities.settings.volume.can_write();
         let mut state = OptionState {
-            rate: rate_supported.then_some(self.desired_rate),
+            rate: (legacy || self.desired_rate_configured).then_some(self.desired_rate),
             rate_status: if rate_supported {
+                CapabilityStatus::Supported
+            } else {
+                CapabilityStatus::Unsupported
+            },
+            pitch: self.desired_pitch,
+            pitch_status: if pitch_supported {
+                CapabilityStatus::Supported
+            } else {
+                CapabilityStatus::Unsupported
+            },
+            volume: self.desired_volume,
+            volume_status: if volume_supported {
                 CapabilityStatus::Supported
             } else {
                 CapabilityStatus::Unsupported
@@ -495,6 +574,27 @@ impl Supervisor {
             },
             ..OptionState::default()
         };
+        if !legacy && capabilities.settings.rate == SettingSupport::ReadWrite {
+            match process.host.get_rate() {
+                Ok(rate) => {
+                    self.desired_rate = rate;
+                    state.rate = Some(rate);
+                }
+                Err(error) => warn_option_failure("reading rate", &error),
+            }
+        }
+        if capabilities.settings.pitch == SettingSupport::ReadWrite {
+            match process.host.get_pitch() {
+                Ok(pitch) => state.pitch = Some(pitch),
+                Err(error) => warn_option_failure("reading pitch", &error),
+            }
+        }
+        if capabilities.settings.volume == SettingSupport::ReadWrite {
+            match process.host.get_volume() {
+                Ok(volume) => state.volume = Some(volume),
+                Err(error) => warn_option_failure("reading volume", &error),
+            }
+        }
         if capabilities.voices.list {
             match process.host.list_voices() {
                 Ok(voices) => state.voices = Some(voices),
@@ -531,6 +631,8 @@ impl Supervisor {
         if let Some(option_error) = first_error.downcast_ref::<ConfiguredSpeechOptionError>() {
             match option_error.option() {
                 ConfiguredSpeechOption::Rate => self.pending_rate = None,
+                ConfiguredSpeechOption::Pitch => self.pending_pitch = None,
+                ConfiguredSpeechOption::Volume => self.pending_volume = None,
                 ConfiguredSpeechOption::Voice => self.pending_voice = None,
             }
             let message = format!("speech option configuration failed: {first_error:#}");
@@ -920,6 +1022,56 @@ impl Driver for Supervisor {
         self.option_state.clone()
     }
 
+    fn set_pitch_option(&mut self, pitch: f32) -> DriverResult<SetOptionOutcome> {
+        if !pitch.is_finite() {
+            return Err(anyhow!("speech pitch must be finite"));
+        }
+        if !self.started {
+            self.pending_pitch = Some(pitch);
+            return Ok(SetOptionOutcome::Accepted);
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|process| !process.host.capabilities().settings.pitch.can_write())
+        {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        let mut actual = pitch;
+        self.call_host("set_pitch", |host| {
+            actual = host.set_pitch(pitch)?;
+            Ok(())
+        })?;
+        self.desired_pitch = Some(actual);
+        self.option_state.pitch = Some(actual);
+        Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn set_volume_option(&mut self, volume: f32) -> DriverResult<SetOptionOutcome> {
+        if !volume.is_finite() {
+            return Err(anyhow!("speech volume must be finite"));
+        }
+        if !self.started {
+            self.pending_volume = Some(volume);
+            return Ok(SetOptionOutcome::Accepted);
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|process| !process.host.capabilities().settings.volume.can_write())
+        {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        let mut actual = volume;
+        self.call_host("set_volume", |host| {
+            actual = host.set_volume(volume)?;
+            Ok(())
+        })?;
+        self.desired_volume = Some(actual);
+        self.option_state.volume = Some(actual);
+        Ok(SetOptionOutcome::Accepted)
+    }
+
     fn set_voice_option(&mut self, voice_id: &str) -> DriverResult<SetOptionOutcome> {
         if voice_id.is_empty() {
             return Err(anyhow!("speech voice ID must not be empty"));
@@ -1025,7 +1177,12 @@ mod tests {
     enum Call {
         Speak(String, bool),
         Stop,
+        GetRate,
         SetRate(u32),
+        GetPitch,
+        SetPitch(u32),
+        GetVolume,
+        SetVolume(u32),
         ListVoices,
         GetVoice,
         SetVoice(String),
@@ -1037,6 +1194,9 @@ mod tests {
         speak_results: VecDeque<DriverResult<()>>,
         stop_results: VecDeque<DriverResult<()>>,
         rate_results: VecDeque<DriverResult<()>>,
+        rate: f32,
+        pitch: f32,
+        volume: f32,
         legacy: bool,
         capabilities: crate::speech::protocol::SpeechCapabilities,
         voices: Vec<VoiceInfo>,
@@ -1050,6 +1210,9 @@ mod tests {
                 speak_results: VecDeque::new(),
                 stop_results: VecDeque::new(),
                 rate_results: VecDeque::new(),
+                rate: 1.0,
+                pitch: 1.0,
+                volume: 1.0,
                 legacy: true,
                 capabilities: Default::default(),
                 voices: Vec::new(),
@@ -1060,7 +1223,6 @@ mod tests {
 
     struct FakeDriver {
         state: Arc<Mutex<FakeState>>,
-        rate: f32,
         capabilities: crate::speech::protocol::SpeechCapabilities,
     }
 
@@ -1099,14 +1261,46 @@ mod tests {
             Ok(())
         }
 
+        fn get_rate(&mut self) -> DriverResult<f32> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(Call::GetRate);
+            Ok(state.rate)
+        }
+
         fn set_rate(&mut self, rate: f32) -> DriverResult<f32> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(Call::SetRate(rate.to_bits()));
             let result = state.rate_results.pop_front().unwrap_or(Ok(()));
             if result.is_ok() {
-                self.rate = rate;
+                state.rate = rate;
             }
-            result.map(|()| self.rate)
+            result.map(|()| state.rate)
+        }
+
+        fn get_pitch(&mut self) -> DriverResult<f32> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(Call::GetPitch);
+            Ok(state.pitch)
+        }
+
+        fn set_pitch(&mut self, pitch: f32) -> DriverResult<f32> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(Call::SetPitch(pitch.to_bits()));
+            state.pitch = pitch;
+            Ok(pitch)
+        }
+
+        fn get_volume(&mut self) -> DriverResult<f32> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(Call::GetVolume);
+            Ok(state.volume)
+        }
+
+        fn set_volume(&mut self, volume: f32) -> DriverResult<f32> {
+            let mut state = self.state.lock().unwrap();
+            state.calls.push(Call::SetVolume(volume.to_bits()));
+            state.volume = volume;
+            Ok(volume)
         }
 
         fn list_voices(&mut self) -> DriverResult<Vec<VoiceInfo>> {
@@ -1183,7 +1377,6 @@ mod tests {
                     Ok(ManagedProcess {
                         host: Box::new(FakeDriver {
                             state,
-                            rate: 1.0,
                             capabilities,
                         }),
                         terminator,
@@ -1218,7 +1411,6 @@ mod tests {
                 return Ok(ManagedProcess {
                     host: Box::new(FakeDriver {
                         state: Arc::clone(&self.active),
-                        rate: 1.0,
                         capabilities: Default::default(),
                     }),
                     terminator,
@@ -1375,7 +1567,72 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_speech_options_do_not_invent_rate_or_current_voice() {
+    fn negotiated_numeric_settings_preserve_independent_read_and_write_support() {
+        let mut harness = Harness::new();
+        let active = fake_state();
+        {
+            let mut state = active.lock().unwrap();
+            state.legacy = false;
+            state.capabilities.settings.rate = SettingSupport::ReadWrite;
+            state.capabilities.settings.pitch = SettingSupport::WriteOnly;
+            state.capabilities.settings.volume = SettingSupport::ReadWrite;
+            state.rate = 1.4;
+            state.volume = 0.9;
+        }
+        harness.push_driver(Arc::clone(&active));
+
+        assert_eq!(
+            harness.supervisor.set_pitch_option(0.75).unwrap(),
+            SetOptionOutcome::Accepted
+        );
+        harness.supervisor.start().unwrap();
+
+        let options = harness.supervisor.option_state();
+        assert_eq!(options.rate_status, CapabilityStatus::Supported);
+        assert_eq!(options.rate, Some(1.4));
+        assert_eq!(options.pitch_status, CapabilityStatus::Supported);
+        assert_eq!(options.pitch, Some(0.75));
+        assert_eq!(options.volume_status, CapabilityStatus::Supported);
+        assert_eq!(options.volume, Some(0.9));
+        assert_eq!(
+            active.lock().unwrap().calls,
+            [
+                Call::SetPitch(0.75f32.to_bits()),
+                Call::GetRate,
+                Call::GetVolume,
+            ]
+        );
+    }
+
+    #[test]
+    fn negotiated_write_only_rate_is_unknown_until_lector_sets_it() {
+        let mut harness = Harness::new();
+        let active = fake_state();
+        {
+            let mut state = active.lock().unwrap();
+            state.legacy = false;
+            state.capabilities.settings.rate = SettingSupport::WriteOnly;
+            state.rate = 1.4;
+        }
+        harness.push_driver(Arc::clone(&active));
+
+        harness.supervisor.start().unwrap();
+
+        let options = harness.supervisor.option_state();
+        assert_eq!(options.rate_status, CapabilityStatus::Supported);
+        assert_eq!(options.rate, None);
+        assert!(active.lock().unwrap().calls.is_empty());
+
+        harness.supervisor.set_rate(1.25).unwrap();
+        assert_eq!(harness.supervisor.option_state().rate, Some(1.25));
+        assert_eq!(
+            active.lock().unwrap().calls,
+            [Call::SetRate(1.25f32.to_bits())]
+        );
+    }
+
+    #[test]
+    fn negotiated_speech_options_do_not_invent_numeric_values_or_current_voice() {
         let mut harness = Harness::new();
         let active = fake_state();
         {
@@ -1403,10 +1660,22 @@ mod tests {
         let options = harness.supervisor.option_state();
         assert_eq!(options.rate_status, CapabilityStatus::Unsupported);
         assert_eq!(options.rate, None);
+        assert_eq!(options.pitch_status, CapabilityStatus::Unsupported);
+        assert_eq!(options.pitch, None);
+        assert_eq!(options.volume_status, CapabilityStatus::Unsupported);
+        assert_eq!(options.volume, None);
         assert_eq!(options.voice_status, CapabilityStatus::Unsupported);
         assert_eq!(options.voice, None);
         assert_eq!(options.voice_selection_status, CapabilityStatus::Supported);
         assert_eq!(options.voices.as_ref().unwrap()[0].id, "voice-a");
+        assert_eq!(
+            harness.supervisor.set_pitch_option(1.0).unwrap(),
+            SetOptionOutcome::Unsupported
+        );
+        assert_eq!(
+            harness.supervisor.set_volume_option(1.0).unwrap(),
+            SetOptionOutcome::Unsupported
+        );
         assert_eq!(
             active.lock().unwrap().calls,
             [Call::SetVoice("voice-a".to_owned()), Call::ListVoices,]

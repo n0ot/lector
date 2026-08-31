@@ -52,6 +52,10 @@ pub enum CapabilityStatus {
 pub struct OptionState {
     pub rate: Option<f32>,
     pub rate_status: CapabilityStatus,
+    pub pitch: Option<f32>,
+    pub pitch_status: CapabilityStatus,
+    pub volume: Option<f32>,
+    pub volume_status: CapabilityStatus,
     pub voice: Option<VoiceInfo>,
     pub voice_status: CapabilityStatus,
     pub voice_selection_status: CapabilityStatus,
@@ -161,6 +165,14 @@ pub trait Driver {
         Ok(SetOptionOutcome::Accepted)
     }
 
+    fn set_pitch_option(&mut self, _pitch: f32) -> DriverResult<SetOptionOutcome> {
+        Ok(SetOptionOutcome::Unsupported)
+    }
+
+    fn set_volume_option(&mut self, _volume: f32) -> DriverResult<SetOptionOutcome> {
+        Ok(SetOptionOutcome::Unsupported)
+    }
+
     fn set_voice_option(&mut self, _voice_id: &str) -> DriverResult<SetOptionOutcome> {
         Ok(SetOptionOutcome::Unsupported)
     }
@@ -217,6 +229,8 @@ impl Driver for SilentDriver {
     fn option_state(&self) -> OptionState {
         OptionState {
             rate_status: CapabilityStatus::Unsupported,
+            pitch_status: CapabilityStatus::Unsupported,
+            volume_status: CapabilityStatus::Unsupported,
             voice_status: CapabilityStatus::Unsupported,
             voice_selection_status: CapabilityStatus::Unsupported,
             ..OptionState::default()
@@ -419,11 +433,31 @@ impl Speech {
     }
 
     pub fn set_rate(&mut self, rate: f32) -> Result<()> {
+        ensure_finite_option("rate", rate)?;
         self.driver.set_rate(rate).map_err(Error::Driver)
     }
 
     pub fn set_rate_option(&mut self, rate: f32) -> Result<SetOptionOutcome> {
+        ensure_finite_option("rate", rate)?;
         self.driver.set_rate_option(rate).map_err(Error::Driver)
+    }
+
+    pub fn pitch(&self) -> Option<f32> {
+        self.driver.option_state().pitch
+    }
+
+    pub fn set_pitch_option(&mut self, pitch: f32) -> Result<SetOptionOutcome> {
+        ensure_finite_option("pitch", pitch)?;
+        self.driver.set_pitch_option(pitch).map_err(Error::Driver)
+    }
+
+    pub fn volume(&self) -> Option<f32> {
+        self.driver.option_state().volume
+    }
+
+    pub fn set_volume_option(&mut self, volume: f32) -> Result<SetOptionOutcome> {
+        ensure_finite_option("volume", volume)?;
+        self.driver.set_volume_option(volume).map_err(Error::Driver)
     }
 
     pub fn paragraph_pause_ms(&self) -> u64 {
@@ -523,6 +557,16 @@ impl Speech {
 
     pub fn clear_symbols(&mut self) {
         self.symbols_map.clear();
+    }
+}
+
+fn ensure_finite_option(name: &str, value: f32) -> Result<()> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(Error::Driver(anyhow::anyhow!(
+            "speech {name} must be finite"
+        )))
     }
 }
 

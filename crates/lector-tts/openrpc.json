@@ -2,12 +2,12 @@
   "openrpc": "1.4.0",
   "info": {
     "title": "Lector speech-host protocol",
-    "description": "Version 2.0 of the bidirectional JSON-RPC interface between Lector and a speech host. Messages are UTF-8 NDJSON over stdio. See docs/speech-driver-protocol.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
+    "description": "Version 2.1 of the bidirectional JSON-RPC interface between Lector and a speech host. Messages are UTF-8 NDJSON over stdio. See docs/speech-driver-protocol.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/license/mit"
     },
-    "version": "2.0.0"
+    "version": "2.1.0"
   },
   "externalDocs": {
     "description": "Normative RFC-style protocol specification",
@@ -219,6 +219,23 @@
       ]
     },
     {
+      "name": "speech.getRate",
+      "summary": "Return the current host speaking rate",
+      "description": "Protocol 2.1 method implemented only when settings.rate is readWrite.",
+      "params": [],
+      "result": {
+        "name": "currentRate",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/RateResult"
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/MethodNotFound" },
+        { "$ref": "#/components/errors/BackendError" }
+      ]
+    },
+    {
       "name": "speech.setRate",
       "summary": "Set the host speaking rate",
       "description": "The host may clamp the request and returns its finite effective value.",
@@ -237,7 +254,7 @@
         "name": "effectiveRate",
         "required": true,
         "schema": {
-          "$ref": "#/components/schemas/SetRateResult"
+          "$ref": "#/components/schemas/RateResult"
         }
       },
       "errors": [
@@ -250,6 +267,96 @@
         {
           "$ref": "#/components/errors/BackendError"
         }
+      ]
+    },
+    {
+      "name": "speech.getPitch",
+      "summary": "Return the current host speaking pitch",
+      "description": "Implemented only when settings.pitch is readWrite.",
+      "params": [],
+      "result": {
+        "name": "currentPitch",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/PitchResult"
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/MethodNotFound" },
+        { "$ref": "#/components/errors/BackendError" }
+      ]
+    },
+    {
+      "name": "speech.setPitch",
+      "summary": "Set the host speaking pitch",
+      "description": "The host may clamp the request and returns its finite effective value.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "pitch",
+          "required": true,
+          "schema": {
+            "type": "number",
+            "description": "A finite value in the host backend's pitch domain."
+          }
+        }
+      ],
+      "result": {
+        "name": "effectivePitch",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/PitchResult"
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/MethodNotFound" },
+        { "$ref": "#/components/errors/BackendError" }
+      ]
+    },
+    {
+      "name": "speech.getVolume",
+      "summary": "Return the current host speaking volume",
+      "description": "Implemented only when settings.volume is readWrite.",
+      "params": [],
+      "result": {
+        "name": "currentVolume",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/VolumeResult"
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/MethodNotFound" },
+        { "$ref": "#/components/errors/BackendError" }
+      ]
+    },
+    {
+      "name": "speech.setVolume",
+      "summary": "Set the host speaking volume",
+      "description": "The host may clamp the request and returns its finite effective value.",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "volume",
+          "required": true,
+          "schema": {
+            "type": "number",
+            "description": "A finite value in the host backend's volume domain."
+          }
+        }
+      ],
+      "result": {
+        "name": "effectiveVolume",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/VolumeResult"
+        }
+      },
+      "errors": [
+        { "$ref": "#/components/errors/InvalidParams" },
+        { "$ref": "#/components/errors/MethodNotFound" },
+        { "$ref": "#/components/errors/BackendError" }
       ]
     },
     {
@@ -609,6 +716,12 @@
         "properties": {
           "rate": {
             "$ref": "#/components/schemas/SettingSupport"
+          },
+          "pitch": {
+            "$ref": "#/components/schemas/SettingSupport"
+          },
+          "volume": {
+            "$ref": "#/components/schemas/SettingSupport"
           }
         },
         "additionalProperties": true
@@ -732,7 +845,7 @@
         "additionalProperties": true,
         "description": "paused=true requires a valid position; paused=false omits position."
       },
-      "SetRateResult": {
+      "RateResult": {
         "type": "object",
         "required": [
           "rate"
@@ -741,6 +854,32 @@
           "rate": {
             "type": "number",
             "description": "The finite effective backend rate."
+          }
+        },
+        "additionalProperties": true
+      },
+      "PitchResult": {
+        "type": "object",
+        "required": [
+          "pitch"
+        ],
+        "properties": {
+          "pitch": {
+            "type": "number",
+            "description": "The finite effective backend pitch."
+          }
+        },
+        "additionalProperties": true
+      },
+      "VolumeResult": {
+        "type": "object",
+        "required": [
+          "volume"
+        ],
+        "properties": {
+          "volume": {
+            "type": "number",
+            "description": "The finite effective backend volume."
           }
         },
         "additionalProperties": true
@@ -828,7 +967,7 @@
   },
   "x-lector-protocol": {
     "major": 2,
-    "minor": 0,
+    "minor": 1,
     "unknownMembers": "ignore",
     "unknownCapabilities": "unsupported",
     "unknownNotifications": "ignore",

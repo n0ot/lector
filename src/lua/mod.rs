@@ -158,6 +158,8 @@ mod tests {
     struct SpeechOptionsDriver {
         state: OptionState,
         rates: Rc<RefCell<Vec<f32>>>,
+        pitches: Rc<RefCell<Vec<f32>>>,
+        volumes: Rc<RefCell<Vec<f32>>>,
         voices: Rc<RefCell<Vec<String>>>,
     }
 
@@ -188,6 +190,22 @@ mod tests {
                 return Ok(SetOptionOutcome::Unsupported);
             }
             self.rates.borrow_mut().push(rate);
+            Ok(SetOptionOutcome::Accepted)
+        }
+
+        fn set_pitch_option(&mut self, pitch: f32) -> anyhow::Result<SetOptionOutcome> {
+            if self.state.pitch_status == CapabilityStatus::Unsupported {
+                return Ok(SetOptionOutcome::Unsupported);
+            }
+            self.pitches.borrow_mut().push(pitch);
+            Ok(SetOptionOutcome::Accepted)
+        }
+
+        fn set_volume_option(&mut self, volume: f32) -> anyhow::Result<SetOptionOutcome> {
+            if self.state.volume_status == CapabilityStatus::Unsupported {
+                return Ok(SetOptionOutcome::Unsupported);
+            }
+            self.volumes.borrow_mut().push(volume);
             Ok(SetOptionOutcome::Accepted)
         }
 
@@ -331,20 +349,28 @@ mod tests {
     }
 
     #[test]
-    fn speech_namespace_exposes_negotiated_rate_current_voice_and_voice_list() {
+    fn speech_namespace_exposes_negotiated_settings_current_voice_and_voice_list() {
         let rates = Rc::new(RefCell::new(Vec::new()));
+        let pitches = Rc::new(RefCell::new(Vec::new()));
+        let volumes = Rc::new(RefCell::new(Vec::new()));
         let selected = Rc::new(RefCell::new(Vec::new()));
         let current = voice("voice-a", "Voice A");
         let driver = SpeechOptionsDriver {
             state: OptionState {
                 rate: Some(1.25),
                 rate_status: CapabilityStatus::Supported,
+                pitch: Some(0.75),
+                pitch_status: CapabilityStatus::Supported,
+                volume: Some(0.5),
+                volume_status: CapabilityStatus::Supported,
                 voice: Some(current.clone()),
                 voice_status: CapabilityStatus::Supported,
                 voice_selection_status: CapabilityStatus::Supported,
                 voices: Some(vec![current, voice("voice-b", "Voice B")]),
             },
             rates: Rc::clone(&rates),
+            pitches: Rc::clone(&pitches),
+            volumes: Rc::clone(&volumes),
             voices: Rc::clone(&selected),
         };
         let speech = speech::Speech::new(Box::new(driver));
@@ -356,6 +382,8 @@ mod tests {
         lua.load(
             r#"
                 assert(lector.o.speech.rate == 1.25)
+                assert(lector.o.speech.pitch == 0.75)
+                assert(lector.o.speech.volume == 0.5)
                 assert(lector.o.speech.voice == "voice-a")
                 local voices = lector.o.speech.voices
                 assert(#voices == 2)
@@ -365,6 +393,8 @@ mod tests {
                 assert(voices[1].gender == "neutral")
                 assert(voices[2].id == "voice-b")
                 lector.o.speech.rate = 1.5
+                lector.o.speech.pitch = 0.8
+                lector.o.speech.volume = 0.6
                 lector.o.speech.voice = "voice-b"
                 local ok, message = pcall(function()
                     lector.o.speech.voice = "missing-voice"
@@ -377,6 +407,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(rates.borrow().as_slice(), [1.5]);
+        assert_eq!(pitches.borrow().as_slice(), [0.8]);
+        assert_eq!(volumes.borrow().as_slice(), [0.6]);
         assert_eq!(selected.borrow().as_slice(), ["voice-b"]);
     }
 
@@ -421,6 +453,8 @@ mod tests {
                 ..OptionState::default()
             },
             rates: Rc::new(RefCell::new(Vec::new())),
+            pitches: Rc::new(RefCell::new(Vec::new())),
+            volumes: Rc::new(RefCell::new(Vec::new())),
             voices: Rc::new(RefCell::new(Vec::new())),
         };
         let speech = speech::Speech::new(Box::new(driver));
@@ -453,11 +487,15 @@ mod tests {
         let driver = SpeechOptionsDriver {
             state: OptionState {
                 rate_status: CapabilityStatus::Unsupported,
+                pitch_status: CapabilityStatus::Unsupported,
+                volume_status: CapabilityStatus::Unsupported,
                 voice_status: CapabilityStatus::Unsupported,
                 voice_selection_status: CapabilityStatus::Unsupported,
                 ..OptionState::default()
             },
             rates: Rc::new(RefCell::new(Vec::new())),
+            pitches: Rc::new(RefCell::new(Vec::new())),
+            volumes: Rc::new(RefCell::new(Vec::new())),
             voices: Rc::new(RefCell::new(Vec::new())),
         };
         let speech = speech::Speech::new(Box::new(driver));
@@ -469,6 +507,8 @@ mod tests {
         lua.load(
             r#"
                 assert(lector.o.speech.rate == nil)
+                assert(lector.o.speech.pitch == nil)
+                assert(lector.o.speech.volume == nil)
                 assert(lector.o.speech.voice == nil)
                 assert(lector.o.speech.voices == nil)
                 local rate_ok, rate_error = pcall(function()
@@ -476,6 +516,16 @@ mod tests {
                 end)
                 assert(rate_ok == false)
                 assert(string.find(tostring(rate_error), "speech.rate is unavailable", 1, true))
+                local pitch_ok, pitch_error = pcall(function()
+                    lector.o.speech.pitch = 1.0
+                end)
+                assert(pitch_ok == false)
+                assert(string.find(tostring(pitch_error), "speech.pitch is unavailable", 1, true))
+                local volume_ok, volume_error = pcall(function()
+                    lector.o.speech.volume = 1.0
+                end)
+                assert(volume_ok == false)
+                assert(string.find(tostring(volume_error), "speech.volume is unavailable", 1, true))
                 local voice_ok, voice_error = pcall(function()
                     lector.o.speech.voice = "unavailable"
                 end)

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MIN_MINOR: u16 = 0;
-pub const PROTOCOL_MAX_MINOR: u16 = 0;
+pub const PROTOCOL_MAX_MINOR: u16 = 1;
 /// Largest integer represented exactly by every common JSON implementation.
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const MAX_UTTERANCE_TEXT_BYTES: usize = 64 * 1024;
@@ -37,6 +37,25 @@ impl ProtocolRange {
         self.major == version.major
             && version.minor >= self.minimum_minor
             && version.minor <= self.maximum_minor
+    }
+
+    #[must_use]
+    pub const fn highest_mutual(self, other: Self) -> Option<ProtocolVersion> {
+        if self.major != other.major
+            || self.maximum_minor < other.minimum_minor
+            || other.maximum_minor < self.minimum_minor
+        {
+            return None;
+        }
+        let minor = if self.maximum_minor < other.maximum_minor {
+            self.maximum_minor
+        } else {
+            other.maximum_minor
+        };
+        Some(ProtocolVersion {
+            major: self.major,
+            minor,
+        })
     }
 }
 
@@ -246,6 +265,10 @@ pub struct ControlCapabilities {
 pub struct SettingCapabilities {
     #[serde(default)]
     pub rate: SettingSupport,
+    #[serde(default)]
+    pub pitch: SettingSupport,
+    #[serde(default)]
+    pub volume: SettingSupport,
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
@@ -321,7 +344,40 @@ pub struct SetVoiceParams {
     pub voice_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct PitchResult {
+    pub pitch: f32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RateResult {
+    pub rate: f32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VolumeResult {
+    pub volume: f32,
+}
+
 impl SpeechCapabilities {
+    /// Restrict additive capabilities to the selected protocol minor. In 2.0,
+    /// rate's historical `readWrite` value authorized only the setter and its
+    /// effective result; 2.1 is the first version with numeric getters.
+    #[must_use]
+    pub fn for_protocol_version(mut self, version: ProtocolVersion) -> Self {
+        if version.major != PROTOCOL_MAJOR {
+            return Self::default();
+        }
+        if version.minor < 1 {
+            if self.settings.rate == SettingSupport::ReadWrite {
+                self.settings.rate = SettingSupport::WriteOnly;
+            }
+            self.settings.pitch = SettingSupport::Unsupported;
+            self.settings.volume = SettingSupport::Unsupported;
+        }
+        self
+    }
+
     #[must_use]
     pub fn supports_resumable_pause(&self) -> bool {
         self.controls.pause_resume.restarts_from_word()
@@ -452,6 +508,35 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn version_ranges_choose_the_highest_mutual_minor() {
+        let current = ProtocolRange::current();
+        assert_eq!(
+            current.highest_mutual(ProtocolRange {
+                major: 2,
+                minimum_minor: 0,
+                maximum_minor: 0,
+            }),
+            Some(ProtocolVersion { major: 2, minor: 0 })
+        );
+        assert_eq!(
+            current.highest_mutual(ProtocolRange {
+                major: 2,
+                minimum_minor: 0,
+                maximum_minor: 9,
+            }),
+            Some(ProtocolVersion { major: 2, minor: 1 })
+        );
+        assert_eq!(
+            current.highest_mutual(ProtocolRange {
+                major: 3,
+                minimum_minor: 0,
+                maximum_minor: 1,
+            }),
+            None
+        );
+    }
+
+    #[test]
     fn missing_and_unknown_capabilities_degrade_to_unsupported() {
         let capabilities: SpeechCapabilities = serde_json::from_value(json!({
             "controls": {
@@ -463,6 +548,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(capabilities.controls.stop, StopSupport::Unknown);
+        assert_eq!(capabilities.settings.pitch, SettingSupport::Unsupported);
+        assert_eq!(capabilities.settings.volume, SettingSupport::Unsupported);
         assert_eq!(
             capabilities.controls.pause_resume,
             PauseResumeSupport::Unsupported
@@ -485,6 +572,24 @@ mod tests {
             extensions: BTreeMap::new(),
         });
         assert!(!incomplete.supports_resumable_pause());
+    }
+
+    #[test]
+    fn protocol_two_zero_exposes_only_its_setter_only_rate_contract() {
+        let capabilities = SpeechCapabilities {
+            settings: SettingCapabilities {
+                rate: SettingSupport::ReadWrite,
+                pitch: SettingSupport::ReadWrite,
+                volume: SettingSupport::ReadWrite,
+                ..SettingCapabilities::default()
+            },
+            ..SpeechCapabilities::default()
+        }
+        .for_protocol_version(ProtocolVersion { major: 2, minor: 0 });
+
+        assert_eq!(capabilities.settings.rate, SettingSupport::WriteOnly);
+        assert_eq!(capabilities.settings.pitch, SettingSupport::Unsupported);
+        assert_eq!(capabilities.settings.volume, SettingSupport::Unsupported);
     }
 
     #[test]

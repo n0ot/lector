@@ -19,6 +19,8 @@ use std::{
 
 struct State {
     rate: f32,
+    pitch: f32,
+    volume: f32,
     voice_id: String,
     speech_log: Option<File>,
     rpc_log: Option<File>,
@@ -124,6 +126,8 @@ fn main() -> Result<()> {
         .transpose()?;
     let state = State {
         rate: 1.0,
+        pitch: 1.0,
+        volume: 1.0,
         voice_id: "stub-a".to_owned(),
         speech_log,
         rpc_log,
@@ -268,6 +272,7 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
         "speech.stop" | "speech.resume" => serde_json::to_value(AcceptedResult { accepted: true })
             .map_err(|error| RpcError::internal_error(error.to_string())),
         "speech.pause" => Ok(json!({"paused": false})),
+        "speech.getRate" => Ok(json!({ "rate": state.rate })),
         "set_rate" | "speech.setRate" => {
             let params = request
                 .params
@@ -282,6 +287,28 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
             } else {
                 Ok(json!({ "rate": state.rate }))
             }
+        }
+        "speech.getPitch" => Ok(json!({ "pitch": state.pitch })),
+        "speech.setPitch" => {
+            let pitch = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("pitch"))
+                .and_then(Value::as_f64)
+                .ok_or_else(|| RpcError::invalid_params("missing pitch"))?;
+            state.pitch = pitch as f32;
+            Ok(json!({ "pitch": state.pitch }))
+        }
+        "speech.getVolume" => Ok(json!({ "volume": state.volume })),
+        "speech.setVolume" => {
+            let volume = request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("volume"))
+                .and_then(Value::as_f64)
+                .ok_or_else(|| RpcError::invalid_params("missing volume"))?;
+            state.volume = volume as f32;
+            Ok(json!({ "volume": state.volume }))
         }
         "speech.listVoices" => serde_json::to_value(VoiceListResult {
             voices: stub_voices(),
@@ -359,6 +386,8 @@ fn stub_capabilities() -> SpeechCapabilities {
         },
         settings: SettingCapabilities {
             rate: SettingSupport::ReadWrite,
+            pitch: SettingSupport::ReadWrite,
+            volume: SettingSupport::ReadWrite,
             ..Default::default()
         },
         voices: VoiceCapabilities {

@@ -250,6 +250,8 @@ fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua
     match option {
         "speech.server" => speech_server_spec_to_lua(lua, sr.speech_server_spec()),
         "speech.rate" => sr.speech().rate().into_lua(lua),
+        "speech.pitch" => sr.speech().pitch().into_lua(lua),
+        "speech.volume" => sr.speech().volume().into_lua(lua),
         "speech.paragraph_pause_ms" => sr.speech().paragraph_pause_ms().into_lua(lua),
         "speech.voice" => sr.speech().voice().map(|voice| voice.id).into_lua(lua),
         "speech.voices" => match sr.speech().voices() {
@@ -371,6 +373,42 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
             })
             .map_err(anyhow::Error::new)
             .context("set option: speech.rate");
+    }
+    if option == "speech.pitch" {
+        let pitch = match value {
+            Number(value) => value as f32,
+            Integer(value) => value as f32,
+            _ => return Err(anyhow!("set option: speech.pitch: value must be a number")),
+        };
+        return sr
+            .speech_mut()
+            .set_pitch_option(pitch)
+            .and_then(|outcome| match outcome {
+                SetOptionOutcome::Accepted => Ok(()),
+                SetOptionOutcome::Unsupported => Err(crate::speech::Error::Driver(anyhow!(
+                    "lector.o.speech.pitch is unavailable: speech host does not support setting pitch"
+                ))),
+            })
+            .map_err(anyhow::Error::new)
+            .context("set option: speech.pitch");
+    }
+    if option == "speech.volume" {
+        let volume = match value {
+            Number(value) => value as f32,
+            Integer(value) => value as f32,
+            _ => return Err(anyhow!("set option: speech.volume: value must be a number")),
+        };
+        return sr
+            .speech_mut()
+            .set_volume_option(volume)
+            .and_then(|outcome| match outcome {
+                SetOptionOutcome::Accepted => Ok(()),
+                SetOptionOutcome::Unsupported => Err(crate::speech::Error::Driver(anyhow!(
+                    "lector.o.speech.volume is unavailable: speech host does not support setting volume"
+                ))),
+            })
+            .map_err(anyhow::Error::new)
+            .context("set option: speech.volume");
     }
     if option == "speech.voice" {
         let String(value) = value else {

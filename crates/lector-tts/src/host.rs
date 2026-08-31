@@ -9,12 +9,12 @@ use crate::{
     protocol::{
         AcceptedResult, BackendInfo, ControlCapabilities, CurrentVoiceResult, DeliveryGuarantee,
         EventCapability, LifecycleCapabilities, MAX_UTTERANCE_TEXT_BYTES, PauseResult,
-        PauseResumeSupport, ProgressCapabilities, ProgressMode, SetVoiceParams,
-        SettingCapabilities, SettingSupport, SpeakParams, SpeechCapabilities,
+        PauseResumeSupport, PitchResult, ProgressCapabilities, ProgressMode, RateResult,
+        SetVoiceParams, SettingCapabilities, SettingSupport, SpeakParams, SpeechCapabilities,
         SpeechEventNotification, SpeechEventPayload, StopSupport, TerminalCapability, TextPosition,
-        UtteranceId, UtteranceParams, VoiceCapabilities, VoiceInfo, VoiceListResult,
+        UtteranceId, UtteranceParams, VoiceCapabilities, VoiceInfo, VoiceListResult, VolumeResult,
     },
-    server::{Request, RpcError, ServerNotification, run_server_with_tick},
+    server::{InitializeResult, Request, RpcError, ServerNotification, run_server_with_tick},
 };
 #[cfg(unix)]
 use anyhow::Context;
@@ -93,7 +93,9 @@ struct State {
     tts: Tts,
     backend: Backends,
     backend_info: BackendInfo,
-    rate: Option<RateState>,
+    rate: Option<SettingState>,
+    pitch: Option<SettingState>,
+    volume: Option<SettingState>,
     selected_voice: Option<String>,
     initialized: bool,
     capabilities: SpeechCapabilities,
@@ -104,7 +106,7 @@ struct State {
 }
 
 #[derive(Clone, Copy)]
-struct RateState {
+struct SettingState {
     current: f32,
     min: f32,
     max: f32,
@@ -113,6 +115,16 @@ struct RateState {
 #[derive(serde::Deserialize)]
 struct RateParams {
     rate: f32,
+}
+
+#[derive(serde::Deserialize)]
+struct PitchParams {
+    pitch: f32,
+}
+
+#[derive(serde::Deserialize)]
+struct VolumeParams {
+    volume: f32,
 }
 
 /// A transient external endpoint is a backend state, not a host transport
@@ -210,10 +222,24 @@ impl State {
         let rate = if features.rate {
             let min = tts.min_rate().map_err(|error| anyhow::anyhow!(error))?;
             let max = tts.max_rate().map_err(|error| anyhow::anyhow!(error))?;
-            let current = tts.normal_rate().map_err(|error| anyhow::anyhow!(error))?;
-            tts.set_rate(current)
-                .map_err(|error| anyhow::anyhow!(error))?;
-            Some(RateState { current, min, max })
+            let current = tts.get_rate().map_err(|error| anyhow::anyhow!(error))?;
+            Some(SettingState { current, min, max })
+        } else {
+            None
+        };
+        let pitch = if features.pitch {
+            let min = tts.min_pitch().map_err(|error| anyhow::anyhow!(error))?;
+            let max = tts.max_pitch().map_err(|error| anyhow::anyhow!(error))?;
+            let current = tts.get_pitch().map_err(|error| anyhow::anyhow!(error))?;
+            Some(SettingState { current, min, max })
+        } else {
+            None
+        };
+        let volume = if features.volume {
+            let min = tts.min_volume().map_err(|error| anyhow::anyhow!(error))?;
+            let max = tts.max_volume().map_err(|error| anyhow::anyhow!(error))?;
+            let current = tts.get_volume().map_err(|error| anyhow::anyhow!(error))?;
+            Some(SettingState { current, min, max })
         } else {
             None
         };
@@ -241,6 +267,8 @@ impl State {
                 extensions: BTreeMap::new(),
             },
             rate,
+            pitch,
+            volume,
             selected_voice,
             initialized: false,
             capabilities,
@@ -397,6 +425,14 @@ impl State {
             tts.set_rate(rate.current)
                 .map_err(|error| RpcError::internal_error(error.to_string()))?;
         }
+        if let Some(pitch) = self.pitch {
+            tts.set_pitch(pitch.current)
+                .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        }
+        if let Some(volume) = self.volume {
+            tts.set_volume(volume.current)
+                .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        }
         if let Some(voice_id) = &self.selected_voice {
             select_voice(&tts, voice_id)
                 .map_err(|error| RpcError::internal_error(error.to_string()))?;
@@ -476,6 +512,130 @@ impl State {
             .as_ref()
             .map(voice_info);
         Ok(CurrentVoiceResult { voice })
+    }
+
+    fn current_rate(&mut self) -> Result<RateResult, RpcError> {
+        if self.capabilities.settings.rate != SettingSupport::ReadWrite {
+            return Err(RpcError::method_not_found("speech.getRate"));
+        }
+        let Some(mut rate) = self.rate else {
+            return Err(RpcError::method_not_found("speech.getRate"));
+        };
+        rate.current = self
+            .tts
+            .get_rate()
+            .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        if !rate.current.is_finite() {
+            return Err(RpcError::internal_error(
+                "speech backend returned a non-finite rate",
+            ));
+        }
+        self.rate = Some(rate);
+        Ok(RateResult { rate: rate.current })
+    }
+
+    fn set_rate(&mut self, rate: f32) -> Result<RateResult, RpcError> {
+        if !self.capabilities.settings.rate.can_write() {
+            return Err(RpcError::method_not_found("speech.setRate"));
+        }
+        if !rate.is_finite() {
+            return Err(RpcError::invalid_params("rate must be finite"));
+        }
+        let Some(mut effective) = self.rate else {
+            return Err(RpcError::method_not_found("speech.setRate"));
+        };
+        effective.current = rate.clamp(effective.min, effective.max);
+        self.tts
+            .set_rate(effective.current)
+            .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        self.rate = Some(effective);
+        Ok(RateResult {
+            rate: effective.current,
+        })
+    }
+
+    fn current_pitch(&mut self) -> Result<PitchResult, RpcError> {
+        if self.capabilities.settings.pitch != SettingSupport::ReadWrite {
+            return Err(RpcError::method_not_found("speech.getPitch"));
+        }
+        let Some(mut pitch) = self.pitch else {
+            return Err(RpcError::method_not_found("speech.getPitch"));
+        };
+        pitch.current = self
+            .tts
+            .get_pitch()
+            .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        if !pitch.current.is_finite() {
+            return Err(RpcError::internal_error(
+                "speech backend returned a non-finite pitch",
+            ));
+        }
+        self.pitch = Some(pitch);
+        Ok(PitchResult {
+            pitch: pitch.current,
+        })
+    }
+
+    fn set_pitch(&mut self, pitch: f32) -> Result<PitchResult, RpcError> {
+        if !self.capabilities.settings.pitch.can_write() {
+            return Err(RpcError::method_not_found("speech.setPitch"));
+        }
+        if !pitch.is_finite() {
+            return Err(RpcError::invalid_params("pitch must be finite"));
+        }
+        let Some(mut effective) = self.pitch else {
+            return Err(RpcError::method_not_found("speech.setPitch"));
+        };
+        effective.current = pitch.clamp(effective.min, effective.max);
+        self.tts
+            .set_pitch(effective.current)
+            .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        self.pitch = Some(effective);
+        Ok(PitchResult {
+            pitch: effective.current,
+        })
+    }
+
+    fn current_volume(&mut self) -> Result<VolumeResult, RpcError> {
+        if self.capabilities.settings.volume != SettingSupport::ReadWrite {
+            return Err(RpcError::method_not_found("speech.getVolume"));
+        }
+        let Some(mut volume) = self.volume else {
+            return Err(RpcError::method_not_found("speech.getVolume"));
+        };
+        volume.current = self
+            .tts
+            .get_volume()
+            .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        if !volume.current.is_finite() {
+            return Err(RpcError::internal_error(
+                "speech backend returned a non-finite volume",
+            ));
+        }
+        self.volume = Some(volume);
+        Ok(VolumeResult {
+            volume: volume.current,
+        })
+    }
+
+    fn set_volume(&mut self, volume: f32) -> Result<VolumeResult, RpcError> {
+        if !self.capabilities.settings.volume.can_write() {
+            return Err(RpcError::method_not_found("speech.setVolume"));
+        }
+        if !volume.is_finite() {
+            return Err(RpcError::invalid_params("volume must be finite"));
+        }
+        let Some(mut effective) = self.volume else {
+            return Err(RpcError::method_not_found("speech.setVolume"));
+        };
+        effective.current = volume.clamp(effective.min, effective.max);
+        self.tts
+            .set_volume(effective.current)
+            .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        self.volume = Some(effective);
+        Ok(VolumeResult {
+            volume: effective.current,
+        })
     }
 
     fn set_voice(&mut self, voice_id: &str) -> Result<CurrentVoiceResult, RpcError> {
@@ -667,6 +827,16 @@ fn native_capabilities(features: Features) -> SpeechCapabilities {
             } else {
                 SettingSupport::Unsupported
             },
+            pitch: if features.pitch {
+                SettingSupport::ReadWrite
+            } else {
+                SettingSupport::Unsupported
+            },
+            volume: if features.volume {
+                SettingSupport::ReadWrite
+            } else {
+                SettingSupport::Unsupported
+            },
             ..Default::default()
         },
         voices: VoiceCapabilities {
@@ -764,7 +934,12 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
         Some(&state.backend_info),
         &state.capabilities,
     ) {
-        if request.method == "initialize" && result.is_ok() {
+        if request.method == "initialize"
+            && let Ok(value) = &result
+        {
+            let initialized: InitializeResult = serde_json::from_value(value.clone())
+                .map_err(|error| RpcError::internal_error(error.to_string()))?;
+            state.capabilities = initialized.capabilities;
             state.initialized = true;
         }
         return result;
@@ -794,22 +969,20 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
             state.resume(&params.utterance_id)?;
             value(AcceptedResult { accepted: true })
         }
+        "speech.getRate" => value(state.current_rate()?),
         "speech.setRate" => {
-            let Some(mut effective) = state.rate else {
-                return Err(RpcError::method_not_found("speech.setRate"));
-            };
             let rate = params::<RateParams>(request.params)?.rate;
-            if !rate.is_finite() {
-                return Err(RpcError::invalid_params("rate must be finite"));
-            }
-            let clamped = rate.clamp(effective.min, effective.max);
-            state
-                .tts
-                .set_rate(clamped)
-                .map_err(|error| RpcError::internal_error(error.to_string()))?;
-            effective.current = clamped;
-            state.rate = Some(effective);
-            Ok(json!({ "rate": effective.current }))
+            value(state.set_rate(rate)?)
+        }
+        "speech.getPitch" => value(state.current_pitch()?),
+        "speech.setPitch" => {
+            let pitch = params::<PitchParams>(request.params)?.pitch;
+            value(state.set_pitch(pitch)?)
+        }
+        "speech.getVolume" => value(state.current_volume()?),
+        "speech.setVolume" => {
+            let volume = params::<VolumeParams>(request.params)?.volume;
+            value(state.set_volume(volume)?)
         }
         "speech.listVoices" => value(state.voices()?),
         "speech.getVoice" => value(state.current_voice()?),
@@ -943,9 +1116,11 @@ mod tests {
     }
 
     #[test]
-    fn native_capabilities_do_not_invent_rate_or_voice_controls() {
+    fn native_capabilities_do_not_invent_settings_or_voice_controls() {
         let unsupported = native_capabilities(Features::default());
         assert_eq!(unsupported.settings.rate, SettingSupport::Unsupported);
+        assert_eq!(unsupported.settings.pitch, SettingSupport::Unsupported);
+        assert_eq!(unsupported.settings.volume, SettingSupport::Unsupported);
         assert!(!unsupported.voices.list);
         assert!(!unsupported.voices.current);
         assert!(!unsupported.voices.select);
@@ -961,10 +1136,14 @@ mod tests {
 
         let configurable = native_capabilities(Features {
             rate: true,
+            pitch: true,
+            volume: true,
             get_voice: true,
             ..Features::default()
         });
         assert_eq!(configurable.settings.rate, SettingSupport::ReadWrite);
+        assert_eq!(configurable.settings.pitch, SettingSupport::ReadWrite);
+        assert_eq!(configurable.settings.volume, SettingSupport::ReadWrite);
         assert!(!configurable.voices.list);
         assert!(configurable.voices.current);
         assert!(!configurable.voices.select);

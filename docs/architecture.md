@@ -16,14 +16,14 @@ Bounded workers isolate side effects that may block:
 
 - The speech supervisor owns both native and custom process backends behind the
   bounded asynchronous speech worker. Its mailbox drops stale speech under
-  overload and prioritizes cancellation and rate changes. JSON-RPC pipe readiness and
+  overload and prioritizes cancellation and speech-setting changes. JSON-RPC pipe readiness and
   absolute deadlines are worker-local; completion or fatal failure reaches the
   main loop through an event-driven control path rather than a polling timer.
   The default native backend is hosted by `lector tts`, which imports the same
   `lector-tts` crate as the independently buildable host binary. Pipe I/O,
   native utterance construction, playback, and platform lifecycle work cannot
   stall terminal processing. Initialization identifies the selected backend
-  and independently negotiates rate and voice operations. The host submits
+  and independently negotiates rate, pitch, volume, and voice operations. The host submits
   only Lector's one active utterance to the backend; the host-independent
   Lector manager keeps all never-submitted speech bounded.
 - `diagnostics` owns log output. Producers enqueue records into a byte-bounded
@@ -51,7 +51,7 @@ but replaces retained speech while suspended. Interrupting speech and the
 explicit, unbound cancel action always replace or discard the retained queue.
 Paragraph gaps are nonblocking manager deadlines which suspension can freeze.
 Runtime speech-host replacement is transactional. A candidate process
-initializes and restores the configured rate while the old generation remains
+initializes and restores configured speech settings while the old generation remains
 owned for rollback; only then is the active generation swapped and the old
 child terminated and reaped. Transport failures never replay an uncertain
 in-flight speech call.
