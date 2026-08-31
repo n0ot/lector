@@ -971,6 +971,18 @@ mod tests {
             .expect("read reference terminal attributes")
     }
 
+    fn spawn_probe(name: &str, rows: u16, cols: u16, attrs: &termios::Termios) -> Process {
+        let exact = format!("pty::tests::{name}");
+        Process::spawn(
+            &std::env::current_exe().expect("resolve test binary"),
+            ["--ignored", "--exact", exact.as_str(), "--nocapture"],
+            rows,
+            cols,
+            attrs,
+        )
+        .unwrap_or_else(|error| panic!("spawn PTY probe {name}: {error:#}"))
+    }
+
     #[derive(Debug)]
     struct NoopChildKiller;
 
@@ -1037,7 +1049,7 @@ mod tests {
     #[test]
     fn compatible_environment_keeps_the_public_xterm_identity() {
         let environment = compatible_terminal_environment();
-        let mut command = CommandBuilder::new("/bin/sh");
+        let mut command = CommandBuilder::new("/fixture/program");
         command.env("TERMINFO", "/stale/private/terminfo");
 
         environment.apply(&mut command);
@@ -1055,7 +1067,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "run through scripts/test-real-tmux-docker"]
     fn private_terminfo_overlay_advertises_synchronized_output() {
+        assert_eq!(
+            std::env::var_os("LECTOR_REAL_TMUX_CONTAINER").as_deref(),
+            Some(OsStr::new("1")),
+            "host terminfo tools must run through scripts/test-real-tmux-docker"
+        );
         let cache = tempfile::tempdir().expect("create terminfo test cache");
         let terminfo = install_synchronized_output_terminfo_with(cache.path(), true)
             .expect("compile synchronized-output terminfo");
@@ -1198,14 +1216,7 @@ mod tests {
     fn process_stream_is_duplex_and_reports_eof_after_child_exit() {
         let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
-        let mut process = Process::spawn(
-            Path::new("/bin/sh"),
-            ["-c", "stty size; read value; printf 'got:%s\\n' \"$value\""],
-            7,
-            19,
-            &attrs,
-        )
-        .expect("spawn PTY child");
+        let mut process = spawn_probe("duplex_probe", 7, 19, &attrs);
         let mut stream = process.stream().expect("clone PTY stream");
 
         stream.write_all(b"hello\n").expect("write PTY input");
@@ -1214,29 +1225,43 @@ mod tests {
             .read_to_string(&mut output)
             .expect("read child output through EOF");
 
-        assert!(output.contains("7 19"), "{output:?}");
-        assert!(output.contains("got:hello"), "{output:?}");
+        assert!(output.contains("PTY_SIZE:7 19"), "{output:?}");
+        assert!(output.contains("PTY_INPUT:hello"), "{output:?}");
         assert!(process.wait().expect("wait for child").success());
+    }
+
+    #[test]
+    #[ignore = "helper process for process_stream_is_duplex_and_reports_eof_after_child_exit"]
+    fn duplex_probe() {
+        let geometry = terminal_geometry(std::io::stdin().as_raw_fd()).expect("read PTY geometry");
+        println!("PTY_SIZE:{} {}", geometry.rows, geometry.cols);
+        std::io::stdout().flush().expect("flush PTY size");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .expect("read PTY input");
+        println!("PTY_INPUT:{}", input.trim_end());
     }
 
     #[test]
     fn resize_updates_the_child_terminal_dimensions() {
         let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
-        let mut process = Process::spawn(
-            Path::new("/bin/sh"),
-            ["-c", "stty size; read _; stty size"],
-            5,
-            13,
-            &attrs,
-        )
-        .expect("spawn PTY child");
+        let mut process = spawn_probe("resize_probe", 5, 13, &attrs);
         let stream = process.stream().expect("clone PTY stream");
         let mut stream = BufReader::new(stream);
-        let mut first_size = String::new();
-        stream
-            .read_line(&mut first_size)
-            .expect("read initial terminal size");
+        let mut startup = String::new();
+        for _ in 0..20 {
+            let mut line = String::new();
+            stream
+                .read_line(&mut line)
+                .expect("read initial terminal size");
+            startup.push_str(&line);
+            if line.contains("PTY_INITIAL_SIZE:5 13") {
+                break;
+            }
+        }
+        assert!(startup.contains("PTY_INITIAL_SIZE:5 13"), "{startup:?}");
 
         process
             .resize_with_geometry(TerminalGeometry::new(11, 23, 9, 18))
@@ -1250,9 +1275,25 @@ mod tests {
             .read_to_string(&mut remaining)
             .expect("read resized terminal size");
 
-        assert_eq!(first_size.trim(), "5 13");
-        assert!(remaining.contains("11 23"), "{remaining:?}");
+        assert!(
+            remaining.contains("PTY_RESIZED_SIZE:11 23"),
+            "{remaining:?}"
+        );
         assert!(process.wait().expect("wait for child").success());
+    }
+
+    #[test]
+    #[ignore = "helper process for resize_updates_the_child_terminal_dimensions"]
+    fn resize_probe() {
+        let geometry = terminal_geometry(std::io::stdin().as_raw_fd()).expect("read PTY geometry");
+        println!("PTY_INITIAL_SIZE:{} {}", geometry.rows, geometry.cols);
+        std::io::stdout().flush().expect("flush initial PTY size");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .expect("wait for resize");
+        let geometry = terminal_geometry(std::io::stdin().as_raw_fd()).expect("read resized PTY");
+        println!("PTY_RESIZED_SIZE:{} {}", geometry.rows, geometry.cols);
     }
 
     #[test]
@@ -1327,21 +1368,18 @@ mod tests {
     fn spawn_preserves_the_callers_current_directory() {
         let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
-        let mut process = Process::spawn(
-            Path::new("/bin/pwd"),
-            std::iter::empty::<&str>(),
-            5,
-            13,
-            &attrs,
-        )
-        .expect("spawn PTY child");
+        let mut process = spawn_probe("current_directory_probe", 5, 13, &attrs);
         let mut stream = process.stream().expect("clone PTY stream");
         let mut output = String::new();
         stream
             .read_to_string(&mut output)
             .expect("read child output");
 
-        let actual = Path::new(output.trim())
+        let child_directory = output
+            .lines()
+            .find_map(|line| line.trim_end_matches('\r').strip_prefix("PTY_CWD:"))
+            .expect("find child working directory marker");
+        let actual = Path::new(child_directory)
             .canonicalize()
             .expect("canonicalize child directory");
         let expected = std::env::current_dir()
@@ -1353,22 +1391,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "helper process for spawn_preserves_the_callers_current_directory"]
+    fn current_directory_probe() {
+        println!(
+            "PTY_CWD:{}",
+            std::env::current_dir()
+                .expect("resolve probe directory")
+                .display()
+        );
+    }
+
+    #[test]
     fn spawn_applies_the_compatible_terminal_environment_to_the_real_child() {
         let _guard = serialize_real_pty_test();
         let attrs = terminal_attrs();
         let cache = tempfile::tempdir().expect("create terminfo test cache");
-        let terminfo = install_synchronized_output_terminfo_with(cache.path(), true)
-            .expect("compile synchronized-output terminfo");
+        let terminfo = install_synchronized_output_terminfo_with(cache.path(), false)
+            .expect("install synchronized-output terminfo");
         let environment = VirtualTerminalEnvironment {
             term: VIRTUAL_TERM.to_owned(),
             terminfo: Some(TerminfoDirectory::Persistent(terminfo)),
         };
+        let exact = "pty::tests::terminal_environment_probe";
         let mut process = Process::spawn_with_geometry_and_environment(
-            Path::new("/bin/sh"),
-            [
-                "-c",
-                "printf '%s|%s|%s\\n' \"$TERM\" \"${TERMINFO:+set}\" \"$TERM_PROGRAM\"",
-            ],
+            &std::env::current_exe().expect("resolve test binary"),
+            ["--ignored", "--exact", exact, "--nocapture"],
             TerminalGeometry::new(5, 13, 8, 16),
             &attrs,
             Some(&environment),
@@ -1382,6 +1429,21 @@ mod tests {
 
         assert!(output.contains("xterm-256color|set|Lector"), "{output:?}");
         assert!(process.wait().expect("wait for child").success());
+    }
+
+    #[test]
+    #[ignore = "helper process for spawn_applies_the_compatible_terminal_environment_to_the_real_child"]
+    fn terminal_environment_probe() {
+        println!(
+            "PTY_ENV:{}|{}|{}",
+            std::env::var("TERM").unwrap_or_default(),
+            if std::env::var_os("TERMINFO").is_some() {
+                "set"
+            } else {
+                "missing"
+            },
+            std::env::var("TERM_PROGRAM").unwrap_or_default()
+        );
     }
 
     #[test]
@@ -1399,12 +1461,10 @@ mod tests {
             term: VIRTUAL_TERM.to_owned(),
             terminfo: Some(terminfo),
         };
+        let exact = "pty::tests::terminfo_lifetime_probe";
         let mut process = Process::spawn_with_geometry_and_environment(
-            Path::new("/bin/sh"),
-            [
-                "-c",
-                "read _; test -r \"$TERMINFO/x/xterm-256color\" && printf 'TERMINFO_ALIVE\\n'",
-            ],
+            &std::env::current_exe().expect("resolve test binary"),
+            ["--ignored", "--exact", exact, "--nocapture"],
             TerminalGeometry::new(5, 13, 8, 16),
             &attrs,
             Some(&environment),
@@ -1428,23 +1488,40 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "helper process for process_keeps_a_temporary_terminfo_entry_alive_for_its_child"]
+    fn terminfo_lifetime_probe() {
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .expect("wait for parent release");
+        let entry = Path::new(&std::env::var_os("TERMINFO").expect("TERMINFO is set"))
+            .join("x/xterm-256color");
+        if entry.is_file() {
+            println!("TERMINFO_ALIVE");
+        }
+    }
+
+    #[test]
     fn spawn_copies_the_requested_terminal_attributes() {
         let _guard = serialize_real_pty_test();
         let mut attrs = terminal_attrs();
         attrs.local_flags.remove(LocalFlags::ECHO);
-        let mut process = Process::spawn(Path::new("/bin/sh"), ["-c", "stty -a"], 5, 13, &attrs)
-            .expect("spawn PTY child");
+        let mut process = spawn_probe("terminal_attributes_probe", 5, 13, &attrs);
         let mut stream = process.stream().expect("clone PTY stream");
         let mut output = String::new();
         stream
             .read_to_string(&mut output)
             .expect("read terminal attributes");
 
-        assert!(
-            output.split_whitespace().any(|flag| flag == "-echo"),
-            "{output:?}"
-        );
+        assert!(output.contains("PTY_ECHO:false"), "{output:?}");
         assert!(process.wait().expect("wait for child").success());
+    }
+
+    #[test]
+    #[ignore = "helper process for spawn_copies_the_requested_terminal_attributes"]
+    fn terminal_attributes_probe() {
+        let attrs = termios::tcgetattr(std::io::stdin()).expect("read child terminal attributes");
+        println!("PTY_ECHO:{}", attrs.local_flags.contains(LocalFlags::ECHO));
     }
 
     #[test]

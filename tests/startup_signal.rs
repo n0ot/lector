@@ -8,7 +8,7 @@ use nix::{
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -36,10 +36,6 @@ impl Drop for LiveProcesses {
             let _ = kill(pid, Signal::SIGKILL);
         }
     }
-}
-
-fn fixture(relative: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
 fn wait_for_pid(path: &Path, timeout: Duration) -> Pid {
@@ -106,21 +102,20 @@ fn sigterm_during_stalled_speech_initialize_cleans_up_and_is_reraised() {
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_lector"));
     command.args([
         "--shell",
-        fixture("tests/fixtures/pty/startup-signal-child")
-            .to_str()
-            .expect("UTF-8 shell fixture"),
+        env!("CARGO_BIN_EXE_tmux-control-adversary"),
         "--config",
-        fixture("tests/fixtures/pty/startup-signal.lua")
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pty/startup-signal.lua")
             .to_str()
             .expect("UTF-8 config fixture"),
     ]);
     command.env("TERM", "xterm-256color");
     command.env(
         "LECTOR_TEST_STARTUP_SIGNAL_SERVER",
-        fixture("tests/fixtures/pty/startup-signal-server"),
+        env!("CARGO_BIN_EXE_proc_stub_server"),
     );
     command.env("LECTOR_TEST_STARTUP_SIGNAL_PID_FILE", &speech_pid_file);
-    command.env("LECTOR_TEST_STARTUP_SIGNAL_APP_PID_FILE", &app_pid_file);
+    command.env("LECTOR_TEST_BLOCKING_APP_PID_FILE", &app_pid_file);
     let lector = pair
         .slave
         .spawn_command(command)

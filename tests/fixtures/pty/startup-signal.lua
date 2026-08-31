@@ -5,6 +5,6 @@ assert(server ~= nil)
 assert(pid_file ~= nil)
 
 lector.o.speech = {
-    program = "/bin/bash",
-    args = { server, pid_file },
+    program = server,
+    args = { "--adversary", "stall-on-initialize", "--pid-file", pid_file },
 }

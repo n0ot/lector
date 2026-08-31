@@ -405,10 +405,10 @@ fn linear_output_completion_survives_fragmented_crlf_and_rejects_ambiguity() {
     assert!(!overwrite.completes_linear_output_record());
     assert_eq!(overwrite.printed_text(), "100%\n");
 
-    let readline = engine.advance(b"\x1b[?2004h\r\n\x1b[?2004l\redbrowse line\r\n\x1b[?2004h");
+    let readline = engine.advance(b"\x1b[?2004h\r\n\x1b[?2004l\rlorem ipsum\r\n\x1b[?2004h");
     assert!(!readline.output_report_structural);
     assert!(readline.completes_linear_output_record());
-    assert_eq!(readline.printed_text(), "edbrowse line\n");
+    assert_eq!(readline.printed_text(), "lorem ipsum\n");
 
     let mut mixed_mode_engine =
         GhosttyEngine::new_with_scrollback(4, 20, 20).expect("create mixed-mode engine");

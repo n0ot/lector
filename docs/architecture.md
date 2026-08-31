@@ -325,7 +325,8 @@ replies because tmux is authoritative there.
 - `src/bin/` contains support tools, test servers, and benchmarks declared
   explicitly in `Cargo.toml`.
 - `tests/` contains integration and policy tests; `tests/fixtures/pty/` contains
-  live PTY and tmux fixtures.
+  Lua configuration fixtures. Live PTY byte producers are first-party binaries
+  declared in `Cargo.toml`.
 - `build_support/`, `crates/lector-ghostty/build.rs`, and `xtask/` implement the
   pinned native dependency workflow. `scripts/` contains developer and live
   test entry points.

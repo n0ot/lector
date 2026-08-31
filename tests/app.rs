@@ -2441,7 +2441,7 @@ fn readline_wrapped_linear_output_reads_immediately() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut term_out = Vec::new();
 
-    for line in ["first edbrowse line", "second edbrowse line"] {
+    for line in ["lorem ipsum", "dolor sit amet"] {
         let update = format!("\x1b[?2004h\r\n\x1b[?2004l\r{line}\r\n\x1b[?2004h");
         app.handle_pty(&mut sr, update.as_bytes(), &mut term_out)
             .expect("receive readline-wrapped line output");
@@ -2454,8 +2454,8 @@ fn readline_wrapped_linear_output_reads_immediately() {
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
         [
-            ("first edbrowse line".into(), false),
-            ("second edbrowse line".into(), false),
+            ("lorem ipsum".into(), false),
+            ("dolor sit amet".into(), false),
         ]
     );
 }

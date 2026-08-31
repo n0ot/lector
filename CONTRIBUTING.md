@@ -19,7 +19,8 @@ links the more detailed contracts.
 - `crates/lector-ghostty/` and `build_support/`: native Ghostty adapter and
   shared build logic.
 - `xtask/`: pinned-dependency maintenance commands.
-- `tests/` and `tests/fixtures/pty/`: integration tests and live fixtures.
+- `tests/` and `tests/fixtures/pty/`: integration tests and Lua configuration
+  fixtures.
 - `scripts/`: developer checks, dependency bootstrap, tracing, and live tests.
 - `docs/`: design contracts and operational documentation.
 
@@ -54,17 +55,34 @@ scripts/check_build_paths.sh
 ```
 
 Nextest keeps the process-sensitive live PTY and real-tmux tests serialized and
-limits other external-process suites through `.config/nextest.toml`. Install
+limits other process suites through `.config/nextest.toml`. Install
 the pinned project version with
 `cargo install cargo-nextest --version 0.9.143 --locked` when it is not already
 available.
 
-Changes to tmux control mode should also run the kill-bounded live suite on a
-machine with tmux installed:
+Changes to tmux control mode should also run the kill-bounded adversary suite:
 
 ```bash
 scripts/run-tmux-adversary --timeout 60 --nocapture
 ```
+
+The real-tmux integration group runs only in a disposable Ubuntu 24.04
+container, without using the host Rust toolchain, tmux binary, tmux server, or
+configuration. Ordinary Cargo and Nextest runs skip these tests:
+
+```bash
+scripts/test-real-tmux-docker
+```
+
+The runner also checks host-terminfo integration against the container's
+`infocmp` and `tic`; ordinary unit tests use the bundled terminfo fixture.
+The checkout is mounted read-only. Docker-managed volumes retain Cargo,
+Ghostty, and test artifacts between runs; tmux processes are discarded with
+the container, while socket paths stay in Docker-managed storage rather than
+the checkout or host tmux runtime. The first run needs network access to build
+the image and populate those caches. Set
+`LECTOR_REAL_TMUX_PLATFORM`, for example to `linux/amd64`, when an explicitly
+emulated architecture is useful. Extra arguments are forwarded to Nextest.
 
 Native dependency prerequisites, cache behavior, and supported targets are in
 [the Ghostty build guide](docs/ghostty-builds.md).

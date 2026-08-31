@@ -284,7 +284,7 @@ commands, fragmented Kitty key events, indefinite prefix waits, cancel, repeat e
 confirmation accept/cancel, command errors, malformed data, binding reload,
 portal/connection changes, and safe fallback behavior.
 
-The non-ignored real-server oracle launches an isolated tmux instance with a
+The Docker-only real-server oracle launches an isolated tmux instance with a
 small `C-a` fixture, discovers live windows 1 and 10, and proves that Lector's
 emulated `C-a n` and `C-a 0` change the actual control client's active window.
 The latter assertion verifies stable-ID resolution of a numeric target. It
@@ -293,14 +293,14 @@ uses bounded channel waits and no timing sleeps.
 `tests/tmux_interaction.rs` covers duplicate names, stable-ID search and
 selection, empty and destroyed scopes, external renames, bounded scrolling,
 cancel/resize, speech, command history and rejection, popups, `M-w`, and a
-second-Ghostty physical render oracle. Its non-ignored isolated real-server
+second-Ghostty physical render oracle. Its Docker-only isolated real-server
 harness switches a live session through the chooser and carries a command and
 its result through the actual control connection.
 
 `tests/tmux_lifecycle.rs` adds deterministic one/multiple-connection detach
 selection, active/inactive stable kill targets, only-window loss and recovery,
 failed commands, stale confirmations, simultaneous server/target destruction,
-portal isolation, and recursive gateway ownership. Its non-ignored destructive
+portal isolation, and recursive gateway ownership. Its Docker-only destructive
 harness creates, splits, kills a pane, kills a window, and detaches through an
 isolated real tmux server. It uses bounded event waits with no sleeps and a drop
 guard that kills the disposable server on success or panic. `tests/tmux_panes.rs`
@@ -310,14 +310,14 @@ disturbing survivors.
 `tests/tmux_connections.rs` gives separate routers identical tmux object IDs and
 proves connection-scoped pane state, input, replies, popups, speech, prefix
 state, command history, detach targets, labels, and removal. It includes 50
-rapid bidirectional switches and a non-ignored harness with two independent
+rapid bidirectional switches and a Docker-only harness with two independent
 disposable tmux servers and PTYs.
 
 `tests/tmux_nested.rs` fragments a decoded child marker one byte at a time,
 checks binary pane output and parent bytes on both sides of the child, routes
 commands through one and two nested layers, repeats identical object IDs at
 every level, preserves parent and sibling engines, exercises startup failure
-and cleanup bounds, and verifies detector release. Its non-ignored local
+and cleanup bounds, and verifies detector release. Its Docker-only local
 loopback harness launches an outer tmux on a real PTY, starts a second real
 `tmux -CC` inside that pane, and proves discovery, portal ownership, bootstrap,
 and echoed child input through both control transports with bounded waits and
@@ -325,7 +325,7 @@ panic-safe server cleanup.
 
 `tests/tmux_recovery.rs` adds every-byte EOF, malformed/timeout/parent-loss
 recovery, direct and nested exceptional-action scoping, confirmation, and
-at-most-once write-fault coverage. Its non-ignored real-server case kills tmux,
+at-most-once write-fault coverage. Its Docker-only real-server case kills tmux,
 fault-injects a lost final terminator into a nested parent pane, and verifies
 that ordinary parent-shell output resumes.
 

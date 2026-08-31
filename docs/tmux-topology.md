@@ -75,8 +75,8 @@ never includes raw control-protocol records.
 windows, duplicate linked-pane records, renames, focus changes, layout and pane
 exit, out-of-order notifications, dropped-notification recovery, malformed
 transaction rollback, server restart, empty optional fields, tab-bearing names,
-and application command batching. Its non-ignored real-PTY oracle starts an
+and application command batching. Its Docker-only real-PTY oracle starts an
 isolated tmux server, creates a second session with a genuinely linked window,
 collects the twelve actual reply blocks, and parses the resulting topology. The
-fixture requires tmux on `PATH` and permission to create a local Unix socket
-under `target/test-tmux`.
+fixture gets tmux and its isolated Unix-socket storage from
+`scripts/test-real-tmux-docker`.

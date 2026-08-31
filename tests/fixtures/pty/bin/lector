@@ -1,8 +1,0 @@
-#!/bin/bash
-
-# Model the startup work performed by Lector's default macOS speech backend so
-# the submitted outer-shell command can settle before the inner repaint.
-sleep 0.2
-LECTOR_INNER_SHELL=1 exec "$LECTOR_TEST_BINARY" \
-    --config "$LECTOR_TEST_SPEECH_CONFIG" \
-    "$@"

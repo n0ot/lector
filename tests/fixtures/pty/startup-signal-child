@@ -1,9 +1,0 @@
-#!/bin/bash
-
-set -u
-
-# Publish readiness only after the script has exec'd Bash. Everything after
-# this marker is a Bash builtin, so the signal test cannot race an unrelated
-# helper process such as latency-child's `stty` setup.
-printf '%s\n' "$$" > "$LECTOR_TEST_STARTUP_SIGNAL_APP_PID_FILE"
-IFS= read -r _blocked

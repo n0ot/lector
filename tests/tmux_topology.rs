@@ -619,6 +619,7 @@ fn failed_inventory_batch_retries_once_without_publishing_partial_topology() {
 }
 
 #[test]
+#[ignore = "run through scripts/test-real-tmux-docker"]
 fn real_tmux_inventory_parses_backward_compatible_key_syntax() {
     let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")

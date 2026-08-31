@@ -1,18 +1,17 @@
 local speech_server = os.getenv("LECTOR_TEST_STARTUP_SPEECH_SERVER")
-local speech_server_script = os.getenv("LECTOR_TEST_STARTUP_SPEECH_SCRIPT")
 local expected_config = os.getenv("LECTOR_TEST_STARTUP_CONFIG")
 
-assert(speech_server == "/bin/bash")
-assert(speech_server_script ~= nil)
+assert(speech_server ~= nil)
 assert(expected_config ~= nil)
 
 lector.o.speech = {
     program = speech_server,
     args = {
-        speech_server_script,
-        "one argument",
-        "'literal quotes'",
-        "$(not a shell)",
+        "--legacy",
+        "--startup-argv-probe",
+        "argument with spaces",
+        "'literal punctuation'",
+        "$(opaque text)",
     },
 }
 

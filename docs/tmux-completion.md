@@ -265,5 +265,6 @@ x86-64.
 
 The primary automated coverage is in `tests/tmux_completion.rs`, with real
 transport and lifecycle coverage distributed across the `tmux_*` integration
-harnesses. No supported test is ignored; live fixtures use bounded event waits
-rather than timing sleeps.
+harnesses. The real-tmux cases are ignored in ordinary Cargo runs and selected
+by `scripts/test-real-tmux-docker`; they use bounded event waits rather than
+timing sleeps.

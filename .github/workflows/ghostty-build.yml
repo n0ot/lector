@@ -60,6 +60,9 @@ jobs:
       - name: Run complete suite
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo nextest run --locked --workspace --all-targets --all-features
+      - name: Run real tmux tests in Docker
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: scripts/test-real-tmux-docker
       - name: Run documentation tests
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo test --locked --workspace --doc --all-features

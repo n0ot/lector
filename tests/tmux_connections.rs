@@ -1228,6 +1228,7 @@ impl RealTransport {
 }
 
 #[test]
+#[ignore = "run through scripts/test-real-tmux-docker"]
 fn two_real_disposable_tmux_servers_keep_input_output_and_selection_independent() {
     let _serial = super::serialize_real_tmux_test();
     assert!(

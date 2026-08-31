@@ -1883,6 +1883,7 @@ fn capture_pane(socket: &Path) -> Option<String> {
 }
 
 #[test]
+#[ignore = "run through scripts/test-real-tmux-docker"]
 fn real_tmux_nested_loopback_routes_control_and_child_input() {
     let _serial = super::serialize_real_tmux_test();
     let (mut app, mut sr, mut physical) = app();

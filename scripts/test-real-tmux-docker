@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+dockerfile="$repo_dir/tests/docker/real-tmux.Dockerfile"
+image=${LECTOR_REAL_TMUX_IMAGE:-lector-real-tmux:ubuntu-24.04}
+platform=${LECTOR_REAL_TMUX_PLATFORM:-}
+test_filter='binary(tmux) & test(/(^|::)(real_|two_real_)/)'
+
+build_args=(
+    --file "$dockerfile"
+    --tag "$image"
+)
+run_args=(
+    --rm
+    --init
+    --dns 1.1.1.1
+    --env LECTOR_REAL_TMUX_CONTAINER=1
+    --tmpfs "/tmp:exec,mode=1777"
+    --volume "$repo_dir:/work:ro"
+    --volume lector-real-tmux-cargo-git:/opt/cargo/git
+    --volume lector-real-tmux-cargo-registry:/opt/cargo/registry
+    --volume lector-real-tmux-target:/work/target
+    --workdir /work
+)
+if [[ -n "$platform" ]]; then
+    build_args+=(--platform "$platform")
+    run_args+=(--platform "$platform")
+fi
+
+docker build "${build_args[@]}" "$repo_dir/tests/docker"
+docker run "${run_args[@]}" "$image" \
+    cargo nextest run --locked --lib --run-ignored only \
+    -E 'test(private_terminfo_overlay_advertises_synchronized_output)'
+docker run "${run_args[@]}" "$image" \
+    cargo nextest run --locked --test tmux --no-fail-fast --run-ignored only \
+    -E "$test_filter" "$@"

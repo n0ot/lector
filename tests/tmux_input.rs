@@ -640,6 +640,7 @@ fn send_real_input(
 }
 
 #[test]
+#[ignore = "run through scripts/test-real-tmux-docker"]
 fn real_tmux_byte_echo_paste_mouse_resize_and_output_flood_harness() {
     let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")

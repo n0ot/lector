@@ -48,6 +48,6 @@ connections, overlays, synchronized-output spans, a 10,000-BEL flood,
 source-local duplicate coalescing, Lua configuration, stale-source cleanup,
 and scheduler transaction order. The audible render is replayed through a
 second headless Ghostty terminal and produces an oracle failure artifact on a
-mismatch. Its non-ignored real-server harness creates a second tmux window,
+mismatch. Its Docker-only real-server harness creates a second tmux window,
 causes ordinary shell output in the first window, and checks the stable source
 reported by Lector without timing sleeps.

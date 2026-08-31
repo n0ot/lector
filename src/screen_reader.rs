@@ -803,15 +803,13 @@ mod tests {
         // depends on terminal tab stops. The suffix after the final tab is
         // independently valid, but even a semantic command boundary cannot
         // make it account for earlier output from the command.
-        view.process_changes(
-            b"cat ~/.bashrc\r\n\x1b]133;C;\x07first\tvalue\r\nsecond\r\n\ttail\r\n",
-        );
+        view.process_changes(b"show-records\r\n\x1b]133;C;\x07lorem\tipsum\r\ndolor\r\n\tsit\r\n");
 
         assert!(view.accessibility_completes_linear_output_record());
         assert!(sr.auto_read(&mut view).unwrap());
         let spoken = speaks.borrow().join(" ");
-        assert!(spoken.contains("first"), "{spoken:?}");
-        assert!(spoken.contains("second"), "{spoken:?}");
+        assert!(spoken.contains("lorem"), "{spoken:?}");
+        assert!(spoken.contains("dolor"), "{spoken:?}");
     }
 
     #[test]
@@ -1084,11 +1082,11 @@ mod tests {
     fn key_echo_suppression_accepts_complete_input_after_a_restored_prompt() {
         let (mut sr, _speaks) = make_sr();
         sr.set_suppress_key_echo(true);
-        for character in "nvim ~/.bashrc".chars() {
+        for character in "edit notes.txt".chars() {
             sr.record_forwarded_character(character);
         }
 
-        assert!(sr.should_suppress_key_echo("ncarpenter:~$ nvim ~/.bashrc\n"));
+        assert!(sr.should_suppress_key_echo("demo:~$ edit notes.txt\n"));
         assert!(sr.pending_key_echo.is_empty());
     }
 

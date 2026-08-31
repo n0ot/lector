@@ -39,13 +39,18 @@ fn drive_real_tmux_phase_with_clock<E>(
 }
 
 fn serialize_real_tmux_test() -> MutexGuard<'static, ()> {
+    assert_eq!(
+        std::env::var_os("LECTOR_REAL_TMUX_CONTAINER").as_deref(),
+        Some(std::ffi::OsStr::new("1")),
+        "real tmux tests must run through scripts/test-real-tmux-docker"
+    );
     REAL_TMUX_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[test]
-fn real_tmux_phase_budget_depends_on_time_not_stream_fragment_count() {
+fn tmux_phase_budget_depends_on_time_not_stream_fragment_count() {
     let start = Instant::now();
     let fragments = std::cell::Cell::new(0_usize);
     let result = drive_real_tmux_phase_with_clock(
@@ -62,7 +67,7 @@ fn real_tmux_phase_budget_depends_on_time_not_stream_fragment_count() {
 }
 
 #[test]
-fn real_tmux_phase_keeps_a_hard_elapsed_time_bound() {
+fn tmux_phase_keeps_a_hard_elapsed_time_bound() {
     let start = Instant::now();
     let clock_reads = std::cell::Cell::new(0_usize);
     let steps = std::cell::Cell::new(0_usize);

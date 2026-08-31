@@ -92,6 +92,12 @@ impl Wire {
 }
 
 fn main() -> Result<()> {
+    if let Some(pid_file) = std::env::var_os("LECTOR_TEST_BLOCKING_APP_PID_FILE") {
+        std::fs::write(pid_file, format!("{}\n", std::process::id()))?;
+        loop {
+            thread::park_timeout(Duration::from_secs(60));
+        }
+    }
     let scenario = Scenario::from_environment()?;
     make_stdin_raw().context("put adversarial control PTY in raw mode")?;
     let wire = Wire::new();

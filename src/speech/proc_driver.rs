@@ -1117,12 +1117,14 @@ mod tests {
 
     #[test]
     fn asynchronous_termination_never_waits_for_a_worker_reap_lock() {
-        let child = Arc::new(Mutex::new(
-            Command::new("/bin/sleep")
-                .arg("60")
-                .spawn()
-                .expect("spawn test child"),
-        ));
+        let mut command = Command::new(std::env::current_exe().expect("resolve test binary"));
+        command.args([
+            "--ignored",
+            "--exact",
+            "speech::proc_driver::tests::stubborn_child_probe",
+            "--nocapture",
+        ]);
+        let child = Arc::new(Mutex::new(command.spawn().expect("spawn test child")));
         let handle = TerminationHandle(Arc::clone(&child));
         let held_child = Arc::clone(&child);
         let (locked_tx, locked_rx) = mpsc::sync_channel(1);
@@ -1149,6 +1151,14 @@ mod tests {
         handle
             .terminate_and_reap()
             .expect("terminate and reap test child");
+    }
+
+    #[test]
+    #[ignore = "helper process for asynchronous_termination_never_waits_for_a_worker_reap_lock"]
+    fn stubborn_child_probe() {
+        loop {
+            thread::park();
+        }
     }
 
     #[test]

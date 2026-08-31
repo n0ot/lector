@@ -94,13 +94,13 @@ fn active_pane_bootstraps_first_and_background_sessions_do_not_delay_readiness()
     view.apply_bootstrap(
         PaneId(99),
         CommandStatus::Success,
-        &[b"ncarpenter:~$".to_vec()],
+        &[b"demo:~$".to_vec()],
         100,
     )
     .unwrap();
     assert!(view.is_ready());
     let contents = views::ViewController::model(&mut view).contents_full();
-    assert!(contents.contains("ncarpenter:~$"));
+    assert!(contents.contains("demo:~$"));
     assert!(!contents.contains("background"));
 }
 
@@ -365,9 +365,7 @@ fn empty_bootstrap_capture_preserves_output_that_arrived_during_bootstrap() {
     let mut panes = TmuxPaneSet::new(1);
     let request = panes.reconcile(&topology).unwrap().remove(0);
 
-    panes
-        .process_output(request.pane_id, b"ncarpenter:~$ ")
-        .unwrap();
+    panes.process_output(request.pane_id, b"demo:~$ ").unwrap();
     panes
         .apply_bootstrap(request.pane_id, CommandStatus::Success, &[], 200)
         .unwrap();
@@ -377,7 +375,7 @@ fn empty_bootstrap_capture_preserves_output_that_arrived_during_bootstrap() {
             .pane_view(request.pane_id)
             .unwrap()
             .contents_full()
-            .contains("ncarpenter:~$")
+            .contains("demo:~$")
     );
 }
 
@@ -840,6 +838,7 @@ fn verify_app_scene(case: &str, app: &mut App, physical: &[u8]) {
 }
 
 #[test]
+#[ignore = "run through scripts/test-real-tmux-docker"]
 fn real_tmux_split_resize_zoom_close_and_bootstrap_match_the_render_oracle() {
     let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")

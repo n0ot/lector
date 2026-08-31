@@ -457,8 +457,8 @@ mod tests {
             220,
             &[
                 "CONTAINER ID   IMAGE                                COMMAND                  CREATED         STATUS                             PORTS                       NAMES",
-                "ce14b2a58e31   ghcr.io/open-webui/open-webui:main   \"bash start.sh\"          12 months ago   Up 17 seconds (health: starting)   0.0.0.0:3000->8080/tcp      open-webui",
-                "9f68d2b92c9c   kindest/node:v1.30.0                 \"/usr/local/bin/entr...\"   12 months ago   Up 17 seconds                                                  kind-worker2",
+                "111111111111   registry.example.test/acme/widget:1  \"/fixture/run\"            3 hours ago     Up 17 seconds (health: starting)   127.0.0.1:12345->8080/tcp   widget-one",
+                "222222222222   registry.example.test/acme/worker:1  \"/fixture/work\"           3 hours ago     Up 17 seconds                                                  worker-two",
             ],
         );
 
@@ -481,7 +481,7 @@ mod tests {
 
         let created = model.cell_text(&view, 1, created_col);
         let status = model.cell_text(&view, 1, status_col);
-        assert_eq!(created, "12 months ago");
+        assert_eq!(created, "3 hours ago");
         assert!(status.starts_with("Up 17 seconds"));
         assert!(!status.starts_with("ago"));
     }

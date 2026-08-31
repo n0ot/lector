@@ -110,10 +110,11 @@ coordinate translation, keyboard protocol preservation, large paste chunking,
 query ownership, partial input during active-pane changes, reply correlation,
 resize storms, overlay resize, and explicit `%pause` recovery.
 
-Its non-ignored real tmux 3.7b harness starts an isolated server and a raw
+Its Docker-only real-tmux harness starts an isolated server and a raw
 byte-echo child. Lector drives NUL, control, UTF-8, invalid UTF-8, legacy Meta,
 Kitty keyboard, focus, mouse, bracketed paste, rapid resize, and a 128 KiB
 output flood through the actual control client. The child renders each received
 byte as hexadecimal, providing an independent end-to-end input oracle without
-timing sleeps. The release latency check queues and encodes 10,000 adjacent
-bytes under a deliberately generous regression budget.
+timing sleeps. The harness is ignored by ordinary Cargo runs and selected by
+`scripts/test-real-tmux-docker`. The release latency check queues and encodes
+10,000 adjacent bytes under a deliberately generous regression budget.

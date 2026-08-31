@@ -726,6 +726,7 @@ fn pane_id_at_index(topology: &str, wanted_index: u64) -> Option<u64> {
 }
 
 #[test]
+#[ignore = "run through scripts/test-real-tmux-docker"]
 fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
     let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")

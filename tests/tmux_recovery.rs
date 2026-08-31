@@ -699,6 +699,7 @@ fn writes_that_fail_do_not_duplicate_exceptional_gateway_bytes() {
 }
 
 #[test]
+#[ignore = "run through scripts/test-real-tmux-docker"]
 fn real_tmux_server_death_with_a_lost_terminator_recovers_a_nested_parent() {
     let _serial = super::serialize_real_tmux_test();
     assert!(

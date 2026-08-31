@@ -23,9 +23,6 @@ const SPOKEN_OUTER_READY: &str = "OUTER dash- SHELL dash- READY";
 const HOST_SCREEN: &[u8] = b"HOST-SCREEN-BEFORE-LECTOR";
 const PARENT_AFTER: &[u8] = b"LECTOR-PARENT-AFTER:0";
 const PARENT_INPUT_LEAK: &[u8] = b"LECTOR-PARENT-INPUT-LEAK";
-const TMUX_FOREGROUND_READY: &[u8] = b"LECTOR-TMUX-FOREGROUND-READY";
-const TMUX_FOREGROUND_ACK: &[u8] = b"LECTOR-TMUX-FOREGROUND-ACK";
-const TMUX_SYNC_READY: &str = "LECTOR-TMUX-SYNC-READY";
 const LATENCY_READY: &str = "LECTOR-LATENCY-READY";
 const STARTUP_HOOK_MARKER: &[u8] = b"LECTOR-STARTUP-HOOK-RAN";
 static LIVE_PTY_LOCK: Mutex<()> = Mutex::new(());
@@ -118,13 +115,13 @@ struct LiveLector {
 }
 
 impl LiveLector {
-    fn spawn(shell: &Path, nested: bool) -> Self {
-        Self::spawn_at_size(shell, nested, STANDARD_TERMINAL)
+    fn spawn(shell_mode: &str, nested: bool) -> Self {
+        Self::spawn_at_size(shell_mode, nested, STANDARD_TERMINAL)
     }
 
-    fn spawn_at_size(shell: &Path, nested: bool, size: TestTerminalSize) -> Self {
+    fn spawn_at_size(shell_mode: &str, nested: bool, size: TestTerminalSize) -> Self {
         Self::spawn_at_size_under_parent(
-            shell,
+            shell_mode,
             nested,
             size,
             false,
@@ -132,9 +129,9 @@ impl LiveLector {
         )
     }
 
-    fn spawn_with_native_speech(shell: &Path) -> Self {
+    fn spawn_with_native_speech(shell_mode: &str) -> Self {
         Self::spawn_at_size_under_parent(
-            shell,
+            shell_mode,
             false,
             STANDARD_TERMINAL,
             false,
@@ -142,9 +139,9 @@ impl LiveLector {
         )
     }
 
-    fn spawn_with_parent_shell(shell: &Path) -> Self {
+    fn spawn_with_parent_shell(shell_mode: &str) -> Self {
         Self::spawn_at_size_under_parent(
-            shell,
+            shell_mode,
             false,
             STANDARD_TERMINAL,
             true,
@@ -152,9 +149,9 @@ impl LiveLector {
         )
     }
 
-    fn spawn_with_config(shell: &Path, config: &Path) -> Self {
+    fn spawn_with_config(shell_mode: &str, config: &Path) -> Self {
         Self::spawn_at_size_under_parent(
-            shell,
+            shell_mode,
             false,
             STANDARD_TERMINAL,
             false,
@@ -165,9 +162,9 @@ impl LiveLector {
         )
     }
 
-    fn spawn_with_atomic_config(shell: &Path, config: &Path) -> Self {
+    fn spawn_with_atomic_config(shell_mode: &str, config: &Path) -> Self {
         Self::spawn_at_size_under_parent(
-            shell,
+            shell_mode,
             false,
             STANDARD_TERMINAL,
             false,
@@ -178,9 +175,9 @@ impl LiveLector {
         )
     }
 
-    fn spawn_without_config(shell: &Path, config: &Path, marker: &Path) -> Self {
+    fn spawn_without_config(shell_mode: &str, config: &Path, marker: &Path) -> Self {
         Self::spawn_at_size_under_parent(
-            shell,
+            shell_mode,
             false,
             STANDARD_TERMINAL,
             false,
@@ -192,7 +189,7 @@ impl LiveLector {
     }
 
     fn spawn_with_resolved_config(
-        shell: &Path,
+        shell_mode: &str,
         cli_config: Option<PathBuf>,
         environment_config: Option<PathBuf>,
         xdg_config_home: Option<OsString>,
@@ -200,7 +197,7 @@ impl LiveLector {
         marker: PathBuf,
     ) -> Self {
         Self::spawn_at_size_under_parent(
-            shell,
+            shell_mode,
             false,
             STANDARD_TERMINAL,
             false,
@@ -214,9 +211,9 @@ impl LiveLector {
         )
     }
 
-    fn spawn_with_fatal_speech(shell: &Path, config: &Path, state: &Path) -> Self {
+    fn spawn_with_fatal_speech(shell_mode: &str, config: &Path, state: &Path) -> Self {
         Self::spawn_at_size_under_parent(
-            shell,
+            shell_mode,
             false,
             STANDARD_TERMINAL,
             false,
@@ -228,7 +225,7 @@ impl LiveLector {
     }
 
     fn spawn_at_size_under_parent(
-        shell: &Path,
+        shell_mode: &str,
         nested: bool,
         size: TestTerminalSize,
         parent_shell: bool,
@@ -249,11 +246,12 @@ impl LiveLector {
         let pair = native_pty_system()
             .openpty(size.pty_size())
             .expect("open physical PTY");
+        let pty_fixture = Path::new(env!("CARGO_BIN_EXE_pty-test-fixture"));
         let mut command = if parent_shell {
-            CommandBuilder::new(fixture("tests/fixtures/pty/parent-shell"))
+            CommandBuilder::new(pty_fixture)
         } else {
             let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_lector"));
-            command.args(["--shell", shell.to_str().expect("UTF-8 fixture path")]);
+            command.args(["--shell", pty_fixture.to_str().expect("UTF-8 fixture path")]);
             match &startup_configuration {
                 StartupConfiguration::ProcessFixture => {
                     command.args([
@@ -313,10 +311,9 @@ impl LiveLector {
                 config,
                 atomic_startup,
             } => {
-                command.env("LECTOR_TEST_STARTUP_SPEECH_SERVER", "/bin/bash");
                 command.env(
-                    "LECTOR_TEST_STARTUP_SPEECH_SCRIPT",
-                    fixture("tests/fixtures/pty/startup-speech-server"),
+                    "LECTOR_TEST_STARTUP_SPEECH_SERVER",
+                    env!("CARGO_BIN_EXE_proc_stub_server"),
                 );
                 command.env("LECTOR_TEST_STARTUP_CONFIG", config);
                 command.env("LECTOR_TEST_STARTUP_ORDER_LOG", &inner_speech_log);
@@ -354,17 +351,18 @@ impl LiveLector {
             StartupConfiguration::ProcessFixture | StartupConfiguration::Native => {}
         }
         if parent_shell {
+            command.env("LECTOR_TEST_PTY_MODE", "parent");
             command.env("LECTOR_TEST_BINARY", env!("CARGO_BIN_EXE_lector"));
-            command.env("LECTOR_TEST_CHILD_SHELL", shell);
+            command.env("LECTOR_TEST_CHILD_SHELL", pty_fixture);
+            command.env("LECTOR_TEST_CHILD_MODE", shell_mode);
+        } else {
+            command.env("LECTOR_TEST_PTY_MODE", shell_mode);
         }
         if nested {
             command.env("LECTOR_TEST_BINARY", env!("CARGO_BIN_EXE_lector"));
-            command.env(
-                "LECTOR_TEST_CHILD_SHELL",
-                fixture("tests/fixtures/pty/bell-shell"),
-            );
+            command.env("LECTOR_TEST_CHILD_SHELL", pty_fixture);
             command.env("LECTOR_TEST_INNER_SPEECH_LOG", &inner_speech_log);
-            command.env("SHELL", fixture("tests/fixtures/pty/interactive-shell"));
+            command.env("SHELL", pty_fixture);
         }
         let child = pair
             .slave
@@ -495,13 +493,6 @@ impl LiveLector {
     fn pump_output(&mut self, timeout: Duration) {
         if let Ok(chunk) = self.receiver.recv_timeout(timeout) {
             self.accept_output(&chunk);
-        }
-    }
-
-    fn pump_for(&mut self, duration: Duration) {
-        let deadline = Instant::now() + duration;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            self.pump_output(remaining.min(Duration::from_millis(5)));
         }
     }
 
@@ -662,7 +653,7 @@ fn assert_resolved_config(
 ) {
     let marker = artifact_dir.join(format!("{case}.loaded"));
     let mut lector = LiveLector::spawn_with_resolved_config(
-        &fixture("tests/fixtures/pty/latency-child"),
+        "latency",
         cli_config,
         environment_config,
         xdg_config_home,
@@ -761,8 +752,8 @@ fn physical_screen_contains(terminal: &Terminal, expected: &str) -> bool {
         .any(|row| row.text().contains(expected))
 }
 
-fn assert_live_key_to_pixel_latency(shell: &Path, case: &str, control_mode: bool) {
-    let mut lector = LiveLector::spawn(shell, false);
+fn assert_live_key_to_pixel_latency(shell_mode: &str, case: &str) {
+    let mut lector = LiveLector::spawn(shell_mode, false);
     assert!(
         lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
             physical_screen_contains(terminal, LATENCY_READY)
@@ -798,10 +789,6 @@ fn assert_live_key_to_pixel_latency(shell: &Path, case: &str, control_mode: bool
     );
 
     lector.send_now(b"q");
-    if control_mode && !lector.finish(Duration::from_secs(2)) {
-        lector.send_now(b"\x1bC");
-        lector.send_now(b"d");
-    }
     assert!(
         lector.finish(Duration::from_secs(5)),
         "{case}: Lector did not exit after the latency probe"
@@ -811,18 +798,13 @@ fn assert_live_key_to_pixel_latency(shell: &Path, case: &str, control_mode: bool
 #[test]
 fn direct_terminal_key_to_pixel_latency_stays_interactive() {
     let _serial = serialize_live_pty_test();
-    assert_live_key_to_pixel_latency(
-        &fixture("tests/fixtures/pty/latency-child"),
-        "direct terminal",
-        false,
-    );
+    assert_live_key_to_pixel_latency("latency", "direct terminal");
 }
 
 #[test]
 fn direct_native_speech_continues_after_startup_and_never_blocks_input() {
     let _serial = serialize_live_pty_test();
-    let mut lector =
-        LiveLector::spawn_with_native_speech(&fixture("tests/fixtures/pty/latency-child"));
+    let mut lector = LiveLector::spawn_with_native_speech("latency");
     assert!(
         lector.wait_for(Duration::from_secs(3), |output| output
             .windows(LATENCY_READY.len())
@@ -925,8 +907,7 @@ fn direct_native_speech_continues_after_startup_and_never_blocks_input() {
 fn init_lua_process_argv_and_deferred_speech_cross_the_ready_boundary_in_order() {
     let _serial = serialize_live_pty_test();
     let config = fixture("tests/fixtures/pty/startup-speech.lua");
-    let mut lector =
-        LiveLector::spawn_with_config(&fixture("tests/fixtures/pty/latency-child"), &config);
+    let mut lector = LiveLector::spawn_with_config("latency", &config);
 
     assert!(
         lector.wait_for_outer_speech(Duration::from_secs(3), "LECTOR-TOP-LEVEL-SPEAK"),
@@ -988,8 +969,7 @@ fn init_lua_process_argv_and_deferred_speech_cross_the_ready_boundary_in_order()
 fn startup_hook_waits_for_the_committed_dec_2026_frame() {
     let _serial = serialize_live_pty_test();
     let config = fixture("tests/fixtures/pty/startup-speech.lua");
-    let mut lector =
-        LiveLector::spawn_with_atomic_config(&fixture("tests/fixtures/pty/latency-child"), &config);
+    let mut lector = LiveLector::spawn_with_atomic_config("latency", &config);
 
     // Place physical input immediately before the focus-mode response. The
     // ownership query necessarily reads both before terminal activation, so
@@ -1082,11 +1062,7 @@ fn a_second_speech_crash_wakes_and_terminates_the_live_main_loop() {
     let state = artifact_dir.join(format!("{unique}.state"));
     let config = fixture("tests/fixtures/pty/fatal-speech.lua");
     let started = Instant::now();
-    let mut lector = LiveLector::spawn_with_fatal_speech(
-        &fixture("tests/fixtures/pty/latency-child"),
-        &config,
-        &state,
-    );
+    let mut lector = LiveLector::spawn_with_fatal_speech("latency", &config, &state);
 
     let status = lector
         .wait_for_exit(Duration::from_secs(3))
@@ -1299,11 +1275,7 @@ fn no_config_skips_the_default_init_lua() {
     .expect("write default init.lua sentinel");
 
     {
-        let mut lector = LiveLector::spawn_without_config(
-            &fixture("tests/fixtures/pty/latency-child"),
-            &config,
-            &marker,
-        );
+        let mut lector = LiveLector::spawn_without_config("latency", &config, &marker);
         assert!(
             lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
                 physical_screen_contains(terminal, LATENCY_READY)
@@ -1326,97 +1298,18 @@ fn no_config_skips_the_default_init_lua() {
 }
 
 #[test]
-fn ordinary_tmux_key_to_pixel_latency_stays_interactive() {
-    let _serial = serialize_live_pty_test();
-    assert_live_key_to_pixel_latency(
-        &fixture("tests/fixtures/pty/latency-tmux"),
-        "ordinary tmux client",
-        false,
-    );
-}
-
-#[test]
-fn fresh_ordinary_tmux_client_loads_lectors_sync_capability() {
-    let _serial = serialize_live_pty_test();
-    let mut lector = LiveLector::spawn(&fixture("tests/fixtures/pty/tmux-sync-info"), false);
-    assert!(
-        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
-            physical_screen_contains(terminal, TMUX_SYNC_READY)
-        }),
-        "fresh ordinary tmux client did not report Lector's Sync capability; screen={:?}; output={:?}",
-        lector
-            .physical_terminal
-            .snapshot()
-            .rows
-            .iter()
-            .map(|row| row.text())
-            .collect::<Vec<_>>(),
-        String::from_utf8_lossy(&lector.output)
-    );
-
-    lector.send(b"q");
-    assert!(
-        lector.finish(Duration::from_secs(5)),
-        "fresh ordinary tmux Sync fixture did not exit"
-    );
-}
-
-#[test]
-fn tmux_control_mode_key_to_pixel_latency_stays_interactive() {
-    let _serial = serialize_live_pty_test();
-    assert_live_key_to_pixel_latency(
-        &fixture("tests/fixtures/pty/latency-tmux-control"),
-        "tmux control mode",
-        true,
-    );
-}
-
-#[test]
 fn live_pty_drains_output_that_was_ready_before_poll_registration_and_delivers_bells_promptly() {
     let _serial = serialize_live_pty_test();
-    let shell = fixture("tests/fixtures/pty/bell-shell");
-    assert_bell_lifecycle(LiveLector::spawn(&shell, false), "direct Lector");
-}
-
-#[test]
-fn hidden_tmux_output_flood_does_not_starve_foreground_input() {
-    let _serial = serialize_live_pty_test();
-    let shell = fixture("tests/fixtures/pty/tmux-hidden-flood");
-    let mut lector = LiveLector::spawn(&shell, false);
-    assert!(
-        lector.wait_for(Duration::from_secs(5), |output| output
-            .windows(TMUX_FOREGROUND_READY.len())
-            .any(|window| window == TMUX_FOREGROUND_READY)),
-        "foreground pane did not become visible during hidden-pane output; output={:?}",
-        String::from_utf8_lossy(&lector.output)
-    );
-
-    let sent_at = Instant::now();
-    lector.send(b"p");
-    assert!(
-        lector.wait_for(Duration::from_secs(2), |output| output
-            .windows(TMUX_FOREGROUND_ACK.len())
-            .any(|window| window == TMUX_FOREGROUND_ACK)),
-        "foreground input was starved for {:?} by hidden-pane output; output={:?}",
-        sent_at.elapsed(),
-        String::from_utf8_lossy(&lector.output)
-    );
-
-    lector.send(b"\x1bC");
-    lector.send(b"d");
-    assert!(
-        lector.finish(Duration::from_secs(5)),
-        "Lector's connection-manager detach did not close the tmux control client"
-    );
+    assert_bell_lifecycle(LiveLector::spawn("bell", false), "direct Lector");
 }
 
 #[test]
 fn direct_output_flood_does_not_starve_auto_read_toggle() {
     let _serial = serialize_live_pty_test();
-    let mut lector = LiveLector::spawn(Path::new("/usr/bin/yes"), false);
+    let mut lector = LiveLector::spawn("flood", false);
     assert!(
         lector.wait_for(Duration::from_secs(3), |output| output.contains(&b'y')),
-        "Lector did not render output from yes"
+        "Lector did not render output from the flood fixture"
     );
     lector.clear_speech_logs();
 
@@ -1432,214 +1325,14 @@ fn direct_output_flood_does_not_starve_auto_read_toggle() {
     lector.send_now(b"\x03");
     assert!(
         lector.finish(Duration::from_secs(3)),
-        "Lector did not exit after interrupting yes"
+        "Lector did not exit after interrupting the flood fixture"
     );
-}
-
-#[test]
-#[ignore = "manual stress test requiring the maintainer's Bash, fzf, and Neovim setup"]
-fn actual_bash_fzf_and_neovim_behave_under_repeated_interactive_input() {
-    let _serial = serialize_live_pty_test();
-    let mut lector = LiveLector::spawn_with_config(
-        Path::new("/bin/bash"),
-        &fixture("tests/fixtures/pty/proc-speech-suppress.lua"),
-    );
-    lector.pump_for(Duration::from_secs(2));
-
-    let mut unexpected_fzf_speech = Vec::new();
-    for iteration in 0..100 {
-        lector.send(b"\x15");
-        lector.pump_for(Duration::from_millis(10));
-        lector.clear_speech_logs();
-        lector.send(b"\x12");
-        lector.pump_for(Duration::from_millis(if iteration == 0 {
-            500
-        } else {
-            80 + iteration % 41
-        }));
-        let speech = lector
-            .outer_speech()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<String>(line).ok())
-            .collect::<Vec<_>>();
-        if speech.as_slice() != [" greater "] {
-            unexpected_fzf_speech.push((iteration, speech));
-        }
-        lector.clear_speech_logs();
-        lector.send(b"\x1b");
-        lector.pump_for(Duration::from_millis(150));
-        lector.clear_speech_logs();
-    }
-    eprintln!("unexpected fzf speech samples: {unexpected_fzf_speech:#?}");
-
-    drop(lector);
-    let mut lector = LiveLector::spawn_with_config(
-        Path::new("/bin/bash"),
-        &fixture("tests/fixtures/pty/proc-speech-suppress.lua"),
-    );
-    lector.pump_for(Duration::from_secs(2));
-
-    let mut alternate_screen_launch_speech = Vec::new();
-    let mut alternate_screen_return_speech = Vec::new();
-    for iteration in 0..20 {
-        lector.send(b"\x15");
-        lector.clear_speech_logs();
-        lector.send(b"nvim ~/.bashrc\r");
-        assert!(
-            lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
-                physical_screen_contains(terminal, "shellcheck shell=bash")
-            }),
-            "Neovim did not show .bashrc on iteration {iteration}"
-        );
-        lector.pump_for(Duration::from_millis(300));
-        alternate_screen_launch_speech.push(lector.outer_speech());
-
-        lector.send(b"\x1b");
-        lector.pump_for(Duration::from_millis(100));
-        lector.clear_speech_logs();
-        lector.send(b":q!\r");
-        lector.pump_for(Duration::from_millis(300));
-        alternate_screen_return_speech.push(lector.outer_speech());
-        lector.clear_speech_logs();
-    }
-    eprintln!("Neovim .bashrc launch speech: {alternate_screen_launch_speech:#?}");
-    eprintln!("Neovim .bashrc return speech: {alternate_screen_return_speech:#?}");
-    let expected_launch_speech = alternate_screen_launch_speech
-        .first()
-        .expect("at least one alternate-screen launch");
-    assert!(
-        expected_launch_speech.contains("shellcheck shell equals bash"),
-        "Neovim did not read the .bashrc cursor line"
-    );
-    assert!(
-        alternate_screen_launch_speech
-            .iter()
-            .all(|speech| speech == expected_launch_speech),
-        "Neovim alternate-screen launches produced inconsistent speech"
-    );
-    assert!(
-        alternate_screen_return_speech
-            .first()
-            .is_some_and(|speech| !speech.is_empty()),
-        "Neovim alternate-screen return did not read the restored cursor line"
-    );
-    assert!(
-        alternate_screen_return_speech
-            .windows(2)
-            .all(|pair| pair[0] == pair[1]),
-        "Neovim alternate-screen returns produced inconsistent cursor-line speech"
-    );
-
-    lector.send(b"\x15");
-    for byte in b"nvim --clean" {
-        lector.send(&[*byte]);
-    }
-    lector.send(b"\r");
-    assert!(
-        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
-            physical_screen_contains(terminal, "[No Name]")
-        }),
-        "Neovim did not become visible; screen={:?}",
-        lector
-            .physical_terminal
-            .snapshot()
-            .rows
-            .iter()
-            .map(|row| row.text())
-            .collect::<Vec<_>>()
-    );
-    lector.pump_for(Duration::from_secs(1));
-    lector.clear_speech_logs();
-    lector.send_now(b"a");
-    // Keep the first inserted character in the same unsettled input/output
-    // window as the append command. This is the intermittent case that used
-    // to announce the initial `T` while the alternate-screen redraw arrived.
-    lector.send_now(b"T");
-    const WORDS: &[u8] = b"his is a test alpha beta gamma delta ";
-    for iteration in 0..3_200 {
-        let byte = WORDS[iteration % WORDS.len()];
-        lector.send_now(&[byte]);
-        if iteration < 1_200 {
-            lector.pump_for(Duration::from_millis(3 + (iteration % 7) as u64));
-        } else if iteration % 13 == 0 {
-            lector.pump_for(Duration::from_millis((iteration % 5) as u64));
-        }
-    }
-    lector.pump_for(Duration::from_secs(2));
-    let neovim_speech = lector.outer_speech();
-    eprintln!("Neovim speech: {neovim_speech:?}");
-
-    lector.send(b"\x1b");
-    lector.pump_for(Duration::from_millis(100));
-    lector.send(b":q!\r");
-    lector.pump_for(Duration::from_secs(1));
-    lector.send(b"exit\r");
-    assert!(lector.finish(Duration::from_secs(5)), "Lector did not exit");
-
-    assert!(
-        unexpected_fzf_speech.is_empty(),
-        "fzf did not consistently read only its application-cursor character"
-    );
-    assert!(
-        neovim_speech.is_empty(),
-        "Neovim spoke while suppressing typed-key echo"
-    );
-}
-
-#[test]
-#[ignore = "manual characterization requiring the maintainer's Neovim setup"]
-fn actual_neovim_separates_insert_mode_status_from_first_echo() {
-    let _serial = serialize_live_pty_test();
-    let mut lector = LiveLector::spawn_with_config(
-        Path::new("/bin/bash"),
-        &fixture("tests/fixtures/pty/proc-speech-suppress.lua"),
-    );
-    lector.pump_for(Duration::from_secs(2));
-    lector.clear_speech_logs();
-    lector.send(b"nvim\r");
-    assert!(
-        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
-            physical_screen_contains(terminal, "[No Name]")
-        }),
-        "Neovim did not become visible"
-    );
-    lector.pump_for(Duration::from_secs(1));
-    for iteration in 0..40 {
-        lector.clear_speech_logs();
-        lector.send(b"a");
-        assert!(
-            lector.wait_for_physical_terminal(Duration::from_secs(1), |terminal| {
-                physical_screen_contains(terminal, "i [No Name]")
-            }),
-            "insert indicator did not become visible on iteration {iteration}"
-        );
-        lector.pump_for(Duration::from_millis(60 + (iteration % 7) * 17));
-        lector.send(b"T");
-        lector.pump_for(Duration::from_millis(250));
-        let speech = lector
-            .outer_speech()
-            .lines()
-            .filter_map(|line| serde_json::from_str::<String>(line).ok())
-            .collect::<Vec<_>>();
-        assert_eq!(speech.as_slice(), ["i"], "iteration {iteration} speech");
-
-        lector.send(b"\x1b");
-        lector.pump_for(Duration::from_millis(100));
-        lector.send(b"u");
-        lector.pump_for(Duration::from_millis(100));
-    }
-
-    lector.send(b":q!\r");
-    lector.pump_for(Duration::from_millis(300));
-    lector.send(b"exit\r");
-    assert!(lector.finish(Duration::from_secs(5)), "Lector did not exit");
 }
 
 #[test]
 fn live_shutdown_fence_consumes_terminal_replies_before_parent_shell_resumes() {
     let _serial = serialize_live_pty_test();
-    let shell = fixture("tests/fixtures/pty/bell-shell");
-    let mut lector = LiveLector::spawn_with_parent_shell(&shell);
+    let mut lector = LiveLector::spawn_with_parent_shell("bell");
     assert!(
         lector.wait_for(Duration::from_secs(2), |output| output
             .windows(READY.len())
@@ -1689,8 +1382,7 @@ fn live_shutdown_fence_consumes_terminal_replies_before_parent_shell_resumes() {
 #[test]
 fn nested_lector_output_and_bells_are_visible_to_the_outer_lector() {
     let _serial = serialize_live_pty_test();
-    let shell = fixture("tests/fixtures/pty/nested-lector-shell");
-    let mut lector = LiveLector::spawn(&shell, true);
+    let mut lector = LiveLector::spawn("nested-lector", true);
     assert!(
         lector.wait_for(Duration::from_secs(2), |output| output
             .windows(OUTER_READY.len())
@@ -1755,8 +1447,7 @@ fn nested_lector_output_and_bells_are_visible_to_the_outer_lector() {
 }
 
 fn assert_outer_review_reads_inner_prompt(size: TestTerminalSize) {
-    let shell = fixture("tests/fixtures/pty/interactive-shell");
-    let mut lector = LiveLector::spawn_at_size(&shell, true, size);
+    let mut lector = LiveLector::spawn_at_size("interactive", true, size);
     assert!(
         lector.wait_for(Duration::from_secs(2), |output| output
             .windows(OUTER_PROMPT.len())

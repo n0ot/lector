@@ -60,6 +60,7 @@ fn root_binary_targets_are_explicit() {
             "tmux-control-adversary",
             "src/bin/tmux-control-adversary.rs",
         ),
+        ("pty-test-fixture", "src/bin/pty-test-fixture.rs"),
         ("lector-ghostty-bench", "src/bin/lector-ghostty-bench.rs"),
     ];
 

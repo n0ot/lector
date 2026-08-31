@@ -164,13 +164,18 @@ impl Drop for CaptureFiles {
 #[cfg(test)]
 mod tests {
     use super::run_bounded_output_with_timeout;
-    use std::{process::Command, time::Duration};
+    use std::{process::Command, thread, time::Duration};
 
     #[test]
     fn wedged_host_tool_is_killed_at_its_deadline() {
         let directory = tempfile::tempdir().expect("create capture directory");
-        let mut command = Command::new("sh");
-        command.args(["-c", "while :; do :; done"]);
+        let mut command = Command::new(std::env::current_exe().expect("resolve test binary"));
+        command.args([
+            "--ignored",
+            "--exact",
+            "host_command::tests::wedged_host_tool_probe",
+            "--nocapture",
+        ]);
         let started = std::time::Instant::now();
         let error = run_bounded_output_with_timeout(
             &mut command,
@@ -182,5 +187,13 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    #[ignore = "helper process for wedged_host_tool_is_killed_at_its_deadline"]
+    fn wedged_host_tool_probe() {
+        loop {
+            thread::park();
+        }
     }
 }

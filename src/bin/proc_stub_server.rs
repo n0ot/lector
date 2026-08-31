@@ -34,6 +34,7 @@ struct State {
 #[derive(Default)]
 struct Options {
     adversary: Option<String>,
+    pid_file: Option<PathBuf>,
     legacy_protocol: bool,
     speech_log: Option<PathBuf>,
     rpc_log: Option<PathBuf>,
@@ -51,6 +52,26 @@ fn main() -> Result<()> {
             "--legacy" => options.legacy_protocol = true,
             "--adversary" => {
                 options.adversary = Some(required_arg(&mut args, "--adversary")?);
+            }
+            "--pid-file" => {
+                options.pid_file = Some(required_arg(&mut args, "--pid-file")?.into());
+            }
+            "--startup-argv-probe" => {
+                let received = [
+                    required_arg(&mut args, "--startup-argv-probe")?,
+                    required_arg(&mut args, "--startup-argv-probe")?,
+                    required_arg(&mut args, "--startup-argv-probe")?,
+                ];
+                let expected = [
+                    "argument with spaces",
+                    "'literal punctuation'",
+                    "$(opaque text)",
+                ];
+                if received.each_ref().map(String::as_str) != expected {
+                    anyhow::bail!(
+                        "LECTOR-SPEECH-ARGV-ERROR: expected {expected:?}, received {received:?}"
+                    );
+                }
             }
             "--speech-log" => {
                 options.speech_log = Some(required_arg(&mut args, "--speech-log")?.into());
@@ -75,7 +96,7 @@ fn main() -> Result<()> {
         }
     }
     if let Some(mode) = options.adversary {
-        return run_adversary(&mode);
+        return run_adversary(&mode, options.pid_file.as_deref());
     }
 
     let generation = options
@@ -378,7 +399,7 @@ fn stub_log_error(error: io::Error) -> RpcError {
     RpcError::internal_error(format!("write proc stub speech log: {error}"))
 }
 
-fn run_adversary(mode: &str) -> Result<()> {
+fn run_adversary(mode: &str, pid_file: Option<&Path>) -> Result<()> {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     let mut stdout = io::stdout().lock();
@@ -393,6 +414,9 @@ fn run_adversary(mode: &str) -> Result<()> {
         return Ok(());
     }
     if mode == "stall-on-initialize" {
+        if let Some(path) = pid_file {
+            std::fs::write(path, format!("{}\n", std::process::id()))?;
+        }
         stall_forever();
     }
     writeln!(

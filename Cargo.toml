@@ -68,6 +68,11 @@ path = "src/bin/tmux-control-adversary.rs"
 test = false
 
 [[bin]]
+name = "pty-test-fixture"
+path = "src/bin/pty-test-fixture.rs"
+test = false
+
+[[bin]]
 name = "lector-ghostty-bench"
 path = "src/bin/lector-ghostty-bench.rs"
 required-features = ["ghostty-vt"]

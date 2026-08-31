@@ -465,10 +465,10 @@ fn connection_bootstrap_speaks_only_the_short_entry_cue_and_ready_pane() {
 #[test]
 fn empty_initial_capture_uses_live_prompt_and_never_announces_blank_screen() {
     let (mut app, _sr, recorder, _clock, _physical) =
-        ready_app_with_bootstrap(Some(b"ncarpenter:~$"), &[]);
-    assert!(app.debug_active_view_contents().contains("ncarpenter:~$"));
+        ready_app_with_bootstrap(Some(b"demo:~$"), &[]);
+    assert!(app.debug_active_view_contents().contains("demo:~$"));
     let messages = recorder.0.borrow();
-    assert_eq!(&*messages, &["tmux", "input", "ncarpenter:~$"]);
+    assert_eq!(&*messages, &["tmux", "input", "demo:~$"]);
     assert!(messages.iter().all(|message| message != "blank screen"));
 }
 
@@ -757,6 +757,7 @@ fn drive_real_tmux(
 }
 
 #[test]
+#[ignore = "run through scripts/test-real-tmux-docker"]
 fn real_tmux_discovers_c_a_and_executes_next_window_through_control_mode() {
     let _serial = super::serialize_real_tmux_test();
     let tmux = std::process::Command::new("tmux")
