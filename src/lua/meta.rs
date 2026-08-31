@@ -3,7 +3,7 @@ use crate::{
     clipboard::{ClipboardRegister, SystemClipboardProvider},
     keymap::KeyBindings,
     screen_reader::ScreenReader,
-    speech::{SpeechServerSpec, symbols},
+    speech::{SetOptionOutcome, SpeechServerSpec, protocol::VoiceInfo, symbols},
 };
 use anyhow::{Context as AnyhowContext, anyhow};
 use mlua::{Error, Function, IntoLua, Lua, Result, Table, Value};
@@ -64,7 +64,8 @@ fn add_callbacks_static(
         let sr_ptr = Rc::clone(&sr_ptr);
         move |_, (key, value): (String, mlua::Value)| {
             with_screen_reader_mut(&sr_ptr, |sr| {
-                set_option(sr, &key, value).map_err(Error::external)
+                set_option(sr, &key, value)
+                    .map_err(|error| Error::external(anyhow!(format!("{error:#}"))))
             })
         }
     })?;
@@ -247,8 +248,26 @@ fn clipboard_register(name: &str) -> anyhow::Result<ClipboardRegister> {
 
 fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua::Value> {
     match option {
-        "speech" => speech_server_spec_to_lua(lua, sr.speech_server_spec()),
-        "speech_rate" => sr.speech().get_rate().into_lua(lua),
+        "speech.server" => speech_server_spec_to_lua(lua, sr.speech_server_spec()),
+        "speech.rate" => sr.speech().rate().into_lua(lua),
+        "speech.paragraph_pause_ms" => sr.speech().paragraph_pause_ms().into_lua(lua),
+        "speech.voice" => sr.speech().voice().map(|voice| voice.id).into_lua(lua),
+        "speech.voices" => match sr.speech().voices() {
+            Some(voices) => {
+                let result = lua
+                    .create_table()
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                for (index, voice) in voices.iter().enumerate() {
+                    let voice = voice_info_to_lua(lua, voice)
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                    result
+                        .set(index + 1, voice)
+                        .map_err(|error| anyhow!(error.to_string()))?;
+                }
+                Ok(Value::Table(result))
+            }
+            None => Ok(Value::Nil),
+        },
         "symbol_level" => sr.speech().symbol_level().to_string().into_lua(lua),
         "help_mode" => sr.help_mode().into_lua(lua),
         "auto_read" => sr.auto_read_enabled().into_lua(lua),
@@ -320,21 +339,60 @@ fn get_binding(lua: &Lua, sr: &ScreenReader, key: &str) -> anyhow::Result<Value>
 
 fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow::Result<()> {
     use mlua::Value::*;
+    if option == "speech.paragraph_pause_ms" {
+        let Integer(value) = value else {
+            return Err(anyhow!(
+                "set option: speech.paragraph_pause_ms: value must be a non-negative integer"
+            ));
+        };
+        let milliseconds = u64::try_from(value).map_err(|_| {
+            anyhow!("set option: speech.paragraph_pause_ms: value must be a non-negative integer")
+        })?;
+        return sr
+            .speech_mut()
+            .set_paragraph_pause_ms(milliseconds)
+            .map_err(anyhow::Error::new)
+            .context("set option: speech.paragraph_pause_ms");
+    }
+    if option == "speech.rate" {
+        let rate = match value {
+            Number(value) => value as f32,
+            Integer(value) => value as f32,
+            _ => return Err(anyhow!("set option: speech.rate: value must be a number")),
+        };
+        return sr
+            .speech_mut()
+            .set_rate_option(rate)
+            .and_then(|outcome| match outcome {
+                SetOptionOutcome::Accepted => Ok(()),
+                SetOptionOutcome::Unsupported => Err(crate::speech::Error::Driver(anyhow!(
+                    "lector.o.speech.rate is unavailable: speech host does not support setting rate"
+                ))),
+            })
+            .map_err(anyhow::Error::new)
+            .context("set option: speech.rate");
+    }
+    if option == "speech.voice" {
+        let String(value) = value else {
+            return Err(anyhow!("set option: speech.voice: value must be a string"));
+        };
+        let voice_id = lua_utf8(&value, "speech voice ID")?;
+        return sr
+            .speech_mut()
+            .set_voice_option(&voice_id)
+            .and_then(|outcome| match outcome {
+                SetOptionOutcome::Accepted => Ok(()),
+                SetOptionOutcome::Unsupported => Err(crate::speech::Error::Driver(anyhow!(
+                    "lector.o.speech.voice is unavailable: speech host does not support selecting a voice"
+                ))),
+            })
+            .map_err(anyhow::Error::new)
+            .context("set option: speech.voice");
+    }
     (match option {
-        "speech" => sr
+        "speech.server" => sr
             .set_startup_speech_server_spec(speech_server_spec_from_lua(value)?)
             .map_err(anyhow::Error::new),
-        "speech_rate" => match value {
-            Number(v) => sr
-                .speech_mut()
-                .set_rate(v as f32)
-                .map_err(anyhow::Error::new),
-            Integer(v) => sr
-                .speech_mut()
-                .set_rate(v as f32)
-                .map_err(anyhow::Error::new),
-            _ => Err(anyhow!("value must be a number")),
-        },
         "symbol_level" => match value {
             String(v) => {
                 let level = v
@@ -431,6 +489,15 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
         _ => Err(anyhow!("unknown option")),
     })
     .map_err(|e| anyhow!("set option: {}: {:?}", option, e))
+}
+
+fn voice_info_to_lua(lua: &Lua, voice: &VoiceInfo) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.set("id", voice.id.as_str())?;
+    table.set("name", voice.name.as_str())?;
+    table.set("language", voice.language.as_str())?;
+    table.set("gender", voice.gender.as_deref())?;
+    Ok(table)
 }
 
 pub(super) fn speech_server_spec_from_lua(value: Value) -> anyhow::Result<SpeechServerSpec> {

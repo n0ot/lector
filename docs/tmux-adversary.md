@@ -15,7 +15,7 @@ Put this in `/tmp/lector-adversary.lua` so the run exercises custom process
 speech without invoking system TTS:
 
 ```lua
-lector.o.speech = { program = "target/debug/proc_stub_server" }
+lector.o.speech.server = { program = "target/debug/proc_stub_server" }
 ```
 
 Then select a scenario with an environment variable:

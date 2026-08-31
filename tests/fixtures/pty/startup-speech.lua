@@ -4,7 +4,7 @@ local expected_config = os.getenv("LECTOR_TEST_STARTUP_CONFIG")
 assert(speech_server ~= nil)
 assert(expected_config ~= nil)
 
-lector.o.speech = {
+lector.o.speech.server = {
     program = speech_server,
     args = {
         "--legacy",

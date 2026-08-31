@@ -1,4 +1,4 @@
-use super::Driver;
+use super::{CapabilityStatus, Driver, OptionState, SetOptionOutcome};
 use anyhow::Result as DriverResult;
 use tts::Tts;
 
@@ -70,6 +70,29 @@ impl Driver for TtsDriver {
         self.tts.set_rate(clamped).map_err(backend_error)?;
         self.rate = clamped;
         Ok(())
+    }
+
+    fn option_state(&self) -> OptionState {
+        if self.rate_bounds.is_some() {
+            OptionState {
+                rate: Some(self.rate),
+                rate_status: CapabilityStatus::Supported,
+                ..OptionState::default()
+            }
+        } else {
+            OptionState {
+                rate_status: CapabilityStatus::Unsupported,
+                ..OptionState::default()
+            }
+        }
+    }
+
+    fn set_rate_option(&mut self, rate: f32) -> DriverResult<SetOptionOutcome> {
+        if self.rate_bounds.is_none() {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        self.set_rate(rate)?;
+        Ok(SetOptionOutcome::Accepted)
     }
 }
 

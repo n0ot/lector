@@ -343,10 +343,10 @@ Speech selection is Lua configuration, not a command-line driver setting:
 
 ```lua
 -- The default.
-lector.o.speech = "native"
+lector.o.speech.server = "native"
 
 -- Or start a custom server with an exact argument vector.
-lector.o.speech = {
+lector.o.speech.server = {
   program = "/opt/lector/bin/lector-tts",
   args = { "--backend", "speech-dispatcher" },
 }
@@ -356,7 +356,7 @@ For example, an SSH stdio bridge can be expressed without any special Lector
 transport support:
 
 ```lua
-lector.o.speech = {
+lector.o.speech.server = {
   program = "ssh",
   args = { "speech-mac", "lector-tts", "--backend", "av-foundation" },
 }
@@ -368,7 +368,44 @@ remain the user's responsibility.
 Lector invokes `program` directly; it does not perform shell parsing. At
 startup it loads `init.lua`, starts and initializes the selected server, and
 then restores the configured speech rate only when the negotiated backend can
-set it. Assigning `lector.o.speech` is a top-level configuration operation.
+set it. Assigning `lector.o.speech.server` is a startup-only configuration
+operation.
+
+Speech timing, rate, and voice controls live in the same namespace:
+
+```lua
+lector.o.speech.rate = 1.25
+
+-- Delay between paragraphs; 100 milliseconds by default.
+-- Set to 0 to add no paragraph delay.
+lector.o.speech.paragraph_pause_ms = 100
+
+local voices = lector.o.speech.voices
+if voices ~= nil then
+  for _, voice in ipairs(voices) do
+    print(voice.id, voice.name, voice.language, voice.gender)
+  end
+end
+
+lector.o.speech.voice = "backend-provided-voice-id"
+```
+
+Paragraph pause is Lector presentation policy rather than a speech-host
+setting. It must be a non-negative integer number of milliseconds, and changes
+apply to paragraph boundaries in speech submitted after the assignment.
+
+The negotiated operations remain independent. `rate`, `voice`, or `voices`
+returns `nil` when the active host cannot report that value, and `voices` is a
+read-only array of `{id, name, language, gender}` tables when listing is
+available. Assigning an unsupported rate or voice, or selecting an ID absent
+from an available voice list, raises a Lua error without changing the option.
+In the Lua REPL the submitted chunk stops and the prompt remains available. In
+`init.lua`, an immediately detectable error skips the rest of the chunk while
+earlier successful assignments remain in effect. A value that only the
+deferred speech-host handshake can reject fails the startup configuration
+boundary instead. Both cases open an error overlay, and configuration errors
+are also written to the structured diagnostic log when `--log` or `--log-file`
+enables logging.
 
 The Lua REPL and hooks can request a nonblocking, transactional runtime switch:
 
@@ -620,10 +657,16 @@ lector --shell /bin/zsh --no-config
 
 ```lua
 -- speech backend; this top-level option is read before speech starts
-lector.o.speech = "native"
+lector.o.speech.server = "native"
 
 -- speaking rate
-lector.o.speech_rate = 1.0
+lector.o.speech.rate = 1.0
+
+-- milliseconds of additional silence between paragraphs
+lector.o.speech.paragraph_pause_ms = 100
+
+-- backend-provided voice ID; inspect lector.o.speech.voices after startup
+lector.o.speech.voice = "voice-id"
 
 -- how many symbols should be spoken
 lector.o.symbol_level = "most"  -- "none", "some", "most", "all", "character"
@@ -800,7 +843,7 @@ Lector has a built‑in Lua REPL so you can try commands while it’s running. O
 
 - If you want Lector to read *only* what you ask for, turn off auto‑read.
 - Use Review table navigation when terminal output is column‑structured (CSV, tables, list views).
-- If speech feels too fast or slow, adjust `lector.o.speech_rate`.
+- If speech feels too fast or slow, adjust `lector.o.speech.rate`.
 
 ## Troubleshooting
 

@@ -11,13 +11,9 @@ use super::protocol::{
     TextPosition, UtteranceId, VoiceInfo,
 };
 use anyhow::{Result, anyhow};
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, time::Instant};
 
 const MAX_PENDING_BYTES: usize = 256 * 1024;
-pub(crate) const PARAGRAPH_PAUSE: Duration = Duration::from_millis(200);
 
 pub trait Host {
     fn capabilities(&self) -> &SpeechCapabilities;
@@ -530,16 +526,17 @@ impl SpeechManager {
             None => {}
         }
 
-        let Some(next) = self.pending.front() else {
+        let Some(boundary) = self.pending.front().map(|next| next.boundary) else {
             return Ok(());
         };
-        if next.boundary == UtteranceBoundary::Paragraph {
-            self.deferred_start = Some(DeferredStart::ParagraphDelay {
-                ready_at: now.checked_add(PARAGRAPH_PAUSE).unwrap_or(now),
-            });
-            return Ok(());
-        }
-        self.start_next_now(host)
+        let UtteranceBoundary::Paragraph(pause) = boundary else {
+            return self.start_next_now(host);
+        };
+        let ready_at = now
+            .checked_add(pause)
+            .ok_or_else(|| anyhow!("paragraph pause exceeds the platform timer range"))?;
+        self.deferred_start = Some(DeferredStart::ParagraphDelay { ready_at });
+        Ok(())
     }
 
     fn start_next_now(&mut self, host: &mut dyn Host) -> Result<()> {
@@ -638,7 +635,9 @@ mod tests {
         PauseResumeSupport, ProgressCapabilities, ProgressMode, SpeechEventPayload, StopSupport,
         TerminalCapability,
     };
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, time::Duration};
+
+    const PARAGRAPH_PAUSE: Duration = Duration::from_millis(100);
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Call {
@@ -1065,7 +1064,7 @@ mod tests {
                 second.clone(),
                 "second words".to_owned(),
                 false,
-                UtteranceBoundary::Paragraph,
+                UtteranceBoundary::Paragraph(PARAGRAPH_PAUSE),
             )
             .unwrap();
 
@@ -1357,6 +1356,7 @@ mod tests {
         let mut host = FakeHost::full();
         let first = UtteranceId::new("first");
         let second = UtteranceId::new("second");
+        let configured_pause = Duration::from_millis(37);
         let now = Instant::now();
         manager
             .submit(&mut host, first.clone(), "first".to_owned(), false)
@@ -1367,22 +1367,53 @@ mod tests {
                 second.clone(),
                 "second".to_owned(),
                 false,
-                UtteranceBoundary::Paragraph,
+                UtteranceBoundary::Paragraph(configured_pause),
             )
             .unwrap();
 
         host.events.push(FakeHost::ended(&first, 1));
         manager.poll_at(&mut host, now).unwrap();
         manager
-            .poll_at(&mut host, now + Duration::from_millis(199))
+            .poll_at(&mut host, now + Duration::from_millis(36))
             .unwrap();
         assert_eq!(host.calls, [Call::Speak(first, "first".to_owned())]);
 
-        manager.poll_at(&mut host, now + PARAGRAPH_PAUSE).unwrap();
+        manager.poll_at(&mut host, now + configured_pause).unwrap();
         assert_eq!(
             host.calls,
             [
                 Call::Speak(UtteranceId::new("first"), "first".to_owned()),
+                Call::Speak(second, "second".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_paragraph_pause_starts_the_next_utterance_in_the_completion_poll() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+        let first = UtteranceId::new("first");
+        let second = UtteranceId::new("second");
+        manager
+            .submit(&mut host, first.clone(), "first".to_owned(), false)
+            .unwrap();
+        manager
+            .submit_with_boundary(
+                &mut host,
+                second.clone(),
+                "second".to_owned(),
+                false,
+                UtteranceBoundary::Paragraph(Duration::ZERO),
+            )
+            .unwrap();
+
+        host.events.push(FakeHost::ended(&first, 1));
+        manager.poll_at(&mut host, Instant::now()).unwrap();
+
+        assert_eq!(
+            host.calls,
+            [
+                Call::Speak(first, "first".to_owned()),
                 Call::Speak(second, "second".to_owned()),
             ]
         );
@@ -1405,7 +1436,7 @@ mod tests {
                 second.clone(),
                 "second".to_owned(),
                 false,
-                UtteranceBoundary::Paragraph,
+                UtteranceBoundary::Paragraph(PARAGRAPH_PAUSE),
             )
             .unwrap();
         host.events.push(FakeHost::ended(&first, 1));
@@ -1444,7 +1475,7 @@ mod tests {
                 second.clone(),
                 "second".to_owned(),
                 false,
-                UtteranceBoundary::Paragraph,
+                UtteranceBoundary::Paragraph(PARAGRAPH_PAUSE),
             )
             .unwrap();
         host.events.push(FakeHost::ended(&first, 1));
@@ -1481,7 +1512,7 @@ mod tests {
                 UtteranceId::new("second"),
                 "second".to_owned(),
                 false,
-                UtteranceBoundary::Paragraph,
+                UtteranceBoundary::Paragraph(PARAGRAPH_PAUSE),
             )
             .unwrap();
         host.events.push(FakeHost::ended(&first, 1));

@@ -38,7 +38,7 @@ host can instead run on any supported machine. An external host is selected in
 `init.lua` with an exact argument vector:
 
 ```lua
-lector.o.speech = {
+lector.o.speech.server = {
   program = "/opt/lector/bin/lector-tts",
   args = { "--backend", "av-foundation", "--voice", "VOICE_ID" },
 }
@@ -272,10 +272,11 @@ boundaries is a paragraph boundary; each nonempty paragraph becomes a separate
 utterance with a stable, opaque child ID and is sequenced by Lector. The Lua
 `lector.api.speak` call returns the parent logical ID; hosts see and echo only
 the individual child IDs and MUST NOT infer their relationship from their
-format. CRLF counts as one line boundary. Lector waits on a nonblocking 200 ms
-deadline after the preceding paragraph's reliable terminal event before it
-submits the next paragraph. The delay is presentation policy, not a host timer
-or protocol field.
+format. CRLF counts as one line boundary. Lector waits on a nonblocking
+`lector.o.speech.paragraph_pause_ms` deadline, 100 ms by default, after the
+preceding paragraph's reliable terminal event before it submits the next
+paragraph. The delay is snapshotted when the logical speech request is
+submitted; it is presentation policy, not a host timer or protocol field.
 
 If reliable terminal delivery is unavailable, Lector cannot know when to
 submit the next paragraph. It therefore replaces paragraph boundaries with

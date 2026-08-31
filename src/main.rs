@@ -166,6 +166,57 @@ fn start_configured_speech(
     Ok(StartupSpeechOutcome::Ready(observation.signals))
 }
 
+fn start_speech_for_configuration_error(
+    sr: &mut ScreenReader,
+    speech_supervisor: &speech::supervisor::SupervisorHandle,
+) -> Result<StartupSpeechOutcome> {
+    let configured = sr.speech_server_spec().clone();
+    match start_configured_speech(sr, configured.clone(), speech_supervisor) {
+        Ok(outcome) => Ok(outcome),
+        Err(configured_error) if configured != speech::SpeechServerSpec::Native => {
+            diagnostics::event(
+                "configuration",
+                "speech-unavailable",
+                &format!(
+                    "configured speech could not present the configuration error; falling back to native speech: {configured_error:#}"
+                ),
+            );
+            let outcome = match start_configured_speech(
+                sr,
+                speech::SpeechServerSpec::Native,
+                speech_supervisor,
+            ) {
+                Ok(outcome) => outcome,
+                Err(native_error) => {
+                    return continue_configuration_error_without_speech(sr, &native_error);
+                }
+            };
+            if matches!(outcome, StartupSpeechOutcome::Ready(_)) {
+                sr.commit_speech_reconfiguration(speech::SpeechServerSpec::Native);
+            }
+            Ok(outcome)
+        }
+        Err(error) => continue_configuration_error_without_speech(sr, &error),
+    }
+}
+
+fn continue_configuration_error_without_speech(
+    sr: &mut ScreenReader,
+    error: &anyhow::Error,
+) -> Result<StartupSpeechOutcome> {
+    diagnostics::event(
+        "configuration",
+        "speech-unavailable",
+        &format!(
+            "configuration error overlay will continue without speech because no speech host could start: {error:#}"
+        ),
+    );
+    sr.disable_speech();
+    let signals = Signals::new([SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGWINCH, SIGTSTP, SIGCONT])
+        .context("install configuration-error event-loop signals")?;
+    Ok(StartupSpeechOutcome::Ready(signals))
+}
+
 fn stdout_retry_poll_timeout(
     current: Option<time::Duration>,
     stdout_registered: bool,
@@ -1784,10 +1835,10 @@ fn main() -> Result<()> {
         load_config,
         &mut screen_reader,
         |screen_reader| {
-            event_loop_started = true;
             let spec = screen_reader.speech_server_spec().clone();
             match start_configured_speech(screen_reader, spec, &speech_supervisor)? {
                 StartupSpeechOutcome::Ready(signals) => {
+                    event_loop_started = true;
                     let exit = do_events(
                         screen_reader,
                         &mut app,
@@ -1818,29 +1869,27 @@ fn main() -> Result<()> {
             if setup_failure_action(event_loop_started)
                 == SetupFailureAction::ShowConfigurationError =>
         {
+            let configuration_error = format!(
+                "Error loading config file: {}\n\n{}",
+                conf_file.display(),
+                err
+            );
+            diagnostics::event("configuration", "load-error", &configuration_error);
             // A broken init.lua must still leave the error UI accessible. Drop
-            // any partially queued startup announcements, then start the
-            // built-in backend using default process selection.
+            // any partially queued startup announcements, then retain every
+            // successfully applied setting while retrying the configured
+            // speech host. If that host itself was the invalid setting, fall
+            // back to native speech so the overlay still has a chance to talk.
             screen_reader.cancel_speaking()?;
-            match start_configured_speech(
-                &mut screen_reader,
-                speech::SpeechServerSpec::Native,
-                &speech_supervisor,
-            )
-            .context("start native speech server for configuration error")?
-            {
+            match start_speech_for_configuration_error(&mut screen_reader, &speech_supervisor)? {
                 StartupSpeechOutcome::Ready(signals) => {
-                    screen_reader.commit_speech_reconfiguration(speech::SpeechServerSpec::Native);
+                    event_loop_started = true;
                     let exit = do_events(
                         &mut screen_reader,
                         &mut app,
                         &mut process,
                         EventStartup {
-                            initial_message: Some(format!(
-                                "Error loading config file: {}\n\n{}",
-                                conf_file.display(),
-                                err
-                            )),
+                            initial_message: Some(configuration_error),
                             config_path: None,
                             signals,
                         },

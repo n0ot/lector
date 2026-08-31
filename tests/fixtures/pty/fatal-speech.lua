@@ -6,7 +6,7 @@ assert(speech_server ~= nil)
 assert(lifecycle_state ~= nil)
 assert(rpc_log ~= nil)
 
-lector.o.speech = {
+lector.o.speech.server = {
     program = speech_server,
     args = {
         "--lifecycle-state", lifecycle_state,

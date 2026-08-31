@@ -4,7 +4,7 @@
 //! is an external side effect and must never be allowed to stall that owner.
 
 use super::protocol::UtteranceId;
-use super::{Driver, UtteranceBoundary};
+use super::{CapabilityStatus, Driver, OptionState, SetOptionOutcome, UtteranceBoundary};
 use anyhow::{Result as DriverResult, anyhow};
 use std::{
     collections::VecDeque,
@@ -37,6 +37,7 @@ enum Request {
     Resume,
     Toggle,
     SetRate(f32),
+    SetVoice(String),
     ConfigureServer(SpeechServerSpec),
     Start(mpsc::SyncSender<std::result::Result<(), String>>),
 }
@@ -52,6 +53,7 @@ impl Request {
             | Self::Resume
             | Self::Toggle
             | Self::SetRate(_)
+            | Self::SetVoice(_)
             | Self::ConfigureServer(_)
             | Self::Start(_) => 0,
         }
@@ -267,6 +269,20 @@ impl Mailbox {
         Ok(())
     }
 
+    fn enqueue_voice(&self, voice_id: String) -> DriverResult<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Ok(());
+        }
+        state
+            .requests
+            .retain(|request| !matches!(request, Request::SetVoice(_)));
+        state.requests.push_front(Request::SetVoice(voice_id));
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
     fn enqueue_server(&self, spec: SpeechServerSpec) -> DriverResult<()> {
         let mut state = self.lock()?;
         if state.shutdown {
@@ -356,6 +372,7 @@ enum NextRequest {
 pub struct BoundedAsyncDriver {
     mailbox: Arc<Mailbox>,
     ordered_utterances: Arc<AtomicBool>,
+    option_state: Arc<Mutex<OptionState>>,
     rate: f32,
     worker: Option<thread::JoinHandle<()>>,
     shutdown_backend: Option<Box<dyn FnOnce() + Send>>,
@@ -386,18 +403,27 @@ impl BoundedAsyncDriver {
         D: Driver + Send + 'static,
     {
         let rate = driver.get_rate();
+        let initial_option_state = driver.option_state();
         let ordered_utterances = Arc::new(AtomicBool::new(driver.supports_ordered_utterances()));
+        let option_state = Arc::new(Mutex::new(initial_option_state));
         let mailbox = Arc::new(Mailbox::new());
         let worker_mailbox = Arc::clone(&mailbox);
         let worker_ordered_utterances = Arc::clone(&ordered_utterances);
+        let worker_option_state = Arc::clone(&option_state);
         let worker = thread::Builder::new()
             .name("lector-speech-driver".to_owned())
             .spawn(move || {
-                run_worker(driver, &worker_mailbox, &worker_ordered_utterances);
+                run_worker(
+                    driver,
+                    &worker_mailbox,
+                    &worker_ordered_utterances,
+                    &worker_option_state,
+                );
             })?;
         Ok(Self {
             mailbox,
             ordered_utterances,
+            option_state,
             rate,
             worker: Some(worker),
             shutdown_backend,
@@ -466,6 +492,51 @@ impl Driver for BoundedAsyncDriver {
         Ok(())
     }
 
+    fn option_state(&self) -> OptionState {
+        self.option_state
+            .lock()
+            .map(|state| state.clone())
+            .unwrap_or_default()
+    }
+
+    fn set_rate_option(&mut self, rate: f32) -> DriverResult<SetOptionOutcome> {
+        if !rate.is_finite() {
+            return Err(anyhow!("speech rate must be finite"));
+        }
+        let status = self
+            .option_state
+            .lock()
+            .map(|state| state.rate_status)
+            .unwrap_or(CapabilityStatus::Unknown);
+        if status == CapabilityStatus::Unsupported {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        self.mailbox.enqueue_rate(rate)?;
+        self.rate = rate;
+        if status == CapabilityStatus::Supported
+            && let Ok(mut state) = self.option_state.lock()
+        {
+            state.rate = Some(rate);
+        }
+        Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn set_voice_option(&mut self, voice_id: &str) -> DriverResult<SetOptionOutcome> {
+        if voice_id.is_empty() {
+            return Err(anyhow!("speech voice ID must not be empty"));
+        }
+        let status = self
+            .option_state
+            .lock()
+            .map(|state| state.voice_selection_status)
+            .unwrap_or(CapabilityStatus::Unknown);
+        if status == CapabilityStatus::Unsupported {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        self.mailbox.enqueue_voice(voice_id.to_owned())?;
+        Ok(SetOptionOutcome::Accepted)
+    }
+
     fn start(&mut self) -> DriverResult<()> {
         let (completed_tx, completed_rx) = mpsc::sync_channel(1);
         self.mailbox.enqueue_start(completed_tx)?;
@@ -518,7 +589,12 @@ impl BoundedAsyncDriver {
     }
 }
 
-fn run_worker(mut driver: impl Driver, mailbox: &Mailbox, ordered_utterances: &AtomicBool) {
+fn run_worker(
+    mut driver: impl Driver,
+    mailbox: &Mailbox,
+    ordered_utterances: &AtomicBool,
+    option_state: &Mutex<OptionState>,
+) {
     let mut failures = 0u64;
     loop {
         let result = match mailbox.next_request(EVENT_POLL_INTERVAL) {
@@ -533,10 +609,16 @@ fn run_worker(mut driver: impl Driver, mailbox: &Mailbox, ordered_utterances: &A
             NextRequest::Request(Request::Resume) => driver.resume(),
             NextRequest::Request(Request::Toggle) => driver.toggle(),
             NextRequest::Request(Request::SetRate(rate)) => driver.set_rate(rate),
+            NextRequest::Request(Request::SetVoice(voice_id)) => {
+                driver.set_voice_option(&voice_id).map(|_| ())
+            }
             NextRequest::Request(Request::ConfigureServer(spec)) => driver.configure_server(spec),
             NextRequest::Request(Request::Start(completed)) => {
                 let result = driver.start();
                 ordered_utterances.store(driver.supports_ordered_utterances(), Ordering::Release);
+                if let Ok(mut published) = option_state.lock() {
+                    *published = driver.option_state();
+                }
                 let report = match &result {
                     Ok(()) => Ok(()),
                     Err(error) => Err(format!("{error:#}")),
@@ -548,6 +630,9 @@ fn run_worker(mut driver: impl Driver, mailbox: &Mailbox, ordered_utterances: &A
             NextRequest::Shutdown => break,
         };
         ordered_utterances.store(driver.supports_ordered_utterances(), Ordering::Release);
+        if let Ok(mut published) = option_state.lock() {
+            *published = driver.option_state();
+        }
         if let Err(error) = result {
             failures = failures.saturating_add(1);
             if failures.is_power_of_two() {
@@ -579,8 +664,8 @@ fn bounded_text(text: &str, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundedAsyncDriver, Driver, MAX_PENDING_SPEECH_BYTES, MAX_SPEECH_ITEM_BYTES, Mailbox,
-        NextRequest, Request, UtteranceId,
+        BoundedAsyncDriver, CapabilityStatus, Driver, MAX_PENDING_SPEECH_BYTES,
+        MAX_SPEECH_ITEM_BYTES, Mailbox, NextRequest, OptionState, Request, UtteranceId,
     };
     use std::{
         sync::mpsc,
@@ -753,6 +838,19 @@ mod tests {
                 Ok(())
             }
 
+            fn option_state(&self) -> OptionState {
+                if self.started {
+                    OptionState {
+                        rate_status: CapabilityStatus::Unsupported,
+                        voice_status: CapabilityStatus::Unsupported,
+                        voice_selection_status: CapabilityStatus::Unsupported,
+                        ..OptionState::default()
+                    }
+                } else {
+                    OptionState::default()
+                }
+            }
+
             fn start(&mut self) -> anyhow::Result<()> {
                 self.started = true;
                 Ok(())
@@ -761,8 +859,13 @@ mod tests {
 
         let mut driver = BoundedAsyncDriver::new(CapabilityDriver { started: false }).unwrap();
         assert!(!driver.supports_ordered_utterances());
+        assert_eq!(driver.option_state().rate_status, CapabilityStatus::Unknown);
         driver.start().unwrap();
         assert!(driver.supports_ordered_utterances());
+        assert_eq!(
+            driver.option_state().rate_status,
+            CapabilityStatus::Unsupported
+        );
     }
 
     #[test]

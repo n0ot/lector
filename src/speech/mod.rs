@@ -1,9 +1,13 @@
 use anyhow::Result as DriverResult;
 use regex::Regex;
-use std::{fmt::Write, sync::LazyLock};
+use std::{
+    fmt::Write,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 use unicode_segmentation::UnicodeSegmentation;
 
-use protocol::UtteranceId;
+use protocol::{UtteranceId, VoiceInfo};
 
 pub mod proc_driver;
 pub mod protocol;
@@ -27,11 +31,46 @@ static EXPAND_END_CAPS: LazyLock<Regex> = LazyLock::new(|| {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Additional silence between paragraph utterances unless Lua overrides it.
+pub const DEFAULT_PARAGRAPH_PAUSE_MS: u64 = 100;
+
+/// What the active speech-host generation has established about an optional
+/// setting. Before the deferred host startup boundary there is deliberately no
+/// guess: Lua getters return nil and setters are retained for the candidate to
+/// apply after capability negotiation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CapabilityStatus {
+    #[default]
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+/// Foreground-safe snapshot of optional speech-host state. Process-backed
+/// drivers publish this from their worker; Lua never performs host I/O.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OptionState {
+    pub rate: Option<f32>,
+    pub rate_status: CapabilityStatus,
+    pub voice: Option<VoiceInfo>,
+    pub voice_status: CapabilityStatus,
+    pub voice_selection_status: CapabilityStatus,
+    pub voices: Option<Vec<VoiceInfo>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetOptionOutcome {
+    Accepted,
+    Unsupported,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     #[error("speech driver: {0}")]
     Driver(#[source] anyhow::Error),
+    #[error("paragraph pause exceeds the platform timer range")]
+    InvalidParagraphPause,
 }
 
 /// Internal timing relationship between adjacent utterances. This is Lector
@@ -40,7 +79,7 @@ pub enum Error {
 pub enum UtteranceBoundary {
     #[default]
     Immediate,
-    Paragraph,
+    Paragraph(Duration),
 }
 
 pub trait Driver {
@@ -105,6 +144,27 @@ pub trait Driver {
     fn get_rate(&self) -> f32;
     fn set_rate(&mut self, rate: f32) -> DriverResult<()>;
 
+    /// Return a nonblocking snapshot of negotiated optional settings. Simple
+    /// in-process compatibility drivers support rate by construction.
+    fn option_state(&self) -> OptionState {
+        OptionState {
+            rate: Some(self.get_rate()),
+            rate_status: CapabilityStatus::Supported,
+            ..OptionState::default()
+        }
+    }
+
+    /// Capability-aware option assignment. Callers decide how an unavailable
+    /// capability is presented, while the driver guarantees it is a no-op.
+    fn set_rate_option(&mut self, rate: f32) -> DriverResult<SetOptionOutcome> {
+        self.set_rate(rate)?;
+        Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn set_voice_option(&mut self, _voice_id: &str) -> DriverResult<SetOptionOutcome> {
+        Ok(SetOptionOutcome::Unsupported)
+    }
+
     /// Finish starting a deferred backend.
     ///
     /// Ordinary drivers are already ready. Process-backed speech overrides
@@ -132,6 +192,40 @@ pub struct Speech {
     processed: String,
     run: String,
     next_utterance_id: u64,
+    paragraph_pause: Duration,
+}
+
+struct SilentDriver;
+
+impl Driver for SilentDriver {
+    fn speak(&mut self, _text: &str, _interrupt: bool) -> DriverResult<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> DriverResult<()> {
+        Ok(())
+    }
+
+    fn get_rate(&self) -> f32 {
+        1.0
+    }
+
+    fn set_rate(&mut self, _rate: f32) -> DriverResult<()> {
+        Err(anyhow::anyhow!("speech is unavailable"))
+    }
+
+    fn option_state(&self) -> OptionState {
+        OptionState {
+            rate_status: CapabilityStatus::Unsupported,
+            voice_status: CapabilityStatus::Unsupported,
+            voice_selection_status: CapabilityStatus::Unsupported,
+            ..OptionState::default()
+        }
+    }
+
+    fn set_rate_option(&mut self, _rate: f32) -> DriverResult<SetOptionOutcome> {
+        Ok(SetOptionOutcome::Unsupported)
+    }
 }
 
 impl Speech {
@@ -143,7 +237,12 @@ impl Speech {
             processed: String::new(),
             run: String::new(),
             next_utterance_id: 1,
+            paragraph_pause: Duration::from_millis(DEFAULT_PARAGRAPH_PAUSE_MS),
         }
+    }
+
+    pub(crate) fn silent() -> Speech {
+        Self::new(Box::new(SilentDriver))
     }
 
     pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<UtteranceId> {
@@ -276,7 +375,7 @@ impl Speech {
                 let boundary = if index == 0 {
                     UtteranceBoundary::Immediate
                 } else {
-                    UtteranceBoundary::Paragraph
+                    UtteranceBoundary::Paragraph(self.paragraph_pause)
                 };
                 if let Err(error) = self.driver.speak_utterance_with_boundary(
                     &chunk_id,
@@ -315,8 +414,60 @@ impl Speech {
         self.driver.get_rate()
     }
 
+    pub fn rate(&self) -> Option<f32> {
+        self.driver.option_state().rate
+    }
+
     pub fn set_rate(&mut self, rate: f32) -> Result<()> {
         self.driver.set_rate(rate).map_err(Error::Driver)
+    }
+
+    pub fn set_rate_option(&mut self, rate: f32) -> Result<SetOptionOutcome> {
+        self.driver.set_rate_option(rate).map_err(Error::Driver)
+    }
+
+    pub fn paragraph_pause_ms(&self) -> u64 {
+        self.paragraph_pause
+            .as_millis()
+            .try_into()
+            .expect("a paragraph pause created from milliseconds fits in u64")
+    }
+
+    /// Set the presentation delay carried by paragraph boundaries in future
+    /// speech requests. Already submitted utterances retain their boundary
+    /// timing so configuration changes cannot rewrite queued speech.
+    pub fn set_paragraph_pause_ms(&mut self, milliseconds: u64) -> Result<()> {
+        let pause = Duration::from_millis(milliseconds);
+        if Instant::now().checked_add(pause).is_none() {
+            return Err(Error::InvalidParagraphPause);
+        }
+        self.paragraph_pause = pause;
+        Ok(())
+    }
+
+    pub fn voice(&self) -> Option<VoiceInfo> {
+        self.driver.option_state().voice
+    }
+
+    pub fn voices(&self) -> Option<Vec<VoiceInfo>> {
+        self.driver.option_state().voices
+    }
+
+    pub fn set_voice_option(&mut self, voice_id: &str) -> Result<SetOptionOutcome> {
+        let state = self.driver.option_state();
+        if state.voice_selection_status == CapabilityStatus::Unsupported {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        if let Some(voices) = state.voices
+            && !voices.iter().any(|voice| voice.id == voice_id)
+        {
+            return Err(Error::Driver(anyhow::anyhow!(
+                "speech voice ID is not available: {voice_id}"
+            )));
+        }
+        self.driver
+            .set_voice_option(voice_id)
+            .map_err(Error::Driver)
     }
 
     pub fn start(&mut self) -> Result<()> {
@@ -417,9 +568,10 @@ fn split_paragraphs(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Driver, Error, Speech, UtteranceBoundary, protocol::UtteranceId, split_paragraphs, symbols,
+        DEFAULT_PARAGRAPH_PAUSE_MS, Driver, Error, Speech, UtteranceBoundary,
+        protocol::UtteranceId, split_paragraphs, symbols,
     };
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, rc::Rc, time::Duration};
 
     struct RecordingDriver(Rc<RefCell<Vec<String>>>);
 
@@ -532,6 +684,8 @@ mod tests {
     fn speak_returns_a_logical_id_and_chunks_have_stable_child_ids() {
         let calls = Rc::new(RefCell::new(Vec::new()));
         let mut speech = Speech::new(Box::new(IdDriver(Rc::clone(&calls))));
+        assert_eq!(speech.paragraph_pause_ms(), DEFAULT_PARAGRAPH_PAUSE_MS);
+        speech.set_paragraph_pause_ms(37).unwrap();
 
         let id = speech.speak("first\n\nsecond", true).unwrap();
 
@@ -549,7 +703,7 @@ mod tests {
                     "1:1".to_owned(),
                     "second".to_owned(),
                     false,
-                    UtteranceBoundary::Paragraph,
+                    UtteranceBoundary::Paragraph(Duration::from_millis(37)),
                 ),
             ]
         );

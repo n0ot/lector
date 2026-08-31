@@ -82,7 +82,7 @@ pub enum Error {
     InvalidLuaBindingContext,
     #[error("Lua hooks are only available in init.lua")]
     InvalidLuaHookContext,
-    #[error("lector.o.speech is startup-only; use lector.api.set_speech() at runtime")]
+    #[error("lector.o.speech.server is startup-only; use lector.api.set_speech() at runtime")]
     InvalidLuaSpeechConfigContext,
     #[error("on_live_read must return a string or nil")]
     InvalidLiveReadResult,
@@ -218,6 +218,14 @@ impl ScreenReader {
     /// Begin bounded worker and child-process teardown.
     pub fn shutdown_speech(&mut self) {
         self.speech.shutdown();
+    }
+
+    /// Keep the terminal and overlays usable after every configured speech
+    /// host has failed. The unavailable driver deliberately reports optional
+    /// settings as unsupported, so later Lua assignments still fail clearly.
+    pub fn disable_speech(&mut self) {
+        self.speech.shutdown();
+        self.speech = Speech::silent();
     }
 
     pub fn input_mode(&self) -> InputMode {

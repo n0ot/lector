@@ -784,11 +784,16 @@ mod tests {
         CLOSE_HINT, CompileOutcome, LuaReplSession, LuaReplView, classify_input, truncate_to_width,
         visible_input_window,
     };
-    use crate::{screen_reader::ScreenReader, speech, views::ViewController};
-    use std::{cell::RefCell, rc::Rc};
+    use crate::{
+        screen_reader::ScreenReader,
+        speech::{self, CapabilityStatus, OptionState, SetOptionOutcome, protocol::VoiceInfo},
+        views::ViewController,
+    };
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
     struct TestDriver {
         speaks: Rc<RefCell<Vec<String>>>,
+        options: OptionState,
     }
 
     impl speech::Driver for TestDriver {
@@ -808,12 +813,26 @@ mod tests {
         fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
             Ok(())
         }
+
+        fn option_state(&self) -> OptionState {
+            self.options.clone()
+        }
+
+        fn set_rate_option(&mut self, _rate: f32) -> anyhow::Result<SetOptionOutcome> {
+            Ok(SetOptionOutcome::Unsupported)
+        }
     }
 
     fn make_screen_reader() -> (ScreenReader, Rc<RefCell<Vec<String>>>) {
         let speaks = Rc::new(RefCell::new(Vec::new()));
         let driver = TestDriver {
             speaks: Rc::clone(&speaks),
+            options: OptionState {
+                rate_status: CapabilityStatus::Unsupported,
+                voice_status: CapabilityStatus::Unsupported,
+                voice_selection_status: CapabilityStatus::Unsupported,
+                ..OptionState::default()
+            },
         };
         let sr = ScreenReader::new(speech::Speech::new(Box::new(driver)));
         (sr, speaks)
@@ -840,6 +859,60 @@ mod tests {
         let mut repl = LuaReplView::new(6, 20, Vec::new()).expect("create lua repl");
         let top_row = repl.model().screen().contents_between(0, 0, 0, 20);
         assert!(top_row.starts_with(CLOSE_HINT));
+    }
+
+    #[test]
+    fn lua_repl_prints_unsupported_option_errors_and_returns_to_the_prompt() {
+        let mut repl = LuaReplView::new(8, 100, Vec::new()).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+
+        enter(&mut repl, &mut sr, b"lector.o.speech.rate = 2\r");
+        finish_eval(&mut repl, &mut sr);
+
+        assert!(
+            repl.model()
+                .screen()
+                .contents()
+                .contains("speech.rate is unavailable")
+        );
+        enter(&mut repl, &mut sr, b"print('still running')\r");
+        finish_eval(&mut repl, &mut sr);
+        assert!(repl.model().screen().contents().contains("still running"));
+    }
+
+    #[test]
+    fn lua_repl_rejects_a_voice_absent_from_the_negotiated_list() {
+        let mut repl = LuaReplView::new(8, 100, Vec::new()).expect("create lua repl");
+        let speaks = Rc::new(RefCell::new(Vec::new()));
+        let driver = TestDriver {
+            speaks,
+            options: OptionState {
+                voice_selection_status: CapabilityStatus::Supported,
+                voices: Some(vec![VoiceInfo {
+                    id: "available-voice".to_owned(),
+                    name: "Available voice".to_owned(),
+                    language: "en-US".to_owned(),
+                    gender: None,
+                    extensions: BTreeMap::new(),
+                }]),
+                ..OptionState::default()
+            },
+        };
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(driver)));
+
+        enter(
+            &mut repl,
+            &mut sr,
+            b"lector.o.speech.voice = 'missing-voice'\r",
+        );
+        finish_eval(&mut repl, &mut sr);
+
+        assert!(
+            repl.model()
+                .screen()
+                .contents()
+                .contains("speech voice ID is not available: missing-voice")
+        );
     }
 
     #[test]

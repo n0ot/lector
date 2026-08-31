@@ -76,6 +76,7 @@ enum StartupConfiguration {
     Explicit {
         config: PathBuf,
         atomic_startup: bool,
+        log_file: Option<PathBuf>,
     },
     FatalSpeech {
         config: PathBuf,
@@ -158,6 +159,21 @@ impl LiveLector {
             StartupConfiguration::Explicit {
                 config: config.to_path_buf(),
                 atomic_startup: false,
+                log_file: None,
+            },
+        )
+    }
+
+    fn spawn_with_config_and_log(shell_mode: &str, config: &Path, log_file: &Path) -> Self {
+        Self::spawn_at_size_under_parent(
+            shell_mode,
+            false,
+            STANDARD_TERMINAL,
+            false,
+            StartupConfiguration::Explicit {
+                config: config.to_path_buf(),
+                atomic_startup: false,
+                log_file: Some(log_file.to_path_buf()),
             },
         )
     }
@@ -171,6 +187,7 @@ impl LiveLector {
             StartupConfiguration::Explicit {
                 config: config.to_path_buf(),
                 atomic_startup: true,
+                log_file: None,
             },
         )
     }
@@ -262,8 +279,18 @@ impl LiveLector {
                     ]);
                 }
                 StartupConfiguration::Native => {}
-                StartupConfiguration::Explicit { config, .. }
-                | StartupConfiguration::FatalSpeech { config, .. } => {
+                StartupConfiguration::Explicit {
+                    config, log_file, ..
+                } => {
+                    command.args(["--config", config.to_str().expect("UTF-8 fixture path")]);
+                    if let Some(log_file) = log_file {
+                        command.args([
+                            "--log-file",
+                            log_file.to_str().expect("UTF-8 diagnostic log path"),
+                        ]);
+                    }
+                }
+                StartupConfiguration::FatalSpeech { config, .. } => {
                     command.args(["--config", config.to_str().expect("UTF-8 fixture path")]);
                 }
                 StartupConfiguration::NoConfig { .. } => {
@@ -310,6 +337,7 @@ impl LiveLector {
             StartupConfiguration::Explicit {
                 config,
                 atomic_startup,
+                ..
             } => {
                 command.env(
                     "LECTOR_TEST_STARTUP_SPEECH_SERVER",
@@ -632,7 +660,7 @@ fn write_config_resolution_fixture(path: &Path, identity: &str) {
                 local marker = assert(io.open(os.getenv("LECTOR_CONFIG_TEST_MARKER"), "w"))
                 marker:write({identity:?})
                 marker:close()
-                lector.o.speech = {{
+                lector.o.speech.server = {{
                     program = assert(os.getenv("LECTOR_TEST_SPEECH_SERVER")),
                     args = {{}},
                 }}
@@ -963,6 +991,70 @@ fn init_lua_process_argv_and_deferred_speech_cross_the_ready_boundary_in_order()
         lector.finish(Duration::from_secs(3)),
         "custom-speech Lector did not exit"
     );
+}
+
+#[test]
+fn invalid_startup_voice_opens_configuration_overlay_and_is_logged() {
+    let _serial = serialize_live_pty_test();
+    let artifact_dir = fixture("target/test-artifacts/live-pty");
+    fs::create_dir_all(&artifact_dir).expect("create live PTY artifact directory");
+    let unique = format!(
+        "{}-{}-invalid-startup-voice",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    );
+    let config = artifact_dir.join(format!("{unique}.lua"));
+    let log = artifact_dir.join(format!("{unique}.jsonl"));
+    fs::write(
+        &config,
+        r#"
+            lector.o.auto_read = false
+            lector.o.speech.server = {
+                program = assert(os.getenv("LECTOR_TEST_STARTUP_SPEECH_SERVER")),
+                args = {},
+            }
+            lector.o.speech.voice = "missing-voice"
+        "#,
+    )
+    .expect("write invalid startup voice config");
+    let mut lector = LiveLector::spawn_with_config_and_log("latency", &config, &log);
+
+    assert!(
+        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+            physical_screen_contains(terminal, "Error loading config file")
+        }),
+        "configuration error overlay was not displayed; output={:?}",
+        String::from_utf8_lossy(&lector.output)
+    );
+    assert!(
+        lector.wait_for(Duration::from_secs(3), |_| {
+            fs::read_to_string(&log).is_ok_and(|records| {
+                records.contains("\"scope\":\"configuration\"")
+                    && records.contains("\"kind\":\"load-error\"")
+                    && records.contains("missing-voice")
+            })
+        }),
+        "configuration error was not written to the diagnostic log: {:?}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    lector.send(b"\x1b");
+    assert!(
+        lector.wait_for_physical_terminal(Duration::from_secs(2), |terminal| {
+            physical_screen_contains(terminal, LATENCY_READY)
+        }),
+        "closing the configuration overlay did not restore the child view"
+    );
+    lector.send(b"q");
+    assert!(
+        lector.finish(Duration::from_secs(3)),
+        "Lector did not exit after closing the configuration overlay"
+    );
+    fs::remove_file(config).expect("remove invalid startup voice config");
+    fs::remove_file(log).expect("remove configuration diagnostic log");
 }
 
 #[test]

@@ -114,6 +114,23 @@ local tbl_lector_clipboard = setmetatable({}, {
     end,
 })
 
+local tbl_lector_o_speech = setmetatable({}, {
+    __index = function(_, k)
+        if k ~= 'server' and k ~= 'rate' and k ~= 'voice' and k ~= 'voices' and k ~= 'paragraph_pause_ms' then
+            error("unknown speech option: " .. tostring(k), 2)
+        end
+        return callbacks.get_option('speech.' .. k)
+    end,
+    __newindex = function(_, k, v)
+        if k == 'voices' then
+            error("lector.o.speech.voices is read-only", 2)
+        elseif k ~= 'server' and k ~= 'rate' and k ~= 'voice' and k ~= 'paragraph_pause_ms' then
+            error("unknown speech option: " .. tostring(k), 2)
+        end
+        callbacks.set_option('speech.' .. k, v)
+    end,
+})
+
 local tbl_lector_o_clipboard = setmetatable({}, {
     __index = function(_, k)
         if k ~= 'default_register' and k ~= 'system_provider' then
@@ -134,7 +151,9 @@ local tbl_lector_o_mt = {
         if type(k) ~= "string" then
             error("option name must be a string for indexing", 2)
         end
-        if k == 'clipboard' then
+        if k == 'speech' then
+            return tbl_lector_o_speech
+        elseif k == 'clipboard' then
             return tbl_lector_o_clipboard
         end
         return callbacks.get_option(k)
@@ -143,7 +162,9 @@ local tbl_lector_o_mt = {
         if type(k) ~= "string" then
             error("option name must be a string for assignment", 2)
         end
-        if k == 'clipboard' then
+        if k == 'speech' then
+            error("assign individual speech options via lector.o.speech[name] = value", 2)
+        elseif k == 'clipboard' then
             error("assign individual clipboard options via lector.o.clipboard[name] = value", 2)
         end
         callbacks.set_option(k, v)

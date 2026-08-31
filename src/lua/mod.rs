@@ -43,9 +43,10 @@ where
             Ok(())
         }
         Err(err) => {
-            let _ = screen_reader.hook_on_error(&err.to_string(), "runtime");
+            let detail = format!("{err:#}");
+            let _ = screen_reader.hook_on_error(&detail, "runtime");
             let _ = screen_reader.hook_on_shutdown("error");
-            Err(Error::external(err))
+            Err(Error::external(anyhow!(detail)))
         }
     }
 }
@@ -117,13 +118,17 @@ mod tests {
     use crate::{
         keymap::{Binding, InputMode},
         screen_reader::ScreenReader,
-        speech::{self, SpeechServerSpec, symbols::Level},
+        speech::{
+            self, CapabilityStatus, OptionState, SetOptionOutcome, SpeechServerSpec,
+            protocol::VoiceInfo, symbols::Level,
+        },
         table::{Column, TableModel, TableState},
         view::View,
     };
     use mlua::Lua;
     use std::{
-        cell::RefCell,
+        cell::{Cell, RefCell},
+        collections::BTreeMap,
         fs,
         rc::Rc,
         time::{SystemTime, UNIX_EPOCH},
@@ -150,6 +155,51 @@ mod tests {
         }
     }
 
+    struct SpeechOptionsDriver {
+        state: OptionState,
+        rates: Rc<RefCell<Vec<f32>>>,
+        voices: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl speech::Driver for SpeechOptionsDriver {
+        fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rate(&self) -> f32 {
+            self.state.rate.unwrap_or(1.0)
+        }
+
+        fn set_rate(&mut self, rate: f32) -> anyhow::Result<()> {
+            self.rates.borrow_mut().push(rate);
+            Ok(())
+        }
+
+        fn option_state(&self) -> OptionState {
+            self.state.clone()
+        }
+
+        fn set_rate_option(&mut self, rate: f32) -> anyhow::Result<SetOptionOutcome> {
+            if self.state.rate_status == CapabilityStatus::Unsupported {
+                return Ok(SetOptionOutcome::Unsupported);
+            }
+            self.rates.borrow_mut().push(rate);
+            Ok(SetOptionOutcome::Accepted)
+        }
+
+        fn set_voice_option(&mut self, voice_id: &str) -> anyhow::Result<SetOptionOutcome> {
+            if self.state.voice_selection_status == CapabilityStatus::Unsupported {
+                return Ok(SetOptionOutcome::Unsupported);
+            }
+            self.voices.borrow_mut().push(voice_id.to_owned());
+            Ok(SetOptionOutcome::Accepted)
+        }
+    }
+
     fn screen_reader() -> ScreenReader {
         let output = Rc::new(RefCell::new(Vec::new()));
         let speech = speech::Speech::new(Box::new(RecordingDriver(output)));
@@ -166,18 +216,28 @@ mod tests {
         path
     }
 
+    fn voice(id: &str, name: &str) -> VoiceInfo {
+        VoiceInfo {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            language: "en-US".to_owned(),
+            gender: Some("neutral".to_owned()),
+            extensions: BTreeMap::new(),
+        }
+    }
+
     #[test]
     fn startup_speech_configuration_preserves_exact_arguments() {
         let mut screen_reader = screen_reader();
         let path = temporary_lua_file(
             "speech-config",
             r#"
-                assert(lector.o.speech == "native")
-                lector.o.speech = {
+                assert(lector.o.speech.server == "native")
+                lector.o.speech.server = {
                     program = "/path with spaces/speech-server",
                     args = {"one argument", "'literal quotes'", "$(not a shell)"},
                 }
-                local configured = lector.o.speech
+                local configured = lector.o.speech.server
                 assert(configured.program == "/path with spaces/speech-server")
                 assert(#configured.args == 3)
                 assert(configured.args[1] == "one argument")
@@ -211,7 +271,7 @@ mod tests {
         let mut screen_reader = screen_reader();
         let path = temporary_lua_file(
             "disabled-config",
-            r#"lector.o.speech = { program = "/must-not-run" }"#,
+            r#"lector.o.speech.server = { program = "/must-not-run" }"#,
         );
 
         setup(path.clone(), false, &mut screen_reader, |sr| {
@@ -234,17 +294,17 @@ mod tests {
         lua.load(
             r#"
                 local assigned, message = pcall(function()
-                    lector.o.speech = {program = "/ignored"}
+                    lector.o.speech.server = {program = "/ignored"}
                 end)
                 assert(assigned == false)
                 assert(string.find(tostring(message), "startup%-only") ~= nil)
-                assert(lector.o.speech == "native")
+                assert(lector.o.speech.server == "native")
 
                 lector.api.set_speech({program = "/first", args = {"first arg"}})
                 lector.api.set_speech({program = "/second", args = {"second arg"}})
                 -- A request is transactional: the getter reports the active
                 -- server until the core commits a successful replacement.
-                assert(lector.o.speech == "native")
+                assert(lector.o.speech.server == "native")
             "#,
         )
         .exec()
@@ -261,9 +321,166 @@ mod tests {
         screen_reader.commit_speech_reconfiguration(requested);
         lua.load(
             r#"
-                local active = lector.o.speech
+                local active = lector.o.speech.server
                 assert(active.program == "/second")
                 assert(#active.args == 1 and active.args[1] == "second arg")
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn speech_namespace_exposes_negotiated_rate_current_voice_and_voice_list() {
+        let rates = Rc::new(RefCell::new(Vec::new()));
+        let selected = Rc::new(RefCell::new(Vec::new()));
+        let current = voice("voice-a", "Voice A");
+        let driver = SpeechOptionsDriver {
+            state: OptionState {
+                rate: Some(1.25),
+                rate_status: CapabilityStatus::Supported,
+                voice: Some(current.clone()),
+                voice_status: CapabilityStatus::Supported,
+                voice_selection_status: CapabilityStatus::Supported,
+                voices: Some(vec![current, voice("voice-b", "Voice B")]),
+            },
+            rates: Rc::clone(&rates),
+            voices: Rc::clone(&selected),
+        };
+        let speech = speech::Speech::new(Box::new(driver));
+        let mut screen_reader = ScreenReader::new(speech);
+        let lua = Lua::new();
+        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
+        setup_repl(&lua, screen_reader_ptr).unwrap();
+
+        lua.load(
+            r#"
+                assert(lector.o.speech.rate == 1.25)
+                assert(lector.o.speech.voice == "voice-a")
+                local voices = lector.o.speech.voices
+                assert(#voices == 2)
+                assert(voices[1].id == "voice-a")
+                assert(voices[1].name == "Voice A")
+                assert(voices[1].language == "en-US")
+                assert(voices[1].gender == "neutral")
+                assert(voices[2].id == "voice-b")
+                lector.o.speech.rate = 1.5
+                lector.o.speech.voice = "voice-b"
+                local ok, message = pcall(function()
+                    lector.o.speech.voice = "missing-voice"
+                end)
+                assert(ok == false)
+                assert(string.find(tostring(message), "voice ID is not available", 1, true))
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        assert_eq!(rates.borrow().as_slice(), [1.5]);
+        assert_eq!(selected.borrow().as_slice(), ["voice-b"]);
+    }
+
+    #[test]
+    fn speech_namespace_configures_paragraph_pause_in_integer_milliseconds() {
+        let mut screen_reader = screen_reader();
+        let lua = Lua::new();
+        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
+        setup_repl(&lua, screen_reader_ptr).unwrap();
+
+        lua.load(
+            r#"
+                assert(lector.o.speech.paragraph_pause_ms == 100)
+                lector.o.speech.paragraph_pause_ms = 0
+                assert(lector.o.speech.paragraph_pause_ms == 0)
+                lector.o.speech.paragraph_pause_ms = 37
+                assert(lector.o.speech.paragraph_pause_ms == 37)
+
+                for _, invalid in ipairs({-1, 1.5, "100"}) do
+                    local ok, message = pcall(function()
+                        lector.o.speech.paragraph_pause_ms = invalid
+                    end)
+                    assert(ok == false)
+                    assert(string.find(tostring(message), "non-negative integer", 1, true))
+                    assert(lector.o.speech.paragraph_pause_ms == 37)
+                end
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        assert_eq!(screen_reader.speech().paragraph_pause_ms(), 37);
+    }
+
+    #[test]
+    fn invalid_config_option_stops_the_chunk_without_rolling_back_prior_assignments() {
+        let driver = SpeechOptionsDriver {
+            state: OptionState {
+                rate_status: CapabilityStatus::Unsupported,
+                voice_status: CapabilityStatus::Unsupported,
+                voice_selection_status: CapabilityStatus::Unsupported,
+                ..OptionState::default()
+            },
+            rates: Rc::new(RefCell::new(Vec::new())),
+            voices: Rc::new(RefCell::new(Vec::new())),
+        };
+        let speech = speech::Speech::new(Box::new(driver));
+        let mut screen_reader = ScreenReader::new(speech);
+        let path = temporary_lua_file(
+            "invalid-option",
+            r#"
+                lector.o.auto_read = false
+                lector.o.speech.voice = "unavailable"
+                lector.o.help_mode = true
+            "#,
+        );
+        let after_called = Cell::new(false);
+
+        let error = setup(path.clone(), true, &mut screen_reader, |_| {
+            after_called.set(true);
+            Ok(())
+        })
+        .expect_err("invalid option must fail configuration");
+
+        assert!(error.to_string().contains("speech.voice is unavailable"));
+        assert!(!screen_reader.auto_read_enabled());
+        assert!(!screen_reader.help_mode());
+        assert!(!after_called.get());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn unsupported_speech_options_are_nil_and_assignments_raise_errors() {
+        let driver = SpeechOptionsDriver {
+            state: OptionState {
+                rate_status: CapabilityStatus::Unsupported,
+                voice_status: CapabilityStatus::Unsupported,
+                voice_selection_status: CapabilityStatus::Unsupported,
+                ..OptionState::default()
+            },
+            rates: Rc::new(RefCell::new(Vec::new())),
+            voices: Rc::new(RefCell::new(Vec::new())),
+        };
+        let speech = speech::Speech::new(Box::new(driver));
+        let mut screen_reader = ScreenReader::new(speech);
+        let lua = Lua::new();
+        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
+        setup_repl(&lua, screen_reader_ptr).unwrap();
+
+        lua.load(
+            r#"
+                assert(lector.o.speech.rate == nil)
+                assert(lector.o.speech.voice == nil)
+                assert(lector.o.speech.voices == nil)
+                local rate_ok, rate_error = pcall(function()
+                    lector.o.speech.rate = 2.0
+                end)
+                assert(rate_ok == false)
+                assert(string.find(tostring(rate_error), "speech.rate is unavailable", 1, true))
+                local voice_ok, voice_error = pcall(function()
+                    lector.o.speech.voice = "unavailable"
+                end)
+                assert(voice_ok == false)
+                assert(string.find(tostring(voice_error), "speech.voice is unavailable", 1, true))
             "#,
         )
         .exec()
