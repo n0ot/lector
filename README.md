@@ -770,6 +770,61 @@ only action that deliberately discards retained speech. A non-interrupting
 `interrupt = true` always performs that replacement even while speech is
 playing.
 
+### View and reader automation
+
+Lua key bindings may use blocking-looking view automation without blocking
+Lector's terminal event loop. `lector.api.view()` returns an immutable snapshot
+of the view which has actually reached the physical terminal. `view.review` is
+the review cursor and `view.cursor` is the presented application's
+`{row=..., col=..., visible=...}` cursor. Coordinates are zero-based and ranges
+are start-inclusive/end-exclusive:
+
+```lua
+local view = lector.api.view()
+local reader = lector.api.reader()
+local result = reader:read(
+  view,
+  view.review,
+  {row = view.rows - 1, col = 0}
+)
+reader:close()
+```
+
+[`examples/lua-config`](examples/lua-config) is a complete configuration folder
+that binds `M-P` to continuous pager reading. Its `init.lua` loads the separate
+pager module so the example can also serve as a starting point for a real
+configuration.
+
+`reader:read(view, first, last)` suspends only the Lua binding. It returns
+`{status="completed"|"cancelled", cause=..., position={row=..., col=...}}`, and
+the review cursor follows host-reported word progress. Reader acquisition
+raises a Lua error unless the negotiated speech host provides reliable
+completed/cancelled events, UTF-8 word progress, and confirmed stop. A reader
+temporarily disables auto read and restores the exact prior setting when it is
+closed, cancelled, the binding returns, or the binding fails.
+
+Any physical key cancels an owned reader and is consumed instead of being sent
+to the application. A view, overlay, screen, speech-host generation, resize, or
+content change during `read` also cancels it conservatively.
+
+Use `view:send_keys(spec)` for Neovim-style key notation: text outside angle
+brackets is literal, while tokens include `<Space>`, `<Esc>`, `<CR>`, `<Tab>`,
+`<BS>`, `<C-x>`, and `<lt>`. `view:send_text(text)` is always literal. Both
+return an input receipt; `receipt:wait_for_stable_screen()` waits for a
+post-input physical presentation and then the same adaptive quiet/DEC 2026
+evidence used by auto read, but a line ending alone does not complete a
+whole-screen wait. It returns
+`{status="presented"|"no_response", view=..., content_changed=...,
+effects={bells=...}}`. `presented` confirms that at least one screen or bell
+presentation crossed a physical-terminal flush before the quiet boundary;
+`no_response` conservatively reports that the application produced no
+observable presentation before the timeout. It does not mean end-of-file.
+Bell counts belong to the receipt interval rather than persistent screen
+state. `view:same_content(other)` compares the exact readable lines, geometry,
+and row-wrapping semantics of two snapshots while ignoring visual-only style
+and cursor changes. A view, overlay, or screen handoff aborts the suspended Lua
+binding instead of returning a response from a different context.
+
 ### Lua hooks
 
 Hooks let you respond to Lector events.

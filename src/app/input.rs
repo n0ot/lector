@@ -278,6 +278,11 @@ impl App {
     ) -> Result<()> {
         let key_event = key.event();
         let key_id = (key_event.code, key_event.modifiers, key_event.state);
+        if key_event.kind != KeyEventKind::Release && self.cancel_lua_reader_for_key(sr)? {
+            self.consumed_key_presses.insert(key_id);
+            self.log_event("physical key cancelled and closed Lua reader");
+            return Ok(());
+        }
         if key.control_code() == Some(3)
             && raw.starts_with(b"\x1b[")
             && raw.ends_with(b"u")
@@ -572,7 +577,8 @@ impl App {
                 }
                 Binding::Lua(lua_binding) => {
                     let mode_before = sr.input_mode();
-                    lua_binding.call()?;
+                    let invocation = lua_binding.start()?;
+                    self.start_lua_invocation(sr, invocation, pty_out, term_out)?;
                     self.consumed_key_presses.insert(key_id);
                     self.sync_table_setup_layer(mode_before, sr, term_out)?;
                 }

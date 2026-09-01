@@ -76,9 +76,15 @@ pub struct LuaBinding {
 }
 
 impl LuaBinding {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn call(&self) -> Result<()> {
         let func: Function = self.lua.registry_value(&self.func).map_err(lua_error)?;
         func.call::<()>(()).map_err(lua_error)
+    }
+
+    pub(crate) fn start(&self) -> Result<crate::lua::automation::Invocation> {
+        let func: Function = self.lua.registry_value(&self.func).map_err(lua_error)?;
+        crate::lua::automation::Invocation::new(Rc::clone(&self.lua), func).map_err(lua_error)
     }
 }
 

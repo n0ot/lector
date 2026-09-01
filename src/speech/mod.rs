@@ -7,7 +7,7 @@ use std::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use protocol::{UtteranceId, VoiceInfo};
+use protocol::{TextPosition, UtteranceId, VoiceInfo};
 
 pub mod proc_driver;
 pub mod protocol;
@@ -66,6 +66,42 @@ pub struct OptionState {
 pub enum SetOptionOutcome {
     Accepted,
     Unsupported,
+}
+
+/// Foreground-safe description of the evidence a speech host can provide to
+/// an interactive reader.  Reader acquisition is deliberately all-or-nothing:
+/// guessing either completion or a spoken position would leave the review
+/// cursor somewhere the user did not actually hear.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReaderSupport {
+    /// Speech-host generation which established these guarantees.
+    pub generation: u64,
+    pub reliable_terminal_events: bool,
+    pub utf8_word_progress: bool,
+    pub confirmed_stop: bool,
+}
+
+impl ReaderSupport {
+    #[must_use]
+    pub const fn is_supported(self) -> bool {
+        self.reliable_terminal_events && self.utf8_word_progress && self.confirmed_stop
+    }
+}
+
+/// A validated, correlated speech-host event.  The supervisor publishes these
+/// to the terminal thread without making that thread perform speech I/O.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReaderSpeechEvent {
+    pub utterance_id: UtteranceId,
+    pub kind: ReaderSpeechEventKind,
+    pub position: Option<TextPosition>,
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReaderSpeechEventKind {
+    Progress,
+    Ended,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -406,6 +442,20 @@ impl Speech {
         self.processed = processed;
         self.run = run_string;
         result.map(|()| id)
+    }
+
+    /// Submit one coordinate-mapped utterance without text rewriting.  The
+    /// reader needs host byte offsets to refer to the exact source string;
+    /// ordinary speech continues to use symbol and emoji expansion above.
+    pub(crate) fn speak_for_reader(&mut self, text: &str) -> Result<UtteranceId> {
+        let id = UtteranceId::new(self.next_utterance_id.to_string());
+        self.next_utterance_id = self.next_utterance_id.wrapping_add(1);
+        if !text.is_empty() {
+            self.driver
+                .speak_utterance(&id, text, true)
+                .map_err(Error::Driver)?;
+        }
+        Ok(id)
     }
 
     pub fn cancel(&mut self) -> Result<()> {

@@ -4,6 +4,7 @@ use anyhow::{Context as AnyhowContext, anyhow};
 use mlua::{Error, Function, Lua, LuaOptions, Result, StdLib, Value};
 use std::{cell::RefCell, fs::File, io::Read, path::PathBuf, rc::Rc};
 
+pub(crate) mod automation;
 mod ext;
 mod inspect;
 mod meta;

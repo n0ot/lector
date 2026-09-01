@@ -4,16 +4,17 @@
 //! own Lector's queue. All transitions are driven by accepted commands and
 //! correlated host events; stale or malformed events cannot advance speech.
 
-use super::UtteranceBoundary;
 use super::protocol::{
     BackendInfo, CurrentVoiceResult, KnownEventKind, MAX_JSON_SAFE_INTEGER,
     MAX_UTTERANCE_TEXT_BYTES, PauseResult, SpeechCapabilities, SpeechEventNotification,
     TextPosition, UtteranceId, VoiceInfo,
 };
+use super::{ReaderSpeechEvent, ReaderSpeechEventKind, UtteranceBoundary};
 use anyhow::{Result, anyhow};
 use std::{collections::VecDeque, time::Instant};
 
 const MAX_PENDING_BYTES: usize = 256 * 1024;
+const MAX_READER_EVENTS: usize = 256;
 
 pub trait Host {
     fn capabilities(&self) -> &SpeechCapabilities;
@@ -118,9 +119,16 @@ pub struct SpeechManager {
     paused_restart: Option<Utterance>,
     deferred_start: Option<DeferredStart>,
     next_restart_id: u64,
+    reader_events: VecDeque<ReaderSpeechEvent>,
 }
 
 impl SpeechManager {
+    /// Drain the bounded foreground observation stream. Only events which
+    /// matched the active utterance and passed sequence validation enter it.
+    pub fn take_reader_events(&mut self) -> Vec<ReaderSpeechEvent> {
+        self.reader_events.drain(..).collect()
+    }
+
     pub fn submit(
         &mut self,
         host: &mut dyn Host,
@@ -399,6 +407,32 @@ impl SpeechManager {
         };
 
         match kind {
+            KnownEventKind::Progress => record_reader_event(
+                &mut self.reader_events,
+                ReaderSpeechEvent {
+                    utterance_id: event.utterance_id.clone(),
+                    kind: ReaderSpeechEventKind::Progress,
+                    position: event.event.position.clone(),
+                    reason: None,
+                },
+            ),
+            KnownEventKind::Ended => record_reader_event(
+                &mut self.reader_events,
+                ReaderSpeechEvent {
+                    utterance_id: event.utterance_id.clone(),
+                    kind: ReaderSpeechEventKind::Ended,
+                    position: event
+                        .event
+                        .position
+                        .clone()
+                        .or_else(|| active.last_position.clone()),
+                    reason: event.event.reason.clone(),
+                },
+            ),
+            KnownEventKind::Started | KnownEventKind::Paused | KnownEventKind::Resumed => {}
+        }
+
+        match kind {
             KnownEventKind::Progress | KnownEventKind::Paused => {
                 if let Some(position) = event
                     .event
@@ -642,6 +676,13 @@ impl SpeechManager {
     }
 }
 
+fn record_reader_event(events: &mut VecDeque<ReaderSpeechEvent>, event: ReaderSpeechEvent) {
+    if events.len() == MAX_READER_EVENTS {
+        let _ = events.pop_front();
+    }
+    events.push_back(event);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +837,15 @@ mod tests {
 
         host.events.push(FakeHost::ended(&one, 1));
         manager.poll(&mut host).unwrap();
+        assert_eq!(
+            manager.take_reader_events(),
+            [ReaderSpeechEvent {
+                utterance_id: one.clone(),
+                kind: ReaderSpeechEventKind::Ended,
+                position: None,
+                reason: Some("completed".to_owned()),
+            }]
+        );
         assert_eq!(
             host.calls,
             [

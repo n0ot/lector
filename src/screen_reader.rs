@@ -1,7 +1,7 @@
 use super::{
     clipboard::{Clipboard, ClipboardRegister, SystemClipboard, SystemClipboardProvider},
     keymap::{InputMode, KeyBindings},
-    speech::{self, Speech, SpeechServerSpec},
+    speech::{self, ReaderSpeechEvent, ReaderSupport, Speech, SpeechServerSpec},
     table::Session as TableSession,
 };
 use mlua::{Lua, WeakLua};
@@ -120,6 +120,9 @@ pub struct ScreenReader {
     input_sequence: u64,
     pending_history_navigation: bool,
     pending_visual_focus_input: Option<PendingVisualFocusInput>,
+    reader_support: ReaderSupport,
+    reader_speech_events: VecDeque<ReaderSpeechEvent>,
+    reader_auto_read_suppressed: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -155,7 +158,40 @@ impl ScreenReader {
             input_sequence: 0,
             pending_history_navigation: false,
             pending_visual_focus_input: None,
+            reader_support: ReaderSupport::default(),
+            reader_speech_events: VecDeque::new(),
+            reader_auto_read_suppressed: false,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn set_reader_support(&mut self, support: ReaderSupport) {
+        self.reader_support = support;
+        if !support.is_supported() {
+            self.reader_speech_events.clear();
+        }
+    }
+
+    pub(crate) fn reader_support(&self) -> ReaderSupport {
+        self.reader_support
+    }
+
+    #[doc(hidden)]
+    pub fn push_reader_speech_events(
+        &mut self,
+        events: impl IntoIterator<Item = ReaderSpeechEvent>,
+    ) {
+        const MAX_EVENTS: usize = 256;
+        for event in events {
+            if self.reader_speech_events.len() == MAX_EVENTS {
+                let _ = self.reader_speech_events.pop_front();
+            }
+            self.reader_speech_events.push_back(event);
+        }
+    }
+
+    pub(crate) fn take_reader_speech_events(&mut self) -> Vec<ReaderSpeechEvent> {
+        self.reader_speech_events.drain(..).collect()
     }
 
     pub fn set_lua_context(&mut self, lua: Rc<Lua>) {
@@ -556,11 +592,15 @@ impl ScreenReader {
     }
 
     pub fn auto_read_enabled(&self) -> bool {
-        self.options.auto_read()
+        !self.reader_auto_read_suppressed && self.options.auto_read()
     }
 
     pub fn set_auto_read_enabled(&mut self, value: bool) {
         self.options.set_auto_read(value);
+    }
+
+    pub(crate) fn set_reader_auto_read_suppressed(&mut self, suppressed: bool) {
+        self.reader_auto_read_suppressed = suppressed;
     }
 
     pub(crate) fn toggle_auto_read(&mut self) -> bool {
@@ -656,6 +696,17 @@ impl ScreenReader {
         let ok = result.is_ok();
         self.call_hook_on_speech_end(text, interrupt, ok)?;
         result.map(Some).map_err(Into::into)
+    }
+
+    pub(crate) fn speak_for_reader(
+        &mut self,
+        text: &str,
+    ) -> Result<crate::speech::protocol::UtteranceId> {
+        self.call_hook_on_speech_start(text, true)?;
+        let result = self.speech.speak_for_reader(text);
+        let ok = result.is_ok();
+        self.call_hook_on_speech_end(text, true, ok)?;
+        result.map_err(Into::into)
     }
 }
 

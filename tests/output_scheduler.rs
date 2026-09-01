@@ -94,6 +94,7 @@ fn event_boundary_coalescing_keeps_only_the_newest_unstarted_scene_and_preserves
         .drain_ready(104, false, &mut output)
         .expect("ready drain");
     assert_eq!(ready.completed_renders.len(), 1);
+    assert_eq!(ready.completed_bells, 2);
     assert_eq!(ready.completed_renders[0].geometry.cols, 20);
     assert_eq!(
         output,
@@ -958,10 +959,11 @@ fn bounded_backlog_discards_obsolete_visual_work_without_dropping_control_or_bel
     assert!(scheduler.pending_bytes() <= 32);
 
     let mut output = Vec::new();
-    scheduler
+    let report = scheduler
         .drain_ready(4, false, &mut output)
         .expect("bounded drain");
     assert_eq!(output, b"controllatest-render\x07");
+    assert_eq!(report.completed_bells, 1);
 }
 
 #[test]
@@ -978,11 +980,36 @@ fn bell_flood_is_capped_before_it_can_materialize_an_unbounded_transaction() {
     assert_eq!(scheduler.pending_bytes(), 96);
 
     let mut output = Vec::new();
-    scheduler
+    let report = scheduler
         .drain_ready(4, false, &mut output)
         .expect("drain bounded bell flood");
     assert_eq!(output, vec![b'\x07'; 96]);
+    assert_eq!(report.completed_bells, 96);
     assert_eq!(scheduler.pending_bytes(), 0);
+}
+
+#[test]
+fn bell_receipt_waits_for_the_successful_physical_flush() {
+    let mut scheduler = OutputScheduler::new(config(), false);
+    scheduler.enqueue_bell(2, 0);
+    let mut writer = FlushScriptedWriter {
+        bytes: Vec::new(),
+        flushes: VecDeque::from([io::ErrorKind::WouldBlock]),
+    };
+
+    let blocked = scheduler
+        .drain_ready(4, false, &mut writer)
+        .expect("write bells before flush backpressure");
+    assert!(blocked.blocked);
+    assert_eq!(blocked.completed_bells, 0);
+    assert_eq!(writer.bytes, b"\x07\x07");
+
+    scheduler.notify_writable();
+    let flushed = scheduler
+        .drain_ready(4, false, &mut writer)
+        .expect("complete the bell flush receipt");
+    assert_eq!(flushed.bytes_written, 0);
+    assert_eq!(flushed.completed_bells, 2);
 }
 
 #[test]

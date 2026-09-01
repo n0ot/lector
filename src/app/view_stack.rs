@@ -554,6 +554,9 @@ impl App {
             self.scene_renderer.invalidate();
             return Err(error).context("flush terminal scene");
         }
+        self.presented_bell_count = self
+            .presented_bell_count
+            .saturating_add(u64::try_from(bell_count).unwrap_or(u64::MAX));
         self.scene_renderer.confirm(&batch.predicted);
         self.presented_scene = batch.predicted;
         if let Some(transition) = synchronization.compositor_transition {

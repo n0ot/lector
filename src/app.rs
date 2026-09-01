@@ -6,7 +6,7 @@ use crate::{
     presentation::{
         CursorOwner, GridPoint, IncrementalVtRenderer, PhysicalTerminalLifecycle, PresentedScene,
         RenderCapabilities, RendererBackend, Scene, SceneDamage, SceneOverlay, SceneSurface,
-        SurfaceId, ViewId,
+        SurfaceId, ViewId, ViewRevision,
     },
     screen_reader::{ScreenReader, TmuxBellMode},
     terminal::{ScreenIdentity, TerminalGeometry, UpdateSummary},
@@ -32,11 +32,14 @@ use std::{
 use terminput::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
 mod input;
+mod lua_automation;
 mod protocol;
 mod pty;
 mod tmux_interaction;
 mod tmux_prefix;
 mod view_stack;
+
+use lua_automation::LuaTask;
 
 use protocol::{
     FOCUS_IN_EVENT, FOCUS_OUT_EVENT, ModifyOtherKeysStatus, SequenceStatus, focus_event_status,
@@ -1152,6 +1155,8 @@ pub struct App {
     kitty_ctrl_c_input_handoff: Option<KittyInputHandoff>,
     log_enabled: bool,
     lua_repl_session: Option<views::LuaReplSession>,
+    lua_task: Option<LuaTask>,
+    next_lua_token: u64,
     last_stdin_update: Option<u128>,
     stabilization_profiles: HashMap<AccessibilityContext, StabilizationProfile>,
     scene_renderer: IncrementalVtRenderer,
@@ -1159,6 +1164,10 @@ pub struct App {
     presented_accessibility_view: Option<ViewId>,
     presented_accessibility_label: Option<String>,
     presented_accessibility_label_tracks_terminal_title: bool,
+    /// Monotonic count of bell bytes which crossed a successful physical
+    /// terminal flush. Input receipts use this event sequence without making
+    /// a bell part of persistent screen state.
+    presented_bell_count: u64,
     pending_view_announcement: bool,
     pending_tmux_location_announcement: Option<u64>,
     pending_active_view_read: Option<ViewId>,
@@ -1566,6 +1575,8 @@ impl App {
             kitty_ctrl_c_input_handoff: None,
             log_enabled: false,
             lua_repl_session: None,
+            lua_task: None,
+            next_lua_token: 1,
             last_stdin_update: None,
             stabilization_profiles: HashMap::new(),
             scene_renderer: IncrementalVtRenderer::new(RenderCapabilities {
@@ -1578,6 +1589,7 @@ impl App {
             presented_accessibility_view: None,
             presented_accessibility_label: None,
             presented_accessibility_label_tracks_terminal_title: false,
+            presented_bell_count: 0,
             pending_view_announcement: false,
             pending_tmux_location_announcement: None,
             pending_active_view_read: None,
@@ -2110,8 +2122,14 @@ impl App {
                 )
             });
         }
+        self.presented_bell_count = self
+            .presented_bell_count
+            .saturating_add(u64::try_from(report.completed_bells).unwrap_or(u64::MAX));
         for completed in &report.completed_effects {
             self.presented_scene.apply_terminal_effect(&completed.event);
+            if matches!(completed.event, crate::terminal::TerminalEvent::Bell) {
+                self.presented_bell_count = self.presented_bell_count.saturating_add(1);
+            }
             if completed.owner == ROOT_SOURCE
                 && self.presented_accessibility_label_tracks_terminal_title
                 && let crate::terminal::TerminalEvent::TitleChanged(title) = &completed.event
@@ -2221,6 +2239,7 @@ impl App {
         let pending_input_deadline = self
             .pending_input_last_at
             .map(|last_at| last_at.saturating_add(ESC_TIMEOUT_MS));
+        let lua_automation_deadline = self.lua_automation_deadline_ms();
         let presented_update = self.active_presented_update_status();
         let now_ms = self.clock.now_ms();
         let accessibility_blocked = self.application_transaction_blocks_stabilization(
@@ -2242,6 +2261,7 @@ impl App {
             .chain(gateway_deadline)
             .chain(pane_resync_deadline)
             .chain(pending_input_deadline)
+            .chain(lua_automation_deadline)
             .chain(accessibility_deadline)
             .chain(
                 self.pending_force_abandon
@@ -2354,7 +2374,11 @@ impl App {
         }
         let bells = vec![b'\x07'; count];
         term_out.write_all(&bells).context("write bell")?;
-        term_out.flush().context("flush bell")
+        term_out.flush().context("flush bell")?;
+        self.presented_bell_count = self
+            .presented_bell_count
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        Ok(())
     }
 
     fn refresh_probed_profile(&mut self) {
@@ -2424,6 +2448,9 @@ impl App {
             || self.view_stack.active_mut().wants_tick()
             || pending_tmux_command_ready
             || !self.pending_direct_gateway_input.is_empty()
+            || self
+                .lua_automation_deadline_ms()
+                .is_some_and(|deadline| deadline <= self.clock.now_ms())
             || self
                 .tmux_termination_deadline_ms
                 .is_some_and(|deadline| deadline <= self.clock.now_ms())

@@ -70,6 +70,9 @@ pub struct DrainReport {
     pub bytes_written: usize,
     pub completed_renders: Vec<CompletedRender>,
     pub completed_effects: Vec<ScheduledTerminalEffect>,
+    /// Physical bells whose bytes reached the same successful flush fence as
+    /// the completed render and effect receipts in this report.
+    pub completed_bells: usize,
     pub blocked: bool,
     pub write_budget_exhausted: bool,
     pub synchronization_timed_out: bool,
@@ -117,6 +120,7 @@ struct ActiveTransaction {
     offset: usize,
     completed_render: Option<TrackedRender>,
     completed_effects: Vec<ScheduledTerminalEffect>,
+    completed_bells: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,6 +160,7 @@ pub struct OutputScheduler {
     active: VecDeque<ActiveTransaction>,
     awaiting_flush_renders: Vec<TrackedRender>,
     awaiting_flush_effects: Vec<ScheduledTerminalEffect>,
+    awaiting_flush_bells: usize,
     flush_required: bool,
     waiting_for_writable: bool,
     application_synchronization: Option<ApplicationSynchronization>,
@@ -179,6 +184,7 @@ impl OutputScheduler {
             active: VecDeque::new(),
             awaiting_flush_renders: Vec::new(),
             awaiting_flush_effects: Vec::new(),
+            awaiting_flush_bells: 0,
             flush_required: false,
             waiting_for_writable: false,
             application_synchronization: None,
@@ -262,6 +268,7 @@ impl OutputScheduler {
         if self.active.is_empty()
             && self.awaiting_flush_renders.is_empty()
             && self.awaiting_flush_effects.is_empty()
+            && self.awaiting_flush_bells == 0
         {
             self.pending_since_ms = None;
         }
@@ -798,6 +805,9 @@ impl OutputScheduler {
                 }
                 self.awaiting_flush_effects
                     .extend(completed.completed_effects);
+                self.awaiting_flush_bells = self
+                    .awaiting_flush_bells
+                    .saturating_add(completed.completed_bells);
                 if reached_synchronization_bypass {
                     break;
                 }
@@ -839,6 +849,9 @@ impl OutputScheduler {
             }
             self.awaiting_flush_effects
                 .extend(completed.completed_effects);
+            self.awaiting_flush_bells = self
+                .awaiting_flush_bells
+                .saturating_add(completed.completed_bells);
         }
         if self.flush_required && !self.flush_writer(writer, &mut report)? {
             return Ok(report);
@@ -875,6 +888,7 @@ impl OutputScheduler {
                 offset: 0,
                 completed_render: None,
                 completed_effects: Vec::new(),
+                completed_bells: 0,
             });
         }
         for effect in self.pending_effects.drain(..) {
@@ -884,6 +898,7 @@ impl OutputScheduler {
                 offset: 0,
                 completed_render: None,
                 completed_effects: vec![effect],
+                completed_bells: 0,
             });
         }
         if let Some(render) = self.pending_render.take() {
@@ -928,15 +943,18 @@ impl OutputScheduler {
                     accessibility: render.accessibility,
                 }),
                 completed_effects: Vec::new(),
+                completed_bells: 0,
             });
         }
         if self.pending_bells > 0 {
+            let completed_bells = self.pending_bells;
             self.active.push_back(ActiveTransaction {
                 kind: ActiveTransactionKind::Bell,
                 bytes: vec![b'\x07'; self.pending_bells],
                 offset: 0,
                 completed_render: None,
                 completed_effects: Vec::new(),
+                completed_bells,
             });
             self.pending_bells = 0;
         }
@@ -947,6 +965,7 @@ impl OutputScheduler {
         self.active.clear();
         self.awaiting_flush_renders.clear();
         self.awaiting_flush_effects.clear();
+        self.awaiting_flush_bells = 0;
         self.flush_required = false;
         self.waiting_for_writable = false;
         self.pending_bytes.clear();
@@ -1008,6 +1027,9 @@ impl OutputScheduler {
         report
             .completed_effects
             .append(&mut self.awaiting_flush_effects);
+        report.completed_bells = report
+            .completed_bells
+            .saturating_add(std::mem::take(&mut self.awaiting_flush_bells));
     }
 }
 

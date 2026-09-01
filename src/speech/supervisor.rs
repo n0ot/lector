@@ -6,7 +6,8 @@
 //! with [`SupervisorHandle`].
 
 use super::{
-    CapabilityStatus, Driver, OptionState, SetOptionOutcome, SpeechServerSpec, UtteranceBoundary,
+    CapabilityStatus, Driver, OptionState, ReaderSpeechEvent, ReaderSupport, SetOptionOutcome,
+    SpeechServerSpec, UtteranceBoundary,
     manager::{Host, SpeechManager},
     proc_driver,
     protocol::{SettingSupport, UtteranceId, VoiceInfo},
@@ -46,6 +47,8 @@ struct HandleState {
     owned_terminators: BTreeMap<u64, Terminator>,
     notifier: Option<Notifier>,
     shutting_down: bool,
+    reader_support: ReaderSupport,
+    reader_events: VecDeque<ReaderSpeechEvent>,
 }
 
 struct HandleInner {
@@ -92,6 +95,18 @@ impl SupervisorHandle {
     #[must_use]
     pub fn take_events(&self) -> Vec<SupervisorEvent> {
         self.lock().events.drain(..).collect()
+    }
+
+    /// Return the latest negotiated reader capability without speech-host I/O.
+    #[must_use]
+    pub fn reader_support(&self) -> ReaderSupport {
+        self.lock().reader_support
+    }
+
+    /// Drain validated progress and terminal events in host order.
+    #[must_use]
+    pub fn take_reader_events(&self) -> Vec<ReaderSpeechEvent> {
+        self.lock().reader_events.drain(..).collect()
     }
 
     /// Terminate the currently active direct child, if any.
@@ -156,6 +171,30 @@ impl SupervisorHandle {
             }
             state.events.push_back(event);
             state.notifier.clone()
+        };
+        if let Some(notifier) = notifier {
+            notify(&notifier);
+        }
+    }
+
+    fn publish_reader_state(
+        &self,
+        support: ReaderSupport,
+        events: impl IntoIterator<Item = ReaderSpeechEvent>,
+    ) {
+        const MAX_READER_EVENTS: usize = 256;
+        let notifier = {
+            let mut state = self.lock();
+            state.reader_support = support;
+            let mut changed = false;
+            for event in events {
+                if state.reader_events.len() == MAX_READER_EVENTS {
+                    let _ = state.reader_events.pop_front();
+                }
+                state.reader_events.push_back(event);
+                changed = true;
+            }
+            changed.then(|| state.notifier.clone()).flatten()
         };
         if let Some(notifier) = notifier {
             notify(&notifier);
@@ -530,7 +569,37 @@ impl Supervisor {
 
     fn clear_active(&mut self) -> Option<ManagedProcess> {
         self.option_state = OptionState::default();
-        self.active.take()
+        let old = self.active.take();
+        self.publish_reader_state();
+        old
+    }
+
+    fn reader_support(&self) -> ReaderSupport {
+        let Some(process) = self.active.as_ref() else {
+            return ReaderSupport::default();
+        };
+        let capabilities = process.host.capabilities();
+        let terminal = &capabilities.lifecycle.terminal;
+        ReaderSupport {
+            generation: process._ownership.generation,
+            reliable_terminal_events: terminal.delivery.is_reliable()
+                && terminal
+                    .distinguishes
+                    .iter()
+                    .any(|reason| reason == "completed")
+                && terminal
+                    .distinguishes
+                    .iter()
+                    .any(|reason| reason == "cancelled"),
+            utf8_word_progress: capabilities.progress.supports_utf8_word_offsets(),
+            confirmed_stop: capabilities.controls.stop == super::protocol::StopSupport::Confirmed,
+        }
+    }
+
+    fn publish_reader_state(&mut self) {
+        let support = self.reader_support();
+        let events = self.manager.take_reader_events();
+        self.handle.publish_reader_state(support, events);
     }
 
     fn refresh_option_state(&mut self) {
@@ -608,6 +677,7 @@ impl Supervisor {
             }
         }
         self.option_state = state;
+        self.publish_reader_state();
     }
 
     fn startup(&mut self) -> DriverResult<()> {
@@ -984,7 +1054,9 @@ impl Driver for Supervisor {
         if !self.started || self.active.is_none() {
             return Ok(());
         }
-        self.call_managed("event", SpeechManager::poll)
+        let result = self.call_managed("event", SpeechManager::poll);
+        self.publish_reader_state();
+        result
     }
 
     fn get_rate(&self) -> f32 {

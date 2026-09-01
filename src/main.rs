@@ -2618,6 +2618,8 @@ fn service_speech_supervisor(
     sr: &mut ScreenReader,
     supervisor: &speech::supervisor::SupervisorHandle,
 ) -> Result<()> {
+    sr.set_reader_support(supervisor.reader_support());
+    sr.push_reader_speech_events(supervisor.take_reader_events());
     for event in supervisor.take_events() {
         match event {
             speech::supervisor::SupervisorEvent::Fatal(message) => {

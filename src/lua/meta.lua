@@ -195,6 +195,147 @@ local tbl_lector_hooks_mt = {
 }
 local tbl_lector_hooks = setmetatable({}, tbl_lector_hooks_mt)
 
+-- Event-loop-backed APIs deliberately use coroutines internally. To a script
+-- these calls are sequential and blocking; Lector continues servicing the
+-- terminal and speech host while the coroutine is suspended.
+local function automation_request(kind, fields)
+    if not coroutine.isyieldable() then
+        error("this Lector API must be called from a Lua key binding", 3)
+    end
+    fields = fields or {}
+    fields.__lector_request = kind
+    return coroutine.yield(fields)
+end
+
+local view_methods = {}
+view_methods.__index = view_methods
+
+function view_methods:line(row)
+    if type(row) ~= "number" or row % 1 ~= 0 or row < 0 or row >= self.rows then
+        error("view row is outside the visible screen", 2)
+    end
+    return self.lines[row + 1]
+end
+
+function view_methods:top()
+    return {row = 0, col = 0}
+end
+
+function view_methods:bottom()
+    return {row = self.rows - 1, col = self.cols}
+end
+
+function view_methods:same_content(other)
+    if getmetatable(other) ~= view_methods then
+        error("view:same_content requires another Lector view", 2)
+    end
+    if self.rows ~= other.rows or self.cols ~= other.cols then
+        return false
+    end
+    for row = 1, self.rows do
+        if self.lines[row] ~= other.lines[row] or
+            self.wrapped[row] ~= other.wrapped[row] then
+            return false
+        end
+    end
+    return true
+end
+
+local receipt_methods = {}
+receipt_methods.__index = receipt_methods
+
+local function wrap_view(view)
+    if type(view) ~= "table" then
+        error("Lector did not return a view", 3)
+    end
+    return setmetatable(view, view_methods)
+end
+
+function receipt_methods:wait_for_stable_screen()
+    if self.waited then
+        error("an input receipt can only be waited on once", 2)
+    end
+    self.waited = true
+    local response = automation_request("wait_for_stable_screen", {
+        receipt = self.receipt,
+    })
+    if type(response) ~= "table" or type(response.effects) ~= "table" then
+        error("Lector returned an invalid screen response", 2)
+    end
+    response.view = wrap_view(response.view)
+    return response
+end
+
+function view_methods:send_keys(keys)
+    if type(keys) ~= "string" then
+        error("keys must be a string", 2)
+    end
+    local result = automation_request("send_keys", {
+        view = self.token,
+        keys = keys,
+    })
+    if result.error then
+        error(result.error, 2)
+    end
+    return setmetatable(result, receipt_methods)
+end
+
+function view_methods:send_text(text)
+    if type(text) ~= "string" then
+        error("text must be a string", 2)
+    end
+    local result = automation_request("send_text", {
+        view = self.token,
+        text = text,
+    })
+    if result.error then
+        error(result.error, 2)
+    end
+    return setmetatable(result, receipt_methods)
+end
+
+local reader_methods = {}
+reader_methods.__index = reader_methods
+
+function reader_methods:read(view, first, last)
+    if self.closed then
+        error("reader is closed", 2)
+    end
+    if getmetatable(view) ~= view_methods then
+        error("reader:read requires a Lector view", 2)
+    end
+    local result = automation_request("reader_read", {
+        reader = self.reader,
+        view = view.token,
+        first = first,
+        last = last,
+    })
+    if result.error then
+        error(result.error, 2)
+    end
+    return result
+end
+
+function reader_methods:close()
+    if not self.closed then
+        self.closed = true
+        automation_request("reader_close", {reader = self.reader})
+    end
+end
+
+lector.api.view = function()
+    return wrap_view(automation_request("current_view"))
+end
+
+lector.api.reader = function()
+    local result = automation_request("reader_acquire")
+    if result.error then
+        error(result.error, 2)
+    end
+    result.closed = false
+    return setmetatable(result, reader_methods)
+end
+
 local tbl_lector_mt = {
     __index = function(t, k)
         if k == 'o' then
