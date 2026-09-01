@@ -13,6 +13,7 @@ macro_rules! add_callbacks_common {
     ($tbl:expr,
         set_option = $set_option:expr,
         get_option = $get_option:expr,
+        get_config_dir = $get_config_dir:expr,
         set_symbol = $set_symbol:expr,
         set_binding = $set_binding:expr,
         get_binding = $get_binding:expr,
@@ -29,6 +30,7 @@ macro_rules! add_callbacks_common {
     ) => {{
         $tbl.set("set_option", $set_option)?;
         $tbl.set("get_option", $get_option)?;
+        $tbl.set("get_config_dir", $get_config_dir)?;
         $tbl.set("set_symbol", $set_symbol)?;
         $tbl.set("set_binding", $set_binding)?;
         $tbl.set("get_binding", $get_binding)?;
@@ -74,6 +76,16 @@ fn add_callbacks_static(
         move |lua, key: String| {
             with_screen_reader(&sr_ptr, |sr| {
                 get_option(lua, sr, &key).map_err(Error::external)
+            })
+        }
+    })?;
+    let get_config_dir = lua.create_function({
+        let sr_ptr = Rc::clone(&sr_ptr);
+        move |lua, ()| {
+            with_screen_reader(&sr_ptr, |sr| {
+                sr.config_dir()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .into_lua(lua)
             })
         }
     })?;
@@ -222,6 +234,7 @@ fn add_callbacks_static(
         tbl_callbacks,
         set_option = set_option,
         get_option = get_option,
+        get_config_dir = get_config_dir,
         set_symbol = set_symbol,
         set_binding = set_binding,
         get_binding = get_binding,

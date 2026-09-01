@@ -640,6 +640,13 @@ Configuration is selected in this order:
 2. The file named by `LECTOR_CONFIG`.
 3. The XDG path above.
 
+`lector.config_dir` is the absolute directory containing the selected config
+file. Lector's Lua module loader searches that directory before Lua's ordinary
+filesystem paths, so a sibling `pager.lua` can be loaded with
+`local pager = require("pager")`. Dotted names such as `require("tools.pager")`
+resolve to `tools/pager.lua` or `tools/pager/init.lua` below the config
+directory. `lector.config_dir` is `nil` under `--no-config`.
+
 An explicit file selected by `--config` or `LECTOR_CONFIG` must exist. On
 macOS, Lector also recognizes the former
 `~/Library/Application Support/lector/init.lua` location when no valid
@@ -791,9 +798,9 @@ reader:close()
 ```
 
 [`examples/lua-config`](examples/lua-config) is a complete configuration folder
-that binds `M-P` to continuous pager reading. Its `init.lua` loads the separate
-pager module so the example can also serve as a starting point for a real
-configuration.
+that binds `M-P` to continuous pager reading. Its `init.lua` uses
+`require("pager")`, so the folder works both as a starting point for a real
+configuration and directly through `--config examples/lua-config/init.lua`.
 
 `reader:read(view, first, last)` suspends only the Lua binding. It returns
 `{status="completed"|"cancelled", cause=..., position={row=..., col=...}}`, and

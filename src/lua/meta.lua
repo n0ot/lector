@@ -338,7 +338,9 @@ end
 
 local tbl_lector_mt = {
     __index = function(t, k)
-        if k == 'o' then
+        if k == 'config_dir' then
+            return callbacks.get_config_dir()
+        elseif k == 'o' then
             return tbl_lector_o
         elseif k == 'symbols' then
             return tbl_lector_symbols

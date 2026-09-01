@@ -981,6 +981,37 @@ mod tests {
     }
 
     #[test]
+    fn empty_reader_range_completes_without_submitting_speech() {
+        let (mut app, mut sr, spoken, _stops, _unused) = setup("return");
+        let lua = Rc::new(Lua::new());
+        let sr_ptr = Rc::new(RefCell::new(&mut sr as *mut ScreenReader));
+        crate::lua::setup_repl(&lua, sr_ptr).unwrap();
+        let function: Function = lua
+            .load(
+                r#"
+                    return function()
+                        local view = lector.api.view()
+                        local reader = lector.api.reader()
+                        local result = reader:read(view, view:top(), view:top())
+                        assert(result.status == "completed")
+                        assert(result.cause == "empty")
+                        reader:close()
+                    end
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let invocation = Invocation::new(Rc::clone(&lua), function).unwrap();
+
+        app.start_lua_invocation(&mut sr, invocation, &mut Vec::new(), &mut Vec::new())
+            .unwrap();
+
+        assert!(app.lua_task.is_none());
+        assert!(spoken.borrow().is_empty());
+        assert!(sr.auto_read_enabled());
+    }
+
+    #[test]
     fn physical_key_cancellation_consumes_the_task_and_restores_auto_read() {
         let (mut app, mut sr, _spoken, stops, invocation) = setup("error('must not resume')");
         let mut pty = Vec::new();

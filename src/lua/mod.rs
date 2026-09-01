@@ -1,8 +1,14 @@
 use self::ext::LuaResultExt;
 use crate::screen_reader::ScreenReader;
 use anyhow::{Context as AnyhowContext, anyhow};
-use mlua::{Error, Function, Lua, LuaOptions, Result, StdLib, Value};
-use std::{cell::RefCell, fs::File, io::Read, path::PathBuf, rc::Rc};
+use mlua::{Error, Function, Lua, LuaOptions, Result, StdLib, Table, Value};
+use std::{
+    cell::RefCell,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 pub(crate) mod automation;
 mod ext;
@@ -18,6 +24,8 @@ pub fn setup<F>(
 where
     F: FnOnce(&mut ScreenReader) -> anyhow::Result<()>,
 {
+    let config_dir = effective_config_dir(&init_lua_file)?;
+    screen_reader.set_config_dir(config_dir);
     let lua = Rc::new(Lua::new_with(
         StdLib::ALL_SAFE | StdLib::JIT,
         LuaOptions::default(),
@@ -25,6 +33,7 @@ where
     screen_reader.set_lua_context(Rc::clone(&lua));
     let sr_ptr = Rc::new(RefCell::new(screen_reader as *mut ScreenReader));
     install_api_static(&lua, Rc::clone(&sr_ptr))?;
+    install_config_module_searcher(&lua, Rc::clone(&sr_ptr))?;
     meta::setup_static(&lua, Rc::clone(&sr_ptr))?;
 
     let configuration_result = if load_init_file && init_lua_file.is_file() {
@@ -54,9 +63,93 @@ where
 
 pub fn setup_repl(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
     install_api_static(lua, Rc::clone(&sr_ptr))?;
+    install_config_module_searcher(lua, Rc::clone(&sr_ptr))?;
     meta::setup_static(lua, sr_ptr)?;
     inspect::install(lua)?;
     Ok(())
+}
+
+fn effective_config_dir(init_lua_file: &Path) -> Result<Option<PathBuf>> {
+    if init_lua_file.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let parent = init_lua_file.parent().unwrap_or_else(|| Path::new(""));
+    std::path::absolute(parent)
+        .map(Some)
+        .map_err(Error::external)
+}
+
+/// Add a config-rooted loader after Lua's preload loader and before its
+/// ordinary filesystem loaders. `require("a.b")` therefore checks
+/// `<config_dir>/a/b.lua` and `<config_dir>/a/b/init.lua` without changing the
+/// process working directory or interpolating the config path into
+/// `package.path`.
+fn install_config_module_searcher(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
+    let searcher = lua.create_function(move |lua, module_name: String| {
+        let ptr = *sr_ptr.borrow();
+        let config_dir = if ptr.is_null() {
+            None
+        } else {
+            // Safety: the pointer is installed by the terminal thread before
+            // config or REPL code can call require.
+            unsafe { (&*ptr).config_dir().map(Path::to_path_buf) }
+        };
+        let Some(config_dir) = config_dir else {
+            return config_searcher_miss(lua, "no Lector configuration directory");
+        };
+        let Some(relative) = config_module_relative_path(&module_name) else {
+            return config_searcher_miss(lua, "invalid Lector config module name");
+        };
+
+        let mut module_file = relative.clone();
+        module_file.set_extension("lua");
+        let candidates = [
+            config_dir.join(module_file),
+            config_dir.join(relative).join("init.lua"),
+        ];
+        for candidate in &candidates {
+            if candidate.is_file() {
+                return load_file(lua, candidate).map(Value::Function);
+            }
+        }
+        let detail = candidates
+            .iter()
+            .map(|candidate| format!("no file '{}'", candidate.display()))
+            .collect::<Vec<_>>()
+            .join("\n\t");
+        config_searcher_miss(lua, &detail)
+    })?;
+
+    let package: Table = lua.globals().get("package")?;
+    let searchers = match package.get::<Value>("searchers")? {
+        Value::Table(searchers) => searchers,
+        _ => package.get::<Table>("loaders")?,
+    };
+    for index in (2..=searchers.raw_len()).rev() {
+        let existing: Value = searchers.raw_get(index)?;
+        searchers.raw_set(index + 1, existing)?;
+    }
+    searchers.raw_set(2, searcher)
+}
+
+fn config_module_relative_path(module_name: &str) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    for segment in module_name.split('.') {
+        if segment.is_empty()
+            || segment.contains('\0')
+            || segment
+                .chars()
+                .any(|character| matches!(character, '/' | '\\'))
+        {
+            return None;
+        }
+        relative.push(segment);
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
+}
+
+fn config_searcher_miss(lua: &Lua, detail: &str) -> Result<Value> {
+    Ok(Value::String(lua.create_string(format!("\n\t{detail}"))?))
 }
 
 fn load_file(lua: &Lua, path: &PathBuf) -> Result<Function> {
@@ -301,6 +394,46 @@ mod tests {
         .unwrap();
 
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn config_directory_is_exposed_and_supplies_relative_modules() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_dir = std::path::absolute(directory.path()).unwrap();
+        let init = config_dir.join("init.lua");
+        fs::write(config_dir.join("pager.lua"), "return { enabled = true }").unwrap();
+        fs::create_dir_all(config_dir.join("tools/pager")).unwrap();
+        fs::write(
+            config_dir.join("tools/pager/init.lua"),
+            "return { nested = true }",
+        )
+        .unwrap();
+        fs::write(
+            &init,
+            format!(
+                r#"
+                    assert(lector.config_dir == {:?})
+                    local pager = require("pager")
+                    assert(require("pager") == pager)
+                    local nested = require("tools.pager")
+                    local writable = pcall(function()
+                        lector.config_dir = "different"
+                    end)
+                    assert(writable == false)
+                    lector.o.help_mode = pager.enabled and nested.nested
+                "#,
+                config_dir.to_string_lossy().as_ref(),
+            ),
+        )
+        .unwrap();
+
+        let mut screen_reader = screen_reader();
+        setup(init, true, &mut screen_reader, |sr| {
+            assert_eq!(sr.config_dir(), Some(config_dir.as_path()));
+            assert!(sr.help_mode());
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

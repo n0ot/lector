@@ -5,7 +5,13 @@ use super::{
     table::Session as TableSession,
 };
 use mlua::{Lua, WeakLua};
-use std::{collections::VecDeque, fmt, rc::Rc, str::FromStr};
+use std::{
+    collections::VecDeque,
+    fmt,
+    path::{Path, PathBuf},
+    rc::Rc,
+    str::FromStr,
+};
 
 mod auto_read;
 mod hooks;
@@ -112,6 +118,7 @@ pub struct ScreenReader {
     key_bindings: KeyBindings,
     table_session: TableSession,
     terminal_focused: bool,
+    config_dir: Option<PathBuf>,
     lua_ctx: Option<Rc<Lua>>,
     lua_ctx_weak: Option<WeakLua>,
     lua_hooks: LuaHooks,
@@ -150,6 +157,7 @@ impl ScreenReader {
             key_bindings: KeyBindings::new(),
             table_session: TableSession::default(),
             terminal_focused: true,
+            config_dir: None,
             lua_ctx: None,
             lua_ctx_weak: None,
             lua_hooks: LuaHooks::default(),
@@ -198,6 +206,14 @@ impl ScreenReader {
         self.lua_ctx_weak = Some(lua.weak());
         self.lua_ctx = Some(lua);
         self.lua_configuration_open = true;
+    }
+
+    pub(crate) fn set_config_dir(&mut self, config_dir: Option<PathBuf>) {
+        self.config_dir = config_dir;
+    }
+
+    pub(crate) fn config_dir(&self) -> Option<&Path> {
+        self.config_dir.as_deref()
     }
 
     /// Finish the startup-only portion of `init.lua` configuration.
