@@ -4896,6 +4896,69 @@ fn typeahead_backspace_is_announced_when_echo_and_erase_share_one_frame() {
 }
 
 #[test]
+fn cursor_addressed_prompt_relocation_preserves_typeahead_backspace_announcements() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"\x1b]133;A\x07> \x1b]133;B\x07", &mut term_out)
+        .expect("queue the first prompt");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the first prompt");
+    app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
+        .expect("forward the empty submission");
+    app.handle_pty(
+        &mut sr,
+        b"\x1b]133;C\x07\r\n\x1b]133;A\x07> \x1b]133;B\x07",
+        &mut term_out,
+    )
+    .expect("queue the second prompt");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the second prompt");
+    app.handle_stdin(&mut sr, b"\x0c", &mut pty_out, &mut term_out)
+        .expect("forward the clear command");
+    app.handle_pty(&mut sr, b"\x1b[H\x1b[2J> ", &mut term_out)
+        .expect("queue the cleared prompt");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the cleared prompt");
+    app.handle_stdin(&mut sr, b"\x15", &mut pty_out, &mut term_out)
+        .expect("forward an ignored control input");
+    app.handle_pty(&mut sr, b"\x07", &mut term_out)
+        .expect("queue its bell-only response");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the bell-only response");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    let _ = app
+        .maybe_finalize_changes(&mut sr)
+        .expect("finalize the unchanged prompt");
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"xyz\x7f\x7f\x7f", &mut pty_out, &mut term_out)
+        .expect("forward typeahead and its Backspaces");
+    app.handle_pty(&mut sr, b"xyz\x08 \x08\x08 \x08\x08 \x08", &mut term_out)
+        .expect("queue the combined echoes and erases");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the visually unchanged result");
+    let _ = app
+        .maybe_finalize_changes(&mut sr)
+        .expect("resolve the deletion chain");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [
+            ("z".into(), false),
+            ("y".into(), false),
+            ("x".into(), false),
+        ]
+    );
+    assert_eq!(pty_out, b"\r\x0c\x15xyz\x7f\x7f\x7f");
+}
+
+#[test]
 fn completed_delete_echo_is_announced_without_finalizing_its_surrounding_update() {
     let (mut app, mut sr, recorder, clock) = make_app();
     app.enable_output_scheduler(OutputSchedulerConfig {

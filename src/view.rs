@@ -2722,7 +2722,17 @@ impl View {
             .iter()
             .rev()
             .find(|mark| mark.alternate_screen == alternate_screen)?;
-        matches!(latest_mark.kind, Osc133Kind::InputStart).then_some(latest_mark.position)
+        let input_start =
+            matches!(latest_mark.kind, Osc133Kind::InputStart).then_some(latest_mark.position)?;
+        (input_start <= self.application_cursor_history_position()).then_some(input_start)
+    }
+
+    fn application_cursor_history_position(&self) -> HistoryPosition {
+        let (row, col) = self.screen().cursor_position();
+        HistoryPosition {
+            row: self.scrollback_len() + usize::from(row),
+            col,
+        }
     }
 
     fn refresh_fallback_semantic_input(&mut self) {
@@ -2784,6 +2794,7 @@ impl View {
         let input_start = self.active_semantic_input_start().or_else(|| {
             self.fallback_semantic_input
                 .map(|fallback| fallback.position)
+                .filter(|position| *position <= self.application_cursor_history_position())
         });
         let Some(input_start) = input_start else {
             return false;
@@ -4881,5 +4892,32 @@ mod tests {
 
         view.process_changes(b"\r\n\x1B]133;C\x07");
         assert_eq!(view.active_semantic_input(), None);
+    }
+
+    #[test]
+    fn active_semantic_input_rejects_a_boundary_after_the_application_cursor() {
+        let mut view = View::new(3, 20);
+        view.process_changes(b"\x1B]133;A\x07> \x1B]133;B\x07\r\n\x1B]133;A\x07> \x1B]133;B\x07");
+        assert_eq!(view.screen().cursor_position(), (1, 2));
+
+        // A cursor-addressed redraw can relocate an active input line without
+        // publishing another semantic marker. The old boundary is historical,
+        // not an active guard for positions on the newly drawn line.
+        view.process_changes(b"\x1B[H\x1B[2J> ");
+        assert_eq!(view.screen().cursor_position(), (0, 2));
+        assert_eq!(view.active_semantic_input(), None);
+        assert!(!view.position_at_or_before_active_semantic_input((0, 3)));
+    }
+
+    #[test]
+    fn inferred_semantic_input_rejects_a_boundary_after_the_application_cursor() {
+        let mut view = View::new(3, 20);
+        view.process_changes(b"\x1B]133;A\x07> \r\n\x1B]133;A\x07> ");
+        assert_eq!(view.screen().cursor_position(), (1, 2));
+        view.note_forwarded_application_input();
+
+        view.process_changes(b"\x1B[H\x1B[2J> ");
+        assert_eq!(view.screen().cursor_position(), (0, 2));
+        assert!(!view.position_at_or_before_active_semantic_input((0, 3)));
     }
 }
