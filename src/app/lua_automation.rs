@@ -1202,7 +1202,7 @@ mod tests {
             }
         }
 
-        let rate = Rc::new(std::cell::Cell::new(1.0));
+        let rate = Rc::new(std::cell::Cell::new(65.0));
         let stops = Rc::new(std::cell::Cell::new(0));
         let speech = speech::Speech::new(Box::new(RateDriver {
             rate: Rc::clone(&rate),
@@ -1221,7 +1221,7 @@ mod tests {
                 r#"
                     return function()
                         local original_rate = lector.o.speech.rate
-                        lector.o.speech.rate = 0.7
+                        lector.o.speech.rate = 55
                         local view = lector.api.view()
                         local reader = lector.api.reader()
                         local result = reader:read(
@@ -1244,14 +1244,14 @@ mod tests {
 
         app.start_lua_invocation(&mut sr, invocation, &mut pty, &mut terminal)
             .unwrap();
-        assert_eq!(rate.get(), 0.7);
+        assert_eq!(rate.get(), 55.0);
         assert!(
             app.cancel_lua_reader_for_key(&mut sr, &mut pty, &mut terminal)
                 .unwrap()
         );
 
         assert!(app.lua_task.is_none());
-        assert_eq!(rate.get(), 1.0);
+        assert_eq!(rate.get(), 65.0);
         assert_eq!(stops.get(), 1);
     }
 

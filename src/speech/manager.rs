@@ -36,6 +36,8 @@ pub trait Host {
     fn get_rate(&mut self) -> Result<f32> {
         Err(anyhow!("speech host cannot report its current rate"))
     }
+    /// Set and return a rate in Lector's normalized inclusive 0..100 domain.
+    /// Host adapters own conversion to backend-native units.
     fn set_rate(&mut self, rate: f32) -> Result<f32>;
     fn get_pitch(&mut self) -> Result<f32> {
         Err(anyhow!("speech host cannot report its current pitch"))

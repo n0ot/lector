@@ -10,7 +10,7 @@ use super::{
     SpeechServerSpec, UtteranceBoundary,
     manager::{Host, SpeechManager},
     proc_driver,
-    protocol::{SettingSupport, UtteranceId, VoiceInfo},
+    protocol::{NORMAL_RATE, SettingSupport, UtteranceId, VoiceInfo, rate_is_normalized},
 };
 use anyhow::{Context, Result as DriverResult, anyhow};
 use mio::Waker;
@@ -418,7 +418,7 @@ impl Supervisor {
         Self {
             spec,
             active: None,
-            desired_rate: 1.0,
+            desired_rate: NORMAL_RATE,
             desired_rate_configured: false,
             pending_rate: None,
             desired_pitch: None,
@@ -1064,8 +1064,8 @@ impl Driver for Supervisor {
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
-        if !rate.is_finite() {
-            return Err(anyhow!("speech rate must be finite"));
+        if !rate_is_normalized(rate) {
+            return Err(anyhow!("speech rate must be between 0 and 100 inclusive"));
         }
         if !self.started {
             self.pending_rate = Some(rate);
@@ -1282,7 +1282,7 @@ mod tests {
                 speak_results: VecDeque::new(),
                 stop_results: VecDeque::new(),
                 rate_results: VecDeque::new(),
-                rate: 1.0,
+                rate: NORMAL_RATE,
                 pitch: 1.0,
                 volume: 1.0,
                 legacy: true,
@@ -1610,14 +1610,14 @@ mod tests {
         harness.push_error("first initialize failed");
         harness.push_driver(Arc::clone(&active));
 
-        harness.supervisor.set_rate(1.75).unwrap();
+        harness.supervisor.set_rate(75.0).unwrap();
         assert_eq!(harness.spawns.load(Ordering::SeqCst), 0);
         harness.supervisor.start().unwrap();
 
         assert_eq!(harness.spawns.load(Ordering::SeqCst), 2);
         assert_eq!(
             active.lock().unwrap().calls,
-            [Call::SetRate(1.75f32.to_bits())]
+            [Call::SetRate(75.0f32.to_bits())]
         );
     }
 
@@ -1628,13 +1628,13 @@ mod tests {
         active.lock().unwrap().legacy = false;
         harness.push_driver(Arc::clone(&active));
 
-        harness.supervisor.set_rate(1.75).unwrap();
+        harness.supervisor.set_rate(75.0).unwrap();
         let error = harness.supervisor.start().unwrap_err();
 
         assert!(format!("{error:#}").contains("speech.rate is unavailable"));
         assert_eq!(harness.spawns.load(Ordering::SeqCst), 1);
         assert_eq!(active.lock().unwrap().calls, [Call::Terminate]);
-        assert_eq!(harness.supervisor.desired_rate, 1.0);
+        assert_eq!(harness.supervisor.desired_rate, NORMAL_RATE);
         assert_eq!(harness.supervisor.pending_rate, None);
     }
 
@@ -1648,7 +1648,7 @@ mod tests {
             state.capabilities.settings.rate = SettingSupport::ReadWrite;
             state.capabilities.settings.pitch = SettingSupport::WriteOnly;
             state.capabilities.settings.volume = SettingSupport::ReadWrite;
-            state.rate = 1.4;
+            state.rate = 60.0;
             state.volume = 0.9;
         }
         harness.push_driver(Arc::clone(&active));
@@ -1661,7 +1661,7 @@ mod tests {
 
         let options = harness.supervisor.option_state();
         assert_eq!(options.rate_status, CapabilityStatus::Supported);
-        assert_eq!(options.rate, Some(1.4));
+        assert_eq!(options.rate, Some(60.0));
         assert_eq!(options.pitch_status, CapabilityStatus::Supported);
         assert_eq!(options.pitch, Some(0.75));
         assert_eq!(options.volume_status, CapabilityStatus::Supported);
@@ -1684,7 +1684,7 @@ mod tests {
             let mut state = active.lock().unwrap();
             state.legacy = false;
             state.capabilities.settings.rate = SettingSupport::WriteOnly;
-            state.rate = 1.4;
+            state.rate = 60.0;
         }
         harness.push_driver(Arc::clone(&active));
 
@@ -1695,11 +1695,11 @@ mod tests {
         assert_eq!(options.rate, None);
         assert!(active.lock().unwrap().calls.is_empty());
 
-        harness.supervisor.set_rate(1.25).unwrap();
-        assert_eq!(harness.supervisor.option_state().rate, Some(1.25));
+        harness.supervisor.set_rate(65.0).unwrap();
+        assert_eq!(harness.supervisor.option_state().rate, Some(65.0));
         assert_eq!(
             active.lock().unwrap().calls,
-            [Call::SetRate(1.25f32.to_bits())]
+            [Call::SetRate(65.0f32.to_bits())]
         );
     }
 
@@ -1771,7 +1771,7 @@ mod tests {
             }];
         }
         harness.push_driver(Arc::clone(&rejected));
-        harness.supervisor.set_rate(1.75).unwrap();
+        harness.supervisor.set_rate(75.0).unwrap();
         harness
             .supervisor
             .set_voice_option("missing-voice")
@@ -1783,7 +1783,7 @@ mod tests {
         assert_eq!(harness.spawns.load(Ordering::SeqCst), 1);
         assert_eq!(harness.supervisor.pending_voice, None);
         assert_eq!(harness.supervisor.desired_voice, None);
-        assert_eq!(harness.supervisor.pending_rate, Some(1.75));
+        assert_eq!(harness.supervisor.pending_rate, Some(75.0));
 
         let accepted = fake_state();
         harness.push_driver(Arc::clone(&accepted));
@@ -1793,11 +1793,11 @@ mod tests {
             .unwrap();
         harness.supervisor.start().unwrap();
 
-        assert_eq!(harness.supervisor.desired_rate, 1.75);
+        assert_eq!(harness.supervisor.desired_rate, 75.0);
         assert_eq!(harness.supervisor.pending_rate, None);
         assert_eq!(
             accepted.lock().unwrap().calls,
-            [Call::SetRate(1.75f32.to_bits())]
+            [Call::SetRate(75.0f32.to_bits())]
         );
     }
 
@@ -1834,7 +1834,7 @@ mod tests {
         assert_eq!(
             active.lock().unwrap().calls,
             [
-                Call::SetRate(1.0f32.to_bits()),
+                Call::SetRate(NORMAL_RATE.to_bits()),
                 Call::Speak("kept".to_owned(), false),
             ]
         );
@@ -1851,14 +1851,14 @@ mod tests {
         harness.supervisor.start().unwrap();
         assert_eq!(
             active.lock().unwrap().calls,
-            [Call::SetRate(1.0f32.to_bits())]
+            [Call::SetRate(NORMAL_RATE.to_bits())]
         );
 
         harness.supervisor.resume().unwrap();
         assert_eq!(
             active.lock().unwrap().calls,
             [
-                Call::SetRate(1.0f32.to_bits()),
+                Call::SetRate(NORMAL_RATE.to_bits()),
                 Call::Speak("held".to_owned(), false),
             ]
         );
@@ -1878,7 +1878,7 @@ mod tests {
         assert_eq!(
             active.lock().unwrap().calls,
             [
-                Call::SetRate(1.0f32.to_bits()),
+                Call::SetRate(NORMAL_RATE.to_bits()),
                 Call::Speak("replacement".to_owned(), false),
             ]
         );
@@ -1907,7 +1907,7 @@ mod tests {
         let restarted = fake_state();
         harness.push_driver(Arc::clone(&failed));
         harness.push_driver(Arc::clone(&restarted));
-        harness.supervisor.set_rate(1.5).unwrap();
+        harness.supervisor.set_rate(70.0).unwrap();
         harness.supervisor.start().unwrap();
 
         assert!(harness.supervisor.speak("uncertain", false).is_err());
@@ -1915,7 +1915,7 @@ mod tests {
         assert_eq!(
             failed.lock().unwrap().calls,
             [
-                Call::SetRate(1.5f32.to_bits()),
+                Call::SetRate(70.0f32.to_bits()),
                 Call::Speak("uncertain".to_owned(), false),
                 Call::Terminate,
             ]
@@ -1923,7 +1923,7 @@ mod tests {
         assert_eq!(
             restarted.lock().unwrap().calls,
             [
-                Call::SetRate(1.5f32.to_bits()),
+                Call::SetRate(70.0f32.to_bits()),
                 Call::Speak("later".to_owned(), false),
             ]
         );

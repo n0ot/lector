@@ -9,7 +9,12 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MIN_MINOR: u16 = 0;
-pub const PROTOCOL_MAX_MINOR: u16 = 1;
+pub const PROTOCOL_MAX_MINOR: u16 = 2;
+/// First protocol minor whose rate domain is independent of the native backend.
+pub const NORMALIZED_RATE_PROTOCOL_MINOR: u16 = 2;
+pub const MIN_RATE: f32 = 0.0;
+pub const NORMAL_RATE: f32 = 50.0;
+pub const MAX_RATE: f32 = 100.0;
 /// Largest integer represented exactly by every common JSON implementation.
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 pub const MAX_UTTERANCE_TEXT_BYTES: usize = 64 * 1024;
@@ -28,6 +33,18 @@ impl ProtocolRange {
         Self {
             major: PROTOCOL_MAJOR,
             minimum_minor: PROTOCOL_MIN_MINOR,
+            maximum_minor: PROTOCOL_MAX_MINOR,
+        }
+    }
+
+    /// Protocol range offered by Lector now that its public rate setting uses
+    /// the normalized 0..100 domain. Older 2.x hosts remain incompatible with
+    /// that setting because their rate values were backend-specific.
+    #[must_use]
+    pub const fn normalized_rate() -> Self {
+        Self {
+            major: PROTOCOL_MAJOR,
+            minimum_minor: NORMALIZED_RATE_PROTOCOL_MINOR,
             maximum_minor: PROTOCOL_MAX_MINOR,
         }
     }
@@ -57,6 +74,11 @@ impl ProtocolRange {
             minor,
         })
     }
+}
+
+#[must_use]
+pub fn rate_is_normalized(rate: f32) -> bool {
+    rate.is_finite() && (MIN_RATE..=MAX_RATE).contains(&rate)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -524,7 +546,7 @@ mod tests {
                 minimum_minor: 0,
                 maximum_minor: 9,
             }),
-            Some(ProtocolVersion { major: 2, minor: 1 })
+            Some(ProtocolVersion { major: 2, minor: 2 })
         );
         assert_eq!(
             current.highest_mutual(ProtocolRange {
@@ -534,6 +556,19 @@ mod tests {
             }),
             None
         );
+    }
+
+    #[test]
+    fn normalized_rate_range_requires_the_new_domain() {
+        let range = ProtocolRange::normalized_rate();
+        assert!(!range.supports(ProtocolVersion { major: 2, minor: 1 }));
+        assert!(range.supports(ProtocolVersion { major: 2, minor: 2 }));
+        assert!(rate_is_normalized(MIN_RATE));
+        assert!(rate_is_normalized(NORMAL_RATE));
+        assert!(rate_is_normalized(MAX_RATE));
+        assert!(!rate_is_normalized(-f32::EPSILON));
+        assert!(!rate_is_normalized(MAX_RATE + 0.01));
+        assert!(!rate_is_normalized(f32::NAN));
     }
 
     #[test]

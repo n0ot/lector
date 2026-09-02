@@ -377,7 +377,7 @@ operation.
 Speech timing, numeric settings, and voice controls live in the same namespace:
 
 ```lua
-lector.o.speech.rate = 1.25
+lector.o.speech.rate = 65
 lector.o.speech.pitch = 1.0
 lector.o.speech.volume = 0.8
 
@@ -402,13 +402,18 @@ apply to paragraph boundaries in speech submitted after the assignment.
 The negotiated operations remain independent. `rate`, `pitch`, `volume`,
 `voice`, or `voices` returns `nil` when the active host cannot report that
 value, and `voices` is a read-only array of `{id, name, language, gender}`
-tables when listing is available. Numeric values use the selected backend's
-domain. Assigning an unsupported setting or voice, or selecting an ID absent
-from an available voice list, raises a Lua error without changing the option.
-In the Lua REPL the submitted chunk stops and the prompt remains available. In
-`init.lua`, an immediately detectable error skips the rest of the chunk while
-earlier successful assignments remain in effect. A value that only the
-deferred speech-host handshake can reject fails the startup configuration
+tables when listing is available. Rate is normalized across hosts: `0` is the
+slowest supported rate, `50` is the backend's normal rate, and `100` is the
+fastest. This replaces the backend-native rate values accepted before speech
+protocol 2.2; migrate existing configurations explicitly, because an old value
+such as `1.0` is valid in the new range but now means nearly the slowest rate.
+Pitch and volume remain in the selected backend's domain. Assigning a rate
+outside `0..100`, assigning an unsupported setting or voice, or selecting an ID
+absent from an available voice list, raises a Lua error without changing the
+option. In the Lua REPL the submitted chunk stops and the prompt remains
+available. In `init.lua`, an immediately detectable error skips the rest of the
+chunk while earlier successful assignments remain in effect. A value that only
+the deferred speech-host handshake can reject fails the startup configuration
 boundary instead. Both cases open an error overlay, and configuration errors
 are also written to the structured diagnostic log when `--log` or `--log-file`
 enables logging.
@@ -703,7 +708,7 @@ after the new generation has committed.
 lector.o.speech.server = "native"
 
 -- speaking rate
-lector.o.speech.rate = 1.0
+lector.o.speech.rate = 50
 
 -- backend-domain pitch and volume, when negotiated
 lector.o.speech.pitch = 1.0

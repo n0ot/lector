@@ -1,8 +1,8 @@
-# Lector speech-host protocol 2.1
+# Lector speech-host protocol 2.2
 
 Status: project specification
 
-Protocol: `2.1` (backward compatible with `2.0`)
+Protocol: `2.2` (the host remains backward compatible with `2.0` and `2.1`)
 
 Machine-readable definition:
 [`../crates/lector-tts/openrpc.json`](../crates/lector-tts/openrpc.json)
@@ -111,13 +111,13 @@ NDJSON is Lector-specific because JSON-RPC does not define stream framing.
 be `initialize`, exactly once:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":0,"maximumMinor":1},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":2,"maximumMinor":2},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
 ```
 
 The host selects a minor version within the offered range:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":1},"server":{"name":"lector-tts","version":"0.1.0"},"backend":{"id":"av-foundation","name":"AVFoundation"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite","pitch":"readWrite","volume":"readWrite"},"voices":{"list":true,"current":true,"select":true}}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":2},"server":{"name":"lector-tts","version":"0.1.0"},"backend":{"id":"av-foundation","name":"AVFoundation"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite","pitch":"readWrite","volume":"readWrite"},"voices":{"list":true,"current":true,"select":true}}}}
 ```
 
 The major version identifies an incompatible contract. Minor versions are
@@ -206,6 +206,17 @@ interpreted as `writeOnly` because that version defined only the setter, and
 pitch and volume are unsupported. Lector invokes a setter only for an
 advertised writable setting and treats unknown or missing setting members as
 unsupported.
+
+Protocol 2.2 normalizes rate to the closed range `0..100`: `0` is the
+backend's slowest supported rate, `50` is its normal/default rate, and `100` is
+its fastest supported rate. The host owns both directions of this conversion;
+native rate units never cross a 2.2 connection. If a backend reports its
+normal rate at one of its endpoints, the host uses a monotone mapping across
+the full native range instead of creating two normalized values for one native
+value. Because earlier 2.x versions used a backend-specific rate domain, a
+Lector client exposing the normalized Lua option offers 2.2 as its minimum
+protocol minor. A newer host serving an older client continues to use that
+older version's native rate domain.
 
 ### 5.5 Voices
 
@@ -339,26 +350,28 @@ retains the complete text for the same fresh-ID restart fallback.
 
 ```json
 {"jsonrpc":"2.0","id":6,"method":"speech.getRate"}
-{"jsonrpc":"2.0","id":6,"result":{"rate":1.0}}
+{"jsonrpc":"2.0","id":6,"result":{"rate":50}}
 ```
 
-This protocol 2.1 method is available only when `settings.rate` is
-`readWrite`. It returns the finite current rate in the host backend's
-documented domain. Lector uses it to expose the active value without imposing
-a client-side default on the backend.
+This method is available only when `settings.rate` is `readWrite`. Under
+protocol 2.2 it returns the current normalized rate in the inclusive range
+`0..100`. Under 2.1 it retains the backend-specific domain defined by that
+version.
 
 ### 7.7 `speech.setRate`
 
 ```json
-{"jsonrpc":"2.0","id":7,"method":"speech.setRate","params":{"rate":1.25}}
-{"jsonrpc":"2.0","id":7,"result":{"rate":1.25}}
+{"jsonrpc":"2.0","id":7,"method":"speech.setRate","params":{"rate":65}}
+{"jsonrpc":"2.0","id":7,"result":{"rate":65}}
 ```
 
-`rate` MUST be finite and uses the host backend's documented domain. The host
-MAY clamp it and returns the finite effective value. Lector restores this
-value when replacing a host process. Lector MUST call this method only when
-`settings.rate` is `readWrite` or `writeOnly`; an unsupported host is neither
-queried for rate bounds nor asked to apply a rate.
+Under protocol 2.2, `rate` MUST be finite and in the inclusive range `0..100`.
+The host MUST translate it into its backend's native domain and return an
+effective value in the same normalized range. Values outside the range are
+invalid parameters rather than candidates for clamping. Lector restores this
+normalized value when replacing a host process. Lector MUST call this method
+only when `settings.rate` is `readWrite` or `writeOnly`; an unsupported host is
+neither queried for rate bounds nor asked to apply a rate.
 
 ### 7.8 `speech.getPitch`
 
@@ -558,7 +571,9 @@ resubmission is safe. A later new speech request may replace the suspended
 item, but resume can remain unavailable. Lector also cannot reliably
 reconstruct other items already accepted into an opaque legacy queue.
 Multi-paragraph logical requests are therefore flattened into one utterance
-for legacy hosts. New
+for legacy hosts. Their required `set_rate` method now receives the same
+normalized `0..100` value as Lector's public option; a legacy adapter is
+responsible for converting that value to its backend domain. New
 implementations MUST implement version 2 and MUST NOT depend on the
 unversioned escape hatch.
 
@@ -574,6 +589,7 @@ A conforming version 2 host must:
 5. Translate native indexes to markers or valid UTF-8 byte boundaries.
 6. Implement pause/resume only if it restarts the interrupted word; otherwise
    advertise it as unsupported and provide stop for Lector's restart fallback.
-7. Invoke rate, pitch, volume, and voice operations only when their independent
-   capabilities are advertised; never fabricate an externally managed voice.
+7. Convert every 2.2 rate between the normalized `0..100` domain and native
+   backend units, invoke other settings only when advertised, and never
+   fabricate an externally managed voice.
 8. Respond inside the deadlines, exit on EOF, and clean up descendants.

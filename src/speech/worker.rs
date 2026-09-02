@@ -3,7 +3,7 @@
 //! The terminal event loop owns all screen and tmux state.  A speech backend
 //! is an external side effect and must never be allowed to stall that owner.
 
-use super::protocol::UtteranceId;
+use super::protocol::{UtteranceId, rate_is_normalized};
 use super::{CapabilityStatus, Driver, OptionState, SetOptionOutcome, UtteranceBoundary};
 use anyhow::{Result as DriverResult, anyhow};
 use std::{
@@ -516,8 +516,8 @@ impl Driver for BoundedAsyncDriver {
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
-        if !rate.is_finite() {
-            return Err(anyhow!("speech rate must be finite"));
+        if !rate_is_normalized(rate) {
+            return Err(anyhow!("speech rate must be between 0 and 100 inclusive"));
         }
         self.mailbox.enqueue_rate(rate)?;
         self.rate = rate;
@@ -532,8 +532,8 @@ impl Driver for BoundedAsyncDriver {
     }
 
     fn set_rate_option(&mut self, rate: f32) -> DriverResult<SetOptionOutcome> {
-        if !rate.is_finite() {
-            return Err(anyhow!("speech rate must be finite"));
+        if !rate_is_normalized(rate) {
+            return Err(anyhow!("speech rate must be between 0 and 100 inclusive"));
         }
         let status = self
             .option_state
@@ -770,7 +770,7 @@ mod tests {
         }
 
         fn get_rate(&self) -> f32 {
-            1.0
+            50.0
         }
 
         fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
@@ -850,7 +850,7 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         driver.speak("stale one", false).unwrap();
         driver.speak("stale two", false).unwrap();
-        driver.set_rate(1.5).unwrap();
+        driver.set_rate(75.0).unwrap();
         driver.speak("new", true).unwrap();
         assert_eq!(driver.mailbox.usage().0, 1);
         driver.stop().unwrap();
@@ -888,9 +888,11 @@ mod tests {
         })
         .unwrap();
         assert!(driver.set_rate(f32::NAN).is_err());
+        assert!(driver.set_rate(-0.01).is_err());
+        assert!(driver.set_rate(100.01).is_err());
         assert!(driver.set_pitch_option(f32::INFINITY).is_err());
         assert!(driver.set_volume_option(f32::NEG_INFINITY).is_err());
-        assert_eq!(driver.get_rate(), 1.0);
+        assert_eq!(driver.get_rate(), 50.0);
     }
 
     #[test]
@@ -913,7 +915,7 @@ mod tests {
             }
 
             fn get_rate(&self) -> f32 {
-                1.0
+                50.0
             }
 
             fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {

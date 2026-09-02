@@ -18,6 +18,8 @@ With no listing option, stdin and stdout are reserved for bounded NDJSON
 JSON-RPC. `--backend auto` (the default) selects the first currently available
 engine. Stable backend IDs, selected backend metadata, rate support, and the
 three voice operations are reported explicitly rather than inferred.
+Protocol 2.2 exposes rate as `0` (slowest) through `100` (fastest); the host
+converts that normalized value to each selected backend's native units.
 
 The host is portable independently of the full Lector application. It may be
 launched locally, across an SSH stdio bridge, or through another transport

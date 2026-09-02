@@ -302,7 +302,7 @@ mod tests {
         }
 
         fn get_rate(&self) -> f32 {
-            1.0
+            50.0
         }
 
         fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
@@ -328,7 +328,7 @@ mod tests {
         }
 
         fn get_rate(&self) -> f32 {
-            self.state.rate.unwrap_or(1.0)
+            self.state.rate.unwrap_or(50.0)
         }
 
         fn set_rate(&mut self, rate: f32) -> anyhow::Result<()> {
@@ -636,7 +636,7 @@ mod tests {
         let rates = Rc::new(RefCell::new(Vec::new()));
         let driver = SpeechOptionsDriver {
             state: OptionState {
-                rate: Some(1.0),
+                rate: Some(50.0),
                 rate_status: CapabilityStatus::Supported,
                 ..OptionState::default()
             },
@@ -652,7 +652,7 @@ mod tests {
         fs::write(
             &path,
             r#"
-                lector.o.speech.rate = 1.75
+                lector.o.speech.rate = 75
                 error("do not commit")
             "#,
         )
@@ -660,9 +660,9 @@ mod tests {
         assert!(reload_configuration(&mut screen_reader).is_err());
         assert!(rates.borrow().is_empty());
 
-        fs::write(&path, "lector.o.speech.rate = 1.5").unwrap();
+        fs::write(&path, "lector.o.speech.rate = 65").unwrap();
         reload_configuration(&mut screen_reader).unwrap();
-        assert_eq!(rates.borrow().as_slice(), [1.5]);
+        assert_eq!(rates.borrow().as_slice(), [65.0]);
         fs::remove_file(path).unwrap();
     }
 
@@ -721,7 +721,7 @@ mod tests {
         let current = voice("voice-a", "Voice A");
         let driver = SpeechOptionsDriver {
             state: OptionState {
-                rate: Some(1.25),
+                rate: Some(65.0),
                 rate_status: CapabilityStatus::Supported,
                 pitch: Some(0.75),
                 pitch_status: CapabilityStatus::Supported,
@@ -745,7 +745,7 @@ mod tests {
 
         lua.load(
             r#"
-                assert(lector.o.speech.rate == 1.25)
+                assert(lector.o.speech.rate == 65)
                 assert(lector.o.speech.pitch == 0.75)
                 assert(lector.o.speech.volume == 0.5)
                 assert(lector.o.speech.voice == "voice-a")
@@ -756,7 +756,7 @@ mod tests {
                 assert(voices[1].language == "en-US")
                 assert(voices[1].gender == "neutral")
                 assert(voices[2].id == "voice-b")
-                lector.o.speech.rate = 1.5
+                lector.o.speech.rate = 70
                 lector.o.speech.pitch = 0.8
                 lector.o.speech.volume = 0.6
                 lector.o.speech.voice = "voice-b"
@@ -765,12 +765,19 @@ mod tests {
                 end)
                 assert(ok == false)
                 assert(string.find(tostring(message), "voice ID is not available", 1, true))
+                for _, invalid_rate in ipairs({-0.01, 100.01}) do
+                    local rate_ok, rate_error = pcall(function()
+                        lector.o.speech.rate = invalid_rate
+                    end)
+                    assert(rate_ok == false)
+                    assert(string.find(tostring(rate_error), "between 0 and 100", 1, true))
+                end
             "#,
         )
         .exec()
         .unwrap();
 
-        assert_eq!(rates.borrow().as_slice(), [1.5]);
+        assert_eq!(rates.borrow().as_slice(), [70.0]);
         assert_eq!(pitches.borrow().as_slice(), [0.8]);
         assert_eq!(volumes.borrow().as_slice(), [0.6]);
         assert_eq!(selected.borrow().as_slice(), ["voice-b"]);
@@ -900,7 +907,7 @@ mod tests {
                 assert(lector.o.speech.voice == nil)
                 assert(lector.o.speech.voices == nil)
                 local rate_ok, rate_error = pcall(function()
-                    lector.o.speech.rate = 2.0
+                    lector.o.speech.rate = 50
                 end)
                 assert(rate_ok == false)
                 assert(string.find(tostring(rate_error), "speech.rate is unavailable", 1, true))

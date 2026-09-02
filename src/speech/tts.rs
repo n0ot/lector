@@ -1,6 +1,10 @@
 use super::{CapabilityStatus, Driver, OptionState, SetOptionOutcome};
 use anyhow::Result as DriverResult;
-use tts::Tts;
+use tts::{
+    Tts,
+    host::RateScale,
+    protocol::{NORMAL_RATE, rate_is_normalized},
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -18,7 +22,7 @@ fn backend_error(error: impl std::fmt::Display) -> Error {
 pub struct TtsDriver {
     tts: Tts,
     rate: f32,
-    rate_bounds: Option<(f32, f32)>,
+    rate_scale: Option<RateScale>,
     pitch: Option<f32>,
     pitch_bounds: Option<(f32, f32)>,
     volume: Option<f32>,
@@ -28,13 +32,22 @@ pub struct TtsDriver {
 impl TtsDriver {
     pub fn new() -> Result<Self> {
         let tts = Tts::default().map_err(backend_error)?;
-        let (rate, rate_bounds) = if tts.supported_features().rate {
+        let (rate, rate_scale) = if tts.supported_features().rate {
             let min_rate = tts.min_rate().map_err(backend_error)?;
             let max_rate = tts.max_rate().map_err(backend_error)?;
-            let rate = tts.get_rate().map_err(backend_error)?;
-            (rate, Some((min_rate, max_rate)))
+            let normal_rate = tts.normal_rate().map_err(backend_error)?;
+            let scale = RateScale::new(min_rate, normal_rate, max_rate)
+                .ok_or_else(|| Error::Backend("invalid native speech-rate domain".to_owned()))?;
+            let native_rate = tts.get_rate().map_err(backend_error)?;
+            if !native_rate.is_finite() {
+                return Err(Error::Backend(
+                    "native speech backend returned a non-finite current rate".to_owned(),
+                ));
+            }
+            let rate = scale.normalize(native_rate);
+            (rate, Some(scale))
         } else {
-            (1.0, None)
+            (NORMAL_RATE, None)
         };
         let (pitch, pitch_bounds) = if tts.supported_features().pitch {
             let min = tts.min_pitch().map_err(backend_error)?;
@@ -55,7 +68,7 @@ impl TtsDriver {
         Ok(TtsDriver {
             tts,
             rate,
-            rate_bounds,
+            rate_scale,
             pitch,
             pitch_bounds,
             volume,
@@ -86,17 +99,30 @@ impl Driver for TtsDriver {
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
-        let Some((min_rate, max_rate)) = self.rate_bounds else {
+        if !rate_is_normalized(rate) {
+            return Err(anyhow::anyhow!(
+                "speech rate must be between 0 and 100 inclusive"
+            ));
+        }
+        let Some(scale) = self.rate_scale else {
             return Ok(());
         };
-        let clamped = rate.clamp(min_rate, max_rate);
-        self.tts.set_rate(clamped).map_err(backend_error)?;
-        self.rate = clamped;
+        self.tts
+            .set_rate(scale.to_native(rate))
+            .map_err(backend_error)?;
+        let native_rate = self.tts.get_rate().map_err(backend_error)?;
+        if !native_rate.is_finite() {
+            return Err(Error::Backend(
+                "native speech backend returned a non-finite current rate".to_owned(),
+            )
+            .into());
+        }
+        self.rate = scale.normalize(native_rate);
         Ok(())
     }
 
     fn option_state(&self) -> OptionState {
-        if self.rate_bounds.is_some() {
+        if self.rate_scale.is_some() {
             OptionState {
                 rate: Some(self.rate),
                 rate_status: CapabilityStatus::Supported,
@@ -135,7 +161,7 @@ impl Driver for TtsDriver {
     }
 
     fn set_rate_option(&mut self, rate: f32) -> DriverResult<SetOptionOutcome> {
-        if self.rate_bounds.is_none() {
+        if self.rate_scale.is_none() {
             return Ok(SetOptionOutcome::Unsupported);
         }
         self.set_rate(rate)?;

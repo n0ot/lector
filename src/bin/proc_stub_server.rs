@@ -2,9 +2,10 @@ use anyhow::Result;
 use lector::{
     proc_server_common::{Request, RpcError, ServerNotification, run_server_with_tick},
     speech::protocol::{
-        AcceptedResult, BackendInfo, ControlCapabilities, CurrentVoiceResult, SettingCapabilities,
-        SettingSupport, SpeechCapabilities, SpeechEventNotification, SpeechEventPayload,
-        StopSupport, UtteranceId, VoiceCapabilities, VoiceInfo, VoiceListResult,
+        AcceptedResult, BackendInfo, ControlCapabilities, CurrentVoiceResult, NORMAL_RATE,
+        SettingCapabilities, SettingSupport, SpeechCapabilities, SpeechEventNotification,
+        SpeechEventPayload, StopSupport, UtteranceId, VoiceCapabilities, VoiceInfo,
+        VoiceListResult, rate_is_normalized,
     },
 };
 use serde_json::{Value, json};
@@ -125,7 +126,7 @@ fn main() -> Result<()> {
         .map(|path| OpenOptions::new().create(true).append(true).open(path))
         .transpose()?;
     let state = State {
-        rate: 1.0,
+        rate: NORMAL_RATE,
         pitch: 1.0,
         volume: 1.0,
         voice_id: "stub-a".to_owned(),
@@ -281,7 +282,13 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
                 .get("rate")
                 .and_then(Value::as_f64)
                 .ok_or_else(|| RpcError::invalid_params("missing rate"))?;
-            state.rate = rate as f32;
+            let rate = rate as f32;
+            if request.method == "speech.setRate" && !rate_is_normalized(rate) {
+                return Err(RpcError::invalid_params(
+                    "rate must be between 0 and 100 inclusive",
+                ));
+            }
+            state.rate = rate;
             if state.legacy_protocol || request.method == "set_rate" {
                 Ok(Value::Null)
             } else {
@@ -455,14 +462,15 @@ fn run_adversary(mode: &str, pid_file: Option<&Path>) -> Result<()> {
             "jsonrpc": "2.0",
             "id": initialize_id,
             "result": {
-                "protocol": {"major": 2, "minor": 0},
+                "protocol": {"major": 2, "minor": 2},
                 "server": {"name": "lector-proc-adversary", "version": env!("CARGO_PKG_VERSION")},
                 "capabilities": {
                     "lifecycle": {
                         "started": {"delivery": "reliable"},
                         "terminal": {"delivery": "reliable", "distinguishes": ["completed"]}
                     },
-                    "controls": {"stop": "confirmed"}
+                    "controls": {"stop": "confirmed"},
+                    "settings": {"rate": "readWrite"}
                 },
             },
         })
@@ -504,6 +512,15 @@ fn run_adversary(mode: &str, pid_file: Option<&Path>) -> Result<()> {
                 remaining -= count;
             }
             stdout.write_all(b"\"}\n")?;
+            stdout.flush()?;
+            Ok(())
+        }
+        "out-of-range-rate-result" => {
+            writeln!(
+                stdout,
+                "{}",
+                json!({"jsonrpc": "2.0", "id": id, "result": {"rate": 101}})
+            )?;
             stdout.flush()?;
             Ok(())
         }

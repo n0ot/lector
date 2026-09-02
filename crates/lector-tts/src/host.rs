@@ -8,11 +8,13 @@ use crate::{
     Backends, Error as TtsError, Features, Gender, Tts, UtteranceId as NativeUtteranceId, Voice,
     protocol::{
         AcceptedResult, BackendInfo, ControlCapabilities, CurrentVoiceResult, DeliveryGuarantee,
-        EventCapability, LifecycleCapabilities, MAX_UTTERANCE_TEXT_BYTES, PauseResult,
-        PauseResumeSupport, PitchResult, ProgressCapabilities, ProgressMode, RateResult,
-        SetVoiceParams, SettingCapabilities, SettingSupport, SpeakParams, SpeechCapabilities,
+        EventCapability, LifecycleCapabilities, MAX_UTTERANCE_TEXT_BYTES, NORMAL_RATE,
+        NORMALIZED_RATE_PROTOCOL_MINOR, PauseResult, PauseResumeSupport, PitchResult,
+        ProgressCapabilities, ProgressMode, ProtocolVersion, RateResult, SetVoiceParams,
+        SettingCapabilities, SettingSupport, SpeakParams, SpeechCapabilities,
         SpeechEventNotification, SpeechEventPayload, StopSupport, TerminalCapability, TextPosition,
         UtteranceId, UtteranceParams, VoiceCapabilities, VoiceInfo, VoiceListResult, VolumeResult,
+        rate_is_normalized,
     },
     server::{InitializeResult, Request, RpcError, ServerNotification, run_server_with_tick},
 };
@@ -93,11 +95,12 @@ struct State {
     tts: Tts,
     backend: Backends,
     backend_info: BackendInfo,
-    rate: Option<SettingState>,
+    rate: Option<RateState>,
     pitch: Option<SettingState>,
     volume: Option<SettingState>,
     selected_voice: Option<String>,
     initialized: bool,
+    protocol: Option<ProtocolVersion>,
     capabilities: SpeechCapabilities,
     rpc_log: Option<File>,
     active: Option<ActiveUtterance>,
@@ -110,6 +113,66 @@ struct SettingState {
     current: f32,
     min: f32,
     max: f32,
+}
+
+#[derive(Clone, Copy)]
+struct RateState {
+    current: f32,
+    scale: RateScale,
+}
+
+/// Piecewise-linear translation between Lector's normalized rate and one
+/// backend's native domain. A normal rate strictly inside the native bounds is
+/// anchored at 50 even when it is not their arithmetic midpoint.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RateScale {
+    min: f32,
+    normal: f32,
+    max: f32,
+    split_at_normal: bool,
+}
+
+impl RateScale {
+    #[must_use]
+    pub fn new(min: f32, normal: f32, max: f32) -> Option<Self> {
+        (min.is_finite()
+            && normal.is_finite()
+            && max.is_finite()
+            && min < max
+            && (min..=max).contains(&normal))
+        .then_some(Self {
+            min,
+            normal,
+            max,
+            split_at_normal: normal > min && normal < max,
+        })
+    }
+
+    #[must_use]
+    pub fn normalize(self, native: f32) -> f32 {
+        let native = native.clamp(self.min, self.max);
+        if !self.split_at_normal {
+            return crate::protocol::MAX_RATE * (native - self.min) / (self.max - self.min);
+        }
+        if native <= self.normal {
+            NORMAL_RATE * (native - self.min) / (self.normal - self.min)
+        } else {
+            NORMAL_RATE + NORMAL_RATE * (native - self.normal) / (self.max - self.normal)
+        }
+    }
+
+    #[must_use]
+    pub fn to_native(self, normalized: f32) -> f32 {
+        let normalized = normalized.clamp(crate::protocol::MIN_RATE, crate::protocol::MAX_RATE);
+        if !self.split_at_normal {
+            return self.min + (self.max - self.min) * normalized / crate::protocol::MAX_RATE;
+        }
+        if normalized <= NORMAL_RATE {
+            self.min + (self.normal - self.min) * normalized / NORMAL_RATE
+        } else {
+            self.normal + (self.max - self.normal) * (normalized - NORMAL_RATE) / NORMAL_RATE
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -222,8 +285,19 @@ impl State {
         let rate = if features.rate {
             let min = tts.min_rate().map_err(|error| anyhow::anyhow!(error))?;
             let max = tts.max_rate().map_err(|error| anyhow::anyhow!(error))?;
+            let normal = tts.normal_rate().map_err(|error| anyhow::anyhow!(error))?;
             let current = tts.get_rate().map_err(|error| anyhow::anyhow!(error))?;
-            Some(SettingState { current, min, max })
+            if !current.is_finite() {
+                return Err(anyhow::anyhow!(
+                    "speech backend returned a non-finite current rate"
+                ));
+            }
+            let scale = RateScale::new(min, normal, max).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "speech backend returned invalid rate bounds: min={min}, normal={normal}, max={max}"
+                )
+            })?;
+            Some(RateState { current, scale })
         } else {
             None
         };
@@ -271,6 +345,7 @@ impl State {
             volume,
             selected_voice,
             initialized: false,
+            protocol: None,
             capabilities,
             rpc_log,
             active: None,
@@ -531,27 +606,60 @@ impl State {
             ));
         }
         self.rate = Some(rate);
-        Ok(RateResult { rate: rate.current })
+        Ok(RateResult {
+            rate: if self.uses_normalized_rate() {
+                rate.scale.normalize(rate.current)
+            } else {
+                rate.current
+            },
+        })
     }
 
     fn set_rate(&mut self, rate: f32) -> Result<RateResult, RpcError> {
         if !self.capabilities.settings.rate.can_write() {
             return Err(RpcError::method_not_found("speech.setRate"));
         }
-        if !rate.is_finite() {
+        let normalized = self.uses_normalized_rate();
+        if normalized && !rate_is_normalized(rate) {
+            return Err(RpcError::invalid_params(
+                "rate must be between 0 and 100 inclusive",
+            ));
+        } else if !normalized && !rate.is_finite() {
             return Err(RpcError::invalid_params("rate must be finite"));
         }
         let Some(mut effective) = self.rate else {
             return Err(RpcError::method_not_found("speech.setRate"));
         };
-        effective.current = rate.clamp(effective.min, effective.max);
+        let requested = if normalized {
+            effective.scale.to_native(rate)
+        } else {
+            rate.clamp(effective.scale.min, effective.scale.max)
+        };
         self.tts
-            .set_rate(effective.current)
+            .set_rate(requested)
             .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        effective.current = self
+            .tts
+            .get_rate()
+            .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        if !effective.current.is_finite() {
+            return Err(RpcError::internal_error(
+                "speech backend returned a non-finite rate",
+            ));
+        }
         self.rate = Some(effective);
         Ok(RateResult {
-            rate: effective.current,
+            rate: if normalized {
+                effective.scale.normalize(effective.current)
+            } else {
+                effective.current
+            },
         })
+    }
+
+    fn uses_normalized_rate(&self) -> bool {
+        self.protocol
+            .is_some_and(|version| version.minor >= NORMALIZED_RATE_PROTOCOL_MINOR)
     }
 
     fn current_pitch(&mut self) -> Result<PitchResult, RpcError> {
@@ -940,6 +1048,7 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
             let initialized: InitializeResult = serde_json::from_value(value.clone())
                 .map_err(|error| RpcError::internal_error(error.to_string()))?;
             state.capabilities = initialized.capabilities;
+            state.protocol = Some(initialized.protocol);
             state.initialized = true;
         }
         return result;
@@ -1105,7 +1214,9 @@ fn write_speech_event(log: &Mutex<File>, event: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendAttempt, classify_backend_attempt, native_capabilities, resumable_suffix};
+    use super::{
+        BackendAttempt, RateScale, classify_backend_attempt, native_capabilities, resumable_suffix,
+    };
     use crate::{Error, Features, protocol::SettingSupport};
 
     #[test]
@@ -1113,6 +1224,26 @@ mod tests {
         assert_eq!(resumable_suffix("héllo world", 7), Some("world"));
         assert_eq!(resumable_suffix("héllo world", 2), None);
         assert_eq!(resumable_suffix("héllo world", 99), None);
+    }
+
+    #[test]
+    fn normalized_rate_scale_anchors_both_extremes_and_backend_normal() {
+        let scale = RateScale::new(0.1, 0.5, 2.0).expect("valid backend rate domain");
+        for (normalized, native) in [(0.0, 0.1), (50.0, 0.5), (100.0, 2.0)] {
+            assert!((scale.to_native(normalized) - native).abs() < f32::EPSILON);
+            assert!((scale.normalize(native) - normalized).abs() < f32::EPSILON);
+        }
+        let native = scale.to_native(75.0);
+        assert!((scale.normalize(native) - 75.0).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn normalized_rate_scale_handles_endpoint_normal_and_rejects_invalid_domains() {
+        let endpoint_normal = RateScale::new(1.0, 1.0, 2.0).expect("valid endpoint normal");
+        assert!(endpoint_normal.normalize(1.0).abs() < f32::EPSILON);
+        assert!((endpoint_normal.to_native(100.0) - 2.0).abs() < f32::EPSILON);
+        assert!(RateScale::new(0.0, 1.0, f32::INFINITY).is_none());
+        assert!(RateScale::new(2.0, 1.0, 0.0).is_none());
     }
 
     #[test]

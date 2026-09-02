@@ -2,12 +2,12 @@
   "openrpc": "1.4.0",
   "info": {
     "title": "Lector speech-host protocol",
-    "description": "Version 2.1 of the bidirectional JSON-RPC interface between Lector and a speech host. Messages are UTF-8 NDJSON over stdio. See docs/speech-driver-protocol.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
+    "description": "Version 2.2 of the bidirectional JSON-RPC interface between Lector and a speech host. Messages are UTF-8 NDJSON over stdio. See docs/speech-driver-protocol.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/license/mit"
     },
-    "version": "2.1.0"
+    "version": "2.2.0"
   },
   "externalDocs": {
     "description": "Normative RFC-style protocol specification",
@@ -221,7 +221,7 @@
     {
       "name": "speech.getRate",
       "summary": "Return the current host speaking rate",
-      "description": "Protocol 2.1 method implemented only when settings.rate is readWrite.",
+      "description": "Implemented only when settings.rate is readWrite. Protocol 2.2 returns a normalized value from 0 (slowest) through 100 (fastest), with 50 representing the backend's normal rate.",
       "params": [],
       "result": {
         "name": "currentRate",
@@ -238,7 +238,7 @@
     {
       "name": "speech.setRate",
       "summary": "Set the host speaking rate",
-      "description": "The host may clamp the request and returns its finite effective value.",
+      "description": "Protocol 2.2 accepts a normalized rate from 0 (slowest) through 100 (fastest), with 50 representing the backend's normal rate, and returns the effective normalized value.",
       "paramStructure": "by-name",
       "params": [
         {
@@ -246,7 +246,9 @@
           "required": true,
           "schema": {
             "type": "number",
-            "description": "A finite value in the host backend's rate domain."
+            "minimum": 0,
+            "maximum": 100,
+            "description": "The normalized rate: 0 is slowest, 50 is the backend's normal rate, and 100 is fastest."
           }
         }
       ],
@@ -853,7 +855,9 @@
         "properties": {
           "rate": {
             "type": "number",
-            "description": "The finite effective backend rate."
+            "minimum": 0,
+            "maximum": 100,
+            "description": "The effective normalized rate from 0 through 100."
           }
         },
         "additionalProperties": true
@@ -967,7 +971,7 @@
   },
   "x-lector-protocol": {
     "major": 2,
-    "minor": 1,
+    "minor": 2,
     "unknownMembers": "ignore",
     "unknownCapabilities": "unsupported",
     "unknownNotifications": "ignore",

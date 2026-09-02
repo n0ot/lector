@@ -20,10 +20,10 @@ use std::{
 fn proc_driver_smoke() {
     let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
     let mut driver = ProcDriver::new(&server_path).expect("spawn proc stub server");
-    assert!((driver.get_rate() - 1.0).abs() < f32::EPSILON);
+    assert!((driver.get_rate() - 50.0).abs() < f32::EPSILON);
     driver.speak("hello", true).expect("speak");
-    driver.set_rate(1.25).expect("set_rate");
-    assert!((driver.get_rate() - 1.25).abs() < f32::EPSILON);
+    driver.set_rate(65.0).expect("set_rate");
+    assert!((driver.get_rate() - 65.0).abs() < f32::EPSILON);
     driver.stop().expect("stop");
 }
 
@@ -39,9 +39,9 @@ fn proc_driver_negotiates_the_current_protocol() {
     assert!(Host::capabilities(&driver).settings.pitch.can_write());
     assert!(Host::capabilities(&driver).settings.volume.can_write());
 
-    assert_eq!(Host::get_rate(&mut driver).unwrap(), 1.0);
-    assert_eq!(Host::set_rate(&mut driver, 1.25).unwrap(), 1.25);
-    assert_eq!(Host::get_rate(&mut driver).unwrap(), 1.25);
+    assert_eq!(Host::get_rate(&mut driver).unwrap(), 50.0);
+    assert_eq!(Host::set_rate(&mut driver, 65.0).unwrap(), 65.0);
+    assert_eq!(Host::get_rate(&mut driver).unwrap(), 65.0);
     assert_eq!(Host::get_pitch(&mut driver).unwrap(), 1.0);
     assert_eq!(Host::set_pitch(&mut driver, 0.75).unwrap(), 0.75);
     assert_eq!(Host::get_pitch(&mut driver).unwrap(), 0.75);
@@ -90,8 +90,8 @@ fn proc_driver_accepts_a_method_not_found_initialize_as_legacy() {
         .expect("spawn legacy proc stub server");
     assert!(driver.is_legacy_protocol());
     driver.speak("legacy speech", false).expect("legacy speak");
-    driver.set_rate(1.5).expect("legacy set_rate");
-    assert!((driver.get_rate() - 1.5).abs() < f32::EPSILON);
+    driver.set_rate(70.0).expect("legacy set_rate");
+    assert!((driver.get_rate() - 70.0).abs() < f32::EPSILON);
 }
 
 #[test]
@@ -303,14 +303,25 @@ fn proc_driver_reports_spawn_failures_with_the_requested_path() {
 }
 
 #[test]
-fn proc_driver_preserves_rate_when_server_rejects_invalid_json_number() {
+fn proc_driver_rejects_invalid_normalized_rate_without_changing_it() {
     let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
     let mut driver = ProcDriver::new(&server_path).expect("spawn proc stub server");
 
-    let error = driver.set_rate(f32::NAN).unwrap_err();
+    for rate in [-0.01, 100.01, f32::NAN] {
+        let error = driver.set_rate(rate).unwrap_err();
+        assert!(error.to_string().contains("between 0 and 100"));
+    }
+    assert!((driver.get_rate() - 50.0).abs() < f32::EPSILON);
+}
 
-    assert!(error.to_string().contains("RPC error -32602"));
-    assert!((driver.get_rate() - 1.0).abs() < f32::EPSILON);
+#[test]
+fn proc_driver_rejects_an_out_of_range_rate_from_the_host() {
+    let mut driver = adversarial_driver("out-of-range-rate-result");
+
+    let error = Host::get_rate(&mut driver).unwrap_err();
+    let error = error.downcast_ref::<ProcError>().expect("proc error");
+    assert!(matches!(error, ProcError::InvalidResponse(_)));
+    assert!(error.is_transport_failure());
 }
 
 #[test]

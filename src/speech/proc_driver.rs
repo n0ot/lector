@@ -2,13 +2,14 @@ use super::{
     manager::Host,
     protocol::{
         AcceptedResult, BackendInfo, ClientCapabilities, ControlCapabilities, CurrentVoiceResult,
-        MAX_JSON_SAFE_INTEGER, PauseResult, PitchResult, ProtocolRange, RateResult, SetVoiceParams,
-        SettingCapabilities, SettingSupport, SpeechCapabilities, SpeechEventNotification,
+        MAX_JSON_SAFE_INTEGER, NORMAL_RATE, PauseResult, PitchResult, ProtocolRange, RateResult,
+        SetVoiceParams, SettingCapabilities, SpeechCapabilities, SpeechEventNotification,
         StopSupport, UtteranceId, UtteranceParams, VoiceInfo, VoiceListResult, VolumeResult,
+        rate_is_normalized,
     },
 };
 use crate::proc_server_common::{
-    InitializeParams, InitializeResult, MAX_RPC_FRAME_BYTES, PeerInfo, SPEECH_PROTOCOL_VERSION,
+    InitializeParams, InitializeResult, MAX_RPC_FRAME_BYTES, PeerInfo,
 };
 use anyhow::Result as DriverResult;
 use mio::{Events, Interest, Poll, Token};
@@ -326,7 +327,7 @@ impl ProcDriver {
             request_buf: Vec::with_capacity(256),
             response_buf: Vec::with_capacity(256),
             next_id: 1,
-            rate: 1.0,
+            rate: NORMAL_RATE,
             timeouts,
             legacy_protocol: false,
             backend: None,
@@ -382,7 +383,7 @@ impl ProcDriver {
             "initialize",
             Some(
                 serde_json::to_value(InitializeParams {
-                    protocol: ProtocolRange::current(),
+                    protocol: ProtocolRange::normalized_rate(),
                     client: PeerInfo {
                         name: "lector".to_owned(),
                         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -405,9 +406,9 @@ impl ProcDriver {
         let initialized: InitializeResult = serde_json::from_value(result).map_err(|error| {
             Error::InvalidResponse(format!("invalid initialize result: {error}"))
         })?;
-        if !ProtocolRange::current().supports(initialized.protocol) {
+        if !ProtocolRange::normalized_rate().supports(initialized.protocol) {
             return Err(Error::SpeechProtocolVersion {
-                expected: SPEECH_PROTOCOL_VERSION,
+                expected: "2.2",
                 actual: format!(
                     "{}.{}",
                     initialized.protocol.major, initialized.protocol.minor
@@ -837,14 +838,17 @@ impl Host for ProcDriver {
     }
 
     fn get_rate(&mut self) -> DriverResult<f32> {
+        if self.legacy_protocol {
+            return Ok(self.rate);
+        }
         let result = self.call("speech.getRate", None)?;
         let result = serde_json::from_value::<RateResult>(result)
             .ok()
-            .filter(|result| result.rate.is_finite());
+            .filter(|result| rate_is_normalized(result.rate));
         let Some(result) = result else {
             self.fail_transport();
             return Err(Error::InvalidResponse(
-                "speech.getRate result must contain a finite rate".to_owned(),
+                "speech.getRate result must contain a rate between 0 and 100 inclusive".to_owned(),
             )
             .into());
         };
@@ -853,6 +857,11 @@ impl Host for ProcDriver {
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<f32> {
+        if !rate_is_normalized(rate) {
+            return Err(anyhow::anyhow!(
+                "speech rate must be between 0 and 100 inclusive"
+            ));
+        }
         let method = if self.legacy_protocol {
             "set_rate"
         } else {
@@ -865,11 +874,11 @@ impl Host for ProcDriver {
         }
         let result = serde_json::from_value::<RateResult>(result)
             .ok()
-            .filter(|result| result.rate.is_finite());
+            .filter(|result| rate_is_normalized(result.rate));
         let Some(result) = result else {
             self.fail_transport();
             return Err(Error::InvalidResponse(
-                "set_rate result must contain a finite rate".to_owned(),
+                "speech.setRate result must contain a rate between 0 and 100 inclusive".to_owned(),
             )
             .into());
         };
@@ -1138,7 +1147,7 @@ fn legacy_capabilities() -> SpeechCapabilities {
             ..Default::default()
         },
         settings: SettingCapabilities {
-            rate: SettingSupport::WriteOnly,
+            rate: super::protocol::SettingSupport::WriteOnly,
             ..Default::default()
         },
         ..Default::default()

@@ -122,7 +122,7 @@ fn real_process_startup_retries_once_after_the_first_generation_fails() {
     let stub = stub_spec(&directory, "server", "retry", Some("1"), None);
     let mut supervisor = Supervisor::new(stub.spec);
 
-    supervisor.set_rate(1.75).unwrap();
+    supervisor.set_rate(75.0).unwrap();
     assert_eq!(
         supervisor.set_pitch_option(0.75).unwrap(),
         lector::speech::SetOptionOutcome::Accepted
@@ -139,6 +139,8 @@ fn real_process_startup_retries_once_after_the_first_generation_fails() {
         record["generation"] == 2
             && record["method"] == "initialize"
             && record["identity"] == "retry"
+            && record["params"]["protocol"]["minimumMinor"] == 2
+            && record["params"]["protocol"]["maximumMinor"] == 2
     }));
     assert!(records.iter().any(|record| {
         record["generation"] == 2
@@ -156,7 +158,7 @@ fn real_process_startup_retries_once_after_the_first_generation_fails() {
                 record["method"].as_str(),
                 Some("set_rate" | "speech.setRate")
             )
-            && record["params"]["rate"].as_f64() == Some(1.75)
+            && record["params"]["rate"].as_f64() == Some(75.0)
     }));
 }
 
@@ -182,7 +184,7 @@ fn real_process_crash_restarts_without_replaying_uncertain_speech() {
     let stub = stub_spec(&directory, "server", "restart", None, Some("1"));
     let mut supervisor = Supervisor::new(stub.spec);
     let handle = supervisor.handle();
-    supervisor.set_rate(1.625).unwrap();
+    supervisor.set_rate(70.0).unwrap();
     supervisor.set_pitch_option(0.8).unwrap();
     supervisor.set_volume_option(0.6).unwrap();
     supervisor.start().unwrap();
@@ -208,7 +210,7 @@ fn real_process_crash_restarts_without_replaying_uncertain_speech() {
                 record["method"].as_str(),
                 Some("set_rate" | "speech.setRate")
             )
-            && record["params"]["rate"].as_f64() == Some(1.625)
+            && record["params"]["rate"].as_f64() == Some(70.0)
     }));
     assert!(records(&stub.log).iter().any(|record| {
         record["generation"] == 2
@@ -276,7 +278,7 @@ fn real_process_reconfiguration_is_transactional_and_preserves_exact_args() {
     let old = stub_spec(&directory, "old", "old server", None, None);
     let mut supervisor = Supervisor::new(old.spec);
     let handle = supervisor.handle();
-    supervisor.set_rate(1.375).unwrap();
+    supervisor.set_rate(60.0).unwrap();
     supervisor.start().unwrap();
 
     let rejected = SpeechServerSpec::Process {
@@ -316,7 +318,7 @@ fn real_process_reconfiguration_is_transactional_and_preserves_exact_args() {
         matches!(
             record["method"].as_str(),
             Some("set_rate" | "speech.setRate")
-        ) && record["params"]["rate"].as_f64() == Some(1.375)
+        ) && record["params"]["rate"].as_f64() == Some(60.0)
     }));
     assert!(
         speech_records(&replacement.log)

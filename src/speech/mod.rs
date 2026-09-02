@@ -9,7 +9,7 @@ use std::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use protocol::{TextPosition, UtteranceId, VoiceInfo};
+use protocol::{NORMAL_RATE, TextPosition, UtteranceId, VoiceInfo, rate_is_normalized};
 
 pub mod proc_driver;
 pub mod protocol;
@@ -274,7 +274,7 @@ impl Driver for SilentDriver {
     }
 
     fn get_rate(&self) -> f32 {
-        1.0
+        NORMAL_RATE
     }
 
     fn set_rate(&mut self, _rate: f32) -> DriverResult<()> {
@@ -567,12 +567,12 @@ impl Speech {
     }
 
     pub fn set_rate(&mut self, rate: f32) -> Result<()> {
-        ensure_finite_option("rate", rate)?;
+        ensure_normalized_rate(rate)?;
         self.driver.set_rate(rate).map_err(Error::Driver)
     }
 
     pub fn set_rate_option(&mut self, rate: f32) -> Result<SetOptionOutcome> {
-        ensure_finite_option("rate", rate)?;
+        ensure_normalized_rate(rate)?;
         self.driver.set_rate_option(rate).map_err(Error::Driver)
     }
 
@@ -910,6 +910,16 @@ fn ensure_finite_option(name: &str, value: f32) -> Result<()> {
     }
 }
 
+fn ensure_normalized_rate(rate: f32) -> Result<()> {
+    if rate_is_normalized(rate) {
+        Ok(())
+    } else {
+        Err(Error::Driver(anyhow::anyhow!(
+            "speech rate must be between 0 and 100 inclusive"
+        )))
+    }
+}
+
 /// Collapse one physical line boundary to a space and split a logical
 /// paragraph boundary into independently sequenced utterances. CRLF is one
 /// boundary; lone CR is accepted for terminal-originated text.
@@ -953,7 +963,8 @@ fn split_paragraphs(text: &str) -> Vec<String> {
 mod tests {
     use super::{
         DEFAULT_PARAGRAPH_PAUSE_MS, Driver, Error, Speech, UtteranceBoundary,
-        protocol::UtteranceId, split_paragraphs, symbols,
+        protocol::{NORMAL_RATE, UtteranceId},
+        split_paragraphs, symbols,
     };
     use std::{cell::RefCell, rc::Rc, time::Duration};
 
@@ -1311,20 +1322,20 @@ mod tests {
     #[test]
     fn control_operations_and_interrupt_flag_reach_the_driver() {
         let state = Rc::new(RefCell::new(DriverState {
-            rate: 1.0,
+            rate: NORMAL_RATE,
             ..DriverState::default()
         }));
         let mut speech = Speech::new(Box::new(StatefulDriver(Rc::clone(&state))));
 
-        assert_eq!(speech.get_rate(), 1.0);
-        speech.set_rate(1.75).unwrap();
+        assert_eq!(speech.get_rate(), NORMAL_RATE);
+        speech.set_rate(75.0).unwrap();
         speech.cancel().unwrap();
         speech.pause().unwrap();
         speech.resume().unwrap();
         speech.toggle().unwrap();
         speech.speak("hello", true).unwrap();
 
-        assert_eq!(speech.get_rate(), 1.75);
+        assert_eq!(speech.get_rate(), 75.0);
         assert_eq!(state.borrow().cancels, 1);
         assert_eq!(state.borrow().pauses, 1);
         assert_eq!(state.borrow().resumes, 1);
@@ -1359,7 +1370,7 @@ mod tests {
         }
 
         fn get_rate(&self) -> f32 {
-            1.0
+            NORMAL_RATE
         }
 
         fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
@@ -1377,10 +1388,15 @@ mod tests {
             speech.pause().unwrap_err(),
             speech.resume().unwrap_err(),
             speech.toggle().unwrap_err(),
-            speech.set_rate(2.0).unwrap_err(),
+            speech.set_rate(75.0).unwrap_err(),
         ] {
             assert!(matches!(error, Error::Driver(_)));
             assert!(error.to_string().starts_with("speech driver:"));
+        }
+
+        for rate in [-0.01, 100.01, f32::NAN] {
+            let error = speech.set_rate(rate).unwrap_err();
+            assert!(error.to_string().contains("between 0 and 100"));
         }
     }
 }

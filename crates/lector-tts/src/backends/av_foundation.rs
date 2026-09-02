@@ -21,7 +21,8 @@ use objc2::{
 use objc2_avf_audio::{
     AVAudioBuffer, AVAudioCommonFormat, AVAudioPCMBuffer, AVSpeechBoundary, AVSpeechSynthesisVoice,
     AVSpeechSynthesisVoiceGender, AVSpeechSynthesizer, AVSpeechSynthesizerDelegate,
-    AVSpeechUtterance,
+    AVSpeechUtterance, AVSpeechUtteranceDefaultSpeechRate, AVSpeechUtteranceMaximumSpeechRate,
+    AVSpeechUtteranceMinimumSpeechRate,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSRange, NSString};
 use oxilangtag::LanguageTag;
@@ -556,7 +557,7 @@ impl AvFoundation {
 
         Ok(AvFoundation {
             commands,
-            rate: 0.5,
+            rate: unsafe { AVSpeechUtteranceDefaultSpeechRate },
             volume: 1.,
             pitch: 1.,
             voice: None,
@@ -651,17 +652,17 @@ impl Backend for AvFoundation {
 
     #[instrument(level = "trace", skip(self))]
     fn min_rate(&self) -> f32 {
-        0.1
+        unsafe { AVSpeechUtteranceMinimumSpeechRate }
     }
 
     #[instrument(level = "trace", skip(self))]
     fn max_rate(&self) -> f32 {
-        2.
+        unsafe { AVSpeechUtteranceMaximumSpeechRate }
     }
 
     #[instrument(level = "trace", skip(self))]
     fn normal_rate(&self) -> f32 {
-        0.5
+        unsafe { AVSpeechUtteranceDefaultSpeechRate }
     }
 
     #[instrument(level = "debug", skip(self), err, ret)]
