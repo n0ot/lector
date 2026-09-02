@@ -23,12 +23,13 @@ mod visual_focus;
 use auto_read::AutoReadBuffers;
 use hooks::LuaHooks;
 use options::Options;
-use tracking::{CursorTrackingMode, PendingDelete};
+use tracking::{CursorTrackingMode, PendingDelete, PendingForwardedText};
 use visual_focus::PendingVisualFocusInput;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 const MAX_PENDING_KEY_ECHO_CHARS: usize = 256;
+const MAX_PENDING_FORWARDED_GRAPHEMES: usize = 256;
 const MAX_PENDING_DELETE_INTENTS: usize = 64;
 const MAX_PENDING_DELETE_PRESENTATIONS: u8 = 64;
 const MAX_PENDING_RUNTIME_ERRORS: usize = 16;
@@ -141,6 +142,7 @@ pub struct ScreenReader {
     lua_reload_staging: bool,
     auto_read_buffers: AutoReadBuffers,
     pending_deletes: VecDeque<PendingDelete>,
+    pending_forwarded_text: Option<PendingForwardedText>,
     input_sequence: u64,
     pending_history_navigation: bool,
     pending_visual_focus_input: Option<PendingVisualFocusInput>,
@@ -185,6 +187,7 @@ impl ScreenReader {
             lua_reload_staging: false,
             auto_read_buffers: AutoReadBuffers::default(),
             pending_deletes: VecDeque::new(),
+            pending_forwarded_text: None,
             input_sequence: 0,
             pending_history_navigation: false,
             pending_visual_focus_input: None,
@@ -1731,6 +1734,205 @@ mod tests {
     }
 
     #[test]
+    fn backspace_of_a_trailing_blank_uses_the_target_write_when_pixels_match() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+
+        view.process_changes(b"> x ");
+        view.finalize_changes(0);
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        // The conventional terminal echo writes a blank over a cell which
+        // was already blank, so the final row is visually identical.
+        view.process_changes(b"\x08 \x08");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), [" space "]);
+    }
+
+    #[test]
+    fn trailing_blank_write_survives_an_intervening_summary_finalization() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+
+        view.process_changes(b"> x ");
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        // A quiet-window finalization can retire evidence that predates the
+        // input while the application's response is still in flight.
+        view.finalize_changes(0);
+
+        view.process_changes(b"\x08 \x08");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), [" space "]);
+    }
+
+    #[test]
+    fn backspace_on_the_top_left_cell_stays_silent() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        view.process_changes(b"\x08 \x08");
+
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert!(sr.pending_deletes.is_empty());
+        assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn backspace_on_the_top_row_announces_a_real_character() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+        view.process_changes(b"x");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        view.process_changes(b"\x08 \x08");
+
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["x"]);
+    }
+
+    #[test]
+    fn backspace_can_confirm_text_forwarded_before_its_echo_is_visible() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+        view.process_changes(b"> ");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"x");
+        sr.record_forwarded_text(&view, Some("x"));
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        // Input echo and deletion arrive in one parser batch whose final
+        // snapshot is exactly the original prompt.
+        view.process_changes(b"x\x08 \x08");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["x"]);
+    }
+
+    #[test]
+    fn forwarded_text_then_backspace_can_settle_in_separate_frames() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+        view.process_changes(b"> ");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"x");
+        sr.record_forwarded_text(&view, Some("x"));
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        view.process_changes(b"x");
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert!(speaks.borrow().is_empty());
+        view.finalize_changes(1);
+
+        view.process_changes(b"\x08 \x08");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["x"]);
+    }
+
+    #[test]
+    fn speculative_backspace_waits_when_only_echo_and_cursor_left_arrive() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+        view.process_changes(b"> ");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"x");
+        sr.record_forwarded_text(&view, Some("x"));
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        view.process_changes(b"x\x08");
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(sr.pending_deletes.len(), 1);
+        assert!(speaks.borrow().is_empty());
+
+        view.process_changes(b" \x08");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["x"]);
+    }
+
+    #[test]
+    fn rapid_backspaces_track_multiple_unpresented_printable_keys() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+        view.process_changes(b"> ");
+        view.finalize_changes(0);
+
+        for text in ["x", "y"] {
+            sr.record_last_key(text.as_bytes());
+            sr.record_forwarded_text(&view, Some(text));
+        }
+        for _ in 0..2 {
+            sr.record_last_key(b"\x7f");
+            sr.defer_backspace(&view);
+        }
+
+        view.process_changes(b"xy\x08 \x08\x08 \x08");
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), ["y", "x"]);
+    }
+
+    #[test]
+    fn unpresented_input_at_the_wrap_margin_does_not_guess_a_stale_target() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 4);
+        view.process_changes(b"abc");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"x");
+        sr.record_forwarded_text(&view, Some("x"));
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        assert!(sr.pending_deletes.is_empty());
+        assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn unpresented_cursor_input_prevents_a_backspace_target_guess() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+        view.process_changes(b"abc");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"\x1b[D");
+        sr.record_forwarded_text(&view, None);
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        assert!(sr.pending_deletes.is_empty());
+        assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn an_unforwarded_backspace_discards_its_bound_intent() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+        view.process_changes(b"x");
+        view.finalize_changes(0);
+
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+        sr.record_delete_forwarding_result(false);
+        view.process_changes(b"\x08 \x08");
+
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert!(sr.pending_deletes.is_empty());
+        assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
     fn deferred_backspace_stays_silent_when_cursor_does_not_move() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
@@ -1938,6 +2140,38 @@ mod tests {
         assert!(view.apply_presented_frame(deletion_frame));
         assert!(sr.resolve_pending_delete(&view).unwrap());
         assert_eq!(speaks.borrow().as_slice(), ["c"]);
+    }
+
+    #[test]
+    fn pre_input_target_write_cannot_complete_a_later_backspace() {
+        use crate::presentation::SurfaceId;
+
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(2, 10);
+        view.process_changes(b"> x ");
+        view.finalize_changes(0);
+        view.enable_presentation_tracking();
+
+        // Parsed before the key, this repaint writes the eventual target but
+        // restores the cursor and leaves the visible row unchanged.
+        view.process_changes(b"\x1b7\x1b[1;4H \x1b8");
+        let pre_input = view.capture_live_presentation_frame(SurfaceId(1));
+        sr.record_last_key(b"\x7f");
+        sr.defer_backspace(&view);
+
+        assert!(view.apply_presented_frame(pre_input));
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        view.process_changes(b"\x08");
+        let cursor_only = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(cursor_only));
+        assert!(!sr.resolve_pending_delete(&view).unwrap());
+        assert!(speaks.borrow().is_empty());
+
+        view.process_changes(b" \x08");
+        let completed = view.capture_live_presentation_frame(SurfaceId(1));
+        assert!(view.apply_presented_frame(completed));
+        assert!(sr.resolve_pending_delete(&view).unwrap());
+        assert_eq!(speaks.borrow().as_slice(), [" space "]);
     }
 
     #[test]

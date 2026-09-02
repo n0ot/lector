@@ -170,6 +170,7 @@ impl App {
         // A focus notification can independently repaint the child. Never
         // attribute that later frame to an earlier key press.
         sr.clear_pending_visual_focus_input();
+        sr.clear_pending_forwarded_text();
         let was_focused = sr.terminal_focused();
         let forward_to_app = self
             .view_stack
@@ -245,6 +246,7 @@ impl App {
             }
             Event::Paste(contents) => {
                 sr.clear_pending_visual_focus_input();
+                sr.clear_pending_forwarded_text();
                 self.log_event(&format!("parsed paste event: [{} chars]", contents.len()));
                 let view_action = self
                     .view_stack
@@ -254,6 +256,7 @@ impl App {
             }
             Event::Mouse(mouse) => {
                 sr.clear_pending_visual_focus_input();
+                sr.clear_pending_forwarded_text();
                 if let Some(view) = self.view_stack.active_tmux_connection_mut() {
                     if let Some(action) = view.translate_mouse_input(mouse) {
                         self.last_stdin_update = Some(self.clock.now_ms());
@@ -669,8 +672,11 @@ impl App {
         let history_navigation = !key.is_release()
             && event.modifiers.is_empty()
             && matches!(event.code, KeyCode::Up | KeyCode::Down);
+        let forwarded_text = (!key.is_release())
+            .then(|| key.text().map(|text| text.into_owned()))
+            .flatten();
         if !key.is_release() {
-            sr.record_forwarded_key(key.text().as_deref(), screen_identity);
+            sr.record_forwarded_key(forwarded_text.as_deref(), screen_identity);
         }
         let input = if child_kitty_keyboard_flags == 0 {
             key.legacy_child_bytes(input, application_cursor, application_keypad)
@@ -688,14 +694,28 @@ impl App {
             .view_stack
             .active_mut()
             .handle_key_input(sr, key, &input, pty_out)?;
-        let visual_focus_claim = visual_focus_context.map(|(view_id, revision_boundary)| {
-            let forwarded = match &action {
-                views::ViewAction::PtyInput => !input.is_empty(),
-                views::ViewAction::TmuxInput { bytes, .. } => !bytes.is_empty(),
-                _ => false,
-            };
-            (view_id, revision_boundary, forwarded)
-        });
+        let forwarded = match &action {
+            views::ViewAction::PtyInput => !input.is_empty(),
+            views::ViewAction::TmuxInput { bytes, .. } => !bytes.is_empty(),
+            _ => false,
+        };
+        let visual_focus_claim = visual_focus_context
+            .map(|(view_id, revision_boundary)| (view_id, revision_boundary, forwarded));
+        if !key.is_release() {
+            match event.code {
+                KeyCode::Backspace | KeyCode::Delete => {
+                    sr.record_delete_forwarding_result(forwarded);
+                    if forwarded && event.code == KeyCode::Delete {
+                        sr.record_forwarded_text(self.view_stack.active_mut().model(), None);
+                    }
+                }
+                _ if forwarded => sr.record_forwarded_text(
+                    self.view_stack.active_mut().model(),
+                    forwarded_text.as_deref(),
+                ),
+                _ => sr.clear_pending_forwarded_text(),
+            }
+        }
         if let Some(mode) = kitty_press_mode {
             let target = match &action {
                 views::ViewAction::PtyInput => Some(ForwardedInputTarget::RootPty),

@@ -75,6 +75,7 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        sr.clear_pending_forwarded_text();
         self.log_bytes("dispatching bytes to active view", input);
         self.last_stdin_update = Some(self.clock.now_ms());
         let action = self

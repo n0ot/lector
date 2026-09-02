@@ -282,6 +282,27 @@ pub enum TerminalOperation {
     WriteRun { row: u16, col: u16, text: String },
 }
 
+/// Coordinate-bearing printable writes retained for accessibility evidence.
+///
+/// Renderer operations are disposable optimization hints, but a write which
+/// reached a particular cell can distinguish a completed visually-invisible
+/// edit from a cursor-only prefix. Ghostty supplies these runs only while its
+/// operation observer is reliable, so absence remains deliberately
+/// inconclusive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalCellWrite {
+    pub row: u16,
+    pub col: u16,
+    pub columns: u16,
+    pub(crate) revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CellWriteBoundary {
+    run_count: usize,
+    last_run_columns: u16,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateSummary {
     pub effects: TerminalEffects,
@@ -300,6 +321,10 @@ pub struct UpdateSummary {
     /// parser continuation.
     pub parser_continuation: bool,
     pub operations: Vec<TerminalOperation>,
+    /// Coordinate spans derived from reliable ASCII write operations and
+    /// retained independently of disposable renderer hints.
+    #[doc(hidden)]
+    pub cell_writes: Vec<TerminalCellWrite>,
     pub cursor_operations: usize,
     pub cursor_operations_after_last_line_feed: usize,
     /// Number of observed LF record boundaries. Unlike retained print text,
@@ -342,6 +367,7 @@ impl Default for UpdateSummary {
             output_report_structural: false,
             parser_continuation: false,
             operations: Vec::new(),
+            cell_writes: Vec::new(),
             cursor_operations: 0,
             cursor_operations_after_last_line_feed: 0,
             line_feed_boundaries: 0,
@@ -391,6 +417,7 @@ impl UpdateSummary {
         self.parser_continuation = next.parser_continuation;
         append_printed_runs(&mut self.printed_runs, next.printed_runs);
         append_terminal_operations(&mut self.operations, next.operations);
+        append_terminal_cell_writes(&mut self.cell_writes, next.cell_writes);
         self.cursor_operations = self
             .cursor_operations
             .saturating_add(next.cursor_operations);
@@ -424,6 +451,51 @@ impl UpdateSummary {
 
     pub fn printed_text_into(&self, text: &mut String) {
         printed_runs_text_into(&self.printed_runs, text);
+    }
+
+    pub(crate) fn cell_write_boundary(&self) -> CellWriteBoundary {
+        CellWriteBoundary {
+            run_count: self.cell_writes.len(),
+            last_run_columns: self.cell_writes.last().map_or(0, |write| write.columns),
+        }
+    }
+
+    pub(crate) fn wrote_cell_at_since(
+        &self,
+        boundary: CellWriteBoundary,
+        after_revision: Option<u64>,
+        row: u16,
+        col: u16,
+    ) -> bool {
+        if let Some(revision) = after_revision {
+            return self.cell_writes.iter().any(|write| {
+                write.revision > revision && write_run_covers_cell(write, 0, row, col)
+            });
+        }
+        if boundary.run_count > self.cell_writes.len() {
+            return false;
+        }
+
+        let mut start = boundary.run_count;
+        if boundary.run_count > 0 {
+            let previous_index = boundary.run_count - 1;
+            let Some(previous) = self.cell_writes.get(previous_index) else {
+                return false;
+            };
+            if boundary.last_run_columns > previous.columns {
+                return false;
+            }
+            if boundary.last_run_columns < previous.columns
+                && write_run_covers_cell(previous, boundary.last_run_columns, row, col)
+            {
+                return true;
+            }
+            start = boundary.run_count;
+        }
+
+        self.cell_writes[start..]
+            .iter()
+            .any(|write| write_run_covers_cell(write, 0, row, col))
     }
 
     /// Writes the independently safe linear-output suffix into `text` and
@@ -614,6 +686,43 @@ fn append_terminal_operations(target: &mut Vec<TerminalOperation>, source: Vec<T
             operation => target.push(operation),
         }
     }
+}
+
+fn append_terminal_cell_writes(
+    target: &mut Vec<TerminalCellWrite>,
+    source: Vec<TerminalCellWrite>,
+) {
+    for write in source {
+        if write.columns == 0 {
+            continue;
+        }
+        if let Some(previous) = target.last_mut()
+            && previous.row == write.row
+            && previous.revision == write.revision
+            && usize::from(previous.col) / MAX_COALESCED_WRITE_RUN_COLUMNS
+                == usize::from(write.col) / MAX_COALESCED_WRITE_RUN_COLUMNS
+            && previous
+                .columns
+                .checked_add(write.columns)
+                .is_some_and(|columns| usize::from(columns) <= MAX_COALESCED_WRITE_RUN_COLUMNS)
+            && previous.col.checked_add(previous.columns) == Some(write.col)
+        {
+            previous.columns += write.columns;
+        } else {
+            target.push(write);
+        }
+    }
+}
+
+fn write_run_covers_cell(write: &TerminalCellWrite, start_column: u16, row: u16, col: u16) -> bool {
+    if write.row != row {
+        return false;
+    }
+    let Some(start_col) = write.col.checked_add(start_column) else {
+        return false;
+    };
+    col.checked_sub(start_col)
+        .is_some_and(|offset| offset < write.columns.saturating_sub(start_column))
 }
 
 fn append_terminal_write_run(
@@ -1654,6 +1763,26 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         .filter(|run| run.boundary == GhosttyPrintBoundary::LineFeed)
         .count();
     let linear_output_effect = normalize_ghostty_linear_output_effect(update.linear_output_effect);
+    let operations = update
+        .operations
+        .into_iter()
+        .map(normalize_ghostty_operation)
+        .collect::<Vec<_>>();
+    let cell_writes = operations
+        .iter()
+        .filter_map(|operation| match operation {
+            TerminalOperation::WriteRun { row, col, text } => {
+                let columns = u16::try_from(text.len()).ok()?;
+                (columns > 0).then_some(TerminalCellWrite {
+                    row: *row,
+                    col: *col,
+                    columns,
+                    revision: 0,
+                })
+            }
+            _ => None,
+        })
+        .collect();
     UpdateSummary {
         effects: TerminalEffects {
             bells: effects
@@ -1670,11 +1799,8 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         printed_runs: normalize_ghostty_printed_runs(update.printed_runs),
         output_report_structural: update.output_report_structural,
         parser_continuation: update.parser_continuation,
-        operations: update
-            .operations
-            .into_iter()
-            .map(normalize_ghostty_operation)
-            .collect(),
+        operations,
+        cell_writes,
         cursor_operations: update.cursor_operations,
         cursor_operations_after_last_line_feed: update.cursor_operations_after_last_line_feed,
         line_feed_boundaries,

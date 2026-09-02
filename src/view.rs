@@ -288,6 +288,13 @@ fn compact_history_delta_root(
     Some(Arc::from(Vec::from(materialized)))
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct AccessibilityCellWriteBoundary {
+    generation: u64,
+    summary: crate::terminal::CellWriteBoundary,
+    revision: Option<ViewRevision>,
+}
+
 pub struct View {
     view_id: ViewId,
     presentation_tracking: bool,
@@ -335,6 +342,7 @@ pub struct View {
     /// accessibility snapshot. Snapshot-diff fallbacks retain only fixed-size
     /// structural provenance; transient printed text remains excluded.
     presented_update: UpdateSummary,
+    accessibility_update_generation: u64,
     prev_screen: TerminalSnapshot,
     prev_screen_time: u128,
     review_cursor_position: (u16, u16),
@@ -433,6 +441,7 @@ impl View {
             media: PaneMediaStore::new(Default::default()),
             standalone_update: UpdateSummary::default(),
             presented_update: UpdateSummary::default(),
+            accessibility_update_generation: 1,
             prev_screen,
             prev_screen_time: 0,
             review_cursor_position: cursor_position,
@@ -487,11 +496,12 @@ impl View {
 
     /// Processes one parser batch and returns that batch's update summary.
     ///
-    /// When `retain_for_accessibility` is true, print provenance moves into the
-    /// accessibility owner instead of being cloned. Standalone views merge
-    /// that subset into their pending summary; presentation-tracked views
-    /// append it to the bounded receipt journal. The returned renderer/effect
-    /// delta retains its damage rows but not that accessibility-only text.
+    /// When `retain_for_accessibility` is true, print and cell-write provenance
+    /// move into the accessibility owner instead of being cloned. Standalone
+    /// views merge that subset into their pending summary; presentation-tracked
+    /// views append it to the bounded receipt journal. The returned
+    /// renderer/effect delta retains its damage rows but not that
+    /// accessibility-only evidence.
     /// Callers which need only the immediate delta leave retention false, so
     /// shadow panes retain no cumulative vectors.
     pub(crate) fn process_changes_with_batch(
@@ -584,6 +594,11 @@ impl View {
             retain_for_accessibility,
             application_revision,
         );
+        if self.presentation_tracking {
+            for write in &mut update.cell_writes {
+                write.revision = application_revision.0;
+            }
+        }
         // This boundary flag drives the scheduler for the just-observed PTY
         // batch; unlike damage and printed runs it must not stay sticky until
         // speech finalization.
@@ -601,7 +616,8 @@ impl View {
                     // Standalone callers have no later physical receipt. Keep
                     // their established cumulative summary contract, while the
                     // returned clone remains the exact renderer/effect batch.
-                    let batch_update = update.clone();
+                    let mut batch_update = update.clone();
+                    batch_update.cell_writes.clear();
                     update.operations.clear();
                     self.standalone_update.synchronized_output_opened = false;
                     self.standalone_update.merge(update);
@@ -613,8 +629,12 @@ impl View {
                 // print provenance which neither consumer uses. Leave no
                 // cumulative vectors behind.
                 update.printed_runs.clear();
+                update.cell_writes.clear();
                 update.linear_output_effect = crate::terminal::LinearOutputEffect::Preserve;
                 self.standalone_update = UpdateSummary::default();
+                if !self.presentation_tracking {
+                    self.advance_accessibility_update_generation();
+                }
                 Some(update)
             }
         } else {
@@ -826,6 +846,7 @@ impl View {
         self.completed_linear_record_cache = None;
         self.standalone_update = UpdateSummary::default();
         self.presented_update = UpdateSummary::default();
+        self.advance_accessibility_update_generation();
         if self.presentation_tracking {
             self.finalized_presented_revision = self.presented_revision;
             self.presented_revision_synchronized_output_closed = false;
@@ -893,6 +914,7 @@ impl View {
         // represented by the committed snapshot established below. It must not
         // survive as an unbounded parallel log.
         self.standalone_update = UpdateSummary::default();
+        self.advance_accessibility_update_generation();
         self.reset_accessibility_journal_for_handoff();
         if matches!(
             self.accessibility_read_state,
@@ -1405,6 +1427,7 @@ impl View {
             // frame was captured. The physical snapshot may still flush, but
             // its old facts must never move the accessibility epoch backwards.
             self.presented_update = UpdateSummary::default();
+            self.advance_accessibility_update_generation();
             return;
         }
         if self.presented_accessibility_epoch != epoch {
@@ -1413,6 +1436,7 @@ impl View {
             self.presented_accessibility_evidence_exact = true;
             self.presented_accessibility_requires_snapshot_diff = false;
             self.presented_update = UpdateSummary::default();
+            self.advance_accessibility_update_generation();
         }
 
         let required_after = self
@@ -1423,6 +1447,7 @@ impl View {
             // older snapshot after an ownership reset. It has no parser facts
             // in the new context and must not revive the previous summary.
             self.presented_update = UpdateSummary::default();
+            self.advance_accessibility_update_generation();
             self.presented_accessibility_evidence_revision = revision;
             return;
         }
@@ -1433,6 +1458,7 @@ impl View {
         self.presented_accessibility_evidence_exact &= !discarded_in_required_range;
         if !self.presented_accessibility_evidence_exact {
             self.presented_update = snapshot_diff_provenance(&self.presented_update);
+            self.advance_accessibility_update_generation();
         }
 
         while self
@@ -1458,6 +1484,7 @@ impl View {
             } else {
                 if entry.requires_snapshot_diff {
                     self.presented_update = snapshot_diff_provenance(&self.presented_update);
+                    self.advance_accessibility_update_generation();
                 }
                 self.presented_update
                     .merge(snapshot_diff_provenance(&entry.update));
@@ -2188,6 +2215,7 @@ impl View {
     fn discard_current_accessibility_evidence(&mut self) {
         self.standalone_update = UpdateSummary::default();
         self.presented_update = UpdateSummary::default();
+        self.advance_accessibility_update_generation();
         self.completed_linear_record_cache = None;
     }
 
@@ -2309,6 +2337,38 @@ impl View {
         } else {
             &self.standalone_update
         }
+    }
+
+    pub(crate) fn accessibility_cell_write_boundary(&self) -> AccessibilityCellWriteBoundary {
+        AccessibilityCellWriteBoundary {
+            generation: self.accessibility_update_generation,
+            summary: self.accessibility_update_summary().cell_write_boundary(),
+            revision: self.input_intent_revision_boundary(),
+        }
+    }
+
+    pub(crate) fn accessibility_wrote_cell_since(
+        &self,
+        boundary: AccessibilityCellWriteBoundary,
+        row: u16,
+        col: u16,
+    ) -> bool {
+        let summary_boundary = if boundary.generation == self.accessibility_update_generation {
+            boundary.summary
+        } else {
+            crate::terminal::CellWriteBoundary::default()
+        };
+        self.accessibility_update_summary().wrote_cell_at_since(
+            summary_boundary,
+            boundary.revision.map(|revision| revision.0),
+            row,
+            col,
+        )
+    }
+
+    fn advance_accessibility_update_generation(&mut self) {
+        self.accessibility_update_generation =
+            self.accessibility_update_generation.wrapping_add(1).max(1);
     }
 
     /// Whether the currently accessible, physically presented update is a
@@ -2434,6 +2494,7 @@ impl View {
     pub(crate) fn clear_update_summary(&mut self) {
         self.standalone_update = UpdateSummary::default();
         self.presented_update = UpdateSummary::default();
+        self.advance_accessibility_update_generation();
         if self.presentation_tracking {
             self.reset_accessibility_journal_for_handoff();
         }
@@ -3147,9 +3208,10 @@ fn row_byte_offset(contents: &str, row: usize) -> usize {
         .map_or(contents.len(), |(offset, _)| offset + 1)
 }
 
-/// Transfers print provenance to accessibility and copies changed-row ranges
-/// only when the immediate renderer still owns the batch. Renderer operations,
-/// terminal replies, and side effects never enter the presentation journal.
+/// Transfers print and cell-write provenance to accessibility and copies
+/// changed-row ranges only when the immediate renderer still owns the batch.
+/// Renderer operations, terminal replies, and side effects never enter the
+/// presentation journal.
 fn take_normalized_accessibility_evidence(
     update: &mut UpdateSummary,
     preserve_renderer_damage: bool,
@@ -3163,6 +3225,7 @@ fn take_normalized_accessibility_evidence(
     // reject a carriage-return overwrite of content predating this span.
     UpdateSummary {
         printed_runs: std::mem::take(&mut update.printed_runs),
+        cell_writes: std::mem::take(&mut update.cell_writes),
         linear_output_effect: std::mem::take(&mut update.linear_output_effect),
         output_report_structural: update.output_report_structural,
         parser_continuation: update.parser_continuation,
@@ -3227,6 +3290,12 @@ fn accessibility_evidence_retained_bytes(update: &UpdateSummary) -> usize {
                 .sum::<usize>(),
         )
         .saturating_add(linear_output_bytes)
+        .saturating_add(
+            update
+                .cell_writes
+                .len()
+                .saturating_mul(std::mem::size_of::<crate::terminal::TerminalCellWrite>()),
+        )
         .saturating_add(
             update
                 .changed_rows

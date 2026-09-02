@@ -1,5 +1,5 @@
 use lector::{
-    app::{App, Clock},
+    app::{App, Clock, DIFF_DELAY},
     output_scheduler::OutputSchedulerConfig,
     screen_reader::ScreenReader,
     speech,
@@ -88,6 +88,12 @@ impl Clock for TestClock {
     }
 }
 
+impl TestClock {
+    fn advance_ms(&self, elapsed: u128) {
+        self.0.set(self.0.get().saturating_add(elapsed));
+    }
+}
+
 #[derive(Clone, Default)]
 struct Recorder(Rc<RefCell<Vec<String>>>);
 
@@ -126,10 +132,11 @@ fn reply(serial: usize, lines: &[Vec<u8>], success: bool) -> Vec<u8> {
     bytes
 }
 
-fn ready_app() -> (App, ScreenReader, Recorder, Vec<u8>) {
+fn ready_app_with_clock() -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
     let recorder = Recorder::default();
     let stack = views::ViewStack::new(Box::new(views::PtyView::new(24, 80)));
-    let mut app = App::new_with_clock(stack, Box::new(TestClock::default())).unwrap();
+    let clock = TestClock::default();
+    let mut app = App::new_with_clock(stack, Box::new(clock.clone())).unwrap();
     let mut sr = ScreenReader::new(speech::Speech::new(Box::new(recorder.clone())));
     let mut physical = Vec::new();
     let mut commands = Vec::new();
@@ -183,6 +190,11 @@ fn ready_app() -> (App, ScreenReader, Recorder, Vec<u8>) {
         )
         .unwrap();
     }
+    (app, sr, recorder, clock, physical)
+}
+
+fn ready_app() -> (App, ScreenReader, Recorder, Vec<u8>) {
+    let (app, sr, recorder, _clock, physical) = ready_app_with_clock();
     (app, sr, recorder, physical)
 }
 
@@ -195,6 +207,19 @@ fn tick(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) -> Vec<u8>
     let mut commands = Vec::new();
     app.handle_tick(sr, &mut commands, physical).unwrap();
     commands
+}
+
+fn pane_output_record(pane_id: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut record = format!("%output %{pane_id} ").into_bytes();
+    for &byte in bytes {
+        if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
+            record.push(byte);
+        } else {
+            record.extend_from_slice(format!("\\{byte:03o}").as_bytes());
+        }
+    }
+    record.push(b'\n');
+    record
 }
 
 fn assert_physical_scene(
@@ -890,6 +915,48 @@ fn scheduled_location_changes_wait_for_their_receipt_and_stay_concise() {
         &*recorder.0.borrow(),
         &["remote", "duplicate", "other-session"]
     );
+}
+
+#[test]
+fn tmux_typeahead_backspace_uses_the_active_panes_forwarded_text() {
+    let (mut app, mut sr, recorder, clock, mut physical) = ready_app_with_clock();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    physical.clear();
+
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(20, b"\r\x1b[2K> "),
+        &mut physical,
+    )
+    .expect("queue the active pane baseline");
+    app.drain_scheduled_output(&mut physical, false)
+        .expect("present the active pane baseline");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    let _ = app
+        .maybe_finalize_changes(&mut sr)
+        .expect("finalize the active pane baseline");
+    recorder.0.borrow_mut().clear();
+
+    input(&mut app, &mut sr, &mut physical, b"x\x7f");
+    let commands = tick(&mut app, &mut sr, &mut physical);
+    assert!(!commands.is_empty(), "tmux input was not forwarded");
+
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(20, b"x\x08 \x08"),
+        &mut physical,
+    )
+    .expect("queue the active pane echo and erase");
+    app.drain_scheduled_output(&mut physical, false)
+        .expect("present the visually unchanged active pane result");
+    let _ = app
+        .maybe_finalize_changes(&mut sr)
+        .expect("resolve the active pane deletion");
+
+    assert_eq!(&*recorder.0.borrow(), &["x"]);
 }
 
 #[test]

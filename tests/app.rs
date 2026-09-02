@@ -3979,7 +3979,7 @@ fn cursor_restore_does_not_expose_a_transient_fzf_height_frame() {
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
 
-    app.handle_pty(&mut sr, b"$ ", &mut term_out)
+    app.handle_pty(&mut sr, b"> ", &mut term_out)
         .expect("queue shell prompt");
     app.drain_scheduled_output(&mut term_out, false)
         .expect("present shell prompt");
@@ -4855,6 +4855,44 @@ fn completed_backspace_echo_is_announced_without_finalizing_its_surrounding_upda
         "ordinary finalization must not announce the deletion twice"
     );
     assert_eq!(pty_out, b"\x7f");
+}
+
+#[test]
+fn typeahead_backspace_is_announced_when_echo_and_erase_share_one_frame() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        ..OutputSchedulerConfig::default()
+    });
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+
+    app.handle_pty(&mut sr, b"$ ", &mut term_out)
+        .expect("queue the baseline line");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the baseline line");
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    assert!(
+        app.maybe_finalize_changes(&mut sr)
+            .expect("finalize the baseline line")
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+
+    app.handle_stdin(&mut sr, b"x\x7f", &mut pty_out, &mut term_out)
+        .expect("forward printable input followed immediately by Backspace");
+    app.handle_pty(&mut sr, b"x\x08 \x08", &mut term_out)
+        .expect("queue the combined echo and erase");
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("present the visually unchanged result");
+    let _ = app
+        .maybe_finalize_changes(&mut sr)
+        .expect("resolve the deletion from its presentation evidence");
+
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("x".into(), false)]
+    );
+    assert_eq!(pty_out, b"x\x7f");
 }
 
 #[test]

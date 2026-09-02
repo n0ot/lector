@@ -2,10 +2,12 @@ use super::{Result, ScreenReader};
 use crate::{
     ext::ScreenExt,
     presentation::{ViewId, ViewRevision},
-    terminal::Row,
-    view::View,
+    terminal::{Row, ScreenIdentity},
+    view::{AccessibilityCellWriteBoundary, View},
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 pub(super) enum CursorTrackingMode {
     On,
@@ -22,6 +24,24 @@ pub(super) struct PendingDelete {
     evaluations: u8,
     input_sequence: u64,
     kind: PendingDeleteKind,
+}
+
+pub(super) struct PendingForwardedText {
+    view_id: ViewId,
+    screen: ScreenIdentity,
+    size: (u16, u16),
+    accessibility_revision: Option<ViewRevision>,
+    application_cursor: (u16, u16),
+    row_before: Row,
+    last_input_sequence: u64,
+    graphemes: VecDeque<PendingForwardedGrapheme>,
+    unmodeled: bool,
+}
+
+struct PendingForwardedGrapheme {
+    target: (u16, u16),
+    cursor_after: (u16, u16),
+    text: String,
 }
 
 pub(super) enum PendingDeleteKind {
@@ -42,6 +62,8 @@ pub(super) struct BackspaceCandidate {
     text: String,
     row_before: Row,
     confirmation: BackspaceConfirmation,
+    write_boundary: AccessibilityCellWriteBoundary,
+    speculative: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -59,6 +81,12 @@ enum PendingDeleteEvaluation {
     Partial,
     NotStarted,
     Rejected,
+}
+
+enum ForwardedBackspace {
+    Candidate((u16, u16), BackspaceCandidate),
+    Blocked,
+    Absent,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +116,14 @@ impl DeleteEvidenceCache {
             .prefix_unchanged
             .entry(key)
             .or_insert_with(|| row_prefix_unchanged(before, view, row, end_col))
+    }
+
+    fn target_was_written(&self, candidate: &BackspaceCandidate, view: &View) -> bool {
+        view.accessibility_wrote_cell_since(
+            candidate.write_boundary,
+            candidate.target.0,
+            candidate.target.1,
+        )
     }
 }
 
@@ -164,13 +200,128 @@ impl ScreenReader {
 
     pub fn clear_pending_delete(&mut self) {
         self.pending_deletes.clear();
+        self.pending_forwarded_text = None;
+    }
+
+    pub(crate) fn clear_pending_forwarded_text(&mut self) {
+        self.pending_forwarded_text = None;
+    }
+
+    /// Records printable input which was actually forwarded to the current
+    /// application but has not necessarily reached an accessible frame yet.
+    /// Only unambiguous single-column ASCII graphemes away from the wrap margin
+    /// are modeled. Every other forwarded input marks the position unknown so
+    /// a following Backspace cannot fall back to a stale visible character.
+    pub(crate) fn record_forwarded_text(&mut self, view: &View, text: Option<&str>) {
+        let screen = view.screen();
+        let application_cursor = screen.cursor_position();
+        let size = screen.size();
+        let accessibility_revision = view.accessibility_revision();
+        let same_context = self.pending_forwarded_text.as_ref().is_some_and(|pending| {
+            pending.view_id == view.view_id()
+                && pending.screen == screen.screen
+                && pending.size == size
+                && pending.accessibility_revision == accessibility_revision
+                && pending.application_cursor == application_cursor
+                && pending.last_input_sequence.wrapping_add(1) == self.input_sequence
+                && row_matches_view(&pending.row_before, view, application_cursor.0)
+        });
+        if same_context
+            && self
+                .pending_forwarded_text
+                .as_ref()
+                .is_some_and(|pending| pending.unmodeled)
+        {
+            self.pending_forwarded_text
+                .as_mut()
+                .expect("matching forwarded input context still exists")
+                .last_input_sequence = self.input_sequence;
+            return;
+        }
+        if !same_context {
+            let Some(row_before) = screen.rows.get(usize::from(application_cursor.0)).cloned()
+            else {
+                self.clear_pending_forwarded_text();
+                return;
+            };
+            self.pending_forwarded_text = Some(PendingForwardedText {
+                view_id: view.view_id(),
+                screen: screen.screen,
+                size,
+                accessibility_revision,
+                application_cursor,
+                row_before,
+                last_input_sequence: self.input_sequence,
+                graphemes: VecDeque::new(),
+                unmodeled: false,
+            });
+        }
+
+        let pending = self
+            .pending_forwarded_text
+            .as_mut()
+            .expect("forwarded text context was initialized");
+        let Some(text) = text.filter(|text| !text.is_empty()) else {
+            pending.graphemes.clear();
+            pending.unmodeled = true;
+            pending.last_input_sequence = self.input_sequence;
+            return;
+        };
+        let mut cursor = pending
+            .graphemes
+            .back()
+            .map_or(application_cursor, |grapheme| grapheme.cursor_after);
+        for grapheme in text.graphemes(true) {
+            let width = UnicodeWidthStr::width(grapheme);
+            let Some(next_col) = cursor
+                .1
+                .checked_add(u16::try_from(width).unwrap_or(u16::MAX))
+            else {
+                pending.graphemes.clear();
+                pending.unmodeled = true;
+                pending.last_input_sequence = self.input_sequence;
+                return;
+            };
+            if !grapheme.is_ascii() || width != 1 || next_col >= size.1 {
+                pending.graphemes.clear();
+                pending.unmodeled = true;
+                pending.last_input_sequence = self.input_sequence;
+                return;
+            }
+            if pending.graphemes.len() == super::MAX_PENDING_FORWARDED_GRAPHEMES {
+                pending.graphemes.pop_front();
+            }
+            pending.graphemes.push_back(PendingForwardedGrapheme {
+                target: cursor,
+                cursor_after: (cursor.0, next_col),
+                text: grapheme.to_string(),
+            });
+            cursor = (cursor.0, next_col);
+        }
+        pending.last_input_sequence = self.input_sequence;
+    }
+
+    /// Removes a deletion intent produced by a binding if its bytes did not
+    /// ultimately cross the active view's application-input boundary.
+    pub(crate) fn record_delete_forwarding_result(&mut self, forwarded: bool) {
+        if forwarded {
+            return;
+        }
+        self.clear_pending_forwarded_text();
+        if self
+            .pending_deletes
+            .back()
+            .is_some_and(|pending| pending.input_sequence == self.input_sequence)
+        {
+            self.pending_deletes.pop_back();
+        }
     }
 
     pub fn defer_backspace(&mut self, view: &View) {
         let application_cursor = view.screen().cursor_position();
         let view_id = view.view_id();
         let revision_boundary = view.input_intent_revision_boundary();
-        let cursor = self
+        let chained_cursor = self
             .pending_deletes
             .back()
             .filter(|pending| {
@@ -189,8 +340,26 @@ impl ScreenReader {
                     })
                     .map(|candidate| candidate.target),
                 _ => None,
-            })
-            .unwrap_or(application_cursor);
+            });
+        match self.take_forwarded_backspace(view, chained_cursor) {
+            ForwardedBackspace::Candidate(cursor, candidate) => {
+                self.push_pending_delete(PendingDelete {
+                    view_id,
+                    revision_boundary,
+                    last_evaluated_revision: None,
+                    evaluations: 0,
+                    input_sequence: self.input_sequence,
+                    kind: PendingDeleteKind::Backspace {
+                        cursor,
+                        candidates: vec![candidate],
+                    },
+                });
+                return;
+            }
+            ForwardedBackspace::Blocked => return,
+            ForwardedBackspace::Absent => {}
+        }
+        let cursor = chained_cursor.unwrap_or(application_cursor);
         if view.position_at_or_before_active_semantic_input(cursor) {
             return;
         }
@@ -259,9 +428,9 @@ impl ScreenReader {
     /// Whether a causally later, physically accessible frame contains a
     /// complete deletion result. Cursor movement alone is insufficient:
     /// terminals commonly receive a backspace echo as cursor-left, erase,
-    /// cursor-left across separate writes. Requiring the edited row and its
-    /// logical cursor position to agree keeps that partial frame behind the
-    /// ordinary stabilization window.
+    /// cursor-left across separate writes. The settled cursor must agree with
+    /// either a changed row or positive write evidence at the target cell;
+    /// this also recognizes a real edit whose final pixels are unchanged.
     pub(crate) fn has_confirmed_pending_delete(&self, view: &View) -> bool {
         if self.pending_deletes.is_empty()
             || view.prev_screen().screen != view.screen().screen
@@ -385,6 +554,72 @@ impl ScreenReader {
         self.pending_deletes.push_back(pending);
     }
 
+    fn take_forwarded_backspace(
+        &mut self,
+        view: &View,
+        chained_cursor: Option<(u16, u16)>,
+    ) -> ForwardedBackspace {
+        let Some(pending) = self.pending_forwarded_text.as_ref() else {
+            return ForwardedBackspace::Absent;
+        };
+        let screen = view.screen();
+        let context_valid = pending.view_id == view.view_id()
+            && pending.screen == screen.screen
+            && pending.size == screen.size()
+            && pending.accessibility_revision == view.accessibility_revision()
+            && pending.application_cursor == screen.cursor_position()
+            && pending.last_input_sequence.wrapping_add(1) == self.input_sequence
+            && row_matches_view(&pending.row_before, view, pending.application_cursor.0);
+        if !context_valid {
+            self.clear_pending_forwarded_text();
+            return ForwardedBackspace::Absent;
+        }
+        if pending.unmodeled {
+            self.pending_forwarded_text
+                .as_mut()
+                .expect("validated forwarded input context still exists")
+                .last_input_sequence = self.input_sequence;
+            return ForwardedBackspace::Blocked;
+        }
+        let Some(grapheme) = pending.graphemes.back() else {
+            return ForwardedBackspace::Absent;
+        };
+        if !chained_cursor.is_none_or(|cursor| cursor == grapheme.cursor_after) {
+            let pending = self
+                .pending_forwarded_text
+                .as_mut()
+                .expect("validated forwarded input context still exists");
+            pending.graphemes.clear();
+            pending.unmodeled = true;
+            pending.last_input_sequence = self.input_sequence;
+            return ForwardedBackspace::Blocked;
+        }
+        if view.position_at_or_before_active_semantic_input(grapheme.cursor_after) {
+            self.clear_pending_forwarded_text();
+            return ForwardedBackspace::Absent;
+        }
+
+        let write_boundary = view.accessibility_cell_write_boundary();
+        let pending = self
+            .pending_forwarded_text
+            .as_mut()
+            .expect("validated forwarded text context still exists");
+        let grapheme = pending
+            .graphemes
+            .pop_back()
+            .expect("validated forwarded grapheme still exists");
+        pending.last_input_sequence = self.input_sequence;
+        let candidate = BackspaceCandidate {
+            target: grapheme.target,
+            text: grapheme.text,
+            row_before: pending.row_before.clone(),
+            confirmation: BackspaceConfirmation::CursorAtTarget,
+            write_boundary,
+            speculative: true,
+        };
+        ForwardedBackspace::Candidate(grapheme.cursor_after, candidate)
+    }
+
     pub fn track_highlighting(&mut self, view: &mut View) -> Result<()> {
         let (highlights, prev_highlights) = (
             view.screen().get_highlights(),
@@ -480,15 +715,26 @@ fn evaluate_pending_delete(
             let confirmed = candidates.iter().find_map(|candidate| {
                 let confirmed = match candidate.confirmation {
                     BackspaceConfirmation::CursorAtTarget => {
-                        backspace_cursor_anchor(intents, anchors[index]).is_some_and(|anchor| {
-                            cursor < *old_cursor
-                                && evidence.prefix_unchanged(
-                                    &anchor.row_before,
-                                    view,
-                                    cursor.0,
-                                    cursor.1,
-                                )
-                        }) && evidence.row_changed(&candidate.row_before, view, candidate.target.0)
+                        let settled_at_candidate = backspace_cursor_anchor(intents, anchors[index])
+                            .is_some_and(|anchor| {
+                                cursor < *old_cursor
+                                    && evidence.prefix_unchanged(
+                                        &anchor.row_before,
+                                        view,
+                                        cursor.0,
+                                        cursor.1,
+                                    )
+                            });
+                        if !settled_at_candidate {
+                            false
+                        } else if candidate.speculative {
+                            evidence.target_was_written(candidate, view)
+                                && !target_cell_contains(view, candidate.target, &candidate.text)
+                        } else {
+                            evidence.row_changed(&candidate.row_before, view, candidate.target.0)
+                                || (candidate.text.chars().all(char::is_whitespace)
+                                    && evidence.target_was_written(candidate, view))
+                        }
                     }
                     BackspaceConfirmation::StationaryMargin => {
                         cursor == *old_cursor
@@ -521,8 +767,15 @@ fn evaluate_pending_delete(
                 }
                 let row_changed =
                     evidence.row_changed(&candidate.row_before, view, candidate.target.0);
-                (cursor == candidate.target && !row_changed)
-                    || (cursor == *old_cursor && row_changed)
+                let target_was_written =
+                    candidate.speculative && evidence.target_was_written(candidate, view);
+                let mutation = row_changed || target_was_written;
+                (candidate.speculative
+                    && cursor == candidate.target
+                    && target_was_written
+                    && target_cell_contains(view, candidate.target, &candidate.text))
+                    || (cursor == candidate.target && !mutation)
+                    || (cursor == *old_cursor && mutation)
             });
             if partial {
                 PendingDeleteEvaluation::Partial
@@ -624,6 +877,8 @@ fn rebase_pending_backspace(intent: &mut PendingDelete, view: &View) {
         if let Some(row) = view.screen().rows.get(usize::from(candidate.target.0)) {
             candidate.row_before = row.clone();
         }
+        candidate.write_boundary = view.accessibility_cell_write_boundary();
+        candidate.speculative = false;
     }
 }
 
@@ -705,7 +960,22 @@ fn push_backspace_candidate(
         text,
         row_before,
         confirmation,
+        write_boundary: view.accessibility_cell_write_boundary(),
+        speculative: false,
     });
+}
+
+fn row_matches_view(before: &Row, view: &View, row: u16) -> bool {
+    view.screen()
+        .rows
+        .get(usize::from(row))
+        .is_some_and(|after| {
+            before.cells.len() == after.cells.len()
+                && before.cells.iter().zip(after.cells.iter()).all(|(a, b)| {
+                    a.contents() == b.contents()
+                        && a.is_wide_continuation() == b.is_wide_continuation()
+                })
+        })
 }
 
 fn cell_owner_to_left(
@@ -810,6 +1080,12 @@ fn target_cell_changed(before: &Row, view: &View, (row, col): (u16, u16)) -> boo
         (None, None) => false,
         _ => true,
     }
+}
+
+fn target_cell_contains(view: &View, (row, col): (u16, u16), text: &str) -> bool {
+    view.screen()
+        .cell(row, col)
+        .is_some_and(|cell| cell.contents() == text)
 }
 
 fn revision_passed(
