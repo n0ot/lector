@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Parser, Subcommand};
 use lector::{
     app, diagnostics, lua,
-    presentation::PhysicalTerminalLifecycle,
+    presentation::{PhysicalKeyboardProtocol, PhysicalTerminalLifecycle},
     pty,
     screen_reader::ScreenReader,
     speech,
@@ -356,6 +356,10 @@ impl Drop for EmergencyTerminalGuard {
 
 fn emergency_terminal_cleanup_bytes(focus_was_enabled: Option<bool>) -> Vec<u8> {
     let mut lifecycle = PhysicalTerminalLifecycle::new(focus_was_enabled);
+    // The panic path cannot safely determine whether a late capability probe
+    // selected Kitty. Clean both enhancement families; ordinary shutdown uses
+    // the lifecycle's exact owned protocol.
+    lifecycle.set_keyboard_protocol(PhysicalKeyboardProtocol::Kitty);
     let _ = lifecycle.activate();
     lifecycle.shutdown().bytes
 }
@@ -1575,6 +1579,8 @@ mod tests {
             b"\x1b[?1005l",
             b"\x1b[?1006l",
             b"\x1b[=0u",
+            b"\x1b[>4;0m",
+            b"\x1b[<u",
             b"\x1b[?25h",
             b"\x1b[?1004l",
         ] {
@@ -2135,6 +2141,7 @@ fn do_events(
         loop {
             if shutdown_deadline.is_none() {
                 service_speech_supervisor(sr, speech_supervisor)?;
+                app.present_pending_runtime_error(sr, &mut stdout)?;
             }
             let mut effective_poll_timeout: Option<time::Duration> = None;
             if let Some(deadline) = shutdown_deadline {
@@ -2629,7 +2636,11 @@ fn service_speech_supervisor(
                 sr.commit_speech_reconfiguration(spec);
             }
             speech::supervisor::SupervisorEvent::ReconfigureFailed(message) => {
-                sr.hook_on_error(&message, "speech-reconfigure")?;
+                sr.report_runtime_error(
+                    "Speech configuration failed",
+                    "speech-reconfigure",
+                    message,
+                );
             }
         }
     }

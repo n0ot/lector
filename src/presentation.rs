@@ -1730,6 +1730,10 @@ pub struct RenderCapabilities {
     pub hyperlinks: bool,
     /// Kitty graphics APC upload and placement commands are supported.
     pub kitty_graphics: bool,
+    /// Kitty keyboard flags owned by Lector rather than the active child.
+    /// These are composed into physical presentation without changing the
+    /// child terminal model.
+    pub kitty_keyboard_flags_floor: u8,
     /// Title, working-directory, and related effects are encoded inside render
     /// transactions. Scheduled mode disables this so typed scheduler work owns
     /// the physical effect boundary.
@@ -1742,6 +1746,7 @@ impl Default for RenderCapabilities {
             synchronized_output: false,
             hyperlinks: true,
             kitty_graphics: false,
+            kitty_keyboard_flags_floor: 0,
             inline_terminal_effects: true,
         }
     }
@@ -1872,6 +1877,7 @@ impl RendererBackend for FullSceneVtRenderer {
 }
 
 fn apply_render_capabilities(presented: &mut PresentedScene, capabilities: RenderCapabilities) {
+    presented.modes.kitty_keyboard_flags |= capabilities.kitty_keyboard_flags_floor;
     if !capabilities.hyperlinks
         && presented
             .rows
@@ -3272,6 +3278,43 @@ enum LifecycleState {
     Shutdown,
 }
 
+/// The unambiguous keyboard protocol Lector requests from its physical
+/// terminal. ModifyOtherKeys mode 2 is the broadly implemented fallback for
+/// terminals which do not advertise Kitty's progressive protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalKeyboardProtocol {
+    ModifyOtherKeys,
+    Kitty,
+}
+
+impl PhysicalKeyboardProtocol {
+    pub const fn for_kitty_support(kitty_keyboard: bool) -> Self {
+        if kitty_keyboard {
+            Self::Kitty
+        } else {
+            Self::ModifyOtherKeys
+        }
+    }
+
+    fn enable_bytes(self) -> &'static [u8] {
+        match self {
+            // xterm modifyOtherKeys mode 2 disambiguates every modified key
+            // which has a legacy encoding. Unsupported terminals ignore it.
+            Self::ModifyOtherKeys => b"\x1b[>4;2m",
+            // Push one stack frame before setting Kitty's disambiguation bit;
+            // child-requested flags are composed into this owned frame.
+            Self::Kitty => b"\x1b[>1u",
+        }
+    }
+
+    fn disable_bytes(self) -> &'static [u8] {
+        match self {
+            Self::ModifyOtherKeys => b"\x1b[>4;0m",
+            Self::Kitty => b"\x1b[<u",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LifecycleTransaction {
     pub bytes: Vec<u8>,
@@ -3284,6 +3327,8 @@ pub struct LifecycleTransaction {
 pub struct PhysicalTerminalLifecycle {
     state: LifecycleState,
     focus_was_enabled: Option<bool>,
+    keyboard_protocol: PhysicalKeyboardProtocol,
+    active_keyboard_protocol: Option<PhysicalKeyboardProtocol>,
 }
 
 impl PhysicalTerminalLifecycle {
@@ -3291,6 +3336,33 @@ impl PhysicalTerminalLifecycle {
         Self {
             state: LifecycleState::Inactive,
             focus_was_enabled,
+            keyboard_protocol: PhysicalKeyboardProtocol::ModifyOtherKeys,
+            active_keyboard_protocol: None,
+        }
+    }
+
+    pub fn set_keyboard_protocol(&mut self, protocol: PhysicalKeyboardProtocol) {
+        self.keyboard_protocol = protocol;
+    }
+
+    /// Move an already-active physical terminal to the newly selected
+    /// protocol. This is needed when the Kitty capability probe completes
+    /// after the initial conservative activation.
+    pub fn reconfigure_keyboard_protocol(&mut self) -> LifecycleTransaction {
+        if self.state != LifecycleState::Active
+            || self.active_keyboard_protocol == Some(self.keyboard_protocol)
+        {
+            return LifecycleTransaction::default();
+        }
+        let mut bytes = Vec::new();
+        if let Some(active) = self.active_keyboard_protocol {
+            bytes.extend_from_slice(active.disable_bytes());
+        }
+        bytes.extend_from_slice(self.keyboard_protocol.enable_bytes());
+        self.active_keyboard_protocol = Some(self.keyboard_protocol);
+        LifecycleTransaction {
+            bytes,
+            damage: SceneDamage::Full,
         }
     }
 
@@ -3299,8 +3371,11 @@ impl PhysicalTerminalLifecycle {
             return LifecycleTransaction::default();
         }
         self.state = LifecycleState::Active;
+        self.active_keyboard_protocol = Some(self.keyboard_protocol);
+        let mut bytes = b"\x1b[?1049h\x1b[?1004h".to_vec();
+        bytes.extend_from_slice(self.keyboard_protocol.enable_bytes());
         LifecycleTransaction {
-            bytes: b"\x1b[?1049h\x1b[?1004h".to_vec(),
+            bytes,
             damage: SceneDamage::Full,
         }
     }
@@ -3309,9 +3384,11 @@ impl PhysicalTerminalLifecycle {
         if self.state != LifecycleState::Active {
             return LifecycleTransaction::default();
         }
+        let bytes = self.cleanup_bytes();
+        self.active_keyboard_protocol = None;
         self.state = LifecycleState::Suspended;
         LifecycleTransaction {
-            bytes: self.cleanup_bytes(),
+            bytes,
             damage: SceneDamage::Full,
         }
     }
@@ -3321,8 +3398,11 @@ impl PhysicalTerminalLifecycle {
             return LifecycleTransaction::default();
         }
         self.state = LifecycleState::Active;
+        self.active_keyboard_protocol = Some(self.keyboard_protocol);
+        let mut bytes = b"\x1b[?1049h\x1b[?1004h".to_vec();
+        bytes.extend_from_slice(self.keyboard_protocol.enable_bytes());
         LifecycleTransaction {
-            bytes: b"\x1b[?1049h\x1b[?1004h".to_vec(),
+            bytes,
             damage: SceneDamage::Full,
         }
     }
@@ -3338,6 +3418,7 @@ impl PhysicalTerminalLifecycle {
                 Vec::new()
             }
         };
+        self.active_keyboard_protocol = None;
         self.state = LifecycleState::Shutdown;
         LifecycleTransaction {
             bytes,
@@ -3352,8 +3433,9 @@ impl PhysicalTerminalLifecycle {
         if self.state != LifecycleState::Active {
             return LifecycleTransaction::default();
         }
-        self.state = LifecycleState::ShutdownFence;
         let mut bytes = self.cleanup_modes_bytes();
+        self.active_keyboard_protocol = None;
+        self.state = LifecycleState::ShutdownFence;
         bytes.extend_from_slice(crate::terminal_protocol::SHUTDOWN_FENCE_QUERY);
         LifecycleTransaction {
             bytes,
@@ -3381,7 +3463,15 @@ impl PhysicalTerminalLifecycle {
     }
 
     fn cleanup_modes_bytes(&self) -> Vec<u8> {
-        let mut bytes = b"\x1b[?2026l\x1b[0m\x1b]8;;\x1b\\\x1b>\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[=0u\x1b[?25h".to_vec();
+        let mut bytes = b"\x1b[?2026l\x1b[0m\x1b]8;;\x1b\\\x1b>\x1b[?1l\x1b[?2004l\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[=0u".to_vec();
+        // Always disable the fallback: an unsupported terminal ignores it,
+        // while a late or misreported Kitty capability must not leave mode 2
+        // behind. Pop only when Lector owns a Kitty stack frame.
+        bytes.extend_from_slice(PhysicalKeyboardProtocol::ModifyOtherKeys.disable_bytes());
+        if self.active_keyboard_protocol == Some(PhysicalKeyboardProtocol::Kitty) {
+            bytes.extend_from_slice(PhysicalKeyboardProtocol::Kitty.disable_bytes());
+        }
+        bytes.extend_from_slice(b"\x1b[?25h");
         if !matches!(self.focus_was_enabled, Some(true)) {
             bytes.extend_from_slice(b"\x1b[?1004l");
         }

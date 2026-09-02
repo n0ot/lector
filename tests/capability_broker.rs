@@ -150,6 +150,43 @@ fn startup_probe_replies_are_fragment_safe_out_of_order_and_never_become_input()
 }
 
 #[test]
+fn startup_da1_fence_relinquishes_the_input_stream_in_the_same_read() {
+    let profile = PhysicalTerminalProfile::conservative(geometry());
+    let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 0);
+    let _ = broker.startup_queries();
+    let input = b"\x1b[?64;22c\x1bi\x1bP\x1b]\x1b[\x1bO\x1b_";
+
+    assert_eq!(
+        broker.ingest(input, 1),
+        b"\x1bi\x1bP\x1b]\x1b[\x1bO\x1b_",
+        "bytes following the ordered fence are ordinary input, even when they resemble reply introducers",
+    );
+    assert!(broker.is_finished());
+    assert_eq!(broker.next_deadline_ms(), None);
+}
+
+#[test]
+fn startup_probe_buffers_only_prefixes_of_requested_reply_families() {
+    let profile = PhysicalTerminalProfile::conservative(geometry());
+    let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 0);
+    let _ = broker.startup_queries();
+
+    for input in [
+        b"\x1bi".as_slice(),
+        b"\x1b_".as_slice(),
+        b"\x1bPx".as_slice(),
+        b"\x1b]x".as_slice(),
+    ] {
+        assert_eq!(broker.ingest(input, 1), input, "input={input:?}");
+        assert_eq!(broker.buffered_reply_bytes(), 0, "input={input:?}");
+    }
+
+    assert!(broker.ingest(b"\x1bP!|partial", 2).is_empty());
+    assert_eq!(broker.finish_if_timed_out(53), b"\x1bP!|partial");
+    assert!(broker.is_finished());
+}
+
+#[test]
 fn startup_probe_retains_and_normalizes_exact_outer_default_colors() {
     let profile = PhysicalTerminalProfile::conservative(geometry());
     let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 0);
@@ -370,9 +407,9 @@ fn timed_out_probe_broker_still_owns_delayed_terminal_replies() {
     assert_eq!(application_input, b"cz");
     assert!(broker.profile().kitty_keyboard);
 
-    assert!(broker.ingest(b"\x1b", 102).is_empty());
-    assert_eq!(broker.next_deadline_ms(), Some(153));
-    assert_eq!(broker.finish_if_timed_out(153), b"\x1b");
+    assert_eq!(broker.ingest(b"\x1b", 102), b"\x1b");
+    assert_eq!(broker.next_deadline_ms(), None);
+    assert!(broker.finish_if_timed_out(153).is_empty());
 }
 
 #[test]
@@ -872,6 +909,30 @@ fn live_harness_consumes_outer_probe_replies_before_input_dispatch() {
     assert_eq!(harness.application_input(), b"x");
     assert!(harness.physical_profile().synchronized_output);
     assert!(harness.physical_profile().kitty_keyboard);
+}
+
+#[test]
+fn late_kitty_probe_atomically_replaces_the_non_kitty_keyboard_fallback() {
+    let mut harness = Harness::new(24, 80).expect("create probe harness");
+    harness.configure_physical_terminal(Some(false));
+    harness
+        .activate_physical_terminal()
+        .expect("activate conservative terminal profile");
+    assert!(contains(harness.terminal_output(), b"\x1b[>4;2m"));
+    harness
+        .start_capability_probes()
+        .expect("start outer probes");
+    let before_reply = harness.terminal_output().len();
+
+    harness
+        .handle_terminal_input(b"\x1b[?0u\x1b[?64;22c")
+        .expect("consume Kitty capability and startup fence");
+
+    let transition = &harness.terminal_output()[before_reply..];
+    assert!(transition.starts_with(b"\x1b[>4;0m\x1b[>1u"));
+    assert!(contains(transition, b"\x1b[=1u"));
+    assert!(harness.physical_profile().kitty_keyboard);
+    assert!(harness.application_input().is_empty());
 }
 
 #[test]

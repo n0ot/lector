@@ -16,7 +16,7 @@ impl App {
         } else {
             input.to_vec()
         };
-        self.refresh_probed_profile();
+        self.refresh_probed_profile(term_out)?;
         self.handle_filtered_terminal_input(sr, &input, pty_out, term_out)?;
         self.flush_pending_clipboard_writes(sr, term_out)
     }
@@ -33,6 +33,7 @@ impl App {
     ) -> Result<()> {
         for &byte in input {
             self.pending_input_last_at = Some(self.clock.now_ms());
+            self.pending_input_timeout_ms = u128::from(sr.legacy_escape_timeout_ms());
             self.pending_input.push_back(byte);
 
             if self.pending_input.len() == 1 && self.pending_input[0] == b'\x1B' {
@@ -214,7 +215,7 @@ impl App {
             self.pending_input_last_at = None;
             return Ok(());
         }
-        if self.clock.now_ms().saturating_sub(last_at) < ESC_TIMEOUT_MS {
+        if self.clock.now_ms().saturating_sub(last_at) < self.pending_input_timeout_ms {
             return Ok(());
         }
 
@@ -278,9 +279,11 @@ impl App {
     ) -> Result<()> {
         let key_event = key.event();
         let key_id = (key_event.code, key_event.modifiers, key_event.state);
-        if key_event.kind != KeyEventKind::Release && self.cancel_lua_reader_for_key(sr)? {
+        if key_event.kind != KeyEventKind::Release
+            && self.cancel_lua_reader_for_key(sr, pty_out, term_out)?
+        {
             self.consumed_key_presses.insert(key_id);
-            self.log_event("physical key cancelled and closed Lua reader");
+            self.log_event("physical key cancelled Lua reader and resumed its binding");
             return Ok(());
         }
         if key.control_code() == Some(3)
@@ -417,6 +420,36 @@ impl App {
             match binding {
                 Binding::Builtin(action) => {
                     let action = *action;
+                    if matches!(action, commands::Action::ReloadConfig) {
+                        self.consumed_key_presses.insert(key_id);
+                        if self.lua_task.is_some() {
+                            sr.speak(
+                                "configuration reload is unavailable while a Lua binding is active",
+                                true,
+                            )?;
+                            return Ok(());
+                        }
+                        match crate::lua::reload_configuration(sr) {
+                            Ok(path) => {
+                                let path = path.to_string_lossy();
+                                sr.hook_on_reload(&path)?;
+                                if !self.present_pending_runtime_error(sr, term_out)? {
+                                    sr.speak("configuration reloaded", true)?;
+                                }
+                            }
+                            Err(error) => {
+                                let detail = format!("{error:#}");
+                                sr.hook_on_error(&detail, "config-reload")?;
+                                self.show_popup_error(
+                                    sr,
+                                    "configuration reload failed",
+                                    &detail,
+                                    term_out,
+                                )?;
+                            }
+                        }
+                        return Ok(());
+                    }
                     if matches!(action, commands::Action::OpenReview) {
                         self.open_review(sr, false, term_out)?;
                         self.consumed_key_presses.insert(key_id);
@@ -642,7 +675,12 @@ impl App {
         let input = if child_kitty_keyboard_flags == 0 {
             key.legacy_child_bytes(input, application_cursor, application_keypad)
         } else {
-            Cow::Borrowed(input)
+            key.kitty_child_bytes(
+                input,
+                child_kitty_keyboard_flags,
+                application_cursor,
+                application_keypad,
+            )
         };
         self.log_bytes("dispatching decoded key to active view", &input);
         self.last_stdin_update = Some(self.clock.now_ms());

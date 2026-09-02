@@ -60,6 +60,7 @@ impl FromStr for SystemClipboardProvider {
     }
 }
 
+#[derive(Clone)]
 pub struct Clipboard {
     idx: usize,
     clipboards: VecDeque<String>,

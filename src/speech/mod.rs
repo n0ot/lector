@@ -1,7 +1,9 @@
 use anyhow::Result as DriverResult;
 use regex::Regex;
 use std::{
+    cell::RefCell,
     fmt::Write,
+    rc::Rc,
     sync::LazyLock,
     time::{Duration, Instant},
 };
@@ -243,6 +245,23 @@ pub struct Speech {
     paragraph_pause: Duration,
 }
 
+/// One reader submission plus the monotone relationship between byte offsets
+/// in the normalized host text and byte offsets in the original view text.
+pub(crate) struct ReaderSubmission {
+    pub(crate) utterance_id: UtteranceId,
+    source_offsets: Vec<usize>,
+}
+
+impl ReaderSubmission {
+    pub(crate) fn source_offset(&self, spoken_offset: usize) -> usize {
+        self.source_offsets
+            .get(spoken_offset)
+            .copied()
+            .or_else(|| self.source_offsets.last().copied())
+            .unwrap_or(0)
+    }
+}
+
 struct SilentDriver;
 
 impl Driver for SilentDriver {
@@ -278,6 +297,97 @@ impl Driver for SilentDriver {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ConfiguredSpeechOptions {
+    rate: Option<f32>,
+    pitch: Option<f32>,
+    volume: Option<f32>,
+    voice: Option<String>,
+}
+
+/// Side-effect-free speech driver used while a replacement Lua configuration
+/// is evaluated. It mirrors the active host's negotiated capabilities so the
+/// ordinary Lua validation path remains authoritative, but records accepted
+/// assignments instead of touching the live host.
+struct ConfigurationDriver {
+    state: OptionState,
+    fallback_rate: f32,
+    configured: Rc<RefCell<ConfiguredSpeechOptions>>,
+}
+
+impl Driver for ConfigurationDriver {
+    fn speak(&mut self, _text: &str, _interrupt: bool) -> DriverResult<()> {
+        Ok(())
+    }
+
+    fn stop(&mut self) -> DriverResult<()> {
+        Ok(())
+    }
+
+    fn get_rate(&self) -> f32 {
+        self.state.rate.unwrap_or(self.fallback_rate)
+    }
+
+    fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
+        self.configured.borrow_mut().rate = Some(rate);
+        self.state.rate = Some(rate);
+        Ok(())
+    }
+
+    fn option_state(&self) -> OptionState {
+        self.state.clone()
+    }
+
+    fn set_rate_option(&mut self, rate: f32) -> DriverResult<SetOptionOutcome> {
+        if self.state.rate_status == CapabilityStatus::Unsupported {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        self.configured.borrow_mut().rate = Some(rate);
+        if self.state.rate_status == CapabilityStatus::Supported {
+            self.state.rate = Some(rate);
+        }
+        Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn set_pitch_option(&mut self, pitch: f32) -> DriverResult<SetOptionOutcome> {
+        if self.state.pitch_status == CapabilityStatus::Unsupported {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        self.configured.borrow_mut().pitch = Some(pitch);
+        if self.state.pitch_status == CapabilityStatus::Supported {
+            self.state.pitch = Some(pitch);
+        }
+        Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn set_volume_option(&mut self, volume: f32) -> DriverResult<SetOptionOutcome> {
+        if self.state.volume_status == CapabilityStatus::Unsupported {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        self.configured.borrow_mut().volume = Some(volume);
+        if self.state.volume_status == CapabilityStatus::Supported {
+            self.state.volume = Some(volume);
+        }
+        Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn set_voice_option(&mut self, voice_id: &str) -> DriverResult<SetOptionOutcome> {
+        if self.state.voice_selection_status == CapabilityStatus::Unsupported {
+            return Ok(SetOptionOutcome::Unsupported);
+        }
+        self.configured.borrow_mut().voice = Some(voice_id.to_owned());
+        if self.state.voice_status == CapabilityStatus::Supported {
+            self.state.voice = self
+                .state
+                .voices
+                .as_ref()
+                .and_then(|voices| voices.iter().find(|voice| voice.id == voice_id))
+                .cloned();
+        }
+        Ok(SetOptionOutcome::Accepted)
+    }
+}
+
 impl Speech {
     pub fn new(driver: Box<dyn Driver>) -> Speech {
         Speech {
@@ -295,6 +405,48 @@ impl Speech {
         Self::new(Box::new(SilentDriver))
     }
 
+    pub(crate) fn configuration_candidate(&self) -> (Speech, Rc<RefCell<ConfiguredSpeechOptions>>) {
+        let configured = Rc::new(RefCell::new(ConfiguredSpeechOptions::default()));
+        let driver = ConfigurationDriver {
+            state: self.driver.option_state(),
+            fallback_rate: self.driver.get_rate(),
+            configured: Rc::clone(&configured),
+        };
+        let mut candidate = Speech::new(Box::new(driver));
+        // These are user-visible runtime choices rather than replacement
+        // tables. Preserve them unless the new init.lua explicitly assigns a
+        // different value. Symbol definitions are rebuilt from Lector's
+        // defaults so deleting a customization from init.lua removes it.
+        candidate.symbol_level = self.symbol_level;
+        candidate.paragraph_pause = self.paragraph_pause;
+        (candidate, configured)
+    }
+
+    pub(crate) fn apply_configured_options(
+        &mut self,
+        configured: &ConfiguredSpeechOptions,
+    ) -> Result<()> {
+        if let Some(rate) = configured.rate {
+            require_option("rate", self.set_rate_option(rate)?)?;
+        }
+        if let Some(pitch) = configured.pitch {
+            require_option("pitch", self.set_pitch_option(pitch)?)?;
+        }
+        if let Some(volume) = configured.volume {
+            require_option("volume", self.set_volume_option(volume)?)?;
+        }
+        if let Some(voice) = configured.voice.as_deref() {
+            require_option("voice", self.set_voice_option(voice)?)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replace_lua_configuration_from(&mut self, candidate: &mut Speech) {
+        self.symbol_level = candidate.symbol_level;
+        self.symbols_map = std::mem::take(&mut candidate.symbols_map);
+        self.paragraph_pause = candidate.paragraph_pause;
+    }
+
     pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<UtteranceId> {
         let id = UtteranceId::new(self.next_utterance_id.to_string());
         self.next_utterance_id = self.next_utterance_id.wrapping_add(1);
@@ -303,106 +455,15 @@ impl Speech {
         }
 
         let mut processed = std::mem::take(&mut self.processed);
-        processed.clear();
-        processed.reserve(text.len());
-
-        // If the text is a single character, increase the symbol level to Level::Character to
-        // read the symbol no matter what.
-        let text = if text.chars().all(char::is_whitespace) {
-            text
-        } else {
-            text.trim()
-        };
-        let level = match text.chars().count() {
-            1 => symbols::Level::Character,
-            _ => self.symbol_level,
-        };
-
-        let mut prev_g: Option<&str> = None;
         let mut run_string = std::mem::take(&mut self.run);
-        run_string.clear();
-        let mut run_count = 0;
-        // Loop N+1 times, where N is the number of graphemes,
-        // to compute the final run at the end.
-        for g in UnicodeSegmentation::graphemes(text, true)
-            .map(Some)
-            .chain(std::iter::once(None))
-        {
-            if prev_g.is_none() || prev_g == g {
-                run_count += 1;
-                prev_g = g;
-                continue;
-            }
-
-            // the previous run has ended
-            let mut collapse_repeated = run_count >= MIN_REPEAT_COUNT;
-            run_string.clear();
-
-            if let Some(symbol) = self.symbols_map.get(prev_g.unwrap()) {
-                if level >= symbol.level {
-                    match symbol.include_original {
-                        symbols::IncludeOriginal::Before
-                            if !processed.is_empty() && level != symbols::Level::Character =>
-                        {
-                            write!(
-                                &mut run_string,
-                                "{} {} ",
-                                prev_g.unwrap(),
-                                symbol.replacement
-                            )
-                            .expect("writing to a String cannot fail")
-                        }
-                        symbols::IncludeOriginal::After if level != symbols::Level::Character => {
-                            write!(
-                                &mut run_string,
-                                " {}{} ",
-                                symbol.replacement,
-                                prev_g.unwrap()
-                            )
-                            .expect("writing to a String cannot fail")
-                        }
-                        _ => write!(&mut run_string, " {} ", symbol.replacement)
-                            .expect("writing to a String cannot fail"),
-                    }
-                } else {
-                    // It doesn't make sense to collapse repeated symbols that aren't expanded
-                    collapse_repeated = false;
-                }
-                if !symbol.repeat {
-                    collapse_repeated = false;
-                }
-            }
-
-            if run_string.is_empty()
-                && let Some(v) = emojis::get(prev_g.unwrap())
-            {
-                write!(&mut run_string, " {} ", v.name()).expect("writing to a String cannot fail");
-            }
-
-            if run_string.is_empty() {
-                collapse_repeated = false; // Only collapse for symbols and emojis
-                run_string.push_str(prev_g.unwrap());
-            }
-
-            if run_string
-                .chars()
-                .all(|c| c.is_whitespace() || c.is_numeric())
-            {
-                collapse_repeated = false;
-            }
-
-            if collapse_repeated {
-                write!(&mut processed, " {} {} ", run_count, run_string)
-                    .expect("writing to a String cannot fail");
-            } else {
-                for _ in 0..run_count {
-                    processed.push_str(run_string.as_str());
-                }
-            }
-
-            run_count = 1;
-            prev_g = g;
-        }
+        let _ = expand_speech_text(
+            text,
+            self.symbol_level,
+            &self.symbols_map,
+            &mut processed,
+            &mut run_string,
+            false,
+        );
 
         // Break up mixed-case words
         let result = {
@@ -444,18 +505,41 @@ impl Speech {
         result.map(|()| id)
     }
 
-    /// Submit one coordinate-mapped utterance without text rewriting.  The
-    /// reader needs host byte offsets to refer to the exact source string;
-    /// ordinary speech continues to use symbol and emoji expansion above.
-    pub(crate) fn speak_for_reader(&mut self, text: &str) -> Result<UtteranceId> {
+    /// Normalize a coordinate-mapped utterance through the same symbol, emoji,
+    /// and case pipeline as ordinary speech while retaining enough origin
+    /// information to translate host progress back to the source view.
+    pub(crate) fn speak_for_reader(&mut self, text: &str) -> Result<ReaderSubmission> {
         let id = UtteranceId::new(self.next_utterance_id.to_string());
         self.next_utterance_id = self.next_utterance_id.wrapping_add(1);
-        if !text.is_empty() {
+        let mut processed = std::mem::take(&mut self.processed);
+        let mut run_string = std::mem::take(&mut self.run);
+        let source_offsets = expand_speech_text(
+            text,
+            self.symbol_level,
+            &self.symbols_map,
+            &mut processed,
+            &mut run_string,
+            true,
+        )
+        .expect("reader speech requests an offset map");
+        let (processed, source_offsets) =
+            insert_case_boundaries(processed, source_offsets, &EXPAND_START_CAPS);
+        let (processed, source_offsets) =
+            insert_case_boundaries(processed, source_offsets, &EXPAND_END_CAPS);
+        let result = if processed.is_empty() {
+            Ok(())
+        } else {
             self.driver
-                .speak_utterance(&id, text, true)
-                .map_err(Error::Driver)?;
-        }
-        Ok(id)
+                .speak_utterance(&id, &processed, true)
+                .map_err(Error::Driver)
+        };
+        self.processed = processed;
+        self.run = run_string;
+        result?;
+        Ok(ReaderSubmission {
+            utterance_id: id,
+            source_offsets,
+        })
     }
 
     pub fn cancel(&mut self) -> Result<()> {
@@ -610,6 +694,212 @@ impl Speech {
     }
 }
 
+fn expand_speech_text(
+    source: &str,
+    symbol_level: symbols::Level,
+    symbols_map: &symbols::SymbolMap,
+    processed: &mut String,
+    run_string: &mut String,
+    map_offsets: bool,
+) -> Option<Vec<usize>> {
+    processed.clear();
+    processed.reserve(source.len());
+    run_string.clear();
+
+    let (text, source_base) = if source.chars().all(char::is_whitespace) {
+        (source, 0)
+    } else {
+        let source_base = source.len().saturating_sub(source.trim_start().len());
+        (source.trim(), source_base)
+    };
+    let level = match text.chars().count() {
+        1 => symbols::Level::Character,
+        _ => symbol_level,
+    };
+    let mut source_offsets = map_offsets.then(|| {
+        let mut offsets = Vec::with_capacity(source.len().saturating_add(1));
+        offsets.push(source_base);
+        offsets
+    });
+
+    let mut previous: Option<(usize, &str)> = None;
+    let mut run_count = 0usize;
+    for current in UnicodeSegmentation::grapheme_indices(text, true)
+        .map(Some)
+        .chain(std::iter::once(None))
+    {
+        let current_grapheme = current.map(|(_, grapheme)| grapheme);
+        if previous.is_none()
+            || previous.is_some_and(|(_, grapheme)| Some(grapheme) == current_grapheme)
+        {
+            run_count = run_count.saturating_add(1);
+            if previous.is_none() {
+                previous = current;
+            }
+            continue;
+        }
+
+        let (run_start, grapheme) = previous.expect("a completed grapheme run has a source");
+        let run_end = current.map_or(text.len(), |(offset, _)| offset);
+        let mut collapse_repeated = run_count >= MIN_REPEAT_COUNT;
+        run_string.clear();
+
+        if let Some(symbol) = symbols_map.get(grapheme) {
+            if level >= symbol.level {
+                match symbol.include_original {
+                    symbols::IncludeOriginal::Before
+                        if !processed.is_empty() && level != symbols::Level::Character =>
+                    {
+                        write!(run_string, "{} {} ", grapheme, symbol.replacement)
+                            .expect("writing to a String cannot fail")
+                    }
+                    symbols::IncludeOriginal::After if level != symbols::Level::Character => {
+                        write!(run_string, " {}{} ", symbol.replacement, grapheme)
+                            .expect("writing to a String cannot fail")
+                    }
+                    _ => write!(run_string, " {} ", symbol.replacement)
+                        .expect("writing to a String cannot fail"),
+                }
+            } else {
+                collapse_repeated = false;
+            }
+            if !symbol.repeat {
+                collapse_repeated = false;
+            }
+        }
+
+        if run_string.is_empty()
+            && let Some(emoji) = emojis::get(grapheme)
+        {
+            write!(run_string, " {} ", emoji.name()).expect("writing to a String cannot fail");
+        }
+        if run_string.is_empty() {
+            collapse_repeated = false;
+            run_string.push_str(grapheme);
+        }
+        if run_string
+            .chars()
+            .all(|character| character.is_whitespace() || character.is_numeric())
+        {
+            collapse_repeated = false;
+        }
+
+        let absolute_start = source_base.saturating_add(run_start);
+        let absolute_end = source_base.saturating_add(run_end);
+        if collapse_repeated {
+            let output_start = processed.len();
+            write!(processed, " {} {} ", run_count, run_string)
+                .expect("writing to a String cannot fail");
+            map_generated_text(
+                &mut source_offsets,
+                output_start,
+                processed.len(),
+                absolute_start,
+                absolute_end,
+            );
+        } else if run_string == grapheme {
+            append_exact_text(
+                processed,
+                &mut source_offsets,
+                &text[run_start..run_end],
+                absolute_start,
+            );
+        } else {
+            for occurrence in 0..run_count {
+                let occurrence_start =
+                    absolute_start.saturating_add(occurrence.saturating_mul(grapheme.len()));
+                let occurrence_end = occurrence_start.saturating_add(grapheme.len());
+                let output_start = processed.len();
+                processed.push_str(run_string);
+                map_generated_text(
+                    &mut source_offsets,
+                    output_start,
+                    processed.len(),
+                    occurrence_start,
+                    occurrence_end,
+                );
+            }
+        }
+
+        previous = current;
+        run_count = usize::from(current.is_some());
+    }
+
+    source_offsets
+}
+
+fn append_exact_text(
+    output: &mut String,
+    source_offsets: &mut Option<Vec<usize>>,
+    text: &str,
+    source_start: usize,
+) {
+    let output_start = output.len();
+    output.push_str(text);
+    let Some(source_offsets) = source_offsets else {
+        return;
+    };
+    debug_assert_eq!(source_offsets.len(), output_start.saturating_add(1));
+    source_offsets.extend((1..=text.len()).map(|offset| source_start.saturating_add(offset)));
+}
+
+fn map_generated_text(
+    source_offsets: &mut Option<Vec<usize>>,
+    output_start: usize,
+    output_end: usize,
+    source_start: usize,
+    source_end: usize,
+) {
+    let Some(source_offsets) = source_offsets else {
+        return;
+    };
+    debug_assert_eq!(source_offsets.len(), output_start.saturating_add(1));
+    source_offsets.resize(output_end.saturating_add(1), source_start);
+    if let Some(last) = source_offsets.last_mut() {
+        *last = source_end;
+    }
+}
+
+fn insert_case_boundaries(
+    text: String,
+    source_offsets: Vec<usize>,
+    pattern: &Regex,
+) -> (String, Vec<usize>) {
+    let positions = pattern
+        .captures_iter(&text)
+        .filter_map(|captures| captures.get(2).map(|group| group.start()))
+        .collect::<Vec<_>>();
+    if positions.is_empty() {
+        return (text, source_offsets);
+    }
+
+    debug_assert_eq!(source_offsets.len(), text.len().saturating_add(1));
+    let mut expanded = String::with_capacity(text.len().saturating_add(positions.len()));
+    let mut expanded_offsets =
+        Vec::with_capacity(source_offsets.len().saturating_add(positions.len()));
+    expanded_offsets.push(source_offsets[0]);
+    let mut previous = 0usize;
+    for position in positions {
+        expanded.push_str(&text[previous..position]);
+        expanded_offsets.extend_from_slice(&source_offsets[previous + 1..=position]);
+        expanded.push(' ');
+        expanded_offsets.push(source_offsets[position]);
+        previous = position;
+    }
+    expanded.push_str(&text[previous..]);
+    expanded_offsets.extend_from_slice(&source_offsets[previous + 1..]);
+    (expanded, expanded_offsets)
+}
+
+fn require_option(name: &str, outcome: SetOptionOutcome) -> Result<()> {
+    match outcome {
+        SetOptionOutcome::Accepted => Ok(()),
+        SetOptionOutcome::Unsupported => Err(Error::Driver(anyhow::anyhow!(
+            "lector.o.speech.{name} became unavailable while committing configuration"
+        ))),
+    }
+}
+
 fn ensure_finite_option(name: &str, value: f32) -> Result<()> {
     if value.is_finite() {
         Ok(())
@@ -711,6 +1001,35 @@ mod tests {
             output.borrow().as_slice(),
             ["camel Case HTTP Server  4  number  ", " space "]
         );
+    }
+
+    #[test]
+    fn reader_normalization_maps_expanded_speech_back_to_source_bytes() {
+        let (mut speech, output) = recorder();
+        speech.set_symbol_level(symbols::Level::All);
+        speech.set_symbol(
+            "∩",
+            "intersect",
+            symbols::Level::Some,
+            symbols::IncludeOriginal::Never,
+            false,
+        );
+        let source = "A∩camelCase";
+
+        let submission = speech.speak_for_reader(source).unwrap();
+
+        let spoken = output.borrow()[0].clone();
+        assert_eq!(spoken, "A intersect camel Case");
+        let symbol_word = spoken.find("intersect").unwrap();
+        assert_eq!(submission.source_offset(symbol_word), 1);
+        let camel_word = spoken.find("camel").unwrap();
+        assert_eq!(submission.source_offset(camel_word), "A∩".len());
+        let case_word = spoken.find("Case").unwrap();
+        assert_eq!(
+            submission.source_offset(case_word),
+            source.find("Case").unwrap()
+        );
+        assert_eq!(submission.source_offset(spoken.len()), source.len());
     }
 
     #[test]

@@ -24,20 +24,24 @@ pub fn setup<F>(
 where
     F: FnOnce(&mut ScreenReader) -> anyhow::Result<()>,
 {
-    let config_dir = effective_config_dir(&init_lua_file)?;
+    let config_file = if load_init_file && !init_lua_file.as_os_str().is_empty() {
+        Some(std::path::absolute(&init_lua_file).map_err(Error::external)?)
+    } else {
+        None
+    };
+    let config_dir = config_file
+        .as_deref()
+        .map(effective_config_dir)
+        .transpose()?
+        .flatten();
+    screen_reader.set_config_file(config_file.clone());
     screen_reader.set_config_dir(config_dir);
-    let lua = Rc::new(Lua::new_with(
-        StdLib::ALL_SAFE | StdLib::JIT,
-        LuaOptions::default(),
-    )?);
-    screen_reader.set_lua_context(Rc::clone(&lua));
-    let sr_ptr = Rc::new(RefCell::new(screen_reader as *mut ScreenReader));
-    install_api_static(&lua, Rc::clone(&sr_ptr))?;
-    install_config_module_searcher(&lua, Rc::clone(&sr_ptr))?;
-    meta::setup_static(&lua, Rc::clone(&sr_ptr))?;
+    let lua = install_configuration_context(screen_reader)?;
 
-    let configuration_result = if load_init_file && init_lua_file.is_file() {
-        load_file(&lua, &init_lua_file).and_then(|function| function.call::<()>(()))
+    let configuration_result = if let Some(init_lua_file) = config_file.as_ref()
+        && init_lua_file.is_file()
+    {
+        load_file(&lua, init_lua_file).and_then(|function| function.call::<()>(()))
     } else {
         Ok(())
     };
@@ -59,6 +63,53 @@ where
             Err(Error::external(anyhow!(detail)))
         }
     }
+}
+
+fn install_configuration_context(screen_reader: &mut ScreenReader) -> Result<Rc<Lua>> {
+    let lua = Rc::new(Lua::new_with(
+        StdLib::ALL_SAFE | StdLib::JIT,
+        LuaOptions::default(),
+    )?);
+    let sr_ptr = Rc::new(RefCell::new(screen_reader as *mut ScreenReader));
+    screen_reader.set_lua_runtime_context(Rc::clone(&lua), Rc::clone(&sr_ptr));
+    install_api_static(&lua, Rc::clone(&sr_ptr))?;
+    install_config_module_searcher(&lua, Rc::clone(&sr_ptr))?;
+    meta::setup_static(&lua, Rc::clone(&sr_ptr))?;
+    Ok(lua)
+}
+
+/// Load the selected init.lua and every required module into a fresh Lua VM,
+/// then publish the complete generation only after evaluation succeeds.
+pub(crate) fn reload_configuration(screen_reader: &mut ScreenReader) -> anyhow::Result<PathBuf> {
+    let config_file = screen_reader
+        .config_file()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("configuration reload is disabled by --no-config"))?;
+    if !config_file.is_file() {
+        return Err(anyhow!(
+            "configuration file does not exist: {}",
+            config_file.display()
+        ));
+    }
+
+    let (mut candidate, configured_speech_options) = screen_reader.lua_reload_candidate();
+    let lua = install_configuration_context(&mut candidate)
+        .context("create replacement Lua configuration context")?;
+    load_file(&lua, &config_file)
+        .and_then(|function| function.call::<()>(()))
+        .with_context(|| format!("load {}", config_file.display()))?;
+    candidate.finish_lua_configuration();
+
+    if candidate.speech_server_spec() != screen_reader.startup_lua_speech_server_spec() {
+        return Err(anyhow!(
+            "lector.o.speech.server is startup-only and changed; restart Lector to apply it"
+        ));
+    }
+    let configured_speech_options = configured_speech_options.borrow().clone();
+    screen_reader
+        .commit_lua_reload(candidate, &configured_speech_options)
+        .context("commit replacement Lua configuration")?;
+    Ok(config_file)
 }
 
 pub fn setup_repl(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
@@ -183,6 +234,11 @@ fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Resu
             }
             // Safety: pointer is set by the main thread before any Lua call.
             let sr = unsafe { &mut *ptr };
+            if sr.lua_configuration_reload_staging() {
+                return Err(Error::external(anyhow!(
+                    "lector.api.speak is unavailable while reloading configuration; use lector.hooks.on_reload"
+                )));
+            }
             sr.speak(&text, interrupt)
                 .map(|id| id.map(|id| id.as_str().to_owned()))
                 .to_lua_result()
@@ -195,6 +251,11 @@ fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Resu
         }
         // Safety: pointer is set by the main thread before any Lua call.
         let sr = unsafe { &mut *ptr };
+        if sr.lua_configuration_reload_staging() {
+            return Err(Error::external(anyhow!(
+                "lector.api.set_speech is unavailable while reloading configuration; use lector.hooks.on_reload"
+            )));
+        }
         let spec = meta::speech_server_spec_from_lua(value).map_err(Error::external)?;
         sr.request_speech_reconfiguration(spec);
         Ok(())
@@ -208,7 +269,7 @@ fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::{setup, setup_repl};
+    use super::{reload_configuration, setup, setup_repl};
     use crate::{
         keymap::{Binding, InputMode},
         screen_reader::ScreenReader,
@@ -437,6 +498,175 @@ mod tests {
     }
 
     #[test]
+    fn reload_rebuilds_bindings_and_required_modules_in_a_fresh_vm() {
+        let directory = tempfile::tempdir().unwrap();
+        let init = directory.path().join("init.lua");
+        let module = directory.path().join("binding.lua");
+        fs::write(
+            &init,
+            r#"
+                local binding = require("binding")
+                lector.bindings["M-v"] = {
+                    binding.help,
+                    function() lector.o.help_mode = binding.help == "first" end,
+                }
+            "#,
+        )
+        .unwrap();
+        fs::write(&module, "return { help = 'first' }").unwrap();
+
+        let mut screen_reader = screen_reader();
+        setup(init.clone(), true, &mut screen_reader, |_| Ok(())).unwrap();
+        assert_eq!(
+            screen_reader
+                .key_bindings()
+                .binding_for_mode(InputMode::Normal, "M-v")
+                .unwrap()
+                .help_text(),
+            "first"
+        );
+
+        fs::write(&module, "return { help = 'second' }").unwrap();
+        fs::write(
+            &init,
+            r#"
+                local binding = require("binding")
+                lector.bindings["M-b"] = {
+                    binding.help,
+                    function() lector.o.help_mode = true end,
+                }
+            "#,
+        )
+        .unwrap();
+
+        reload_configuration(&mut screen_reader).unwrap();
+        assert!(
+            screen_reader
+                .key_bindings()
+                .binding_for_mode(InputMode::Normal, "M-v")
+                .is_none()
+        );
+        let binding = screen_reader
+            .key_bindings()
+            .binding_for_mode(InputMode::Normal, "M-b")
+            .unwrap();
+        assert_eq!(binding.help_text(), "second");
+        let Binding::Lua(binding) = binding else {
+            panic!("expected replacement Lua binding");
+        };
+        binding.call().unwrap();
+        assert!(screen_reader.help_mode());
+    }
+
+    #[test]
+    fn failed_reload_preserves_the_complete_previous_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let init = directory.path().join("init.lua");
+        fs::write(
+            &init,
+            r#"
+                lector.bindings["M-v"] = {"old binding", function() end}
+                lector.hooks.on_reload = function() end
+            "#,
+        )
+        .unwrap();
+
+        let mut screen_reader = screen_reader();
+        setup(init.clone(), true, &mut screen_reader, |_| Ok(())).unwrap();
+        fs::write(
+            &init,
+            r#"
+                lector.o.auto_read = false
+                lector.bindings["M-v"] = {"partial replacement", function() end}
+                lector.hooks.on_reload = nil
+                error("candidate rejected")
+            "#,
+        )
+        .unwrap();
+
+        let error = reload_configuration(&mut screen_reader).unwrap_err();
+        assert!(format!("{error:#}").contains("candidate rejected"));
+        assert!(screen_reader.auto_read_enabled());
+        assert_eq!(
+            screen_reader
+                .key_bindings()
+                .binding_for_mode(InputMode::Normal, "M-v")
+                .unwrap()
+                .help_text(),
+            "old binding"
+        );
+        screen_reader.hook_on_reload("unchanged").unwrap();
+    }
+
+    #[test]
+    fn reload_rejects_a_changed_startup_only_speech_server() {
+        let directory = tempfile::tempdir().unwrap();
+        let init = directory.path().join("init.lua");
+        fs::write(
+            &init,
+            r#"lector.bindings["M-v"] = {"old binding", function() end}"#,
+        )
+        .unwrap();
+
+        let mut screen_reader = screen_reader();
+        setup(init.clone(), true, &mut screen_reader, |_| Ok(())).unwrap();
+        fs::write(
+            &init,
+            r#"
+                lector.bindings["M-v"] = {"replacement", function() end}
+                lector.o.speech.server = {program = "/different"}
+            "#,
+        )
+        .unwrap();
+
+        let error = reload_configuration(&mut screen_reader).unwrap_err();
+        assert!(format!("{error:#}").contains("startup-only"));
+        assert_eq!(
+            screen_reader
+                .key_bindings()
+                .binding_for_mode(InputMode::Normal, "M-v")
+                .unwrap()
+                .help_text(),
+            "old binding"
+        );
+    }
+
+    #[test]
+    fn reload_stages_speech_options_before_applying_them_to_the_live_host() {
+        let rates = Rc::new(RefCell::new(Vec::new()));
+        let driver = SpeechOptionsDriver {
+            state: OptionState {
+                rate: Some(1.0),
+                rate_status: CapabilityStatus::Supported,
+                ..OptionState::default()
+            },
+            rates: Rc::clone(&rates),
+            pitches: Rc::new(RefCell::new(Vec::new())),
+            volumes: Rc::new(RefCell::new(Vec::new())),
+            voices: Rc::new(RefCell::new(Vec::new())),
+        };
+        let mut screen_reader = ScreenReader::new(speech::Speech::new(Box::new(driver)));
+        let path = temporary_lua_file("reload-speech-option", "");
+        setup(path.clone(), true, &mut screen_reader, |_| Ok(())).unwrap();
+
+        fs::write(
+            &path,
+            r#"
+                lector.o.speech.rate = 1.75
+                error("do not commit")
+            "#,
+        )
+        .unwrap();
+        assert!(reload_configuration(&mut screen_reader).is_err());
+        assert!(rates.borrow().is_empty());
+
+        fs::write(&path, "lector.o.speech.rate = 1.5").unwrap();
+        reload_configuration(&mut screen_reader).unwrap();
+        assert_eq!(rates.borrow().as_slice(), [1.5]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn repl_requires_explicit_nonblocking_speech_reconfiguration() {
         let mut screen_reader = screen_reader();
         let lua = Lua::new();
@@ -575,6 +805,30 @@ mod tests {
         .unwrap();
 
         assert_eq!(screen_reader.speech().paragraph_pause_ms(), 37);
+    }
+
+    #[test]
+    fn legacy_escape_timeout_is_bounded_and_round_trips() {
+        let mut screen_reader = screen_reader();
+        let lua = Lua::new();
+        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
+        setup_repl(&lua, screen_reader_ptr).unwrap();
+
+        lua.load(
+            r#"
+                assert(lector.o.legacy_escape_timeout_ms == 30)
+                lector.o.legacy_escape_timeout_ms = 0
+                assert(lector.o.legacy_escape_timeout_ms == 0)
+                lector.o.legacy_escape_timeout_ms = 1000
+                assert(lector.o.legacy_escape_timeout_ms == 1000)
+                assert(pcall(function() lector.o.legacy_escape_timeout_ms = -1 end) == false)
+                assert(pcall(function() lector.o.legacy_escape_timeout_ms = 1001 end) == false)
+                assert(pcall(function() lector.o.legacy_escape_timeout_ms = 1.5 end) == false)
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(screen_reader.legacy_escape_timeout_ms(), 1000);
     }
 
     #[test]
@@ -746,6 +1000,7 @@ mod tests {
                 lector.o.auto_read = false
                 lector.o.suppress_key_echo = true
                 lector.o.report_indentation = false
+                lector.o.legacy_escape_timeout_ms = 12
                 lector.o.tmux_bells = "spoken"
                 lector.o.clipboard.default_register = "+"
                 lector.o.clipboard.system_provider = "osc52"
@@ -798,6 +1053,7 @@ mod tests {
             assert!(!sr.auto_read_enabled());
             assert!(sr.suppress_key_echo());
             assert!(!sr.indentation_reporting_enabled());
+            assert_eq!(sr.legacy_escape_timeout_ms(), 12);
             assert_eq!(sr.tmux_bell_mode().to_string(), "spoken");
             assert_eq!(sr.clipboard_default_register().to_string(), "+");
             assert_eq!(sr.system_clipboard_provider().to_string(), "osc52");

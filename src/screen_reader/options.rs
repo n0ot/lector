@@ -1,6 +1,7 @@
 use super::TmuxBellMode;
 use crate::clipboard::{ClipboardRegister, SystemClipboardProvider};
 
+#[derive(Clone)]
 pub(super) struct Options {
     help_mode: bool,
     auto_read: bool,
@@ -13,6 +14,7 @@ pub(super) struct Options {
     tmux_bell_mode: TmuxBellMode,
     clipboard_default_register: ClipboardRegister,
     system_clipboard_provider: SystemClipboardProvider,
+    legacy_escape_timeout_ms: u16,
 }
 
 impl Default for Options {
@@ -29,6 +31,7 @@ impl Default for Options {
             tmux_bell_mode: TmuxBellMode::Audible,
             clipboard_default_register: ClipboardRegister::Internal,
             system_clipboard_provider: SystemClipboardProvider::Native,
+            legacy_escape_timeout_ms: 30,
         }
     }
 }
@@ -142,6 +145,14 @@ impl Options {
     pub(super) fn set_system_clipboard_provider(&mut self, value: SystemClipboardProvider) {
         self.system_clipboard_provider = value;
     }
+
+    pub(super) fn legacy_escape_timeout_ms(&self) -> u16 {
+        self.legacy_escape_timeout_ms
+    }
+
+    pub(super) fn set_legacy_escape_timeout_ms(&mut self, value: u16) {
+        self.legacy_escape_timeout_ms = value;
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +180,7 @@ mod tests {
             options.system_clipboard_provider(),
             SystemClipboardProvider::Native
         );
+        assert_eq!(options.legacy_escape_timeout_ms(), 30);
     }
 
     #[test]

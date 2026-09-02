@@ -1,5 +1,7 @@
 use std::borrow::Cow;
-use terminput::{Encoding, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+use terminput::{
+    Encoding, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, KittyFlags,
+};
 
 /// A semantic key event decoded at Lector's terminal boundary.
 ///
@@ -169,6 +171,62 @@ impl KeyInput {
             Err(_) => Cow::Owned(Vec::new()),
         }
     }
+
+    /// Encode a semantic physical key for a child which enabled Kitty's
+    /// keyboard protocol. Kitty input already carrying the child's requested
+    /// detail is retained byte-for-byte; legacy and modifyOtherKeys input is
+    /// upgraded at this boundary.
+    pub(crate) fn kitty_child_bytes<'a>(
+        &self,
+        raw: &'a [u8],
+        kitty_keyboard_flags: u8,
+        application_cursor: bool,
+        application_keypad: bool,
+    ) -> Cow<'a, [u8]> {
+        if is_kitty_key_encoding(raw) {
+            if self.is_release() && kitty_keyboard_flags & 2 == 0 {
+                return Cow::Owned(Vec::new());
+            }
+            return Cow::Borrowed(raw);
+        }
+
+        let event = self.normalized_event();
+        let report_all_keys = kitty_keyboard_flags & 8 != 0;
+        let is_keypad = event.state.contains(KeyEventState::KEYPAD);
+        // Kitty retains the legacy application-cursor/keypad encodings for
+        // ordinary presses unless all-keys reporting was requested. The raw
+        // bytes already reflect the physical mode composed by the renderer.
+        if !report_all_keys
+            && event.kind == KeyEventKind::Press
+            && event.modifiers.is_empty()
+            && (application_cursor && !is_keypad || application_keypad && is_keypad)
+        {
+            return Cow::Borrowed(raw);
+        }
+
+        let mut flags = KittyFlags::empty();
+        if kitty_keyboard_flags & 1 != 0 {
+            flags.insert(KittyFlags::DISAMBIGUATE_ESCAPE_CODES);
+        }
+        if kitty_keyboard_flags & 2 != 0 {
+            flags.insert(KittyFlags::REPORT_EVENT_TYPES);
+        }
+        if kitty_keyboard_flags & 4 != 0 {
+            flags.insert(KittyFlags::REPORT_ALTERNATE_KEYS);
+        }
+        if kitty_keyboard_flags & 8 != 0 {
+            flags.insert(KittyFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+        }
+
+        let mut encoded = [0; 64];
+        match Event::Key(event).encode(&mut encoded, Encoding::Kitty(flags)) {
+            Ok(length) => Cow::Owned(encoded[..length].to_vec()),
+            // A legacy representation is preferable to dropping a key which
+            // the encoder does not yet model; Kitty applications continue to
+            // accept the protocol's legacy-compatible forms.
+            Err(_) => Cow::Borrowed(raw),
+        }
+    }
 }
 
 fn is_extended_key_encoding(event: KeyEvent, raw: &[u8]) -> bool {
@@ -180,6 +238,12 @@ fn is_extended_key_encoding(event: KeyEvent, raw: &[u8]) -> bool {
         || raw
             .strip_prefix(b"\x1B[27;")
             .is_some_and(|body| body.ends_with(b"~"))
+}
+
+fn is_kitty_key_encoding(raw: &[u8]) -> bool {
+    raw.strip_prefix(b"\x1B[")
+        .or_else(|| raw.strip_prefix(b"\x9B"))
+        .is_some_and(|body| body.ends_with(b"u") || body.contains(&b':'))
 }
 
 fn legacy_control_code(ch: char) -> Option<u8> {

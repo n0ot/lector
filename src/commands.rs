@@ -121,6 +121,7 @@ define_actions! {
     ),
     ToggleSymbolLevel => ("toggle symbol level", "toggle_symbol_level"),
     SayOverlay => ("say current overlay", "say_overlay"),
+    ReloadConfig => ("reload Lua configuration", "reload_config"),
     OpenLuaRepl => ("open Lua REPL", "open_lua_repl"),
     OpenReview => ("enter review mode", "open_review"),
     OpenTmuxConnectionChooser => (
@@ -297,6 +298,7 @@ pub fn handle(
         Action::TableCharNext => table::character_next(sr, view),
         Action::TableCharRead => table::character_read(sr, view),
         Action::ToggleHelp
+        | Action::ReloadConfig
         | Action::OpenLuaRepl
         | Action::OpenReview
         | Action::OpenTmuxConnectionChooser

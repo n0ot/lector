@@ -2937,7 +2937,7 @@ impl App {
             .as_mut()
             .map(|broker| broker.finish_if_timed_out(self.clock.now_ms()))
             .unwrap_or_default();
-        self.refresh_probed_profile();
+        self.refresh_probed_profile(term_out)?;
         if !released_probe_input.is_empty() {
             self.handle_filtered_terminal_input(sr, &released_probe_input, pty_out, term_out)?;
         }

@@ -4,9 +4,9 @@ use crate::{
     keymap::Binding,
     output_scheduler::{DrainReport, OutputScheduler, OutputSchedulerConfig, ScheduledOutputClass},
     presentation::{
-        CursorOwner, GridPoint, IncrementalVtRenderer, PhysicalTerminalLifecycle, PresentedScene,
-        RenderCapabilities, RendererBackend, Scene, SceneDamage, SceneOverlay, SceneSurface,
-        SurfaceId, ViewId, ViewRevision,
+        CursorOwner, GridPoint, IncrementalVtRenderer, PhysicalKeyboardProtocol,
+        PhysicalTerminalLifecycle, PresentedScene, RenderCapabilities, RendererBackend, Scene,
+        SceneDamage, SceneOverlay, SceneSurface, SurfaceId, ViewId, ViewRevision,
     },
     screen_reader::{ScreenReader, TmuxBellMode},
     terminal::{ScreenIdentity, TerminalGeometry, UpdateSummary},
@@ -23,7 +23,6 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     io::Write,
     sync::LazyLock,
@@ -83,7 +82,7 @@ const ADAPTIVE_DIFF_MARGIN: u16 = 4;
 const ADAPTIVE_DIFF_DECAY: u16 = 2;
 const ADAPTIVE_DIFF_CLEAN_BURSTS: u8 = 3;
 const LATE_CONTINUATION_WINDOW_MS: u128 = 100;
-const ESC_TIMEOUT_MS: u128 = 50;
+const DEFAULT_LEGACY_ESCAPE_TIMEOUT_MS: u128 = 30;
 static ANSI_CSI_RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
     regex::bytes::Regex::new(r"^\x1B\[[\x30-\x3F]*[\x20-\x2F]*[\x40-\x7E--[A-D~]]$")
         .expect("ANSI CSI pattern must be valid")
@@ -1145,6 +1144,7 @@ pub struct App {
     view_stack: views::ViewStack,
     pending_input: VecDeque<u8>,
     pending_input_last_at: Option<u128>,
+    pending_input_timeout_ms: u128,
     application_replies: ApplicationReplyBroker<SurfaceId>,
     terminal_effect_policy: TerminalEffectPolicy,
     popup_responses: VecDeque<views::PopupResponse>,
@@ -1565,6 +1565,7 @@ impl App {
             view_stack,
             pending_input: VecDeque::new(),
             pending_input_last_at: None,
+            pending_input_timeout_ms: DEFAULT_LEGACY_ESCAPE_TIMEOUT_MS,
             application_replies: ApplicationReplyBroker::default(),
             terminal_effect_policy: TerminalEffectPolicy::secure_default(),
             popup_responses: VecDeque::new(),
@@ -1583,6 +1584,7 @@ impl App {
                 synchronized_output: false,
                 hyperlinks: physical_profile.hyperlinks,
                 kitty_graphics: physical_profile.kitty_graphics,
+                kitty_keyboard_flags_floor: 0,
                 inline_terminal_effects: true,
             }),
             presented_scene: PresentedScene::blank(geometry),
@@ -1849,12 +1851,17 @@ impl App {
             synchronized_output: self.output_scheduler.is_none() && profile.synchronized_output,
             hyperlinks: profile.hyperlinks,
             kitty_graphics: profile.kitty_graphics,
+            kitty_keyboard_flags_floor: u8::from(profile.kitty_keyboard),
             inline_terminal_effects: self.output_scheduler.is_none(),
         };
         if let Some(scheduler) = &mut self.output_scheduler {
             scheduler.set_synchronized_output_supported(profile.synchronized_output);
         }
         self.scene_renderer.set_capabilities(capabilities);
+        self.physical_lifecycle
+            .set_keyboard_protocol(PhysicalKeyboardProtocol::for_kitty_support(
+                profile.kitty_keyboard,
+            ));
         self.physical_profile = profile;
     }
 
@@ -1863,6 +1870,7 @@ impl App {
             synchronized_output: false,
             hyperlinks: self.physical_profile.hyperlinks,
             kitty_graphics: self.physical_profile.kitty_graphics,
+            kitty_keyboard_flags_floor: u8::from(self.physical_profile.kitty_keyboard),
             inline_terminal_effects: false,
         });
         self.output_scheduler = Some(OutputScheduler::new(
@@ -2008,6 +2016,10 @@ impl App {
 
     pub fn configure_physical_terminal(&mut self, focus_was_enabled: Option<bool>) {
         self.physical_lifecycle = PhysicalTerminalLifecycle::new(focus_was_enabled);
+        self.physical_lifecycle
+            .set_keyboard_protocol(PhysicalKeyboardProtocol::for_kitty_support(
+                self.physical_profile.kitty_keyboard,
+            ));
     }
 
     pub fn activate_physical_terminal(&mut self, term_out: &mut dyn Write) -> Result<()> {
@@ -2238,7 +2250,7 @@ impl App {
             .min();
         let pending_input_deadline = self
             .pending_input_last_at
-            .map(|last_at| last_at.saturating_add(ESC_TIMEOUT_MS));
+            .map(|last_at| last_at.saturating_add(self.pending_input_timeout_ms));
         let lua_automation_deadline = self.lua_automation_deadline_ms();
         let presented_update = self.active_presented_update_status();
         let now_ms = self.clock.now_ms();
@@ -2381,15 +2393,22 @@ impl App {
         Ok(())
     }
 
-    fn refresh_probed_profile(&mut self) {
+    fn refresh_probed_profile(&mut self, term_out: &mut dyn Write) -> Result<()> {
         let Some(profile) = self
             .startup_probe_broker
             .as_ref()
             .map(|broker| broker.profile().clone())
         else {
-            return;
+            return Ok(());
         };
+        let keyboard_protocol_changed =
+            profile.kitty_keyboard != self.physical_profile.kitty_keyboard;
         self.set_physical_profile(profile);
+        if keyboard_protocol_changed {
+            let transaction = self.physical_lifecycle.reconfigure_keyboard_protocol();
+            self.apply_lifecycle_transaction(term_out, transaction, true)?;
+        }
+        Ok(())
     }
 
     fn log_bytes(&self, label: &str, bytes: &[u8]) {
@@ -2715,6 +2734,24 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.show_popup_announcement(sr, title, message, term_out)
+    }
+
+    /// Present one error whose failing owner has already restored its state.
+    /// This deliberately runs from the normal event loop: if notification or
+    /// overlay rendering fails, the error is no longer safely recoverable and
+    /// the failure must reach terminal cleanup.
+    #[doc(hidden)]
+    pub fn present_pending_runtime_error(
+        &mut self,
+        sr: &mut ScreenReader,
+        term_out: &mut dyn Write,
+    ) -> Result<bool> {
+        let Some(report) = sr.take_runtime_error() else {
+            return Ok(false);
+        };
+        sr.hook_on_error(&report.message, report.context)?;
+        self.show_popup_error(sr, report.title, &report.message, term_out)?;
+        Ok(true)
     }
 
     pub fn show_popup_confirmation(

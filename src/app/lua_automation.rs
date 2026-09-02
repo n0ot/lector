@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     lua::automation::{Invocation, REQUEST_FIELD, parse_keys},
-    speech::{ReaderSpeechEventKind, protocol::UtteranceId},
+    speech::ReaderSpeechEventKind,
 };
 use anyhow::{Context, anyhow, bail};
 use mlua::{Table, ThreadStatus, Value};
@@ -70,7 +70,7 @@ struct LuaCoordinate {
 
 struct ActiveRead {
     context: LuaViewKey,
-    utterance_id: UtteranceId,
+    submission: crate::speech::ReaderSubmission,
     offsets: Vec<(usize, LuaCoordinate)>,
     finish: LuaCoordinate,
     position: LuaCoordinate,
@@ -138,7 +138,12 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         if self.lua_task.is_some() {
-            bail!("another Lua key binding is waiting for Lector");
+            sr.report_runtime_error(
+                "Lua binding unavailable",
+                "lua-binding",
+                "another Lua key binding is waiting for Lector",
+            );
+            return Ok(());
         }
         let task = LuaTask::new(invocation);
         self.resume_lua_task(sr, task, Value::Nil, pty_out, term_out)
@@ -169,8 +174,7 @@ impl App {
         let wake = match wake_result {
             Ok(wake) => wake,
             Err(error) => {
-                self.finish_lua_task(sr, &mut task, true)?;
-                return Err(error);
+                return self.recover_lua_task_error(sr, &mut task, error);
             }
         };
         if let Some(wake) = wake {
@@ -209,8 +213,14 @@ impl App {
 
     /// A physical key press has priority over every reader transition. The
     /// press and its matching release are consumed by the ordinary binding
-    /// bookkeeping; Lua is not resumed after the user's cancellation.
-    pub(super) fn cancel_lua_reader_for_key(&mut self, sr: &mut ScreenReader) -> Result<bool> {
+    /// bookkeeping, while the suspended call is resumed with a cancellation
+    /// result so Lua can run its own cleanup.
+    pub(super) fn cancel_lua_reader_for_key(
+        &mut self,
+        sr: &mut ScreenReader,
+        pty_out: &mut dyn Write,
+        term_out: &mut dyn Write,
+    ) -> Result<bool> {
         let reader_active = self
             .lua_task
             .as_ref()
@@ -219,13 +229,40 @@ impl App {
             return Ok(false);
         }
         let mut task = self.lua_task.take().expect("reader task was present");
-        let cancel_result = if matches!(task.wait, LuaWait::Reading(_)) {
-            sr.speech_mut().cancel()
-        } else {
-            Ok(())
+        let wait = std::mem::replace(&mut task.wait, LuaWait::Ready);
+        let response = match wait {
+            LuaWait::Reading(read) => {
+                if let Err(error) = sr.speech_mut().cancel() {
+                    self.finish_lua_reader(sr, &mut task);
+                    return Err(error.into());
+                }
+                read_result(&task.invocation.lua, "cancelled", "key", read.position)
+                    .map(Value::Table)
+                    .map_err(Into::into)
+            }
+            LuaWait::Stable(wait) => self
+                .capture_lua_stable_response(
+                    &mut task,
+                    "cancelled",
+                    wait.context,
+                    &wait.content,
+                    self.presented_bell_count
+                        .saturating_sub(wait.initial_bell_count),
+                )
+                .map(Value::Table),
+            LuaWait::Ready => {
+                self.lua_task = Some(task);
+                return Ok(false);
+            }
         };
-        self.finish_lua_reader(sr, &mut task);
-        cancel_result?;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.finish_lua_task(sr, &mut task, false)?;
+                return Err(error);
+            }
+        };
+        self.resume_lua_task(sr, task, response, pty_out, term_out)?;
         Ok(true)
     }
 
@@ -257,11 +294,22 @@ impl App {
                 Ok(())
             }
             Ok(false) => self.finish_lua_task(sr, &mut task, false),
-            Err(error) => {
-                self.finish_lua_task(sr, &mut task, true)?;
-                Err(error)
-            }
+            Err(error) => self.recover_lua_task_error(sr, &mut task, error),
         }
+    }
+
+    /// A binding owns auto-read suppression and may own in-flight reader
+    /// speech. Its error becomes recoverable only after both have been
+    /// released successfully; a cleanup failure still escapes to shutdown.
+    fn recover_lua_task_error(
+        &mut self,
+        sr: &mut ScreenReader,
+        task: &mut LuaTask,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        self.finish_lua_task(sr, task, true)?;
+        sr.report_runtime_error("Lua binding failed", "lua-binding", format!("{error:#}"));
+        Ok(())
     }
 
     /// Return true when the coroutine yielded an asynchronous wait and false
@@ -338,10 +386,10 @@ impl App {
                         )?);
                         continue;
                     }
-                    let utterance_id = sr.speak_for_reader(&text)?;
+                    let submission = sr.speak_for_reader(&text)?;
                     task.wait = LuaWait::Reading(ActiveRead {
                         context: view,
-                        utterance_id,
+                        submission,
                         offsets,
                         finish: last,
                         position: first,
@@ -432,7 +480,7 @@ impl App {
         }
 
         for event in sr.take_reader_speech_events() {
-            if event.utterance_id != read.utterance_id {
+            if event.utterance_id != read.submission.utterance_id {
                 continue;
             }
             if let Some(offset) = event
@@ -440,7 +488,8 @@ impl App {
                 .as_ref()
                 .and_then(|position| position.utf8_offset())
             {
-                let position = coordinate_for_offset(&read.offsets, offset, read.position);
+                let source_offset = read.submission.source_offset(offset);
+                let position = coordinate_for_offset(&read.offsets, source_offset, read.position);
                 self.move_reader_review_cursor(sr, read.context, position)?;
                 read.position = position;
             }
@@ -885,12 +934,12 @@ mod tests {
         (app, sr, spoken, stops, invocation)
     }
 
-    fn active_utterance(app: &App) -> UtteranceId {
+    fn active_utterance(app: &App) -> crate::speech::protocol::UtteranceId {
         let task = app.lua_task.as_ref().expect("active Lua task");
         let LuaWait::Reading(read) = &task.wait else {
             panic!("Lua task is not reading")
         };
-        read.utterance_id.clone()
+        read.submission.utterance_id.clone()
     }
 
     #[test]
@@ -934,6 +983,84 @@ mod tests {
         assert!(app.lua_task.is_none());
         assert!(sr.auto_read_enabled());
         assert_eq!(*stops.borrow(), 0);
+    }
+
+    #[test]
+    fn reader_symbol_expansion_keeps_review_progress_on_source_coordinates() {
+        let (mut app, mut sr, spoken, _stops, invocation) = setup("return");
+        sr.speech_mut()
+            .set_symbol_level(crate::speech::symbols::Level::All);
+        sr.speech_mut().set_symbol(
+            ".",
+            "dot",
+            crate::speech::symbols::Level::Some,
+            crate::speech::symbols::IncludeOriginal::Never,
+            false,
+        );
+        app.view_stack
+            .root_mut()
+            .model()
+            .process_changes(b"\r\x1b[2Ka.b");
+        let mut pty = Vec::new();
+        let mut terminal = Vec::new();
+
+        app.start_lua_invocation(&mut sr, invocation, &mut pty, &mut terminal)
+            .unwrap();
+
+        assert_eq!(spoken.borrow().as_slice(), ["a dot b"]);
+        let utterance_id = active_utterance(&app);
+        sr.push_reader_speech_events([ReaderSpeechEvent {
+            utterance_id: utterance_id.clone(),
+            kind: ReaderSpeechEventKind::Progress,
+            position: Some(TextPosition::Utf8ByteOffset { offset: 2 }),
+            reason: None,
+        }]);
+        app.drive_lua_automation(&mut sr, &mut pty, &mut terminal)
+            .unwrap();
+        assert_eq!(
+            app.view_stack.root_mut().model().review_cursor_position(),
+            (0, 1)
+        );
+
+        sr.push_reader_speech_events([ReaderSpeechEvent {
+            utterance_id,
+            kind: ReaderSpeechEventKind::Ended,
+            position: Some(TextPosition::Utf8ByteOffset { offset: 7 }),
+            reason: Some("completed".to_owned()),
+        }]);
+        app.drive_lua_automation(&mut sr, &mut pty, &mut terminal)
+            .unwrap();
+        assert!(app.lua_task.is_none());
+    }
+
+    #[test]
+    fn lua_error_after_reader_completion_restores_state_and_opens_error_popup() {
+        let (mut app, mut sr, spoken, stops, invocation) = setup("error('script exploded')");
+        let mut pty = Vec::new();
+        let mut terminal = Vec::new();
+        app.on_resize(8, 80, &mut terminal).unwrap();
+        app.start_lua_invocation(&mut sr, invocation, &mut pty, &mut terminal)
+            .unwrap();
+        let utterance_id = active_utterance(&app);
+        sr.push_reader_speech_events([ReaderSpeechEvent {
+            utterance_id,
+            kind: ReaderSpeechEventKind::Ended,
+            position: Some(TextPosition::Utf8ByteOffset { offset: 5 }),
+            reason: Some("completed".to_owned()),
+        }]);
+
+        app.drive_lua_automation(&mut sr, &mut pty, &mut terminal)
+            .unwrap();
+
+        assert!(app.lua_task.is_none());
+        assert!(sr.auto_read_enabled());
+        assert_eq!(*stops.borrow(), 0);
+        assert!(
+            app.present_pending_runtime_error(&mut sr, &mut terminal)
+                .unwrap()
+        );
+        assert_eq!(app.view_stack.active_mut().kind(), views::ViewKind::Popup);
+        assert!(spoken.borrow().join(" ").contains("script exploded"));
     }
 
     #[test]
@@ -1012,8 +1139,15 @@ mod tests {
     }
 
     #[test]
-    fn physical_key_cancellation_consumes_the_task_and_restores_auto_read() {
-        let (mut app, mut sr, _spoken, stops, invocation) = setup("error('must not resume')");
+    fn physical_key_cancellation_resumes_lua_then_restores_owned_state() {
+        let (mut app, mut sr, _spoken, stops, invocation) = setup(
+            r#"
+                assert(result.status == "cancelled")
+                assert(result.cause == "key")
+                assert(result.position.row == 0)
+                assert(result.position.col == 2)
+            "#,
+        );
         let mut pty = Vec::new();
         let mut terminal = Vec::new();
         sr.set_auto_read_enabled(false);
@@ -1021,11 +1155,104 @@ mod tests {
             .unwrap();
         sr.set_auto_read_enabled(true);
         assert!(!sr.auto_read_enabled());
+        let utterance_id = active_utterance(&app);
+        sr.push_reader_speech_events([ReaderSpeechEvent {
+            utterance_id,
+            kind: ReaderSpeechEventKind::Progress,
+            position: Some(TextPosition::Utf8ByteOffset { offset: 2 }),
+            reason: None,
+        }]);
+        app.drive_lua_automation(&mut sr, &mut pty, &mut terminal)
+            .unwrap();
 
-        assert!(app.cancel_lua_reader_for_key(&mut sr).unwrap());
+        assert!(
+            app.cancel_lua_reader_for_key(&mut sr, &mut pty, &mut terminal)
+                .unwrap()
+        );
         assert!(app.lua_task.is_none());
         assert!(!sr.auto_read_enabled());
         assert_eq!(*stops.borrow(), 1);
+        assert!(pty.is_empty());
+    }
+
+    #[test]
+    fn physical_key_cancellation_lets_lua_restore_runtime_speech_rate() {
+        struct RateDriver {
+            rate: Rc<std::cell::Cell<f32>>,
+            stops: Rc<std::cell::Cell<usize>>,
+        }
+
+        impl speech::Driver for RateDriver {
+            fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            fn stop(&mut self) -> anyhow::Result<()> {
+                self.stops.set(self.stops.get().saturating_add(1));
+                Ok(())
+            }
+
+            fn get_rate(&self) -> f32 {
+                self.rate.get()
+            }
+
+            fn set_rate(&mut self, rate: f32) -> anyhow::Result<()> {
+                self.rate.set(rate);
+                Ok(())
+            }
+        }
+
+        let rate = Rc::new(std::cell::Cell::new(1.0));
+        let stops = Rc::new(std::cell::Cell::new(0));
+        let speech = speech::Speech::new(Box::new(RateDriver {
+            rate: Rc::clone(&rate),
+            stops: Rc::clone(&stops),
+        }));
+        let mut sr = ScreenReader::new(speech);
+        sr.set_reader_support(reader_support());
+        let stack = ViewStack::new(Box::new(PtyView::new(2, 10)));
+        let mut app = App::new(stack).unwrap();
+        app.view_stack.root_mut().model().process_changes(b"alpha");
+        let lua = Rc::new(Lua::new());
+        let sr_ptr = Rc::new(RefCell::new(&mut sr as *mut ScreenReader));
+        crate::lua::setup_repl(&lua, sr_ptr).unwrap();
+        let function: Function = lua
+            .load(
+                r#"
+                    return function()
+                        local original_rate = lector.o.speech.rate
+                        lector.o.speech.rate = 0.7
+                        local view = lector.api.view()
+                        local reader = lector.api.reader()
+                        local result = reader:read(
+                            view,
+                            view:top(),
+                            {row = 0, col = 5}
+                        )
+                        assert(result.status == "cancelled")
+                        assert(result.cause == "key")
+                        lector.o.speech.rate = original_rate
+                        reader:close()
+                    end
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let invocation = Invocation::new(Rc::clone(&lua), function).unwrap();
+        let mut pty = Vec::new();
+        let mut terminal = Vec::new();
+
+        app.start_lua_invocation(&mut sr, invocation, &mut pty, &mut terminal)
+            .unwrap();
+        assert_eq!(rate.get(), 0.7);
+        assert!(
+            app.cancel_lua_reader_for_key(&mut sr, &mut pty, &mut terminal)
+                .unwrap()
+        );
+
+        assert!(app.lua_task.is_none());
+        assert_eq!(rate.get(), 1.0);
+        assert_eq!(stops.get(), 1);
     }
 
     #[test]
@@ -1091,6 +1318,28 @@ mod tests {
     fn present_live_view(app: &mut App, terminal: &mut Vec<u8>) {
         app.render_active_view(terminal).unwrap();
         app.drain_scheduled_output(terminal, true).unwrap();
+    }
+
+    #[test]
+    fn configuration_reload_does_not_replace_a_vm_with_a_suspended_task() {
+        let (mut app, mut sr, _clock, invocation) =
+            setup_stable_wait("error('task must remain suspended')");
+        let mut pty = Vec::new();
+        let mut terminal = Vec::new();
+        app.start_lua_invocation(&mut sr, invocation, &mut pty, &mut terminal)
+            .unwrap();
+        assert!(app.lua_task.is_some());
+        pty.clear();
+
+        app.handle_stdin(&mut sr, b"\x1bR", &mut pty, &mut terminal)
+            .unwrap();
+
+        assert!(app.lua_task.is_some());
+        assert_eq!(
+            app.view_stack.active_mut().kind(),
+            views::ViewKind::Terminal
+        );
+        assert!(pty.is_empty());
     }
 
     #[test]

@@ -191,7 +191,10 @@ those pane queries itself; Lector's pane engines are observational shadows and
 discard their duplicate replies.
 Lector puts DA1 last in its bounded physical-terminal startup probes and
 consumes replies through that processing fence; those replies are never sent to
-the application. The same probe set reads the outer terminal's exact OSC 10/11
+the application. A timeout releases pending input while retaining ownership of
+the delayed reply vocabulary; the ordered DA1 response is the exact point at
+which the broker relinquishes the input stream completely. The same probe set
+reads the outer terminal's exact OSC 10/11
 default foreground and background plus its native light/dark report when
 available. Lector mirrors those values into OSC 10/11 and color-scheme replies
 for direct children, including applications which query during startup; the
@@ -423,7 +426,8 @@ lector.api.set_speech({
 The call returns immediately. Lector retains the old server for rollback while
 the candidate initializes; speech requested during that handshake waits in the
 bounded worker queue. A failed candidate leaves the old setting committed and
-calls `lector.hooks.on_error(message, "speech-reconfigure")`.
+opens an error popup after calling
+`lector.hooks.on_error(message, "speech-reconfigure")`.
 
 Custom servers use the bidirectional version 2 speech-host protocol: bounded
 UTF-8 NDJSON JSON-RPC 2.0 over stdin/stdout, with explicit capabilities and
@@ -472,6 +476,7 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 - **Cancel speech** has no default binding. Cancellation stops speech and
   discards the current utterance and everything queued behind it.
 - **Say the current overlay name**. Default: `M-w`.
+- **Reload Lua configuration** from the selected `init.lua`. Default: `M-R`.
 - **Toggle auto‑read** if you want to hear only on demand. Default: `M-'`.
 - **Toggle stop on focus loss** (interrupt speech when terminal focus leaves). Default: `M-g`.
 - **Move and read** by line/word/character using the review cursor.
@@ -525,6 +530,15 @@ Lector retains up to 10,000 primary-screen rows. `M-r` works through both the
 xterm Meta encoding used by non-Kitty terminals and Kitty keyboard events.
 `M-PageUp`/`M-PageDown` and `M-Up`/`M-Down` pass through to the running
 application.
+
+While active, Lector requests Kitty's disambiguate-escape-codes flag from
+supporting outer terminals and xterm modifyOtherKeys mode 2 otherwise. It
+decodes that physical protocol to semantic keys, then encodes each key for the
+active child's independently modeled keyboard mode. Terminals which ignore
+both enhancement requests retain the unavoidable legacy ambiguity between a
+standalone Escape-prefixed key and the start of a terminal sequence. Only that
+fallback uses `lector.o.legacy_escape_timeout_ms` (30 ms by default); probe
+timeouts are separate and are not changed by this option.
 
 Resizing keeps the captured Review document frozen but creates a new viewport
 for the new terminal geometry. Lector keeps the cursor at the same screen row
@@ -663,6 +677,25 @@ lector --shell /bin/zsh --config ./lector-demo.lua
 lector --shell /bin/zsh --no-config
 ```
 
+Press `M-R` to reload the selected configuration. Lector evaluates `init.lua`
+and its required modules in a fresh Lua VM, so edits to files such as
+`pager.lua` take effect without clearing `package.loaded`. Bindings, hooks, and
+symbol definitions are published as one generation only after the complete
+file succeeds. If loading fails, Lector opens an error popup and leaves the
+previous generation active.
+
+Reload preserves live session state and starts the replacement keymap from
+Lector's built-in defaults. Removing a custom binding or hook from `init.lua`
+therefore removes it on the next successful reload. Startup-only settings must
+remain unchanged; for example, changing `lector.o.speech.server` requires a
+restart. The shell and PTY are selected before Lua runs and likewise cannot be
+changed by reload. Reload is unavailable under `--no-config`.
+
+While a replacement is being evaluated, APIs with immediate external effects
+(`lector.api.speak`, `lector.api.set_speech`, and system clipboard access) are
+unavailable. Put post-reload work in `lector.hooks.on_reload`; it runs only
+after the new generation has committed.
+
 ### Common options
 
 ```lua
@@ -697,6 +730,9 @@ lector.o.report_indentation = false
 
 -- interrupt speech immediately when terminal focus is lost
 lector.o.stop_speech_on_focus_loss = true
+
+-- legacy ESC-prefix ambiguity only; enhanced keyboard input is immediate
+lector.o.legacy_escape_timeout_ms = 30
 
 -- tmux pane bells: "audible" (default), "spoken", or "off"
 lector.o.tmux_bells = "spoken"
@@ -738,6 +774,9 @@ You can remap keys or add your own Lua functions:
 ```lua
 -- this is the default pause/resume binding
 lector.bindings["M-x"] = "lector.toggle_speaking"
+
+-- this is the default configuration reload binding
+lector.bindings["M-R"] = "lector.reload_config"
 
 -- optional one-way controls; these keys are otherwise unbound by Lector
 lector.bindings["M-z"] = "lector.pause_speaking"
@@ -808,10 +847,25 @@ the review cursor follows host-reported word progress. Reader acquisition
 raises a Lua error unless the negotiated speech host provides reliable
 completed/cancelled events, UTF-8 word progress, and confirmed stop. A reader
 temporarily disables auto read and restores the exact prior setting when it is
-closed, cancelled, the binding returns, or the binding fails.
+closed, the binding returns, the binding fails, or a state change invalidates
+the reader.
 
-Any physical key cancels an owned reader and is consumed instead of being sent
-to the application. A view, overlay, screen, speech-host generation, resize, or
+Reader utterances use the same configured symbol, emoji, repeated-symbol, and
+mixed-case transformations as ordinary speech. Lector retains a byte-offset
+map for the transformed utterance so host word progress still moves the review
+cursor through coordinates in the original view text.
+
+An error raised by a Lua key binding ends that binding, restores every reader
+and auto-read resource it owned, and opens an error popup with the Lua
+traceback. If owned speech cannot be cancelled during that cleanup, Lector
+exits instead of pretending that the binding was safely contained.
+
+Any physical key requests a speech stop (reader acquisition has already
+established confirmed-stop support) and immediately resumes the suspended
+`reader:read()` with `status="cancelled"` and `cause="key"`; the key is consumed
+instead of being sent to the application. Lua should use that result to return
+or perform cleanup, and the reader remains owned until Lua closes it or the
+binding returns. A view, overlay, screen, speech-host generation, resize, or
 content change during `read` also cancels it conservatively.
 
 Use `view:send_keys(spec)` for Neovim-style key notation: text outside angle
@@ -821,11 +875,13 @@ return an input receipt; `receipt:wait_for_stable_screen()` waits for a
 post-input physical presentation and then the same adaptive quiet/DEC 2026
 evidence used by auto read, but a line ending alone does not complete a
 whole-screen wait. It returns
-`{status="presented"|"no_response", view=..., content_changed=...,
+`{status="presented"|"no_response"|"cancelled", view=..., content_changed=...,
 effects={bells=...}}`. `presented` confirms that at least one screen or bell
 presentation crossed a physical-terminal flush before the quiet boundary;
 `no_response` conservatively reports that the application produced no
-observable presentation before the timeout. It does not mean end-of-file.
+observable presentation before the timeout. It does not mean end-of-file. A
+physical key produces `cancelled` when the suspended task owns a reader, so Lua
+can unwind its reader and other temporary settings.
 Bell counts belong to the receipt interval rather than persistent screen
 state. `view:same_content(other)` compares the exact readable lines, geometry,
 and row-wrapping semantics of two snapshots while ignoring visual-only style
@@ -851,6 +907,7 @@ Available hooks:
 ```lua
 -- lifecycle
 lector.hooks.on_startup = function(ctx) end         -- ctx: { config_path, version, pid }
+lector.hooks.on_reload = function(ctx) end          -- ctx: { config_path, version, pid }
 lector.hooks.on_shutdown = function(reason) end     -- reason: "exit" | "error"
 lector.hooks.on_error = function(message, context) end
 
@@ -885,6 +942,23 @@ manager; they do not claim that audible playback started or ended. Playback
 lifecycle is correlated internally by the speech-host events documented in
 the protocol.
 
+If a runtime hook raises an error or returns an invalid value, Lector disables
+that hook for the current configuration generation and opens an error popup.
+Disabling it before presentation prevents the popup's own screen and speech
+events from repeatedly invoking the failed callback. Observer hooks fall back
+conservatively: `on_key_unhandled` does not consume the key, and a failed
+`on_live_read` leaves the original text unchanged. `on_shutdown` is the
+exception because Lector no longer owns an interactive terminal on which an
+error popup can be recovered; a shutdown-hook error is reported after terminal
+cleanup.
+
+Runtime recovery is limited to boundaries which can prove that their owned
+state has been restored. Terminal and PTY transport failures, compositor or
+registry corruption, failed reader cleanup, and other internal invariant
+failures still terminate Lector through its normal terminal-cleanup path. If
+rendering or announcing an error popup itself fails, that secondary failure is
+fatal as well.
+
 `on_startup` is the post-start boundary. It runs only after `init.lua` has
 finished, the selected speech server has initialized, the physical terminal
 and startup probes are active, and initial child output has been presented. It
@@ -896,6 +970,10 @@ lector.hooks.on_startup = function(_)
   lector.api.speak("welcome to Lector", false)
 end
 ```
+
+`on_reload` is the corresponding post-commit boundary for a successful
+`M-R`. `on_startup` is not run again, and a failed candidate never installs or
+runs its `on_reload` hook.
 
 ## Lua REPL
 

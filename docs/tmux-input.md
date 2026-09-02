@@ -41,13 +41,15 @@ until Lector has either learned the outer terminal's exact defaults or reached
 the bounded probe deadline; the reported colors are then reconciled with the
 same profile used for direct children.
 
-Physical-terminal startup probes have the same durable ownership rule. DA1 or
-the inactivity deadline makes ordinary keyboard input ready, but delayed
-responses to Lector's earlier physical queries remain Lector-owned and are
-consumed even after that boundary. Application queries are answered by the
-root virtual engine and are never emitted to the physical terminal. Thus slow
-or backpressured physical replies cannot later appear as keys in a full-screen
-application such as Codex.
+Physical-terminal startup probes have the same durable ownership rule. The
+inactivity deadline makes ordinary keyboard input ready, but delayed responses
+to Lector's earlier physical queries remain Lector-owned until the final DA1
+response arrives. That ordered response is a processing fence: after consuming
+it, the startup broker passes every subsequent byte through without classifying
+escape prefixes. Application queries are answered by the root virtual engine
+and are never emitted to the physical terminal. Thus slow or backpressured
+physical replies cannot later appear as keys in a full-screen application such
+as Codex, while post-fence Meta keys do not pay the probe timeout.
 
 ## Focus and mouse
 

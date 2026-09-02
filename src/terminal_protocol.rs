@@ -408,10 +408,10 @@ impl ProbePolicy {
 /// bytes which are not recognized as such a reply are returned as ordinary
 /// input.
 ///
-/// Reaching the DA1 fence or the startup timeout makes ordinary input ready;
-/// it does not transfer ownership of delayed probe replies to the application.
-/// Lector never forwards application queries to the physical terminal, so a
-/// later reply in this probe vocabulary still belongs to this broker.
+/// The startup timeout makes ordinary input ready without transferring
+/// ownership of delayed probe replies to the application. Reaching the ordered
+/// DA1 fence proves that no startup reply remains in flight and relinquishes
+/// the byte stream completely.
 pub struct StartupProbeBroker {
     profile: PhysicalTerminalProfile,
     report: ProbeReport,
@@ -419,7 +419,7 @@ pub struct StartupProbeBroker {
     started_at_ms: u128,
     last_activity_at_ms: u128,
     started: bool,
-    finished: bool,
+    state: StartupProbeState,
     pending: Vec<u8>,
     discarding_oversized: Option<OversizedSequence>,
     malformed_replies: usize,
@@ -432,6 +432,19 @@ pub struct StartupProbeBroker {
     primary_device_attributes_received: bool,
 }
 
+/// Ownership of the terminal-input byte stream during startup probing.
+///
+/// A timeout makes startup non-blocking, but it cannot prove that replies are
+/// no longer in flight. The final DA1 response can: terminal replies are
+/// ordered, so that response is the exact boundary after which every byte is
+/// ordinary input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupProbeState {
+    Probing,
+    TimedOutAwaitingFence,
+    Fenced,
+}
+
 impl StartupProbeBroker {
     pub fn new(profile: PhysicalTerminalProfile, policy: ProbePolicy, started_at_ms: u128) -> Self {
         Self {
@@ -441,7 +454,7 @@ impl StartupProbeBroker {
             started_at_ms,
             last_activity_at_ms: started_at_ms,
             started: false,
-            finished: false,
+            state: StartupProbeState::Probing,
             pending: Vec::new(),
             discarding_oversized: None,
             malformed_replies: 0,
@@ -481,8 +494,16 @@ impl StartupProbeBroker {
         if !input.is_empty() {
             self.last_activity_at_ms = now_ms;
         }
+        if self.state == StartupProbeState::Fenced {
+            return input.to_vec();
+        }
+
         let mut output = Vec::new();
-        for &byte in input {
+        for (input_index, &byte) in input.iter().enumerate() {
+            if self.state == StartupProbeState::Fenced {
+                output.extend_from_slice(&input[input_index..]);
+                break;
+            }
             if let Some(discarding) = self.discarding_oversized.as_mut() {
                 if discarding.consume(byte) {
                     self.discarding_oversized = None;
@@ -495,17 +516,25 @@ impl StartupProbeBroker {
                 if self.pending.is_empty() {
                     break;
                 }
-                if self.pending[0] != b'\x1b' {
+                if !matches!(self.pending[0], b'\x1b' | b'\x9b') {
                     output.push(self.pending.remove(0));
                     continue;
                 }
-                let Some(sequence_len) = complete_escape_len(&self.pending) else {
-                    if self.pending.len() > MAX_PROBE_REPLY_BYTES {
-                        self.discarding_oversized = OversizedSequence::from_prefix(&self.pending);
-                        self.pending.clear();
-                        self.malformed_replies = self.malformed_replies.saturating_add(1);
+                let sequence_len = match probe_reply_status(&self.pending, self.policy) {
+                    ProbeReplyStatus::NotReply => {
+                        output.push(self.pending.remove(0));
+                        continue;
                     }
-                    break;
+                    ProbeReplyStatus::Incomplete => {
+                        if self.pending.len() > MAX_PROBE_REPLY_BYTES {
+                            self.discarding_oversized =
+                                OversizedSequence::from_prefix(&self.pending);
+                            self.pending.clear();
+                            self.malformed_replies = self.malformed_replies.saturating_add(1);
+                        }
+                        break;
+                    }
+                    ProbeReplyStatus::Complete(sequence_len) => sequence_len,
                 };
                 let sequence = self.pending[..sequence_len].to_vec();
                 self.pending.drain(..sequence_len);
@@ -525,16 +554,24 @@ impl StartupProbeBroker {
         if now_ms.saturating_sub(self.last_activity_at_ms) <= PROBE_INACTIVITY_TIMEOUT_MS {
             return Vec::new();
         }
-        if self.finished && self.pending.is_empty() && self.discarding_oversized.is_none() {
+        if self.state == StartupProbeState::Fenced
+            && self.pending.is_empty()
+            && self.discarding_oversized.is_none()
+        {
             return Vec::new();
         }
-        self.finished = true;
+        if self.state == StartupProbeState::Probing {
+            self.state = StartupProbeState::TimedOutAwaitingFence;
+        }
         self.discarding_oversized = None;
         std::mem::take(&mut self.pending)
     }
 
-    pub const fn next_deadline_ms(&self) -> Option<u128> {
-        if self.finished && self.pending.is_empty() && self.discarding_oversized.is_none() {
+    pub fn next_deadline_ms(&self) -> Option<u128> {
+        if self.state != StartupProbeState::Probing
+            && self.pending.is_empty()
+            && self.discarding_oversized.is_none()
+        {
             None
         } else {
             Some(
@@ -544,8 +581,8 @@ impl StartupProbeBroker {
         }
     }
 
-    pub const fn is_finished(&self) -> bool {
-        self.finished
+    pub fn is_finished(&self) -> bool {
+        self.state != StartupProbeState::Probing
     }
 
     pub const fn malformed_replies(&self) -> usize {
@@ -563,8 +600,11 @@ impl StartupProbeBroker {
     /// Absolute deadline used only for child colour replies. Ordinary input
     /// may extend the broker's fragment-safety timeout, but can never hold a
     /// child theme negotiation indefinitely.
-    pub const fn color_wait_deadline_ms(&self) -> Option<u128> {
-        if self.started && !self.finished && !self.color_profile_complete() {
+    pub fn color_wait_deadline_ms(&self) -> Option<u128> {
+        if self.started
+            && self.state == StartupProbeState::Probing
+            && !self.color_profile_complete()
+        {
             Some(
                 self.started_at_ms
                     .saturating_add(PROBE_INACTIVITY_TIMEOUT_MS + 1),
@@ -575,7 +615,7 @@ impl StartupProbeBroker {
     }
 
     pub fn color_wait_pending(&self, now_ms: u128) -> bool {
-        !self.finished
+        self.state == StartupProbeState::Probing
             && !self.color_profile_complete()
             && self
                 .color_wait_deadline_ms()
@@ -665,7 +705,7 @@ impl StartupProbeBroker {
         }
         if is_primary_device_attributes_reply(sequence) {
             self.primary_device_attributes_received = true;
-            self.finished = true;
+            self.state = StartupProbeState::Fenced;
             return true;
         }
         if is_other_device_attributes_reply(sequence) {
@@ -729,9 +769,9 @@ enum OversizedSequence {
 
 impl OversizedSequence {
     fn from_prefix(prefix: &[u8]) -> Option<Self> {
-        match prefix.get(1) {
-            Some(b'[') => Some(Self::Csi),
-            Some(b']' | b'P' | b'_') => Some(Self::String {
+        match (prefix.first(), prefix.get(1)) {
+            (Some(b'\x9b'), _) | (Some(b'\x1b'), Some(b'[')) => Some(Self::Csi),
+            (Some(b'\x1b'), Some(b']' | b'P')) => Some(Self::String {
                 previous_was_escape: prefix.last() == Some(&b'\x1b'),
             }),
             _ => None,
@@ -750,6 +790,81 @@ impl OversizedSequence {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeReplyStatus {
+    NotReply,
+    Incomplete,
+    Complete(usize),
+}
+
+/// Classify only the reply vocabulary requested by `startup_queries`.
+/// Display-side escape strings are not terminal input replies merely because
+/// they share an introducer with one, so an unrelated completed prefix can be
+/// released immediately instead of waiting for the probe timeout.
+fn probe_reply_status(bytes: &[u8], policy: ProbePolicy) -> ProbeReplyStatus {
+    match bytes {
+        [b'\x9b', ..] => csi_reply_status(bytes, 1),
+        [b'\x1b'] => ProbeReplyStatus::Incomplete,
+        [b'\x1b', b'[', ..] => csi_reply_status(bytes, 2),
+        [b'\x1b', b'P', ..] => string_reply_status(bytes, b"\x1bP!|"),
+        [b'\x1b', b']', ..] => {
+            let prefixes: &[&[u8]] = if policy.clipboard_read {
+                &[b"\x1b]10;", b"\x1b]11;", b"\x1b]52;"]
+            } else {
+                &[b"\x1b]10;", b"\x1b]11;"]
+            };
+            if prefixes
+                .iter()
+                .any(|prefix| prefix.starts_with(bytes) || bytes.starts_with(prefix))
+            {
+                terminated_string_status(bytes)
+            } else {
+                ProbeReplyStatus::NotReply
+            }
+        }
+        [b'\x1b', ..] => ProbeReplyStatus::NotReply,
+        _ => ProbeReplyStatus::NotReply,
+    }
+}
+
+fn csi_reply_status(bytes: &[u8], parameter_start: usize) -> ProbeReplyStatus {
+    if bytes.len() <= parameter_start {
+        return ProbeReplyStatus::Incomplete;
+    }
+    bytes
+        .iter()
+        .enumerate()
+        .skip(parameter_start)
+        .find_map(|(index, byte)| {
+            (0x40..=0x7e)
+                .contains(byte)
+                .then_some(ProbeReplyStatus::Complete(index + 1))
+        })
+        .unwrap_or(ProbeReplyStatus::Incomplete)
+}
+
+fn string_reply_status(bytes: &[u8], prefix: &[u8]) -> ProbeReplyStatus {
+    if prefix.starts_with(bytes) || bytes.starts_with(prefix) {
+        terminated_string_status(bytes)
+    } else {
+        ProbeReplyStatus::NotReply
+    }
+}
+
+fn terminated_string_status(bytes: &[u8]) -> ProbeReplyStatus {
+    let mut index = 2;
+    while index < bytes.len() {
+        if bytes[index] == 0x07 {
+            return ProbeReplyStatus::Complete(index + 1);
+        }
+        if bytes[index] == b'\x1b' && bytes.get(index + 1) == Some(&b'\\') {
+            return ProbeReplyStatus::Complete(index + 2);
+        }
+        index += 1;
+    }
+    ProbeReplyStatus::Incomplete
 }
 
 fn complete_escape_len(bytes: &[u8]) -> Option<usize> {

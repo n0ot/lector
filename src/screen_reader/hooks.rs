@@ -68,7 +68,25 @@ impl ScreenReader {
             .map_err(Error::lua)?;
         tbl.set("pid", std::process::id()).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>(tbl).map_err(Error::lua)
+        let result = func.call::<()>(tbl);
+        self.finish_lua_hook_call("on_startup", result, |_| Ok(()))
+    }
+
+    pub fn hook_on_reload(&mut self, config_path: &str) -> Result<()> {
+        let Some(key) = &self.lua_hooks.on_reload else {
+            return Ok(());
+        };
+        let Some(lua) = self.lua_ctx.as_ref() else {
+            return Ok(());
+        };
+        let tbl = lua.create_table().map_err(Error::lua)?;
+        tbl.set("config_path", config_path).map_err(Error::lua)?;
+        tbl.set("version", env!("CARGO_PKG_VERSION"))
+            .map_err(Error::lua)?;
+        tbl.set("pid", std::process::id()).map_err(Error::lua)?;
+        let func: Function = lua.registry_value(key).map_err(Error::lua)?;
+        let result = func.call::<()>(tbl);
+        self.finish_lua_hook_call("on_reload", result, |_| Ok(()))
     }
 
     /// Whether startup must wait for a physically presented child frame
@@ -97,8 +115,8 @@ impl ScreenReader {
             return Ok(());
         };
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>((message.to_string(), context.to_string()))
-            .map_err(Error::lua)
+        let result = func.call::<()>((message.to_string(), context.to_string()));
+        self.finish_lua_hook_call("on_error", result, |_| Ok(()))
     }
 
     pub fn hook_on_screen_update(&mut self, view: &View, overlay_active: bool) -> Result<()> {
@@ -128,7 +146,8 @@ impl ScreenReader {
         tbl.set("prev_screen", view.prev_screen().contents_full())
             .map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>(tbl).map_err(Error::lua)
+        let result = func.call::<()>(tbl);
+        self.finish_lua_hook_call("on_screen_update", result, |_| Ok(()))
     }
 
     pub fn hook_on_review_cursor_move(
@@ -151,7 +170,8 @@ impl ScreenReader {
         tbl.set("prev_row", old_pos.0).map_err(Error::lua)?;
         tbl.set("prev_col", old_pos.1).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>(tbl).map_err(Error::lua)
+        let result = func.call::<()>(tbl);
+        self.finish_lua_hook_call("on_review_cursor_move", result, |_| Ok(()))
     }
 
     pub fn hook_on_mode_change(&mut self, old: InputMode, new: InputMode) -> Result<()> {
@@ -165,8 +185,8 @@ impl ScreenReader {
             return Ok(());
         };
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>((old.as_str().to_string(), new.as_str().to_string()))
-            .map_err(Error::lua)
+        let result = func.call::<()>((old.as_str().to_string(), new.as_str().to_string()));
+        self.finish_lua_hook_call("on_mode_change", result, |_| Ok(()))
     }
 
     pub(crate) fn hook_on_table_mode_enter(&mut self, table_state: &TableState) -> Result<()> {
@@ -190,7 +210,8 @@ impl ScreenReader {
         tbl.set("current_col", table_state.current_col())
             .map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>(tbl).map_err(Error::lua)
+        let result = func.call::<()>(tbl);
+        self.finish_lua_hook_call("on_table_mode_enter", result, |_| Ok(()))
     }
 
     pub fn hook_on_table_mode_exit(&mut self) -> Result<()> {
@@ -201,10 +222,11 @@ impl ScreenReader {
             return Ok(());
         };
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>(()).map_err(Error::lua)
+        let result = func.call::<()>(());
+        self.finish_lua_hook_call("on_table_mode_exit", result, |_| Ok(()))
     }
 
-    pub fn hook_on_clipboard_change(&self, op: &str, entry: Option<&str>) -> Result<()> {
+    pub fn hook_on_clipboard_change(&mut self, op: &str) -> Result<()> {
         let Some(key) = &self.lua_hooks.on_clipboard_change else {
             return Ok(());
         };
@@ -217,12 +239,13 @@ impl ScreenReader {
             .map_err(Error::lua)?;
         meta.set("size", self.clipboard.size())
             .map_err(Error::lua)?;
-        let entry = match entry {
+        let entry = match self.clipboard.get() {
             Some(value) => Value::String(lua.create_string(value).map_err(Error::lua)?),
             None => Value::Nil,
         };
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>((entry, meta)).map_err(Error::lua)
+        let result = func.call::<()>((entry, meta));
+        self.finish_lua_hook_call("on_clipboard_change", result, |_| Ok(()))
     }
 
     pub fn hook_on_key_unhandled(&mut self, key: Option<&str>, mode: InputMode) -> Result<bool> {
@@ -237,9 +260,9 @@ impl ScreenReader {
             Some(value) => Value::String(lua.create_string(value).map_err(Error::lua)?),
             None => Value::Nil,
         };
-        let result: Value = func
-            .call((key_value, mode.as_str().to_string()))
-            .map_err(Error::lua)?;
+        let result = func.call((key_value, mode.as_str().to_string()));
+        let result: Value =
+            self.finish_lua_hook_call("on_key_unhandled", result, |_| Ok(Value::Boolean(false)))?;
         Ok(matches!(result, Value::Boolean(true)))
     }
 
@@ -259,11 +282,25 @@ impl ScreenReader {
         meta.set("cursor_moves", cursor_moves).map_err(Error::lua)?;
         meta.set("scrolled", scrolled).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result: Value = func.call((text.to_string(), meta)).map_err(Error::lua)?;
+        let result = func.call((text.to_string(), meta));
+        let result: Value = self.finish_lua_hook_call("on_live_read", result, |lua| {
+            lua.create_string(text).map(Value::String)
+        })?;
         match result {
             Value::Nil | Value::Boolean(false) => Ok(None),
-            Value::String(value) => Ok(Some(value.to_str().map_err(Error::lua)?.to_string())),
-            _ => Err(Error::InvalidLiveReadResult),
+            Value::String(value) => match value.to_str() {
+                Ok(value) => Ok(Some(value.to_string())),
+                Err(error) => self.finish_lua_hook_call("on_live_read", Err(error), |_| {
+                    Ok(Some(text.to_string()))
+                }),
+            },
+            _ => self.finish_lua_hook_call(
+                "on_live_read",
+                Err(mlua::Error::runtime(
+                    Error::InvalidLiveReadResult.to_string(),
+                )),
+                |_| Ok(Some(text.to_string())),
+            ),
         }
     }
 
@@ -277,8 +314,8 @@ impl ScreenReader {
         let meta = lua.create_table().map_err(Error::lua)?;
         meta.set("interrupt", interrupt).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>((text.to_string(), meta))
-            .map_err(Error::lua)
+        let result = func.call::<()>((text.to_string(), meta));
+        self.finish_lua_hook_call("on_speech_start", result, |_| Ok(()))
     }
 
     pub(super) fn call_hook_on_speech_end(
@@ -297,8 +334,43 @@ impl ScreenReader {
         meta.set("interrupt", interrupt).map_err(Error::lua)?;
         meta.set("ok", ok).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>((text.to_string(), meta))
-            .map_err(Error::lua)
+        let result = func.call::<()>((text.to_string(), meta));
+        self.finish_lua_hook_call("on_speech_end", result, |_| Ok(()))
+    }
+
+    /// A callback error is recoverable only once the callback can no longer
+    /// run again while its error overlay is being presented. Registry access
+    /// and Lua-context failures remain fatal because they indicate that the
+    /// configuration generation itself is no longer trustworthy.
+    fn finish_lua_hook_call<T, F>(
+        &mut self,
+        name: &'static str,
+        result: mlua::Result<T>,
+        fallback: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(&Lua) -> mlua::Result<T>,
+    {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let lua = self
+                    .lua_ctx
+                    .as_ref()
+                    .cloned()
+                    .ok_or(Error::InvalidLuaHookContext)?;
+                let slot = self
+                    .lua_hooks
+                    .slot_mut(name)
+                    .ok_or_else(|| Error::UnknownHook(name.to_owned()))?;
+                if let Some(key) = slot.take() {
+                    lua.remove_registry_value(key).map_err(Error::lua)?;
+                }
+                let fallback = fallback(&lua).map_err(Error::lua)?;
+                self.report_runtime_error("Lua hook failed", name, format!("{name}: {error}"));
+                Ok(fallback)
+            }
+        }
     }
 
     fn ensure_lua_hook_context(&self, lua: &Lua) -> Result<()> {
@@ -315,6 +387,7 @@ impl ScreenReader {
 #[derive(Default)]
 pub(super) struct LuaHooks {
     on_startup: Option<RegistryKey>,
+    on_reload: Option<RegistryKey>,
     on_shutdown: Option<RegistryKey>,
     on_screen_update: Option<RegistryKey>,
     on_live_read: Option<RegistryKey>,
@@ -333,6 +406,7 @@ impl LuaHooks {
     fn slot_mut(&mut self, name: &str) -> Option<&mut Option<RegistryKey>> {
         match name {
             "on_startup" => Some(&mut self.on_startup),
+            "on_reload" => Some(&mut self.on_reload),
             "on_shutdown" => Some(&mut self.on_shutdown),
             "on_screen_update" => Some(&mut self.on_screen_update),
             "on_live_read" => Some(&mut self.on_live_read),
@@ -352,6 +426,7 @@ impl LuaHooks {
     fn slot(&self, name: &str) -> Option<&Option<RegistryKey>> {
         match name {
             "on_startup" => Some(&self.on_startup),
+            "on_reload" => Some(&self.on_reload),
             "on_shutdown" => Some(&self.on_shutdown),
             "on_screen_update" => Some(&self.on_screen_update),
             "on_live_read" => Some(&self.on_live_read),

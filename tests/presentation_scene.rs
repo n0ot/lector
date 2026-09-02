@@ -1,9 +1,10 @@
 use lector::{
     harness::Harness,
     presentation::{
-        CursorOwner, GridPoint, GridRect, OutputTransaction, PhysicalTerminalLifecycle,
-        PresentationError, PresentedScene, RenderBatch, RenderOracle, RendererBackend, Scene,
-        SceneDamage, SceneImagePlacement, SceneOverlay, SceneSurface, SurfaceId,
+        CursorOwner, GridPoint, GridRect, OutputTransaction, PhysicalKeyboardProtocol,
+        PhysicalTerminalLifecycle, PresentationError, PresentedScene, RenderBatch, RenderOracle,
+        RendererBackend, Scene, SceneDamage, SceneImagePlacement, SceneOverlay, SceneSurface,
+        SurfaceId,
     },
     terminal::{GhosttyEngine, TerminalGeometry},
 };
@@ -279,6 +280,7 @@ fn physical_terminal_suspend_resume_and_shutdown_are_explicit_and_idempotent() {
     let mut lifecycle = PhysicalTerminalLifecycle::new(Some(false));
     let activation = lifecycle.activate();
     assert!(activation.bytes.starts_with(b"\x1b[?1049h"));
+    assert!(activation.bytes.ends_with(b"\x1b[>4;2m"));
     assert!(
         activation
             .bytes
@@ -296,6 +298,12 @@ fn physical_terminal_suspend_resume_and_shutdown_are_explicit_and_idempotent() {
     );
     assert!(suspended.bytes.windows(6).any(|part| part == b"\x1b[?25h"));
     assert!(suspended.bytes.ends_with(b"\x1b[?1049l"));
+    assert!(
+        suspended
+            .bytes
+            .windows(b"\x1b[>4;0m".len())
+            .any(|part| part == b"\x1b[>4;0m")
+    );
 
     let resumed = lifecycle.resume();
     assert_eq!(resumed.damage, SceneDamage::Full);
@@ -308,6 +316,64 @@ fn physical_terminal_suspend_resume_and_shutdown_are_explicit_and_idempotent() {
     assert!(shutdown.bytes.ends_with(b"\x1b[?1049l"));
     assert!(lifecycle.shutdown().bytes.is_empty());
     assert!(lifecycle.resume().bytes.is_empty());
+}
+
+#[test]
+fn physical_keyboard_protocol_is_owned_across_activation_transition_and_cleanup() {
+    let mut lifecycle = PhysicalTerminalLifecycle::new(Some(true));
+    let mut physical = GhosttyEngine::new(24, 80).expect("create physical keyboard oracle");
+    let activation = lifecycle.activate();
+    assert!(activation.bytes.ends_with(b"\x1b[>4;2m"));
+    physical
+        .advance(&activation.bytes)
+        .expect("apply non-Kitty fallback");
+    assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 0);
+
+    lifecycle.set_keyboard_protocol(PhysicalKeyboardProtocol::Kitty);
+    let transition = lifecycle.reconfigure_keyboard_protocol();
+    assert_eq!(transition.damage, SceneDamage::Full);
+    assert_eq!(transition.bytes, b"\x1b[>4;0m\x1b[>1u");
+    physical
+        .advance(&transition.bytes)
+        .expect("apply Kitty transition");
+    assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 1);
+    assert!(lifecycle.reconfigure_keyboard_protocol().bytes.is_empty());
+
+    let suspended = lifecycle.suspend();
+    assert!(
+        suspended
+            .bytes
+            .windows(b"\x1b[<u".len())
+            .any(|part| part == b"\x1b[<u")
+    );
+    assert!(
+        !suspended
+            .bytes
+            .windows(b"\x1b[?1004l".len())
+            .any(|part| part == b"\x1b[?1004l")
+    );
+    physical
+        .advance(&suspended.bytes)
+        .expect("apply Kitty suspension cleanup");
+    assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 0);
+
+    let resumed = lifecycle.resume();
+    assert!(resumed.bytes.ends_with(b"\x1b[>1u"));
+    physical
+        .advance(&resumed.bytes)
+        .expect("apply Kitty resume");
+    assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 1);
+    let shutdown = lifecycle.shutdown();
+    assert!(
+        shutdown
+            .bytes
+            .windows(b"\x1b[<u".len())
+            .any(|part| part == b"\x1b[<u")
+    );
+    physical
+        .advance(&shutdown.bytes)
+        .expect("apply Kitty shutdown cleanup");
+    assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 0);
 }
 
 #[test]

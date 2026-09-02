@@ -1,16 +1,18 @@
 use lector::{
     app::{App, Clock, DIFF_DELAY, MAX_DIFF_DELAY, MAX_PENDING_TERMINAL_INPUT_BYTES},
+    lua,
     output_scheduler::OutputSchedulerConfig,
     presentation::{PresentedScene, RenderStrategy},
     screen_reader::ScreenReader,
     speech,
-    terminal::{Color, GhosttyEngine, TerminalEngine},
+    terminal::{Color, GhosttyEngine, TerminalEngine, TerminalGeometry},
     terminal_protocol::PhysicalTerminalProfile,
     view::View,
     views,
 };
 use std::{
     cell::{Cell, RefCell},
+    fs,
     io::{self, Write},
     rc::Rc,
 };
@@ -684,22 +686,23 @@ fn assert_repl_lifecycle(
     terminal: TerminalKeyboardSupport,
     underlying_app: UnderlyingAppKeyboardSupport,
 ) {
-    let (protocol, input) = match (terminal, underlying_app) {
-        (TerminalKeyboardSupport::LegacyOnly, UnderlyingAppKeyboardSupport::Legacy)
-        | (TerminalKeyboardSupport::Kitty, UnderlyingAppKeyboardSupport::Legacy) => {
+    let (protocol, input) = match terminal {
+        TerminalKeyboardSupport::LegacyOnly => {
             (ReplInputProtocol::Legacy, &LEGACY_REPL_LIFECYCLE_INPUT)
         }
-        (TerminalKeyboardSupport::Kitty, UnderlyingAppKeyboardSupport::Kitty) => {
-            (ReplInputProtocol::Kitty, &KITTY_REPL_LIFECYCLE_INPUT)
-        }
-        (TerminalKeyboardSupport::LegacyOnly, UnderlyingAppKeyboardSupport::Kitty) => {
-            panic!("a legacy-only terminal cannot enable the Kitty keyboard protocol")
-        }
+        TerminalKeyboardSupport::Kitty => (ReplInputProtocol::Kitty, &KITTY_REPL_LIFECYCLE_INPUT),
     };
     let scenario = format!("terminal={terminal:?}, underlying_app={underlying_app:?}");
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
+
+    if terminal == TerminalKeyboardSupport::Kitty {
+        let mut profile =
+            PhysicalTerminalProfile::conservative(TerminalGeometry::from_cells(24, 80));
+        profile.kitty_keyboard = true;
+        app.set_physical_profile(profile);
+    }
 
     if underlying_app == UnderlyingAppKeyboardSupport::Kitty {
         const ENABLE_ALL_KITTY_KEYBOARD_FEATURES: &[u8] = b"\x1B[>31u";
@@ -882,15 +885,255 @@ fn assert_repl_lifecycle(
         &mut term_out,
         "forward input after REPL exit",
     );
-    let expected: Vec<u8> = input
-        .resumed_app_input
-        .iter()
-        .flat_map(|event| event.iter().copied())
-        .collect();
+    let expected = match (terminal, underlying_app) {
+        (TerminalKeyboardSupport::LegacyOnly, UnderlyingAppKeyboardSupport::Legacy)
+        | (TerminalKeyboardSupport::Kitty, UnderlyingAppKeyboardSupport::Legacy) => {
+            b"_\x01".to_vec()
+        }
+        (TerminalKeyboardSupport::LegacyOnly, UnderlyingAppKeyboardSupport::Kitty) => {
+            b"\x1B[95u\x1B[97;5u".to_vec()
+        }
+        (TerminalKeyboardSupport::Kitty, UnderlyingAppKeyboardSupport::Kitty) => input
+            .resumed_app_input
+            .iter()
+            .flat_map(|event| event.iter().copied())
+            .collect(),
+    };
     assert_eq!(
         pty_out, expected,
         "child input did not resume verbatim: {scenario}"
     );
+}
+
+#[test]
+fn lua_binding_is_immediate_after_probe_fence_with_enhanced_outer_keyboards() {
+    for (
+        name,
+        kitty,
+        lua_input,
+        line_input,
+        csi_prefix_input,
+        osc_prefix_input,
+        apc_prefix_input,
+        enable,
+    ) in [
+        (
+            "non-Kitty modifyOtherKeys",
+            false,
+            b"\x1B[27;4;80~".as_slice(),
+            b"\x1B[27;3;105~".as_slice(),
+            b"\x1B[27;3;91~".as_slice(),
+            b"\x1B[27;3;93~".as_slice(),
+            b"\x1B[27;4;95~".as_slice(),
+            b"\x1B[>4;2m".as_slice(),
+        ),
+        (
+            "Kitty",
+            true,
+            b"\x1B[112:80;4u".as_slice(),
+            b"\x1B[105;3u".as_slice(),
+            b"\x1B[91;3u".as_slice(),
+            b"\x1B[93;3u".as_slice(),
+            b"\x1B[95;4u".as_slice(),
+            b"\x1B[>1u".as_slice(),
+        ),
+    ] {
+        let (mut app, mut sr, recorder, _clock) = make_app();
+        let config_dir = tempfile::tempdir().expect("create isolated config directory");
+        let config = config_dir.path().join("init.lua");
+        fs::write(
+            &config,
+            r#"
+                lector.bindings["M-P"] = {
+                    "protocol boundary test",
+                    function() lector.api.speak("Lua binding reached", true) end,
+                }
+            "#,
+        )
+        .expect("write isolated Lua config");
+        lua::setup(config, true, &mut sr, |_| Ok(())).expect("load isolated Lua binding");
+
+        let mut profile =
+            PhysicalTerminalProfile::conservative(TerminalGeometry::from_cells(24, 80));
+        profile.kitty_keyboard = kitty;
+        app.set_physical_profile(profile);
+        app.configure_physical_terminal(Some(false));
+        let mut pty_out = Vec::new();
+        let mut term_out = Vec::new();
+        app.activate_physical_terminal(&mut term_out)
+            .expect("activate physical keyboard mode");
+        assert!(
+            term_out
+                .windows(enable.len())
+                .any(|window| window == enable),
+            "missing outer keyboard enable for {name}",
+        );
+
+        app.start_capability_probes(&mut term_out)
+            .expect("start terminal probes");
+        app.handle_stdin(&mut sr, b"\x1B[?64;22c\x1BOP", &mut pty_out, &mut term_out)
+            .expect("consume probe fence and open help in one read");
+        assert!(sr.help_mode(), "F1 was not handled for {name}");
+        recorder.inner.borrow_mut().speaks.clear();
+
+        app.handle_stdin(&mut sr, lua_input, &mut pty_out, &mut term_out)
+            .unwrap_or_else(|error| panic!("invoke Lua binding for {name}: {error}"));
+        assert_eq!(
+            recorder.inner.borrow().speaks.as_slice(),
+            [("protocol boundary test".into(), false)],
+            "binding dispatch was not complete in the input turn for {name}",
+        );
+        assert!(pty_out.is_empty(), "binding leaked to child for {name}");
+
+        for (input, expected) in [
+            (line_input, "current line"),
+            (csi_prefix_input, "previous clipboard"),
+            (osc_prefix_input, "next clipboard"),
+            (apc_prefix_input, "this key is unmapped"),
+        ] {
+            recorder.inner.borrow_mut().speaks.clear();
+            app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+                .unwrap_or_else(|error| panic!("dispatch {expected} for {name}: {error}"));
+            assert_eq!(
+                recorder.inner.borrow().speaks.as_slice(),
+                [(expected.into(), false)],
+                "{expected} was not complete in the input turn for {name}",
+            );
+            assert!(pty_out.is_empty(), "{expected} leaked to child for {name}");
+        }
+    }
+}
+
+#[test]
+fn default_meta_shift_r_atomically_reloads_lua_bindings_and_runs_reload_hook() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let config = config_dir.path().join("init.lua");
+    fs::write(
+        &config,
+        r#"
+            lector.bindings["M-v"] = {
+                "old binding",
+                function() lector.api.speak("old binding", true) end,
+            }
+        "#,
+    )
+    .expect("write initial Lua config");
+    lua::setup(config.clone(), true, &mut sr, |_| Ok(())).expect("load initial Lua config");
+
+    fs::write(
+        &config,
+        r#"
+            lector.bindings["M-v"] = {
+                "new binding",
+                function() lector.api.speak("new binding", true) end,
+            }
+            lector.hooks.on_reload = function(_)
+                lector.api.speak("reload hook", false)
+            end
+        "#,
+    )
+    .expect("write replacement Lua config");
+
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_stdin(&mut sr, b"\x1bR", &mut pty_out, &mut term_out)
+        .expect("reload configuration through default binding");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [
+            ("reload hook".into(), false),
+            ("configuration reloaded".into(), true),
+        ]
+    );
+    assert!(pty_out.is_empty(), "reload key leaked to the child");
+
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bv", &mut pty_out, &mut term_out)
+        .expect("invoke replacement Lua binding");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("new binding".into(), true)]
+    );
+    assert!(pty_out.is_empty(), "replacement binding leaked to child");
+}
+
+#[test]
+fn failed_meta_shift_r_reload_keeps_the_previous_binding_generation() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let config = config_dir.path().join("init.lua");
+    fs::write(
+        &config,
+        r#"
+            lector.bindings["M-v"] = {
+                "old binding",
+                function() lector.api.speak("old binding", true) end,
+            }
+        "#,
+    )
+    .expect("write initial Lua config");
+    lua::setup(config.clone(), true, &mut sr, |_| Ok(())).expect("load initial Lua config");
+    fs::write(
+        &config,
+        r#"
+            lector.bindings["M-v"] = {
+                "partial binding",
+                function() lector.api.speak("partial binding", true) end,
+            }
+            error("replacement failed")
+        "#,
+    )
+    .expect("write invalid replacement Lua config");
+
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_stdin(&mut sr, b"\x1bR", &mut pty_out, &mut term_out)
+        .expect("report failed reload without leaving the event loop");
+    assert!(pty_out.is_empty(), "failed reload key leaked to the child");
+
+    app.handle_stdin(&mut sr, b"\x1b", &mut pty_out, &mut term_out)
+        .expect("begin closing reload error popup");
+    clock.advance_ms(30);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("finish closing reload error popup");
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bv", &mut pty_out, &mut term_out)
+        .expect("invoke preserved Lua binding");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("old binding".into(), true)]
+    );
+    assert!(pty_out.is_empty(), "preserved binding leaked to child");
+}
+
+#[test]
+fn legacy_ambiguous_binding_uses_only_the_configured_input_timeout_after_probe_fence() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    sr.set_legacy_escape_timeout_ms(7);
+    app.start_capability_probes(&mut term_out)
+        .expect("start terminal probes");
+    app.handle_stdin(&mut sr, b"\x1B[?64;22c\x1B]", &mut pty_out, &mut term_out)
+        .expect("consume probe fence and retain ambiguous legacy key");
+    assert_eq!(
+        app.scheduled_output_timeout(),
+        Some(std::time::Duration::from_millis(7)),
+    );
+    clock.advance_ms(6);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("remain inside configured ambiguity window");
+    assert!(recorder.inner.borrow().speaks.is_empty());
+
+    clock.advance_ms(1);
+    app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
+        .expect("resolve legacy Meta-close-bracket");
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("no clipboard".into(), false)],
+    );
+    assert!(pty_out.is_empty());
 }
 
 #[test]
@@ -6764,6 +7007,14 @@ fn repl_lifecycle_on_kitty_terminal_with_kitty_app() {
 }
 
 #[test]
+fn repl_lifecycle_on_legacy_terminal_with_kitty_app() {
+    assert_repl_lifecycle(
+        TerminalKeyboardSupport::LegacyOnly,
+        UnderlyingAppKeyboardSupport::Kitty,
+    );
+}
+
+#[test]
 fn kitty_associated_text_is_transcoded_for_legacy_child() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
@@ -6804,7 +7055,7 @@ fn extended_shift_enter_becomes_enter_for_legacy_child() {
 }
 
 #[test]
-fn modify_other_keys_shift_enter_is_preserved_for_extended_keyboard_child() {
+fn modify_other_keys_shift_enter_is_transcoded_for_extended_keyboard_child() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -6815,7 +7066,21 @@ fn modify_other_keys_shift_enter_is_preserved_for_extended_keyboard_child() {
     app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
         .expect("forward Shift-Enter to an extended-keyboard child");
 
-    assert_eq!(pty_out, input);
+    assert_eq!(pty_out, b"\x1B[13;2u");
+}
+
+#[test]
+fn legacy_meta_key_is_upgraded_for_extended_keyboard_child() {
+    let (mut app, mut sr, _recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(&mut sr, b"\x1B[>1u", &mut term_out)
+        .expect("enable child Kitty keyboard mode");
+
+    app.handle_stdin(&mut sr, b"\x1Bq", &mut pty_out, &mut term_out)
+        .expect("forward legacy Meta-q to an extended-keyboard child");
+
+    assert_eq!(pty_out, b"\x1B[113;3u");
 }
 
 #[test]
@@ -6986,9 +7251,9 @@ fn lone_escape_flushes_at_the_exact_timeout_boundary() {
         .unwrap();
     assert_eq!(
         app.scheduled_output_timeout(),
-        Some(std::time::Duration::from_millis(50))
+        Some(std::time::Duration::from_millis(30))
     );
-    clock.advance_ms(49);
+    clock.advance_ms(29);
     assert_eq!(
         app.scheduled_output_timeout(),
         Some(std::time::Duration::from_millis(1))

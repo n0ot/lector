@@ -293,6 +293,7 @@ fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua
         }
         "highlight_tracking" => sr.highlight_tracking_enabled().into_lua(lua),
         "stop_speech_on_focus_loss" => sr.stop_speech_on_focus_loss().into_lua(lua),
+        "legacy_escape_timeout_ms" => sr.legacy_escape_timeout_ms().into_lua(lua),
         "tmux_bells" => sr.tmux_bell_mode().to_string().into_lua(lua),
         "clipboard.default_register" => sr.clipboard_default_register().to_string().into_lua(lua),
         "clipboard.system_provider" => sr.system_clipboard_provider().to_string().into_lua(lua),
@@ -354,6 +355,25 @@ fn get_binding(lua: &Lua, sr: &ScreenReader, key: &str) -> anyhow::Result<Value>
 
 fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow::Result<()> {
     use mlua::Value::*;
+    if option == "legacy_escape_timeout_ms" {
+        let Integer(value) = value else {
+            return Err(anyhow!(
+                "set option: legacy_escape_timeout_ms: value must be an integer from 0 through 1000"
+            ));
+        };
+        let milliseconds = u16::try_from(value).map_err(|_| {
+            anyhow!(
+                "set option: legacy_escape_timeout_ms: value must be an integer from 0 through 1000"
+            )
+        })?;
+        if milliseconds > 1_000 {
+            return Err(anyhow!(
+                "set option: legacy_escape_timeout_ms: value must be an integer from 0 through 1000"
+            ));
+        }
+        sr.set_legacy_escape_timeout_ms(milliseconds);
+        return Ok(());
+    }
     if option == "speech.paragraph_pause_ms" {
         let Integer(value) = value else {
             return Err(anyhow!(

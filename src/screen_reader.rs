@@ -6,6 +6,7 @@ use super::{
 };
 use mlua::{Lua, WeakLua};
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     fmt,
     path::{Path, PathBuf},
@@ -30,6 +31,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 const MAX_PENDING_KEY_ECHO_CHARS: usize = 256;
 const MAX_PENDING_DELETE_INTENTS: usize = 64;
 const MAX_PENDING_DELETE_PRESENTATIONS: u8 = 64;
+const MAX_PENDING_RUNTIME_ERRORS: usize = 16;
+
+/// An error whose owner has restored its invariants and which can therefore
+/// be presented without tearing down the terminal session.
+#[derive(Debug)]
+pub(crate) struct RuntimeErrorReport {
+    pub(crate) title: &'static str,
+    pub(crate) context: &'static str,
+    pub(crate) message: String,
+}
 
 #[derive(Clone, Copy)]
 struct PendingKeyEcho {
@@ -94,6 +105,8 @@ pub enum Error {
     InvalidLiveReadResult,
     #[error("clipboard: {0}")]
     Clipboard(String),
+    #[error("{0} is unavailable while a replacement configuration is being staged")]
+    ConfigReloadOperation(&'static str),
 }
 
 impl Error {
@@ -118,10 +131,14 @@ pub struct ScreenReader {
     key_bindings: KeyBindings,
     table_session: TableSession,
     terminal_focused: bool,
+    config_file: Option<PathBuf>,
     config_dir: Option<PathBuf>,
     lua_ctx: Option<Rc<Lua>>,
     lua_ctx_weak: Option<WeakLua>,
+    lua_screen_reader_ptr: Option<Rc<RefCell<*mut ScreenReader>>>,
     lua_hooks: LuaHooks,
+    lua_startup_speech_server_spec: Option<SpeechServerSpec>,
+    lua_reload_staging: bool,
     auto_read_buffers: AutoReadBuffers,
     pending_deletes: VecDeque<PendingDelete>,
     input_sequence: u64,
@@ -130,6 +147,7 @@ pub struct ScreenReader {
     reader_support: ReaderSupport,
     reader_speech_events: VecDeque<ReaderSpeechEvent>,
     reader_auto_read_suppressed: bool,
+    pending_runtime_errors: VecDeque<RuntimeErrorReport>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -157,10 +175,14 @@ impl ScreenReader {
             key_bindings: KeyBindings::new(),
             table_session: TableSession::default(),
             terminal_focused: true,
+            config_file: None,
             config_dir: None,
             lua_ctx: None,
             lua_ctx_weak: None,
+            lua_screen_reader_ptr: None,
             lua_hooks: LuaHooks::default(),
+            lua_startup_speech_server_spec: None,
+            lua_reload_staging: false,
             auto_read_buffers: AutoReadBuffers::default(),
             pending_deletes: VecDeque::new(),
             input_sequence: 0,
@@ -169,7 +191,34 @@ impl ScreenReader {
             reader_support: ReaderSupport::default(),
             reader_speech_events: VecDeque::new(),
             reader_auto_read_suppressed: false,
+            pending_runtime_errors: VecDeque::new(),
         }
+    }
+
+    /// Queue an error only after the failing operation has relinquished every
+    /// resource it temporarily owned. The bound prevents a collection of
+    /// independently failing callbacks from growing memory without limit.
+    #[doc(hidden)]
+    pub fn report_runtime_error(
+        &mut self,
+        title: &'static str,
+        context: &'static str,
+        message: impl Into<String>,
+    ) {
+        let message = message.into();
+        crate::diagnostics::event("runtime-error", context, &message);
+        if self.pending_runtime_errors.len() == MAX_PENDING_RUNTIME_ERRORS {
+            let _ = self.pending_runtime_errors.pop_front();
+        }
+        self.pending_runtime_errors.push_back(RuntimeErrorReport {
+            title,
+            context,
+            message,
+        });
+    }
+
+    pub(crate) fn take_runtime_error(&mut self) -> Option<RuntimeErrorReport> {
+        self.pending_runtime_errors.pop_front()
     }
 
     #[doc(hidden)]
@@ -208,6 +257,23 @@ impl ScreenReader {
         self.lua_configuration_open = true;
     }
 
+    pub(crate) fn set_lua_runtime_context(
+        &mut self,
+        lua: Rc<Lua>,
+        screen_reader_ptr: Rc<RefCell<*mut ScreenReader>>,
+    ) {
+        self.set_lua_context(lua);
+        self.lua_screen_reader_ptr = Some(screen_reader_ptr);
+    }
+
+    pub(crate) fn set_config_file(&mut self, config_file: Option<PathBuf>) {
+        self.config_file = config_file;
+    }
+
+    pub(crate) fn config_file(&self) -> Option<&Path> {
+        self.config_file.as_deref()
+    }
+
     pub(crate) fn set_config_dir(&mut self, config_dir: Option<PathBuf>) {
         self.config_dir = config_dir;
     }
@@ -223,6 +289,83 @@ impl ScreenReader {
     /// `lector.api.set_speech()` path just like the Lua REPL does.
     pub(crate) fn finish_lua_configuration(&mut self) {
         self.lua_configuration_open = false;
+        if !self.lua_reload_staging && self.lua_startup_speech_server_spec.is_none() {
+            self.lua_startup_speech_server_spec = Some(self.speech_server_spec.clone());
+        }
+    }
+
+    pub(crate) fn lua_configuration_reload_staging(&self) -> bool {
+        self.lua_reload_staging
+    }
+
+    pub(crate) fn lua_reload_candidate(
+        &self,
+    ) -> (ScreenReader, Rc<RefCell<speech::ConfiguredSpeechOptions>>) {
+        let (speech, configured_speech_options) = self.speech.configuration_candidate();
+        let mut candidate = ScreenReader::new(speech);
+        candidate.options = self.options.clone();
+        candidate.clipboard = self.clipboard.clone();
+        candidate.terminal_focused = self.terminal_focused;
+        candidate.config_file = self.config_file.clone();
+        candidate.config_dir = self.config_dir.clone();
+        candidate.speech_server_spec = self
+            .lua_startup_speech_server_spec
+            .clone()
+            .unwrap_or_else(|| self.speech_server_spec.clone());
+        candidate.lua_startup_speech_server_spec = self.lua_startup_speech_server_spec.clone();
+        candidate.lua_reload_staging = true;
+        (candidate, configured_speech_options)
+    }
+
+    pub(crate) fn startup_lua_speech_server_spec(&self) -> &SpeechServerSpec {
+        self.lua_startup_speech_server_spec
+            .as_ref()
+            .unwrap_or(&self.speech_server_spec)
+    }
+
+    /// Publish one fully evaluated Lua configuration generation. No callback
+    /// can observe the field-by-field replacement because reload runs at a
+    /// terminal event-loop dispatch boundary.
+    pub(crate) fn commit_lua_reload(
+        &mut self,
+        mut candidate: ScreenReader,
+        configured_speech_options: &speech::ConfiguredSpeechOptions,
+    ) -> Result<()> {
+        self.speech
+            .apply_configured_options(configured_speech_options)?;
+        self.speech
+            .replace_lua_configuration_from(&mut candidate.speech);
+
+        if let Some(pointer) = self.lua_screen_reader_ptr.take() {
+            *pointer.borrow_mut() = std::ptr::null_mut();
+        }
+        let next_pointer = candidate.lua_screen_reader_ptr.take();
+        if let Some(pointer) = next_pointer.as_ref() {
+            *pointer.borrow_mut() = self as *mut ScreenReader;
+        }
+
+        self.options = candidate.options;
+        if !self.options.suppress_key_echo() {
+            self.pending_key_echo.clear();
+            self.key_echo_stream_active = false;
+        }
+        self.clipboard = candidate.clipboard;
+        self.key_bindings = candidate.key_bindings;
+        self.lua_ctx = candidate.lua_ctx;
+        self.lua_ctx_weak = candidate.lua_ctx_weak;
+        self.lua_screen_reader_ptr = next_pointer;
+        self.lua_hooks = candidate.lua_hooks;
+        self.lua_configuration_open = false;
+        for report in candidate.pending_runtime_errors {
+            if self.pending_runtime_errors.len() == MAX_PENDING_RUNTIME_ERRORS {
+                let _ = self.pending_runtime_errors.pop_front();
+            }
+            self.pending_runtime_errors.push_back(report);
+        }
+        if let Some(spec) = candidate.pending_speech_reconfiguration {
+            self.pending_speech_reconfiguration = Some(spec);
+        }
+        Ok(())
     }
 
     pub fn speech_server_spec(&self) -> &SpeechServerSpec {
@@ -479,16 +622,20 @@ impl ScreenReader {
 
     pub fn push_clipboard(&mut self, text: String) -> Result<()> {
         self.clipboard.put(text);
-        self.hook_on_clipboard_change("push", self.clipboard.get())
+        self.hook_on_clipboard_change("push")
     }
 
     pub(crate) fn read_clipboard(&mut self, register: ClipboardRegister) -> Result<Option<String>> {
         match register {
             ClipboardRegister::Internal => Ok(self.clipboard.get().map(str::to_owned)),
-            ClipboardRegister::System => self
-                .system_clipboard
-                .read(self.options.system_clipboard_provider())
-                .map_err(|error| Error::Clipboard(error.to_string())),
+            ClipboardRegister::System => {
+                if self.lua_reload_staging {
+                    return Err(Error::ConfigReloadOperation("system clipboard access"));
+                }
+                self.system_clipboard
+                    .read(self.options.system_clipboard_provider())
+                    .map_err(|error| Error::Clipboard(error.to_string()))
+            }
         }
     }
 
@@ -499,10 +646,14 @@ impl ScreenReader {
     ) -> Result<()> {
         match register {
             ClipboardRegister::Internal => self.push_clipboard(text),
-            ClipboardRegister::System => self
-                .system_clipboard
-                .write(self.options.system_clipboard_provider(), text)
-                .map_err(|error| Error::Clipboard(error.to_string())),
+            ClipboardRegister::System => {
+                if self.lua_reload_staging {
+                    return Err(Error::ConfigReloadOperation("system clipboard access"));
+                }
+                self.system_clipboard
+                    .write(self.options.system_clipboard_provider(), text)
+                    .map_err(|error| Error::Clipboard(error.to_string()))
+            }
         }
     }
 
@@ -510,12 +661,16 @@ impl ScreenReader {
         match register {
             ClipboardRegister::Internal => {
                 self.clipboard.clear();
-                self.hook_on_clipboard_change("clear", None)
+                self.hook_on_clipboard_change("clear")
             }
-            ClipboardRegister::System => self
-                .system_clipboard
-                .clear(self.options.system_clipboard_provider())
-                .map_err(|error| Error::Clipboard(error.to_string())),
+            ClipboardRegister::System => {
+                if self.lua_reload_staging {
+                    return Err(Error::ConfigReloadOperation("system clipboard access"));
+                }
+                self.system_clipboard
+                    .clear(self.options.system_clipboard_provider())
+                    .map_err(|error| Error::Clipboard(error.to_string()))
+            }
         }
     }
 
@@ -534,7 +689,7 @@ impl ScreenReader {
                 self.clipboard.size()
             )));
         }
-        self.hook_on_clipboard_change("select", self.clipboard.get())
+        self.hook_on_clipboard_change("select")
     }
 
     pub(crate) fn take_terminal_clipboard_writes(&mut self) -> Vec<Vec<u8>> {
@@ -564,7 +719,7 @@ impl ScreenReader {
         if !self.clipboard.prev() {
             return Ok(ClipboardMove::Boundary);
         }
-        self.hook_on_clipboard_change("prev", self.clipboard.get())?;
+        self.hook_on_clipboard_change("prev")?;
         Ok(ClipboardMove::Selected)
     }
 
@@ -575,7 +730,7 @@ impl ScreenReader {
         if !self.clipboard.next() {
             return Ok(ClipboardMove::Boundary);
         }
-        self.hook_on_clipboard_change("next", self.clipboard.get())?;
+        self.hook_on_clipboard_change("next")?;
         Ok(ClipboardMove::Selected)
     }
 
@@ -687,6 +842,17 @@ impl ScreenReader {
         self.options.set_tmux_bell_mode(value);
     }
 
+    /// Delay used only when legacy input is an incomplete prefix of a longer
+    /// terminal sequence. Enhanced Kitty and modifyOtherKeys input does not
+    /// pay this timeout.
+    pub fn legacy_escape_timeout_ms(&self) -> u16 {
+        self.options.legacy_escape_timeout_ms()
+    }
+
+    pub fn set_legacy_escape_timeout_ms(&mut self, value: u16) {
+        self.options.set_legacy_escape_timeout_ms(value);
+    }
+
     pub(crate) fn toggle_stop_speech_on_focus_loss(&mut self) -> bool {
         self.options.toggle_stop_speech_on_focus_loss()
     }
@@ -717,7 +883,7 @@ impl ScreenReader {
     pub(crate) fn speak_for_reader(
         &mut self,
         text: &str,
-    ) -> Result<crate::speech::protocol::UtteranceId> {
+    ) -> Result<crate::speech::ReaderSubmission> {
         self.call_hook_on_speech_start(text, true)?;
         let result = self.speech.speak_for_reader(text);
         let ok = result.is_ok();
@@ -2046,6 +2212,72 @@ mod tests {
                 .to_string(),
             "Lua hooks are only available in init.lua"
         );
+    }
+
+    #[test]
+    fn failing_lua_hook_is_disabled_and_queued_after_its_fallback() {
+        let (mut sr, speaks) = make_sr();
+        let lua = Rc::new(Lua::new());
+        sr.set_lua_context(Rc::clone(&lua));
+        let hook = lua
+            .create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("hook exploded")))
+            .unwrap();
+        sr.set_hook(&lua, "on_speech_start", Value::Function(hook))
+            .unwrap();
+
+        sr.speak("still spoken", false).unwrap();
+
+        assert_eq!(speaks.borrow().as_slice(), ["still spoken"]);
+        assert!(matches!(
+            sr.get_hook(&lua, "on_speech_start").unwrap(),
+            Value::Nil
+        ));
+        let report = sr.take_runtime_error().expect("queued hook error");
+        assert_eq!(report.title, "Lua hook failed");
+        assert_eq!(report.context, "on_speech_start");
+        assert!(report.message.contains("hook exploded"));
+
+        sr.speak("spoken once", false).unwrap();
+        assert!(sr.take_runtime_error().is_none());
+    }
+
+    #[test]
+    fn invalid_live_read_hook_preserves_original_text_and_is_disabled() {
+        let (mut sr, _) = make_sr();
+        let lua = Rc::new(Lua::new());
+        sr.set_lua_context(Rc::clone(&lua));
+        let hook = lua.create_function(|_, ()| Ok(true)).unwrap();
+        sr.set_hook(&lua, "on_live_read", Value::Function(hook))
+            .unwrap();
+
+        assert_eq!(
+            sr.hook_on_live_read("unaltered", 1, false).unwrap(),
+            Some("unaltered".to_owned())
+        );
+        assert!(matches!(
+            sr.get_hook(&lua, "on_live_read").unwrap(),
+            Value::Nil
+        ));
+        assert_eq!(sr.take_runtime_error().unwrap().context, "on_live_read");
+    }
+
+    #[test]
+    fn shutdown_hook_error_remains_fatal_after_interactive_overlays_end() {
+        let (mut sr, _) = make_sr();
+        let lua = Rc::new(Lua::new());
+        sr.set_lua_context(Rc::clone(&lua));
+        let hook = lua
+            .create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("shutdown exploded")))
+            .unwrap();
+        sr.set_hook(&lua, "on_shutdown", Value::Function(hook))
+            .unwrap();
+
+        assert!(sr.hook_on_shutdown("exit").is_err());
+        assert!(matches!(
+            sr.get_hook(&lua, "on_shutdown").unwrap(),
+            Value::Function(_)
+        ));
+        assert!(sr.take_runtime_error().is_none());
     }
 
     #[test]

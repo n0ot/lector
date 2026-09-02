@@ -95,6 +95,7 @@ const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("M-s", Action::ToggleSymbolLevel),
     ("M-r", Action::OpenReview),
     ("M-w", Action::SayOverlay),
+    ("M-R", Action::ReloadConfig),
     ("M-n", Action::PassNextKey),
     ("M-x", Action::ToggleSpeaking),
     ("M-u", Action::RevLinePrev),
@@ -373,6 +374,16 @@ mod tests {
                 "key={key}"
             );
         }
+    }
+
+    #[test]
+    fn configuration_reload_has_a_default_binding() {
+        let bindings = KeyBindings::new();
+
+        assert!(matches!(
+            bindings.binding_for_mode(InputMode::Normal, "M-R"),
+            Some(Binding::Builtin(Action::ReloadConfig))
+        ));
     }
 
     #[test]
