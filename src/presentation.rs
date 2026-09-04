@@ -3288,6 +3288,8 @@ pub enum PhysicalKeyboardProtocol {
 }
 
 impl PhysicalKeyboardProtocol {
+    const KITTY_FLAGS: u8 = 1 | 4;
+
     pub const fn for_kitty_support(kitty_keyboard: bool) -> Self {
         if kitty_keyboard {
             Self::Kitty
@@ -3301,9 +3303,16 @@ impl PhysicalKeyboardProtocol {
             // xterm modifyOtherKeys mode 2 disambiguates every modified key
             // which has a legacy encoding. Unsupported terminals ignore it.
             Self::ModifyOtherKeys => b"\x1b[>4;2m",
-            // Push one stack frame before setting Kitty's disambiguation bit;
-            // child-requested flags are composed into this owned frame.
-            Self::Kitty => b"\x1b[>1u",
+            // Push one stack frame before requesting disambiguation and shifted
+            // alternate keys; child-requested flags are composed into this frame.
+            Self::Kitty => b"\x1b[>5u",
+        }
+    }
+
+    pub const fn kitty_flags_floor(self) -> u8 {
+        match self {
+            Self::ModifyOtherKeys => 0,
+            Self::Kitty => Self::KITTY_FLAGS,
         }
     }
 

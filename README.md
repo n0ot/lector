@@ -536,14 +536,17 @@ xterm Meta encoding used by non-Kitty terminals and Kitty keyboard events.
 `M-PageUp`/`M-PageDown` and `M-Up`/`M-Down` pass through to the running
 application.
 
-While active, Lector requests Kitty's disambiguate-escape-codes flag from
-supporting outer terminals and xterm modifyOtherKeys mode 2 otherwise. It
-decodes that physical protocol to semantic keys, then encodes each key for the
-active child's independently modeled keyboard mode. Terminals which ignore
-both enhancement requests retain the unavoidable legacy ambiguity between a
-standalone Escape-prefixed key and the start of a terminal sequence. Only that
-fallback uses `lector.o.legacy_escape_timeout_ms` (30 ms by default); probe
-timeouts are separate and are not changed by this option.
+While active, Lector requests Kitty's disambiguate-escape-codes and
+report-alternate-keys flags from supporting outer terminals and xterm
+modifyOtherKeys mode 2 otherwise. The alternate-key metadata preserves shifted
+punctuation according to the active keyboard layout. Lector decodes that
+physical protocol to semantic keys, then encodes each key for the active
+child's independently modeled keyboard mode, removing metadata which the child
+did not request. Terminals which ignore both enhancement requests retain the
+unavoidable legacy ambiguity between a standalone Escape-prefixed key and the
+start of a terminal sequence. Only that fallback uses
+`lector.o.legacy_escape_timeout_ms` (30 ms by default); probe timeouts are
+separate and are not changed by this option.
 
 Resizing keeps the captured Review document frozen but creates a new viewport
 for the new terminal geometry. Lector keeps the cursor at the same screen row

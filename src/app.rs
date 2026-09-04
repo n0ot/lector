@@ -1847,11 +1847,12 @@ impl App {
         {
             self.view_stack.set_virtual_terminal_colors(colors);
         }
+        let keyboard_protocol = PhysicalKeyboardProtocol::for_kitty_support(profile.kitty_keyboard);
         let capabilities = RenderCapabilities {
             synchronized_output: self.output_scheduler.is_none() && profile.synchronized_output,
             hyperlinks: profile.hyperlinks,
             kitty_graphics: profile.kitty_graphics,
-            kitty_keyboard_flags_floor: u8::from(profile.kitty_keyboard),
+            kitty_keyboard_flags_floor: keyboard_protocol.kitty_flags_floor(),
             inline_terminal_effects: self.output_scheduler.is_none(),
         };
         if let Some(scheduler) = &mut self.output_scheduler {
@@ -1859,18 +1860,18 @@ impl App {
         }
         self.scene_renderer.set_capabilities(capabilities);
         self.physical_lifecycle
-            .set_keyboard_protocol(PhysicalKeyboardProtocol::for_kitty_support(
-                profile.kitty_keyboard,
-            ));
+            .set_keyboard_protocol(keyboard_protocol);
         self.physical_profile = profile;
     }
 
     pub fn enable_output_scheduler(&mut self, config: OutputSchedulerConfig) {
+        let keyboard_protocol =
+            PhysicalKeyboardProtocol::for_kitty_support(self.physical_profile.kitty_keyboard);
         self.scene_renderer.set_capabilities(RenderCapabilities {
             synchronized_output: false,
             hyperlinks: self.physical_profile.hyperlinks,
             kitty_graphics: self.physical_profile.kitty_graphics,
-            kitty_keyboard_flags_floor: u8::from(self.physical_profile.kitty_keyboard),
+            kitty_keyboard_flags_floor: keyboard_protocol.kitty_flags_floor(),
             inline_terminal_effects: false,
         });
         self.output_scheduler = Some(OutputScheduler::new(

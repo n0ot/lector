@@ -85,23 +85,30 @@ impl KeyInput {
         legacy_control_code(ch)
     }
 
-    /// Transcodes an extended keyboard event for a child using legacy Xterm
-    /// input. Input which is already legacy-compatible remains byte-exact.
+    /// Transcodes a keyboard event for a child using legacy Xterm input.
+    /// Mode-sensitive keys are derived from the semantic event and the child's
+    /// modes; other input which is already legacy-compatible remains byte-exact.
     pub(crate) fn legacy_child_bytes<'a>(
         &self,
         raw: &'a [u8],
         application_cursor: bool,
         application_keypad: bool,
     ) -> Cow<'a, [u8]> {
-        if !is_extended_key_encoding(self.event, raw) {
-            return Cow::Borrowed(raw);
-        }
         if self.is_release() {
             return Cow::Owned(Vec::new());
         }
 
         let mut event = self.normalized_event();
         event.kind = KeyEventKind::Press;
+
+        if let Some(sequence) =
+            legacy_application_mode_sequence(event, application_cursor, application_keypad)
+        {
+            return Cow::Owned(sequence.to_vec());
+        }
+        if !is_extended_key_encoding(self.event, raw) {
+            return Cow::Borrowed(raw);
+        }
 
         // Super and Hyper have no legacy representation. Sending only the base
         // key would turn a shortcut into unintended text.
@@ -147,22 +154,6 @@ impl KeyInput {
             return Cow::Owned(encoded);
         }
 
-        let is_keypad = event.state.contains(KeyEventState::KEYPAD);
-        if application_keypad
-            && is_keypad
-            && event.modifiers.is_empty()
-            && let Some(sequence) = application_keypad_sequence(event.code)
-        {
-            return Cow::Owned(sequence.to_vec());
-        }
-        if application_cursor
-            && !is_keypad
-            && event.modifiers.is_empty()
-            && let Some(sequence) = application_cursor_sequence(event.code)
-        {
-            return Cow::Owned(sequence.to_vec());
-        }
-
         let mut encoded = [0; 32];
         match Event::Key(event).encode(&mut encoded, Encoding::Xterm) {
             Ok(length) => Cow::Owned(encoded[..length].to_vec()),
@@ -186,6 +177,11 @@ impl KeyInput {
         if is_kitty_key_encoding(raw) {
             if self.is_release() && kitty_keyboard_flags & 2 == 0 {
                 return Cow::Owned(Vec::new());
+            }
+            if kitty_keyboard_flags & 4 == 0
+                && let Some(without_alternates) = strip_kitty_alternate_key_codes(raw)
+            {
+                return Cow::Owned(without_alternates);
             }
             return Cow::Borrowed(raw);
         }
@@ -246,6 +242,25 @@ fn is_kitty_key_encoding(raw: &[u8]) -> bool {
         .is_some_and(|body| body.ends_with(b"u") || body.contains(&b':'))
 }
 
+fn strip_kitty_alternate_key_codes(raw: &[u8]) -> Option<Vec<u8>> {
+    let (prefix, body) = raw
+        .strip_prefix(b"\x1B[")
+        .map(|body| (&raw[..2], body))
+        .or_else(|| raw.strip_prefix(b"\x9B").map(|body| (&raw[..1], body)))?;
+    let first_field_end = body
+        .iter()
+        .position(|byte| *byte == b';' || (0x40..=0x7E).contains(byte))?;
+    let alternate_start = body[..first_field_end]
+        .iter()
+        .position(|byte| *byte == b':')?;
+
+    let mut stripped = Vec::with_capacity(raw.len());
+    stripped.extend_from_slice(prefix);
+    stripped.extend_from_slice(&body[..alternate_start]);
+    stripped.extend_from_slice(&body[first_field_end..]);
+    Some(stripped)
+}
+
 fn legacy_control_code(ch: char) -> Option<u8> {
     match ch.to_ascii_lowercase() {
         '@' | ' ' | '2' => Some(0x00),
@@ -257,6 +272,25 @@ fn legacy_control_code(ch: char) -> Option<u8> {
         '_' | '7' | '/' => Some(0x1F),
         '?' | '8' => Some(0x7F),
         _ => None,
+    }
+}
+
+fn legacy_application_mode_sequence(
+    event: KeyEvent,
+    application_cursor: bool,
+    application_keypad: bool,
+) -> Option<&'static [u8]> {
+    if !event.modifiers.is_empty() {
+        return None;
+    }
+
+    let is_keypad = event.state.contains(KeyEventState::KEYPAD);
+    if application_keypad && is_keypad {
+        application_keypad_sequence(event.code)
+    } else if application_cursor && !is_keypad {
+        application_cursor_sequence(event.code)
+    } else {
+        None
     }
 }
 
@@ -420,6 +454,38 @@ mod tests {
     }
 
     #[test]
+    fn kitty_shifted_alternate_is_the_binding_identity() {
+        let raw = b"\x1B[91:123;4u";
+        let terminput::Event::Key(event) = terminput::Event::parse_from(raw)
+            .expect("parse Kitty event")
+            .expect("complete Kitty event")
+        else {
+            panic!("expected key event");
+        };
+        let input = KeyInput::new(event, raw);
+
+        assert_eq!(event.code, KeyCode::Char('{'));
+        assert_eq!(
+            input.legacy_child_bytes(raw, false, false).as_ref(),
+            b"\x1B{"
+        );
+        assert_eq!(
+            input.kitty_child_bytes(raw, 1, false, false).as_ref(),
+            b"\x1B[91;4u"
+        );
+        assert_eq!(input.kitty_child_bytes(raw, 5, false, false).as_ref(), raw);
+
+        let raw_with_text = b"\x1B[91:123;4;123u";
+        let input = KeyInput::new(event, raw_with_text);
+        assert_eq!(
+            input
+                .kitty_child_bytes(raw_with_text, 17, false, false)
+                .as_ref(),
+            b"\x1B[91;4;123u"
+        );
+    }
+
+    #[test]
     fn extended_keys_fall_back_to_legacy_xterm_sequences() {
         let cases = [
             (
@@ -567,6 +633,41 @@ mod tests {
         assert_eq!(
             input.legacy_child_bytes(keypad, false, true).as_ref(),
             b"\x1BOM"
+        );
+    }
+
+    #[test]
+    fn child_application_modes_override_physical_compatibility_bytes() {
+        for (code, raw, expected) in [
+            (KeyCode::Left, b"\x1B[D".as_slice(), b"\x1BOD".as_slice()),
+            (KeyCode::Right, b"\x1B[C".as_slice(), b"\x1BOC".as_slice()),
+            (KeyCode::Up, b"\x1B[A".as_slice(), b"\x1BOA".as_slice()),
+            (KeyCode::Down, b"\x1B[B".as_slice(), b"\x1BOB".as_slice()),
+            (KeyCode::Home, b"\x1B[H".as_slice(), b"\x1BOH".as_slice()),
+            (KeyCode::End, b"\x1B[F".as_slice(), b"\x1BOF".as_slice()),
+        ] {
+            let input = KeyInput::new(KeyEvent::new(code), raw);
+            assert_eq!(
+                input.legacy_child_bytes(raw, false, false).as_ref(),
+                raw,
+                "normal cursor mode must retain raw bytes for {code:?}"
+            );
+            assert_eq!(
+                input.legacy_child_bytes(raw, true, false).as_ref(),
+                expected,
+                "application cursor mode must encode {code:?} semantically"
+            );
+        }
+
+        let raw = b"1";
+        let keypad = KeyInput::new(
+            KeyEvent::new(KeyCode::Char('1')).state(KeyEventState::KEYPAD),
+            raw,
+        );
+        assert_eq!(keypad.legacy_child_bytes(raw, false, false).as_ref(), raw);
+        assert_eq!(
+            keypad.legacy_child_bytes(raw, false, true).as_ref(),
+            b"\x1BOq"
         );
     }
 

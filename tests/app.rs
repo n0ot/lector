@@ -935,7 +935,7 @@ fn lua_binding_is_immediate_after_probe_fence_with_enhanced_outer_keyboards() {
             b"\x1B[91;3u".as_slice(),
             b"\x1B[93;3u".as_slice(),
             b"\x1B[95;4u".as_slice(),
-            b"\x1B[>1u".as_slice(),
+            b"\x1B[>5u".as_slice(),
         ),
     ] {
         let (mut app, mut sr, recorder, _clock) = make_app();
@@ -7126,6 +7126,32 @@ fn kitty_associated_text_is_transcoded_for_legacy_child() {
         .expect("forward Kitty associated-text event");
 
     assert_eq!(pty_out, b"_");
+}
+
+#[test]
+fn kitty_alternate_metadata_distinguishes_shifted_punctuation_bindings() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_stdin(&mut sr, b"\x1BOP", &mut pty_out, &mut term_out)
+        .expect("open help");
+
+    for (input, expected_help) in [
+        (b"\x1B[91;3u".as_slice(), "previous clipboard"),
+        (b"\x1B[93;3u".as_slice(), "next clipboard"),
+        (b"\x1B[91:123;4u".as_slice(), "left click at review cursor"),
+        (b"\x1B[93:125;4u".as_slice(), "right click at review cursor"),
+    ] {
+        recorder.inner.borrow_mut().speaks.clear();
+        app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+            .expect("dispatch shifted punctuation binding");
+        assert_eq!(
+            recorder.inner.borrow().speaks.as_slice(),
+            [(expected_help.into(), false)],
+            "input={input:?}"
+        );
+    }
+    assert!(pty_out.is_empty());
 }
 
 #[test]

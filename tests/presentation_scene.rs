@@ -332,11 +332,11 @@ fn physical_keyboard_protocol_is_owned_across_activation_transition_and_cleanup(
     lifecycle.set_keyboard_protocol(PhysicalKeyboardProtocol::Kitty);
     let transition = lifecycle.reconfigure_keyboard_protocol();
     assert_eq!(transition.damage, SceneDamage::Full);
-    assert_eq!(transition.bytes, b"\x1b[>4;0m\x1b[>1u");
+    assert_eq!(transition.bytes, b"\x1b[>4;0m\x1b[>5u");
     physical
         .advance(&transition.bytes)
         .expect("apply Kitty transition");
-    assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 1);
+    assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 5);
     assert!(lifecycle.reconfigure_keyboard_protocol().bytes.is_empty());
 
     let suspended = lifecycle.suspend();
@@ -358,11 +358,11 @@ fn physical_keyboard_protocol_is_owned_across_activation_transition_and_cleanup(
     assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 0);
 
     let resumed = lifecycle.resume();
-    assert!(resumed.bytes.ends_with(b"\x1b[>1u"));
+    assert!(resumed.bytes.ends_with(b"\x1b[>5u"));
     physical
         .advance(&resumed.bytes)
         .expect("apply Kitty resume");
-    assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 1);
+    assert_eq!(physical.normalized_snapshot().modes.kitty_keyboard_flags, 5);
     let shutdown = lifecycle.shutdown();
     assert!(
         shutdown

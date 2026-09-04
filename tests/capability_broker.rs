@@ -929,8 +929,8 @@ fn late_kitty_probe_atomically_replaces_the_non_kitty_keyboard_fallback() {
         .expect("consume Kitty capability and startup fence");
 
     let transition = &harness.terminal_output()[before_reply..];
-    assert!(transition.starts_with(b"\x1b[>4;0m\x1b[>1u"));
-    assert!(contains(transition, b"\x1b[=1u"));
+    assert!(transition.starts_with(b"\x1b[>4;0m\x1b[>5u"));
+    assert!(contains(transition, b"\x1b[=5u"));
     assert!(harness.physical_profile().kitty_keyboard);
     assert!(harness.application_input().is_empty());
 }
