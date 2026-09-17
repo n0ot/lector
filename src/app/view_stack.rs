@@ -430,18 +430,28 @@ impl App {
     ) -> Result<()> {
         let scheduled = self.output_scheduler.is_some();
         scene.effects.bell_count = if scheduled { 0 } else { bell_count };
-        if scheduled
-            && self
-                .output_scheduler
-                .as_ref()
-                .is_some_and(crate::output_scheduler::OutputScheduler::has_started_render_work)
-        {
-            // If an older render has begun, this full reconstruction follows
-            // it without depending on its predicted shadow. An unstarted
-            // render is replaceable and was itself computed from the still
-            // confirmed scene, so it does not invalidate incremental damage.
-            self.scene_renderer.invalidate();
-            damage = SceneDamage::Full;
+        if let Some(scheduler) = &self.output_scheduler {
+            if scheduler.has_started_render_work() {
+                // A full reconstruction follows the started render without
+                // depending on its not-yet-confirmed predicted shadow.
+                self.scene_renderer.invalidate();
+                damage = SceneDamage::Full;
+            } else if scheduler.has_render_work()
+                && !matches!(
+                    damage,
+                    SceneDamage::Full | SceneDamage::Resize { .. } | SceneDamage::Surfaces(_)
+                )
+            {
+                // Replacing unstarted output diffs against the last confirmed
+                // scene. The latest model damage excludes changes queued by
+                // earlier updates, so compare the whole viewport to retain all
+                // unpresented changes, including on a cursor-only update.
+                damage = SceneDamage::regions([crate::presentation::GridRect::new(
+                    GridPoint::new(0, 0),
+                    scene.geometry.rows,
+                    scene.geometry.cols,
+                )]);
+            }
         }
         let presented_application_synchronized =
             self.view_stack.presented_holds_synchronized_output();

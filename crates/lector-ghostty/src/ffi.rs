@@ -178,8 +178,17 @@ pub(crate) const RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8: RenderStateRowCells
 
 pub(crate) type Cell = u64;
 pub(crate) type CellData = c_int;
+pub(crate) const CELL_DATA_CONTENT_TAG: CellData = 2;
 pub(crate) const CELL_DATA_WIDE: CellData = 3;
 pub(crate) const CELL_DATA_HAS_HYPERLINK: CellData = 7;
+pub(crate) const CELL_DATA_COLOR_PALETTE: CellData = 10;
+pub(crate) const CELL_DATA_COLOR_RGB: CellData = 11;
+
+pub(crate) type CellContentTag = c_int;
+pub(crate) const CELL_CONTENT_CODEPOINT: CellContentTag = 0;
+pub(crate) const CELL_CONTENT_CODEPOINT_GRAPHEME: CellContentTag = 1;
+pub(crate) const CELL_CONTENT_BG_COLOR_PALETTE: CellContentTag = 2;
+pub(crate) const CELL_CONTENT_BG_COLOR_RGB: CellContentTag = 3;
 
 pub(crate) type CellWide = c_int;
 pub(crate) const CELL_WIDE_NARROW: CellWide = 0;

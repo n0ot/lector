@@ -243,6 +243,18 @@ _Static_assert(GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8 == 9,
                "GhosttyRenderStateRowCellsData values changed");
 _Static_assert(GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE == 2,
                "GhosttyRenderStateRowCellsData style value changed");
+_Static_assert(sizeof(GhosttyCellContentTag) == sizeof(int) &&
+                   sizeof(GhosttyColorPaletteIndex) == sizeof(uint8_t),
+               "Ghostty cell background query types changed");
+_Static_assert(GHOSTTY_CELL_DATA_CONTENT_TAG == 2 &&
+                   GHOSTTY_CELL_DATA_COLOR_PALETTE == 10 &&
+                   GHOSTTY_CELL_DATA_COLOR_RGB == 11,
+               "Ghostty cell background query tags changed");
+_Static_assert(GHOSTTY_CELL_CONTENT_CODEPOINT == 0 &&
+                   GHOSTTY_CELL_CONTENT_CODEPOINT_GRAPHEME == 1 &&
+                   GHOSTTY_CELL_CONTENT_BG_COLOR_PALETTE == 2 &&
+                   GHOSTTY_CELL_CONTENT_BG_COLOR_RGB == 3,
+               "Ghostty cell content tags changed");
 _Static_assert(GHOSTTY_CELL_DATA_WIDE == 3,
                "GhosttyCellData values changed");
 _Static_assert(GHOSTTY_CELL_WIDE_SPACER_HEAD == 3,

@@ -38,7 +38,10 @@ differential recordings are regression inputs; their classification fields are
 documentation, not runtime policy.
 
 The adapter normalizes Ghostty cells into Lector's grapheme, width, style,
-hyperlink, wrapping, and history model. Lector exposes at most 10,000
+hyperlink, wrapping, and history model. Background-only cells combine Ghostty's
+cell content color with its style metadata, including when captured from
+scrollback, so erased regions retain their application-selected color.
+Lector exposes at most 10,000
 scrollback rows. Ghostty's allocator prunes complete pages and therefore may
 physically retain additional rows; the adapter disables the independent byte
 cap, configures 20,000 lines of physical headroom, and clips its public model
@@ -133,7 +136,9 @@ no larger PTY budget.
 Modeled visual updates become eligible at the end of their current bounded
 event-loop turn and have a 64 KiB per-drain write budget. An unstarted render
 can be replaced by the newest
-authoritative scene, while started transactions, lifecycle/control bytes, and
+authoritative scene. A replacement compares the complete viewport against the
+last confirmed presentation, since the newest parser damage alone omits earlier
+unflushed changes. Started transactions, lifecycle/control bytes, and
 bells are retained. This bounds obsolete incremental visual work
 without delaying terminal replies or input sent to the application PTY.
 Application mode 2026 is pane-local batching intent: Lector owns at most one

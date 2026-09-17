@@ -3436,7 +3436,7 @@ impl Terminal {
             grapheme: row_cell_grapheme(&self.row_cells)?,
             width,
             continuation,
-            style: normalize_style(row_cell_style(&self.row_cells)?)?,
+            style: normalize_cell_style(raw_cell, row_cell_style(&self.row_cells)?)?,
             hyperlink: if cell_query(raw_cell, ffi::CELL_DATA_HAS_HYPERLINK)? {
                 let reference = terminal_grid_ref(
                     &self.terminal,
@@ -3887,6 +3887,25 @@ fn row_cell_style(handle: &RowCellsHandle) -> Result<ffi::Style, Error> {
     Ok(style)
 }
 
+// Ghostty stores erased cells' backgrounds in their content payload rather
+// than their style ID. Both viewport and history readers must combine the two.
+fn normalize_cell_style(cell: ffi::Cell, style: ffi::Style) -> Result<StyleSnapshot, Error> {
+    let mut style = normalize_style(style)?;
+    match cell_query::<ffi::CellContentTag>(cell, ffi::CELL_DATA_CONTENT_TAG)? {
+        ffi::CELL_CONTENT_CODEPOINT | ffi::CELL_CONTENT_CODEPOINT_GRAPHEME => {}
+        ffi::CELL_CONTENT_BG_COLOR_PALETTE => {
+            style.background =
+                ColorSnapshot::Indexed(cell_query(cell, ffi::CELL_DATA_COLOR_PALETTE)?);
+        }
+        ffi::CELL_CONTENT_BG_COLOR_RGB => {
+            let rgb = cell_query::<ffi::ColorRgb>(cell, ffi::CELL_DATA_COLOR_RGB)?;
+            style.background = ColorSnapshot::Rgb(rgb.r, rgb.g, rgb.b);
+        }
+        _ => return Err(Error::InvalidValue),
+    }
+    Ok(style)
+}
+
 fn normalize_style(style: ffi::Style) -> Result<StyleSnapshot, Error> {
     Ok(StyleSnapshot {
         foreground: normalize_style_color(style.fg_color)?,
@@ -4089,7 +4108,7 @@ fn read_grid_cell(reference: &ffi::GridRef) -> Result<CellSnapshot, Error> {
         grapheme: grid_ref_grapheme(reference)?,
         width,
         continuation,
-        style: normalize_style(grid_ref_style(reference)?)?,
+        style: normalize_cell_style(raw_cell, grid_ref_style(reference)?)?,
         hyperlink: if cell_query(raw_cell, ffi::CELL_DATA_HAS_HYPERLINK)? {
             grid_ref_hyperlink(reference)?
         } else {
@@ -4332,6 +4351,32 @@ mod tests {
         let mut trailing_blank = String::new();
         row.append_contents_range_to(&mut trailing_blank, 0, 2);
         assert_eq!(trailing_blank, "a");
+    }
+
+    #[test]
+    fn erased_cell_backgrounds_survive_viewport_and_history_snapshots() {
+        for (sgr, expected) in [
+            ("48;2;12;34;56", super::ColorSnapshot::Rgb(12, 34, 56)),
+            ("48;5;42", super::ColorSnapshot::Indexed(42)),
+        ] {
+            let mut terminal = Terminal::new(3, 8).expect("terminal");
+            terminal
+                .advance(format!("\x1b[{sgr}m\x1b[2J\x1b[HA\x1b[K").as_bytes())
+                .expect("paint and erase");
+            for row in terminal.snapshot().rows.iter() {
+                for cell in row.cells.iter() {
+                    assert_eq!(cell.style.background, expected, "viewport background");
+                }
+            }
+            terminal
+                .advance(b"\x1b[3;1H\r\n")
+                .expect("scroll into history");
+            let snapshot = terminal.snapshot_with_history().expect("history snapshot");
+            assert_eq!(snapshot.scrollback.len(), 1);
+            for cell in snapshot.scrollback[0].cells.iter() {
+                assert_eq!(cell.style.background, expected, "history background");
+            }
+        }
     }
 
     #[test]

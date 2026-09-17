@@ -1262,6 +1262,59 @@ fn project_harness_coalesces_event_burst_and_matches_the_ghostty_oracle() {
     assert!(!contents.contains("stale"), "{contents:?}");
 }
 
+#[test]
+fn replacing_unstarted_renders_preserves_all_unpresented_changes() {
+    for synchronized in [false, true] {
+        let mut harness = Harness::new_scheduled(4, 20).expect("scheduled harness");
+        harness
+            .handle_pty_output(b"\x1b[?1049hbase")
+            .expect("initial scene");
+        harness.tick(4).expect("initial deadline");
+        harness
+            .drain_scheduled_output(false)
+            .expect("confirm initial scene");
+        if synchronized {
+            harness
+                .handle_pty_output(b"\x1b[?2026h")
+                .expect("open frame");
+        }
+        harness
+            .handle_pty_output(b"\x1b[2;1Hsecond")
+            .expect("first dirty row");
+        harness
+            .handle_pty_output(b"\x1b[3;1Hthird")
+            .expect("second dirty row");
+        // A cursor-only update must retain both earlier unflushed cell changes.
+        harness
+            .handle_pty_output(b"\x1b[1;1H")
+            .expect("move cursor");
+        if synchronized {
+            harness
+                .handle_pty_output(b"\x1b[?2026l")
+                .expect("close frame");
+        }
+        harness.tick(4).expect("replacement deadline");
+        harness
+            .drain_scheduled_output(false)
+            .expect("flush replacement");
+        let mut physical = GhosttyEngine::new(4, 20).expect("physical Ghostty");
+        physical
+            .advance(harness.terminal_output())
+            .expect("parse physical output");
+        let snapshot = physical.normalized_snapshot();
+        assert_eq!(
+            snapshot.rows[1].contents().trim_end(),
+            "second",
+            "synchronized={synchronized}"
+        );
+        assert_eq!(
+            snapshot.rows[2].contents().trim_end(),
+            "third",
+            "synchronized={synchronized}"
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum WriteStep {
     Count(usize),
