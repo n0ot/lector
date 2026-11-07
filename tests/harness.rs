@@ -1,6 +1,49 @@
 use lector::harness::Harness;
 
 #[test]
+fn deletion_survives_a_completed_unchanged_frame() {
+    let mut harness = Harness::new(4, 20).unwrap();
+    harness
+        .run_script(
+            r"
+Scenario: an unchanged receipt precedes the edit
+Given pty-stdout: \x1b[2;1H> abc
+And settled:
+And clear-speech:
+When stdin: \x7f
+And pty-stdout: \x1b[?2026h\x1b[0m\x1b[2;6H\x1b[?25h\x1b[?2026l
+And settled:
+And pty-stdout: \x1b[?2026h\x1b[2;5H\x1b[K\x1b[?2026l
+And settled:
+Then expect-speak: c
+And expect-no-speak:
+
+Scenario: unchanged receipts alone never announce deletion
+Given pty-stdout: > abc
+And settled:
+And clear-speech:
+When stdin: \x7f
+And pty-stdout: \x1b[?2026h\x1b[0m\x1b[?25h\x1b[?2026l
+And settled:
+Then expect-no-speak:
+
+Scenario: an incompatible replacement disproves the pending edit
+Given pty-stdout: > abc
+And settled:
+And clear-speech:
+When stdin: \x7f
+And pty-stdout: \r# xyz
+And settled:
+And clear-speech:
+And pty-stdout: \x1b[1;5H\x1b[K
+And settled:
+Then expect-no-speak:
+",
+        )
+        .unwrap();
+}
+
+#[test]
 fn harness_script_basic() {
     let script = include_str!("scripts/basic.txt");
     let mut harness = Harness::new(24, 80).expect("create harness");

@@ -2076,7 +2076,10 @@ fn cursor_addressed_transcript_growth_reads_the_inserted_response() {
     );
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        &[("with more detail.".into(), false)]
+        &[(
+            "It continues on this row with more detail. Working 2s".into(),
+            false
+        )]
     );
 }
 
@@ -5851,7 +5854,7 @@ fn maximum_delay_finalizes_continuously_changing_output() {
 }
 
 #[test]
-fn cursor_tracking_wins_over_single_line_ruler_change() {
+fn cursor_tracking_preserves_parallel_status_changes() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -5881,12 +5884,12 @@ fn cursor_tracking_wins_over_single_line_ruler_change() {
 
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        [("second line".into(), false)]
+        [("2".into(), false), ("second line".into(), false)]
     );
 }
 
 #[test]
-fn cursor_tracking_stays_silent_on_blank_line_during_ruler_change() {
+fn blank_cursor_destination_does_not_hide_status_changes() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -5914,7 +5917,10 @@ fn cursor_tracking_stays_silent_on_blank_line_during_ruler_change() {
     app.maybe_finalize_changes(&mut sr)
         .expect("finalize cursor move");
 
-    assert!(recorder.inner.borrow().speaks.is_empty());
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("2".into(), false)]
+    );
 }
 
 #[test]
@@ -5945,7 +5951,7 @@ fn diff_wins_when_cursor_movement_redraws_the_cursor_line() {
 }
 
 #[test]
-fn inline_input_ignores_coupled_ruler_redraws() {
+fn inline_input_preserves_coupled_status_redraws() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -5987,7 +5993,7 @@ fn inline_input_ignores_coupled_ruler_redraws() {
 
     assert_eq!(
         recorder.inner.borrow().speaks.as_slice(),
-        [("l".into(), false), ("p".into(), false)]
+        [("l 4".into(), false), ("p 5".into(), false)]
     );
 }
 
@@ -6025,10 +6031,9 @@ fn neovim_typeahead_suppression_skips_the_unechoed_append_command() {
             .expect("finalize insert-mode redraw")
     );
 
-    assert!(
-        recorder.inner.borrow().speaks.is_empty(),
-        "speaks={:?}",
-        recorder.inner.borrow().speaks
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("2".into(), false)]
     );
 }
 

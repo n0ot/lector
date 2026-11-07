@@ -1370,7 +1370,9 @@ mod tests {
         let read = sr.auto_read_after_input(&mut view).unwrap();
 
         assert!(read);
-        assert!(speaks.borrow().is_empty());
+        let spoken = speaks.borrow().join(" ");
+        assert!(spoken.contains("INSERT"));
+        assert!(!spoken.contains("hello"));
         assert!(sr.pending_key_echo.is_empty());
     }
 
@@ -1393,7 +1395,7 @@ mod tests {
         let read = sr.auto_read(&mut view).unwrap();
 
         assert!(read);
-        assert_eq!(speaks.borrow().as_slice(), ["i"]);
+        assert_eq!(speaks.borrow().as_slice(), ["i -- INSERT --"]);
         assert_eq!(sr.pending_key_echo.len(), 1);
         assert!(sr.key_echo_stream_active);
 
@@ -1407,8 +1409,46 @@ mod tests {
         let read = sr.auto_read_after_input(&mut view).unwrap();
 
         assert!(read);
-        assert_eq!(speaks.borrow().as_slice(), ["i"]);
+        assert_eq!(
+            speaks.borrow().as_slice(),
+            ["i -- INSERT --", " left bracket  plus  right bracket "]
+        );
         assert!(sr.pending_key_echo.is_empty());
+    }
+
+    #[test]
+    fn editing_does_not_hide_an_independent_notification() {
+        for suppress_echo in [false, true] {
+            let (mut sr, speaks) = make_sr();
+            let mut view = View::new(4, 60);
+            view.process_changes(b"> a\x1b[4;1HReady\x1b[1;4H");
+            view.finalize_changes(0);
+            sr.set_suppress_key_echo(suppress_echo);
+            sr.record_forwarded_key(Some("b"), crate::terminal::ScreenIdentity::Primary);
+            view.process_changes(
+                b"\x1b[?2026h\x1b[1;4Hb\x1b[4;1HConnection lost; please retry\x1b[1;5H\x1b[?2026l",
+            );
+            assert!(sr.auto_read_after_input(&mut view).unwrap());
+            let spoken = speaks.borrow().join(" ");
+            assert!(spoken.contains("Connection lost; please retry"));
+            assert_eq!(spoken.starts_with("b "), !suppress_echo);
+        }
+    }
+
+    #[test]
+    fn mode_change_preserves_both_short_and_long_notifications() {
+        let (mut sr, speaks) = make_sr();
+        let mut view = View::new(4, 72);
+        view.process_changes(b"> \x1b[2;1HReady\x1b[3;1HWaiting\x1b[1;3H");
+        view.finalize_changes(0);
+        view.process_changes(
+            b"\x1b[?2026h\x1b[6 q\x1b[2;1H\x1b[KBusy\x1b[3;1HThe operation failed and requires another attempt\x1b[1;3H\x1b[?2026l",
+        );
+        assert!(sr.auto_read(&mut view).unwrap());
+        assert_eq!(
+            speaks.borrow().as_slice(),
+            ["Busy The operation failed and requires another attempt"]
+        );
     }
 
     #[test]
@@ -1716,6 +1756,43 @@ mod tests {
         sr.track_cursor(&mut view).unwrap();
 
         assert!(speaks.borrow().is_empty());
+    }
+
+    #[test]
+    fn unchanged_receipts_do_not_disprove_pending_edits() {
+        use crate::presentation::SurfaceId;
+
+        for backspace in [true, false] {
+            let (mut sr, speaks) = make_sr();
+            let mut view = View::new(3, 16);
+            view.process_changes(b"> abc");
+            if !backspace {
+                view.process_changes(b"\x08");
+            }
+            view.finalize_changes(0);
+            view.enable_presentation_tracking();
+            if backspace {
+                sr.defer_backspace(&view);
+            } else {
+                sr.defer_delete(&view);
+            }
+            // A later receipt restores modes and cursor but does not yet
+            // contain the edit. It must neither speak nor discard the intent.
+            view.process_changes(b"\x1b[?2026h\x1b[0m\x1b[?25h\x1b[?2026l");
+            let frame = view.capture_live_presentation_frame(SurfaceId(1));
+            assert!(view.apply_presented_frame(frame));
+            assert!(!sr.resolve_pending_delete(&view).unwrap());
+            assert_eq!(sr.pending_deletes.len(), 1);
+            assert!(speaks.borrow().is_empty());
+            view.finalize_changes(1);
+
+            view.process_changes(b"\x1b[?2026h\x1b[1;5H\x1b[K\x1b[?2026l");
+            let frame = view.capture_live_presentation_frame(SurfaceId(1));
+            assert!(view.apply_presented_frame(frame));
+            assert!(sr.resolve_pending_delete(&view).unwrap());
+            assert_eq!(speaks.borrow().as_slice(), ["c"]);
+            assert!(sr.pending_deletes.is_empty());
+        }
     }
 
     #[test]

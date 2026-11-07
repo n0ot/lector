@@ -159,7 +159,7 @@ And settled:
 Then expect-speak-contains: 20 percent
 And expect-no-speak:
 
-Scenario: cursor movement wins over a coupled full screen ruler redraw
+Scenario: cursor movement preserves a coupled full screen status redraw
 Given pty-stdout: \x1B[2J\x1B[1;1Hfirst line\x1B[2;1Hsecond line\x1B[4;1Hfile 1,1 All\x1B[1;1H
 And settled:
 And clear-speech:
@@ -167,6 +167,7 @@ When stdin: j
 And pty-stdout: \x1B[2J\x1B[1;1Hfirst line\x1B[2;1Hsecond line\x1B[4;1Hfile 2,1 All\x1B[2;1H
 And settled:
 Then expect-pty-stdin: j
+And expect-speak: 2
 And expect-speak: second line
 And expect-no-speak:
 

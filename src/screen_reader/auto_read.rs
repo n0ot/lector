@@ -12,8 +12,6 @@ pub(super) struct AutoReadBuffers {
     interface_state: String,
     interface_state_candidate: String,
     interface_region: String,
-    transcript_growth: String,
-    transcript_growth_candidate: String,
     lcs: Vec<usize>,
 }
 
@@ -320,16 +318,11 @@ impl ScreenReader {
         if unpainted_echo_candidate {
             // A trailing whitespace cell is visually indistinguishable from
             // the blank cell it replaced, although a full-screen editor may
-            // repaint its ruler. Cursor advancement alone is ambiguous, so
-            // suppress this update only when the terminal's actual print
-            // report exactly acknowledges pending input.
+            // repaint its ruler. Consume an echo only when the actual print
+            // report acknowledges it, then retain the other changed text.
             let live_text = std::mem::take(&mut self.auto_read_buffers.live_text);
-            let suppress_echo = self.should_suppress_key_echo(&live_text);
+            self.should_suppress_key_echo(&live_text);
             self.auto_read_buffers.live_text = live_text;
-            if suppress_echo {
-                self.auto_read_buffers.diff_text = diff_text;
-                return Ok(true);
-            }
         }
         let cursor_row_inline_edit = prefer_cursor
             && cursor_changed
@@ -344,14 +337,14 @@ impl ScreenReader {
             && !prev_cursor_row_changed
         {
             // Cursor shape is application-controlled terminal state. When it
-            // changes alongside status-only painting, the compact changed
-            // label describes a real interface-mode transition rather than a
+            // changes alongside status-only painting, the changed
+            // labels describe a real interface-mode transition rather than a
             // typed character at the application cursor. Keep any pending
             // echo intact for a later cursor-row receipt.
             let mut state = std::mem::take(&mut self.auto_read_buffers.interface_state);
             let mut candidate =
                 std::mem::take(&mut self.auto_read_buffers.interface_state_candidate);
-            let has_state = collect_compact_interface_state_change(
+            let has_state = collect_interface_state_changes(
                 old_text,
                 new_text,
                 prev_cursor_row,
@@ -385,36 +378,6 @@ impl ScreenReader {
                 return Ok(true);
             }
         }
-        if interface_repaint && !input_echo_cursor_row && !cursor_row_inline_edit {
-            let mut growth = std::mem::take(&mut self.auto_read_buffers.transcript_growth);
-            let mut candidate =
-                std::mem::take(&mut self.auto_read_buffers.transcript_growth_candidate);
-            let has_growth = collect_extended_transcript_lines(
-                old_text,
-                new_text,
-                prev_cursor_row.min(cursor_row),
-                &mut growth,
-                &mut candidate,
-                &mut self.auto_read_buffers.lcs,
-            );
-            let suppress_echo = has_growth && self.should_suppress_key_echo(&growth);
-            let growth_to_speak = if has_growth && !suppress_echo {
-                self.hook_on_live_read(&growth, cursor_moves, scrolled)?
-            } else {
-                None
-            };
-            self.auto_read_buffers.transcript_growth = growth;
-            self.auto_read_buffers.transcript_growth_candidate = candidate;
-            if has_growth {
-                self.auto_read_buffers.diff_text = diff_text;
-                if let Some(text) = growth_to_speak
-                    && !text.is_empty()
-                {
-                    self.speak(&text, false)?;
-                }
-                return Ok(true);
-            }
-        }
         if interface_repaint
             && !transcript_growth_repaint
             && !input_echo_cursor_row
@@ -433,10 +396,8 @@ impl ScreenReader {
             self.read_new_interface_region_repaint()?;
             return Ok(true);
         }
-        // Full-screen applications commonly redraw a ruler or status line along with an
-        // inline edit. Keep the fine-grained insertion diff anchored to the cursor row in
-        // that case; otherwise the secondary row makes the update look like unrelated
-        // multi-line output and the whole edited line is announced.
+        // Keep fine-grained feedback for an inline edit, then append changes
+        // from other rows. Their timing alone cannot establish irrelevance.
         let prefer_inline_cursor_row = input_echo_cursor_row || cursor_row_inline_edit;
         let inline_row = usize::from(input_echo_row.unwrap_or(cursor.0));
         let (diff_old_text, diff_new_text) = if prefer_inline_cursor_row {
@@ -476,18 +437,15 @@ impl ScreenReader {
         });
         let cursor_on_changed_row = prefer_inline_cursor_row
             || single_changed_row.is_some_and(|row| row == prev_cursor.0 || row == cursor.0);
-        if prefer_cursor
+        // Cursor movement does not prove a parallel status update is
+        // incidental. Speak that update, then allow destination tracking too.
+        let track_destination = prefer_cursor
             && diff_state == DiffState::Single
             && cursor_moves > 0
             && !scrolled
             && cursor_changed
             && !cursor_on_changed_row
-            && !cursor_crossed_changed_row
-        {
-            diff_text.clear();
-            self.auto_read_buffers.diff_text = diff_text;
-            return Ok(false);
-        }
+            && !cursor_crossed_changed_row;
 
         let suppress_echo = if input_echo_cursor_row {
             self.should_suppress_cursor_row_key_echo(&diff_text)
@@ -495,14 +453,11 @@ impl ScreenReader {
             self.should_suppress_key_echo(&diff_text)
         };
         if suppress_echo {
-            self.auto_read_buffers.diff_text = diff_text;
-            return Ok(true);
+            diff_text.clear();
         }
-        if input_echo_cursor_row {
-            // Selecting the cursor row protects exact editor echoes from a
-            // parallel ruler repaint. If the candidate does not match queued
-            // input, it was not proven to be an echo: restore the complete
-            // stable-frame diff so unrelated output cannot disappear.
+        if input_echo_cursor_row && !suppress_echo {
+            // A failed match provides no evidence of an inline edit. Restore
+            // the complete diff, including context for replacement words.
             collect_auto_read_diff(
                 old_text,
                 new_text,
@@ -510,10 +465,28 @@ impl ScreenReader {
                 &mut self.auto_read_buffers.graphemes,
                 &mut self.auto_read_buffers.lcs,
             );
-            if self.should_suppress_key_echo(&diff_text) {
-                self.auto_read_buffers.diff_text = diff_text;
-                return Ok(true);
+        } else if prefer_inline_cursor_row {
+            // Exact echo evidence applies only to the edited row. Changes
+            // elsewhere may be important even when painted in the same frame.
+            let mut other = std::mem::take(&mut self.auto_read_buffers.interface_state_candidate);
+            for (row, (old, new)) in old_text
+                .split_terminator('\n')
+                .zip(new_text.split_terminator('\n'))
+                .enumerate()
+            {
+                if row == inline_row || old == new {
+                    continue;
+                }
+                other.clear();
+                collect_inserted_fields(old, new, &mut other, &mut self.auto_read_buffers.lcs);
+                if !other.is_empty() {
+                    if !diff_text.is_empty() {
+                        diff_text.push('\n');
+                    }
+                    diff_text.push_str(&other);
+                }
             }
+            self.auto_read_buffers.interface_state_candidate = other;
         }
 
         let original_nonempty = !diff_text.is_empty();
@@ -523,7 +496,7 @@ impl ScreenReader {
             self.speak(&text, false)?;
         }
         self.auto_read_buffers.diff_text = diff_text;
-        Ok(original_nonempty)
+        Ok((original_nonempty || suppress_echo) && !track_destination)
     }
 
     /// Speak the application cursor's complete soft-wrapped logical line.
@@ -574,7 +547,6 @@ impl ScreenReader {
     }
 }
 
-const MAX_COMPACT_INTERFACE_STATE_CHARS: usize = 32;
 const MIN_NEW_INTERFACE_POPULATED_ROWS: usize = 2;
 const MAX_NEW_INTERFACE_REGION_ROWS: usize = 64;
 const MAX_NEW_INTERFACE_REGION_CELLS: usize = 8_192;
@@ -621,44 +593,6 @@ fn has_inserted_transcript_lines(old_text: &str, new_text: &str, cursor_row: usi
         }
     }
     matched > 0 && old_count.saturating_sub(matched) <= 1
-}
-
-/// Collect only prefix-preserving line extensions above the prompt cursor.
-/// This lets streaming response text bypass cursor-only TUI tracking without
-/// also announcing a separately repainted status or ruler row.
-fn collect_extended_transcript_lines(
-    old_text: &str,
-    new_text: &str,
-    cursor_row: usize,
-    out: &mut String,
-    candidate: &mut String,
-    lcs: &mut Vec<usize>,
-) -> bool {
-    out.clear();
-    candidate.clear();
-    for (old_line, new_line) in old_text
-        .split_terminator('\n')
-        .zip(new_text.split_terminator('\n'))
-        .take(cursor_row)
-    {
-        let old_line = old_line.trim_end();
-        let new_line = new_line.trim_end();
-        let extends_by_field = !old_line.trim().is_empty()
-            && new_line.starts_with(old_line)
-            && new_line.len() > old_line.len()
-            && new_line.split_whitespace().count() > old_line.split_whitespace().count();
-        if !extends_by_field {
-            continue;
-        }
-        candidate.clear();
-        if collect_inserted_fields(old_line, new_line, candidate, lcs) {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(candidate);
-        }
-    }
-    !out.is_empty()
 }
 
 fn collect_new_interface_region(view: &View, out: &mut String) -> bool {
@@ -829,7 +763,7 @@ fn rows_have_same_text(previous: &crate::terminal::Row, current: &crate::termina
             .all(|(old, new)| old.contents() == new.contents())
 }
 
-fn collect_compact_interface_state_change(
+fn collect_interface_state_changes(
     old_text: &str,
     new_text: &str,
     old_cursor_row: usize,
@@ -853,14 +787,13 @@ fn collect_compact_interface_state_change(
             continue;
         }
         let compact = candidate.trim();
-        let compact_chars = compact.chars().count();
-        if compact_chars == 0 || compact_chars > MAX_COMPACT_INTERFACE_STATE_CHARS {
+        if compact.is_empty() {
             continue;
         }
-        if out.is_empty() || compact_chars < out.chars().count() {
-            out.clear();
-            out.push_str(compact);
+        if !out.is_empty() {
+            out.push('\n');
         }
+        out.push_str(compact);
     }
     !out.is_empty()
 }
@@ -1180,10 +1113,7 @@ fn is_word_char(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DiffState, collect_auto_read_diff, collect_extended_transcript_lines,
-        collect_inserted_fields, field_replacement,
-    };
+    use super::{DiffState, collect_auto_read_diff, collect_inserted_fields, field_replacement};
 
     #[test]
     fn multiline_diff_preserves_each_source_line_boundary_once() {
@@ -1218,25 +1148,6 @@ mod tests {
         );
 
         assert_eq!(output, "first\n\nsecond\n");
-    }
-
-    #[test]
-    fn extended_transcript_lines_exclude_parallel_status_replacements() {
-        let old = "You: explain repainting\nClaude:\nThe response starts here.\nIt continues on this row\n\nWorking 1s\n> \n";
-        let new = "You: explain repainting\nClaude:\nThe response starts here.\nIt continues on this row with more detail.\n\nWorking 2s\n> \n";
-        let mut output = String::new();
-        let mut candidate = String::new();
-        let mut lcs = Vec::new();
-
-        assert!(collect_extended_transcript_lines(
-            old,
-            new,
-            6,
-            &mut output,
-            &mut candidate,
-            &mut lcs,
-        ));
-        assert_eq!(output, "with more detail.");
     }
 
     #[test]

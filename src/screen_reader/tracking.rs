@@ -775,7 +775,10 @@ fn evaluate_pending_delete(
                     && target_was_written
                     && target_cell_contains(view, candidate.target, &candidate.text))
                     || (cursor == candidate.target && !mutation)
-                    || (cursor == *old_cursor && mutation)
+                    // An unchanged receipt does not distinguish a rejected
+                    // key from an edit whose repaint has not arrived yet.
+                    // Keep waiting within the existing presentation bound.
+                    || cursor == *old_cursor
             });
             if partial {
                 PendingDeleteEvaluation::Partial
@@ -799,6 +802,10 @@ fn evaluate_pending_delete(
                 && evidence.row_changed(row_before, view, application_cursor.0)
             {
                 PendingDeleteEvaluation::Confirmed(text.clone())
+            } else if cursor == *application_cursor
+                && !evidence.row_changed(row_before, view, application_cursor.0)
+            {
+                PendingDeleteEvaluation::Partial
             } else {
                 PendingDeleteEvaluation::Rejected
             }
