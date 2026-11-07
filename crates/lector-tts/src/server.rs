@@ -716,7 +716,7 @@ mod tests {
 
         handle_line(" \r\n", &mut handler, &mut output).unwrap();
         assert_eq!(calls.get(), 0);
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
 
         handle_line("not json", &mut handler, &mut output).unwrap();
         assert_eq!(calls.get(), 0);
@@ -732,7 +732,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calls.get(), 1);
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
     }
 
     #[test]
@@ -752,7 +752,7 @@ mod tests {
             })
             .unwrap();
         assert!(frames.bytes.capacity() <= MAX_RPC_FRAME_BYTES);
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
         frames
             .push(
                 b"\n{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ok\"}\n",
