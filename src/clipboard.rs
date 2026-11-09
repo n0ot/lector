@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::{collections::VecDeque, fmt, str::FromStr};
 
 const INTERNAL_CLIPBOARD_CAPACITY: usize = 10;
@@ -214,35 +215,12 @@ impl SystemClipboard {
 }
 
 fn osc52_write(text: &str) -> Vec<u8> {
-    let encoded = encode_base64(text.as_bytes());
+    let encoded = STANDARD.encode(text.as_bytes());
     let mut sequence = Vec::with_capacity(OSC52_PREFIX.len() + encoded.len() + OSC52_SUFFIX.len());
     sequence.extend_from_slice(OSC52_PREFIX);
     sequence.extend_from_slice(encoded.as_bytes());
     sequence.extend_from_slice(OSC52_SUFFIX);
     sequence
-}
-
-fn encode_base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let first = chunk[0];
-        let second = chunk.get(1).copied().unwrap_or(0);
-        let third = chunk.get(2).copied().unwrap_or(0);
-        output.push(TABLE[usize::from(first >> 2)] as char);
-        output.push(TABLE[usize::from((first & 0x03) << 4 | second >> 4)] as char);
-        if chunk.len() > 1 {
-            output.push(TABLE[usize::from((second & 0x0f) << 2 | third >> 6)] as char);
-        } else {
-            output.push('=');
-        }
-        if chunk.len() > 2 {
-            output.push(TABLE[usize::from(third & 0x3f)] as char);
-        } else {
-            output.push('=');
-        }
-    }
-    output
 }
 
 #[cfg(test)]
@@ -302,6 +280,23 @@ mod tests {
             "osc52".parse::<SystemClipboardProvider>().unwrap(),
             SystemClipboardProvider::Osc52
         );
+    }
+
+    #[test]
+    fn osc52_payload_preserves_standard_base64_padding() {
+        for (text, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("\0", "AA=="),
+            ("ÿ", "w78="),
+        ] {
+            assert_eq!(
+                super::osc52_write(text),
+                format!("\x1b]52;c;{encoded}\x1b\\").as_bytes()
+            );
+        }
     }
 
     #[test]

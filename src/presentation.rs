@@ -9,6 +9,7 @@ use crate::terminal::{
     TerminalEvent, TerminalGeometry, TerminalModes, TerminalOperation, TerminalSnapshot,
     UnderlineStyle, UpdateSummary,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -2787,7 +2788,7 @@ fn write_kitty_images(
 }
 
 fn write_kitty_upload(bytes: &mut Vec<u8>, image_id: u32, upload: &SceneImageUpload) {
-    let encoded = encode_base64(&upload.data);
+    let encoded = STANDARD.encode(&upload.data);
     let format = match upload.format {
         PixelFormat::Rgb | PixelFormat::Gray => 24,
         PixelFormat::Rgba | PixelFormat::GrayAlpha => 32,
@@ -2839,29 +2840,6 @@ fn write_kitty_placement(bytes: &mut Vec<u8>, image: &PresentedImage) {
         )
         .as_bytes(),
     );
-}
-
-fn encode_base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        encoded.push(TABLE[usize::from(a >> 2)] as char);
-        encoded.push(TABLE[usize::from((a & 0x03) << 4 | b >> 4)] as char);
-        encoded.push(if chunk.len() > 1 {
-            TABLE[usize::from((b & 0x0f) << 2 | c >> 6)] as char
-        } else {
-            '='
-        });
-        encoded.push(if chunk.len() > 2 {
-            TABLE[usize::from(c & 0x3f)] as char
-        } else {
-            '='
-        });
-    }
-    encoded
 }
 
 fn write_terminal_string(bytes: &mut Vec<u8>, code: u8, value: Option<&str>) {
@@ -3485,5 +3463,37 @@ impl PhysicalTerminalLifecycle {
             bytes.extend_from_slice(b"\x1b[?1004l");
         }
         bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PixelFormat, SceneImageUpload, SurfaceId, write_kitty_upload};
+
+    #[test]
+    fn kitty_upload_preserves_standard_base64_binary_payloads() {
+        for (data, encoded) in [
+            (&b""[..], ""),
+            (&b"\xfb"[..], "+w=="),
+            (&b"\xfb\xff"[..], "+/8="),
+            (&b"\xfb\xff\x00"[..], "+/8A"),
+        ] {
+            let upload = SceneImageUpload {
+                owner: SurfaceId(1),
+                image_id: 2,
+                image_number: 0,
+                pixel_width: 1,
+                pixel_height: 1,
+                format: PixelFormat::Rgba,
+                data: data.into(),
+                data_digest: 0,
+            };
+            let mut bytes = Vec::new();
+            write_kitty_upload(&mut bytes, 2, &upload);
+            assert_eq!(
+                bytes,
+                format!("\x1b_Ga=t,t=d,f=32,s=1,v=1,i=2,q=2,m=0;{encoded}\x1b\\").as_bytes()
+            );
+        }
     }
 }

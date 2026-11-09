@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use lector::{
     app::App,
     output_scheduler::{EnqueueOutcome, OutputScheduler, OutputSchedulerConfig},
@@ -1201,7 +1202,7 @@ fn run_media_workload(iterations: usize) -> Result<MediaWorkloadReport, String> 
         .collect::<Vec<_>>();
     let command = format!(
         "\x1b_Ga=T,f=32,s={PIXEL_WIDTH},v={PIXEL_HEIGHT},i=17,p=23,c=8,r=4,q=2;{}\x1b\\",
-        encode_base64(&pixels)
+        STANDARD.encode(&pixels)
     );
     let mut source =
         GhosttyEngine::new(geometry.rows, geometry.cols).map_err(|error| error.to_string())?;
@@ -1347,29 +1348,6 @@ fn count_batch_pattern(batch: &RenderBatch, pattern: &[u8]) -> usize {
                 .count()
         })
         .sum()
-}
-
-fn encode_base64(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let a = chunk[0];
-        let b = chunk.get(1).copied().unwrap_or(0);
-        let c = chunk.get(2).copied().unwrap_or(0);
-        encoded.push(TABLE[usize::from(a >> 2)] as char);
-        encoded.push(TABLE[usize::from((a & 0x03) << 4 | b >> 4)] as char);
-        encoded.push(if chunk.len() > 1 {
-            TABLE[usize::from((b & 0x0f) << 2 | c >> 6)] as char
-        } else {
-            '='
-        });
-        encoded.push(if chunk.len() > 2 {
-            TABLE[usize::from(c & 0x3f)] as char
-        } else {
-            '='
-        });
-    }
-    encoded
 }
 
 fn run_scheduler_workload(workload: SchedulerWorkload) -> Result<SchedulerWorkloadReport, String> {
