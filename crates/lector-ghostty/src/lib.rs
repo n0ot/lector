@@ -24,6 +24,8 @@ pub enum Error {
     NoValue,
     IoError,
     LimitExceeded,
+    Rejected,
+    Unsupported,
     UnknownResult(i32),
     NullHandle,
     NullString,
@@ -690,11 +692,12 @@ impl TerminalHandle {
         // a complete page long before the independent line limit, leaving
         // fewer rows than Lector's contract. Remove it and bound retention by
         // the physical line limit below instead.
+        let unlimited = usize::MAX;
         result_from_code(unsafe {
             ffi::ghostty_terminal_set(
                 self.as_ptr(),
                 ffi::TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
-                std::ptr::null(),
+                (&unlimited as *const usize).cast(),
             )
         })?;
         // SAFETY: the handle is valid and Ghostty synchronously copies the
@@ -1046,12 +1049,23 @@ extern "C" fn effect_xtversion(
 }
 
 extern "C" fn effect_size(
-    _terminal: ffi::Terminal,
+    terminal: ffi::Terminal,
     userdata: *mut c_void,
     out: *mut ffi::SizeReportSize,
 ) -> bool {
     // SAFETY: see `effect_write_pty`.
     if let Some(sink) = unsafe { effect_sink(userdata) } {
+        // 1.x asks for geometry immediately when mode 2048 is enabled.
+        // Lector does not broker that mode; decline before any report escapes.
+        // Explicit size queries remain available after boundary enforcement.
+        match terminal_mode_raw(terminal, ffi::MODE_IN_BAND_RESIZE) {
+            Ok(true) => return false,
+            Ok(false) => {}
+            Err(error) => {
+                sink.record_error(error);
+                return false;
+            }
+        }
         sink.events.push(EffectSnapshot::Query(QuerySnapshot::Size));
         let Some(out) = (unsafe { out.as_mut() }) else {
             sink.record_error(Error::InvalidValue);
@@ -1131,31 +1145,27 @@ extern "C" fn effect_clipboard_write(
     _terminal: ffi::Terminal,
     userdata: *mut c_void,
     write: *const ffi::ClipboardWrite,
-) -> ffi::ClipboardWriteResult {
+) {
     // SAFETY: see `effect_write_pty`.
     let Some(sink) = (unsafe { effect_sink(userdata) }) else {
-        return ffi::CLIPBOARD_WRITE_RESULT_SUCCESS;
+        return;
     };
     let Some(write) = (unsafe { write.as_ref() }) else {
         sink.record_error(Error::InvalidValue);
-        return ffi::CLIPBOARD_WRITE_RESULT_SUCCESS;
+        return;
     };
-    if write.size < std::mem::size_of::<ffi::ClipboardWrite>() {
-        sink.record_error(Error::InvalidValue);
-        return ffi::CLIPBOARD_WRITE_RESULT_SUCCESS;
-    }
     let location = match write.location {
         ffi::CLIPBOARD_LOCATION_STANDARD => ClipboardLocationSnapshot::Standard,
         ffi::CLIPBOARD_LOCATION_SELECTION => ClipboardLocationSnapshot::Selection,
         ffi::CLIPBOARD_LOCATION_PRIMARY => ClipboardLocationSnapshot::Primary,
         _ => {
             sink.record_error(Error::InvalidValue);
-            return ffi::CLIPBOARD_WRITE_RESULT_SUCCESS;
+            return;
         }
     };
     if write.contents_len > 0 && write.contents.is_null() {
         sink.record_error(Error::InvalidValue);
-        return ffi::CLIPBOARD_WRITE_RESULT_SUCCESS;
+        return;
     }
     let contents = if write.contents_len == 0 {
         &[]
@@ -1170,14 +1180,14 @@ extern "C" fn effect_clipboard_write(
             Ok(value) => value,
             Err(error) => {
                 sink.record_error(error);
-                return ffi::CLIPBOARD_WRITE_RESULT_SUCCESS;
+                return;
             }
         };
         let data = if content.data.len == 0 {
             Vec::new()
         } else if content.data.ptr.is_null() {
             sink.record_error(Error::NullString);
-            return ffi::CLIPBOARD_WRITE_RESULT_SUCCESS;
+            return;
         } else {
             // SAFETY: content bytes are borrowed for this callback and copied.
             unsafe { std::slice::from_raw_parts(content.data.ptr, content.data.len) }.to_vec()
@@ -1188,7 +1198,17 @@ extern "C" fn effect_clipboard_write(
         location,
         contents: copied,
     });
-    ffi::CLIPBOARD_WRITE_RESULT_SUCCESS
+    // The stable API requires a synchronous reply while the request is borrowed.
+    unsafe {
+        (write.reply)(
+            write,
+            &ffi::ClipboardWriteReply {
+                size: std::mem::size_of::<ffi::ClipboardWriteReply>(),
+                result: ffi::CLIPBOARD_WRITE_RESULT_SUCCESS,
+                remember: false,
+            },
+        );
+    }
 }
 
 extern "C" fn effect_desktop_notification(
@@ -1204,10 +1224,6 @@ extern "C" fn effect_desktop_notification(
         sink.record_error(Error::InvalidValue);
         return;
     };
-    if notification.size < std::mem::size_of::<ffi::DesktopNotification>() {
-        sink.record_error(Error::InvalidValue);
-        return;
-    }
     match (
         callback_string(notification.title),
         callback_string(notification.body),
@@ -1232,10 +1248,6 @@ extern "C" fn effect_progress_report(
         sink.record_error(Error::InvalidValue);
         return;
     };
-    if report.size < std::mem::size_of::<ffi::ProgressReport>() {
-        sink.record_error(Error::InvalidValue);
-        return;
-    }
     let state = match report.state {
         ffi::PROGRESS_STATE_REMOVE => ProgressStateSnapshot::Remove,
         ffi::PROGRESS_STATE_SET => ProgressStateSnapshot::Set,
@@ -2897,9 +2909,17 @@ impl Terminal {
             let image_data = if let Some(current) = current_images.get(&image_id) {
                 current.clone()
             } else {
-                let data_len = kitty_image_query::<usize>(image, ffi::KITTY_IMAGE_DATA_DATA_LEN)?;
-                let data_ptr =
-                    kitty_image_query::<*const u8>(image, ffi::KITTY_IMAGE_DATA_DATA_PTR)?;
+                let pixels = match kitty_image_query::<ffi::GhosttyString>(
+                    image,
+                    ffi::KITTY_IMAGE_DATA_PIXELS,
+                ) {
+                    Ok(pixels) => pixels,
+                    // A placement may exist before all image pixels arrive.
+                    Err(Error::NoValue) => continue,
+                    Err(error) => return Err(error),
+                };
+                let data_len = pixels.len;
+                let data_ptr = pixels.ptr;
                 if data_len > 0 && data_ptr.is_null() {
                     return Err(Error::NullString);
                 }
@@ -3695,12 +3715,16 @@ fn terminal_string(
 }
 
 fn terminal_mode(handle: &TerminalHandle, mode: ffi::Mode) -> Result<bool, Error> {
+    terminal_mode_raw(handle.as_ptr(), mode)
+}
+
+fn terminal_mode_raw(terminal: ffi::Terminal, mode: ffi::Mode) -> Result<bool, Error> {
     let mut config = ffi::TerminalModeConfig { mode, value: false };
     // SAFETY: the handle is valid and the mode query struct matches the
     // frozen GhosttyTerminalModeConfig layout.
     let result = unsafe {
         ffi::ghostty_terminal_get(
-            handle.as_ptr(),
+            terminal,
             ffi::TERMINAL_DATA_MODE,
             (&mut config as *mut ffi::TerminalModeConfig).cast(),
         )
@@ -3911,15 +3935,15 @@ fn normalize_style(style: ffi::Style) -> Result<StyleSnapshot, Error> {
         foreground: normalize_style_color(style.fg_color)?,
         background: normalize_style_color(style.bg_color)?,
         underline_color: normalize_style_color(style.underline_color)?,
-        bold: style.bold,
-        dim: style.faint,
-        italic: style.italic,
-        blink: style.blink,
-        inverse: style.inverse,
-        invisible: style.invisible,
-        strikethrough: style.strikethrough,
-        overline: style.overline,
-        underline: match style.underline {
+        bold: style.flags & (1 << 0) != 0,
+        dim: style.flags & (1 << 2) != 0,
+        italic: style.flags & (1 << 1) != 0,
+        blink: style.flags & (1 << 3) != 0,
+        inverse: style.flags & (1 << 4) != 0,
+        invisible: style.flags & (1 << 5) != 0,
+        strikethrough: style.flags & (1 << 6) != 0,
+        overline: style.flags & (1 << 7) != 0,
+        underline: match i32::from((style.flags >> 8) & 7) {
             ffi::SGR_UNDERLINE_NONE => UnderlineSnapshot::None,
             ffi::SGR_UNDERLINE_SINGLE => UnderlineSnapshot::Single,
             ffi::SGR_UNDERLINE_DOUBLE => UnderlineSnapshot::Double,
@@ -3953,7 +3977,6 @@ fn terminal_grid_ref(
 ) -> Result<ffi::GridRef, Error> {
     let point = ffi::Point::coordinate(tag, col, row);
     let mut reference = ffi::GridRef {
-        size: std::mem::size_of::<ffi::GridRef>(),
         node: std::ptr::null_mut(),
         x: 0,
         y: 0,
@@ -4171,6 +4194,8 @@ fn result_from_code(code: ffi::ResultCode) -> Result<(), Error> {
         ffi::NO_VALUE => Err(Error::NoValue),
         ffi::IO_ERROR => Err(Error::IoError),
         ffi::LIMIT_EXCEEDED => Err(Error::LimitExceeded),
+        ffi::REJECTED => Err(Error::Rejected),
+        ffi::UNSUPPORTED => Err(Error::Unsupported),
         other => Err(Error::UnknownResult(other)),
     }
 }
@@ -4201,18 +4226,16 @@ const _: () = {
     assert!(std::mem::offset_of!(ffi::PointCoordinate, y) == 4);
     assert!(std::mem::size_of::<ffi::PointValue>() == 16);
     assert!(std::mem::offset_of!(ffi::Point, tag) == 0);
-    assert!(std::mem::offset_of!(ffi::GridRef, size) == 0);
-    assert!(std::mem::offset_of!(ffi::GridRef, node) == std::mem::size_of::<usize>());
+    assert!(std::mem::offset_of!(ffi::GridRef, node) == 0);
     assert!(std::mem::size_of::<ffi::ColorRgb>() == 3);
-    assert!(std::mem::size_of::<ffi::StyleColorValue>() == 8);
-    assert!(std::mem::offset_of!(ffi::Style, size) == 0);
-    assert!(std::mem::offset_of!(ffi::Style, fg_color) == std::mem::size_of::<usize>());
+    assert!(std::mem::size_of::<ffi::StyleColorValue>() == 3);
+    assert!(std::mem::offset_of!(ffi::Style, fg_color) == 0);
     if std::mem::size_of::<usize>() == 8 {
         assert!(std::mem::size_of::<ffi::Point>() == 24);
         assert!(std::mem::offset_of!(ffi::Point, value) == 8);
-        assert!(std::mem::size_of::<ffi::GridRef>() == 24);
-        assert!(std::mem::size_of::<ffi::StyleColor>() == 16);
-        assert!(std::mem::size_of::<ffi::Style>() == 72);
+        assert!(std::mem::size_of::<ffi::GridRef>() == 16);
+        assert!(std::mem::size_of::<ffi::StyleColor>() == 4);
+        assert!(std::mem::size_of::<ffi::Style>() == 16);
     }
 };
 

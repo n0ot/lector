@@ -231,11 +231,11 @@ fn full_renderer_preserves_wide_combining_blank_and_wrap_boundaries() {
 }
 
 #[test]
-fn full_renderer_preserves_a_wrap_marker_on_the_last_visible_row() {
+fn full_renderer_preserves_an_explicit_line_break_on_the_last_visible_row() {
     let geometry = TerminalGeometry::from_cells(2, 8);
     let (scene, intended) = scene_from_bytes(geometry, b"primary\x1b[?1049halt\r\nscreen\x1b[1;4H");
     assert!(
-        intended
+        !intended
             .clone()
             .into_terminal_snapshot()
             .rows
@@ -244,7 +244,7 @@ fn full_renderer_preserves_a_wrap_marker_on_the_last_visible_row() {
             .wrapped
     );
     assert_oracle(
-        "full-renderer-last-visible-wrap",
+        "full-renderer-last-visible-line-break",
         &scene,
         RenderCapabilities::default(),
     );

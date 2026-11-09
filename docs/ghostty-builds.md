@@ -247,19 +247,27 @@ diagnostic path.
 ## Pinned inputs
 
 - Lector adapter: `lector-ghostty = 0.1.0`, from this repository.
-- Ghostty source commit: `43fe699071c7dceb161dc3b0c04fce46ade36174`
-  from the upstream `main` branch on 2026-08-13. Libghostty does not yet have
-  independent tagged releases, so Lector pins a reviewed commit rather than a
-  floating branch.
+- libghostty-vt: `1.0.0`, tag `vt-1.0.0`, source commit
+  `0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec`.
 - Official source archive SHA-256:
-  `fbff942fc10b4d0a9de146e805922ef2b763226813fc449fdbb22c9ac7dd0f4a`.
-- Zig: exactly `0.16.0` for building the archive.
+  `4a6ef758be721923e1969e7b81b443dcc92d8dd3fb5a39600c03a8817a753676`.
+- Matching dependency archive SHA-256:
+  `4d5ea5e448e4c7ea8fb55ccbaa8668f2a97d44f438cee831e2b7ecd162d85c29`.
+- Zig: exactly `0.17.0` for building the archive.
 
-The source archive comes from Ghostty's official GitHub repository. The
-bootstrap verifies its checksum before extraction and builds with
-`emit-lib-vt=true`, `emit-xcframework=false`, and `app-runtime=none`. Lector
-links `libghostty-vt.a` statically and never falls back to an arbitrary system
-library.
+Lector targets the stable libghostty-vt C ABI `>=1.0.0, <2.0.0`, whose
+version is independent of the Ghostty application. Bundled builds remain
+pinned to the exact tested release and checksums above. Future 1.x upgrades
+require a tested PR; builds never resolve a moving latest version.
+
+Source and dependency archives come from
+`https://release.files.ghostty.org/libghostty-vt/1.0.0/`. Both checksums are
+verified before extraction. The source's `LIB_VERSION` selects the standalone
+library build, and `--system` supplies all dependencies without Zig fetching
+packages. Lector links `libghostty-vt.a` statically and never falls back to an
+arbitrary system library. Cached or externally supplied archives must match
+the exact release, target, optimization, ABI probe, and archive checksum;
+unsupported major versions are not accepted.
 
 ## Fresh-clone developer build
 
@@ -279,9 +287,9 @@ To build both Rust and the Ghostty core in debug mode for engine debugging:
 LECTOR_GHOSTTY_OPTIMIZE=Debug cargo build --locked
 ```
 
-On a cache miss, Cargo downloads the official Zig 0.16.0 binary for the host,
+On a cache miss, Cargo downloads the official Zig 0.17.0 binary for the host,
 verifies its published SHA-256 checksum, and caches it under
-`target/toolchains/zig/0.16.0`. It then downloads and verifies the pinned
+`target/toolchains/zig/0.17.0`. It then downloads and verifies the pinned
 official Ghostty source and builds the required static archive. Everything
 under `target` is ignored. Subsequent Rust development and release builds both
 select `ReleaseFast`, validate the archive checksum and build metadata, and
@@ -302,14 +310,14 @@ target/ghostty-prebuilt/<rust-target>/<Debug|ReleaseFast>/
 ```
 
 Maintainers can invoke the lower-level bootstrap directly. It accepts a
-matching Zig 0.16.0 on `PATH` and otherwise obtains the pinned toolchain:
+matching Zig 0.17.0 on `PATH` and otherwise obtains the pinned toolchain:
 
 ```sh
 scripts/bootstrap_ghostty.sh --optimize ReleaseFast
 cargo build --locked --release --features ghostty-vt
 ```
 
-On macOS, Zig 0.16.0 uses the macOS 26 SDK reported by `xcrun --sdk macosx`.
+On macOS, Zig 0.17.0 uses the macOS 26 SDK reported by `xcrun --sdk macosx`.
 
 ## Offline, packaging, and release builds
 

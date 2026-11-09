@@ -4903,7 +4903,10 @@ mod tests {
         // A cursor-addressed redraw can relocate an active input line without
         // publishing another semantic marker. The old boundary is historical,
         // not an active guard for positions on the newly drawn line.
-        view.process_changes(b"\x1B[H\x1B[2J> ");
+        // Erase below the home position. ED2 now deliberately moves a
+        // semantic prompt into scrollback in libghostty 1.x, which would
+        // no longer put the old boundary after the application cursor.
+        view.process_changes(b"\x1B[H\x1B[J> ");
         assert_eq!(view.screen().cursor_position(), (0, 2));
         assert_eq!(view.active_semantic_input(), None);
         assert!(!view.position_at_or_before_active_semantic_input((0, 3)));
