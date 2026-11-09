@@ -1,5 +1,15 @@
 # Project guidance
 
+## Pull requests and completion
+
+Make changes on a branch and submit a pull request targeting `master`. Do not push directly to `master` or bypass branch protection, including with administrator privileges.
+
+Work is complete only when all required GitHub CI checks pass for the latest pull request revision and the branch is up to date with `master`. Local checks alone are not sufficient. After pushing changes, monitor CI and address failures before considering the work done or merging. If CI cannot finish or a failure cannot be resolved, report the work as incomplete and explain the blocker.
+
+The required `CI` check validates all build jobs. Markdown-only changes run the CI policy checks and skip compilation; mixed changes and uncertain diffs require the full matrix. CI runs for pull requests and pushes to `master`, and reuses verified Ghostty and Zig artifacts when their inputs match.
+
+When changing CI job names or coverage, keep the `CI` gate and GitHub branch protection aligned with the workflow so every required job remains enforced.
+
 ## Bug fixes
 
 Identify the general invariant or state transition exposed by a reported bug, and encode that invariant once at the lowest appropriate layer. Prefer evidence-based state models over checks for the particular command, application, key sequence, or protocol encoding in the report. Do not accumulate special cases merely because they reproduce the desired result.
