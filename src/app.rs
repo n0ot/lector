@@ -30,6 +30,7 @@ use std::{
 };
 use terminput::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
+mod deferred_tmux_output;
 mod input;
 mod lua_automation;
 mod protocol;
@@ -38,6 +39,7 @@ mod tmux_interaction;
 mod tmux_prefix;
 mod view_stack;
 
+use deferred_tmux_output::{DeferredTmuxOutput, EnqueueResult};
 use lua_automation::LuaTask;
 
 use protocol::{
@@ -58,7 +60,6 @@ const TMUX_FLOW_RETRY_MAX_MS: u128 = 2_000;
 const TMUX_HIDDEN_IMMEDIATE_BUDGET_BYTES: usize = 4 * 1024;
 const TMUX_BACKGROUND_DRAIN_BUDGET_BYTES: usize = 4 * 1024;
 const TMUX_BACKGROUND_PAUSE_THRESHOLD_BYTES: usize = 16 * 1024;
-const TMUX_BACKGROUND_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
 const TMUX_PANE_OUTPUT_COALESCE_LIMIT_BYTES: usize = 64 * 1024;
 const TMUX_EXPECTED_REPLY_LIMIT: usize = 512;
 const TMUX_ROUTED_COMMAND_LIMIT_BYTES: usize = 1024 * 1024;
@@ -1221,9 +1222,7 @@ pub struct App {
     last_tmux_bell_source: Option<TmuxBellSource>,
     recent_tmux_bells: BTreeMap<(u64, crate::tmux_model::PaneId), u128>,
     tmux_background_bell_windows: BTreeSet<(u64, crate::tmux_model::WindowId)>,
-    pending_tmux_background_output: BTreeMap<(u64, crate::tmux_model::PaneId), VecDeque<u8>>,
-    pending_tmux_background_order: VecDeque<(u64, crate::tmux_model::PaneId)>,
-    pending_tmux_background_bytes: usize,
+    pending_tmux_background_output: DeferredTmuxOutput,
     tmux_hidden_output_bytes_this_turn: usize,
     pending_presentation_batch: Option<PendingPresentationBatch>,
     clock: Box<dyn Clock>,
@@ -1621,9 +1620,7 @@ impl App {
             last_tmux_bell_source: None,
             recent_tmux_bells: BTreeMap::new(),
             tmux_background_bell_windows: BTreeSet::new(),
-            pending_tmux_background_output: BTreeMap::new(),
-            pending_tmux_background_order: VecDeque::new(),
-            pending_tmux_background_bytes: 0,
+            pending_tmux_background_output: DeferredTmuxOutput::default(),
             tmux_hidden_output_bytes_this_turn: 0,
             pending_presentation_batch: None,
             clock,
@@ -1661,7 +1658,7 @@ impl App {
 
     #[must_use]
     pub fn debug_tmux_background_pending_bytes(&self) -> usize {
-        self.pending_tmux_background_bytes
+        self.pending_tmux_background_output.len_bytes()
     }
 
     pub fn debug_tmux_resource_usage(
