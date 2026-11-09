@@ -956,6 +956,48 @@ mod tests {
     }
 
     #[test]
+    fn automatic_reading_permission_applies_to_all_entry_points() {
+        for reader_suppressed in [false, true] {
+            for after_input in [false, true] {
+                let (mut sr, speaks) = make_sr();
+                let mut view = View::new(4, 20);
+                view.process_changes(b"visible content");
+                if reader_suppressed {
+                    sr.set_reader_auto_read_suppressed(true);
+                } else {
+                    sr.set_auto_read_enabled(false);
+                }
+                // A missing departure checkpoint requires a full introduction,
+                // which must respect permission just as ordinary diffs do.
+                assert!(view.activate_accessible_document_context());
+                let read = if after_input {
+                    sr.auto_read_after_input(&mut view)
+                } else {
+                    sr.auto_read(&mut view)
+                }
+                .unwrap();
+                assert!(!read);
+                assert!(speaks.borrow().is_empty());
+
+                // Explicit reading remains available while auto-read is off.
+                assert!(sr.speak_application_screen(&view).unwrap());
+                assert!(
+                    speaks
+                        .borrow()
+                        .iter()
+                        .any(|text| text.contains("visible content"))
+                );
+                speaks.borrow_mut().clear();
+                view.finalize_changes(1);
+                sr.set_reader_auto_read_suppressed(false);
+                sr.set_auto_read_enabled(true);
+                assert!(!sr.auto_read(&mut view).unwrap());
+                assert!(speaks.borrow().is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn auto_read_speaks_new_text() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
