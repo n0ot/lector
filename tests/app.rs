@@ -6488,60 +6488,141 @@ fn auto_read_does_not_speak_when_terminal_unfocused() {
 
 #[test]
 fn focus_return_reads_background_changes_without_pausing_visual_presentation() {
-    let (mut app, mut sr, recorder, clock) = make_app();
-    app.enable_output_scheduler(OutputSchedulerConfig {
-        latency_budget_ms: 0,
-        ..OutputSchedulerConfig::default()
-    });
-    let mut pty_out = Vec::new();
-    let mut term_out = Vec::new();
-    let mut physical = GhosttyEngine::new(24, 80).expect("physical oracle");
+    for scheduled in [false, true] {
+        let (mut app, mut sr, recorder, clock) = make_app();
+        if scheduled {
+            app.enable_output_scheduler(OutputSchedulerConfig {
+                latency_budget_ms: 0,
+                ..OutputSchedulerConfig::default()
+            });
+        }
+        let mut pty_out = Vec::new();
+        let mut term_out = Vec::new();
+        let mut physical = GhosttyEngine::new(24, 80).expect("physical oracle");
 
-    app.handle_pty(&mut sr, b"before", &mut term_out)
-        .expect("draw the initial document");
-    app.drain_scheduled_output(&mut term_out, false)
-        .expect("present the initial document");
-    physical
-        .advance(&term_out)
-        .expect("parse the initial physical frame");
-    term_out.clear();
-    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
-    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
-    recorder.inner.borrow_mut().speaks.clear();
-
-    app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
-        .expect("lose outer focus");
-    app.handle_pty(&mut sr, b"\r\narrived while away", &mut term_out)
-        .expect("draw while unfocused");
-    app.drain_scheduled_output(&mut term_out, false)
-        .expect("present while unfocused");
-    physical
-        .advance(&term_out)
-        .expect("parse the background physical frame");
-    assert!(
+        app.handle_pty(&mut sr, b"before", &mut term_out)
+            .expect("draw the initial document");
+        if scheduled {
+            app.drain_scheduled_output(&mut term_out, false)
+                .expect("present the initial document");
+        }
         physical
-            .normalized_snapshot()
-            .contents()
-            .contains("arrived while away"),
-        "outer focus must not gate the visual renderer"
-    );
+            .advance(&term_out)
+            .expect("parse the initial physical frame");
+        term_out.clear();
+        clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+        assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+        recorder.inner.borrow_mut().speaks.clear();
 
-    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
-    assert!(app.maybe_finalize_changes(&mut sr).unwrap());
-    assert!(recorder.inner.borrow().speaks.is_empty());
+        app.handle_stdin(&mut sr, b"\x1B[O", &mut pty_out, &mut term_out)
+            .expect("lose outer focus");
+        app.handle_pty(&mut sr, b"\r\narrived while away", &mut term_out)
+            .expect("draw while unfocused");
+        if scheduled {
+            app.drain_scheduled_output(&mut term_out, false)
+                .expect("present while unfocused");
+        }
+        physical
+            .advance(&term_out)
+            .expect("parse the background physical frame");
+        assert!(
+            physical
+                .normalized_snapshot()
+                .contents()
+                .contains("arrived while away"),
+            "outer focus must not gate the visual renderer"
+        );
 
-    app.handle_stdin(&mut sr, b"\x1B[I", &mut pty_out, &mut term_out)
-        .expect("regain outer focus");
-    let spoken = recorder
-        .inner
-        .borrow()
-        .speaks
-        .iter()
-        .map(|(text, _)| text.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(spoken.contains("arrived while away"), "{spoken:?}");
-    assert!(!spoken.contains("before"), "{spoken:?}");
+        clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+        assert!(app.maybe_finalize_changes(&mut sr).unwrap());
+        assert!(recorder.inner.borrow().speaks.is_empty());
+
+        app.handle_stdin(&mut sr, b"\x1B[I", &mut pty_out, &mut term_out)
+            .expect("regain outer focus");
+        let spoken = recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(spoken.contains("arrived while away"), "{spoken:?}");
+        assert!(!spoken.contains("before"), "{spoken:?}");
+    }
+}
+
+#[test]
+fn focus_return_with_auto_read_disabled_consumes_background_changes_silently() {
+    for scheduled in [false, true] {
+        for disable_before_departure in [false, true] {
+            for background_output in [false, true] {
+                let (mut app, mut sr, recorder, clock) = make_app();
+                if scheduled {
+                    app.enable_output_scheduler(OutputSchedulerConfig {
+                        latency_budget_ms: 0,
+                        ..OutputSchedulerConfig::default()
+                    });
+                }
+                let mut pty_out = Vec::new();
+                let mut term_out = Vec::new();
+                app.handle_pty(&mut sr, b"before", &mut term_out).unwrap();
+                if scheduled {
+                    app.drain_scheduled_output(&mut term_out, false).unwrap();
+                }
+                clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+                app.maybe_finalize_changes(&mut sr).unwrap();
+                recorder.inner.borrow_mut().speaks.clear();
+                if disable_before_departure {
+                    sr.set_auto_read_enabled(false);
+                }
+                app.handle_stdin(&mut sr, b"\x1b[O", &mut pty_out, &mut term_out)
+                    .unwrap();
+                if background_output {
+                    app.handle_pty(&mut sr, b"\r\nbackground", &mut term_out)
+                        .unwrap();
+                    if scheduled {
+                        app.drain_scheduled_output(&mut term_out, false).unwrap();
+                    }
+                    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+                    app.maybe_finalize_changes(&mut sr).unwrap();
+                }
+                sr.set_auto_read_enabled(false);
+                app.handle_stdin(&mut sr, b"\x1b[I", &mut pty_out, &mut term_out)
+                    .unwrap();
+                assert!(
+                    recorder.inner.borrow().speaks.is_empty(),
+                    "scheduled={scheduled}, disabled before departure={disable_before_departure}, background={background_output}"
+                );
+
+                // Re-enabling does not replay a presentation already consumed
+                // while disabled, even across another focus cycle.
+                sr.set_auto_read_enabled(true);
+                for event in [b"\x1b[I", b"\x1b[O", b"\x1b[I"] {
+                    app.handle_stdin(&mut sr, event, &mut pty_out, &mut term_out)
+                        .unwrap();
+                }
+                assert!(recorder.inner.borrow().speaks.is_empty());
+                app.handle_pty(&mut sr, b"\r\nfresh", &mut term_out)
+                    .unwrap();
+                if scheduled {
+                    app.drain_scheduled_output(&mut term_out, false).unwrap();
+                }
+                clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+                app.maybe_finalize_changes(&mut sr).unwrap();
+                let spoken = recorder
+                    .inner
+                    .borrow()
+                    .speaks
+                    .iter()
+                    .map(|(text, _)| text.clone())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(spoken.contains("fresh"), "{spoken:?}");
+                assert!(!spoken.contains("background"), "{spoken:?}");
+            }
+        }
+    }
 }
 
 #[test]
