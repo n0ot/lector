@@ -33,8 +33,7 @@ def ci_passed(needs):
     build = changes.get("outputs", {}).get("build")
     if build not in ("true", "false"):
         return False
-    expected = "success" if build == "true" else "skipped"
-    return all(needs.get(job, {}).get("result") == expected for job in BUILD_JOBS)
+    return all(needs.get(job, {}).get("result") == "success" for job in BUILD_JOBS)
 
 
 def main():

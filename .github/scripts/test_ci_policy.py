@@ -37,7 +37,7 @@ class GateTests(unittest.TestCase):
 
     def test_successful_build_and_documentation_exemption(self):
         self.assertTrue(ci_passed(self.needs()))
-        self.assertTrue(ci_passed(self.needs("false", "skipped")))
+        self.assertTrue(ci_passed(self.needs("false", "success")))
 
     def test_each_unsuccessful_build_blocks_merge(self):
         for job in BUILD_JOBS:
@@ -50,7 +50,7 @@ class GateTests(unittest.TestCase):
         self.assertFalse(ci_passed({}))
         self.assertFalse(ci_passed(self.needs("")))
         for result in ("failure", "cancelled", "skipped"):
-            needs = self.needs("false", "skipped")
+            needs = self.needs("false", "success")
             needs["changes"]["result"] = result
             self.assertFalse(ci_passed(needs))
 
