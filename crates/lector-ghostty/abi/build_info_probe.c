@@ -1,6 +1,9 @@
 #include <stddef.h>
 
 #include <ghostty/vt/build_info.h>
+#include <ghostty/vt/version.h>
+
+_Static_assert(GHOSTTY_VT_VERSION_MAJOR == 1, "Lector requires libghostty-vt 1.x");
 #include <ghostty/vt/grid_ref.h>
 #include <ghostty/vt/grid_ref_tracked.h>
 #include <ghostty/vt/kitty_graphics.h>
@@ -44,9 +47,9 @@ _Static_assert(GHOSTTY_RENDER_STATE_DIRTY_FALSE == 0 &&
                    GHOSTTY_RENDER_STATE_DIRTY_PARTIAL == 1 &&
                    GHOSTTY_RENDER_STATE_DIRTY_FULL == 2 &&
                    GHOSTTY_RENDER_STATE_DATA_DIRTY == 3 &&
-                   GHOSTTY_RENDER_STATE_OPTION_DIRTY == 0 &&
+                   GHOSTTY_RENDER_STATE_OPT_DIRTY == 1 &&
                    GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY == 1 &&
-                   GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY == 0,
+                   GHOSTTY_RENDER_STATE_ROW_OPT_DIRTY == 1,
                "Ghostty render damage values changed");
 _Static_assert(sizeof(GhosttySizeReportSize) == 12,
                "GhosttySizeReportSize layout changed");
@@ -76,29 +79,23 @@ _Static_assert(offsetof(GhosttyClipboardContent, mime) == 0,
                "GhosttyClipboardContent.mime offset changed");
 _Static_assert(offsetof(GhosttyClipboardContent, data) == 2 * sizeof(size_t),
                "GhosttyClipboardContent.data offset changed");
-_Static_assert(sizeof(GhosttyClipboardWrite) == 4 * sizeof(size_t),
+_Static_assert(sizeof(GhosttyClipboardWrite) == 8 * sizeof(size_t),
                "GhosttyClipboardWrite layout changed");
-_Static_assert(offsetof(GhosttyClipboardWrite, size) == 0,
-               "GhosttyClipboardWrite.size offset changed");
-_Static_assert(offsetof(GhosttyClipboardWrite, location) == sizeof(size_t),
+_Static_assert(offsetof(GhosttyClipboardWrite, location) == 0,
                "GhosttyClipboardWrite.location offset changed");
-_Static_assert(offsetof(GhosttyClipboardWrite, contents) == 2 * sizeof(size_t),
+_Static_assert(offsetof(GhosttyClipboardWrite, contents) == sizeof(size_t),
                "GhosttyClipboardWrite.contents offset changed");
-_Static_assert(offsetof(GhosttyClipboardWrite, contents_len) ==
-                   3 * sizeof(size_t),
+_Static_assert(offsetof(GhosttyClipboardWrite, contents_len) == 2 * sizeof(size_t),
                "GhosttyClipboardWrite.contents_len offset changed");
-_Static_assert(sizeof(GhosttyTerminalDesktopNotification) == 5 * sizeof(size_t),
+_Static_assert(sizeof(GhosttyTerminalDesktopNotification) == 4 * sizeof(size_t),
                "GhosttyTerminalDesktopNotification layout changed");
-_Static_assert(offsetof(GhosttyTerminalDesktopNotification, title) ==
-                   sizeof(size_t),
+_Static_assert(offsetof(GhosttyTerminalDesktopNotification, title) == 0,
                "GhosttyTerminalDesktopNotification.title offset changed");
-_Static_assert(offsetof(GhosttyTerminalDesktopNotification, body) ==
-                   3 * sizeof(size_t),
+_Static_assert(offsetof(GhosttyTerminalDesktopNotification, body) == 2 * sizeof(size_t),
                "GhosttyTerminalDesktopNotification.body offset changed");
-_Static_assert(offsetof(GhosttyTerminalProgressReport, state) == sizeof(size_t),
+_Static_assert(offsetof(GhosttyTerminalProgressReport, state) == 0,
                "GhosttyTerminalProgressReport.state offset changed");
-_Static_assert(offsetof(GhosttyTerminalProgressReport, progress) ==
-                   sizeof(size_t) + sizeof(int),
+_Static_assert(offsetof(GhosttyTerminalProgressReport, progress) == sizeof(int),
                "GhosttyTerminalProgressReport.progress offset changed");
 _Static_assert(sizeof(GhosttyTerminalUnknownSequenceValue) == 128,
                "GhosttyTerminalUnknownSequenceValue layout changed");
@@ -121,17 +118,13 @@ _Static_assert(offsetof(GhosttyPointCoordinate, y) == 4,
                "GhosttyPointCoordinate.y offset changed");
 _Static_assert(sizeof(GhosttyPointValue) == 16,
                "GhosttyPointValue layout changed");
-_Static_assert(offsetof(GhosttyGridRef, size) == 0,
-               "GhosttyGridRef.size offset changed");
-_Static_assert(offsetof(GhosttyGridRef, node) == sizeof(size_t),
+_Static_assert(offsetof(GhosttyGridRef, node) == 0,
                "GhosttyGridRef.node offset changed");
 _Static_assert(sizeof(GhosttyColorRgb) == 3,
                "GhosttyColorRgb layout changed");
-_Static_assert(sizeof(GhosttyStyleColorValue) == sizeof(uint64_t),
+_Static_assert(sizeof(GhosttyStyleColorValue) == 3,
                "GhosttyStyleColorValue layout changed");
-_Static_assert(offsetof(GhosttyStyle, size) == 0,
-               "GhosttyStyle.size offset changed");
-_Static_assert(offsetof(GhosttyStyle, fg_color) == sizeof(size_t),
+_Static_assert(offsetof(GhosttyStyle, fg_color) == 0,
                "GhosttyStyle.fg_color offset changed");
 _Static_assert(offsetof(GhosttyKittyGraphicsPlacementRenderInfo, size) == 0,
                "GhosttyKittyGraphicsPlacementRenderInfo.size offset changed");
@@ -145,7 +138,7 @@ _Static_assert(offsetof(GhosttyKittyGraphicsPlacementRenderInfo, source_x) ==
                    36,
                "GhosttyKittyGraphicsPlacementRenderInfo.source_x offset changed");
 #if SIZE_MAX == UINT64_MAX
-_Static_assert(sizeof(GhosttyTerminalProgressReport) == 16,
+_Static_assert(sizeof(GhosttyTerminalProgressReport) == 8,
                "GhosttyTerminalProgressReport layout changed");
 _Static_assert(sizeof(GhosttyTerminalUnknownStringSequence) == 24,
                "GhosttyTerminalUnknownStringSequence layout changed");
@@ -156,11 +149,11 @@ _Static_assert(sizeof(GhosttyTerminalUnknownSequence) == 136,
 _Static_assert(sizeof(GhosttyPoint) == 24, "GhosttyPoint layout changed");
 _Static_assert(offsetof(GhosttyPoint, value) == 8,
                "GhosttyPoint.value offset changed");
-_Static_assert(sizeof(GhosttyGridRef) == 24,
+_Static_assert(sizeof(GhosttyGridRef) == 16,
                "GhosttyGridRef layout changed");
-_Static_assert(sizeof(GhosttyStyleColor) == 16,
+_Static_assert(sizeof(GhosttyStyleColor) == 4,
                "GhosttyStyleColor layout changed");
-_Static_assert(sizeof(GhosttyStyle) == 72, "GhosttyStyle layout changed");
+_Static_assert(sizeof(GhosttyStyle) == 16, "GhosttyStyle layout changed");
 _Static_assert(sizeof(GhosttyKittyGraphicsPlacementRenderInfo) == 56,
                "GhosttyKittyGraphicsPlacementRenderInfo layout changed");
 #endif
@@ -177,13 +170,13 @@ _Static_assert(GHOSTTY_BUILD_INFO_VERSION_BUILD == 10,
                "GhosttyBuildInfo values changed");
 _Static_assert(GHOSTTY_TERMINAL_DATA_CURSOR_X == 3,
                "GhosttyTerminalData values changed");
-_Static_assert(GHOSTTY_TERMINAL_DATA_CURSOR_STYLE == 10,
+_Static_assert(GHOSTTY_TERMINAL_DATA_CURSOR_SGR_STYLE == 10,
                "GhosttyTerminalData cursor style changed");
 _Static_assert(GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE == 10 &&
-                   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR == 0 &&
-                   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK == 1 &&
-                   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE == 2 &&
-                   GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW == 3,
+                   GHOSTTY_CURSOR_STYLE_BAR == 0 &&
+                   GHOSTTY_CURSOR_STYLE_BLOCK == 1 &&
+                   GHOSTTY_CURSOR_STYLE_UNDERLINE == 2 &&
+                   GHOSTTY_CURSOR_STYLE_BLOCK_HOLLOW == 3,
                "Ghostty render cursor visual style values changed");
 _Static_assert(GHOSTTY_TERMINAL_DATA_KITTY_KEYBOARD_FLAGS == 8 &&
                    GHOSTTY_TERMINAL_DATA_TITLE == 12 &&
@@ -199,32 +192,32 @@ _Static_assert(GHOSTTY_TERMINAL_DATA_WIDTH_PX == 16 &&
                "GhosttyTerminalData geometry/continuation values changed");
 _Static_assert(GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS == 30,
                "GhosttyTerminalData Kitty graphics value changed");
-_Static_assert(GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT == 15,
+_Static_assert(GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT == 16,
                "GhosttyTerminalOption Kitty graphics value changed");
-_Static_assert(GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES == 28,
+_Static_assert(GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES == 29,
                "GhosttyTerminalOption values changed");
-_Static_assert(GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES == 31,
+_Static_assert(GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES == 32,
                "GhosttyTerminalOption continuation value changed");
-_Static_assert(GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES == 0,
+_Static_assert(GHOSTTY_SNAPSHOT_DECODER_OPT_MAX_CONTINUATION_BYTES == 1,
                "GhosttySnapshotDecoderOption values changed");
 _Static_assert(GHOSTTY_SNAPSHOT_DECODER_DATA_SOURCE_OFFSET == 2,
                "GhosttySnapshotDecoderData values changed");
-_Static_assert(GHOSTTY_TERMINAL_OPT_USERDATA == 0 &&
-                   GHOSTTY_TERMINAL_OPT_WRITE_PTY == 1 &&
-                   GHOSTTY_TERMINAL_OPT_BELL == 2 &&
-                   GHOSTTY_TERMINAL_OPT_ENQUIRY == 3 &&
-                   GHOSTTY_TERMINAL_OPT_XTVERSION == 4 &&
-                   GHOSTTY_TERMINAL_OPT_TITLE_CHANGED == 5 &&
-                   GHOSTTY_TERMINAL_OPT_SIZE == 6 &&
-                   GHOSTTY_TERMINAL_OPT_COLOR_SCHEME == 7 &&
-                   GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES == 8,
+_Static_assert(GHOSTTY_TERMINAL_OPT_USERDATA == 1 &&
+                   GHOSTTY_TERMINAL_OPT_WRITE_PTY == 2 &&
+                   GHOSTTY_TERMINAL_OPT_BELL == 3 &&
+                   GHOSTTY_TERMINAL_OPT_ENQUIRY == 4 &&
+                   GHOSTTY_TERMINAL_OPT_XTVERSION == 5 &&
+                   GHOSTTY_TERMINAL_OPT_TITLE_CHANGED == 6 &&
+                   GHOSTTY_TERMINAL_OPT_SIZE == 7 &&
+                   GHOSTTY_TERMINAL_OPT_COLOR_SCHEME == 8 &&
+                   GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES == 9,
                "GhosttyTerminalOption core effect values changed");
-_Static_assert(GHOSTTY_TERMINAL_OPT_PWD_CHANGED == 25 &&
-                   GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE == 26 &&
-                   GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION == 29 &&
-                   GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT == 30 &&
-                   GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE == 35 &&
-                   GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES == 36,
+_Static_assert(GHOSTTY_TERMINAL_OPT_PWD_CHANGED == 26 &&
+                   GHOSTTY_TERMINAL_OPT_CLIPBOARD_WRITE == 27 &&
+                   GHOSTTY_TERMINAL_OPT_DESKTOP_NOTIFICATION == 30 &&
+                   GHOSTTY_TERMINAL_OPT_PROGRESS_REPORT == 31 &&
+                   GHOSTTY_TERMINAL_OPT_UNKNOWN_SEQUENCE == 36 &&
+                   GHOSTTY_TERMINAL_OPT_UNKNOWN_MAX_BYTES == 37,
                "GhosttyTerminalOption effect values changed");
 _Static_assert(GHOSTTY_TERMINAL_UNKNOWN_SEQUENCE_APC == 0,
                "GhosttyTerminalUnknownSequenceTag values changed");
@@ -282,10 +275,31 @@ _Static_assert(GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR == 1 &&
                    GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Y_OFFSET == 5 &&
                    GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z == 12,
                "Ghostty Kitty placement data values changed");
-_Static_assert(GHOSTTY_KITTY_IMAGE_DATA_NUMBER == 2 &&
-                   GHOSTTY_KITTY_IMAGE_DATA_WIDTH == 3 &&
-                   GHOSTTY_KITTY_IMAGE_DATA_HEIGHT == 4 &&
-                   GHOSTTY_KITTY_IMAGE_DATA_FORMAT == 5 &&
-                   GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR == 7 &&
-                   GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN == 8,
+_Static_assert(GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_NUMBER == 2 &&
+                   GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_WIDTH == 3 &&
+                   GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_HEIGHT == 4 &&
+                   GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_FORMAT == 5 &&
+                   GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_PIXELS == 7 &&
+                   GHOSTTY_KITTY_GRAPHICS_IMAGE_DATA_EXPECTED_LEN == 8,
                "Ghostty Kitty image data values changed");
+
+_Static_assert(GHOSTTY_REJECTED == -7 && GHOSTTY_UNSUPPORTED == -8,
+               "Ghostty stable result values changed");
+_Static_assert(offsetof(GhosttyStyleColor, value) == 1 &&
+                   offsetof(GhosttyStyle, flags) == 12,
+               "Ghostty stable style offsets changed");
+_Static_assert(GHOSTTY_STYLE_FLAG_BOLD == (1u << 0) &&
+                   GHOSTTY_STYLE_FLAG_ITALIC == (1u << 1) &&
+                   GHOSTTY_STYLE_FLAG_FAINT == (1u << 2) &&
+                   GHOSTTY_STYLE_FLAG_BLINK == (1u << 3) &&
+                   GHOSTTY_STYLE_FLAG_INVERSE == (1u << 4) &&
+                   GHOSTTY_STYLE_FLAG_INVISIBLE == (1u << 5) &&
+                   GHOSTTY_STYLE_FLAG_STRIKETHROUGH == (1u << 6) &&
+                   GHOSTTY_STYLE_FLAG_OVERLINE == (1u << 7) &&
+                   GHOSTTY_STYLE_UNDERLINE_SHIFT == 8 &&
+                   GHOSTTY_STYLE_UNDERLINE_MASK == (7u << 8),
+               "Ghostty stable style flags changed");
+_Static_assert(sizeof(GhosttyClipboardWriteReply) == 16 &&
+                   offsetof(GhosttyClipboardWriteReply, remember) == 12 &&
+                   offsetof(GhosttyClipboardWrite, reply) == 56,
+               "Ghostty clipboard reply layout changed");

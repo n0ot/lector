@@ -8,6 +8,8 @@ pub(crate) const OUT_OF_SPACE: ResultCode = -3;
 pub(crate) const NO_VALUE: ResultCode = -4;
 pub(crate) const IO_ERROR: ResultCode = -5;
 pub(crate) const LIMIT_EXCEEDED: ResultCode = -6;
+pub(crate) const REJECTED: ResultCode = -7;
+pub(crate) const UNSUPPORTED: ResultCode = -8;
 
 pub(crate) type BuildInfo = c_int;
 pub(crate) const BUILD_INFO_SIMD: BuildInfo = 1;
@@ -64,26 +66,26 @@ pub(crate) const TERMINAL_DATA_CONTINUATION_MAX_BYTES: TerminalData = 36;
 pub(crate) const TERMINAL_DATA_MODE: TerminalData = 37;
 
 pub(crate) type TerminalOption = c_int;
-pub(crate) const TERMINAL_OPT_USERDATA: TerminalOption = 0;
-pub(crate) const TERMINAL_OPT_WRITE_PTY: TerminalOption = 1;
-pub(crate) const TERMINAL_OPT_BELL: TerminalOption = 2;
-pub(crate) const TERMINAL_OPT_ENQUIRY: TerminalOption = 3;
-pub(crate) const TERMINAL_OPT_XTVERSION: TerminalOption = 4;
-pub(crate) const TERMINAL_OPT_TITLE_CHANGED: TerminalOption = 5;
-pub(crate) const TERMINAL_OPT_SIZE: TerminalOption = 6;
-pub(crate) const TERMINAL_OPT_COLOR_SCHEME: TerminalOption = 7;
-pub(crate) const TERMINAL_OPT_DEVICE_ATTRIBUTES: TerminalOption = 8;
-pub(crate) const TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT: TerminalOption = 15;
-pub(crate) const TERMINAL_OPT_PWD_CHANGED: TerminalOption = 25;
-pub(crate) const TERMINAL_OPT_CLIPBOARD_WRITE: TerminalOption = 26;
-pub(crate) const TERMINAL_OPT_SCROLLBACK_MAX_BYTES: TerminalOption = 27;
-pub(crate) const TERMINAL_OPT_SCROLLBACK_MAX_LINES: TerminalOption = 28;
-pub(crate) const TERMINAL_OPT_DESKTOP_NOTIFICATION: TerminalOption = 29;
-pub(crate) const TERMINAL_OPT_PROGRESS_REPORT: TerminalOption = 30;
-pub(crate) const TERMINAL_OPT_CONTINUATION_MAX_BYTES: TerminalOption = 31;
-pub(crate) const TERMINAL_OPT_MODE: TerminalOption = 34;
-pub(crate) const TERMINAL_OPT_UNKNOWN_SEQUENCE: TerminalOption = 35;
-pub(crate) const TERMINAL_OPT_UNKNOWN_MAX_BYTES: TerminalOption = 36;
+pub(crate) const TERMINAL_OPT_USERDATA: TerminalOption = 1;
+pub(crate) const TERMINAL_OPT_WRITE_PTY: TerminalOption = 2;
+pub(crate) const TERMINAL_OPT_BELL: TerminalOption = 3;
+pub(crate) const TERMINAL_OPT_ENQUIRY: TerminalOption = 4;
+pub(crate) const TERMINAL_OPT_XTVERSION: TerminalOption = 5;
+pub(crate) const TERMINAL_OPT_TITLE_CHANGED: TerminalOption = 6;
+pub(crate) const TERMINAL_OPT_SIZE: TerminalOption = 7;
+pub(crate) const TERMINAL_OPT_COLOR_SCHEME: TerminalOption = 8;
+pub(crate) const TERMINAL_OPT_DEVICE_ATTRIBUTES: TerminalOption = 9;
+pub(crate) const TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT: TerminalOption = 16;
+pub(crate) const TERMINAL_OPT_PWD_CHANGED: TerminalOption = 26;
+pub(crate) const TERMINAL_OPT_CLIPBOARD_WRITE: TerminalOption = 27;
+pub(crate) const TERMINAL_OPT_SCROLLBACK_MAX_BYTES: TerminalOption = 28;
+pub(crate) const TERMINAL_OPT_SCROLLBACK_MAX_LINES: TerminalOption = 29;
+pub(crate) const TERMINAL_OPT_DESKTOP_NOTIFICATION: TerminalOption = 30;
+pub(crate) const TERMINAL_OPT_PROGRESS_REPORT: TerminalOption = 31;
+pub(crate) const TERMINAL_OPT_CONTINUATION_MAX_BYTES: TerminalOption = 32;
+pub(crate) const TERMINAL_OPT_MODE: TerminalOption = 35;
+pub(crate) const TERMINAL_OPT_UNKNOWN_SEQUENCE: TerminalOption = 36;
+pub(crate) const TERMINAL_OPT_UNKNOWN_MAX_BYTES: TerminalOption = 37;
 
 pub(crate) type ColorScheme = c_int;
 pub(crate) const COLOR_SCHEME_LIGHT: ColorScheme = 0;
@@ -155,7 +157,7 @@ pub(crate) const RENDER_STATE_DIRTY_PARTIAL: RenderStateDirty = 1;
 pub(crate) const RENDER_STATE_DIRTY_FULL: RenderStateDirty = 2;
 
 pub(crate) type RenderStateOption = c_int;
-pub(crate) const RENDER_STATE_OPTION_DIRTY: RenderStateOption = 0;
+pub(crate) const RENDER_STATE_OPTION_DIRTY: RenderStateOption = 1;
 
 pub(crate) type RenderCursorVisualStyle = c_int;
 pub(crate) const RENDER_CURSOR_VISUAL_STYLE_BAR: RenderCursorVisualStyle = 0;
@@ -169,7 +171,7 @@ pub(crate) const RENDER_STATE_ROW_DATA_RAW: RenderStateRowData = 2;
 pub(crate) const RENDER_STATE_ROW_DATA_CELLS: RenderStateRowData = 3;
 
 pub(crate) type RenderStateRowOption = c_int;
-pub(crate) const RENDER_STATE_ROW_OPTION_DIRTY: RenderStateRowOption = 0;
+pub(crate) const RENDER_STATE_ROW_OPTION_DIRTY: RenderStateRowOption = 1;
 
 pub(crate) type RenderStateRowCellsData = c_int;
 pub(crate) const RENDER_STATE_ROW_CELLS_DATA_RAW: RenderStateRowCellsData = 1;
@@ -237,7 +239,6 @@ impl Point {
 
 #[repr(C)]
 pub(crate) struct GridRef {
-    pub(crate) size: usize,
     pub(crate) node: *mut c_void,
     pub(crate) x: u16,
     pub(crate) y: u16,
@@ -245,7 +246,7 @@ pub(crate) struct GridRef {
 
 pub(crate) type TrackedGridRef = *mut c_void;
 
-pub(crate) type StyleColorTag = c_int;
+pub(crate) type StyleColorTag = u8;
 pub(crate) const STYLE_COLOR_NONE: StyleColorTag = 0;
 pub(crate) const STYLE_COLOR_PALETTE: StyleColorTag = 1;
 pub(crate) const STYLE_COLOR_RGB: StyleColorTag = 2;
@@ -270,7 +271,6 @@ pub(crate) struct ColorRgb {
 pub(crate) union StyleColorValue {
     pub(crate) palette: u8,
     pub(crate) rgb: ColorRgb,
-    pub(crate) _padding: u64,
 }
 
 #[repr(C)]
@@ -283,28 +283,17 @@ pub(crate) struct StyleColor {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) struct Style {
-    pub(crate) size: usize,
     pub(crate) fg_color: StyleColor,
     pub(crate) bg_color: StyleColor,
     pub(crate) underline_color: StyleColor,
-    pub(crate) bold: bool,
-    pub(crate) italic: bool,
-    pub(crate) faint: bool,
-    pub(crate) blink: bool,
-    pub(crate) inverse: bool,
-    pub(crate) invisible: bool,
-    pub(crate) strikethrough: bool,
-    pub(crate) overline: bool,
-    pub(crate) underline: c_int,
+    pub(crate) flags: u16,
+    pub(crate) reserved: u16,
 }
 
 impl Style {
     pub(crate) fn init() -> Self {
-        // Sized C structs are initialized with their byte size and zeroed
-        // trailing fields, per GHOSTTY_INIT_SIZED.
-        let mut value: Self = unsafe { std::mem::zeroed() };
-        value.size = std::mem::size_of::<Self>();
-        value
+        // The stable style is a frozen, zero-initializable value struct.
+        unsafe { std::mem::zeroed() }
     }
 }
 
@@ -341,8 +330,7 @@ pub(crate) const KITTY_IMAGE_DATA_NUMBER: KittyGraphicsImageData = 2;
 pub(crate) const KITTY_IMAGE_DATA_WIDTH: KittyGraphicsImageData = 3;
 pub(crate) const KITTY_IMAGE_DATA_HEIGHT: KittyGraphicsImageData = 4;
 pub(crate) const KITTY_IMAGE_DATA_FORMAT: KittyGraphicsImageData = 5;
-pub(crate) const KITTY_IMAGE_DATA_DATA_PTR: KittyGraphicsImageData = 7;
-pub(crate) const KITTY_IMAGE_DATA_DATA_LEN: KittyGraphicsImageData = 8;
+pub(crate) const KITTY_IMAGE_DATA_PIXELS: KittyGraphicsImageData = 7;
 
 pub(crate) type KittyImageFormat = c_int;
 pub(crate) const KITTY_IMAGE_FORMAT_RGB: KittyImageFormat = 0;
@@ -398,10 +386,21 @@ pub(crate) struct ClipboardContent {
 
 #[repr(C)]
 pub(crate) struct ClipboardWrite {
-    pub(crate) size: usize,
     pub(crate) location: ClipboardLocation,
     pub(crate) contents: *const ClipboardContent,
     pub(crate) contents_len: usize,
+    pub(crate) name: GhosttyString,
+    pub(crate) granted: bool,
+    pub(crate) can_remember: bool,
+    pub(crate) ctx: *const c_void,
+    pub(crate) reply: unsafe extern "C" fn(*const ClipboardWrite, *const ClipboardWriteReply),
+}
+
+#[repr(C)]
+pub(crate) struct ClipboardWriteReply {
+    pub(crate) size: usize,
+    pub(crate) result: ClipboardWriteResult,
+    pub(crate) remember: bool,
 }
 
 pub(crate) type ClipboardWriteResult = c_int;
@@ -409,7 +408,6 @@ pub(crate) const CLIPBOARD_WRITE_RESULT_SUCCESS: ClipboardWriteResult = 0;
 
 #[repr(C)]
 pub(crate) struct DesktopNotification {
-    pub(crate) size: usize,
     pub(crate) title: GhosttyString,
     pub(crate) body: GhosttyString,
 }
@@ -423,7 +421,6 @@ pub(crate) const PROGRESS_STATE_PAUSE: ProgressState = 4;
 
 #[repr(C)]
 pub(crate) struct ProgressReport {
-    pub(crate) size: usize,
     pub(crate) state: ProgressState,
     pub(crate) progress: i8,
 }
@@ -476,17 +473,21 @@ const _: () = {
     assert!(size_of::<ClipboardContent>() == 32);
     assert!(offset_of!(ClipboardContent, mime) == 0);
     assert!(offset_of!(ClipboardContent, data) == 16);
-    assert!(size_of::<ClipboardWrite>() == 32);
-    assert!(offset_of!(ClipboardWrite, size) == 0);
-    assert!(offset_of!(ClipboardWrite, location) == 8);
-    assert!(offset_of!(ClipboardWrite, contents) == 16);
-    assert!(offset_of!(ClipboardWrite, contents_len) == 24);
-    assert!(size_of::<DesktopNotification>() == 40);
-    assert!(offset_of!(DesktopNotification, title) == 8);
-    assert!(offset_of!(DesktopNotification, body) == 24);
-    assert!(size_of::<ProgressReport>() == 16);
-    assert!(offset_of!(ProgressReport, state) == 8);
-    assert!(offset_of!(ProgressReport, progress) == 12);
+    assert!(size_of::<ClipboardWrite>() == 64);
+    assert!(offset_of!(ClipboardWrite, reply) == 56);
+    assert!(size_of::<ClipboardWriteReply>() == 16);
+    assert!(offset_of!(ClipboardWriteReply, remember) == 12);
+    assert!(offset_of!(StyleColor, value) == 1);
+    assert!(offset_of!(Style, flags) == 12);
+    assert!(offset_of!(ClipboardWrite, location) == 0);
+    assert!(offset_of!(ClipboardWrite, contents) == 8);
+    assert!(offset_of!(ClipboardWrite, contents_len) == 16);
+    assert!(size_of::<DesktopNotification>() == 32);
+    assert!(offset_of!(DesktopNotification, title) == 0);
+    assert!(offset_of!(DesktopNotification, body) == 16);
+    assert!(size_of::<ProgressReport>() == 8);
+    assert!(offset_of!(ProgressReport, state) == 0);
+    assert!(offset_of!(ProgressReport, progress) == 4);
     assert!(size_of::<UnknownStringSequence>() == 24);
     assert!(offset_of!(UnknownStringSequence, content) == 8);
     assert!(size_of::<UnknownSequenceValue>() == 128);

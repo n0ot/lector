@@ -100,9 +100,10 @@ fn ghostty_media_lifetime_handles_chunking_delete_scroll_resize_and_malformed_pa
     assert_eq!(visible[0].rendered_pixel_width, 12);
     assert_eq!(visible[0].rendered_pixel_height, 24);
 
+    // Delete by ID: d=A deletes visible placements, retaining scrollback in 1.x.
     engine
-        .advance(b"\x1b_Ga=d,d=A\x1b\\")
-        .expect("delete media");
+        .advance(b"\x1b_Ga=d,d=I,i=3\x1b\\\x1b_Ga=d,d=I,i=7\x1b\\")
+        .expect("delete media including history");
     assert!(
         engine
             .kitty_image_placements()

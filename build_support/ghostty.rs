@@ -1,9 +1,9 @@
 pub const ADAPTER_VERSION: &str = "0.1.0";
-pub const GHOSTTY_COMMIT: &str = "43fe699071c7dceb161dc3b0c04fce46ade36174";
-pub const GHOSTTY_APP_VERSION: &str = "1.3.2-dev";
-pub const REQUIRED_ZIG_VERSION: &str = "0.16.0";
+pub const GHOSTTY_COMMIT: &str = "0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec";
+pub const GHOSTTY_VERSION: &str = "1.0.0";
+pub const REQUIRED_ZIG_VERSION: &str = "0.17.0";
 pub const GHOSTTY_ARCHIVE_SHA256: &str =
-    "fbff942fc10b4d0a9de146e805922ef2b763226813fc449fdbb22c9ac7dd0f4a";
+    "4a6ef758be721923e1969e7b81b443dcc92d8dd3fb5a39600c03a8817a753676";
 
 pub const SUPPORTED_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",

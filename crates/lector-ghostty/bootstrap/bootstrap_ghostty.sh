@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-GHOSTTY_COMMIT=43fe699071c7dceb161dc3b0c04fce46ade36174
-GHOSTTY_ARCHIVE_SHA256=fbff942fc10b4d0a9de146e805922ef2b763226813fc449fdbb22c9ac7dd0f4a
-GHOSTTY_APP_VERSION=1.3.2-dev
-REQUIRED_ZIG_VERSION=0.16.0
+GHOSTTY_COMMIT=0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec
+GHOSTTY_ARCHIVE_SHA256=4a6ef758be721923e1969e7b81b443dcc92d8dd3fb5a39600c03a8817a753676
+GHOSTTY_VERSION=1.0.0
+GHOSTTY_DEPS_SHA256=4d5ea5e448e4c7ea8fb55ccbaa8668f2a97d44f438cee831e2b7ecd162d85c29
+REQUIRED_ZIG_VERSION=0.17.0
 
 bootstrap_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 crate_dir=$(cd "$bootstrap_dir/.." && pwd)
@@ -83,7 +84,9 @@ esac
 
 source_parent="$build_root/ghostty-source"
 source_dir="$source_parent/$GHOSTTY_COMMIT"
-archive="$source_parent/$GHOSTTY_COMMIT.tar.gz"
+archive="$source_parent/libghostty-vt-$GHOSTTY_VERSION.tar.gz"
+deps_archive="$source_parent/libghostty-vt-$GHOSTTY_VERSION-deps.tar.gz"
+deps_dir="$source_parent/libghostty-vt-$GHOSTTY_VERSION-deps"
 prefix="$prebuilt_root/$target/$optimize"
 cache_dir="$build_root/ghostty-zig-cache/$target/$optimize"
 global_cache_dir="$build_root/ghostty-zig-cache/global"
@@ -110,7 +113,7 @@ metadata_has() {
 
 if [[ -s "$static_archive" && -f "$metadata_path" ]] &&
     metadata_has "ghostty_commit=$GHOSTTY_COMMIT" &&
-    metadata_has "ghostty_app_version=$GHOSTTY_APP_VERSION" &&
+    metadata_has "ghostty_version=$GHOSTTY_VERSION" &&
     metadata_has "zig_version=$REQUIRED_ZIG_VERSION" &&
     metadata_has "target=$target" &&
     metadata_has "optimize=$optimize" &&
@@ -142,7 +145,7 @@ if [[ ! -f "$archive" ]]; then
     archive_part="$archive.part"
     curl --proto '=https' --tlsv1.2 --fail --location \
         --output "$archive_part" \
-        "https://codeload.github.com/ghostty-org/ghostty/tar.gz/$GHOSTTY_COMMIT"
+        "https://release.files.ghostty.org/libghostty-vt/$GHOSTTY_VERSION/libghostty-vt-$GHOSTTY_VERSION.tar.gz"
     mv "$archive_part" "$archive"
 fi
 
@@ -169,16 +172,35 @@ if [[ "$(<"$source_dir/.lector-ghostty-source")" != "$GHOSTTY_COMMIT" ]]; then
     exit 1
 fi
 
+if [[ ! -f "$deps_archive" ]]; then
+    curl --proto '=https' --tlsv1.2 --fail --location \
+        --output "$deps_archive.part" \
+        "https://release.files.ghostty.org/libghostty-vt/$GHOSTTY_VERSION/libghostty-vt-$GHOSTTY_VERSION-deps.tar.gz"
+    mv "$deps_archive.part" "$deps_archive"
+fi
+if [[ "$(sha256 "$deps_archive")" != "$GHOSTTY_DEPS_SHA256" ]]; then
+    echo "Ghostty dependencies archive checksum mismatch" >&2
+    exit 1
+fi
+if [[ ! -d "$deps_dir" ]]; then
+    extract_dir=$(mktemp -d "$source_parent/extract.XXXXXX")
+    tar -xzf "$deps_archive" --strip-components=1 -C "$extract_dir"
+    mv "$extract_dir" "$deps_dir"
+    extract_dir=
+fi
+if [[ "$(<"$source_dir/LIB_VERSION")" != "$GHOSTTY_VERSION" ]]; then
+    echo "Ghostty library version does not match the pinned release" >&2
+    exit 1
+fi
+
 mkdir -p "$prefix"
 (
     cd "$source_dir"
-    # The archive has no .git boundary, so pin Ghostty's version instead of
-    # allowing its build to interpret an enclosing Lector tag as its own.
+    # LIB_VERSION selects the standalone library build; dependencies are offline.
     ZIG_GLOBAL_CACHE_DIR="$global_cache_dir" "$zig_bin" build \
         -Demit-lib-vt=true \
         -Demit-xcframework=false \
-        -Dapp-runtime=none \
-        -Dversion-string="$GHOSTTY_APP_VERSION" \
+        --system "$deps_dir" \
         -Dtarget="$zig_target" \
         -Doptimize="$optimize" \
         --prefix "$prefix" \
@@ -212,7 +234,7 @@ archive_sha=$(sha256 "$archive_path")
 metadata_tmp="$metadata_path.tmp.$$"
 {
     printf 'ghostty_commit=%s\n' "$GHOSTTY_COMMIT"
-    printf 'ghostty_app_version=%s\n' "$GHOSTTY_APP_VERSION"
+    printf 'ghostty_version=%s\n' "$GHOSTTY_VERSION"
     printf 'zig_version=%s\n' "$REQUIRED_ZIG_VERSION"
     printf 'target=%s\n' "$target"
     printf 'optimize=%s\n' "$optimize"
