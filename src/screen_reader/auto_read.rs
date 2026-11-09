@@ -34,6 +34,13 @@ impl ScreenReader {
 
     fn auto_read_impl(&mut self, view: &mut View, prefer_cursor: bool) -> Result<bool> {
         let document_comparison = view.prepare_accessible_document_comparison();
+        // Context activation can request automatic reading independently of
+        // ordinary output handling. Consume its comparison boundary even when
+        // speech is disabled, but never let that path bypass the user's setting
+        // or an active reader's suppression of automatic speech.
+        if !self.auto_read_enabled() {
+            return Ok(false);
+        }
         if document_comparison == AccessibleDocumentComparison::Reintroduce {
             return self.speak_application_screen(view);
         }
