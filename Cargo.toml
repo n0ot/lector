@@ -43,7 +43,6 @@ tts = { package = "lector-tts", version = "0.1.0", path = "crates/lector-tts" }
 terminput = "0.5.12"
 thiserror = "2.0.17"
 lector-ghostty = { version = "0.1.0", path = "crates/lector-ghostty" }
-base64 = { version = "0.23.1", default-features = false, features = ["alloc"] }
 
 [features]
 default = ["ghostty-vt"]

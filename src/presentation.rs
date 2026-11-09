@@ -9,7 +9,6 @@ use crate::terminal::{
     TerminalEvent, TerminalGeometry, TerminalModes, TerminalOperation, TerminalSnapshot,
     UnderlineStyle, UpdateSummary,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -2788,7 +2787,7 @@ fn write_kitty_images(
 }
 
 fn write_kitty_upload(bytes: &mut Vec<u8>, image_id: u32, upload: &SceneImageUpload) {
-    let encoded = STANDARD.encode(&upload.data);
+    let encoded = crate::base64::encode(&upload.data);
     let format = match upload.format {
         PixelFormat::Rgb | PixelFormat::Gray => 24,
         PixelFormat::Rgba | PixelFormat::GrayAlpha => 32,

@@ -1,4 +1,3 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::{collections::VecDeque, fmt, str::FromStr};
 
 const INTERNAL_CLIPBOARD_CAPACITY: usize = 10;
@@ -215,7 +214,7 @@ impl SystemClipboard {
 }
 
 fn osc52_write(text: &str) -> Vec<u8> {
-    let encoded = STANDARD.encode(text.as_bytes());
+    let encoded = crate::base64::encode(text.as_bytes());
     let mut sequence = Vec::with_capacity(OSC52_PREFIX.len() + encoded.len() + OSC52_SUFFIX.len());
     sequence.extend_from_slice(OSC52_PREFIX);
     sequence.extend_from_slice(encoded.as_bytes());
