@@ -23,7 +23,7 @@
         { "grapheme": "e" },
         { "grapheme": "e" },
         { "grapheme": "n" }
-      ], "wrapped": true }
+      ], "wrapped": false }
     ],
     "cursor": { "row": 0, "col": 3, "visible": true },
     "screen": "alternate",

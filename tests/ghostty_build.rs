@@ -17,14 +17,14 @@ fn linked_build_matches_the_pinned_source_and_feature_contract() {
     );
 
     assert!(build_info::supports_kitty_graphics().expect("query Kitty graphics build support"));
-    assert_eq!(build_info::major_version().unwrap(), 0);
-    assert_eq!(build_info::minor_version().unwrap(), 1);
+    assert_eq!(build_info::major_version().unwrap(), 1);
+    assert_eq!(build_info::minor_version().unwrap(), 0);
     assert_eq!(build_info::patch_version().unwrap(), 0);
-    assert_eq!(build_info::pre_version().unwrap(), "dev");
+    assert_eq!(build_info::pre_version().unwrap(), "");
     // Ghostty gives the C library its own semantic version without source
     // metadata. The exact source revision is recorded separately above.
     assert_eq!(build_info::build_version().unwrap(), "");
-    assert_eq!(build_info::version_string().unwrap(), "0.1.0-dev");
+    assert_eq!(build_info::version_string().unwrap(), "1.0.0");
 }
 
 #[test]

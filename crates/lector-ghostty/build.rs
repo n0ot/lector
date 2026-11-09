@@ -4,9 +4,9 @@ use std::{
     process::Command,
 };
 
-const GHOSTTY_COMMIT: &str = "43fe699071c7dceb161dc3b0c04fce46ade36174";
-const GHOSTTY_APP_VERSION: &str = "1.3.2-dev";
-const REQUIRED_ZIG_VERSION: &str = "0.16.0";
+const GHOSTTY_COMMIT: &str = "0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec";
+const GHOSTTY_VERSION: &str = "1.0.0";
+const REQUIRED_ZIG_VERSION: &str = "0.17.0";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GHOSTTY_PREBUILT_ROOT");
@@ -159,7 +159,7 @@ fn static_library_name(target: &str) -> &'static str {
 fn validate_metadata(metadata: &str, target: &str, optimize: &str) -> Result<(), String> {
     let expected = [
         ("ghostty_commit", GHOSTTY_COMMIT),
-        ("ghostty_app_version", GHOSTTY_APP_VERSION),
+        ("ghostty_version", GHOSTTY_VERSION),
         ("zig_version", REQUIRED_ZIG_VERSION),
         ("target", target),
         ("optimize", optimize),
@@ -183,4 +183,28 @@ fn validate_metadata(metadata: &str, target: &str, optimize: &str) -> Result<(),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_metadata_rejects_other_library_releases_and_majors() {
+        let metadata = format!(
+            "ghostty_commit={GHOSTTY_COMMIT}\nghostty_version={GHOSTTY_VERSION}\n\
+             zig_version={REQUIRED_ZIG_VERSION}\ntarget=aarch64-apple-darwin\n\
+             optimize=ReleaseFast\napp_runtime=none\nemit_lib_vt=true\n\
+             kitty_graphics=true\nabi_header_check=passed\n\
+             abi_probe_sha256=probe\narchive_sha256=archive\n"
+        );
+        assert!(validate_metadata(&metadata, "aarch64-apple-darwin", "ReleaseFast").is_ok());
+        for version in ["0.1.0-dev", "2.0.0", "1.1.0", "1.0.0-dev"] {
+            let mismatched = metadata.replace(
+                "ghostty_version=1.0.0",
+                &format!("ghostty_version={version}"),
+            );
+            assert!(validate_metadata(&mismatched, "aarch64-apple-darwin", "ReleaseFast").is_err());
+        }
+    }
 }
