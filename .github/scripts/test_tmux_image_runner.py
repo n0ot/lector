@@ -19,6 +19,8 @@ class TmuxImageRunnerTests(unittest.TestCase):
 import json, os, sys
 with open(os.environ['DOCKER_CALLS'], 'a') as log:
     log.write(json.dumps(sys.argv[1:]) + '\\n')
+if os.environ.get('FAIL_PREPARE') and 'list' in sys.argv:
+    sys.exit(1)
 if sys.argv[1:3] == ['image', 'inspect']:
     if os.environ.get('MISSING_IMAGE'):
         sys.exit(1)
@@ -50,6 +52,30 @@ if sys.argv[1:3] == ['image', 'inspect']:
             index = reused.index(IMAGE)
             self.assertEqual(original[:index], reused[:index])
             self.assertEqual(original[index + 1:], reused[index + 1:])
+
+    def test_bind_cache_preserves_commands_and_prepare_does_not_run_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, calls = self.run_runner(
+                LECTOR_REAL_TMUX_CACHE_DIR=directory, LECTOR_REAL_TMUX_PREBUILT_IMAGE=IMAGE,
+                LECTOR_REAL_TMUX_PLATFORM='linux/amd64', LECTOR_REAL_TMUX_PREPARE_ONLY='1')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            runs = calls[1:]
+            for call in runs:
+                self.assertIn(directory + '/target:/work/target', call)
+                self.assertIn(directory + '/cargo-registry:/opt/cargo/registry', call)
+                self.assertIn(directory + '/cargo-git:/opt/cargo/git', call)
+                self.assertNotIn('lector-real-tmux-target:/work/target', call)
+            commands = [call[call.index(IMAGE) + 1:] for call in runs]
+            self.assertIn(['bash', 'scripts/bootstrap_zig.sh'], commands)
+            self.assertIn(['bash', 'scripts/bootstrap_ghostty.sh', '--optimize', 'ReleaseFast'], commands)
+            self.assertEqual(sum(command[:3] == ['cargo', 'nextest', 'list'] for command in commands), 2)
+            self.assertFalse(any(command[:3] == ['cargo', 'nextest', 'run'] for command in commands))
+            failed, failed_calls = self.run_runner(
+                LECTOR_REAL_TMUX_CACHE_DIR=directory, LECTOR_REAL_TMUX_PREBUILT_IMAGE=IMAGE,
+                LECTOR_REAL_TMUX_PLATFORM='linux/amd64', LECTOR_REAL_TMUX_PREPARE_ONLY='1',
+                FAIL_PREPARE='1')
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertFalse(any('run' in call[call.index(IMAGE) + 1:] for call in failed_calls[1:]))
 
     def test_invalid_identity_or_missing_platform_never_runs(self):
         for image, platform in [('mutable:tag', 'linux/amd64'), (IMAGE, '')]:

@@ -6,6 +6,7 @@ dockerfile="$repo_dir/tests/docker/real-tmux.Dockerfile"
 image=${LECTOR_REAL_TMUX_IMAGE:-lector-real-tmux:ubuntu-24.04}
 platform=${LECTOR_REAL_TMUX_PLATFORM:-}
 prebuilt_image=${LECTOR_REAL_TMUX_PREBUILT_IMAGE:-}
+cache_dir=${LECTOR_REAL_TMUX_CACHE_DIR:-}
 test_filter='binary(tmux) & test(/(^|::)(real_|two_real_)/)'
 
 build_args=(
@@ -19,11 +20,26 @@ run_args=(
     --env LECTOR_REAL_TMUX_CONTAINER=1
     --tmpfs "/tmp:exec,mode=1777"
     --volume "$repo_dir:/work:ro"
-    --volume lector-real-tmux-cargo-git:/opt/cargo/git
-    --volume lector-real-tmux-cargo-registry:/opt/cargo/registry
-    --volume lector-real-tmux-target:/work/target
     --workdir /work
 )
+if [[ -n "$cache_dir" ]]; then
+    if [[ "$cache_dir" != /* || "$cache_dir" == / ]]; then
+        echo "LECTOR_REAL_TMUX_CACHE_DIR must be an absolute cache directory" >&2
+        exit 2
+    fi
+    mkdir -p "$cache_dir"/{cargo-git,cargo-registry,target}
+    run_args+=(
+        --volume "$cache_dir/cargo-git:/opt/cargo/git"
+        --volume "$cache_dir/cargo-registry:/opt/cargo/registry"
+        --volume "$cache_dir/target:/work/target"
+    )
+else
+    run_args+=(
+        --volume lector-real-tmux-cargo-git:/opt/cargo/git
+        --volume lector-real-tmux-cargo-registry:/opt/cargo/registry
+        --volume lector-real-tmux-target:/work/target
+    )
+fi
 if [[ -n "$platform" ]]; then
     build_args+=(--platform "$platform")
     run_args+=(--platform "$platform")
@@ -48,6 +64,16 @@ fi
 run_args+=(--pull never)
 docker run "${run_args[@]}" "$image" scripts/check-rust-toolchain
 docker run "${run_args[@]}" "$image" bash tests/docker/check-nextest-install.sh
+if [[ "${LECTOR_REAL_TMUX_PREPARE_ONLY:-0}" == 1 ]]; then
+    # Validate restored native artifacts even when Cargo fingerprints are fresh.
+    docker run "${run_args[@]}" "$image" bash scripts/bootstrap_zig.sh
+    docker run "${run_args[@]}" "$image" bash scripts/bootstrap_ghostty.sh --optimize ReleaseFast
+    docker run "${run_args[@]}" "$image" cargo nextest list --locked --lib \
+        -E 'test(private_terminfo_overlay_advertises_synchronized_output)' >/dev/null
+    docker run "${run_args[@]}" "$image" cargo nextest list --locked --test tmux \
+        -E "$test_filter" >/dev/null
+    exit 0
+fi
 docker run "${run_args[@]}" "$image" \
     cargo nextest run --locked --lib --run-ignored only \
     -E 'test(private_terminfo_overlay_advertises_synchronized_output)'
