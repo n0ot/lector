@@ -1,6 +1,7 @@
 pub mod app;
 mod application_accessibility;
 mod attributes;
+mod base64;
 mod clipboard;
 mod commands;
 pub mod diagnostics;
