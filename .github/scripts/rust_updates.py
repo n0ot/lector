@@ -131,7 +131,24 @@ def approved(reviews, reviewer, author, head):
                 and relevant[-1]["commit_id"] == head)
 
 
+def validate_pr(repo, pr):
+    head = pr["head"]["sha"]
+    files = api(f"repos/{repo}/pulls/{pr['number']}/files")
+    if [f["filename"] for f in files] != [PIN]:
+        raise RuntimeError("Reviewed update is no longer limited to the canonical pin")
+    base_pin = api(f"repos/{repo}/contents/{PIN}?ref={pr['base']['sha']}")
+    head_pin = api(f"repos/{repo}/contents/{PIN}?ref={head}")
+    before = base64.b64decode(base_pin["content"]).decode()
+    after = base64.b64decode(head_pin["content"]).decode()
+    release = tomllib.loads(after)["toolchain"]["channel"]
+    previous = tomllib.loads(before)["toolchain"]["channel"]
+    if version(release) <= version(previous) or replace_pin(before, release) != after:
+        raise RuntimeError("Update must only advance the exact canonical Rust release")
+
+
 def reconcile(repo, pr, reviewer):
+    # Check before dispatch as well as merge; never run a repurposed update branch.
+    validate_pr(repo, pr)
     head = pr["head"]["sha"]
     runs = api(f"repos/{repo}/actions/workflows/ghostty-build.yml/runs?head_sha={head}&event=workflow_dispatch")
     if not runs["workflow_runs"]:
@@ -158,18 +175,6 @@ def reconcile(repo, pr, reviewer):
         report(repo, pr, f"CI passed; awaiting independent review by @{reviewer} on `{head}`. "
                "A stale approval, author approval, or changes-requested review cannot authorize merge.")
         return
-    # Refuse a foreign branch, arbitrary edits, or a changed head before asking GitHub to merge.
-    files = api(f"repos/{repo}/pulls/{pr['number']}/files")
-    if [f["filename"] for f in files] != [PIN]:
-        raise RuntimeError("Reviewed update is no longer limited to the canonical pin")
-    base_pin = api(f"repos/{repo}/contents/{PIN}?ref={pr['base']['sha']}")
-    head_pin = api(f"repos/{repo}/contents/{PIN}?ref={head}")
-    before = base64.b64decode(base_pin["content"]).decode()
-    after = base64.b64decode(head_pin["content"]).decode()
-    release = tomllib.loads(after)["toolchain"]["channel"]
-    previous = tomllib.loads(before)["toolchain"]["channel"]
-    if version(release) <= version(previous) or replace_pin(before, release) != after:
-        raise RuntimeError("Update must only advance the exact canonical Rust release")
     state = json.loads(gh("pr", "view", str(pr["number"]), "--repo", repo,
                           "--json", "headRefOid,mergeStateStatus"))
     if state["headRefOid"] != head or state["mergeStateStatus"] != "CLEAN":

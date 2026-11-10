@@ -9,6 +9,9 @@ import rust_updates as update
 
 class RustUpdateTests(unittest.TestCase):
     def setUp(self):
+        self.validation = patch.object(update, "validate_pr")
+        self.validation.start()
+        self.addCleanup(self.validation.stop)
         self.pr = {"number": 1, "user": {"login": "author"}, "head": {"sha": "head"}}
         self.run = {"status": "completed", "conclusion": "success", "html_url": "https://example.test/run"}
 
@@ -80,20 +83,29 @@ class RustUpdateTests(unittest.TestCase):
             self.assertFalse(update.approved([review, dict(review, state=state)], "reviewer", "author", "head"))
 
     def test_reviewed_validated_pin_uses_protected_exact_head_merge(self):
-        import base64
-        before = '[toolchain]\nchannel = "1.2.3"\n'
-        after = before.replace("1.2.3", "1.2.4")
         self.pr["base"] = {"sha": "base"}
         review = {"user": {"login": "reviewer"}, "state": "APPROVED", "commit_id": "head"}
-        responses = [{"workflow_runs": [self.run]}, [{"filename": update.PIN}],
-                     {"content": base64.b64encode(before.encode()).decode()},
-                     {"content": base64.b64encode(after.encode()).decode()}]
+        responses = [{"workflow_runs": [self.run]}]
         with patch.object(update, "api", side_effect=responses), patch.object(update, "gh", side_effect=[
                 update.json.dumps([[review]]),
                 update.json.dumps({"headRefOid": "head", "mergeStateStatus": "CLEAN"}), ""]) as gh:
             update.reconcile("owner/repo", self.pr, "reviewer")
             self.assertEqual(gh.call_args.args, ("pr", "merge", "1", "--repo", "owner/repo",
                              "--squash", "--delete-branch", "--match-head-commit", "head"))
+
+    def test_pin_validation_rejects_unrelated_edits_before_dispatch(self):
+        import base64
+        self.validation.stop()
+        self.pr["base"] = {"sha": "base"}
+        before = '[toolchain]\nchannel = "1.2.3"\n'
+        after = before.replace("1.2.3", "1.2.4") + 'profile = "minimal"\n'
+        responses = [[{"filename": update.PIN}],
+                     {"content": base64.b64encode(before.encode()).decode()},
+                     {"content": base64.b64encode(after.encode()).decode()}]
+        with patch.object(update, "api", side_effect=responses) as api:
+            with self.assertRaisesRegex(RuntimeError, "only advance"):
+                update.reconcile("owner/repo", self.pr, "reviewer")
+            self.assertTrue(all(not call.kwargs for call in api.call_args_list))
 
     def test_missing_auth_fails_before_network_or_repository_mutation(self):
         with patch.dict(os.environ, {"GH_TOKEN": ""}), patch.object(update, "api") as api:
