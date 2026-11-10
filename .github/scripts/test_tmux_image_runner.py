@@ -1,0 +1,73 @@
+"""Exercise runner selection with an inert Docker command fixture."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+IMAGE = "sha256:" + "a" * 64
+
+
+class TmuxImageRunnerTests(unittest.TestCase):
+    def run_runner(self, **settings):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            docker = root / "docker"
+            docker.write_text("""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['DOCKER_CALLS'], 'a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\\n')
+if sys.argv[1:3] == ['image', 'inspect']:
+    if os.environ.get('MISSING_IMAGE'):
+        sys.exit(1)
+    print(os.environ.get('IMAGE_PLATFORM', 'linux/amd64'))
+""")
+            docker.chmod(0o755)
+            calls = root / "calls"
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith('LECTOR_REAL_TMUX_')}
+            env.update(PATH=f"{root}:{env['PATH']}", DOCKER_CALLS=str(calls), **settings)
+            result = subprocess.run([str(ROOT / 'scripts/test-real-tmux-docker')],
+                                    env=env, text=True, capture_output=True)
+            return result, [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+
+    def test_default_build_and_prebuilt_run_identical_test_commands(self):
+        normal, normal_calls = self.run_runner(LECTOR_REAL_TMUX_PLATFORM='linux/amd64')
+        prebuilt, prebuilt_calls = self.run_runner(
+            LECTOR_REAL_TMUX_PLATFORM='linux/amd64', LECTOR_REAL_TMUX_PREBUILT_IMAGE=IMAGE)
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        self.assertEqual(prebuilt.returncode, 0, prebuilt.stderr)
+        self.assertEqual(normal_calls[0][0], 'build')
+        self.assertFalse(any(call[0] == 'build' for call in prebuilt_calls))
+        self.assertEqual(len(normal_calls), 5)
+        self.assertEqual(len(prebuilt_calls), 5)
+        for original, reused in zip(normal_calls[1:], prebuilt_calls[1:]):
+            self.assertEqual(original[0], 'run')
+            self.assertIn('--pull', reused)
+            self.assertEqual(reused[reused.index('--pull') + 1], 'never')
+            index = reused.index(IMAGE)
+            self.assertEqual(original[:index], reused[:index])
+            self.assertEqual(original[index + 1:], reused[index + 1:])
+
+    def test_invalid_identity_or_missing_platform_never_runs(self):
+        for image, platform in [('mutable:tag', 'linux/amd64'), (IMAGE, '')]:
+            with self.subTest(image=image, platform=platform):
+                result, calls = self.run_runner(LECTOR_REAL_TMUX_PREBUILT_IMAGE=image,
+                                               LECTOR_REAL_TMUX_PLATFORM=platform)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
+
+    def test_wrong_platform_or_missing_local_image_never_runs_or_builds(self):
+        for extra in [{'IMAGE_PLATFORM': 'linux/arm64'}, {'MISSING_IMAGE': '1'}]:
+            with self.subTest(extra=extra):
+                result, calls = self.run_runner(LECTOR_REAL_TMUX_PREBUILT_IMAGE=IMAGE,
+                                               LECTOR_REAL_TMUX_PLATFORM='linux/amd64', **extra)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][:2], ['image', 'inspect'])
+
+
+if __name__ == '__main__':
+    unittest.main()
