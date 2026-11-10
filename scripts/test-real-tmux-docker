@@ -29,6 +29,7 @@ if [[ -n "$platform" ]]; then
 fi
 
 docker build "${build_args[@]}" "$repo_dir/tests/docker"
+docker run "${run_args[@]}" "$image" bash tests/docker/check-nextest-install.sh
 docker run "${run_args[@]}" "$image" \
     cargo nextest run --locked --lib --run-ignored only \
     -E 'test(private_terminfo_overlay_advertises_synchronized_output)'
