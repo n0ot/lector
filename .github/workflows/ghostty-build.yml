@@ -252,7 +252,6 @@ jobs:
     needs: changes
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
-      CARGO_HOME: ${{ github.workspace }}/target/alpine-cargo-home
       CARGO_INCREMENTAL: 0
     name: Alpine native static PIE
     runs-on: ubuntu-24.04
@@ -273,6 +272,9 @@ jobs:
         if: needs.changes.outputs.build == 'true'
         id: alpine
         run: |
+          # Keep registry dependencies outside the workspace so pruning retains them.
+          export CARGO_HOME="$RUNNER_TEMP/alpine-cargo"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME"
           docker run --detach --name lector-alpine --dns 1.1.1.1 \
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
