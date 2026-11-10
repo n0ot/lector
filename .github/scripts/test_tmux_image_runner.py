@@ -61,6 +61,7 @@ if sys.argv[1:3] == ['image', 'inspect']:
             self.assertEqual(result.returncode, 0, result.stderr)
             runs = calls[1:]
             for call in runs:
+                self.assertIn('/work/target/test-tmux:mode=1777', call)
                 self.assertIn(directory + '/target:/work/target', call)
                 self.assertIn(directory + '/cargo-registry:/opt/cargo/registry', call)
                 self.assertIn(directory + '/cargo-git:/opt/cargo/git', call)

@@ -88,7 +88,7 @@ The runner also checks host-terminfo integration against the container's
 `infocmp` and `tic`; ordinary unit tests use the bundled terminfo fixture.
 The checkout is mounted read-only. Docker-managed volumes retain Cargo,
 Ghostty, and test artifacts between runs; tmux processes are discarded with
-the container, while socket paths stay in Docker-managed storage rather than
+the container, while socket paths stay in container-local temporary storage rather than
 the checkout or host tmux runtime. The first run needs network access to build
 the image and populate those caches. Set
 `LECTOR_REAL_TMUX_PLATFORM`, for example to `linux/amd64`, when an explicitly
