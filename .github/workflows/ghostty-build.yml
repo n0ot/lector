@@ -116,6 +116,7 @@ jobs:
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Build cached tmux image
         id: tmux-image
+        timeout-minutes: 10
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         continue-on-error: true
         # docker/build-push-action v7
@@ -125,10 +126,11 @@ jobs:
           file: tests/docker/real-tmux.Dockerfile
           platforms: linux/amd64
           load: true
-          cache-from: type=gha,scope=lector-tmux-v1-linux-amd64-${{ hashFiles('tests/docker/real-tmux.Dockerfile*', 'tests/docker/install-nextest.sh', 'rust-toolchain.toml', 'scripts/check-rust-toolchain') }}
-          cache-to: type=gha,mode=max,ignore-error=true,scope=lector-tmux-v1-linux-amd64-${{ hashFiles('tests/docker/real-tmux.Dockerfile*', 'tests/docker/install-nextest.sh', 'rust-toolchain.toml', 'scripts/check-rust-toolchain') }}
+          cache-from: type=gha,timeout=2m,scope=lector-tmux-v1-linux-amd64-${{ hashFiles('tests/docker/real-tmux.Dockerfile*', 'tests/docker/install-nextest.sh', 'rust-toolchain.toml', 'scripts/check-rust-toolchain') }}
+          cache-to: type=gha,mode=max,ignore-error=true,timeout=2m,scope=lector-tmux-v1-linux-amd64-${{ hashFiles('tests/docker/real-tmux.Dockerfile*', 'tests/docker/install-nextest.sh', 'rust-toolchain.toml', 'scripts/check-rust-toolchain') }}
       - name: Build tmux image without cache after cache failure
         id: tmux-image-cold
+        timeout-minutes: 10
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-image.outcome == 'failure'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
