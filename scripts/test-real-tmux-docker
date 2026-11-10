@@ -5,6 +5,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 dockerfile="$repo_dir/tests/docker/real-tmux.Dockerfile"
 image=${LECTOR_REAL_TMUX_IMAGE:-lector-real-tmux:ubuntu-24.04}
 platform=${LECTOR_REAL_TMUX_PLATFORM:-}
+prebuilt_image=${LECTOR_REAL_TMUX_PREBUILT_IMAGE:-}
 test_filter='binary(tmux) & test(/(^|::)(real_|two_real_)/)'
 
 build_args=(
@@ -28,7 +29,23 @@ if [[ -n "$platform" ]]; then
     run_args+=(--platform "$platform")
 fi
 
-docker build "${build_args[@]}" "$repo_dir"
+if [[ -n "$prebuilt_image" ]]; then
+    # Require an immutable local image and an explicit platform: never guess a tag.
+    if [[ ! "$prebuilt_image" =~ ^sha256:[0-9a-f]{64}$ || -z "$platform" ]]; then
+        echo "prebuilt execution requires an image ID and LECTOR_REAL_TMUX_PLATFORM" >&2
+        exit 2
+    fi
+    actual_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$prebuilt_image")
+    if [[ "$actual_platform" != "$platform" ]]; then
+        echo "prebuilt image platform $actual_platform does not match $platform" >&2
+        exit 2
+    fi
+    image=$prebuilt_image
+else
+    docker build "${build_args[@]}" "$repo_dir"
+fi
+# The selected image must already exist; do not pull an unrelated replacement.
+run_args+=(--pull never)
 docker run "${run_args[@]}" "$image" scripts/check-rust-toolchain
 docker run "${run_args[@]}" "$image" bash tests/docker/check-nextest-install.sh
 docker run "${run_args[@]}" "$image" \
