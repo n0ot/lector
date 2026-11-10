@@ -140,14 +140,69 @@ jobs:
           platforms: linux/amd64
           load: true
           no-cache: true
+      - name: Identify container compilation cache
+        id: tmux-cache-key
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        env:
+          TMUX_IMAGE: ${{ steps.tmux-image-cold.outputs.imageid || steps.tmux-image.outputs.imageid }}
+        run: |
+          echo "prefix=$(python3 .github/scripts/tmux_cache_key.py "$TMUX_IMAGE" linux/amd64)" >> "$GITHUB_OUTPUT"
+      - name: Restore container compilation cache
+        id: tmux-cache
+        timeout-minutes: 5
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            ${{ runner.temp }}/lector-tmux-cache/cargo-git
+            ${{ runner.temp }}/lector-tmux-cache/cargo-registry
+            ${{ runner.temp }}/lector-tmux-cache/target/debug
+            ${{ runner.temp }}/lector-tmux-cache/target/ghostty-prebuilt
+            ${{ runner.temp }}/lector-tmux-cache/target/toolchains
+          key: ${{ steps.tmux-cache-key.outputs.prefix }}-${{ github.sha }}
+          restore-keys: ${{ steps.tmux-cache-key.outputs.prefix }}-
+      - name: Validate restored container compilation cache
+        id: tmux-cache-check
+        timeout-minutes: 10
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        continue-on-error: true
+        env:
+          LECTOR_REAL_TMUX_PREBUILT_IMAGE: ${{ steps.tmux-image-cold.outputs.imageid || steps.tmux-image.outputs.imageid }}
+          LECTOR_REAL_TMUX_PLATFORM: linux/amd64
+          LECTOR_REAL_TMUX_CACHE_DIR: ${{ runner.temp }}/lector-tmux-cache
+          LECTOR_REAL_TMUX_PREPARE_ONLY: '1'
+          CACHE_RESTORE_OUTCOME: ${{ steps.tmux-cache.outcome }}
+        run: |
+          if [[ "$CACHE_RESTORE_OUTCOME" != success ]]; then
+            rm -rf -- "${RUNNER_TEMP:?}/lector-tmux-cache"
+          fi
+          scripts/test-real-tmux-docker
+      - name: Discard unusable container compilation cache
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache-check.outcome == 'failure'
+        run: sudo rm -rf -- "${RUNNER_TEMP:?}/lector-tmux-cache"
       - name: Run real tmux tests in Docker
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           LECTOR_REAL_TMUX_PREBUILT_IMAGE: ${{ steps.tmux-image-cold.outputs.imageid || steps.tmux-image.outputs.imageid }}
           LECTOR_REAL_TMUX_PLATFORM: linux/amd64
+          LECTOR_REAL_TMUX_CACHE_DIR: ${{ runner.temp }}/lector-tmux-cache
         run: |
           : "${LECTOR_REAL_TMUX_PREBUILT_IMAGE:?image build did not return an ID}"
           scripts/test-real-tmux-docker
+      - name: Save container compilation cache
+        timeout-minutes: 5
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            ${{ runner.temp }}/lector-tmux-cache/cargo-git
+            ${{ runner.temp }}/lector-tmux-cache/cargo-registry
+            ${{ runner.temp }}/lector-tmux-cache/target/debug
+            ${{ runner.temp }}/lector-tmux-cache/target/ghostty-prebuilt
+            ${{ runner.temp }}/lector-tmux-cache/target/toolchains
+          key: ${{ steps.tmux-cache-key.outputs.prefix }}-${{ github.sha }}
       - name: Run documentation tests
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo test --locked --workspace --doc --all-features
