@@ -1129,7 +1129,7 @@ mod tests {
 
     #[test]
     fn regex_search_preserves_direction_with_line_boundary_matches() {
-        let document = ReviewDocument::from_text(2, 20, b"a a\r\na");
+        let document = ReviewDocument::from_text(2, 20, b"a ab\r\na");
         for pattern in ["a|$", "a|\\n"] {
             let forward = document
                 .search(pattern, pos(0, 0), SearchDirection::Forward, 1)
