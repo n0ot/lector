@@ -190,6 +190,9 @@ jobs:
         run: |
           : "${LECTOR_REAL_TMUX_PREBUILT_IMAGE:?image build did not return an ID}"
           scripts/test-real-tmux-docker
+      - name: Make container artifacts readable for cache upload
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache.outputs.cache-hit != 'true'
+        run: sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP:?}/lector-tmux-cache"
       - name: Save container compilation cache
         timeout-minutes: 5
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache.outputs.cache-hit != 'true'
