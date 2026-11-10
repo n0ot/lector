@@ -1,0 +1,32 @@
+name: Tested Rust updates
+
+"on":
+  schedule:
+    - cron: '19 8 * * 1'
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Ghostty build matrix]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: tested-rust-updates
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.head_branch == 'automation/rust-toolchain'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Prepare and test a stable Rust update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_MODE: ${{ github.event_name == 'workflow_run' && 'report' || 'propose' }}
+        run: python3 .github/scripts/rust_updates.py "$UPDATE_MODE"

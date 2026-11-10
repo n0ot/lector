@@ -5,6 +5,7 @@ name: Ghostty build matrix
   push:
     branches: [master]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read

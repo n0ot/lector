@@ -23,3 +23,7 @@ Regression tests should exercise abstract scenarios with simulated inputs and st
 Prefer explicit byte sequences and modeled state over launching real programs. This keeps each test specific to the behavior under test and avoids external dependencies. Use project-built fixtures when process or platform behavior itself is the subject.
 
 Use an external program only when Lector intentionally implements compatibility with that program or one of its concrete protocols, and make the test exercise that compatibility boundary directly. Run indispensable external integrations only inside Docker containers, never directly on the host, and keep ordinary test commands inert with respect to them. Platform-specific host tests may run only Lector and project-built fixtures. Express this policy through test structure rather than checks for particular names, paths, commands, or applications.
+
+## Agent queue
+
+When orchestrating this repository's queue, run `python3 .github/scripts/rust_updates.py sync --project <PROJECT_NODE_ID>` before dispatch and at the existing 30-minute checkpoints. This imports only validated canonical Rust updates as review/merge cards. Use the normal independent-agent final-revision review and protected merge process; a separate GitHub reviewer account is not required. A stopped session leaves prepared updates waiting.
