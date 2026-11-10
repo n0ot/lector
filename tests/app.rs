@@ -1285,7 +1285,7 @@ fn review_previous_line_stops_at_visible_top_when_scrollback_exists() {
 
 #[test]
 fn legacy_review_overlay_freezes_output_bells_on_errors_and_restores_the_root() {
-    let (mut app, mut sr, _recorder, clock) = make_app();
+    let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
     app.handle_pty(&mut sr, b"before\x1B[H", &mut term_out)
@@ -1311,6 +1311,7 @@ fn legacy_review_overlay_freezes_output_bells_on_errors_and_restores_the_root() 
     assert!(app.has_overlay());
 
     term_out.clear();
+    recorder.inner.borrow_mut().speaks.clear();
     app.handle_stdin(&mut sr, b"f\x1B", &mut pty_out, &mut term_out)
         .expect("queue cancellation escape");
     clock.advance_ms(100);
@@ -1319,12 +1320,17 @@ fn legacy_review_overlay_freezes_output_bells_on_errors_and_restores_the_root() 
     assert!(term_out.is_empty());
     assert!(app.has_overlay());
 
+    assert!(recorder.inner.borrow().speaks.is_empty());
     app.handle_stdin(&mut sr, b"\x1B", &mut pty_out, &mut term_out)
         .expect("queue idle escape");
     clock.advance_ms(100);
     app.handle_tick(&mut sr, &mut pty_out, &mut term_out)
-        .expect("bell on idle escape");
-    assert_eq!(term_out, b"\x07");
+        .expect("announce review on idle escape");
+    assert!(term_out.is_empty());
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("review mode".into(), false)]
+    );
     assert!(app.has_overlay());
 
     term_out.clear();
@@ -1565,7 +1571,189 @@ fn phase_two_baseline_preserves_full_overlay_redraw_title_cursor_and_modes() {
 }
 
 #[test]
-fn review_overlay_uses_normal_cursor_tracking_for_horizontal_motions() {
+fn review_modes_and_search_results_are_announced_with_auto_read_off() {
+    for (scheduled, suppress_echo) in [(false, false), (false, true), (true, false), (true, true)] {
+        let (mut app, mut sr, recorder, clock) = make_app();
+        sr.set_auto_read_enabled(false);
+        sr.set_suppress_key_echo(suppress_echo);
+        if scheduled {
+            app.enable_output_scheduler(OutputSchedulerConfig::default());
+        }
+        let mut pty_out = Vec::new();
+        let mut term_out = Vec::new();
+        let present = |app: &mut App, sr: &mut ScreenReader, output: &mut Vec<u8>| {
+            clock.advance_ms(100);
+            if scheduled {
+                app.drain_scheduled_output(output, false).unwrap();
+            }
+            app.handle_tick(sr, &mut Vec::new(), output).unwrap();
+        };
+        app.handle_pty(&mut sr, b"one two one\x1b[H", &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        recorder.inner.borrow_mut().speaks.clear();
+        app.handle_stdin(&mut sr, b"vVv\x1b[27u", &mut pty_out, &mut term_out)
+            .unwrap();
+        assert_eq!(
+            recorder
+                .inner
+                .borrow()
+                .speaks
+                .iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "visual character mode",
+                "visual line mode",
+                "visual character mode",
+                "review mode"
+            ]
+        );
+        recorder.inner.borrow_mut().speaks.clear();
+
+        for byte in b"/one\r" {
+            app.handle_stdin(&mut sr, &[*byte], &mut pty_out, &mut term_out)
+                .unwrap();
+            present(&mut app, &mut sr, &mut term_out);
+        }
+        assert_eq!(
+            recorder
+                .inner
+                .borrow()
+                .speaks
+                .iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<Vec<_>>(),
+            if suppress_echo {
+                vec!["search forward", "one", "2 of 2", "review mode"]
+            } else {
+                vec![
+                    "search forward",
+                    "o",
+                    "n",
+                    "e",
+                    "one",
+                    "2 of 2",
+                    "review mode",
+                ]
+            }
+        );
+        recorder.inner.borrow_mut().speaks.clear();
+        app.handle_stdin(&mut sr, b"n", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        assert_eq!(
+            recorder
+                .inner
+                .borrow()
+                .speaks
+                .iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "1 of 2"]
+        );
+        recorder.inner.borrow_mut().speaks.clear();
+        app.handle_stdin(&mut sr, b"N", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        assert_eq!(
+            recorder
+                .inner
+                .borrow()
+                .speaks
+                .iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "2 of 2"]
+        );
+        recorder.inner.borrow_mut().speaks.clear();
+        for input in [b"?".as_slice(), b"\x1b[27u"] {
+            app.handle_stdin(&mut sr, input, &mut pty_out, &mut term_out)
+                .unwrap();
+            present(&mut app, &mut sr, &mut term_out);
+        }
+        assert_eq!(
+            recorder
+                .inner
+                .borrow()
+                .speaks
+                .iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<Vec<_>>(),
+            ["search backward", "review mode"]
+        );
+        assert!(pty_out.is_empty());
+    }
+}
+
+#[test]
+fn review_navigation_reads_document_destinations_after_presentation() {
+    for scheduled in [false, true] {
+        let (mut app, mut sr, recorder, clock) = make_app();
+        if scheduled {
+            app.enable_output_scheduler(OutputSchedulerConfig::default());
+        }
+        sr.set_auto_read_enabled(false);
+        let mut pty_out = Vec::new();
+        let mut term_out = Vec::new();
+        let present = |app: &mut App, sr: &mut ScreenReader, output: &mut Vec<u8>| {
+            clock.advance_ms(40);
+            if scheduled {
+                app.drain_scheduled_output(output, false).unwrap();
+            }
+            app.handle_tick(sr, &mut Vec::new(), output).unwrap();
+        };
+        let rows = (0..40)
+            .map(|row| format!("row {row}\r\n"))
+            .collect::<String>();
+        app.handle_pty(&mut sr, rows.as_bytes(), &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        assert_eq!(
+            recorder.inner.borrow().speaks.len(),
+            2,
+            "title and initial destination; scheduled={scheduled}"
+        );
+        assert_eq!(recorder.inner.borrow().speaks[0].0, "Review");
+        recorder.inner.borrow_mut().speaks.clear();
+
+        app.handle_stdin(&mut sr, b"gg", &mut pty_out, &mut term_out)
+            .unwrap();
+        if scheduled {
+            assert!(recorder.inner.borrow().speaks.is_empty());
+        }
+        present(&mut app, &mut sr, &mut term_out);
+        assert_eq!(
+            recorder.inner.borrow().speaks.as_slice(),
+            [("row 0".into(), false)]
+        );
+        recorder.inner.borrow_mut().speaks.clear();
+
+        app.handle_stdin(&mut sr, b"30j", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        assert_eq!(
+            recorder.inner.borrow().speaks.as_slice(),
+            [("row 30".into(), false)]
+        );
+        recorder.inner.borrow_mut().speaks.clear();
+
+        app.handle_stdin(&mut sr, b"zz", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        assert!(recorder.inner.borrow().speaks.is_empty());
+        assert!(pty_out.is_empty());
+    }
+}
+
+#[test]
+fn review_overlay_reads_horizontal_destinations() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();

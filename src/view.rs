@@ -311,6 +311,7 @@ pub struct View {
     presented_application_accessibility_policy: ApplicationAccessibilityPolicy,
     pending_application_speech: VecDeque<PendingApplicationSpeech>,
     pending_application_speech_bytes: usize,
+    internal_accessibility: bool,
     accessibility_journal: VecDeque<AccessibilityJournalEntry>,
     accessibility_journal_bytes: usize,
     accessibility_journal_gap_start: Option<ViewRevision>,
@@ -418,6 +419,7 @@ impl View {
             presented_application_accessibility_policy: ApplicationAccessibilityPolicy::default(),
             pending_application_speech: VecDeque::new(),
             pending_application_speech_bytes: 0,
+            internal_accessibility: false,
             accessibility_journal: VecDeque::new(),
             accessibility_journal_bytes: 0,
             accessibility_journal_gap_start: None,
@@ -829,6 +831,13 @@ impl View {
         {
             return;
         }
+        if self.internal_accessibility && self.application_accessibility_policy().suppress_auto_read
+        {
+            // The internal view has already described this presentation
+            // semantically. Do not defer its document introduction until a
+            // later prompt switches back to ordinary diff-based reading.
+            self.prepare_accessible_document_comparison();
+        }
         if frozen {
             // The parser may already be drawing a newer frame. Advance the
             // speech baseline only to the snapshot whose render receipt has
@@ -916,6 +925,14 @@ impl View {
         self.standalone_update = UpdateSummary::default();
         self.advance_accessibility_update_generation();
         self.reset_accessibility_journal_for_handoff();
+        if self.internal_accessibility {
+            // Internal views can describe their initial state before the
+            // scheduler takes ownership. Carry those unpresented messages
+            // into the new epoch; delivery still waits for a render receipt.
+            for pending in &mut self.pending_application_speech {
+                pending.epoch_generation = self.live_accessibility_epoch.generation;
+            }
+        }
         if matches!(
             self.accessibility_read_state,
             AccessibilityReadState::Frozen { .. }
@@ -1218,10 +1235,29 @@ impl View {
         }
     }
 
+    /// Internal views use the same bounded, revision-gated speech delivery as
+    /// applications, but their explicit navigation is independent of auto-read.
+    pub(crate) fn set_internal_accessibility_policy(&mut self, semantic: bool) {
+        self.internal_accessibility = true;
+        self.live_application_accessibility_policy = ApplicationAccessibilityPolicy {
+            suppress_auto_read: semantic,
+            suppress_cursor_tracking: semantic,
+        };
+    }
+
+    pub(crate) fn has_internal_accessibility(&self) -> bool {
+        self.internal_accessibility
+    }
+
+    pub(crate) fn queue_internal_speech(&mut self, speech: ApplicationAccessibilitySpeech) {
+        debug_assert!(self.internal_accessibility);
+        self.push_application_speech(self.live_revision, speech);
+    }
+
     /// Takes semantic speech whose owning view and presentation revision are
-    /// currently active. Callers deliberately discard this result when global
-    /// automatic reading is disabled or the terminal is unfocused; messages
-    /// are never replayed after focus returns.
+    /// currently active. Application messages are discarded when automatic
+    /// reading is disabled; internal navigation remains explicit feedback.
+    /// Unfocused messages are never replayed after focus returns.
     pub(crate) fn take_presented_application_speech(
         &mut self,
     ) -> Vec<ApplicationAccessibilitySpeech> {

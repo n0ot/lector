@@ -8,6 +8,20 @@ use crate::{
 use regex::RegexBuilder;
 use std::ops::Range;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SearchMatch {
+    pub(crate) position: HistoryPosition,
+    pub(crate) ordinal: usize,
+    pub(crate) total: usize,
+    pub(crate) wrapped: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchFailure {
+    InvalidPattern,
+    NotFound,
+}
+
 #[derive(Clone, Debug)]
 struct Cell {
     text: String,
@@ -249,6 +263,109 @@ impl ReviewDocument {
     pub(crate) fn cell_text(&self, position: HistoryPosition) -> &str {
         self.cell(position.row, position.col)
             .map_or("", |cell| cell.text.as_str())
+    }
+
+    /// Describe the destination from document coordinates, independently of
+    /// scrolling, clipping, or the physical width of a Unicode grapheme.
+    pub(crate) fn cursor_feedback(
+        &self,
+        previous: Option<HistoryPosition>,
+        current: HistoryPosition,
+    ) -> crate::application_accessibility::ApplicationAccessibilitySpeech {
+        use crate::application_accessibility::ApplicationAccessibilitySpeech;
+        if previous.is_none_or(|previous| previous.row != current.row) {
+            let line = self.line_text(current.row);
+            return ApplicationAccessibilitySpeech {
+                text: if line.trim().is_empty() {
+                    "blank".into()
+                } else {
+                    line
+                },
+                indentation: Some(self.line_first_nonblank(current.row)),
+            };
+        }
+        let previous = previous.unwrap();
+        let distance = self.rows.get(current.row).map_or(0, |row| {
+            row.cells
+                .iter()
+                .skip(usize::from(previous.col.min(current.col)))
+                .take(usize::from(previous.col.abs_diff(current.col)))
+                .filter(|cell| !cell.wide_continuation)
+                .count()
+        });
+        let word = self.keyword_bounds(current);
+        let text = if distance > 1
+            && let Some((start, end)) = word
+            && Some(start) != self.keyword_bounds(previous).map(|bounds| bounds.0)
+        {
+            self.text_between(current.row, start, end)
+        } else {
+            match self.cell_text(current) {
+                "" => "blank".into(),
+                " " => "space".into(),
+                "\t" => "tab".into(),
+                text if text.chars().all(char::is_whitespace) => "blank".into(),
+                text => text.into(),
+            }
+        };
+        ApplicationAccessibilitySpeech {
+            text,
+            indentation: None,
+        }
+    }
+
+    pub(crate) fn search_feedback(
+        &self,
+        previous: HistoryPosition,
+        current: HistoryPosition,
+    ) -> crate::application_accessibility::ApplicationAccessibilitySpeech {
+        if previous.row != current.row {
+            return self.cursor_feedback(None, current);
+        }
+        let mut feedback = self.cursor_feedback(Some(current), current);
+        if let Some((start, end)) = self.keyword_bounds(current) {
+            feedback.text = self.text_between(current.row, start, end);
+        }
+        feedback
+    }
+
+    fn keyword_bounds(&self, position: HistoryPosition) -> Option<(u16, u16)> {
+        if self.word_class(position, WordStyle::Word) != 1 {
+            return None;
+        }
+        let row = self.rows.get(position.row)?;
+        let mut start = position.col;
+        while start > 0 {
+            let col = start - 1;
+            if !row.cells[usize::from(col)].wide_continuation
+                && self.word_class(
+                    HistoryPosition {
+                        row: position.row,
+                        col,
+                    },
+                    WordStyle::Word,
+                ) != 1
+            {
+                break;
+            }
+            start = col;
+        }
+        let mut end = position.col + 1;
+        while end < row.end {
+            if !row.cells[usize::from(end)].wide_continuation
+                && self.word_class(
+                    HistoryPosition {
+                        row: position.row,
+                        col: end,
+                    },
+                    WordStyle::Word,
+                ) != 1
+            {
+                break;
+            }
+            end += 1;
+        }
+        Some((start, end))
     }
 
     fn cell(&self, row: usize, col: u16) -> Option<&Cell> {
@@ -573,43 +690,52 @@ impl ReviewDocument {
         position: HistoryPosition,
         direction: SearchDirection,
         count: usize,
-    ) -> Option<HistoryPosition> {
-        let regex = RegexBuilder::new(query).multi_line(true).build().ok()?;
+    ) -> Result<SearchMatch, SearchFailure> {
+        let regex = RegexBuilder::new(query)
+            .multi_line(true)
+            .build()
+            .map_err(|_| SearchFailure::InvalidPattern)?;
         let matches = regex
             .find_iter(&self.flat_text)
             .filter_map(|found| self.position_for_offset(found.start()))
             .collect::<Vec<_>>();
         if matches.is_empty() {
-            return None;
+            return Err(SearchFailure::NotFound);
         }
-        let ordered = match direction {
-            SearchDirection::Forward => matches
-                .iter()
-                .copied()
-                .filter(|candidate| *candidate > position)
-                .chain(
-                    matches
-                        .iter()
-                        .copied()
-                        .filter(|candidate| *candidate <= position),
-                )
-                .collect::<Vec<_>>(),
-            SearchDirection::Backward => matches
-                .iter()
-                .copied()
-                .rev()
-                .filter(|candidate| *candidate < position)
-                .chain(
-                    matches
-                        .iter()
-                        .copied()
-                        .rev()
-                        .filter(|candidate| *candidate >= position),
-                )
-                .collect::<Vec<_>>(),
+        let steps = count.max(1) - 1;
+        let total = matches.len();
+        // Newlines map to the start of their row, so regex offset order is
+        // not necessarily cursor-position order. Partition by direction
+        // without binary-searching the mapped positions.
+        let mut ahead = Vec::new();
+        let mut behind = Vec::new();
+        let indices: Box<dyn Iterator<Item = usize>> = match direction {
+            SearchDirection::Forward => Box::new(0..total),
+            SearchDirection::Backward => Box::new((0..total).rev()),
         };
-        let target = *ordered.get(count.saturating_sub(1) % ordered.len())?;
-        (target != position).then_some(target)
+        for index in indices {
+            let is_ahead = match direction {
+                SearchDirection::Forward => matches[index] > position,
+                SearchDirection::Backward => matches[index] < position,
+            };
+            if is_ahead {
+                ahead.push(index);
+            } else {
+                behind.push(index);
+            }
+        }
+        let wrapped = steps >= ahead.len();
+        let index = ahead
+            .into_iter()
+            .chain(behind)
+            .nth(steps % total)
+            .expect("nonempty search matches");
+        Ok(SearchMatch {
+            position: matches[index],
+            ordinal: index + 1,
+            total,
+            wrapped,
+        })
     }
 
     fn build_search_text(&mut self) {
@@ -869,6 +995,33 @@ mod tests {
     }
 
     #[test]
+    fn cursor_feedback_uses_graphemes_words_and_explicit_whitespace() {
+        let mut source = View::new(4, 40);
+        source.process_changes("界a one two\r\n  indented\r\n\r\nlast".as_bytes());
+        let (document, _, _) = ReviewDocument::capture(&mut source);
+        // Crossing a double-width grapheme is a one-character move.
+        assert_eq!(
+            document.cursor_feedback(Some(pos(0, 0)), pos(0, 2)).text,
+            "a"
+        );
+        assert_eq!(
+            document.cursor_feedback(Some(pos(0, 2)), pos(0, 3)).text,
+            "space"
+        );
+        assert_eq!(
+            document.cursor_feedback(Some(pos(0, 2)), pos(0, 8)).text,
+            "two"
+        );
+        let line = document.cursor_feedback(Some(pos(0, 8)), pos(1, 2));
+        assert_eq!(line.text, "  indented");
+        assert_eq!(line.indentation, Some(2));
+        assert_eq!(
+            document.cursor_feedback(Some(pos(1, 2)), pos(2, 0)).text,
+            "blank"
+        );
+    }
+
+    #[test]
     fn snapshot_retains_scrollback_and_does_not_change_with_source() {
         let mut source = View::new(2, 20);
         source.process_changes(b"one\r\ntwo\r\nthree");
@@ -923,22 +1076,112 @@ mod tests {
     }
 
     #[test]
-    fn regex_search_wraps_in_both_directions() {
-        let document = ReviewDocument::from_text(3, 20, b"alpha\r\nbeta alpha\r\ngamma");
+    fn search_feedback_reads_a_word_on_the_same_row_and_a_line_on_another() {
+        let document = ReviewDocument::from_text(3, 30, b"a to z\r\nnext destination");
+        assert_eq!(document.search_feedback(pos(0, 1), pos(0, 2)).text, "to");
+        assert_eq!(document.search_feedback(pos(0, 2), pos(0, 2)).text, "to");
         assert_eq!(
-            document.search("alpha", pos(0, 0), SearchDirection::Forward, 1),
-            Some(pos(1, 5))
+            document.search_feedback(pos(0, 2), pos(1, 5)).text,
+            "next destination"
         );
+    }
+
+    #[test]
+    fn search_reports_position_wrap_and_failure_without_requiring_movement() {
+        use super::SearchFailure;
+        let document = ReviewDocument::from_text(2, 30, b"one two one");
+        let found = document
+            .search("one", pos(0, 0), SearchDirection::Forward, 1)
+            .unwrap();
         assert_eq!(
-            document.search("alpha", pos(0, 0), SearchDirection::Backward, 1),
-            Some(pos(1, 5))
+            (found.position, found.ordinal, found.total, found.wrapped),
+            (pos(0, 8), 2, 2, false)
+        );
+        let wrapped = document
+            .search("one", found.position, SearchDirection::Forward, 1)
+            .unwrap();
+        assert_eq!(
+            (wrapped.position, wrapped.ordinal, wrapped.wrapped),
+            (pos(0, 0), 1, true)
+        );
+        let same = document
+            .search("two", pos(0, 4), SearchDirection::Backward, 1)
+            .unwrap();
+        assert_eq!(
+            (same.position, same.total, same.wrapped),
+            (pos(0, 4), 1, true)
+        );
+        assert!(
+            document
+                .search("one", pos(0, 0), SearchDirection::Forward, 3)
+                .unwrap()
+                .wrapped
         );
         assert_eq!(
             document.search("[", pos(0, 0), SearchDirection::Forward, 1),
-            None
+            Err(SearchFailure::InvalidPattern)
         );
         assert_eq!(
             document.search("absent", pos(0, 0), SearchDirection::Forward, 1),
+            Err(SearchFailure::NotFound)
+        );
+    }
+
+    #[test]
+    fn regex_search_preserves_direction_with_line_boundary_matches() {
+        let document = ReviewDocument::from_text(2, 20, b"a ab\r\na");
+        for pattern in ["a|$", "a|\\n"] {
+            let forward = document
+                .search(pattern, pos(0, 0), SearchDirection::Forward, 1)
+                .unwrap();
+            assert_eq!(forward.position, pos(0, 2));
+            assert_eq!(forward.ordinal, 2);
+            assert!(!forward.wrapped);
+            let backward = document
+                .search(pattern, pos(0, 2), SearchDirection::Backward, 1)
+                .unwrap();
+            assert_eq!(backward.position, pos(0, 0));
+            assert_eq!(backward.ordinal, 3);
+            assert!(!backward.wrapped);
+            for direction in [SearchDirection::Forward, SearchDirection::Backward] {
+                let first = document.search(pattern, pos(0, 0), direction, 1).unwrap();
+                let repeated = document
+                    .search(pattern, pos(0, 0), direction, first.total + 1)
+                    .unwrap();
+                assert_eq!(repeated.position, first.position);
+                assert_eq!(repeated.ordinal, first.ordinal);
+                assert!(repeated.wrapped);
+            }
+        }
+    }
+
+    #[test]
+    fn regex_search_wraps_in_both_directions() {
+        let document = ReviewDocument::from_text(3, 20, b"alpha\r\nbeta alpha\r\ngamma");
+        assert_eq!(
+            document
+                .search("alpha", pos(0, 0), SearchDirection::Forward, 1)
+                .ok()
+                .map(|found| found.position),
+            Some(pos(1, 5))
+        );
+        assert_eq!(
+            document
+                .search("alpha", pos(0, 0), SearchDirection::Backward, 1)
+                .ok()
+                .map(|found| found.position),
+            Some(pos(1, 5))
+        );
+        assert_eq!(
+            document
+                .search("[", pos(0, 0), SearchDirection::Forward, 1)
+                .ok(),
+            None
+        );
+        assert_eq!(
+            document
+                .search("absent", pos(0, 0), SearchDirection::Forward, 1)
+                .ok(),
             None
         );
     }
@@ -1000,7 +1243,10 @@ mod tests {
             Some(pos(1, 0))
         );
         assert_eq!(
-            document.search("final", pos(0, 0), SearchDirection::Forward, 1),
+            document
+                .search("final", pos(0, 0), SearchDirection::Forward, 1)
+                .ok()
+                .map(|found| found.position),
             Some(pos(3, 0))
         );
         assert_eq!(
