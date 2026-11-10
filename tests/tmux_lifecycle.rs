@@ -237,6 +237,48 @@ fn kill_confirmations_capture_and_report_the_original_stable_target() {
 }
 
 #[test]
+fn gateway_confirmation_replaces_a_command_without_reviving_it_after_a_response() {
+    use lector::tmux_lifecycle::GatewayControlAction;
+
+    for (response, expected) in [
+        (b"\r".as_slice(), b"\x1c".as_slice()),
+        (b"\x1b[27;1u".as_slice(), b"".as_slice()),
+    ] {
+        let (mut app, mut sr, _recorder, mut physical) = ready_app(multi_inventory());
+        input(&mut app, &mut sr, &mut physical, b"\x01x");
+        assert!(app.debug_active_view_contents().contains("pane %20"));
+        assert!(
+            app.request_tmux_gateway_action(
+                &mut sr,
+                GatewayControlAction::ForceAbandon,
+                &mut physical,
+            )
+            .unwrap()
+        );
+        assert!(
+            app.debug_active_view_contents()
+                .contains("Control-backslash")
+        );
+        // Prefix bindings cannot create another command confirmation while
+        // this gateway overlay owns input.
+        assert!(input(&mut app, &mut sr, &mut physical, b"\x01x").is_empty());
+        assert!(
+            app.debug_active_view_contents()
+                .contains("Control-backslash")
+        );
+        assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+        assert!(input(&mut app, &mut sr, &mut physical, response).is_empty());
+        assert_eq!(tick(&mut app, &mut sr, &mut physical), expected);
+
+        // The older popup remains in the generic overlay stack, but its
+        // captured destructive command was replaced, not suspended.
+        assert!(app.has_overlay());
+        input(&mut app, &mut sr, &mut physical, b"\r");
+        assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    }
+}
+
+#[test]
 fn external_destruction_rejects_a_stale_confirmation_and_server_death_clears_it() {
     let (mut app, mut sr, recorder, mut physical) = ready_app(multi_inventory());
     input(&mut app, &mut sr, &mut physical, b"\x01x");
