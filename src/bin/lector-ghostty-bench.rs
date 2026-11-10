@@ -1349,6 +1349,8 @@ fn count_batch_pattern(batch: &RenderBatch, pattern: &[u8]) -> usize {
         .sum()
 }
 
+// Keep fixture encoding independent of the production encoder so benchmark
+// inputs do not silently track changes to the renderer under measurement.
 fn encode_base64(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(input.len().div_ceil(3) * 4);
