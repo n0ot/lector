@@ -775,6 +775,9 @@ impl App {
         };
         let now_ms = self.clock.now_ms();
         let view = self.view_stack.active_mut().model();
+        if let Some(title) = &title {
+            sr.speak(title, false)?;
+        }
         let application_policy = consume_application_accessibility(sr, view, true)?;
         prepare_review_cursor_for_active_context(sr, view)?;
         // No document owns the accessibility context while the outer
@@ -784,9 +787,6 @@ impl App {
         let context_activated =
             sr.terminal_focused() && view.activate_accessible_document_context();
         view.with_live_screen(|view| -> Result<()> {
-            if let Some(title) = &title {
-                sr.speak(title, false)?;
-            }
             if context_activated && !application_policy.suppress_auto_read {
                 sr.auto_read(view)?;
             } else if !context_activated && !application_policy.suppress_cursor_tracking {
@@ -852,7 +852,8 @@ impl App {
         } else {
             self.view_stack.active_mut().model()
         };
-        let application_policy = consume_application_accessibility(sr, view, !overlay_active)?;
+        let allow_speech = !overlay_active || view.has_internal_accessibility();
+        let application_policy = consume_application_accessibility(sr, view, allow_speech)?;
         let presented_screen_identity_changed = view.prev_screen().screen != view.screen().screen;
         if presented_screen_identity_changed {
             sr.retain_pending_key_echo_for_screen(view.screen().screen);

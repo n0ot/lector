@@ -118,7 +118,7 @@ fn consume_application_accessibility(
         // suppression reached the physical presentation boundary.
         sr.clear_pending_delete();
     }
-    let speak = allow_speech && sr.auto_read_enabled();
+    let speak = allow_speech && (sr.auto_read_enabled() || view.has_internal_accessibility());
     for message in messages {
         let indentation_changed = message
             .indentation

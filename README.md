@@ -501,11 +501,31 @@ Review overlay. Output from the running application continues in the
 background, but cannot move or replace the snapshot. Press `q` to leave Review
 and return to the underlying terminal or overlay. `Escape` never
 closes Review: it cancels a pending count, motion, search, or visual selection.
-Pressing it with nothing to cancel rings the terminal bell.
+Pressing it with nothing to cancel says “review mode,” reminding you that `q`
+returns to the application.
 Review opens with its visible application cursor at the source view's review
 cursor. Inside Review, the left-click action (`M-{`) places that visible cursor
 at the independent review cursor instead of sending a mouse event to the
 background application.
+
+Navigation speech follows the frozen document: changing rows reads the
+destination line, a jump into another word reads that word, and a smaller move
+reads the destination character. Spaces and blank lines are named. Scrolling
+does not reread the newly exposed page, and repositioning the viewport without
+moving the document cursor stays silent. This feedback works with auto-read
+disabled and honors the indentation-reporting setting.
+
+Review announces entry into characterwise or linewise Visual mode and says
+“review mode” when a selection ends or a search completes or is cancelled.
+`v` and `V` switch selection types; pressing the active type again cancels it.
+Search entry announces “search forward” (`/`) or “search backward” (`?`).
+Enter, `n`, and `N` read the destination line when the row changes, or the
+word at the match on the same line, followed by a compact count such as
+“21 of 29.” This also confirms a match already under the cursor. Escape from
+search says only “review mode.” Search typing and pasting honor the suppress-key-echo
+setting. Invalid patterns, missing matches, and the lack
+of a previous search receive spoken explanations; failed searches stay open
+for correction or Escape.
 
 Review has its own dependency-free vi command parser:
 

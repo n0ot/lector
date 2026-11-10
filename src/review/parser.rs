@@ -58,6 +58,7 @@ pub(crate) enum ViewportPlacement {
 pub(crate) enum Command {
     None,
     Bell,
+    AnnounceMode,
     Exit,
     Move(Motion, usize),
     ScrollPage {
@@ -188,7 +189,7 @@ impl Parser {
             self.reset_pending();
             return Command::None;
         }
-        Command::Bell
+        Command::AnnounceMode
     }
 
     fn feed_normal(&mut self, key: Key) -> Command {
@@ -305,8 +306,18 @@ impl Parser {
                 Command::None
             }
             Key::Char('v') | Key::Char('V') => {
-                self.visual = None;
-                self.finish(Command::CancelVisual)
+                let kind = if key == Key::Char('v') {
+                    VisualKind::Character
+                } else {
+                    VisualKind::Line
+                };
+                if self.visual == Some(kind) {
+                    self.visual = None;
+                    self.finish(Command::CancelVisual)
+                } else {
+                    self.visual = Some(kind);
+                    self.finish(Command::StartVisual(kind))
+                }
             }
             Key::Char('g') => {
                 self.prefix = Prefix::G;
@@ -768,14 +779,26 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_state_but_bells_when_idle() {
+    fn escape_cancels_state_but_announces_mode_when_idle() {
         let mut parser = Parser::default();
-        assert_eq!(parser.feed(Key::Escape), Command::Bell);
+        assert_eq!(parser.feed(Key::Escape), Command::AnnounceMode);
         parser.feed(Key::Char('3'));
         assert_eq!(parser.feed(Key::Escape), Command::None);
         parser.feed(Key::Char('f'));
         assert_eq!(parser.feed(Key::Escape), Command::None);
-        assert_eq!(parser.feed(Key::Escape), Command::Bell);
+        assert_eq!(parser.feed(Key::Escape), Command::AnnounceMode);
+    }
+
+    #[test]
+    fn escape_reminds_only_after_pending_state_has_been_cancelled() {
+        for prefix in ["2", "g", "z", "f", "y", "yi", "\"", "\"+", "[", "]"] {
+            let mut parser = Parser::default();
+            for character in prefix.chars() {
+                assert_eq!(parser.feed(Key::Char(character)), Command::None);
+            }
+            assert_eq!(parser.feed(Key::Escape), Command::None, "{prefix}");
+            assert_eq!(parser.feed(Key::Escape), Command::AnnounceMode, "{prefix}");
+        }
     }
 
     #[test]

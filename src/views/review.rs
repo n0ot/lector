@@ -2,7 +2,7 @@ use super::{Result, ViewAction, ViewController, ViewKind};
 use crate::{
     line_editor::{EditorAction, LineEditor},
     review::{
-        document::{ReviewDocument, SearchDirection},
+        document::{ReviewDocument, SearchDirection, SearchFailure, SearchMatch},
         parser::{
             Command, FindDirection, Key, Motion, Parser, TextObject, ViewportPlacement, VisualKind,
         },
@@ -36,6 +36,15 @@ struct LastSearch {
 struct SearchPrompt {
     query: String,
     direction: SearchDirection,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReviewMode {
+    Normal,
+    Visual(VisualKind),
+    Search(SearchDirection),
+    TableSetup,
+    Name,
 }
 
 struct NamePrompt {
@@ -72,7 +81,9 @@ impl ReviewView {
 
     pub fn new_page_up(source: &mut View) -> Self {
         let mut review = Self::new(source);
+        review.view.take_presented_application_speech();
         let _ = review.scroll_page(false, 1);
+        review.queue_cursor_feedback(None);
         review
     }
 
@@ -108,6 +119,9 @@ impl ReviewView {
         };
         review.ensure_cursor_visible();
         review.render();
+        if kind == ViewKind::Review {
+            review.queue_cursor_feedback(None);
+        }
         review
     }
 
@@ -199,12 +213,16 @@ impl ReviewView {
             bytes.extend_from_slice(format!("\x1B[{row};{col}H\x1B[?25h").as_bytes());
         }
 
-        // Keep one View alive for the lifetime of the overlay. Its application
-        // cursor is the visible terminal cursor, and preserving prev_screen lets
-        // the shared cursor tracker report review motions just like PTY motions.
+        // Keep one View alive so semantic navigation speech can follow its
+        // physical presentation receipts. Column-name editing still uses the
+        // ordinary terminal diff and cursor tracker.
         self.view.clear_update_summary();
         self.view.process_changes(&bytes);
         self.view.clear_update_summary();
+        if self.kind == ViewKind::Review {
+            self.view
+                .set_internal_accessibility_policy(self.name_prompt.is_none());
+        }
     }
 
     fn handle_search_key(&mut self, sr: &mut ScreenReader, key: Key) -> Result<ViewAction> {
@@ -219,8 +237,10 @@ impl ReviewView {
                 let Some((index, _)) = prompt.query.grapheme_indices(true).next_back() else {
                     return Ok(ViewAction::Bell);
                 };
+                let removed = prompt.query[index..].to_owned();
                 prompt.query.truncate(index);
                 self.render();
+                self.queue_feedback(if removed == " " { "space" } else { &removed });
                 Ok(ViewAction::Redraw)
             }
             Key::Ctrl('u') => {
@@ -230,6 +250,7 @@ impl ReviewView {
                 }
                 prompt.query.clear();
                 self.render();
+                self.queue_feedback("search cleared");
                 Ok(ViewAction::Redraw)
             }
             Key::Enter => self.finish_search(sr),
@@ -240,6 +261,14 @@ impl ReviewView {
                     .query
                     .push(ch);
                 self.render();
+                self.queue_search_echo(
+                    sr,
+                    if ch == ' ' {
+                        "space".into()
+                    } else {
+                        ch.to_string()
+                    },
+                );
                 Ok(ViewAction::Redraw)
             }
             _ => Ok(ViewAction::Bell),
@@ -250,6 +279,7 @@ impl ReviewView {
         let prompt = self.search_prompt.as_ref().expect("search prompt");
         let query = if prompt.query.is_empty() {
             let Some(last) = &self.last_search else {
+                sr.speak("no previous search", false)?;
                 return Ok(ViewAction::Bell);
             };
             last.query.clone()
@@ -257,34 +287,31 @@ impl ReviewView {
             prompt.query.clone()
         };
         let direction = prompt.direction;
-        let Some(target) = self.document.search(&query, self.cursor, direction, 1) else {
-            return Ok(ViewAction::Bell);
+        let found = match self.document.search(&query, self.cursor, direction, 1) {
+            Ok(found) => found,
+            Err(error) => return Self::announce_search_failure(sr, error),
         };
         self.last_search = Some(LastSearch { query, direction });
         self.search_prompt = None;
-        self.move_with_table_context(sr, target)
+        self.present_search_match(sr, found)
     }
 
     fn handle_command(&mut self, sr: &mut ScreenReader, command: Command) -> Result<ViewAction> {
         match command {
             Command::None => Ok(ViewAction::None),
             Command::Bell => Ok(ViewAction::Bell),
+            Command::AnnounceMode => {
+                sr.speak("review mode", false)?;
+                Ok(ViewAction::None)
+            }
             Command::Exit => Ok(ViewAction::Pop),
             Command::StartVisual(kind) => {
-                self.visual_anchor = Some(self.cursor);
+                self.visual_anchor.get_or_insert(self.cursor);
                 self.visual_kind = kind;
-                sr.speak(
-                    match kind {
-                        VisualKind::Character => "visual",
-                        VisualKind::Line => "visual line",
-                    },
-                    false,
-                )?;
                 Ok(ViewAction::None)
             }
             Command::CancelVisual => {
                 self.visual_anchor = None;
-                sr.speak("visual cancelled", false)?;
                 Ok(ViewAction::None)
             }
             Command::Move(motion, count) | Command::MoveVisual(motion, count) => {
@@ -295,8 +322,10 @@ impl ReviewView {
             }
             Command::ScrollPage { forward, count } => {
                 let old = self.current_table_cell();
+                let previous = self.cursor;
                 let action = self.scroll_page(forward, count);
                 self.announce_table_transition(sr, old)?;
+                self.queue_cursor_feedback(Some(previous));
                 Ok(action)
             }
             Command::RepositionViewport {
@@ -305,8 +334,10 @@ impl ReviewView {
                 first_nonblank,
             } => {
                 let old = self.current_table_cell();
+                let previous = self.cursor;
                 let action = self.reposition_viewport(placement, line, first_nonblank);
                 self.announce_table_transition(sr, old)?;
+                self.queue_cursor_feedback(Some(previous));
                 Ok(action)
             }
             Command::YankMotion(motion, count, register) => {
@@ -371,6 +402,7 @@ impl ReviewView {
             }
             Command::RepeatSearch { reverse, count } => {
                 let Some(last) = self.last_search.clone() else {
+                    sr.speak("no previous search", false)?;
                     return Ok(ViewAction::Bell);
                 };
                 let direction = if reverse {
@@ -378,13 +410,14 @@ impl ReviewView {
                 } else {
                     last.direction
                 };
-                let Some(target) = self
+                let found = match self
                     .document
                     .search(&last.query, self.cursor, direction, count)
-                else {
-                    return Ok(ViewAction::Bell);
+                {
+                    Ok(found) => found,
+                    Err(error) => return Self::announce_search_failure(sr, error),
                 };
-                self.move_with_table_context(sr, target)
+                self.present_search_match(sr, found)
             }
             Command::DetectTable => self.detect_table(sr),
             Command::StartTableSetup => self.start_table_setup(sr),
@@ -599,9 +632,80 @@ impl ReviewView {
         target: HistoryPosition,
     ) -> Result<ViewAction> {
         let old = self.current_table_cell();
+        let previous = self.cursor;
         let action = self.move_to(target);
         self.announce_table_transition(sr, old)?;
+        self.queue_cursor_feedback(Some(previous));
         Ok(action)
+    }
+
+    fn queue_cursor_feedback(&mut self, previous: Option<HistoryPosition>) {
+        if self.kind != ViewKind::Review || previous == Some(self.cursor) {
+            return;
+        }
+        let speech = self.document.cursor_feedback(previous, self.cursor);
+        self.view.queue_internal_speech(speech);
+    }
+
+    fn queue_feedback(&mut self, text: impl Into<String>) {
+        if !self.view.has_internal_accessibility() {
+            return;
+        }
+        self.view.queue_internal_speech(
+            crate::application_accessibility::ApplicationAccessibilitySpeech {
+                text: text.into(),
+                indentation: None,
+            },
+        );
+    }
+
+    fn queue_search_echo(&mut self, sr: &ScreenReader, text: impl Into<String>) {
+        if !sr.suppress_key_echo() {
+            self.queue_feedback(text);
+        }
+    }
+
+    fn announce_search_failure(
+        sr: &mut ScreenReader,
+        failure: SearchFailure,
+    ) -> Result<ViewAction> {
+        sr.speak(
+            match failure {
+                SearchFailure::InvalidPattern => "invalid search pattern",
+                SearchFailure::NotFound => "no matches",
+            },
+            false,
+        )?;
+        Ok(ViewAction::Bell)
+    }
+
+    fn present_search_match(
+        &mut self,
+        sr: &mut ScreenReader,
+        found: SearchMatch,
+    ) -> Result<ViewAction> {
+        let old = self.current_table_cell();
+        let previous = self.cursor;
+        let action = self.move_to(found.position);
+        self.announce_table_transition(sr, old)?;
+        self.view
+            .queue_internal_speech(self.document.search_feedback(previous, self.cursor));
+        self.queue_feedback(format!("{} of {}", found.ordinal, found.total));
+        Ok(action)
+    }
+
+    fn review_mode(&self) -> ReviewMode {
+        if self.name_prompt.is_some() {
+            ReviewMode::Name
+        } else if let Some(prompt) = &self.search_prompt {
+            ReviewMode::Search(prompt.direction)
+        } else if self.table_setup.is_some() {
+            ReviewMode::TableSetup
+        } else if self.visual_anchor.is_some() {
+            ReviewMode::Visual(self.visual_kind)
+        } else {
+            ReviewMode::Normal
+        }
     }
 
     fn current_table_cell(&self) -> Option<CellAddress> {
@@ -1037,7 +1141,8 @@ impl ReviewView {
     }
 
     fn handle_review_key(&mut self, sr: &mut ScreenReader, key: Key) -> Result<ViewAction> {
-        if self.name_prompt.is_some() {
+        let previous = self.review_mode();
+        let action = if self.name_prompt.is_some() {
             self.handle_name_key(sr, key)
         } else if self.search_prompt.is_some() {
             self.handle_search_key(sr, key)
@@ -1046,7 +1151,27 @@ impl ReviewView {
         } else {
             let command = self.parser.feed(key);
             self.handle_command(sr, command)
+        }?;
+        let current = self.review_mode();
+        if current != previous {
+            let announcement = match current {
+                ReviewMode::Normal => Some("review mode"),
+                ReviewMode::Visual(VisualKind::Character) => Some("visual character mode"),
+                ReviewMode::Visual(VisualKind::Line) => Some("visual line mode"),
+                ReviewMode::Search(SearchDirection::Forward) => Some("search forward"),
+                ReviewMode::Search(SearchDirection::Backward) => Some("search backward"),
+                // These modes already have descriptive table/prompt feedback.
+                ReviewMode::TableSetup | ReviewMode::Name => None,
+            };
+            if let Some(announcement) = announcement {
+                if matches!(action, ViewAction::Redraw | ViewAction::RedrawSilently) {
+                    self.queue_feedback(announcement);
+                } else {
+                    sr.speak(announcement, false)?;
+                }
+            }
         }
+        Ok(action)
     }
 
     fn handle_keys(
@@ -1106,7 +1231,10 @@ impl ViewController for ReviewView {
             row: self.viewport_top.saturating_add(usize::from(row)),
             col: self.viewport_left.saturating_add(col),
         };
-        Some(self.move_to(target))
+        let previous = self.cursor;
+        let action = self.move_to(target);
+        self.queue_cursor_feedback(Some(previous));
+        Some(action)
     }
 
     fn handle_input(
@@ -1186,11 +1314,18 @@ impl ViewController for ReviewView {
         if self.search_prompt.is_none() {
             return Ok(ViewAction::Bell);
         }
-        let chars = contents
-            .chars()
-            .filter(|ch| !ch.is_control())
-            .map(Key::Char);
-        self.handle_keys(sr, chars)
+        let text: String = contents.chars().filter(|ch| !ch.is_control()).collect();
+        if text.is_empty() {
+            return Ok(ViewAction::None);
+        }
+        self.search_prompt
+            .as_mut()
+            .expect("active search prompt")
+            .query
+            .push_str(&text);
+        self.render();
+        self.queue_search_echo(sr, text);
+        Ok(ViewAction::Redraw)
     }
 
     fn on_resize(&mut self, rows: u16, cols: u16) {
@@ -1323,7 +1458,7 @@ mod tests {
         assert!(matches!(input(&mut view, &mut sr, b"x"), ViewAction::Bell));
         assert!(matches!(
             input(&mut view, &mut sr, b"\x1b"),
-            ViewAction::Bell
+            ViewAction::None
         ));
         assert!(matches!(input(&mut view, &mut sr, b"q"), ViewAction::Pop));
     }
@@ -1349,16 +1484,126 @@ mod tests {
 
     #[test]
     fn escape_cancels_pending_command_without_closing() {
-        let (mut view, mut sr, _) = setup(b"abc");
+        let (mut view, mut sr, spoken) = setup(b"abc");
         assert!(matches!(input(&mut view, &mut sr, b"f"), ViewAction::None));
         assert!(matches!(
             input(&mut view, &mut sr, b"\x1b"),
             ViewAction::None
         ));
+        assert!(spoken.borrow().is_empty());
         assert!(matches!(
             input(&mut view, &mut sr, b"\x1b"),
-            ViewAction::Bell
+            ViewAction::None
         ));
+        assert_eq!(spoken.borrow().as_slice(), ["review mode"]);
+    }
+
+    #[test]
+    fn escape_cancels_search_and_visual_before_reminding_about_review() {
+        let (mut view, mut sr, spoken) = setup(b"one two");
+        input(&mut view, &mut sr, b"/two");
+        spoken.borrow_mut().clear();
+        input(&mut view, &mut sr, b"\x1b");
+        assert!(spoken.borrow().is_empty());
+        input(&mut view, &mut sr, b"\x1b");
+        assert_eq!(spoken.borrow().as_slice(), ["review mode"]);
+
+        input(&mut view, &mut sr, b"v");
+        spoken.borrow_mut().clear();
+        input(&mut view, &mut sr, b"\x1b");
+        assert_eq!(spoken.borrow().as_slice(), ["review mode"]);
+        input(&mut view, &mut sr, b"\x1b");
+        assert_eq!(spoken.borrow().as_slice(), ["review mode", "review mode"]);
+    }
+
+    #[test]
+    fn visual_type_switches_preserve_the_anchor_and_yank_returns_to_review() {
+        let (mut view, mut sr, spoken) = setup(b"one two");
+        input(&mut view, &mut sr, b"vllVv");
+        assert_eq!(view.visual_anchor, Some(HistoryPosition { row: 0, col: 0 }));
+        assert_eq!(
+            spoken.borrow().as_slice(),
+            [
+                "visual character mode",
+                "visual line mode",
+                "visual character mode"
+            ]
+        );
+        input(&mut view, &mut sr, b"y");
+        assert!(view.visual_anchor.is_none());
+        assert_eq!(&spoken.borrow()[3..], ["copied", "review mode"]);
+    }
+
+    #[test]
+    fn search_echo_suppression_covers_typed_and_pasted_text_but_not_deletions() {
+        for suppress in [false, true] {
+            let (mut view, mut sr, _) = setup(b"sample");
+            sr.set_suppress_key_echo(suppress);
+            input(&mut view, &mut sr, b"/");
+            view.view.take_presented_application_speech();
+            view.handle_review_key(&mut sr, super::Key::Char('é'))
+                .unwrap();
+            view.handle_paste(&mut sr, "value", &mut Vec::new())
+                .unwrap();
+            let speech = view.view.take_presented_application_speech();
+            assert_eq!(
+                speech
+                    .iter()
+                    .map(|message| message.text.as_str())
+                    .collect::<Vec<_>>(),
+                if suppress {
+                    vec![]
+                } else {
+                    vec!["é", "value"]
+                }
+            );
+            assert_eq!(view.search_prompt.as_ref().unwrap().query, "évalue");
+            input(&mut view, &mut sr, b"\x7f");
+            assert_eq!(view.view.take_presented_application_speech()[0].text, "e");
+        }
+    }
+
+    #[test]
+    fn pasted_search_text_is_announced_as_one_edit() {
+        let (mut view, mut sr, _) = setup(b"one two");
+        input(&mut view, &mut sr, b"/");
+        view.view.take_presented_application_speech();
+        view.handle_paste(&mut sr, "one two", &mut Vec::new())
+            .unwrap();
+        assert_eq!(view.search_prompt.as_ref().unwrap().query, "one two");
+        let speech = view.view.take_presented_application_speech();
+        assert_eq!(
+            speech
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            ["one two"]
+        );
+    }
+
+    #[test]
+    fn accepting_a_search_at_the_current_match_still_reports_success() {
+        let (mut view, mut sr, _) = setup(b"one two");
+        view.view.take_presented_application_speech();
+        input(&mut view, &mut sr, b"/one\r");
+        assert!(view.search_prompt.is_none());
+        assert_eq!(view.cursor, HistoryPosition { row: 0, col: 0 });
+        let speech = view.view.take_presented_application_speech();
+        assert_eq!(
+            speech
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "search forward",
+                "o",
+                "n",
+                "e",
+                "one",
+                "1 of 1",
+                "review mode"
+            ]
+        );
     }
 
     #[test]
@@ -1798,13 +2043,17 @@ mod tests {
 
     #[test]
     fn search_errors_bell_and_escape_only_cancels_the_prompt() {
-        let (mut view, mut sr, _) = setup(b"alpha");
+        let (mut view, mut sr, spoken) = setup(b"alpha");
         assert!(matches!(input(&mut view, &mut sr, b"n"), ViewAction::Bell));
         assert!(matches!(
             input(&mut view, &mut sr, b"/missing\r"),
             ViewAction::Bell
         ));
         assert!(view.search_prompt.is_some());
+        assert_eq!(
+            spoken.borrow().as_slice(),
+            ["no previous search", "no matches"]
+        );
         assert!(matches!(
             input(&mut view, &mut sr, b"\x1b"),
             ViewAction::Redraw
@@ -1815,6 +2064,8 @@ mod tests {
             input(&mut view, &mut sr, b"/[\r"),
             ViewAction::Bell
         ));
+        assert_eq!(spoken.borrow().last().unwrap(), "invalid search pattern");
+        assert!(view.search_prompt.is_some());
     }
 
     #[test]

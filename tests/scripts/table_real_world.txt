@@ -70,7 +70,6 @@ And expect-speak: m
 And expect-speak: e
 And expect-speak: column name saved
 And expect-speak: name
-And expect-speak-contains: prefix Name
 And expect-speak: Age
 And expect-speak: tabstop set
 And expect-speak: display column 18
@@ -80,10 +79,10 @@ And expect-speak: g
 And expect-speak: e
 And expect-speak: column name saved
 And expect-speak: age
-And expect-speak-contains: prefix Name
 And expect-speak-contains: prefix Alice
 And expect-speak: bottom row set
 And expect-speak: row 2
+And expect-speak: space
 And expect-speak: right edge set
 And expect-speak: display column 26
 And expect-speak: table setup saved
