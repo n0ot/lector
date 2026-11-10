@@ -2508,23 +2508,23 @@ impl App {
                     .is_some_and(|pane| Some(pane.window_id) == attached_window))
                 || active_gateway_path.contains(&(connection_id, pane_id))
         };
-        let pane_resume_requests = self
+        let mut pane_resume_requests = Vec::new();
+        if let Some(connection) = self
             .tmux_connections
             .iter_mut()
             .find(|connection| connection.id == connection_id)
-            .into_iter()
-            .flat_map(|connection| connection.pane_flow.iter_mut())
-            .filter_map(|(pane_id, flow)| {
-                (pane_is_presented(*pane_id)
+        {
+            for (pane_id, flow) in &mut connection.pane_flow {
+                if pane_is_presented(*pane_id)
                     && (flow.is_paused || flow.pause_requested)
                     && !flow.final_resync_requested
-                    && !flow.resume_requested)
-                    .then(|| {
-                        flow.resume_requested = true;
-                        *pane_id
-                    })
-            })
-            .collect::<Vec<_>>();
+                    && !flow.resume_requested
+                {
+                    flow.resume_requested = true;
+                    pane_resume_requests.push(*pane_id);
+                }
+            }
+        }
 
         let obsolete_deferred = self
             .pending_tmux_background_output
