@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+channel=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' "$repo_dir/rust-toolchain.toml")
+[[ "$channel" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo "rust-toolchain.toml must select one exact stable release" >&2
+    exit 1
+}
+if [[ "${1:-}" == --channel && $# == 1 ]]; then
+    printf '%s\n' "$channel"
+    exit 0
+fi
+host=
+target=
+packaged=false
+while (($#)); do
+    case "$1" in
+        --host) host=$2; shift 2 ;;
+        --target) target=$2; shift 2 ;;
+        --packaged) packaged=true; shift ;;
+        *) echo "usage: $0 [--channel | --packaged] [--host HOST] [--target TARGET]" >&2; exit 2 ;;
+    esac
+done
+compiler=${RUSTC:-rustc}
+metadata=$("$compiler" -vV)
+printf '%s\n' "$metadata"
+release=$(sed -n 's/^release: //p' <<< "$metadata")
+actual_host=$(sed -n 's/^host: //p' <<< "$metadata")
+if [[ "$packaged" == true ]]; then
+    echo "Distribution-packaged compiler compatibility lane (canonical pin: $channel)"
+elif [[ "$release" != "$channel" ]]; then
+    echo "Compiler mismatch: expected $channel, invoked $release ($compiler)" >&2
+    exit 1
+fi
+if [[ -n "$host" && "$actual_host" != "$host" ]]; then
+    echo "Compiler host mismatch: expected $host, invoked $actual_host" >&2
+    exit 1
+fi
+if [[ -n "$target" ]]; then
+    libdir=$("$compiler" --print target-libdir --target "$target")
+    if ! compgen -G "$libdir/libcore-*.rlib" > /dev/null; then
+        echo "Missing Rust standard library for target $target" >&2
+        exit 1
+    fi
+    echo "Target standard library verified: $target"
+fi
