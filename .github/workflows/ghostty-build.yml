@@ -47,6 +47,9 @@ jobs:
 
   tier-one:
     needs: changes
+    env:
+      CARGO_TARGET_DIR: target/cargo
+      CARGO_INCREMENTAL: 0
     name: ${{ matrix.name }}
     runs-on: ${{ needs.changes.outputs.build == 'true' && matrix.runner || 'ubuntu-24.04' }}
     strategy:
@@ -88,6 +91,21 @@ jobs:
         run: >-
           scripts/check-rust-toolchain --host "${{ matrix.target }}"
           --target "${{ matrix.target }}"
+      - name: Identify Cargo cache inputs
+        if: needs.changes.outputs.build == 'true'
+        id: cargo-cache-key
+        run: python3 .github/scripts/cargo_cache_key.py --target "${{ matrix.target }}" --lane native-debug-release-all-features
+      - name: Cache Cargo dependencies
+        if: needs.changes.outputs.build == 'true'
+        # Swatinem/rust-cache v2.9.3: prunes workspace binaries and incremental artifacts.
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        continue-on-error: true
+        with:
+          prefix-key: lector-cargo-v1
+          key: ${{ steps.cargo-cache-key.outputs.key }}
+          workspaces: . -> target/cargo
+          cache-bin: false
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST LECTOR GHOSTTY
       - name: Build and test linked Ghostty metadata
         if: needs.changes.outputs.build == 'true'
         run: cargo ghostty-check
@@ -157,6 +175,8 @@ jobs:
     name: ${{ matrix.target }} static link
     runs-on: ${{ needs.changes.outputs.build == 'true' && matrix.runner || 'ubuntu-24.04' }}
     env:
+      CARGO_TARGET_DIR: target/cargo
+      CARGO_INCREMENTAL: 0
       CC_aarch64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-cc
       CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-cc
       LECTOR_ZIG_CC_TARGET: ${{ matrix.zig_target }}
@@ -193,6 +213,21 @@ jobs:
       - name: Verify canonical compiler and cross target
         if: needs.changes.outputs.build == 'true'
         run: scripts/check-rust-toolchain --host "${{ matrix.host }}" --target "${{ matrix.target }}"
+      - name: Identify Cargo cache inputs
+        if: needs.changes.outputs.build == 'true'
+        id: cargo-cache-key
+        run: python3 .github/scripts/cargo_cache_key.py --target "${{ matrix.target }}" --lane static-debug-release-ghostty-vt
+      - name: Cache Cargo dependencies
+        if: needs.changes.outputs.build == 'true'
+        # Swatinem/rust-cache v2.9.3: prunes workspace binaries and incremental artifacts.
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        continue-on-error: true
+        with:
+          prefix-key: lector-cargo-v1
+          key: ${{ steps.cargo-cache-key.outputs.key }}
+          workspaces: . -> target/cargo
+          cache-bin: false
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST LECTOR GHOSTTY
       - name: Install pinned Zig C toolchain
         if: needs.changes.outputs.build == 'true'
         run: scripts/bootstrap_zig.sh
@@ -215,6 +250,9 @@ jobs:
 
   alpine-static:
     needs: changes
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
+      CARGO_INCREMENTAL: 0
     name: Alpine native static PIE
     runs-on: ubuntu-24.04
     steps:
@@ -230,17 +268,50 @@ jobs:
             target/ghostty-prebuilt
             target/toolchains
           key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-alpine-3.24-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
+      - name: Prepare Alpine's packaged compiler
+        if: needs.changes.outputs.build == 'true'
+        id: alpine
+        run: |
+          # Keep registry dependencies outside the workspace so pruning retains them.
+          export CARGO_HOME="$RUNNER_TEMP/alpine-cargo"
+          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
+          mkdir -p "$CARGO_HOME"
+          docker run --detach --name lector-alpine --dns 1.1.1.1 \
+            --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            --volume "$CARGO_HOME:$CARGO_HOME" --workdir "$GITHUB_WORKSPACE" \
+            --env CARGO_HOME --env CARGO_TARGET_DIR --env CARGO_INCREMENTAL \
+            alpine:3.24 sleep infinity
+          docker exec lector-alpine apk add --no-cache \
+            bash binutils build-base ca-certificates cargo curl file git pkgconf rust tar xz
+          echo "uid=$(id -u):$(id -g)" >> "$GITHUB_OUTPUT"
+          docker exec --user "$(id -u):$(id -g)" lector-alpine \
+            scripts/check-rust-toolchain --packaged --host x86_64-alpine-linux-musl
+          docker exec lector-alpine rustc -vV > "$RUNNER_TEMP/alpine-rustc.txt"
+      - name: Identify packaged Cargo cache inputs
+        if: needs.changes.outputs.build == 'true'
+        id: cargo-cache-key
+        run: >-
+          python3 .github/scripts/cargo_cache_key.py --target x86_64-alpine-linux-musl
+          --lane alpine-packaged-release-default --compiler-metadata "$RUNNER_TEMP/alpine-rustc.txt"
+      - name: Cache Cargo dependencies
+        if: needs.changes.outputs.build == 'true'
+        # Swatinem/rust-cache v2.9.3: prunes workspace binaries and incremental artifacts.
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        continue-on-error: true
+        with:
+          prefix-key: lector-cargo-v1
+          key: ${{ steps.cargo-cache-key.outputs.key }}
+          workspaces: . -> target/cargo
+          cmd-format: docker exec --user ${{ steps.alpine.outputs.uid }} lector-alpine {0}
+          cache-bin: false
+          env-vars: CARGO CC CFLAGS CXX CMAKE RUST LECTOR GHOSTTY
       - name: Build and inspect with Alpine's packaged Rust
         if: needs.changes.outputs.build == 'true'
         run: |
-          docker run --rm --dns 1.1.1.1 \
-            --volume "$GITHUB_WORKSPACE:/work" --workdir /work \
-            alpine:3.24 sh -lc '
-              set -eu
-              apk add --no-cache bash binutils build-base ca-certificates \
-                cargo curl file git pkgconf rust tar xz
-              scripts/check-rust-toolchain --packaged --host x86_64-alpine-linux-musl
-              cargo build --locked --release --bin lector
-              scripts/check-static-pie target/release/lector
-              target/release/lector --version
-            '
+          docker exec --user "$(id -u):$(id -g)" lector-alpine sh -lc '
+            set -eu
+            cargo build --locked --release --bin lector
+            scripts/check-static-pie "$CARGO_TARGET_DIR/release/lector"
+            "$CARGO_TARGET_DIR/release/lector" --version
+          '
+          # Keep this disposable container alive for rust-cache's post-job pruning.

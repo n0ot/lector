@@ -420,3 +420,17 @@ input independently.
 - Cross-target builds prepare and cache an archive for the exact Rust target.
 - Released binaries should show no `libghostty-vt` dependency in `otool -L` or
   `ldd`. `cargo ghostty-check` verifies this automatically.
+
+### CI Cargo compilation cache
+
+CI places Cargo outputs in `target/cargo`, separate from verified Ghostty/Zig
+archives. A commit-pinned Rust cache action retains dependencies and registry
+state while pruning workspace binaries and incremental artifacts. Restore/save
+failures are nonfatal; all build, link, inspection and test commands still run.
+
+Keys partition actual compiler metadata, runner OS/architecture, Rust target,
+lane profiles/features, lockfile, Cargo configuration and build/linker inputs.
+The input fingerprint is part of the fallback prefix too, so changed lockfiles
+or configurations cannot restore a previous compilation archive. Alpine uses
+its own packaged compiler inside its disposable container, with a separate
+Cargo home and identity; it never keys against the runner's rustup compiler.
