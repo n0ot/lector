@@ -705,20 +705,32 @@ impl ReviewDocument {
         }
         let steps = count.max(1) - 1;
         let total = matches.len();
-        let (index, wrapped) = match direction {
-            SearchDirection::Forward => {
-                let start = matches.partition_point(|candidate| *candidate <= position);
-                (
-                    (start % total + steps % total) % total,
-                    steps >= total - start,
-                )
-            }
-            SearchDirection::Backward => {
-                let before = matches.partition_point(|candidate| *candidate < position);
-                let start = if before == 0 { total - 1 } else { before - 1 };
-                ((start + total - steps % total) % total, steps >= before)
-            }
+        // Newlines map to the start of their row, so regex offset order is
+        // not necessarily cursor-position order. Partition by direction
+        // without binary-searching the mapped positions.
+        let mut ahead = Vec::new();
+        let mut behind = Vec::new();
+        let indices: Box<dyn Iterator<Item = usize>> = match direction {
+            SearchDirection::Forward => Box::new(0..total),
+            SearchDirection::Backward => Box::new((0..total).rev()),
         };
+        for index in indices {
+            let is_ahead = match direction {
+                SearchDirection::Forward => matches[index] > position,
+                SearchDirection::Backward => matches[index] < position,
+            };
+            if is_ahead {
+                ahead.push(index);
+            } else {
+                behind.push(index);
+            }
+        }
+        let wrapped = steps >= ahead.len();
+        let index = ahead
+            .into_iter()
+            .chain(behind)
+            .nth(steps % total)
+            .expect("nonempty search matches");
         Ok(SearchMatch {
             position: matches[index],
             ordinal: index + 1,
@@ -1114,6 +1126,34 @@ mod tests {
             document.search("absent", pos(0, 0), SearchDirection::Forward, 1),
             Err(SearchFailure::NotFound)
         );
+    }
+
+    #[test]
+    fn regex_search_preserves_direction_with_line_boundary_matches() {
+        let document = ReviewDocument::from_text(2, 20, b"a a\r\na");
+        for pattern in ["a|$", "a|\\n"] {
+            let forward = document
+                .search(pattern, pos(0, 0), SearchDirection::Forward, 1)
+                .unwrap();
+            assert_eq!(forward.position, pos(0, 2));
+            assert_eq!(forward.ordinal, 2);
+            assert!(!forward.wrapped);
+            let backward = document
+                .search(pattern, pos(0, 2), SearchDirection::Backward, 1)
+                .unwrap();
+            assert_eq!(backward.position, pos(0, 0));
+            assert_eq!(backward.ordinal, 3);
+            assert!(!backward.wrapped);
+            for direction in [SearchDirection::Forward, SearchDirection::Backward] {
+                let first = document.search(pattern, pos(0, 0), direction, 1).unwrap();
+                let repeated = document
+                    .search(pattern, pos(0, 0), direction, first.total + 1)
+                    .unwrap();
+                assert_eq!(repeated.position, first.position);
+                assert_eq!(repeated.ordinal, first.ordinal);
+                assert!(repeated.wrapped);
+            }
+        }
     }
 
     #[test]
