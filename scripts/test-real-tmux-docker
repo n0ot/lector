@@ -19,6 +19,8 @@ run_args=(
     --dns 1.1.1.1
     --env LECTOR_REAL_TMUX_CONTAINER=1
     --tmpfs "/tmp:exec,mode=1777"
+    # Runtime sockets must stay on a Linux filesystem even with a host cache.
+    --tmpfs "/work/target/test-tmux:mode=1777"
     --volume "$repo_dir:/work:ro"
     --workdir /work
 )
