@@ -295,10 +295,9 @@ impl ReviewDocument {
         });
         let word = self.keyword_bounds(current);
         let text = if distance > 1
-            && word.is_some()
-            && word.map(|bounds| bounds.0) != self.keyword_bounds(previous).map(|bounds| bounds.0)
+            && let Some((start, end)) = word
+            && Some(start) != self.keyword_bounds(previous).map(|bounds| bounds.0)
         {
-            let (start, end) = word.unwrap();
             self.text_between(current.row, start, end)
         } else {
             match self.cell_text(current) {
