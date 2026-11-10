@@ -136,6 +136,9 @@ def sync(repo, project):
         return
     head = ref["object"]["sha"]
     comparison = api(f"repos/{repo}/compare/master...{head}")
+    if comparison.get("status") in ("behind", "identical"):
+        print("Prepared branch is already contained in master")
+        return
     if [file["filename"] for file in comparison["files"]] != [PIN]:
         raise RuntimeError("Prepared update must only change the canonical pin")
     base_sha = comparison["merge_base_commit"]["sha"]

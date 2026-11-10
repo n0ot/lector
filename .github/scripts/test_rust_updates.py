@@ -75,6 +75,13 @@ class RustUpdateTests(unittest.TestCase):
             self.assertIn("Master retains its tested pin", update.dispatch("owner/repo", "head"))
             api.assert_not_called()
 
+    def test_merged_branch_left_on_remote_is_a_noop(self):
+        for status in ("behind", "identical"):
+            responses = [self.sync_reads()[0], {"status": status, "files": []}]
+            with patch.object(update, "api", side_effect=responses), patch.object(update, "open_pr") as pr:
+                update.sync("owner/repo", "project")
+                pr.assert_not_called()
+
     def test_sync_does_not_queue_failed_or_pending_validation(self):
         for check in (None, dict(self.check, conclusion="failure"), dict(self.check, status="in_progress")):
             with patch.object(update, "api", side_effect=self.sync_reads()), \
