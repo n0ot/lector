@@ -523,6 +523,21 @@ mod stabilization_tests {
 
         profile.finish_burst(155, 125, true);
         assert_eq!(profile.burst(), None);
+
+        profile.rebase_burst_deadline(200);
+        profile.observe_output(225, None, true);
+        let burst = profile.burst().expect("rebased burst");
+        assert_eq!((burst.first_output_ms, burst.last_output_ms), (200, 225));
+        profile.cancel_burst_context();
+        assert_eq!(profile.burst(), None);
+
+        profile.observe_output(300, None, true);
+        profile.reset_context();
+        assert_eq!(profile.burst(), None);
+        profile.observe_output(400, None, true);
+        let burst = profile.burst().expect("new context burst");
+        assert_eq!((burst.first_output_ms, burst.last_output_ms), (400, 400));
+        assert_eq!(burst.delay_ms, DIFF_DELAY);
     }
 
     #[test]
@@ -717,6 +732,12 @@ fn stabilization_decision(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BurstOutputTimes {
+    first_ms: u128,
+    last_ms: u128,
+}
+
 #[derive(Clone, Debug)]
 struct StabilizationProfile {
     delay_ms: u16,
@@ -725,8 +746,7 @@ struct StabilizationProfile {
     clean_bursts: u8,
     burst_adaptive_quiet_trainable: bool,
     late_raise_checkpoint: Option<(u16, u16)>,
-    burst_first_output_ms: Option<u128>,
-    burst_last_output_ms: Option<u128>,
+    burst_output: Option<BurstOutputTimes>,
     last_ordinary_finalized_ms: Option<u128>,
     last_ordinary_output_ms: Option<u128>,
 }
@@ -740,8 +760,7 @@ impl Default for StabilizationProfile {
             clean_bursts: 0,
             burst_adaptive_quiet_trainable: true,
             late_raise_checkpoint: None,
-            burst_first_output_ms: None,
-            burst_last_output_ms: None,
+            burst_output: None,
             last_ordinary_finalized_ms: None,
             last_ordinary_output_ms: None,
         }
@@ -755,7 +774,7 @@ impl StabilizationProfile {
         last_input_ms: Option<u128>,
         adaptive_quiet_trainable: bool,
     ) {
-        if self.burst_first_output_ms.is_none() {
+        if self.burst_output.is_none() {
             self.burst_adaptive_quiet_trainable = adaptive_quiet_trainable;
         } else {
             self.burst_adaptive_quiet_trainable &= adaptive_quiet_trainable;
@@ -781,14 +800,18 @@ impl StabilizationProfile {
             self.last_ordinary_output_ms = None;
         }
 
-        if let Some(previous) = self.burst_last_output_ms {
+        if let Some(output) = &mut self.burst_output {
             let gap = now_ms
-                .saturating_sub(previous)
+                .saturating_sub(output.last_ms)
                 .min(u128::from(MAX_ADAPTIVE_DIFF_DELAY)) as u16;
             self.maximum_gap_ms = self.maximum_gap_ms.max(gap);
+            output.last_ms = now_ms;
+        } else {
+            self.burst_output = Some(BurstOutputTimes {
+                first_ms: now_ms,
+                last_ms: now_ms,
+            });
         }
-        self.burst_first_output_ms.get_or_insert(now_ms);
-        self.burst_last_output_ms = Some(now_ms);
     }
 
     fn finish_burst(&mut self, now_ms: u128, last_output_ms: u128, ordinary: bool) {
@@ -824,15 +847,14 @@ impl StabilizationProfile {
         }
         self.maximum_gap_ms = 0;
         self.burst_adaptive_quiet_trainable = true;
-        self.burst_first_output_ms = None;
-        self.burst_last_output_ms = None;
+        self.burst_output = None;
     }
 
     fn burst(&self) -> Option<StabilizationBurst> {
-        let last_output_ms = self.burst_last_output_ms?;
+        let output = self.burst_output?;
         Some(StabilizationBurst {
-            first_output_ms: self.burst_first_output_ms.unwrap_or(last_output_ms),
-            last_output_ms,
+            first_output_ms: output.first_ms,
+            last_output_ms: output.last_ms,
             delay_ms: if self.burst_adaptive_quiet_trainable {
                 self.delay_ms
             } else {
@@ -842,8 +864,10 @@ impl StabilizationProfile {
     }
 
     fn rebase_burst_deadline(&mut self, now_ms: u128) {
-        self.burst_first_output_ms = Some(now_ms);
-        self.burst_last_output_ms = Some(now_ms);
+        self.burst_output = Some(BurstOutputTimes {
+            first_ms: now_ms,
+            last_ms: now_ms,
+        });
     }
 
     fn cancel_burst_context(&mut self) {
@@ -854,8 +878,7 @@ impl StabilizationProfile {
         self.maximum_gap_ms = 0;
         self.clean_bursts = 0;
         self.burst_adaptive_quiet_trainable = true;
-        self.burst_first_output_ms = None;
-        self.burst_last_output_ms = None;
+        self.burst_output = None;
         self.last_ordinary_finalized_ms = None;
         self.last_ordinary_output_ms = None;
     }
