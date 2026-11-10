@@ -4,6 +4,8 @@
 
 Make changes on a branch and submit a pull request targeting `master`. Do not push directly to `master` or bypass branch protection, including with administrator privileges.
 
+Before independent review, successfully run `cargo build -r --locked` locally and the relevant end-to-end tests, including host Lector/project-fixture tests and Docker-only external integrations where applicable. Resolve local failures and rerun affected checks before review. Blocked local validation means the work is incomplete; passing CI is not a substitute for this local gate. Preserve the test isolation policy below.
+
 Work is complete only when all required GitHub CI checks pass for the latest pull request revision and the branch is up to date with `master`. Local checks alone are not sufficient. After pushing changes, monitor CI and address failures before considering the work done or merging. If CI cannot finish or a failure cannot be resolved, report the work as incomplete and explain the blocker.
 
 The required `CI` check validates all build jobs. Markdown-only changes run the CI policy checks and skip compilation; mixed changes and uncertain diffs require the full matrix. CI runs for pull requests and pushes to `master`, and reuses verified Ghostty and Zig artifacts when their inputs match.

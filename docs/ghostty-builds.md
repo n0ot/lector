@@ -296,6 +296,11 @@ select `ReleaseFast`, validate the archive checksum and build metadata, and
 reuse that one native artifact without entering Zig. The separate `Debug`
 archive is created and reused only when `LECTOR_GHOSTTY_OPTIMIZE=Debug` is set.
 
+Zig's internal local and global caches live under
+`target/ghostty-zig-cache/<zig-version>/`. Compiler upgrades select a separate
+cache namespace; old caches remain untouched. These compiler caches are
+distinct from the checksum-verified native archives in `ghostty-prebuilt`.
+
 `cargo ghostty-check` bootstraps and verifies both native profiles, runs the
 linked build-information tests, and checks the resulting runtime linkage.
 
@@ -411,6 +416,10 @@ input independently.
 - A bootstrap failure on a fresh build reports the failed download, checksum,
   toolchain, or Zig build directly. Re-run the same ordinary Cargo command
   after correcting that underlying problem.
+- If macOS reports that `rust-objcopy` cannot load `libLLVM.dylib`, install
+  the matching official component with `rustup component add llvm-tools`
+  from the checkout, then retry. This Rust toolchain issue is separate from
+  Ghostty compilation; do not override dynamic-library search paths.
 - A metadata mismatch means the cached archive was built for another commit,
   Zig version, Rust target, or optimization profile. The next ordinary Cargo
   build regenerates it; do not copy in a system library.

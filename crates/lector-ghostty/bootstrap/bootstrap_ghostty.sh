@@ -88,8 +88,11 @@ archive="$source_parent/libghostty-vt-$GHOSTTY_VERSION.tar.gz"
 deps_archive="$source_parent/libghostty-vt-$GHOSTTY_VERSION-deps.tar.gz"
 deps_dir="$source_parent/libghostty-vt-$GHOSTTY_VERSION-deps"
 prefix="$prebuilt_root/$target/$optimize"
-cache_dir="$build_root/ghostty-zig-cache/$target/$optimize"
-global_cache_dir="$build_root/ghostty-zig-cache/global"
+# Compiler-internal cache formats are not a compatibility boundary across Zig
+# releases. Keep each pinned compiler's local and global state together.
+zig_cache_root="$build_root/ghostty-zig-cache/$REQUIRED_ZIG_VERSION"
+cache_dir="$zig_cache_root/$target/$optimize"
+global_cache_dir="$zig_cache_root/global"
 metadata_path="$prefix/lector-ghostty-build.txt"
 static_archive="$prefix/static-lib/libghostty-vt.a"
 abi_probe_source="$crate_dir/abi/build_info_probe.c"
