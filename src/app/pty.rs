@@ -615,7 +615,8 @@ impl App {
             });
         self.pending_direct_gateway_input
             .retain(|input| !removed_connections.contains(&input.connection_id));
-        self.discard_deferred_tmux_connections(&removed_connections);
+        self.pending_tmux_background_output
+            .remove_connections(&removed_connections);
         self.cleanup_nested_gateway_state(&removed_connections);
         let carrier_cleanup_parents = self
             .tmux_carrier_leases
@@ -1563,7 +1564,8 @@ impl App {
             self.open_review(sr, false, term_out)?;
         }
         if let Some((pane_id, status, output, line_flags)) = bootstrap_reply {
-            self.discard_deferred_tmux_pane_output((connection_id, pane_id));
+            self.pending_tmux_background_output
+                .remove((connection_id, pane_id));
             let bootstrap_replies =
                 if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
                     let was_ready = view.is_ready();
@@ -1959,7 +1961,7 @@ impl App {
             return self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out);
         }
 
-        let has_deferred_output = self.pending_tmux_background_output.contains_key(&key);
+        let has_deferred_output = self.pending_tmux_background_output.contains(key);
         let exceeds_immediate_budget = self
             .tmux_hidden_output_bytes_this_turn
             .saturating_add(bytes.len())
@@ -2080,42 +2082,25 @@ impl App {
         bytes: &[u8],
     ) {
         let key = (connection_id, pane_id);
-        let would_exceed_limit = self
-            .pending_tmux_background_bytes
-            .saturating_add(bytes.len())
-            > TMUX_BACKGROUND_OUTPUT_LIMIT_BYTES;
-        if would_exceed_limit {
-            let dropped = self.discard_deferred_tmux_pane_output(key);
-            self.log_event(&format!(
-                "tmux deferred pane output overflow connection={connection_id} pane={} dropped={} rejected={}",
-                pane_id.0,
-                dropped,
-                bytes.len()
-            ));
-            self.mark_tmux_pane_for_resync(
-                connection_id,
-                pane_id,
-                dropped.saturating_add(bytes.len()),
-            );
-            return;
-        }
-
-        if !self.pending_tmux_background_output.contains_key(&key) {
-            self.pending_tmux_background_order.push_back(key);
-        }
-        self.pending_tmux_background_output
-            .entry(key)
-            .or_default()
-            .extend(bytes);
-        self.pending_tmux_background_bytes = self
-            .pending_tmux_background_bytes
-            .saturating_add(bytes.len());
-        if self
-            .pending_tmux_background_output
-            .get(&key)
-            .is_some_and(|queued| queued.len() >= TMUX_BACKGROUND_PAUSE_THRESHOLD_BYTES)
-        {
-            self.queue_tmux_background_pause(connection_id, pane_id);
+        match self.pending_tmux_background_output.enqueue(key, bytes) {
+            EnqueueResult::Overflow { dropped_bytes } => {
+                self.log_event(&format!(
+                    "tmux deferred pane output overflow connection={connection_id} pane={} dropped={} rejected={}",
+                    pane_id.0,
+                    dropped_bytes,
+                    bytes.len()
+                ));
+                self.mark_tmux_pane_for_resync(
+                    connection_id,
+                    pane_id,
+                    dropped_bytes.saturating_add(bytes.len()),
+                );
+            }
+            EnqueueResult::Queued { pane_bytes } => {
+                if pane_bytes >= TMUX_BACKGROUND_PAUSE_THRESHOLD_BYTES {
+                    self.queue_tmux_background_pause(connection_id, pane_id);
+                }
+            }
         }
     }
 
@@ -2151,33 +2136,6 @@ impl App {
         }
     }
 
-    fn discard_deferred_tmux_pane_output(
-        &mut self,
-        key: (u64, crate::tmux_model::PaneId),
-    ) -> usize {
-        let dropped = self
-            .pending_tmux_background_output
-            .remove(&key)
-            .map_or(0, |queued| queued.len());
-        self.pending_tmux_background_bytes =
-            self.pending_tmux_background_bytes.saturating_sub(dropped);
-        self.pending_tmux_background_order
-            .retain(|candidate| *candidate != key);
-        dropped
-    }
-
-    fn discard_deferred_tmux_connections(&mut self, connection_ids: &[u64]) {
-        let keys = self
-            .pending_tmux_background_output
-            .keys()
-            .filter(|(connection_id, _)| connection_ids.contains(connection_id))
-            .copied()
-            .collect::<Vec<_>>();
-        for key in keys {
-            self.discard_deferred_tmux_pane_output(key);
-        }
-    }
-
     fn drain_tmux_background_output(
         &mut self,
         sr: &mut ScreenReader,
@@ -2185,23 +2143,11 @@ impl App {
     ) -> Result<()> {
         let mut remaining = TMUX_BACKGROUND_DRAIN_BUDGET_BYTES;
         while remaining > 0 {
-            let Some(key) = self.pending_tmux_background_order.pop_front() else {
+            let Some((key, bytes)) = self.pending_tmux_background_output.drain_next(remaining)
+            else {
                 break;
             };
-            let Some(queued) = self.pending_tmux_background_output.get_mut(&key) else {
-                continue;
-            };
-            let count = remaining.min(queued.len());
-            let bytes = queued.drain(..count).collect::<Vec<_>>();
-            let has_more = !queued.is_empty();
-            if has_more {
-                self.pending_tmux_background_order.push_back(key);
-            } else {
-                self.pending_tmux_background_output.remove(&key);
-            }
-            self.pending_tmux_background_bytes =
-                self.pending_tmux_background_bytes.saturating_sub(count);
-            remaining = remaining.saturating_sub(count);
+            remaining -= bytes.len();
             if !self.discard_stale_tmux_pane_output(key.0, key.1, &bytes) {
                 self.process_tmux_pane_output(sr, key.0, key.1, &bytes, term_out)?;
             }
@@ -2495,7 +2441,8 @@ impl App {
             .retain(|command| !removed.contains(&command.connection_id));
         self.pending_direct_gateway_input
             .retain(|input| !removed.contains(&input.connection_id));
-        self.discard_deferred_tmux_connections(&removed);
+        self.pending_tmux_background_output
+            .remove_connections(&removed);
         self.cleanup_nested_gateway_state(&removed);
         if self
             .pending_tmux_confirmation
@@ -2608,15 +2555,14 @@ impl App {
 
         let obsolete_deferred = self
             .pending_tmux_background_output
-            .keys()
+            .panes()
             .filter(|(source_connection_id, pane_id)| {
                 *source_connection_id == connection_id
                     && (topology.pane(*pane_id).is_none() || pane_is_presented(*pane_id))
             })
-            .copied()
             .collect::<Vec<_>>();
         for key @ (_, pane_id) in obsolete_deferred {
-            let dropped = self.discard_deferred_tmux_pane_output(key);
+            let dropped = self.pending_tmux_background_output.remove(key);
             if dropped == 0 || topology.pane(pane_id).is_none() {
                 continue;
             }
