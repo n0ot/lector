@@ -96,3 +96,33 @@ emulated architecture is useful. Extra arguments are forwarded to Nextest.
 
 Native dependency prerequisites, cache behavior, and supported targets are in
 [the Ghostty build guide](docs/ghostty-builds.md).
+
+## Tested Rust updates
+
+The weekly `Tested Rust updates` workflow reads Rust's official stable manifest
+and maintains one `automation/rust-toolchain` PR. It changes only the canonical
+pin, explicitly dispatches the full build matrix, and retains the tested master
+pin on failure. Repeated runs reuse the PR; a changed base or pin requires new
+CI and review. Failed validation is linked in a single updated PR status comment.
+
+Operational setup requires Actions permission to create PRs (repository Actions
+settings), and `contents`, `pull-requests`, and `actions` write permissions for
+its workflow token. No PAT is needed: explicit `workflow_dispatch` is supported
+with `GITHUB_TOKEN`, avoiding suppressed or approval-gated implicit PR runs.
+See [GitHub's event documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
+
+Set repository variable `RUST_UPDATE_REVIEWER` to the account of an independently
+operated review agent/app. That integration must actually review update PRs and
+submit an `APPROVED` GitHub review on the current commit; merely setting a name
+does not install or start a reviewer. It must differ from the PR author. Missing,
+stale, dismissed, or negative review blocks merge, even when CI passes. The
+workflow never self-approves. No reviewer service or credentials are bundled;
+until one is configured, PR creation/testing works but automatic merging is
+intentionally incomplete.
+
+Protected merging runs after CI or a review event, or the next weekly/manual
+run. It requires a current approved head, a clean/up-to-date branch, and the
+existing protected checks; there is no administrator bypass. If authentication
+or dispatch fails, inspect the workflow log and PR status comment, fix access,
+and rerun `Tested Rust updates`. An orphan or unexpectedly modified automation
+branch requires inspection before recovery; it is never silently overwritten.

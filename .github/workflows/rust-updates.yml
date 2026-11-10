@@ -1,0 +1,40 @@
+name: Tested Rust updates
+
+"on":
+  schedule:
+    - cron: '19 8 * * 1'
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Ghostty build matrix]
+    types: [completed]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: tested-rust-updates
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: >-
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'automation/rust-toolchain') ||
+      (github.event_name == 'pull_request_review' && github.event.pull_request.head.ref == 'automation/rust-toolchain')
+    runs-on: ubuntu-24.04
+    steps:
+      # Always run trusted default-branch code, never code from the update PR.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Propose or reconcile a tested update
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUST_UPDATE_REVIEWER: ${{ vars.RUST_UPDATE_REVIEWER }}
+          UPDATE_MODE: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'propose' || 'reconcile' }}
+        run: python3 .github/scripts/rust_updates.py "$UPDATE_MODE"
