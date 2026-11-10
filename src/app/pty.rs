@@ -457,8 +457,7 @@ impl App {
         origin: GatewayOrigin,
         term_out: &mut dyn Write,
     ) -> Result<()> {
-        self.pending_tmux_confirmation = None;
-        self.pending_gateway_confirmation = None;
+        self.pending_confirmation = None;
         if origin == GatewayOrigin::Direct {
             self.application_replies.take(ROOT_SOURCE);
         }
@@ -574,20 +573,7 @@ impl App {
         {
             self.pending_force_abandon = None;
         }
-        if self
-            .pending_tmux_confirmation
-            .as_ref()
-            .is_some_and(|confirmation| removed_connections.contains(&confirmation.connection_id))
-        {
-            self.pending_tmux_confirmation = None;
-        }
-        if self
-            .pending_gateway_confirmation
-            .as_ref()
-            .is_some_and(|confirmation| removed_connections.contains(&confirmation.connection_id))
-        {
-            self.pending_gateway_confirmation = None;
-        }
+        self.cancel_confirmation_for_connections(&removed_connections);
         self.tmux_connections
             .retain(|connection| !removed_connections.contains(&connection.id));
         self.recent_tmux_bells
@@ -2444,20 +2430,7 @@ impl App {
         self.pending_tmux_background_output
             .remove_connections(&removed);
         self.cleanup_nested_gateway_state(&removed);
-        if self
-            .pending_tmux_confirmation
-            .as_ref()
-            .is_some_and(|confirmation| removed.contains(&confirmation.connection_id))
-        {
-            self.pending_tmux_confirmation = None;
-        }
-        if self
-            .pending_gateway_confirmation
-            .as_ref()
-            .is_some_and(|confirmation| removed.contains(&confirmation.connection_id))
-        {
-            self.pending_gateway_confirmation = None;
-        }
+        self.cancel_confirmation_for_connections(&removed);
         self.view_stack.remove_tmux_connections(&removed);
         if self
             .active_tmux_connection

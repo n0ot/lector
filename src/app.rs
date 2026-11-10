@@ -1214,8 +1214,7 @@ pub struct App {
         BTreeSet<u32>,
     >,
     active_tmux_connection: Option<u64>,
-    pending_tmux_confirmation: Option<PendingTmuxConfirmation>,
-    pending_gateway_confirmation: Option<PendingGatewayConfirmation>,
+    pending_confirmation: Option<PendingConfirmation>,
     pending_direct_gateway_input: VecDeque<PendingDirectGatewayInput>,
     pending_graceful_teardown: Option<PendingGracefulTeardown>,
     pending_force_abandon: Option<PendingForceAbandon>,
@@ -1484,6 +1483,20 @@ enum TmuxPrefixPhase {
     Repeating { table: String, expires_at_ms: u128 },
 }
 
+enum PendingConfirmation {
+    Command(PendingTmuxConfirmation),
+    Gateway(PendingGatewayConfirmation),
+}
+
+impl PendingConfirmation {
+    fn connection_id(&self) -> u64 {
+        match self {
+            Self::Command(confirmation) => confirmation.connection_id,
+            Self::Gateway(confirmation) => confirmation.connection_id,
+        }
+    }
+}
+
 struct PendingTmuxConfirmation {
     connection_id: u64,
     command: String,
@@ -1612,8 +1625,7 @@ impl App {
             pending_tmux_session_switches: BTreeMap::new(),
             rejected_tmux_carrier_indices: BTreeMap::new(),
             active_tmux_connection: None,
-            pending_tmux_confirmation: None,
-            pending_gateway_confirmation: None,
+            pending_confirmation: None,
             pending_direct_gateway_input: VecDeque::new(),
             pending_graceful_teardown: None,
             pending_force_abandon: None,
@@ -2551,8 +2563,7 @@ impl App {
             {
                 connection.prefix_state = None;
             }
-            self.pending_tmux_confirmation = None;
-            self.pending_gateway_confirmation = None;
+            self.pending_confirmation = None;
             if let Some(parent) = self.view_stack.tmux_connection_mut(parent_connection_id) {
                 parent.show_connection();
             }
@@ -2573,8 +2584,7 @@ impl App {
         {
             connection.prefix_state = None;
         }
-        self.pending_tmux_confirmation = None;
-        self.pending_gateway_confirmation = None;
+        self.pending_confirmation = None;
         let Some(connection) = self.view_stack.tmux_connection_mut(connection_id) else {
             return Ok(false);
         };
@@ -2598,8 +2608,7 @@ impl App {
         {
             return Ok(false);
         }
-        self.pending_tmux_confirmation = None;
-        self.pending_gateway_confirmation = None;
+        self.pending_confirmation = None;
         self.active_tmux_connection = Some(connection_id);
         self.cancel_stabilization_bursts();
         self.queue_tmux_connection_activation(connection_id);

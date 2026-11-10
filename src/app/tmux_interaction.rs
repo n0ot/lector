@@ -8,6 +8,16 @@ struct TmuxGatewayHop {
 }
 
 impl App {
+    pub(super) fn cancel_confirmation_for_connections(&mut self, connections: &[u64]) {
+        if self
+            .pending_confirmation
+            .as_ref()
+            .is_some_and(|confirmation| connections.contains(&confirmation.connection_id()))
+        {
+            self.pending_confirmation = None;
+        }
+    }
+
     /// Requests lifecycle control for the currently selected tmux connection.
     /// Graceful teardown is ordered by the connection hierarchy. Abandoning a
     /// transport is staged behind the normal confirmation popup.
@@ -71,11 +81,11 @@ impl App {
             ),
             crate::tmux_lifecycle::GatewayControlAction::GracefulDetach => unreachable!(),
         };
-        self.pending_tmux_confirmation = None;
-        self.pending_gateway_confirmation = Some(PendingGatewayConfirmation {
-            connection_id,
-            action,
-        });
+        self.pending_confirmation =
+            Some(PendingConfirmation::Gateway(PendingGatewayConfirmation {
+                connection_id,
+                action,
+            }));
         self.show_popup_confirmation(sr, title, &message, term_out)?;
         Ok(true)
     }
@@ -128,8 +138,7 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<()> {
         self.pending_force_abandon = None;
-        self.pending_gateway_confirmation = None;
-        self.pending_tmux_confirmation = None;
+        self.pending_confirmation = None;
         self.pending_graceful_teardown = Some(PendingGracefulTeardown {
             remaining: self.tmux_hierarchy.all_teardown_order().into(),
             awaiting: None,
