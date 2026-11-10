@@ -415,11 +415,11 @@ impl App {
                 );
             }
         };
-        self.pending_tmux_confirmation = Some(PendingTmuxConfirmation {
+        self.pending_confirmation = Some(PendingConfirmation::Command(PendingTmuxConfirmation {
             connection_id,
             command: scoped_command,
             target,
-        });
+        }));
         self.show_popup_confirmation(sr, title, &message, term_out)
     }
 

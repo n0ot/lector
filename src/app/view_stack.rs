@@ -129,41 +129,40 @@ impl App {
                 }
             }
             views::ViewAction::PopupResponse(response) => {
-                let gateway_confirmation = self.pending_gateway_confirmation.take();
-                if let Some(confirmation) = gateway_confirmation {
-                    let confirmed = response == views::PopupResponse::Confirmed;
-                    self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
-                    if confirmed && !self.accept_gateway_confirmation(confirmation)? {
-                        self.show_popup_error(
-                            sr,
-                            "tmux gateway disappeared",
-                            "the confirmed tmux gateway no longer exists; no bytes were sent",
-                            term_out,
-                        )?;
+                let confirmed = response == views::PopupResponse::Confirmed;
+                match self.pending_confirmation.take() {
+                    Some(PendingConfirmation::Gateway(confirmation)) => {
+                        self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
+                        if confirmed && !self.accept_gateway_confirmation(confirmation)? {
+                            self.show_popup_error(
+                                sr,
+                                "tmux gateway disappeared",
+                                "the confirmed tmux gateway no longer exists; no bytes were sent",
+                                term_out,
+                            )?;
+                        }
                     }
-                    return Ok(());
-                }
-                let tmux_confirmation = self.pending_tmux_confirmation.take();
-                if let Some(confirmation) = tmux_confirmation {
-                    let confirmed = response == views::PopupResponse::Confirmed;
-                    let target_exists = self.tmux_confirmation_target_exists(&confirmation);
-                    self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
-                    if confirmed && target_exists {
-                        self.queue_tmux_user_command(
-                            confirmation.connection_id,
-                            &confirmation.command,
-                        )?;
-                    } else if confirmed {
-                        self.show_popup_error(
-                            sr,
-                            "tmux target disappeared",
-                            "the confirmed tmux target no longer exists; no command was sent",
-                            term_out,
-                        )?;
+                    Some(PendingConfirmation::Command(confirmation)) => {
+                        let target_exists = self.tmux_confirmation_target_exists(&confirmation);
+                        self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
+                        if confirmed && target_exists {
+                            self.queue_tmux_user_command(
+                                confirmation.connection_id,
+                                &confirmation.command,
+                            )?;
+                        } else if confirmed {
+                            self.show_popup_error(
+                                sr,
+                                "tmux target disappeared",
+                                "the confirmed tmux target no longer exists; no command was sent",
+                                term_out,
+                            )?;
+                        }
                     }
-                } else {
-                    self.popup_responses.push_back(response);
-                    self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
+                    None => {
+                        self.popup_responses.push_back(response);
+                        self.handle_view_action(sr, views::ViewAction::Pop, term_out)?;
+                    }
                 }
             }
             views::ViewAction::ActivateTmuxConnection(connection_id) => {
