@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG NEXTEST_VERSION=0.9.143
+ARG TARGETARCH
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
@@ -9,7 +9,6 @@ RUN apt-get update \
         build-essential \
         ca-certificates \
         curl \
-        file \
         git \
         ncurses-bin \
         perl \
@@ -31,7 +30,9 @@ WORKDIR /opt/lector
 RUN curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
         https://sh.rustup.rs \
         | sh -s -- --default-toolchain "$(scripts/check-rust-toolchain --channel)" --profile minimal --no-modify-path -y \
-    && scripts/check-rust-toolchain \
-    && cargo install cargo-nextest --version "${NEXTEST_VERSION}" --locked
+    && scripts/check-rust-toolchain
+
+COPY tests/docker/install-nextest.sh /tmp/install-nextest.sh
+RUN bash /tmp/install-nextest.sh "${TARGETARCH}" && rm /tmp/install-nextest.sh
 
 WORKDIR /work

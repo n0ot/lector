@@ -1,5 +1,8 @@
-# The image only needs toolchain metadata; source is mounted at test time.
+# The image only needs toolchain metadata and the nextest installer; source is mounted at test time.
 **
 !rust-toolchain.toml
 !scripts
 !scripts/check-rust-toolchain
+!tests
+!tests/docker
+!tests/docker/install-nextest.sh
