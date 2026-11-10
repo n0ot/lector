@@ -68,10 +68,11 @@ jobs:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         if: needs.changes.outputs.build == 'true'
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install repository Rust toolchain
         if: needs.changes.outputs.build == 'true'
-        with:
-          targets: ${{ matrix.target }}
+        run: >-
+          rustup toolchain install "$(scripts/check-rust-toolchain --channel)"
+          --profile minimal --component clippy,rustfmt --target "${{ matrix.target }}"
       - name: Cache verified Ghostty and Zig artifacts
         if: needs.changes.outputs.build == 'true'
         # actions/cache v5
@@ -81,11 +82,11 @@ jobs:
             target/ghostty-prebuilt
             target/toolchains
           key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
-      - name: Verify native architecture
+      - name: Verify canonical compiler and native architecture
         if: needs.changes.outputs.build == 'true'
         run: >-
-          test "$(rustc -vV | sed -n 's/^host: //p')"
-          = "${{ matrix.target }}"
+          scripts/check-rust-toolchain --host "${{ matrix.target }}"
+          --target "${{ matrix.target }}"
       - name: Build and test linked Ghostty metadata
         if: needs.changes.outputs.build == 'true'
         run: cargo ghostty-check
@@ -129,19 +130,22 @@ jobs:
       matrix:
         include:
           - target: aarch64-unknown-linux-musl
+            host: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             zig_target: aarch64-linux-musl
           - target: x86_64-unknown-linux-musl
+            host: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             zig_target: x86_64-linux-musl
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         if: needs.changes.outputs.build == 'true'
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install repository Rust toolchain
         if: needs.changes.outputs.build == 'true'
-        with:
-          targets: ${{ matrix.target }}
+        run: >-
+          rustup toolchain install "$(scripts/check-rust-toolchain --channel)"
+          --profile minimal --component clippy,rustfmt --target "${{ matrix.target }}"
       - name: Cache verified Ghostty and Zig artifacts
         if: needs.changes.outputs.build == 'true'
         # actions/cache v5
@@ -151,6 +155,9 @@ jobs:
             target/ghostty-prebuilt
             target/toolchains
           key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
+      - name: Verify canonical compiler and cross target
+        if: needs.changes.outputs.build == 'true'
+        run: scripts/check-rust-toolchain --host "${{ matrix.host }}" --target "${{ matrix.target }}"
       - name: Install pinned Zig C toolchain
         if: needs.changes.outputs.build == 'true'
         run: scripts/bootstrap_zig.sh
@@ -197,6 +204,7 @@ jobs:
               set -eu
               apk add --no-cache bash binutils build-base ca-certificates \
                 cargo curl file git pkgconf rust tar xz
+              scripts/check-rust-toolchain --packaged --host x86_64-alpine-linux-musl
               cargo build --locked --release --bin lector
               scripts/check-static-pie target/release/lector
               target/release/lector --version

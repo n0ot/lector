@@ -1,0 +1,5 @@
+# The image only needs toolchain metadata; source is mounted at test time.
+**
+!rust-toolchain.toml
+!scripts
+!scripts/check-rust-toolchain

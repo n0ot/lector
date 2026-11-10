@@ -24,6 +24,16 @@ links the more detailed contracts.
 - `scripts/`: developer checks, dependency bootstrap, tracing, and live tests.
 - `docs/`: design contracts and operational documentation.
 
+## Rust toolchain
+
+`rust-toolchain.toml` is the exact tested Rust release for local rustup,
+native/static CI, and the Ubuntu tmux image. Run `scripts/check-rust-toolchain`
+to verify the compiler actually invoked, including any environment override.
+CI also checks the native host or installed cross-target standard library.
+Alpine intentionally uses its distribution-packaged Rust as a separate
+compatibility lane: it has no rustup shim, so the repository pin does not
+select its compiler. That lane logs and verifies its compiler host explicitly.
+
 ## Fast verification
 
 Run these while iterating:
