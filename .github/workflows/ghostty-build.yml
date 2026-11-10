@@ -252,7 +252,7 @@ jobs:
     needs: changes
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
-      CARGO_HOME: ${{ runner.temp }}/alpine-cargo
+      CARGO_HOME: ${{ github.workspace }}/target/alpine-cargo-home
       CARGO_INCREMENTAL: 0
     name: Alpine native static PIE
     runs-on: ubuntu-24.04
