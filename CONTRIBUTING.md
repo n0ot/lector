@@ -96,3 +96,33 @@ emulated architecture is useful. Extra arguments are forwarded to Nextest.
 
 Native dependency prerequisites, cache behavior, and supported targets are in
 [the Ghostty build guide](docs/ghostty-builds.md).
+
+## Tested Rust updates
+
+The weekly/manual `Tested Rust updates` workflow reads Rust's official stable
+manifest and maintains one `automation/rust-toolchain` branch containing only
+the canonical pin update. It explicitly dispatches the full build matrix with
+`GITHUB_TOKEN`; it does not need Actions PR-creation or review-approval permission.
+Failures leave master untouched and are visible in CI and the updater summary.
+Repeat runs reuse the branch and validation; rerun failed CI after fixing its
+cause. Unexpected edits on the reserved branch stop the updater safely.
+
+An active agent-queue orchestrator imports validated updates with:
+
+```bash
+python3 .github/scripts/rust_updates.py sync --project <PROJECT_NODE_ID>
+```
+
+This uses the session's existing `gh` repository/Projects authentication to
+create or reuse one PR and one Queued issue. It never resets an existing card's
+status. The worker follows the ordinary independent **agent** review, final-SHA
+CI and protected merge contract. Reviewer and merger may use the same authorized
+GitHub account; formal GitHub approvals and a separate reviewer service are not
+required. No script self-approves or merges the update.
+
+Run sync before dispatch and at the session's existing 30-minute checkpoints,
+not in a new model polling loop. When the session is stopped, scheduled branch
+preparation and CI still run, but creating/reviewing/merging the PR waits until
+an orchestrator resumes. This is not a persistent, unattended agent service.
+See [GitHub's dispatch documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
+for why explicit dispatch is needed with workflow tokens.
