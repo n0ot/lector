@@ -110,9 +110,41 @@ jobs:
       - name: Run complete suite
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo nextest run --locked --workspace --all-targets --all-features
+      - name: Set up tmux image builder
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        # docker/setup-buildx-action v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Build cached tmux image
+        id: tmux-image
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        continue-on-error: true
+        # docker/build-push-action v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: tests/docker/real-tmux.Dockerfile
+          platforms: linux/amd64
+          load: true
+          cache-from: type=gha,scope=lector-tmux-v1-linux-amd64-${{ hashFiles('tests/docker/real-tmux.Dockerfile*', 'tests/docker/install-nextest.sh', 'rust-toolchain.toml', 'scripts/check-rust-toolchain') }}
+          cache-to: type=gha,mode=max,ignore-error=true,scope=lector-tmux-v1-linux-amd64-${{ hashFiles('tests/docker/real-tmux.Dockerfile*', 'tests/docker/install-nextest.sh', 'rust-toolchain.toml', 'scripts/check-rust-toolchain') }}
+      - name: Build tmux image without cache after cache failure
+        id: tmux-image-cold
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-image.outcome == 'failure'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: tests/docker/real-tmux.Dockerfile
+          platforms: linux/amd64
+          load: true
+          no-cache: true
       - name: Run real tmux tests in Docker
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
-        run: scripts/test-real-tmux-docker
+        env:
+          LECTOR_REAL_TMUX_PREBUILT_IMAGE: ${{ steps.tmux-image-cold.outputs.imageid || steps.tmux-image.outputs.imageid }}
+          LECTOR_REAL_TMUX_PLATFORM: linux/amd64
+        run: |
+          : "${LECTOR_REAL_TMUX_PREBUILT_IMAGE:?image build did not return an ID}"
+          scripts/test-real-tmux-docker
       - name: Run documentation tests
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo test --locked --workspace --doc --all-features
