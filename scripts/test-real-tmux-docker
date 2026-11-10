@@ -28,7 +28,8 @@ if [[ -n "$platform" ]]; then
     run_args+=(--platform "$platform")
 fi
 
-docker build "${build_args[@]}" "$repo_dir/tests/docker"
+docker build "${build_args[@]}" "$repo_dir"
+docker run "${run_args[@]}" "$image" scripts/check-rust-toolchain
 docker run "${run_args[@]}" "$image" bash tests/docker/check-nextest-install.sh
 docker run "${run_args[@]}" "$image" \
     cargo nextest run --locked --lib --run-ignored only \

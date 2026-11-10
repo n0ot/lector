@@ -1,7 +1,6 @@
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RUST_VERSION=1.97.0
 ARG TARGETARCH
 
 RUN apt-get update \
@@ -22,14 +21,18 @@ ENV CARGO_HOME=/opt/cargo \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PATH=/opt/cargo/bin:${PATH} \
-    RUSTUP_HOME=/opt/rustup \
-    RUSTUP_TOOLCHAIN=${RUST_VERSION}
+    RUSTUP_HOME=/opt/rustup
+
+COPY rust-toolchain.toml /opt/lector/rust-toolchain.toml
+COPY scripts/check-rust-toolchain /opt/lector/scripts/check-rust-toolchain
+WORKDIR /opt/lector
 
 RUN curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
         https://sh.rustup.rs \
-        | sh -s -- --default-toolchain "${RUST_VERSION}" --profile minimal --no-modify-path -y
+        | sh -s -- --default-toolchain "$(scripts/check-rust-toolchain --channel)" --profile minimal --no-modify-path -y \
+    && scripts/check-rust-toolchain
 
-COPY install-nextest.sh /tmp/install-nextest.sh
+COPY tests/docker/install-nextest.sh /tmp/install-nextest.sh
 RUN bash /tmp/install-nextest.sh "${TARGETARCH}" && rm /tmp/install-nextest.sh
 
 WORKDIR /work
