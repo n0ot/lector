@@ -1852,6 +1852,63 @@ fn review_search_repeat_and_inner_word_yank_feed_f7_clipboard_paste() {
 }
 
 #[test]
+fn review_marks_search_and_find_survive_overlay_lifecycle() {
+    for scheduled in [false, true] {
+        let (mut app, mut sr, _recorder, clock) = make_app();
+        if scheduled {
+            app.enable_output_scheduler(OutputSchedulerConfig::default());
+        }
+        let mut pty_out = Vec::new();
+        let mut term_out = Vec::new();
+        let present = |app: &mut App, sr: &mut ScreenReader, output: &mut Vec<u8>| {
+            clock.advance_ms(100);
+            if scheduled {
+                app.drain_scheduled_output(output, false).unwrap();
+            }
+            app.handle_tick(sr, &mut Vec::new(), output).unwrap();
+        };
+        app.handle_pty(&mut sr, b"one two one three\x1b[H", &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"/one\rwma0foq", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"`ayiwq", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"\x1b[18~", &mut pty_out, &mut term_out)
+            .unwrap();
+        assert_eq!(pty_out, b"three");
+        pty_out.clear();
+        app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"nwyiwq", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"\x1b[18~", &mut pty_out, &mut term_out)
+            .unwrap();
+        assert_eq!(pty_out, b"three");
+        pty_out.clear();
+        app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b";yiwq", &mut pty_out, &mut term_out)
+            .unwrap();
+        present(&mut app, &mut sr, &mut term_out);
+        app.handle_stdin(&mut sr, b"\x1b[18~", &mut pty_out, &mut term_out)
+            .unwrap();
+        assert_eq!(pty_out, b"two");
+    }
+}
+
+#[test]
 fn review_backward_search_and_reverse_repeat_are_motion_commands() {
     let (mut app, mut sr, _recorder, _clock) = make_app();
     let mut pty_out = Vec::new();

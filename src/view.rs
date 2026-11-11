@@ -297,6 +297,7 @@ pub(crate) struct AccessibilityCellWriteBoundary {
 
 pub struct View {
     view_id: ViewId,
+    review_navigation: [crate::review::navigation::SharedNavigation; 2],
     presentation_tracking: bool,
     live_revision: ViewRevision,
     presented_revision: ViewRevision,
@@ -398,6 +399,7 @@ impl View {
         let prev_screen = committed_snapshot.clone();
         let presented_history_basis = PresentedHistoryBasis::from_snapshot(&committed_snapshot);
         View {
+            review_navigation: Default::default(),
             view_id: ViewId(NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed)),
             presentation_tracking: false,
             live_revision: ViewRevision(0),
@@ -527,6 +529,8 @@ impl View {
         let old_review_scrollback = self.review_scrollback;
         let needs_live_snapshot_copy = !self.presentation_tracking || old_review_scrollback != 0;
         let old_history_origin = self.engine.snapshot().history_origin;
+        let old_live_start = old_history_origin + self.engine.snapshot().scrollback_extent;
+        let old_screen_index = usize::from(self.engine.snapshot().alternate_screen());
         let old_scrollback_extent = self.engine.snapshot().scrollback_extent;
         let old_live_snapshot = needs_live_snapshot_copy.then(|| self.engine.snapshot().clone());
         let was_synchronized = self.engine.snapshot().modes.synchronized_output;
@@ -544,7 +548,46 @@ impl View {
         // Output is always interpreted against the live drawing screen. The
         // selected review viewport is restored afterward.
         self.engine.select_viewport(Viewport::Live);
+        let old_cursor_row = old_live_start + usize::from(self.engine.snapshot().cursor.row);
         let mut update = TerminalEngine::advance(&mut self.engine, buf);
+        let live_end =
+            self.engine.snapshot().history_origin + self.engine.snapshot().scrollback_extent;
+        if update.screen_before == update.screen_after && live_end < old_live_start {
+            self.review_navigation[old_screen_index]
+                .borrow_mut()
+                .invalidate_from(0);
+        } else if update.output_report_structural
+            || update.screen_before != update.screen_after
+            || (live_end == old_live_start
+                && update.operations.iter().any(|operation| {
+                    matches!(
+                        operation,
+                        crate::terminal::TerminalOperation::ScrollUp { .. }
+                            | crate::terminal::TerminalOperation::ScrollDown { .. }
+                    )
+                }))
+        {
+            self.review_navigation[old_screen_index]
+                .borrow_mut()
+                .invalidate_from(old_live_start);
+            if update.screen_before != update.screen_after {
+                // Alternate screen entry can clear/recreate its grid. Never
+                // infer identity merely because replacement text is equal.
+                self.review_navigation[1].borrow_mut().invalidate_from(0);
+            }
+        } else if update.printed_runs.iter().any(|run| !run.text.is_empty()) {
+            // Linear output may overwrite or extend its starting row. Rows
+            // before that cursor retain their absolute lineage through scroll.
+            let leading_lines = update
+                .printed_runs
+                .iter()
+                .take_while(|run| run.text.is_empty())
+                .filter(|run| run.boundary == crate::terminal::PrintBoundary::LineFeed)
+                .count();
+            self.review_navigation[old_screen_index]
+                .borrow_mut()
+                .invalidate_from(old_cursor_row.saturating_add(leading_lines));
+        }
         let synchronized_output_open_snapshot =
             self.engine.take_synchronized_output_open_snapshot();
         let synchronized = update.synchronized_output;
@@ -1198,6 +1241,34 @@ impl View {
 
     pub(crate) fn holds_synchronized_output(&self) -> bool {
         self.application_transaction_open()
+    }
+
+    /// Borrow navigation memory for precisely the captured accessible document.
+    /// A separate View (such as generated help) owns separate navigation memory.
+    pub(crate) fn capture_review_navigation(
+        &mut self,
+        snapshot: &TerminalSnapshot,
+    ) -> (
+        crate::review::navigation::SharedNavigation,
+        crate::review::navigation::NavigationCapture,
+    ) {
+        let navigation = self.review_navigation[usize::from(snapshot.alternate_screen())].clone();
+        // The parser may be ahead of the physical receipt. New marks from that
+        // old snapshot remain local to Review, but must not claim live identity.
+        let current = if self.presentation_tracking {
+            self.live_revision == self.presented_revision
+        } else {
+            !matches!(
+                self.accessibility_read_state,
+                AccessibilityReadState::Frozen { .. }
+            )
+        };
+        let capture = navigation.borrow_mut().capture(
+            snapshot.history_origin,
+            snapshot.scrollback.len() + snapshot.rows.len(),
+            current,
+        );
+        (navigation, capture)
     }
 
     pub fn snapshot_with_history(&mut self) -> TerminalSnapshot {
@@ -2238,6 +2309,9 @@ impl View {
     }
 
     fn invalidate_accessible_document_comparison(&mut self) {
+        for navigation in &self.review_navigation {
+            navigation.borrow_mut().invalidate_from(0);
+        }
         self.accessible_document_comparison_epoch = self
             .accessible_document_comparison_epoch
             .wrapping_add(1)
