@@ -353,7 +353,7 @@ impl ScreenReader {
             self.key_echo_stream_active = false;
         }
         self.clipboard = candidate.clipboard;
-        self.key_bindings = candidate.key_bindings;
+        self.key_bindings.replace_from(candidate.key_bindings);
         self.lua_ctx = candidate.lua_ctx;
         self.lua_ctx_weak = candidate.lua_ctx_weak;
         self.lua_screen_reader_ptr = next_pointer;

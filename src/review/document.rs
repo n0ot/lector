@@ -7,6 +7,8 @@ use crate::{
 };
 use regex::RegexBuilder;
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SearchMatch {
@@ -132,6 +134,99 @@ impl ReviewDocument {
         };
         document.build_search_text();
         document
+    }
+
+    /// Build generated help as inert text rather than feeding user-supplied
+    /// descriptions into a terminal parser. Return each entry's physical rows
+    /// so refreshed documents can preserve a stable entry and offset.
+    pub(crate) fn from_lines(lines: &[String], cols: u16) -> (Self, Vec<Range<usize>>) {
+        let cols = cols.max(2);
+        let mut rows = Vec::new();
+        let mut spans = Vec::new();
+        for line in lines {
+            let start = rows.len();
+            let mut row = Row {
+                cells: Vec::new(),
+                wrapped: false,
+                end: 0,
+            };
+            let text: String = line
+                .chars()
+                .flat_map(|ch| {
+                    if ch.is_control() {
+                        ch.escape_default().collect::<Vec<_>>()
+                    } else {
+                        vec![ch]
+                    }
+                })
+                .collect();
+            for grapheme in text.graphemes(true) {
+                let width = grapheme.width().clamp(1, 2) as u16;
+                if u32::from(row.end) + u32::from(width) > u32::from(cols) {
+                    // A wide grapheme can leave an unused tail cell. Padding
+                    // is inert and keeps wrapped row coordinates rectangular.
+                    while row.end < cols {
+                        row.cells.push(Cell {
+                            text: " ".into(),
+                            wide_continuation: false,
+                            style: Style::default(),
+                            hyperlink: None,
+                        });
+                        row.end += 1;
+                    }
+                    row.wrapped = true;
+                    rows.push(row);
+                    row = Row {
+                        cells: Vec::new(),
+                        wrapped: false,
+                        end: 0,
+                    };
+                }
+                row.cells.push(Cell {
+                    text: grapheme.to_owned(),
+                    wide_continuation: false,
+                    style: Style::default(),
+                    hyperlink: None,
+                });
+                if width == 2 {
+                    row.cells.push(Cell {
+                        text: String::new(),
+                        wide_continuation: true,
+                        style: Style::default(),
+                        hyperlink: None,
+                    });
+                }
+                row.end += width;
+            }
+            rows.push(row);
+            spans.push(start..rows.len());
+        }
+        if rows.is_empty() {
+            rows.push(Row {
+                cells: Vec::new(),
+                wrapped: false,
+                end: 0,
+            });
+        }
+        for row in &mut rows {
+            row.cells.resize_with(usize::from(cols), || Cell {
+                text: " ".into(),
+                wide_continuation: false,
+                style: Style::default(),
+                hyperlink: None,
+            });
+        }
+        let mut document = Self {
+            rows,
+            marks: Vec::new(),
+            capture_cols: cols,
+            alternate_screen: false,
+            flat_text: String::new(),
+            flat_positions: Vec::new(),
+            positions: Vec::new(),
+        };
+        document.build_search_text();
+        (document, spans)
     }
 
     #[cfg(test)]
@@ -1071,6 +1166,20 @@ mod tests {
 
     fn pos(row: usize, col: u16) -> HistoryPosition {
         HistoryPosition { row, col }
+    }
+
+    #[test]
+    fn generated_lines_are_inert_wrapped_and_allow_empty_rows() {
+        let (document, spans) =
+            ReviewDocument::from_lines(&["".into(), "ab界c".into(), "x\x1b[31my".into()], 4);
+        assert_eq!(spans[0], 0..1);
+        assert_eq!(spans[1], 1..3);
+        assert_eq!(document.cell_text(HistoryPosition { row: 1, col: 2 }), "界");
+        assert!(document.flat_text.contains("ab界c"));
+        assert!(document.flat_text.contains(r"x\u{1b}[31my"));
+        assert!(!document.flat_text.contains('\x1b'));
+        let (empty, _) = ReviewDocument::from_lines(&[], 0);
+        assert_eq!(empty.row_count(), 1);
     }
 
     #[test]

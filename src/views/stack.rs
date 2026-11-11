@@ -107,6 +107,7 @@ impl ViewStack {
             return false;
         }
         self.deactivate_active_document_context();
+        self.active_mut().on_close();
         let removed = self.views.pop();
         if self.presentation_tracking
             && let Some(view) = removed
@@ -123,6 +124,9 @@ impl ViewStack {
         if self.has_overlay() {
             self.deactivate_active_document_context();
             self.begin_compositor_transition();
+        }
+        for view in &mut self.views[self.base_count..] {
+            view.on_close();
         }
         if self.presentation_tracking {
             self.retired_views
@@ -191,6 +195,7 @@ impl ViewStack {
                     .downcast_mut::<crate::views::TmuxConnectionView>()
                     .is_some_and(|connection| connection_ids.contains(&connection.connection_id()));
             if remove {
+                view.on_close();
                 removed_base_count = removed_base_count.saturating_add(1);
                 if self.presentation_tracking {
                     self.retired_views.push(view);

@@ -114,6 +114,51 @@ impl ReviewView {
         review
     }
 
+    pub(crate) fn new_generated(
+        rows: u16,
+        cols: u16,
+        title: &str,
+        document: ReviewDocument,
+        navigation: SharedNavigation,
+        cursor: HistoryPosition,
+    ) -> Self {
+        let mut source = View::new(rows, cols);
+        let mut review = Self::new_with_identity(&mut source, title, ViewKind::Review);
+        review.view.take_presented_application_speech();
+        review.navigation = navigation;
+        review.replace_generated_document(document, cursor);
+        review.queue_cursor_feedback(None);
+        review
+    }
+
+    pub(crate) fn document_cursor(&self) -> HistoryPosition {
+        self.cursor
+    }
+
+    /// Keep the presentation owner alive while replacing generated content.
+    /// Search entry survives; selections, pending motions, and table geometry
+    /// cannot safely cross document replacement and are cancelled.
+    pub(crate) fn replace_generated_document(
+        &mut self,
+        document: ReviewDocument,
+        cursor: HistoryPosition,
+    ) {
+        let screen_row = self.cursor.row.saturating_sub(self.viewport_top);
+        self.navigation_capture =
+            self.navigation
+                .borrow_mut()
+                .capture(0, document.row_count(), true);
+        self.cursor = document.clamp(cursor);
+        self.document = document;
+        self.viewport_top = self.cursor.row.saturating_sub(screen_row);
+        self.parser = Parser::default();
+        self.visual_anchor = None;
+        self.table = None;
+        self.table_setup = None;
+        self.name_prompt = None;
+        self.render();
+    }
+
     fn document_height(&self) -> usize {
         usize::from(self.rows).saturating_sub(usize::from(
             self.search_prompt.is_some() || self.name_prompt.is_some(),

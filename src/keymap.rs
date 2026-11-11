@@ -1,6 +1,10 @@
 use crate::commands::{self, Action};
 use mlua::{Function, Lua, RegistryKey, Value};
-use std::{collections::HashMap, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::{BTreeSet, HashMap},
+    rc::Rc,
+};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -90,6 +94,7 @@ impl LuaBinding {
 
 const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("F1", Action::ToggleHelp),
+    ("M-?", Action::OpenBindings),
     ("M-'", Action::ToggleAutoRead),
     ("M-\"", Action::ToggleReviewCursorFollowsScreenCursor),
     ("M-s", Action::ToggleSymbolLevel),
@@ -170,7 +175,14 @@ const TABLE_SETUP_BINDINGS: &[(&str, Action)] = &[
     ("b", Action::RevWordPrev),
 ];
 
+pub(crate) struct BindingDescription {
+    pub key: String,
+    pub help: String,
+    pub inherited: bool,
+}
+
 pub struct KeyBindings {
+    revision: Rc<Cell<u64>>,
     normal: HashMap<String, Binding>,
     table: HashMap<String, Binding>,
     table_setup: HashMap<String, Binding>,
@@ -179,10 +191,59 @@ pub struct KeyBindings {
 impl KeyBindings {
     pub fn new() -> Self {
         Self {
+            revision: Rc::new(Cell::new(0)),
             normal: Self::default_map(NORMAL_BINDINGS),
             table: Self::default_map(TABLE_BINDINGS),
             table_setup: Self::default_map(TABLE_SETUP_BINDINGS),
         }
+    }
+
+    pub(crate) fn revision_observer(&self) -> Rc<Cell<u64>> {
+        self.revision.clone()
+    }
+
+    fn changed(&self) {
+        self.revision.set(self.revision.get().wrapping_add(1));
+    }
+
+    /// Reload preserves observers so open generated documents notice the new
+    /// map even when it happens to have the same number of edits as the old one.
+    pub(crate) fn replace_from(&mut self, replacement: Self) {
+        for (_, binding) in self
+            .normal
+            .drain()
+            .chain(self.table.drain())
+            .chain(self.table_setup.drain())
+        {
+            binding.cleanup();
+        }
+        self.normal = replacement.normal;
+        self.table = replacement.table;
+        self.table_setup = replacement.table_setup;
+        self.changed();
+    }
+
+    pub(crate) fn describe_effective(&self, mode: InputMode) -> Vec<BindingDescription> {
+        let keys: BTreeSet<_> = self
+            .normal
+            .keys()
+            .chain(self.bindings(mode).keys())
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| {
+                let binding = self.binding_for_mode(mode, key)?;
+                let help = binding.help_text();
+                Some(BindingDescription {
+                    key: key.clone(),
+                    help: if help.is_empty() {
+                        "custom binding (no description)".to_owned()
+                    } else {
+                        help.to_owned()
+                    },
+                    inherited: mode != InputMode::Normal && !self.bindings(mode).contains_key(key),
+                })
+            })
+            .collect()
     }
 
     pub fn binding_for_mode(&self, mode: InputMode, key: &str) -> Option<&Binding> {
@@ -221,6 +282,7 @@ impl KeyBindings {
     pub fn clear_binding_for_mode(&mut self, mode: InputMode, key: &str) {
         if let Some(binding) = self.bindings_mut(mode).remove(key) {
             binding.cleanup();
+            self.changed();
         }
     }
 
@@ -276,6 +338,7 @@ impl KeyBindings {
     }
 
     fn replace_binding(&mut self, mode: InputMode, key: String, binding: Binding) {
+        self.changed();
         if let Some(prev) = self.bindings_mut(mode).insert(key, binding) {
             prev.cleanup();
         }
@@ -311,6 +374,57 @@ mod tests {
     use crate::commands::Action;
     use mlua::{Lua, LuaOptions, StdLib};
     use std::rc::Rc;
+
+    #[test]
+    fn effective_descriptions_follow_lua_overrides_and_fallback() {
+        let lua = Rc::new(Lua::new());
+        let function = lua.create_function(|_, ()| Ok(())).unwrap();
+        let mut bindings = KeyBindings::new();
+        bindings
+            .set_lua_binding_for_mode(
+                InputMode::Normal,
+                "custom".into(),
+                "neutral description".into(),
+                lua.clone(),
+                function,
+            )
+            .unwrap();
+        let inherited = bindings
+            .describe_effective(InputMode::Table)
+            .into_iter()
+            .find(|b| b.key == "custom")
+            .unwrap();
+        assert_eq!(inherited.help, "neutral description");
+        assert!(inherited.inherited);
+        bindings.set_builtin_binding_for_mode(
+            InputMode::Table,
+            "custom".into(),
+            Action::OpenBindings,
+        );
+        let own = bindings
+            .describe_effective(InputMode::Table)
+            .into_iter()
+            .find(|b| b.key == "custom")
+            .unwrap();
+        assert!(!own.inherited);
+        assert_eq!(own.help, "show current key bindings");
+        bindings.clear_binding_for_mode(InputMode::Table, "custom");
+        assert!(
+            bindings
+                .describe_effective(InputMode::Table)
+                .into_iter()
+                .find(|b| b.key == "custom")
+                .unwrap()
+                .inherited
+        );
+        bindings.clear_binding_for_mode(InputMode::Normal, "custom");
+        assert!(
+            !bindings
+                .describe_effective(InputMode::Table)
+                .iter()
+                .any(|b| b.key == "custom")
+        );
+    }
 
     #[test]
     fn lua_binding_executes() {
