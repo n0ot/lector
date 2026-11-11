@@ -539,7 +539,12 @@ Review has its own dependency-free vi command parser:
   nonblank character. A count selects the one-based snapshot line first.
 - `[p` and `]p` jump to previous and next OSC 133 prompt markers.
 - `f`, `F`, `t`, and `T` find a character on the logical line; `;` and `,`
-  repeat that find. `%` finds and jumps between matching `()`, `[]`, and `{}`.
+  repeat that find in its original or opposite direction, respectively. Neither
+  changes the original direction, and repeats start at the current cursor.
+  `%` finds and jumps between matching `()`, `[]`, and `{}`.
+- `ma` through `mz` set named marks. `'a` jumps to mark `a`'s line at its first
+  nonblank character; `` `a `` jumps to its exact position. Setting a mark
+  announces its name; an unset or expired mark is explained.
 - `/` and `?` search the complete frozen scrollback using regular expressions.
   `n` repeats in the same direction and `N` repeats in the opposite direction;
   searches wrap at the ends.
@@ -549,6 +554,21 @@ Review has its own dependency-free vi command parser:
   `F7`. Prefix a yank with `""` for Lector's internal history or `"+` for the
   system clipboard; for example, `"+yiw` copies the inner word to the system
   clipboard.
+
+Named marks, the last accepted search and its direction, and the last character
+find survive closing and reopening Review within one Lector process. Each source
+view or tmux pane owns separate memory for its primary and alternate screen.
+`n` and `N` reuse the remembered search; an empty `/` or `?` submission reuses
+its pattern with the requested direction.
+
+Marks track retained document rows through ordinary append/scrolling, not screen
+coordinates. Eviction, reset, and resize/reflow can make a mark unavailable.
+Mutable screen rows are conservatively invalidated when output may replace them,
+even if their new text looks identical. Earlier retained history survives a grid
+repaint. Marks created from an older, not-yet-current physical presentation stay
+local to that frozen Review. Existing marks remain usable in the open frozen
+snapshot even while the source changes; reopening checks their validity. State
+is kept in memory only and disappears when Lector exits.
 
 Invalid chords, unavailable prompt/search/find targets, unmatched `%` braces,
 and motions past a boundary ring the terminal bell. Ordinary Lector review

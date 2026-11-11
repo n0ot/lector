@@ -232,6 +232,7 @@ pub enum PrintBoundary {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PrintedRun {
     pub text: String,
+    /// Applied before this run's text, even when the text is nonempty.
     pub boundary: PrintBoundary,
 }
 

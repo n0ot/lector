@@ -60,6 +60,11 @@ pub(crate) enum Command {
     Bell,
     AnnounceMode,
     Exit,
+    SetMark(char),
+    JumpMark {
+        name: char,
+        exact: bool,
+    },
     Move(Motion, usize),
     ScrollPage {
         forward: bool,
@@ -109,6 +114,10 @@ enum Prefix {
     None,
     G,
     Z,
+    SetMark,
+    JumpMark {
+        exact: bool,
+    },
     Bracket {
         forward: bool,
     },
@@ -202,6 +211,16 @@ impl Parser {
 
         match key {
             Key::Char('q') => self.finish(Command::Exit),
+            Key::Char('m') => {
+                self.prefix = Prefix::SetMark;
+                Command::None
+            }
+            Key::Char('\'') | Key::Char('`') => {
+                self.prefix = Prefix::JumpMark {
+                    exact: key == Key::Char('`'),
+                };
+                Command::None
+            }
             Key::Char('"') => {
                 self.awaiting_register = true;
                 Command::None
@@ -352,6 +371,15 @@ impl Parser {
     fn feed_prefix(&mut self, key: Key) -> Command {
         let prefix = std::mem::replace(&mut self.prefix, Prefix::None);
         let pending_count = self.count.take();
+        if matches!(prefix, Prefix::SetMark | Prefix::JumpMark { .. }) {
+            return self.finish(match (prefix, key) {
+                (Prefix::SetMark, Key::Char(name @ 'a'..='z')) => Command::SetMark(name),
+                (Prefix::JumpMark { exact }, Key::Char(name @ 'a'..='z')) => {
+                    Command::JumpMark { name, exact }
+                }
+                _ => Command::Bell,
+            });
+        }
         if prefix == Prefix::Z {
             let (placement, first_nonblank) = match key {
                 Key::Char('t') => (ViewportPlacement::Top, false),

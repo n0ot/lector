@@ -3,6 +3,7 @@ use crate::{
     line_editor::{EditorAction, LineEditor},
     review::{
         document::{ReviewDocument, SearchDirection, SearchFailure, SearchMatch},
+        navigation::{LastFind, LastSearch, NavigationCapture, SharedNavigation, mark_index},
         parser::{
             Command, FindDirection, Key, Motion, Parser, TextObject, ViewportPlacement, VisualKind,
         },
@@ -17,20 +18,6 @@ use std::{any::Any, io::Write};
 use terminput::{KeyCode, KeyModifiers};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-
-#[derive(Copy, Clone, Debug)]
-struct LastFind {
-    direction: FindDirection,
-    till: bool,
-    target: char,
-    matched: HistoryPosition,
-}
-
-#[derive(Clone, Debug)]
-struct LastSearch {
-    query: String,
-    direction: SearchDirection,
-}
 
 #[derive(Clone, Debug)]
 struct SearchPrompt {
@@ -66,8 +53,8 @@ pub struct ReviewView {
     cols: u16,
     visual_anchor: Option<HistoryPosition>,
     visual_kind: VisualKind,
-    last_find: Option<LastFind>,
-    last_search: Option<LastSearch>,
+    navigation: SharedNavigation,
+    navigation_capture: NavigationCapture,
     search_prompt: Option<SearchPrompt>,
     table: Option<ReviewTable>,
     table_setup: Option<TableSetup>,
@@ -95,6 +82,8 @@ impl ReviewView {
         // Review opens at the source's independent review cursor, not at the
         // source application's cursor. render() exposes this as the overlay's
         // application cursor so normal cursor tracking starts from that point.
+        let snapshot = source.snapshot_with_history();
+        let (navigation, navigation_capture) = source.capture_review_navigation(&snapshot);
         let (document, cursor, viewport_top) = ReviewDocument::capture(source);
         let (rows, cols) = source.size();
         let mut review = Self {
@@ -110,8 +99,8 @@ impl ReviewView {
             cols,
             visual_anchor: None,
             visual_kind: VisualKind::Character,
-            last_find: None,
-            last_search: None,
+            navigation,
+            navigation_capture,
             search_prompt: None,
             table: None,
             table_setup: None,
@@ -278,7 +267,7 @@ impl ReviewView {
     fn finish_search(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
         let prompt = self.search_prompt.as_ref().expect("search prompt");
         let query = if prompt.query.is_empty() {
-            let Some(last) = &self.last_search else {
+            let Some(last) = self.navigation.borrow().search.clone() else {
                 sr.speak("no previous search", false)?;
                 return Ok(ViewAction::Bell);
             };
@@ -291,7 +280,7 @@ impl ReviewView {
             Ok(found) => found,
             Err(error) => return Self::announce_search_failure(sr, error),
         };
-        self.last_search = Some(LastSearch { query, direction });
+        self.navigation.borrow_mut().search = Some(LastSearch { query, direction });
         self.search_prompt = None;
         self.present_search_match(sr, found)
     }
@@ -305,6 +294,29 @@ impl ReviewView {
                 Ok(ViewAction::None)
             }
             Command::Exit => Ok(ViewAction::Pop),
+            Command::SetMark(name) => {
+                self.navigation
+                    .borrow_mut()
+                    .set_mark(&self.navigation_capture, name, self.cursor);
+                self.navigation_capture.marks[mark_index(name)] = Some(self.cursor);
+                self.queue_feedback(format!("mark {name} set"));
+                Ok(ViewAction::Redraw)
+            }
+            Command::JumpMark { name, exact } => {
+                let Some(mut target) = self.navigation_capture.marks[mark_index(name)] else {
+                    let state = if self.navigation.borrow().has_mark(name) {
+                        "unavailable"
+                    } else {
+                        "not set"
+                    };
+                    sr.speak(&format!("mark {name} {state}"), false)?;
+                    return Ok(ViewAction::Bell);
+                };
+                if !exact {
+                    target.col = self.document.line_first_nonblank(target.row);
+                }
+                self.move_with_table_context(sr, target)
+            }
             Command::StartVisual(kind) => {
                 self.visual_anchor.get_or_insert(self.cursor);
                 self.visual_kind = kind;
@@ -401,7 +413,7 @@ impl ReviewView {
                 Ok(ViewAction::Redraw)
             }
             Command::RepeatSearch { reverse, count } => {
-                let Some(last) = self.last_search.clone() else {
+                let Some(last) = self.navigation.borrow().search.clone() else {
                     sr.speak("no previous search", false)?;
                     return Ok(ViewAction::Bell);
                 };
@@ -821,21 +833,32 @@ impl ReviewView {
                 if destination == self.cursor {
                     return None;
                 }
-                self.last_find = Some(LastFind {
+                self.navigation.borrow_mut().find = Some(LastFind {
                     direction,
                     till,
                     target,
-                    matched,
                 });
                 Some(destination)
             }
             Motion::RepeatFind { reverse } => {
-                let mut find = self.last_find?;
+                let find = self.navigation.borrow().find?;
                 let forward = (find.direction == FindDirection::Forward) != reverse;
-                let start = if reverse { position } else { find.matched };
-                let matched =
+                let mut matched =
                     self.document
-                        .find_character(start, find.target, forward, false, count)?;
+                        .find_character(position, find.target, forward, false, 1)?;
+                // A till repeat skips an adjacent occurrence which would leave
+                // the cursor unchanged. Always start from today's cursor, not
+                // a cached match from an earlier motion or frozen document.
+                let skip = find.till && self.document.adjacent(matched, !forward) == Some(position);
+                if skip || count > 1 {
+                    matched = self.document.find_character(
+                        matched,
+                        find.target,
+                        forward,
+                        false,
+                        count - usize::from(!skip),
+                    )?;
+                }
                 let destination = if find.till {
                     self.document.adjacent(matched, !forward)?
                 } else {
@@ -844,8 +867,6 @@ impl ReviewView {
                 if destination == self.cursor {
                     return None;
                 }
-                find.matched = matched;
-                self.last_find = Some(find);
                 Some(destination)
             }
             Motion::Prompt { forward } => self.document.prompt(position, forward, count),
@@ -1449,6 +1470,236 @@ mod tests {
 
     fn input(view: &mut ReviewView, sr: &mut ScreenReader, bytes: &[u8]) -> ViewAction {
         view.handle_input(sr, bytes, &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn marks_survive_reopening_and_append_scrolling_with_exact_and_line_jumps() {
+        let (_, mut sr, _) = setup(b"");
+        let mut source = View::new(3, 30);
+        source.process_changes(b"  first\r\nsecond\r\nthird");
+        source.set_review_history_position(HistoryPosition { row: 0, col: 4 });
+        let mut view = ReviewView::new(&mut source);
+        input(&mut view, &mut sr, b"ma");
+        input(&mut view, &mut sr, b"q");
+        source.process_changes(b"\r\nfourth\r\nfifth");
+        let mut view = ReviewView::new(&mut source);
+        input(&mut view, &mut sr, b"G`a");
+        assert_eq!(view.cursor, HistoryPosition { row: 0, col: 4 });
+        input(&mut view, &mut sr, b"G'a");
+        assert_eq!(view.cursor, HistoryPosition { row: 0, col: 2 });
+    }
+
+    #[test]
+    fn marks_on_the_previous_cursor_row_survive_append_fragmentation() {
+        for chunks in [
+            vec![b"\r\nthird".as_slice()],
+            vec![b"\r\n".as_slice(), b"third".as_slice()],
+            vec![b"\r".as_slice(), b"\n".as_slice(), b"third".as_slice()],
+            b"\r\nthird".chunks(1).collect(),
+        ] {
+            let (_, mut sr, _) = setup(b"");
+            let mut source = View::new(2, 30);
+            source.process_changes(b"first\r\nsecond");
+            source.set_review_history_position(HistoryPosition { row: 1, col: 1 });
+            let mut review = ReviewView::new(&mut source);
+            input(&mut review, &mut sr, b"ma");
+            drop(review);
+            for chunk in chunks {
+                source.process_changes(chunk);
+            }
+            let mut reopened = ReviewView::new(&mut source);
+            input(&mut reopened, &mut sr, b"G`a");
+            assert_eq!(reopened.cursor, HistoryPosition { row: 1, col: 1 });
+        }
+    }
+
+    #[test]
+    fn frozen_marks_remain_local_after_source_replacement_but_cannot_escape_capture() {
+        let (_, mut sr, spoken) = setup(b"");
+        let mut source = View::new(3, 30);
+        source.process_changes(b"first\r\nsecond");
+        source.set_review_history_position(HistoryPosition { row: 0, col: 2 });
+        let mut view = ReviewView::new(&mut source);
+        // Even a same-text repaint cannot establish that the old row survived.
+        source.process_changes(b"\x1b[Hfirst");
+        input(&mut view, &mut sr, b"maG`a");
+        assert_eq!(view.cursor, HistoryPosition { row: 0, col: 2 });
+        let mut reopened = ReviewView::new(&mut source);
+        assert!(matches!(
+            input(&mut reopened, &mut sr, b"`a"),
+            ViewAction::Bell
+        ));
+        assert!(
+            spoken
+                .borrow()
+                .iter()
+                .any(|text| text == "mark a unavailable")
+        );
+        assert!(matches!(
+            input(&mut reopened, &mut sr, b"`z"),
+            ViewAction::Bell
+        ));
+        assert!(spoken.borrow().iter().any(|text| text == "mark z not set"));
+    }
+
+    #[test]
+    fn source_and_screen_navigation_are_isolated_and_searches_survive_reopening() {
+        let (_, mut sr, _) = setup(b"");
+        let mut source = View::new(3, 30);
+        source.process_changes(b"item one\r\nitem two\r\nitem three");
+        source.set_review_history_position(HistoryPosition { row: 2, col: 0 });
+        let mut view = ReviewView::new(&mut source);
+        input(&mut view, &mut sr, b"?item\rma");
+        assert_eq!(view.cursor.row, 1);
+        let mut reopened = ReviewView::new(&mut source);
+        input(&mut reopened, &mut sr, b"n");
+        assert_eq!(reopened.cursor.row, 1);
+        input(&mut reopened, &mut sr, b"N");
+        assert_eq!(reopened.cursor.row, 2);
+        input(&mut reopened, &mut sr, b"n");
+        assert_eq!(reopened.cursor.row, 1);
+        input(&mut reopened, &mut sr, b"?\r");
+        assert_eq!(reopened.cursor.row, 0);
+        let mut other = View::new(3, 30);
+        let other_review = ReviewView::new(&mut other);
+        assert!(other_review.navigation.borrow().search.is_none());
+        assert!(!other_review.navigation.borrow().has_mark('a'));
+        source.process_changes(b"\x1b[?1049hother");
+        let alternate = ReviewView::new(&mut source);
+        assert!(alternate.navigation.borrow().search.is_none());
+        assert!(!alternate.navigation.borrow().has_mark('a'));
+        source.process_changes(b"\x1b[?1049l");
+        let primary = ReviewView::new(&mut source);
+        assert_eq!(
+            primary.navigation.borrow().search.as_ref().unwrap().query,
+            "item"
+        );
+    }
+
+    #[test]
+    fn history_marks_survive_grid_repaint_but_reset_and_resize_invalidate() {
+        let (_, mut sr, _) = setup(b"");
+        for reset in [false, true] {
+            let mut source = View::new(2, 30);
+            source.process_changes(b"first\r\nsecond\r\nthird");
+            source.set_review_history_position(HistoryPosition { row: 0, col: 1 });
+            let mut view = ReviewView::new(&mut source);
+            input(&mut view, &mut sr, b"ma");
+            source.process_changes(b"\x1b[Hother");
+            let mut reopened = ReviewView::new(&mut source);
+            assert!(matches!(
+                input(&mut reopened, &mut sr, b"`a"),
+                ViewAction::Redraw
+            ));
+            if reset {
+                source.process_changes(b"\x1bc");
+            } else {
+                source.set_size(3, 15);
+            }
+            let mut reopened = ReviewView::new(&mut source);
+            assert!(matches!(
+                input(&mut reopened, &mut sr, b"`a"),
+                ViewAction::Bell
+            ));
+        }
+    }
+
+    #[test]
+    fn find_repeats_use_current_cursor_and_preserve_original_direction() {
+        let (mut view, mut sr, _) = setup(b"a x b x c x d x");
+        input(&mut view, &mut sr, b"fx;");
+        assert_eq!(view.cursor.col, 6);
+        input(&mut view, &mut sr, b"0;");
+        assert_eq!(view.cursor.col, 2);
+        input(&mut view, &mut sr, b"2;");
+        assert_eq!(view.cursor.col, 10);
+        input(&mut view, &mut sr, b",");
+        assert_eq!(view.cursor.col, 6);
+        input(&mut view, &mut sr, b";");
+        assert_eq!(view.cursor.col, 10);
+        input(&mut view, &mut sr, b"Fx,");
+        assert_eq!(view.cursor.col, 10);
+        input(&mut view, &mut sr, b";");
+        assert_eq!(view.cursor.col, 6);
+    }
+
+    #[test]
+    fn till_repeats_skip_stationary_matches_in_both_directions_and_counts() {
+        let (mut view, mut sr, _) = setup(b"a x b x c x d x");
+        input(&mut view, &mut sr, b"tx2;");
+        assert_eq!(view.cursor.col, 9);
+        input(&mut view, &mut sr, b",");
+        assert_eq!(view.cursor.col, 7);
+        input(&mut view, &mut sr, b",");
+        assert_eq!(view.cursor.col, 3);
+        input(&mut view, &mut sr, b";");
+        assert_eq!(view.cursor.col, 5);
+        input(&mut view, &mut sr, b"$Tx;");
+        assert_eq!(view.cursor.col, 7);
+        input(&mut view, &mut sr, b",");
+        assert_eq!(view.cursor.col, 9);
+    }
+
+    #[test]
+    fn partial_region_scroll_invalidates_marks_even_when_text_is_identical() {
+        let (_, mut sr, _) = setup(b"");
+        let mut source = View::new(3, 30);
+        source.process_changes(b"same\r\nsame\r\nsame\x1b[1;2r\x1b[2;1H");
+        source.set_review_history_position(HistoryPosition { row: 0, col: 1 });
+        let mut view = ReviewView::new(&mut source);
+        input(&mut view, &mut sr, b"ma");
+        source.process_changes(b"\n");
+        let mut reopened = ReviewView::new(&mut source);
+        assert!(matches!(
+            input(&mut reopened, &mut sr, b"`a"),
+            ViewAction::Bell
+        ));
+    }
+
+    #[test]
+    fn marks_created_from_unpresented_source_state_stay_local_until_fresh_capture() {
+        use crate::presentation::SurfaceId;
+        let (_, mut sr, _) = setup(b"");
+        let mut source = View::new(3, 30);
+        source.process_changes(b"first\r\nsecond");
+        source.set_review_history_position(HistoryPosition { row: 0, col: 1 });
+        source.enable_presentation_tracking();
+        source.process_changes(b"\r\nthird");
+        let frame = source.capture_live_presentation_frame(SurfaceId(1));
+        let mut old = ReviewView::new(&mut source);
+        input(&mut old, &mut sr, b"ma");
+        assert!(source.apply_presented_frame(frame));
+        let mut fresh = ReviewView::new(&mut source);
+        assert!(matches!(
+            input(&mut fresh, &mut sr, b"`a"),
+            ViewAction::Bell
+        ));
+        input(&mut fresh, &mut sr, b"gglma");
+        // A later parse invalidates the capture even while Review is frozen.
+        source.process_changes(b"\x1b[Hreplacement");
+        input(&mut fresh, &mut sr, b"G`a");
+        assert_eq!(fresh.cursor, HistoryPosition { row: 0, col: 1 });
+        let frame = source.capture_live_presentation_frame(SurfaceId(1));
+        assert!(source.apply_presented_frame(frame));
+        let mut reopened = ReviewView::new(&mut source);
+        assert!(matches!(
+            input(&mut reopened, &mut sr, b"`a"),
+            ViewAction::Bell
+        ));
+    }
+
+    #[test]
+    fn character_find_settings_survive_reopening_without_old_match_coordinates() {
+        let (_, mut sr, _) = setup(b"");
+        let mut source = View::new(3, 30);
+        source.process_changes(b"a x b x c x");
+        source.set_review_history_position(HistoryPosition { row: 0, col: 0 });
+        let mut view = ReviewView::new(&mut source);
+        input(&mut view, &mut sr, b"fx;");
+        assert_eq!(view.cursor.col, 6);
+        let mut reopened = ReviewView::new(&mut source);
+        input(&mut reopened, &mut sr, b";");
+        assert_eq!(reopened.cursor.col, 2);
     }
 
     #[test]
