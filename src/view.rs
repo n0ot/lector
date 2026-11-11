@@ -575,18 +575,22 @@ impl View {
                 // infer identity merely because replacement text is equal.
                 self.review_navigation[1].borrow_mut().invalidate_from(0);
             }
-        } else if update.printed_runs.iter().any(|run| !run.text.is_empty()) {
-            // Linear output may overwrite or extend its starting row. Rows
-            // before that cursor retain their absolute lineage through scroll.
-            let leading_lines = update
-                .printed_runs
-                .iter()
-                .take_while(|run| run.text.is_empty())
-                .filter(|run| run.boundary == crate::terminal::PrintBoundary::LineFeed)
-                .count();
-            self.review_navigation[old_screen_index]
-                .borrow_mut()
-                .invalidate_from(old_cursor_row.saturating_add(leading_lines));
+        } else {
+            // A run's boundary precedes its text, including when the observer
+            // coalesces a line feed with subsequent printing. Count that
+            // boundary before locating the first row that can be changed.
+            let mut leading_lines = 0;
+            for run in &update.printed_runs {
+                if run.boundary == crate::terminal::PrintBoundary::LineFeed {
+                    leading_lines += 1;
+                }
+                if !run.text.is_empty() {
+                    self.review_navigation[old_screen_index]
+                        .borrow_mut()
+                        .invalidate_from(old_cursor_row.saturating_add(leading_lines));
+                    break;
+                }
+            }
         }
         let synchronized_output_open_snapshot =
             self.engine.take_synchronized_output_open_snapshot();

@@ -1490,6 +1490,30 @@ mod tests {
     }
 
     #[test]
+    fn marks_on_the_previous_cursor_row_survive_append_fragmentation() {
+        for chunks in [
+            vec![b"\r\nthird".as_slice()],
+            vec![b"\r\n".as_slice(), b"third".as_slice()],
+            vec![b"\r".as_slice(), b"\n".as_slice(), b"third".as_slice()],
+            b"\r\nthird".chunks(1).collect(),
+        ] {
+            let (_, mut sr, _) = setup(b"");
+            let mut source = View::new(2, 30);
+            source.process_changes(b"first\r\nsecond");
+            source.set_review_history_position(HistoryPosition { row: 1, col: 1 });
+            let mut review = ReviewView::new(&mut source);
+            input(&mut review, &mut sr, b"ma");
+            drop(review);
+            for chunk in chunks {
+                source.process_changes(chunk);
+            }
+            let mut reopened = ReviewView::new(&mut source);
+            input(&mut reopened, &mut sr, b"G`a");
+            assert_eq!(reopened.cursor, HistoryPosition { row: 1, col: 1 });
+        }
+    }
+
+    #[test]
     fn frozen_marks_remain_local_after_source_replacement_but_cannot_escape_capture() {
         let (_, mut sr, spoken) = setup(b"");
         let mut source = View::new(3, 30);
