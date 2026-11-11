@@ -131,6 +131,9 @@ pub trait ViewController {
     fn place_application_cursor_at_review_cursor(&mut self) -> Option<ViewAction> {
         None
     }
+    /// Ends the logical session before removal from the interactive stack.
+    /// The presentation owner may stay alive until outstanding renders finish.
+    fn on_close(&mut self) {}
     fn wants_tick(&self) -> bool {
         false
     }

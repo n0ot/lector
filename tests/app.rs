@@ -8048,3 +8048,72 @@ fn bindings_reload_refresh_obeys_physical_presentation_receipts() {
     );
     assert!(pty.is_empty());
 }
+
+#[test]
+fn bindings_close_and_reopen_before_flush_retains_cursor_and_marks() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let mut pty = Vec::new();
+    let mut term = Vec::new();
+    app.handle_stdin(&mut sr, b"\x1b?", &mut pty, &mut term)
+        .unwrap();
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term, false).unwrap();
+    app.handle_stdin(&mut sr, b"/open the HTTP\r0ma", &mut pty, &mut term)
+        .unwrap();
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term, false).unwrap();
+    app.handle_stdin(&mut sr, b"q", &mut pty, &mut term)
+        .unwrap();
+    clock.advance_ms(4);
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    assert!(
+        app.drain_scheduled_output(&mut writer, false)
+            .unwrap()
+            .blocked
+    );
+    app.handle_stdin(&mut sr, b"\x1b?yy\x1bc", &mut pty, &mut term)
+        .unwrap();
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .last()
+            .unwrap()
+            .0
+            .contains("open the HTTP"),
+        "reopening must restore the logical cursor before the old view retires"
+    );
+    app.handle_stdin(&mut sr, b"gg`ayy\x1bc", &mut pty, &mut term)
+        .unwrap();
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .last()
+            .unwrap()
+            .0
+            .contains("open the HTTP"),
+        "unchanged document marks must survive reopening before flush"
+    );
+    writer.block_flush = false;
+    app.drain_scheduled_output(&mut writer, true).unwrap();
+    app.handle_stdin(&mut sr, b"gg`ayy\x1bc", &mut pty, &mut term)
+        .unwrap();
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .last()
+            .unwrap()
+            .0
+            .contains("open the HTTP")
+    );
+    assert!(pty.is_empty());
+}

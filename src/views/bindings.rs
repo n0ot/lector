@@ -46,6 +46,7 @@ impl Default for SessionState {
 pub(crate) struct BindingsSession(Rc<RefCell<SessionState>>);
 
 pub(crate) struct BindingsView {
+    closed: bool,
     review: ReviewView,
     session: BindingsSession,
     revision: Rc<Cell<u64>>,
@@ -185,6 +186,7 @@ impl BindingsView {
         let revision = sr.key_bindings().revision_observer();
         let rendered_revision = revision.get();
         Self {
+            closed: false,
             review,
             session,
             revision,
@@ -240,16 +242,6 @@ impl BindingsView {
     }
 }
 
-impl Drop for BindingsView {
-    fn drop(&mut self) {
-        let mut state = self.session.0.borrow_mut();
-        state.cursor = self.review.document_cursor();
-        state.entries = std::mem::take(&mut self.entries);
-        state.spans = std::mem::take(&mut self.spans);
-        state.cols = self.cols;
-    }
-}
-
 impl ViewController for BindingsView {
     fn as_any(&self) -> &dyn Any {
         self
@@ -265,6 +257,17 @@ impl ViewController for BindingsView {
     }
     fn kind(&self) -> ViewKind {
         ViewKind::Review
+    }
+    fn on_close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        let mut state = self.session.0.borrow_mut();
+        state.cursor = self.review.document_cursor();
+        state.entries = self.entries.clone();
+        state.spans = self.spans.clone();
+        state.cols = self.cols;
     }
     fn wants_tick(&self) -> bool {
         self.revision.get() != self.rendered_revision
@@ -318,7 +321,7 @@ impl ViewController for BindingsView {
     }
     fn on_resize(&mut self, rows: u16, cols: u16) {
         self.review.on_resize(rows, cols);
-        if cols != self.cols {
+        if !self.closed && cols != self.cols {
             self.replace_entries(self.entries.clone(), cols);
         }
     }
@@ -378,6 +381,27 @@ mod tests {
             .unwrap();
         &view.entries[index].id
     }
+    #[test]
+    fn retired_view_destruction_cannot_overwrite_a_newer_session() {
+        let (mut sr, _) = setup();
+        let session = BindingsSession::default();
+        let mut old = BindingsView::new(10, 80, session.clone(), &sr);
+        jump(&mut old, &mut sr, "review:gx");
+        old.on_close();
+        let mut current = BindingsView::new(10, 80, session.clone(), &sr);
+        jump(&mut current, &mut sr, "normal:M-r");
+        input(&mut current, &mut sr, b"ma");
+        current.on_close();
+        drop(current);
+        // Presentation retirement may resize an older owner before dropping it.
+        old.on_resize(8, 70);
+        drop(old);
+        let mut reopened = BindingsView::new(10, 80, session, &sr);
+        assert_eq!(current_id(&reopened), "normal:M-r");
+        input(&mut reopened, &mut sr, b"gg`a");
+        assert_eq!(current_id(&reopened), "normal:M-r");
+    }
+
     #[test]
     fn refresh_keeps_an_in_progress_search() {
         let (mut sr, _) = setup();
@@ -459,6 +483,7 @@ mod tests {
         assert_eq!(current_id(&view), "review:gx");
         input(&mut view, &mut sr, b"0mayy");
         assert!(sr.clipboard_text().unwrap().contains("open the HTTP"));
+        view.on_close();
         drop(view);
         let mut view = BindingsView::new(10, 80, session, &sr);
         input(&mut view, &mut sr, b"gg`a");
