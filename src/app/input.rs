@@ -453,6 +453,30 @@ impl App {
                         }
                         return Ok(());
                     }
+                    if matches!(action, commands::Action::OpenBindings) {
+                        if self
+                            .view_stack
+                            .active_mut()
+                            .as_any()
+                            .is::<views::BindingsView>()
+                        {
+                            sr.speak("bindings already open", false)?;
+                        } else {
+                            let (rows, cols) = self.view_stack.active_mut().model().live_size();
+                            let session = self
+                                .bindings_session
+                                .get_or_insert_with(Default::default)
+                                .clone();
+                            let bindings = views::BindingsView::new(rows, cols, session, sr);
+                            self.handle_view_action(
+                                sr,
+                                views::ViewAction::Push(Box::new(bindings)),
+                                term_out,
+                            )?;
+                        }
+                        self.consumed_key_presses.insert(key_id);
+                        return Ok(());
+                    }
                     if matches!(action, commands::Action::OpenReview) {
                         self.open_review(sr, false, term_out)?;
                         self.consumed_key_presses.insert(key_id);

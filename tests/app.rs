@@ -7913,3 +7913,138 @@ fn standard_clock_constructor_exposes_idle_terminal_state() {
     assert!(!app.wants_tick());
     assert_eq!(app.debug_active_view_contents(), "\n\n");
 }
+
+#[test]
+fn bindings_overlay_runtime_lua_refresh_and_source_navigation_are_independent() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("init.lua");
+    fs::write(
+        &config,
+        r#"
+        lector.bindings["M-z"] = {"update descriptions", function()
+            lector.bindings["M-z"] = {"updated description", function() end}
+        end}
+    "#,
+    )
+    .unwrap();
+    lua::setup(config, true, &mut sr, |_| Ok(())).unwrap();
+    let mut pty = Vec::new();
+    let mut term = Vec::new();
+    app.handle_pty(&mut sr, b"alpha beta\x1b[H", &mut term)
+        .unwrap();
+    app.handle_stdin(&mut sr, b"\x1brwmaq", &mut pty, &mut term)
+        .unwrap();
+    app.handle_stdin(&mut sr, b"\x1b?", &mut pty, &mut term)
+        .unwrap();
+    app.handle_stdin(&mut sr, b"/update descriptions\r0mayy", &mut pty, &mut term)
+        .unwrap();
+    app.handle_stdin(&mut sr, b"\x1bc", &mut pty, &mut term)
+        .unwrap();
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text.contains("update descriptions"))
+    );
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bz", &mut pty, &mut term)
+        .unwrap();
+    app.handle_tick(&mut sr, &mut pty, &mut term).unwrap();
+    app.handle_stdin(&mut sr, b"yy", &mut pty, &mut term)
+        .unwrap();
+    app.handle_stdin(&mut sr, b"\x1bc", &mut pty, &mut term)
+        .unwrap();
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text.contains("updated description"))
+    );
+    app.handle_stdin(&mut sr, b"q\x1br`ayiwq", &mut pty, &mut term)
+        .unwrap();
+    app.handle_stdin(&mut sr, b"\x1b[18~", &mut pty, &mut term)
+        .unwrap();
+    assert_eq!(pty, b"beta");
+    pty.clear();
+    assert!(pty.is_empty());
+}
+
+#[test]
+fn bindings_reload_refresh_obeys_physical_presentation_receipts() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("init.lua");
+    fs::write(
+        &config,
+        r#"lector.bindings["M-z"] = {"original description", function() end}"#,
+    )
+    .unwrap();
+    lua::setup(config.clone(), true, &mut sr, |_| Ok(())).unwrap();
+    let mut pty = Vec::new();
+    let mut term = Vec::new();
+    app.handle_stdin(&mut sr, b"\x1b?", &mut pty, &mut term)
+        .unwrap();
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term, false).unwrap();
+    app.handle_stdin(&mut sr, b"/original description\r", &mut pty, &mut term)
+        .unwrap();
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term, false).unwrap();
+    app.handle_tick(&mut sr, &mut pty, &mut term).unwrap();
+    fs::write(
+        &config,
+        r#"lector.bindings["M-z"] = {"replacement description", function() end}"#,
+    )
+    .unwrap();
+    app.handle_stdin(&mut sr, b"\x1bR", &mut pty, &mut term)
+        .unwrap();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_tick(&mut sr, &mut pty, &mut term).unwrap();
+    assert!(
+        recorder.inner.borrow().speaks.is_empty(),
+        "refresh must not auto-read the buffer"
+    );
+    clock.advance_ms(4);
+    let mut writer = FlushGateWriter {
+        block_flush: true,
+        ..FlushGateWriter::default()
+    };
+    assert!(
+        app.drain_scheduled_output(&mut writer, false)
+            .unwrap()
+            .blocked
+    );
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty, &mut term)
+        .unwrap();
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .last()
+            .unwrap()
+            .0
+            .contains("original description")
+    );
+    writer.block_flush = false;
+    app.drain_scheduled_output(&mut writer, true).unwrap();
+    app.handle_stdin(&mut sr, b"\x1bi", &mut pty, &mut term)
+        .unwrap();
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .last()
+            .unwrap()
+            .0
+            .contains("replacement description")
+    );
+    assert!(pty.is_empty());
+}

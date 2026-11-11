@@ -697,6 +697,116 @@ fn motion_for_key(key: Key) -> Option<Motion> {
     }
 }
 
+/// Review grammar; runtime bindings are listed separately and take precedence.
+pub(crate) const HELP_BINDINGS: &[(&str, &str)] = &[
+    ("q", "close Review and return to the underlying view"),
+    (
+        "Escape",
+        "cancel pending input, search or selection; otherwise announce review mode",
+    ),
+    ("[count]", "prefix a motion or yank with a decimal count"),
+    ("h / Left", "move to the previous character"),
+    ("j / Down", "move to the next line"),
+    ("k / Up", "move to the previous line"),
+    ("l / Right", "move to the next character"),
+    ("w / W", "next word / whitespace-delimited word"),
+    ("b / B", "previous word / whitespace-delimited word"),
+    ("e / E", "end of word / whitespace-delimited word"),
+    (
+        "0 / ^ / $",
+        "line start / first nonblank character / line end",
+    ),
+    (
+        "gg / G",
+        "first / last document line; a count selects a line",
+    ),
+    ("C-b / C-u", "previous page"),
+    ("C-f / C-d", "next page"),
+    (
+        "zt / zz / zb",
+        "place current line at viewport top / middle / bottom",
+    ),
+    (
+        "zEnter / z. / z-",
+        "place line at top / middle / bottom and move to first nonblank",
+    ),
+    ("[p / ]p", "previous / next semantic shell prompt"),
+    (
+        "f{char} / F{char}",
+        "find character forward / backward on the logical line",
+    ),
+    (
+        "t{char} / T{char}",
+        "move up to character forward / backward on the logical line",
+    ),
+    (
+        "; / ,",
+        "repeat character find in its original / opposite direction",
+    ),
+    ("%", "jump to matching parenthesis, bracket or brace"),
+    ("m{a-z}", "set a named mark in this source document"),
+    (
+        "'{a-z}",
+        "jump to marked line at its first nonblank character",
+    ),
+    ("`{a-z}", "jump to the exact marked position"),
+    (
+        "/pattern / ?pattern",
+        "search forward / backward with a regular expression",
+    ),
+    (
+        "n / N",
+        "repeat the last search in its original / opposite direction",
+    ),
+    (
+        "Search: Enter",
+        "accept search; empty input reuses the previous pattern",
+    ),
+    (
+        "Search: Backspace / C-u",
+        "delete a character / clear the search input",
+    ),
+    (
+        "y{motion} / yy",
+        "copy a motion range / whole lines to the default register",
+    ),
+    (
+        "yiw / yaw / yiW / yaW",
+        "copy inner / outer word or whitespace-delimited word",
+    ),
+    (
+        "v / V",
+        "start or toggle characterwise / linewise selection",
+    ),
+    (
+        "Visual: y",
+        "copy the selection to the selected or default register",
+    ),
+    (
+        "\"\"y / \"+y",
+        "prefix a yank with Lector's internal / system clipboard register",
+    ),
+    ("gx", "open the HTTP or HTTPS link under the Review cursor"),
+    (
+        "gy / \"\"gy",
+        "copy the link destination to Lector's internal clipboard",
+    ),
+    ("\"+gy", "copy the link destination to the system clipboard"),
+    ("gt / gT", "detect a table / start manual table setup"),
+    ("gB / gR", "mark the table bottom row / right edge"),
+    ("gH", "toggle the current table column as row header"),
+    ("[| / ]|", "previous / next table cell"),
+    ("{| / }|", "table cell above / below"),
+    ("Table setup: Space", "toggle a column start at the cursor"),
+    ("Table setup: H", "cycle header mode"),
+    ("Table setup: c", "edit the current column name"),
+    (
+        "Column name: Enter / Escape / C-u",
+        "save / cancel / clear the name",
+    ),
+    ("Table setup: Enter / Escape", "accept / cancel table setup"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::{

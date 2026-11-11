@@ -1,3 +1,4 @@
+mod bindings;
 mod lua_repl;
 mod message;
 mod popup;
@@ -11,6 +12,7 @@ mod tmux_connection;
 mod tmux_connections;
 mod tmux_portal;
 
+pub(crate) use bindings::{BindingsSession, BindingsView};
 pub use lua_repl::{LuaReplSession, LuaReplView};
 pub use message::MessageView;
 pub use popup::{PopupResponse, PopupView};

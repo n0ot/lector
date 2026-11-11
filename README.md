@@ -496,6 +496,20 @@ You don’t need to memorize everything. Help Mode will tell you what each key d
 
 ### Review overlay (reading past output)
 
+Press `M-?` (Alt+?) to open a searchable buffer of current bindings. It lists
+normal, table, and table-setup bindings, including Lua descriptions and inherited
+normal bindings, followed by Review command syntax. Configured bindings take
+precedence over Review keys. Use Review movement, `/` or `?`, marks, and yanks;
+`q` returns to the underlying view. The `open_bindings` action can be rebound.
+
+This buffer has its own saved cursor, marks, search, and character-find state.
+Runtime binding edits and successful configuration reloads refresh it while it
+is open without reading the whole buffer aloud. The cursor stays with the same
+binding; if that entry disappears, it moves to the next surviving entry, then
+the previous one. Content changes or rewrapping invalidate this buffer's marks
+and selections while retaining search state. Application Review memory remains
+independent.
+
 Press `M-r` to capture the current screen and retained scrollback in a frozen
 Review overlay. Output from the running application continues in the
 background, but cannot move or replace the snapshot. Press `q` to leave Review

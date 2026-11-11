@@ -60,6 +60,7 @@ macro_rules! define_actions {
                     Action::SayOverlay
                         | Action::ToggleReviewCursorFollowsScreenCursor
                         | Action::OpenReview
+                        | Action::OpenBindings
                         | Action::RevLinePrev
                         | Action::RevLineNext
                         | Action::RevLinePrevNonBlank
@@ -124,6 +125,7 @@ define_actions! {
     ReloadConfig => ("reload Lua configuration", "reload_config"),
     OpenLuaRepl => ("open Lua REPL", "open_lua_repl"),
     OpenReview => ("enter review mode", "open_review"),
+    OpenBindings => ("show current key bindings", "open_bindings"),
     OpenTmuxConnectionChooser => (
         "open tmux connection chooser",
         "open_tmux_connection_chooser"
@@ -301,6 +303,7 @@ pub fn handle(
         | Action::ReloadConfig
         | Action::OpenLuaRepl
         | Action::OpenReview
+        | Action::OpenBindings
         | Action::OpenTmuxConnectionChooser
         | Action::RenameTmuxConnection
         | Action::OpenTmuxSessionChooser
