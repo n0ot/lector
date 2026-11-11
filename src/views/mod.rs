@@ -52,6 +52,7 @@ impl Error {
 }
 
 pub enum ViewAction {
+    OpenUrl(String),
     None,
     Bell,
     PtyInput,

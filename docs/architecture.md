@@ -26,6 +26,11 @@ Bounded workers isolate side effects that may block:
   and independently negotiates rate, pitch, volume, and voice operations. The host submits
   only Lector's one active utterance to the backend; the host-independent
   Lector manager keeps all never-submitted speech bounded.
+- Explicit Review URL opening uses one worker owned by `App`. The worker
+  launches the desktop helper with one literal URL argument and null standard
+  streams, waits for it, and reaps it even if the overlay closes. A bounded
+  result channel is polled at 50 ms deadlines while pending. Repeated requests
+  report busy; shutdown does not wait for or kill a long-lived browser helper.
 - `diagnostics` owns log output. Producers enqueue records into a byte-bounded
   queue, and the event loop never performs the underlying file or stderr I/O.
 

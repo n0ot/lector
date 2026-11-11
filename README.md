@@ -570,6 +570,30 @@ local to that frozen Review. Existing marks remain usable in the open frozen
 snapshot even while the source changes; reopening checks their validity. State
 is kept in memory only and disappears when Lector exits.
 
+Review also provides link commands at its vi navigation cursor:
+
+- `gx` opens an HTTP or HTTPS link with the desktop URL handler (`open` on
+  macOS, `xdg-open` on Linux). Opening is explicit and never changes mouse
+  handling in the underlying application.
+- `gy` copies its destination to Lector's internal clipboard, regardless of the
+  configured default register. `""gy` explicitly selects the internal clipboard;
+  `"+gy` copies to the system clipboard using the configured provider. Ordinary
+  yanks still honor the default register.
+
+OSC 8 link metadata takes precedence over the visible label and preserves the
+exact destination for copying, including non-HTTP schemes. Without metadata,
+Lector recognizes HTTP(S) URLs under the cursor across terminal soft wraps,
+but never joins hard newlines. Whitespace, quotes, backticks, and angle brackets
+end a plain-text URL; trailing sentence punctuation and unmatched closing
+brackets are excluded. Encoded punctuation avoids that plain-text ambiguity.
+The separate Lector inspection cursor does not change the target of `gx`/`gy`;
+`M-{` can first move the vi cursor to that inspection position.
+
+The desktop opener runs independently of terminal input and Review's lifetime.
+Failures are spoken. Only one opener may run at a time; another `gx` reports
+that it is busy. Some Linux handlers remain running until the browser closes;
+Lector does not kill the browser to enforce a timeout. `gy` remains available.
+
 Invalid chords, unavailable prompt/search/find targets, unmatched `%` braces,
 and motions past a boundary ring the terminal bell. Ordinary Lector review
 commands (`M-u`/`M-o`, `M-j`/`M-l`, and so on) remain available in the overlay

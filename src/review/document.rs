@@ -27,6 +27,7 @@ struct Cell {
     text: String,
     wide_continuation: bool,
     style: Style,
+    hyperlink: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +107,7 @@ impl ReviewDocument {
                 cells.push(Cell {
                     text,
                     wide_continuation,
+                    hyperlink: cell.and_then(|cell| cell.hyperlink.clone()),
                     style: cell.map_or_else(Style::default, |cell| cell.style.clone()),
                 });
             }
@@ -137,6 +139,29 @@ impl ReviewDocument {
         let mut view = View::new(rows, cols);
         view.process_changes(text);
         Self::capture(&mut view).0
+    }
+
+    /// Resolve only the exact cursor cell, using frozen OSC 8 metadata before
+    /// conservative plain-text detection. Search text already joins soft wraps
+    /// and inserts a newline at every hard row boundary.
+    pub(crate) fn link_at(&self, position: HistoryPosition) -> Option<String> {
+        let cell = self.cell(position.row, position.col)?;
+        if let Some(uri) = &cell.hyperlink {
+            return Some(uri.clone());
+        }
+        let position = if cell.wide_continuation {
+            HistoryPosition {
+                row: position.row,
+                col: self.clamp_col(position.row, position.col),
+            }
+        } else {
+            position
+        };
+        if let Some(uri) = &self.cell(position.row, position.col)?.hyperlink {
+            return Some(uri.clone());
+        }
+        let offset = self.flat_positions.iter().position(|p| *p == position)?;
+        super::links::plain_url_at(&self.flat_text, offset).map(str::to_owned)
     }
 
     pub(crate) fn row_count(&self) -> usize {
@@ -982,6 +1007,60 @@ fn write_color(bytes: &mut Vec<u8>, color: Color, foreground: bool) {
             )
             .as_bytes(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_osc8_links_override_label_text_and_remain_copyable() {
+        let mut source = View::new(3, 40);
+        source.process_changes(b"\x1b]8;;custom:destination\x07https://example.test\x1b]8;;\x07");
+        let document = ReviewDocument::capture(&mut source).0;
+        source.process_changes(b"\r\x1b[2Kreplacement");
+        assert_eq!(
+            document
+                .link_at(HistoryPosition { row: 0, col: 4 })
+                .as_deref(),
+            Some("custom:destination")
+        );
+        assert_eq!(document.link_at(HistoryPosition { row: 0, col: 25 }), None);
+    }
+
+    #[test]
+    fn plain_urls_join_soft_wraps_but_not_hard_newlines() {
+        let document = ReviewDocument::from_text(4, 12, b"https://example.test/path");
+        assert_eq!(
+            document
+                .link_at(HistoryPosition { row: 1, col: 3 })
+                .as_deref(),
+            Some("https://example.test/path")
+        );
+        let document = ReviewDocument::from_text(4, 40, b"https://example.test\r\n/path");
+        assert_eq!(
+            document
+                .link_at(HistoryPosition { row: 0, col: 4 })
+                .as_deref(),
+            Some("https://example.test")
+        );
+        assert_eq!(document.link_at(HistoryPosition { row: 1, col: 2 }), None);
+    }
+
+    #[test]
+    fn wide_link_labels_resolve_at_both_columns_and_in_history() {
+        let document = ReviewDocument::from_text(
+            2,
+            20,
+            "\x1b]8;;https://example.test\x07界\x1b]8;;\x07\r\nx\r\ny".as_bytes(),
+        );
+        for col in [0, 1] {
+            assert_eq!(
+                document.link_at(HistoryPosition { row: 0, col }).as_deref(),
+                Some("https://example.test")
+            );
+        }
     }
 }
 

@@ -2841,6 +2841,9 @@ impl App {
         pty_out: &mut dyn Write,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        if let Some(Err(error)) = self.url_opener.poll(self.clock.now_ms()) {
+            sr.speak(&format!("could not open link: {error}"), false)?;
+        }
         self.drive_lua_automation(sr, pty_out, term_out)?;
         self.expire_tmux_gateway_terminators(sr, term_out)?;
         self.advance_graceful_tmux_teardown(sr, term_out)?;

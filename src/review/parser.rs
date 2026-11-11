@@ -87,6 +87,8 @@ pub(crate) enum Command {
         reverse: bool,
         count: usize,
     },
+    OpenLink,
+    CopyLink(ClipboardRegister),
     DetectTable,
     StartTableSetup,
     MarkTableBottom,
@@ -402,6 +404,10 @@ impl Parser {
         let count = pending_count.unwrap_or(1).max(1);
         if self.visual.is_none() {
             let command = match (prefix, key) {
+                (Prefix::G, Key::Char('x')) => Some(Command::OpenLink),
+                (Prefix::G, Key::Char('y')) => Some(Command::CopyLink(
+                    self.register.unwrap_or(ClipboardRegister::Internal),
+                )),
                 (Prefix::G, Key::Char('t')) => Some(Command::DetectTable),
                 (Prefix::G, Key::Char('T')) => Some(Command::StartTableSetup),
                 (Prefix::G, Key::Char('B')) => Some(Command::MarkTableBottom),
@@ -702,6 +708,23 @@ mod tests {
 
     fn feed(parser: &mut Parser, keys: &[Key]) -> Vec<Command> {
         keys.iter().copied().map(|key| parser.feed(key)).collect()
+    }
+
+    #[test]
+    fn link_commands_use_explicit_registers_and_reset_after_use() {
+        let mut parser = Parser::default();
+        for (keys, expected) in [
+            ("gx", Command::OpenLink),
+            ("gy", Command::CopyLink(ClipboardRegister::Internal)),
+            ("\"+gy", Command::CopyLink(ClipboardRegister::System)),
+            ("gy", Command::CopyLink(ClipboardRegister::Internal)),
+            ("\"\"gy", Command::CopyLink(ClipboardRegister::Internal)),
+        ] {
+            let commands: Vec<_> = keys.chars().map(|ch| parser.feed(Key::Char(ch))).collect();
+            assert_eq!(commands.last(), Some(&expected), "{keys}");
+        }
+        assert_eq!(parser.feed(Key::Char('y')), Command::None);
+        assert_eq!(parser.feed(Key::Char('y')), Command::YankLine(1, None));
     }
 
     #[test]
@@ -1038,7 +1061,7 @@ mod tests {
     fn invalid_chords_bell_and_reset() {
         let mut parser = Parser::default();
         assert_eq!(
-            feed(&mut parser, &[Key::Char('g'), Key::Char('x')]),
+            feed(&mut parser, &[Key::Char('g'), Key::Char('Q')]),
             vec![Command::None, Command::Bell]
         );
         assert_eq!(

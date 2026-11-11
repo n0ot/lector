@@ -172,6 +172,59 @@ mod stabilization_tests {
     }
 
     #[test]
+    fn desktop_opener_pending_work_uses_deadlines_and_reports_failure_after_review_closes() {
+        use crate::{screen_reader::ScreenReader, speech};
+        use std::{cell::RefCell, rc::Rc, sync::mpsc};
+        struct Recorder(Rc<RefCell<Vec<String>>>);
+        impl speech::Driver for Recorder {
+            fn speak(&mut self, text: &str, _: bool) -> anyhow::Result<()> {
+                self.0.borrow_mut().push(text.to_owned());
+                Ok(())
+            }
+            fn stop(&mut self) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn get_rate(&self) -> f32 {
+                1.0
+            }
+            fn set_rate(&mut self, _: f32) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let mut app = App::new(ViewStack::new(Box::new(PtyView::new(4, 20)))).unwrap();
+        let spoken = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(Recorder(spoken.clone()))));
+        let (release, wait) = mpsc::channel();
+        let now = app.clock.now_ms();
+        app.url_opener
+            .open_with("https://example.test", now, move |_| {
+                wait.recv().unwrap();
+                Err("modeled opener failure".into())
+            })
+            .unwrap();
+        assert!(!app.has_overlay());
+        assert_eq!(app.url_opener.next_poll_ms(), Some(now + 50));
+        assert!(
+            app.scheduled_output_timeout()
+                .is_some_and(|timeout| timeout <= std::time::Duration::from_millis(50))
+        );
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while app.url_opener.next_poll_ms().is_some() {
+            app.handle_tick(&mut sr, &mut Vec::new(), &mut Vec::new())
+                .unwrap();
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(
+            spoken
+                .borrow()
+                .iter()
+                .any(|text| text.contains("modeled opener failure"))
+        );
+    }
+
+    #[test]
     fn application_transaction_blocks_every_commit_reason_and_deadline() {
         let update = PresentedUpdateStatus {
             synchronized_output_closed: true,
@@ -1165,6 +1218,7 @@ impl Clock for StdClock {
 }
 
 pub struct App {
+    url_opener: crate::review::links::UrlOpener,
     view_stack: views::ViewStack,
     pending_input: VecDeque<u8>,
     pending_input_last_at: Option<u128>,
@@ -1597,6 +1651,7 @@ impl App {
         let geometry = view_stack.root_mut().model().live_screen().geometry;
         let physical_profile = PhysicalTerminalProfile::conservative(geometry);
         let mut app = Self {
+            url_opener: crate::review::links::UrlOpener::default(),
             view_stack,
             pending_input: VecDeque::new(),
             pending_input_last_at: None,
@@ -2307,6 +2362,7 @@ impl App {
             .chain(pane_resync_deadline)
             .chain(pending_input_deadline)
             .chain(lua_automation_deadline)
+            .chain(self.url_opener.next_poll_ms())
             .chain(accessibility_deadline)
             .chain(
                 self.pending_force_abandon
@@ -2494,7 +2550,10 @@ impl App {
         } else {
             !self.pending_tmux_commands.is_empty()
         };
-        presented_transition_ready
+        self.url_opener
+            .next_poll_ms()
+            .is_some_and(|deadline| deadline <= self.clock.now_ms())
+            || presented_transition_ready
             || pending_read_ready
             || !self.pending_tmux_background_output.is_empty()
             || self.view_stack.active_mut().wants_tick()
