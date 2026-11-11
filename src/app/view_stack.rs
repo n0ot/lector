@@ -102,6 +102,12 @@ impl App {
                 .note_forwarded_application_input();
         }
         match action {
+            views::ViewAction::OpenUrl(url) => {
+                match self.url_opener.open(&url, self.clock.now_ms()) {
+                    Ok(()) => sr.speak("opening link", false)?,
+                    Err(error) => sr.speak(&format!("could not open link: {error}"), false)?,
+                };
+            }
             views::ViewAction::PtyInput => {
                 self.last_stdin_update = Some(self.clock.now_ms());
             }

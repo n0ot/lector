@@ -126,3 +126,25 @@ fn harness_script_terminal_differential_corpus() {
     let mut harness = Harness::new(24, 80).expect("create harness");
     harness.run_script(script).expect("run script");
 }
+
+#[test]
+fn review_link_copy_uses_frozen_osc8_and_plain_text_destinations() {
+    let mut harness = Harness::new(4, 40).unwrap();
+    harness
+        .run_script(
+            r"
+Scenario: an OSC 8 label copies its destination through Review
+When pty-stdout: \x1b]8;;https://example.test/path\x07label\x1b]8;;\x07\x1b[H
+And stdin: \x1brgyq
+And stdin: \x1b[18~
+Then expect-pty-stdin: https://example.test/path
+
+Scenario: a plain text URL copies without its surrounding punctuation
+When pty-stdout: (https://example.test/path).\x1b[H
+And stdin: \x1brlgyq
+And stdin: \x1b[18~
+Then expect-pty-stdin: https://example.test/path
+",
+        )
+        .unwrap();
+}

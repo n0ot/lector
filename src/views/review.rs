@@ -431,6 +431,17 @@ impl ReviewView {
                 };
                 self.present_search_match(sr, found)
             }
+            Command::OpenLink | Command::CopyLink(_) => {
+                let Some(url) = self.document.link_at(self.cursor) else {
+                    sr.speak("no link at cursor", false)?;
+                    return Ok(ViewAction::Bell);
+                };
+                if let Command::CopyLink(register) = command {
+                    self.yank(sr, Some(register), url)
+                } else {
+                    Ok(ViewAction::OpenUrl(url))
+                }
+            }
             Command::DetectTable => self.detect_table(sr),
             Command::StartTableSetup => self.start_table_setup(sr),
             Command::MarkTableBottom => self.mark_table_bottom(sr),
@@ -1204,7 +1215,7 @@ impl ReviewView {
         for key in keys {
             let action = self.handle_review_key(sr, key)?;
             match action {
-                ViewAction::Pop | ViewAction::Bell => return Ok(action),
+                ViewAction::Pop | ViewAction::Bell | ViewAction::OpenUrl(_) => return Ok(action),
                 ViewAction::Redraw => result = ViewAction::Redraw,
                 ViewAction::RedrawSilently => result = ViewAction::RedrawSilently,
                 ViewAction::None => {}
@@ -2160,6 +2171,38 @@ mod tests {
             ViewAction::Redraw
         ));
         assert_eq!(view.cursor.col, 10);
+    }
+
+    #[test]
+    fn link_actions_use_frozen_metadata_and_explicit_clipboard_semantics() {
+        let (mut view, mut sr, spoken) =
+            setup(b"\x1b]8;;https://example.test/target\x07label\x1b]8;;\x07");
+        sr.set_clipboard_default_register(ClipboardRegister::System);
+        sr.set_system_clipboard_provider(SystemClipboardProvider::Osc52);
+        input(&mut view, &mut sr, b"gy");
+        assert_eq!(sr.clipboard_text(), Some("https://example.test/target"));
+        assert!(sr.take_terminal_clipboard_writes().is_empty());
+        input(&mut view, &mut sr, b"\"+gy");
+        assert_eq!(sr.take_terminal_clipboard_writes().len(), 1);
+        input(&mut view, &mut sr, b"\"\"gy");
+        assert!(sr.take_terminal_clipboard_writes().is_empty());
+        assert!(
+            matches!(input(&mut view, &mut sr, b"gx"), ViewAction::OpenUrl(url) if url == "https://example.test/target")
+        );
+        assert!(spoken.borrow().iter().any(|text| text == "copied"));
+        // The new command's default does not change ordinary yank defaults.
+        input(&mut view, &mut sr, b"yiw");
+        assert_eq!(sr.take_terminal_clipboard_writes().len(), 1);
+    }
+
+    #[test]
+    fn absent_links_announce_without_copy_or_open() {
+        let (mut view, mut sr, spoken) = setup(b"ordinary text");
+        for keys in [b"gx", b"gy"] {
+            assert!(matches!(input(&mut view, &mut sr, keys), ViewAction::Bell));
+        }
+        assert_eq!(sr.clipboard_text(), None);
+        assert_eq!(*spoken.borrow(), ["no link at cursor", "no link at cursor"]);
     }
 
     #[test]
