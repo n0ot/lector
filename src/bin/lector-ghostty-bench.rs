@@ -1082,9 +1082,7 @@ fn run_compositor_workload(
     let allocations = ALLOCATIONS.load(Ordering::Relaxed);
     let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
     if router.is_some()
-        && !app
-            .debug_active_view_contents()
-            .contains(&format!("pane {:06}", update_count - 1))
+        && app.debug_active_view_contents().trim_end() != format!("pane {:06}", update_count - 1)
     {
         return Err("tmux pane output was not published to the active view".into());
     }
@@ -1190,7 +1188,7 @@ fn benchmark_tmux_connection(
     )?;
     app.drain_scheduled_output(writer, true)
         .map_err(|e| e.to_string())?;
-    if !app.debug_active_view_contents().contains("ready") {
+    if app.debug_active_view_contents().trim_end() != "ready" {
         return Err("benchmark tmux pane bootstrap did not publish ready state".into());
     }
     Ok(router)
