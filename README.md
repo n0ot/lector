@@ -26,7 +26,7 @@ maintainer diagnostics are documented in
 [docs/ghostty-builds.md](docs/ghostty-builds.md).
 
 For a concise map of runtime ownership, data flow, concurrency boundaries, and
-source directories, see [docs/architecture.md](docs/architecture.md).
+source directories, see [architecture source map](docs/architecture.md#source-map).
 The [documentation index](docs/README.md) and [contributor guide](CONTRIBUTING.md)
 collect the deeper design notes and verification commands.
 

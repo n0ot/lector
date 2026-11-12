@@ -86,8 +86,9 @@ Control mode adds parsing and `send-keys -H` routing, but no timer-based delay.
 ## Regression and latency gates
 
 `tests/live_pty.rs` drives a real physical PTY and a headless Ghostty oracle.
-It measures 20 key-to-pixel samples for each of direct terminal, ordinary tmux,
-and tmux control mode. The median must remain below 25 ms and p95 below 100 ms;
+It measures 20 key-to-pixel samples for the direct terminal using a project-built
+fixture. External tmux compatibility tests live in `tests/suite_tmux.rs` and run only
+through the Docker harness; they cover ordinary tmux and control mode. The median must remain below 25 ms and p95 below 100 ms;
 the wider tail bound avoids turning normal host scheduling noise into flaky
 failures while the median catches a reintroduced polling floor.
 
@@ -147,6 +148,14 @@ Existing history, renderer, scheduler/backpressure and media ceilings are
 preserved. New report fields are additive; baseline consumers must require all
 six compositor workloads, as the benchmark contract test does.
 
+The merged [row-mutation report](../benchmarks/results/row-mutation-01a7858/README.md)
+records paired compositor measurements and raw artifacts with unchanged gates.
+Its five measured pairs on one Apple M1 Pro/macOS aarch64 environment showed
+lower pane/overlay composition time with identical allocation and byte counters;
+small collateral timing increases remain disclosed. These measurements cover
+that machine and the report's measurement fences, not other platforms or
+end-to-end user latency. Release profile defaults remain unchanged.
+
 The deterministic Neovim-style regression in `tests/app.rs` opens DEC 2026,
 replaces several transient full-screen draws, blocks the final physical flush,
 and verifies that neither pixels nor speech escape. It then verifies that only
@@ -192,8 +201,14 @@ cargo test --locked --test app neovim_atomic_redraw
 cargo test --locked --test live_pty key_to_pixel_latency -- --nocapture
 ```
 
-Real tmux tests create private Unix sockets and may need permission when run in
-a filesystem sandbox.
+Run external tmux compatibility tests only in Docker:
+
+```sh
+scripts/test-real-tmux-docker
+```
+
+Ordinary host test commands leave those integrations ignored. Host PTY tests
+launch only Lector and project-built fixtures.
 
 ## Diagnostic timeline
 
