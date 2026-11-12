@@ -325,7 +325,9 @@ pub struct UpdateSummary {
     /// Coordinate spans derived from reliable ASCII write operations and
     /// retained independently of disposable renderer hints.
     #[doc(hidden)]
-    pub cell_writes: Vec<TerminalCellWrite>,
+    // A single contiguous write is the common case. Multiple disjoint spans
+    // spill normally; no provenance is truncated to fit the inline storage.
+    pub cell_writes: smallvec::SmallVec<[TerminalCellWrite; 1]>,
     pub cursor_operations: usize,
     pub cursor_operations_after_last_line_feed: usize,
     /// Number of observed LF record boundaries. Unlike retained print text,
@@ -368,7 +370,7 @@ impl Default for UpdateSummary {
             output_report_structural: false,
             parser_continuation: false,
             operations: Vec::new(),
-            cell_writes: Vec::new(),
+            cell_writes: smallvec::SmallVec::new(),
             cursor_operations: 0,
             cursor_operations_after_last_line_feed: 0,
             line_feed_boundaries: 0,
@@ -649,24 +651,35 @@ fn printed_runs_text_into(runs: &[PrintedRun], text: &mut String) {
     }
 }
 
-fn append_printed_runs(target: &mut Vec<PrintedRun>, source: Vec<PrintedRun>) {
-    for run in source {
-        if run.boundary == PrintBoundary::LineFeed
-            && let Some(previous) = target.last_mut()
-            && previous.boundary == PrintBoundary::CarriageReturn
-            && previous.text.is_empty()
-        {
-            previous.boundary = PrintBoundary::LineFeed;
+fn coalesce_printed_run(previous: &mut PrintedRun, run: &mut PrintedRun) -> bool {
+    if run.boundary == PrintBoundary::LineFeed
+        && previous.boundary == PrintBoundary::CarriageReturn
+        && previous.text.is_empty()
+    {
+        previous.boundary = PrintBoundary::LineFeed;
+        previous.text = std::mem::take(&mut run.text);
+        return true;
+    }
+    if run.boundary == PrintBoundary::Continue {
+        if previous.text.is_empty() {
+            previous.text = std::mem::take(&mut run.text);
+        } else {
             previous.text.push_str(&run.text);
+        }
+        return true;
+    }
+    false
+}
+
+fn append_printed_runs(target: &mut Vec<PrintedRun>, source: Vec<PrintedRun>) {
+    for mut run in source {
+        if target
+            .last_mut()
+            .is_some_and(|previous| coalesce_printed_run(previous, &mut run))
+        {
             continue;
         }
-        if run.boundary == PrintBoundary::Continue
-            && let Some(previous) = target.last_mut()
-        {
-            previous.text.push_str(&run.text);
-        } else {
-            target.push(run);
-        }
+        target.push(run);
     }
 }
 
@@ -690,8 +703,8 @@ fn append_terminal_operations(target: &mut Vec<TerminalOperation>, source: Vec<T
 }
 
 fn append_terminal_cell_writes(
-    target: &mut Vec<TerminalCellWrite>,
-    source: Vec<TerminalCellWrite>,
+    target: &mut smallvec::SmallVec<[TerminalCellWrite; 1]>,
+    source: smallvec::SmallVec<[TerminalCellWrite; 1]>,
 ) {
     for write in source {
         if write.columns == 0 {
@@ -1707,7 +1720,7 @@ fn refresh_normalized_ghostty_metadata(
 fn normalize_ghostty_printed_runs(
     runs: Vec<lector_ghostty::PrintedRunSnapshot>,
 ) -> Vec<PrintedRun> {
-    let source = runs
+    let mut normalized: Vec<_> = runs
         .into_iter()
         .map(|run| PrintedRun {
             text: run.text,
@@ -1718,8 +1731,7 @@ fn normalize_ghostty_printed_runs(
             },
         })
         .collect();
-    let mut normalized = Vec::new();
-    append_printed_runs(&mut normalized, source);
+    normalized.dedup_by(|run, previous| coalesce_printed_run(previous, run));
     normalized
 }
 
@@ -1943,6 +1955,28 @@ fn normalize_ghostty_mouse_encoding(value: lector_ghostty::MouseEncoding) -> Mou
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cell_write_spill_preserves_revision_and_deletion_boundaries() {
+        let mut engine = GhosttyEngine::new(2, 12).expect("create engine");
+        let mut update = engine.advance(b"a").expect("first write");
+        update.cell_writes[0].revision = 7;
+        let boundary = update.cell_write_boundary();
+        let mut next = engine
+            .advance(b"\x1b[1;3Hb\x1b[1;5Hc")
+            .expect("separate writes");
+        for write in &mut next.cell_writes {
+            write.revision = 8;
+        }
+        update.merge(next);
+        assert_eq!(update.cell_writes.len(), 3);
+        for after_revision in [None, Some(7)] {
+            assert!(!update.wrote_cell_at_since(boundary, after_revision, 0, 0));
+            assert!(update.wrote_cell_at_since(boundary, after_revision, 0, 2));
+            assert!(update.wrote_cell_at_since(boundary, after_revision, 0, 4));
+            assert!(!update.wrote_cell_at_since(boundary, after_revision, 0, 3));
+        }
+    }
+
     use super::{GhosttyEngine, TerminalEngine, Viewport};
 
     #[test]

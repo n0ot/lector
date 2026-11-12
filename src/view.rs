@@ -3415,12 +3415,16 @@ fn accessibility_evidence_retained_bytes(update: &UpdateSummary) -> usize {
                 .sum::<usize>(),
         )
         .saturating_add(linear_output_bytes)
-        .saturating_add(
+        .saturating_add(if update.cell_writes.spilled() {
             update
                 .cell_writes
-                .len()
-                .saturating_mul(std::mem::size_of::<crate::terminal::TerminalCellWrite>()),
-        )
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::terminal::TerminalCellWrite>())
+        } else {
+            // Inline spans are already included in the journal entry's
+            // fixed size above; count only additional heap-owned spans.
+            0
+        })
         .saturating_add(
             update
                 .changed_rows
@@ -3636,6 +3640,30 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cell_write_retained_bytes_count_inline_storage_once_and_spilled_capacity() {
+        use crate::terminal::{TerminalCellWrite, UpdateSummary};
+        let mut update = UpdateSummary::default();
+        let fixed = super::accessibility_evidence_retained_bytes(&update);
+        let write = |col| TerminalCellWrite {
+            row: 0,
+            col,
+            columns: 1,
+            revision: 1,
+        };
+        update.cell_writes.push(write(0));
+        assert_eq!(super::accessibility_evidence_retained_bytes(&update), fixed);
+        update.cell_writes.push(write(2));
+        update.cell_writes.reserve(8);
+        assert_eq!(
+            super::accessibility_evidence_retained_bytes(&update),
+            fixed + update.cell_writes.capacity() * std::mem::size_of::<TerminalCellWrite>(),
+        );
+        // Clearing logical evidence must not hide a retained heap allocation.
+        update.cell_writes.clear();
+        assert!(super::accessibility_evidence_retained_bytes(&update) > fixed);
+    }
+
     use super::{
         PRESENTED_HISTORY_MAX_DELTA_DEPTH, PRESENTED_HISTORY_MAX_RETAINED_ROWS, View,
         compute_row_hashes, fnv1a_64,
