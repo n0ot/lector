@@ -676,7 +676,7 @@ fn parse_speech_server_args(table: Table) -> anyhow::Result<Vec<String>> {
     Ok(args)
 }
 
-fn lua_utf8(value: &mlua::String, field: &str) -> anyhow::Result<String> {
+fn lua_utf8(value: &mlua::LuaString, field: &str) -> anyhow::Result<String> {
     value
         .to_str()
         .map(|value| value.to_string())

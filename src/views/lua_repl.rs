@@ -8,7 +8,7 @@ use crate::{
 };
 use mlua::{
     Error as LuaError, Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, Table, Thread,
-    ThreadStatus, Value, VmState,
+    Value, VmState, thread::ThreadStatus,
 };
 use std::{any::Any, cell::RefCell, io::Write, rc::Rc};
 use unicode_segmentation::UnicodeSegmentation;
@@ -852,6 +852,105 @@ mod tests {
                 .expect("resume Lua evaluation");
         }
         panic!("Lua evaluation did not finish");
+    }
+
+    #[test]
+    fn lua_repl_hook_errors_and_explicit_yields_leave_the_runtime_usable() {
+        let mut repl = LuaReplView::new(12, 80, Vec::new()).expect("create lua repl");
+        let (mut sr, _speaks) = make_screen_reader();
+
+        // LuaJIT rejects yielding from an instruction hook. Preserve that error
+        // and recovery behavior without disabling the production hook.
+        // Disable JIT in this script to exercise the interpreter hook deterministically.
+        enter(
+            &mut repl,
+            &mut sr,
+            b"jit.off(); total = 0; for i=1,20000 do total=total+1 end; return total\r",
+        );
+        finish_eval(&mut repl, &mut sr);
+        assert!(
+            repl.model()
+                .screen()
+                .contents()
+                .contains("attempt to yield from a hook")
+        );
+        enter(&mut repl, &mut sr, b"total = 20\r");
+        finish_eval(&mut repl, &mut sr);
+
+        for _ in 0..3 {
+            enter(
+                &mut repl,
+                &mut sr,
+                b"coroutine.yield('hidden'); coroutine.yield('hidden'); return total + 1\r",
+            );
+            finish_eval(&mut repl, &mut sr);
+            assert!(
+                repl.model()
+                    .screen()
+                    .contents()
+                    .lines()
+                    .any(|line| line.trim() == "21")
+            );
+            enter(
+                &mut repl,
+                &mut sr,
+                b"coroutine.yield(); error('evaluation failed')\r",
+            );
+            finish_eval(&mut repl, &mut sr);
+            assert!(repl.model().screen().contents().contains("Error:"));
+            // An error from a Rust callback must also leave the same runtime usable.
+            enter(&mut repl, &mut sr, b"lector.o.speech.rate = 2\r");
+            finish_eval(&mut repl, &mut sr);
+            assert!(
+                repl.model()
+                    .screen()
+                    .contents()
+                    .contains("speech.rate is unavailable")
+            );
+        }
+        enter(&mut repl, &mut sr, b"return total + 2\r");
+        finish_eval(&mut repl, &mut sr);
+        assert!(
+            repl.model()
+                .screen()
+                .contents()
+                .lines()
+                .any(|line| line.trim() == "22")
+        );
+    }
+
+    #[test]
+    fn lua_repl_escape_cancels_suspended_evaluation_and_session_remains_usable() {
+        let session = LuaReplSession::new(Vec::new()).expect("create session");
+        let mut repl = LuaReplView::from_session(8, 80, session.clone());
+        let (mut sr, _speaks) = make_screen_reader();
+        enter(
+            &mut repl,
+            &mut sr,
+            b"saved = 7; for i=1,10 do coroutine.yield() end; saved = 99\r",
+        );
+        for _ in 0..3 {
+            repl.tick(&mut sr, &mut Vec::new()).expect("bounded tick");
+            assert!(repl.wants_tick());
+        }
+        assert!(matches!(
+            repl.handle_input(&mut sr, b"\x1b", &mut Vec::new())
+                .expect("cancel"),
+            crate::views::ViewAction::Pop
+        ));
+        assert!(!repl.wants_tick());
+        drop(repl);
+        let mut reopened = LuaReplView::from_session(8, 80, session);
+        enter(&mut reopened, &mut sr, b"return saved + 1\r");
+        finish_eval(&mut reopened, &mut sr);
+        assert!(
+            reopened
+                .model()
+                .screen()
+                .contents()
+                .lines()
+                .any(|line| line.trim() == "8")
+        );
     }
 
     #[test]

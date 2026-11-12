@@ -4,7 +4,7 @@ use crate::{
     speech::ReaderSpeechEventKind,
 };
 use anyhow::{Context, anyhow, bail};
-use mlua::{Table, ThreadStatus, Value};
+use mlua::{Table, Value, thread::ThreadStatus};
 use std::{
     collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},

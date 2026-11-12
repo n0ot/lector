@@ -1,4 +1,4 @@
-use mlua::{Lua, Result, String as LuaString, Table, Value};
+use mlua::{Lua, LuaString, Result, Table, Value};
 use std::{cmp::Ordering, collections::HashSet, os::raw::c_void};
 
 const INDENT: &str = "  ";
