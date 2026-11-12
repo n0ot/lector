@@ -120,6 +120,33 @@ cargo run --locked --release --features ghostty-vt \
   --check-baseline benchmarks/ghostty-release-baseline-macos-aarch64.json
 ```
 
+The additive schema-1 compositor workloads `split-scene-panes` and
+`split-scene-overlays` measure `PresentedScene::compose` directly. Their
+`measurement_scope` is `scene-composition`: scene construction, full VT
+rendering, and RenderOracle replay are outside both latency and allocation
+fences. Non-covering panes guarantee `blit_surface` executes, including negative
+origins, right/bottom clipping, and a full-width hyperlinked row. Plain and
+styled panes and overlapping overlays inserted out of z-order cover copying
+cells, blank-cell occlusion and layer ordering. Setup rejects an overlay fixture
+without visible overlap.
+Both alternating scenes warm up once before measurement; representative cells
+are checked against source snapshots and every measured composition is checked
+against rendered VT using RenderOracle. Here `input_bytes` is the encoded fixture
+size represented by the scene (not parser throughput), `output_bytes` counts
+verification output, and `completed_renders` counts verified frames, not receipts.
+
+`tmux-control-pane-output` has `measurement_scope: ingest-through-receipt`, like
+the existing direct workloads. A neutral modeled handshake establishes a live
+pane outside the fence. Escaped `%output` messages arrive in two fragments via
+`TmuxGatewayRouter`, exercising control parsing, App dispatch (including
+`process_tmux_control`), terminal mutation, rendering and physical receipt
+publication. No tmux executable is launched. The final active pane text and
+one completed receipt per update are required. Input bytes are control wire
+bytes; all input strings and latency storage are allocated before measurement.
+Existing history, renderer, scheduler/backpressure and media ceilings are
+preserved. New report fields are additive; baseline consumers must require all
+six compositor workloads, as the benchmark contract test does.
+
 The deterministic Neovim-style regression in `tests/app.rs` opens DEC 2026,
 replaces several transient full-screen draws, blocks the final physical flush,
 and verifies that neither pixels nor speech escape. It then verifies that only

@@ -247,6 +247,72 @@
         "maximum_output_bytes": 100000,
         "minimum_completed_render_percent": 99.0
       }
+    },
+    {
+      "name": "split-scene-panes",
+      "measurement_scope": "scene-composition",
+      "measured": {
+        "latency_p50_ns": 19250,
+        "latency_p95_ns": 20083,
+        "latency_max_ns": 46084,
+        "allocations": 1300000,
+        "allocated_bytes": 1419440000,
+        "output_bytes": 30150000,
+        "throughput_mib_per_second": 155.54886191099067,
+        "completed_render_percent": 100.0
+      },
+      "limits": {
+        "minimum_throughput_mib_per_second": 77.77443095549533,
+        "maximum_latency_p95_ns": 40166,
+        "maximum_allocations": 1430000,
+        "maximum_allocated_bytes": 1561384001,
+        "maximum_output_bytes": 33165001,
+        "minimum_completed_render_percent": 100.0
+      }
+    },
+    {
+      "name": "split-scene-overlays",
+      "measurement_scope": "scene-composition",
+      "measured": {
+        "latency_p50_ns": 20125,
+        "latency_p95_ns": 20375,
+        "latency_max_ns": 46291,
+        "allocations": 1440000,
+        "allocated_bytes": 1424120000,
+        "output_bytes": 31640000,
+        "throughput_mib_per_second": 155.5844987862307,
+        "completed_render_percent": 100.0
+      },
+      "limits": {
+        "minimum_throughput_mib_per_second": 77.79224939311536,
+        "maximum_latency_p95_ns": 40750,
+        "maximum_allocations": 1584001,
+        "maximum_allocated_bytes": 1566532001,
+        "maximum_output_bytes": 34804000,
+        "minimum_completed_render_percent": 100.0
+      }
+    },
+    {
+      "name": "tmux-control-pane-output",
+      "measurement_scope": "ingest-through-receipt",
+      "measured": {
+        "latency_p50_ns": 39709,
+        "latency_p95_ns": 40458,
+        "latency_max_ns": 161250,
+        "allocations": 2160030,
+        "allocated_bytes": 2968831284,
+        "output_bytes": 471017,
+        "throughput_mib_per_second": 0.9301408583244319,
+        "completed_render_percent": 100.0
+      },
+      "limits": {
+        "minimum_throughput_mib_per_second": 0.46507042916221597,
+        "maximum_latency_p95_ns": 80916,
+        "maximum_allocations": 2376033,
+        "maximum_allocated_bytes": 3265714413,
+        "maximum_output_bytes": 518119,
+        "minimum_completed_render_percent": 100.0
+      }
     }
   ],
   "scheduler_workloads": [
@@ -309,5 +375,22 @@
         "maximum_upload_transactions": 1
       }
     }
-  ]
+  ],
+  "split_scene_tmux_provenance": {
+    "revision": "372454f37364353f75d0abf7c1e6c258016f14d9",
+    "recorded_at": "2026-11-12",
+    "target": "aarch64-apple-darwin",
+    "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "os": "macOS 26.6.2 (25G83)",
+    "hardware": "Apple M1 Pro, 32 GiB RAM",
+    "ghostty_commit": "0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec",
+    "ghostty_version": "1.0.0",
+    "ghostty_optimize": "ReleaseFast",
+    "zig_version": "0.17.0",
+    "runs": "results/split-scenes-372454f-{warmup,run1,run2,run3,gate}.json",
+    "method": "One full-process warmup discarded, then three sequential full release runs with other workers CPU-idle. New measured values use worst repetition per metric. All pre-existing master baseline entries remain unchanged. Only three added workload thresholds refreshed from final overlapping fixtures: half minimum throughput, twice maximum p95, 10% allocation/byte/output headroom, 100% completed renders.",
+    "base_revision": "fda95bdadcf6488e1319fae5567d2dffceade066",
+    "mlua_version": "0.12.2",
+    "overlay_overlap_cells": 10
+  }
 }
