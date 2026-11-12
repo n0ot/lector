@@ -46,6 +46,29 @@ lifecycle:
    initial child output.
 5. It calls `on_startup` immediately before entering the normal input loop.
 
+Lua callbacks borrow the reader only during an explicit Rust-to-Lua entry
+(`src/lua/access.rs`). Persistent callbacks own a VM-local access slot; each
+configuration evaluation, hook call, binding resume, and REPL resume installs
+an mlua scoped userdata reference in that slot. Returning, yielding, errors,
+and Rust unwinding all restore the previous slot and invalidate the scoped
+userdata. Moving or dropping the reader between entries leaves no reader
+address in the Lua runtime. A nested hook uses a child scope reborrowed from
+its caller, so no incompatible reader reference stays usable across mutation.
+Configuration VMs must still own the reader's current generation at entry and
+at each callback borrow. Reload candidates have their own reader and VM; a
+failed reload leaves the live generation unchanged, while a successful reload
+cannot reactivate retained old callbacks. The persistent REPL obtains access
+only for each resume and retains its Lua environment independently of the
+configuration generation.
+
+Lua argument tables are parsed before reader access and response data is
+snapshotted before allocating Lua tables. Unmediated reentry while a reader
+borrow is already active fails with an mlua borrow error. Nested Rust-to-Lua
+entries are limited to 32 per VM to bound recursive hook stacks; reaching this
+limit follows ordinary hook-error recovery without disabling unrelated hooks.
+This boundary uses safe Rust and mlua's scoped borrowing APIs, with no custom
+raw-pointer lifetime or aliasing mechanism.
+
 Runtime speech sequencing is owned by a host-independent manager. It sends at
 most one active utterance to a version 2 host, advances its bounded queue only
 from correlated terminal evidence, and models playing, suspended, replacing,

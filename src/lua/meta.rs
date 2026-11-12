@@ -1,4 +1,4 @@
-use super::ext::LuaResultExt;
+use super::{access::ReaderAccess, ext::LuaResultExt};
 use crate::{
     clipboard::{ClipboardRegister, SystemClipboardProvider},
     keymap::KeyBindings,
@@ -7,7 +7,7 @@ use crate::{
 };
 use anyhow::{Context as AnyhowContext, anyhow};
 use mlua::{Error, Function, IntoLua, Lua, Result, Table, Value};
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{collections::BTreeMap, rc::Rc};
 
 macro_rules! add_callbacks_common {
     ($tbl:expr,
@@ -48,183 +48,193 @@ macro_rules! add_callbacks_common {
     }};
 }
 
-pub fn setup_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
+pub fn setup_static(lua: &Lua, access: ReaderAccess) -> Result<()> {
     let tbl_callbacks = lua.create_table()?;
-    add_callbacks_static(lua, &tbl_callbacks, sr_ptr)?;
+    add_callbacks_static(lua, &tbl_callbacks, access)?;
     lua.load(include_str!("meta.lua"))
         .set_name("meta.lua")
         .call::<()>((tbl_callbacks,))?;
     Ok(())
 }
 
-fn add_callbacks_static(
-    lua: &Lua,
-    tbl_callbacks: &Table,
-    sr_ptr: Rc<RefCell<*mut ScreenReader>>,
-) -> Result<()> {
-    let set_option = lua.create_function_mut({
-        let sr_ptr = Rc::clone(&sr_ptr);
+fn add_callbacks_static(lua: &Lua, tbl_callbacks: &Table, access: ReaderAccess) -> Result<()> {
+    let set_option = lua.create_function({
+        let access = access.clone();
         move |_, (key, value): (String, mlua::Value)| {
-            with_screen_reader_mut(&sr_ptr, |sr| {
+            if key == "speech.server" {
+                let spec = speech_server_spec_from_lua(value).map_err(Error::external)?;
+                return access.with_mut(|sr| {
+                    sr.set_startup_speech_server_spec(spec)
+                        .map_err(Error::external)
+                });
+            }
+            with_screen_reader_mut(&access, |sr| {
                 set_option(sr, &key, value)
                     .map_err(|error| Error::external(anyhow!(format!("{error:#}"))))
             })
         }
     })?;
     let get_option = lua.create_function({
-        let sr_ptr = Rc::clone(&sr_ptr);
+        let access = access.clone();
         move |lua, key: String| {
-            with_screen_reader(&sr_ptr, |sr| {
-                get_option(lua, sr, &key).map_err(Error::external)
-            })
+            let value = access.with(|sr| get_option(sr, &key).map_err(Error::external))?;
+            value.into_lua(lua)
         }
     })?;
     let get_config_dir = lua.create_function({
-        let sr_ptr = Rc::clone(&sr_ptr);
+        let access = access.clone();
         move |lua, ()| {
-            with_screen_reader(&sr_ptr, |sr| {
-                sr.config_dir()
-                    .map(|path| path.to_string_lossy().into_owned())
-                    .into_lua(lua)
-            })
+            access
+                .with(|sr| {
+                    Ok(sr
+                        .config_dir()
+                        .map(|path| path.to_string_lossy().into_owned()))
+                })?
+                .into_lua(lua)
         }
     })?;
-    let set_symbol = lua.create_function_mut({
-        let sr_ptr = Rc::clone(&sr_ptr);
+    let set_symbol = lua.create_function({
+        let access = access.clone();
         move |_, (key, value): (String, mlua::Value)| {
-            with_screen_reader_mut(&sr_ptr, |sr| match value {
-                mlua::Value::Nil => {
-                    sr.speech_mut().remove_symbol(&key);
-                    Ok(())
-                }
-                mlua::Value::Table(table_value) => {
-                    let replacement: String = table_value.get(1)?;
-                    let level: symbols::Level = AnyhowContext::context(
-                        table_value.get::<String>(2)?.parse(),
-                        "parse level",
-                    )
-                    .to_lua_result()?;
-                    let include_original: symbols::IncludeOriginal = AnyhowContext::context(
-                        table_value.get::<String>(3)?.parse(),
-                        "parse include_original",
-                    )
-                    .to_lua_result()?;
-                    let repeat: bool = table_value.get(4)?;
+            let symbol = match value {
+                Value::Nil => None,
+                Value::Table(table) => Some((
+                    table.get::<String>(1)?,
+                    table
+                        .get::<String>(2)?
+                        .parse::<symbols::Level>()
+                        .context("parse level")
+                        .to_lua_result()?,
+                    table
+                        .get::<String>(3)?
+                        .parse::<symbols::IncludeOriginal>()
+                        .context("parse include_original")
+                        .to_lua_result()?,
+                    table.get::<bool>(4)?,
+                )),
+                _ => return Err(Error::runtime("symbol value must be a table or nil")),
+            };
+            access.with_mut(|sr| {
+                if let Some((replacement, level, include_original, repeat)) = symbol {
                     sr.speech_mut()
                         .set_symbol(&key, &replacement, level, include_original, repeat);
-                    Ok(())
+                } else {
+                    sr.speech_mut().remove_symbol(&key);
                 }
-                _ => Err(Error::external(anyhow!(
-                    "symbol value must be a table or nil"
-                ))),
+                Ok(())
             })
         }
     })?;
-    let set_binding = lua.create_function_mut({
-        let sr_ptr = Rc::clone(&sr_ptr);
+    let set_binding = lua.create_function({
+        let access = access.clone();
         move |lua, (key, value): (String, mlua::Value)| {
-            with_screen_reader_mut(&sr_ptr, |sr| {
-                set_binding(lua, sr, &key, value).map_err(Error::external)
+            let binding = parse_binding(value).map_err(Error::external)?;
+            with_screen_reader_mut(&access, |sr| {
+                set_binding(lua, sr, &key, binding).map_err(Error::external)
             })
         }
     })?;
     let get_binding = lua.create_function({
-        let sr_ptr = Rc::clone(&sr_ptr);
-        move |lua, key: String| {
-            with_screen_reader(&sr_ptr, |sr| {
-                get_binding(lua, sr, &key).map_err(Error::external)
-            })
-        }
+        let access = access.clone();
+        move |lua, key: String| get_binding(&access, lua, &key)
     })?;
     let get_symbol = lua.create_function({
-        let sr_ptr = Rc::clone(&sr_ptr);
+        let access = access.clone();
         move |lua, key: String| {
-            with_screen_reader(&sr_ptr, |sr| {
-                let value = match sr.speech().symbol(&key) {
-                    Some(v) => {
-                        let tbl = lua.create_table()?;
-                        tbl.set(1, v.replacement.clone())?;
-                        tbl.set(2, v.level.to_string())?;
-                        tbl.set(3, v.include_original.to_string())?;
-                        tbl.set(4, v.repeat)?;
-                        Value::Table(tbl)
-                    }
-                    None => Value::Nil,
-                };
-                Ok(value)
-            })
+            let symbol = access.with(|sr| {
+                Ok(sr.speech().symbol(&key).map(|symbol| {
+                    (
+                        symbol.replacement.clone(),
+                        symbol.level.to_string(),
+                        symbol.include_original.to_string(),
+                        symbol.repeat,
+                    )
+                }))
+            })?;
+            match symbol {
+                Some((replacement, level, include_original, repeat)) => {
+                    let table = lua.create_table()?;
+                    table.set(1, replacement)?;
+                    table.set(2, level)?;
+                    table.set(3, include_original)?;
+                    table.set(4, repeat)?;
+                    Ok(Value::Table(table))
+                }
+                None => Ok(Value::Nil),
+            }
         }
     })?;
-    let clear_symbols = lua.create_function_mut({
-        let sr_ptr = Rc::clone(&sr_ptr);
+    let clear_symbols = lua.create_function({
+        let access = access.clone();
         move |_, ()| {
-            with_screen_reader_mut(&sr_ptr, |sr| {
+            with_screen_reader_mut(&access, |sr| {
                 sr.speech_mut().clear_symbols();
                 Ok(())
             })
         }
     })?;
-    let set_hook = lua.create_function_mut({
-        let sr_ptr = Rc::clone(&sr_ptr);
+    let set_hook = lua.create_function({
+        let access = access.clone();
         move |lua, (key, value): (String, Value)| {
-            with_screen_reader_mut(&sr_ptr, |sr| {
+            with_screen_reader_mut(&access, |sr| {
                 sr.set_hook(lua, &key, value).map_err(Error::external)
             })
         }
     })?;
     let get_hook = lua.create_function({
-        let sr_ptr = Rc::clone(&sr_ptr);
+        let access = access.clone();
         move |lua, key: String| {
-            with_screen_reader(&sr_ptr, |sr| {
+            with_screen_reader(&access, |sr| {
                 sr.get_hook(lua, &key).map_err(Error::external)
             })
         }
     })?;
-    let get_clipboard_text = lua.create_function_mut({
-        let sr_ptr = Rc::clone(&sr_ptr);
+    let get_clipboard_text = lua.create_function({
+        let access = access.clone();
         move |lua, name: String| {
-            with_screen_reader_mut(&sr_ptr, |sr| {
-                let register = clipboard_register(&name).map_err(Error::external)?;
-                sr.read_clipboard(register)
-                    .map_err(Error::external)?
-                    .into_lua(lua)
-            })
+            let register = clipboard_register(&name).map_err(Error::external)?;
+            access
+                .with_mut(|sr| sr.read_clipboard(register).map_err(Error::external))?
+                .into_lua(lua)
         }
     })?;
-    let set_clipboard_text = lua.create_function_mut({
-        let sr_ptr = Rc::clone(&sr_ptr);
+    let set_clipboard_text = lua.create_function({
+        let access = access.clone();
         move |_, (name, text): (String, String)| {
-            with_screen_reader_mut(&sr_ptr, |sr| {
+            with_screen_reader_mut(&access, |sr| {
                 let register = clipboard_register(&name).map_err(Error::external)?;
                 sr.write_clipboard(register, text).map_err(Error::external)
             })
         }
     })?;
-    let clear_clipboard = lua.create_function_mut({
-        let sr_ptr = Rc::clone(&sr_ptr);
+    let clear_clipboard = lua.create_function({
+        let access = access.clone();
         move |_, name: String| {
-            with_screen_reader_mut(&sr_ptr, |sr| {
+            with_screen_reader_mut(&access, |sr| {
                 let register = clipboard_register(&name).map_err(Error::external)?;
                 sr.clear_clipboard(register).map_err(Error::external)
             })
         }
     })?;
     let get_clipboard_entries = lua.create_function({
-        let sr_ptr = Rc::clone(&sr_ptr);
+        let access = access.clone();
         move |lua, ()| {
-            with_screen_reader(&sr_ptr, |sr| {
-                lua.create_sequence_from(sr.internal_clipboard_entries())
-            })
+            let entries = access.with(|sr| Ok(sr.internal_clipboard_entries()))?;
+            lua.create_sequence_from(entries)
         }
     })?;
     let get_clipboard_index = lua.create_function({
-        let sr_ptr = Rc::clone(&sr_ptr);
-        move |lua, ()| with_screen_reader(&sr_ptr, |sr| sr.internal_clipboard_index().into_lua(lua))
+        let access = access.clone();
+        move |lua, ()| {
+            access
+                .with(|sr| Ok(sr.internal_clipboard_index()))?
+                .into_lua(lua)
+        }
     })?;
-    let set_clipboard_index = lua.create_function_mut({
-        let sr_ptr = Rc::clone(&sr_ptr);
+    let set_clipboard_index = lua.create_function({
+        let access = access.clone();
         move |_, index: usize| {
-            with_screen_reader_mut(&sr_ptr, |sr| {
+            with_screen_reader_mut(&access, |sr| {
                 sr.select_internal_clipboard(index).map_err(Error::external)
             })
         }
@@ -259,66 +269,99 @@ fn clipboard_register(name: &str) -> anyhow::Result<ClipboardRegister> {
     }
 }
 
-fn get_option(lua: &Lua, sr: &ScreenReader, option: &str) -> anyhow::Result<mlua::Value> {
-    match option {
-        "speech.server" => speech_server_spec_to_lua(lua, sr.speech_server_spec()),
-        "speech.rate" => sr.speech().rate().into_lua(lua),
-        "speech.pitch" => sr.speech().pitch().into_lua(lua),
-        "speech.volume" => sr.speech().volume().into_lua(lua),
-        "speech.paragraph_pause_ms" => sr.speech().paragraph_pause_ms().into_lua(lua),
-        "speech.voice" => sr.speech().voice().map(|voice| voice.id).into_lua(lua),
-        "speech.voices" => match sr.speech().voices() {
-            Some(voices) => {
-                let result = lua
-                    .create_table()
-                    .map_err(|error| anyhow!(error.to_string()))?;
+// Snapshot reader data before allocating Lua strings/tables: allocation can
+// collect userdata and run Lua finalizers.
+enum OptionValue {
+    Boolean(bool),
+    Integer(u64),
+    Number(Option<f32>),
+    Text(Option<String>),
+    Server(SpeechServerSpec),
+    Voices(Option<Vec<VoiceInfo>>),
+}
+
+impl IntoLua for OptionValue {
+    fn into_lua(self, lua: &Lua) -> Result<Value> {
+        match self {
+            Self::Boolean(value) => value.into_lua(lua),
+            Self::Integer(value) => value.into_lua(lua),
+            Self::Number(value) => value.into_lua(lua),
+            Self::Text(value) => value.into_lua(lua),
+            Self::Server(value) => speech_server_spec_to_lua(lua, &value),
+            Self::Voices(None) => Ok(Value::Nil),
+            Self::Voices(Some(voices)) => {
+                let result = lua.create_table()?;
                 for (index, voice) in voices.iter().enumerate() {
-                    let voice = voice_info_to_lua(lua, voice)
-                        .map_err(|error| anyhow!(error.to_string()))?;
-                    result
-                        .set(index + 1, voice)
-                        .map_err(|error| anyhow!(error.to_string()))?;
+                    result.set(index + 1, voice_info_to_lua(lua, voice)?)?;
                 }
                 Ok(Value::Table(result))
             }
-            None => Ok(Value::Nil),
-        },
-        "symbol_level" => sr.speech().symbol_level().to_string().into_lua(lua),
-        "help_mode" => sr.help_mode().into_lua(lua),
-        "auto_read" => sr.auto_read_enabled().into_lua(lua),
-        "suppress_key_echo" => sr.suppress_key_echo().into_lua(lua),
-        "report_indentation" => sr.indentation_reporting_enabled().into_lua(lua),
-        "review_follows_screen_cursor" | "rev_follows" => {
-            sr.review_follows_screen_cursor().into_lua(lua)
         }
-        "highlight_tracking" => sr.highlight_tracking_enabled().into_lua(lua),
-        "stop_speech_on_focus_loss" => sr.stop_speech_on_focus_loss().into_lua(lua),
-        "legacy_escape_timeout_ms" => sr.legacy_escape_timeout_ms().into_lua(lua),
-        "tmux_bells" => sr.tmux_bell_mode().to_string().into_lua(lua),
-        "clipboard.default_register" => sr.clipboard_default_register().to_string().into_lua(lua),
-        "clipboard.system_provider" => sr.system_clipboard_provider().to_string().into_lua(lua),
-        _ => Err(Error::external(anyhow!("unknown option"))),
     }
-    .map_err(|e| anyhow!("{}", e))
-    .context(format!("get option: {}", option))
 }
 
-fn set_binding(lua: &Lua, sr: &mut ScreenReader, key: &str, value: Value) -> anyhow::Result<()> {
-    let (mode, key) = sr.key_bindings().split_mode_key(key);
+fn get_option(sr: &ScreenReader, option: &str) -> anyhow::Result<OptionValue> {
+    use OptionValue::*;
+    Ok(match option {
+        "speech.server" => Server(sr.speech_server_spec().clone()),
+        "speech.rate" => Number(sr.speech().rate()),
+        "speech.pitch" => Number(sr.speech().pitch()),
+        "speech.volume" => Number(sr.speech().volume()),
+        "speech.paragraph_pause_ms" => Integer(sr.speech().paragraph_pause_ms()),
+        "speech.voice" => Text(sr.speech().voice().map(|voice| voice.id)),
+        "speech.voices" => Voices(sr.speech().voices()),
+        "symbol_level" => Text(Some(sr.speech().symbol_level().to_string())),
+        "help_mode" => Boolean(sr.help_mode()),
+        "auto_read" => Boolean(sr.auto_read_enabled()),
+        "suppress_key_echo" => Boolean(sr.suppress_key_echo()),
+        "report_indentation" => Boolean(sr.indentation_reporting_enabled()),
+        "review_follows_screen_cursor" | "rev_follows" => {
+            Boolean(sr.review_follows_screen_cursor())
+        }
+        "highlight_tracking" => Boolean(sr.highlight_tracking_enabled()),
+        "stop_speech_on_focus_loss" => Boolean(sr.stop_speech_on_focus_loss()),
+        "legacy_escape_timeout_ms" => Integer(sr.legacy_escape_timeout_ms().into()),
+        "tmux_bells" => Text(Some(sr.tmux_bell_mode().to_string())),
+        "clipboard.default_register" => Text(Some(sr.clipboard_default_register().to_string())),
+        "clipboard.system_provider" => Text(Some(sr.system_clipboard_provider().to_string())),
+        _ => return Err(anyhow!("get option: {option}: unknown option")),
+    })
+}
+
+enum ParsedBinding {
+    Clear,
+    Builtin(crate::commands::Action),
+    Lua(String, Function),
+}
+
+fn parse_binding(value: Value) -> anyhow::Result<ParsedBinding> {
     match value {
-        Value::Nil => {
-            sr.key_bindings_mut().clear_binding_for_mode(mode, key);
-            Ok(())
-        }
-        Value::String(name) => {
-            let name = name.to_str().map_err(|err| anyhow!(err.to_string()))?;
-            let action = KeyBindings::builtin_action_from_value(name.as_ref())?;
-            sr.key_bindings_mut()
-                .set_builtin_binding_for_mode(mode, key.to_string(), action);
-            Ok(())
-        }
+        Value::Nil => Ok(ParsedBinding::Clear),
+        Value::String(name) => Ok(ParsedBinding::Builtin(
+            KeyBindings::builtin_action_from_value(name.to_str()?.as_ref())?,
+        )),
         Value::Table(table) => {
-            let (help, func) = parse_binding_table(table)?;
+            let (help, function) = parse_binding_table(table)?;
+            Ok(ParsedBinding::Lua(help, function))
+        }
+        _ => Err(anyhow!("binding value must be a string, table, or nil")),
+    }
+}
+
+fn set_binding(
+    lua: &Lua,
+    sr: &mut ScreenReader,
+    key: &str,
+    binding: ParsedBinding,
+) -> anyhow::Result<()> {
+    let (mode, key) = sr.key_bindings().split_mode_key(key);
+    match binding {
+        ParsedBinding::Clear => sr.key_bindings_mut().clear_binding_for_mode(mode, key),
+        ParsedBinding::Builtin(action) => {
+            sr.key_bindings_mut()
+                .set_builtin_binding_for_mode(mode, key.to_string(), action)
+        }
+        ParsedBinding::Lua(help, func) => {
             let ctx = Rc::clone(sr.lua_binding_context(lua).map_err(anyhow::Error::new)?);
             sr.key_bindings_mut().set_lua_binding_for_mode(
                 mode,
@@ -327,10 +370,9 @@ fn set_binding(lua: &Lua, sr: &mut ScreenReader, key: &str, value: Value) -> any
                 ctx,
                 func,
             )?;
-            Ok(())
         }
-        _ => Err(anyhow!("binding value must be a string, table, or nil")),
     }
+    Ok(())
 }
 
 fn parse_binding_table(table: Table) -> anyhow::Result<(String, Function)> {
@@ -345,12 +387,13 @@ fn parse_binding_table(table: Table) -> anyhow::Result<(String, Function)> {
     Ok((help, func))
 }
 
-fn get_binding(lua: &Lua, sr: &ScreenReader, key: &str) -> anyhow::Result<Value> {
-    let allow_function = sr.owns_lua_context(lua);
-    let (mode, key) = sr.key_bindings().split_mode_key(key);
-    sr.key_bindings()
-        .binding_value_for_lua_mode(mode, key, lua, allow_function)
-        .map_err(|err| anyhow!(err.to_string()))
+fn get_binding(access: &ReaderAccess, lua: &Lua, key: &str) -> Result<Value> {
+    let value = access.with(|sr| {
+        let (mode, key) = sr.key_bindings().split_mode_key(key);
+        sr.key_bindings()
+            .binding_snapshot_for_lua_mode(mode, key, sr.owns_lua_context(lua))
+    })?;
+    value.into_lua(lua)
 }
 
 fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow::Result<()> {
@@ -461,9 +504,6 @@ fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow
             .context("set option: speech.voice");
     }
     (match option {
-        "speech.server" => sr
-            .set_startup_speech_server_spec(speech_server_spec_from_lua(value)?)
-            .map_err(anyhow::Error::new),
         "symbol_level" => match value {
             String(v) => {
                 let level = v
@@ -692,25 +732,15 @@ fn reject_nul(value: &str, field: &str) -> anyhow::Result<()> {
 }
 
 fn with_screen_reader_mut<T>(
-    sr_ptr: &Rc<RefCell<*mut ScreenReader>>,
+    access: &ReaderAccess,
     f: impl FnOnce(&mut ScreenReader) -> Result<T>,
 ) -> Result<T> {
-    let ptr = *sr_ptr.borrow();
-    if ptr.is_null() {
-        return Err(Error::external(anyhow!("screen reader unavailable")));
-    }
-    // Safety: the pointer is set by the main thread before any Lua call.
-    unsafe { f(&mut *ptr) }
+    access.with_mut(f)
 }
 
 fn with_screen_reader<T>(
-    sr_ptr: &Rc<RefCell<*mut ScreenReader>>,
+    access: &ReaderAccess,
     f: impl FnOnce(&ScreenReader) -> Result<T>,
 ) -> Result<T> {
-    let ptr = *sr_ptr.borrow();
-    if ptr.is_null() {
-        return Err(Error::external(anyhow!("screen reader unavailable")));
-    }
-    // Safety: the pointer is set by the main thread before any Lua call.
-    unsafe { f(&*ptr) }
+    access.with(f)
 }

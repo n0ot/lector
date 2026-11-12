@@ -7138,6 +7138,59 @@ fn say_overlay_tracks_a_flushed_title_effect_before_its_cell_render() {
 }
 
 #[test]
+fn repl_aliases_survive_nested_hooks_errors_and_reader_movement() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("init.lua");
+    fs::write(
+        &config,
+        r#"
+        lector.hooks.on_speech_start = function(text)
+            if text == 'fixture' then lector.clipboard.internal.text = 'nested' end
+        end
+        lector.hooks.on_clipboard_change = function()
+            lector.o.auto_read = false
+        end
+    "#,
+    )
+    .unwrap();
+    lua::setup(config, true, &mut sr, |_| Ok(())).unwrap();
+    let mut pty = Vec::new();
+    let mut terminal = Vec::new();
+    app.handle_stdin(&mut sr, b"\x1bL", &mut pty, &mut terminal)
+        .unwrap();
+    app.handle_stdin(
+        &mut sr,
+        b"saved = lector.api.speak; saved('fixture', false); error('chunk fault')\r",
+        &mut pty,
+        &mut terminal,
+    )
+    .unwrap();
+    app.handle_tick(&mut sr, &mut pty, &mut terminal).unwrap();
+    assert!(!sr.auto_read_enabled());
+    assert!(app.debug_active_view_contents().contains("chunk fault"));
+    let mut moved = Box::new(sr);
+    app.handle_stdin(
+        &mut moved,
+        b"saved('recovered', false)\r",
+        &mut pty,
+        &mut terminal,
+    )
+    .unwrap();
+    app.handle_tick(&mut moved, &mut pty, &mut terminal)
+        .unwrap();
+    assert!(
+        recorder
+            .inner
+            .borrow()
+            .speaks
+            .iter()
+            .any(|(text, _)| text == "recovered")
+    );
+    assert!(pty.is_empty());
+}
+
+#[test]
 fn lua_repl_history_persists_after_close() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();

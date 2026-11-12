@@ -3,12 +3,15 @@ use crate::screen_reader::ScreenReader;
 use anyhow::{Context as AnyhowContext, anyhow};
 use mlua::{Error, Function, Lua, LuaOptions, Result, StdLib, Table, Value};
 use std::{
-    cell::RefCell,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
     rc::Rc,
 };
+
+mod access;
+use access::ReaderAccess;
+pub(crate) use access::enter;
 
 pub(crate) mod automation;
 mod ext;
@@ -41,7 +44,9 @@ where
     let configuration_result = if let Some(init_lua_file) = config_file.as_ref()
         && init_lua_file.is_file()
     {
-        load_file(&lua, init_lua_file).and_then(|function| function.call::<()>(()))
+        enter(&lua, screen_reader, || {
+            load_file(&lua, init_lua_file).and_then(|function| function.call::<()>(()))
+        })
     } else {
         Ok(())
     };
@@ -70,11 +75,11 @@ fn install_configuration_context(screen_reader: &mut ScreenReader) -> Result<Rc<
         StdLib::ALL_SAFE | StdLib::JIT,
         LuaOptions::default(),
     )?);
-    let sr_ptr = Rc::new(RefCell::new(screen_reader as *mut ScreenReader));
-    screen_reader.set_lua_runtime_context(Rc::clone(&lua), Rc::clone(&sr_ptr));
-    install_api_static(&lua, Rc::clone(&sr_ptr))?;
-    install_config_module_searcher(&lua, Rc::clone(&sr_ptr))?;
-    meta::setup_static(&lua, Rc::clone(&sr_ptr))?;
+    screen_reader.set_lua_context(Rc::clone(&lua));
+    let access = ReaderAccess::install(&lua, true);
+    install_api_static(&lua, access.clone())?;
+    install_config_module_searcher(&lua, access.clone())?;
+    meta::setup_static(&lua, access.clone())?;
     Ok(lua)
 }
 
@@ -95,9 +100,10 @@ pub(crate) fn reload_configuration(screen_reader: &mut ScreenReader) -> anyhow::
     let (mut candidate, configured_speech_options) = screen_reader.lua_reload_candidate();
     let lua = install_configuration_context(&mut candidate)
         .context("create replacement Lua configuration context")?;
-    load_file(&lua, &config_file)
-        .and_then(|function| function.call::<()>(()))
-        .with_context(|| format!("load {}", config_file.display()))?;
+    enter(&lua, &mut candidate, || {
+        load_file(&lua, &config_file).and_then(|function| function.call::<()>(()))
+    })
+    .with_context(|| format!("load {}", config_file.display()))?;
     candidate.finish_lua_configuration();
 
     if candidate.speech_server_spec() != screen_reader.startup_lua_speech_server_spec() {
@@ -112,10 +118,11 @@ pub(crate) fn reload_configuration(screen_reader: &mut ScreenReader) -> anyhow::
     Ok(config_file)
 }
 
-pub fn setup_repl(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
-    install_api_static(lua, Rc::clone(&sr_ptr))?;
-    install_config_module_searcher(lua, Rc::clone(&sr_ptr))?;
-    meta::setup_static(lua, sr_ptr)?;
+pub fn setup_repl(lua: &Lua) -> Result<()> {
+    let access = ReaderAccess::install(lua, false);
+    install_api_static(lua, access.clone())?;
+    install_config_module_searcher(lua, access.clone())?;
+    meta::setup_static(lua, access)?;
     inspect::install(lua)?;
     Ok(())
 }
@@ -135,16 +142,9 @@ fn effective_config_dir(init_lua_file: &Path) -> Result<Option<PathBuf>> {
 /// `<config_dir>/a/b.lua` and `<config_dir>/a/b/init.lua` without changing the
 /// process working directory or interpolating the config path into
 /// `package.path`.
-fn install_config_module_searcher(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
+fn install_config_module_searcher(lua: &Lua, access: ReaderAccess) -> Result<()> {
     let searcher = lua.create_function(move |lua, module_name: String| {
-        let ptr = *sr_ptr.borrow();
-        let config_dir = if ptr.is_null() {
-            None
-        } else {
-            // Safety: the pointer is installed by the terminal thread before
-            // config or REPL code can call require.
-            unsafe { (&*ptr).config_dir().map(Path::to_path_buf) }
-        };
+        let config_dir = access.with(|sr| Ok(sr.config_dir().map(Path::to_path_buf)))?;
         let Some(config_dir) = config_dir else {
             return config_searcher_miss(lua, "no Lector configuration directory");
         };
@@ -222,43 +222,35 @@ fn load_file(lua: &Lua, path: &PathBuf) -> Result<Function> {
     lua.load(&s).set_name(&path_string).into_function()
 }
 
-fn install_api_static(lua: &Lua, sr_ptr: Rc<RefCell<*mut ScreenReader>>) -> Result<()> {
+fn install_api_static(lua: &Lua, access: ReaderAccess) -> Result<()> {
     let tbl_lector = lua.create_table()?;
     let tbl_api = lua.create_table()?;
     let speak_fn = lua.create_function({
-        let sr_ptr = Rc::clone(&sr_ptr);
+        let access = access.clone();
         move |_, (text, interrupt): (String, bool)| {
-            let ptr = *sr_ptr.borrow();
-            if ptr.is_null() {
-                return Err(Error::external(anyhow!("screen reader unavailable")));
-            }
-            // Safety: pointer is set by the main thread before any Lua call.
-            let sr = unsafe { &mut *ptr };
-            if sr.lua_configuration_reload_staging() {
-                return Err(Error::external(anyhow!(
-                    "lector.api.speak is unavailable while reloading configuration; use lector.hooks.on_reload"
-                )));
-            }
-            sr.speak(&text, interrupt)
-                .map(|id| id.map(|id| id.as_str().to_owned()))
-                .to_lua_result()
+            access.with_mut(|sr| {
+                if sr.lua_configuration_reload_staging() {
+                    return Err(Error::external(anyhow!(
+                        "lector.api.speak is unavailable while reloading configuration; use lector.hooks.on_reload"
+                    )));
+                }
+                sr.speak(&text, interrupt)
+                    .map(|id| id.map(|id| id.as_str().to_owned()))
+                    .to_lua_result()
+            })
         }
     })?;
-    let set_speech_fn = lua.create_function_mut(move |_, value: Value| {
-        let ptr = *sr_ptr.borrow();
-        if ptr.is_null() {
-            return Err(Error::external(anyhow!("screen reader unavailable")));
-        }
-        // Safety: pointer is set by the main thread before any Lua call.
-        let sr = unsafe { &mut *ptr };
-        if sr.lua_configuration_reload_staging() {
-            return Err(Error::external(anyhow!(
-                "lector.api.set_speech is unavailable while reloading configuration; use lector.hooks.on_reload"
-            )));
-        }
+    let set_speech_fn = lua.create_function(move |_, value: Value| {
         let spec = meta::speech_server_spec_from_lua(value).map_err(Error::external)?;
-        sr.request_speech_reconfiguration(spec);
-        Ok(())
+        access.with_mut(|sr| {
+            if sr.lua_configuration_reload_staging() {
+                return Err(Error::external(anyhow!(
+                    "lector.api.set_speech is unavailable while reloading configuration; use lector.hooks.on_reload"
+                )));
+            }
+            sr.request_speech_reconfiguration(spec);
+            Ok(())
+        })
     })?;
     tbl_api.set("speak", speak_fn)?;
     tbl_api.set("set_speech", set_speech_fn)?;
@@ -373,7 +365,7 @@ mod tests {
         }
     }
 
-    fn screen_reader() -> ScreenReader {
+    pub(super) fn screen_reader() -> ScreenReader {
         let output = Rc::new(RefCell::new(Vec::new()));
         let speech = speech::Speech::new(Box::new(RecordingDriver(output)));
         ScreenReader::new(speech)
@@ -554,7 +546,11 @@ mod tests {
         let Binding::Lua(binding) = binding else {
             panic!("expected replacement Lua binding");
         };
-        binding.call().unwrap();
+        let invocation = binding.start().unwrap();
+        super::enter(&invocation.lua, &mut screen_reader, || {
+            invocation.thread.resume::<()>(())
+        })
+        .unwrap();
         assert!(screen_reader.help_mode());
     }
 
@@ -670,11 +666,11 @@ mod tests {
     fn repl_requires_explicit_nonblocking_speech_reconfiguration() {
         let mut screen_reader = screen_reader();
         let lua = Lua::new();
-        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
-        setup_repl(&lua, screen_reader_ptr).unwrap();
+        setup_repl(&lua).unwrap();
 
-        lua.load(
-            r#"
+        super::enter(&lua, &mut screen_reader, || {
+            lua.load(
+                r#"
                 local assigned, message = pcall(function()
                     lector.o.speech.server = {program = "/ignored"}
                 end)
@@ -688,8 +684,9 @@ mod tests {
                 -- server until the core commits a successful replacement.
                 assert(lector.o.speech.server == "native")
             "#,
-        )
-        .exec()
+            )
+            .exec()
+        })
         .unwrap();
 
         let requested = screen_reader.take_speech_reconfiguration().unwrap();
@@ -701,14 +698,16 @@ mod tests {
             }
         );
         screen_reader.commit_speech_reconfiguration(requested);
-        lua.load(
-            r#"
+        super::enter(&lua, &mut screen_reader, || {
+            lua.load(
+                r#"
                 local active = lector.o.speech.server
                 assert(active.program == "/second")
                 assert(#active.args == 1 and active.args[1] == "second arg")
             "#,
-        )
-        .exec()
+            )
+            .exec()
+        })
         .unwrap();
     }
 
@@ -740,11 +739,11 @@ mod tests {
         let speech = speech::Speech::new(Box::new(driver));
         let mut screen_reader = ScreenReader::new(speech);
         let lua = Lua::new();
-        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
-        setup_repl(&lua, screen_reader_ptr).unwrap();
+        setup_repl(&lua).unwrap();
 
-        lua.load(
-            r#"
+        super::enter(&lua, &mut screen_reader, || {
+            lua.load(
+                r#"
                 assert(lector.o.speech.rate == 65)
                 assert(lector.o.speech.pitch == 0.75)
                 assert(lector.o.speech.volume == 0.5)
@@ -773,8 +772,9 @@ mod tests {
                     assert(string.find(tostring(rate_error), "between 0 and 100", 1, true))
                 end
             "#,
-        )
-        .exec()
+            )
+            .exec()
+        })
         .unwrap();
 
         assert_eq!(rates.borrow().as_slice(), [70.0]);
@@ -787,11 +787,11 @@ mod tests {
     fn speech_namespace_configures_paragraph_pause_in_integer_milliseconds() {
         let mut screen_reader = screen_reader();
         let lua = Lua::new();
-        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
-        setup_repl(&lua, screen_reader_ptr).unwrap();
+        setup_repl(&lua).unwrap();
 
-        lua.load(
-            r#"
+        super::enter(&lua, &mut screen_reader, || {
+            lua.load(
+                r#"
                 assert(lector.o.speech.paragraph_pause_ms == 100)
                 lector.o.speech.paragraph_pause_ms = 0
                 assert(lector.o.speech.paragraph_pause_ms == 0)
@@ -807,8 +807,9 @@ mod tests {
                     assert(lector.o.speech.paragraph_pause_ms == 37)
                 end
             "#,
-        )
-        .exec()
+            )
+            .exec()
+        })
         .unwrap();
 
         assert_eq!(screen_reader.speech().paragraph_pause_ms(), 37);
@@ -818,11 +819,11 @@ mod tests {
     fn legacy_escape_timeout_is_bounded_and_round_trips() {
         let mut screen_reader = screen_reader();
         let lua = Lua::new();
-        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
-        setup_repl(&lua, screen_reader_ptr).unwrap();
+        setup_repl(&lua).unwrap();
 
-        lua.load(
-            r#"
+        super::enter(&lua, &mut screen_reader, || {
+            lua.load(
+                r#"
                 assert(lector.o.legacy_escape_timeout_ms == 30)
                 lector.o.legacy_escape_timeout_ms = 0
                 assert(lector.o.legacy_escape_timeout_ms == 0)
@@ -832,8 +833,9 @@ mod tests {
                 assert(pcall(function() lector.o.legacy_escape_timeout_ms = 1001 end) == false)
                 assert(pcall(function() lector.o.legacy_escape_timeout_ms = 1.5 end) == false)
             "#,
-        )
-        .exec()
+            )
+            .exec()
+        })
         .unwrap();
         assert_eq!(screen_reader.legacy_escape_timeout_ms(), 1000);
     }
@@ -896,11 +898,11 @@ mod tests {
         let speech = speech::Speech::new(Box::new(driver));
         let mut screen_reader = ScreenReader::new(speech);
         let lua = Lua::new();
-        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
-        setup_repl(&lua, screen_reader_ptr).unwrap();
+        setup_repl(&lua).unwrap();
 
-        lua.load(
-            r#"
+        super::enter(&lua, &mut screen_reader, || {
+            lua.load(
+                r#"
                 assert(lector.o.speech.rate == nil)
                 assert(lector.o.speech.pitch == nil)
                 assert(lector.o.speech.volume == nil)
@@ -927,8 +929,9 @@ mod tests {
                 assert(voice_ok == false)
                 assert(string.find(tostring(voice_error), "speech.voice is unavailable", 1, true))
             "#,
-        )
-        .exec()
+            )
+            .exec()
+        })
         .unwrap();
     }
 
@@ -936,11 +939,11 @@ mod tests {
     fn lua_speak_returns_opaque_string_ids_and_nil_for_suppressed_text() {
         let mut screen_reader = screen_reader();
         let lua = Lua::new();
-        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
-        setup_repl(&lua, screen_reader_ptr).unwrap();
+        setup_repl(&lua).unwrap();
 
-        lua.load(
-            r#"
+        super::enter(&lua, &mut screen_reader, || {
+            lua.load(
+                r#"
                 local first = lector.api.speak("first", false)
                 local second = lector.api.speak("second", false)
                 assert(type(first) == "string")
@@ -948,8 +951,9 @@ mod tests {
                 assert(first ~= second)
                 assert(lector.api.speak("", false) == nil)
             "#,
-        )
-        .exec()
+            )
+            .exec()
+        })
         .unwrap();
     }
 
@@ -957,11 +961,11 @@ mod tests {
     fn speech_server_specs_are_strictly_validated_before_queueing() {
         let mut screen_reader = screen_reader();
         let lua = Lua::new();
-        let screen_reader_ptr = Rc::new(RefCell::new(&mut screen_reader as *mut ScreenReader));
-        setup_repl(&lua, screen_reader_ptr).unwrap();
+        setup_repl(&lua).unwrap();
 
-        lua.load(
-            r#"
+        super::enter(&lua, &mut screen_reader, || {
+            lua.load(
+                r#"
                 local invalid = {
                     "not-native",
                     {},
@@ -979,8 +983,9 @@ mod tests {
                     assert(pcall(lector.api.set_speech, spec) == false)
                 end
             "#,
-        )
-        .exec()
+            )
+            .exec()
+        })
         .unwrap();
 
         assert_eq!(screen_reader.take_speech_reconfiguration(), None);
@@ -1085,7 +1090,8 @@ mod tests {
             let Binding::Lua(binding) = binding else {
                 panic!("expected Lua binding");
             };
-            binding.call()?;
+            let invocation = binding.start()?;
+            super::enter(&invocation.lua, sr, || invocation.thread.resume::<()>(()))?;
             assert!(!sr.review_follows_screen_cursor());
 
             sr.speak("?", false)?;
@@ -1131,5 +1137,198 @@ mod tests {
         assert!(screen_reader.auto_read_enabled());
         assert_eq!(output.borrow().as_slice(), [" query "]);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scoped_aliases_follow_reader_moves_but_not_return_yield_or_drop() {
+        let mut reader = screen_reader();
+        let lua = super::install_configuration_context(&mut reader).unwrap();
+        let alias: mlua::Function = lua
+            .load("return function() lector.o.help_mode = not lector.o.help_mode end")
+            .eval()
+            .unwrap();
+        assert!(alias.call::<()>(()).is_err());
+        super::enter(&lua, &mut reader, || alias.call::<()>(())).unwrap();
+        assert!(reader.help_mode());
+        let mut moved = Box::new(reader);
+        let thread = lua
+            .create_thread(
+                lua.load(
+                    "lector.o.help_mode = false; coroutine.yield(); lector.o.help_mode = true",
+                )
+                .into_function()
+                .unwrap(),
+            )
+            .unwrap();
+        super::enter(&lua, &mut moved, || thread.resume::<()>(())).unwrap();
+        assert!(!moved.help_mode());
+        assert!(alias.call::<()>(()).is_err());
+        super::enter(&lua, &mut moved, || thread.resume::<()>(())).unwrap();
+        assert!(moved.help_mode());
+        assert!(alias.call::<()>(()).is_err());
+        drop(moved);
+        assert!(alias.call::<()>(()).is_err());
+    }
+
+    #[test]
+    fn retained_generations_and_candidates_cannot_target_another_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let init = directory.path().join("init.lua");
+        fs::write(&init, "lector.o.help_mode = false").unwrap();
+        let mut reader = screen_reader();
+        reader.set_config_file(Some(init.clone()));
+        let old = super::install_configuration_context(&mut reader).unwrap();
+        reader.finish_lua_configuration();
+        let alias: mlua::Function = old
+            .load("return function() lector.o.help_mode = true end")
+            .eval()
+            .unwrap();
+        fs::write(
+            &init,
+            "lector.o.help_mode = true; error('reject candidate')",
+        )
+        .unwrap();
+        assert!(reload_configuration(&mut reader).is_err());
+        assert!(!reader.help_mode());
+        super::enter(&old, &mut reader, || alias.call::<()>(())).unwrap();
+        assert!(reader.help_mode());
+        fs::write(&init, "lector.o.help_mode = false").unwrap();
+        reload_configuration(&mut reader).unwrap();
+        assert!(super::enter(&old, &mut reader, || alias.call::<()>(())).is_err());
+        assert!(alias.call::<()>(()).is_err());
+        assert!(!reader.help_mode());
+        let (mut candidate, _) = reader.lua_reload_candidate();
+        let candidate_lua = super::install_configuration_context(&mut candidate).unwrap();
+        super::enter(&candidate_lua, &mut candidate, || {
+            candidate_lua.load("lector.o.help_mode = true").exec()
+        })
+        .unwrap();
+        assert!(candidate.help_mode());
+        assert!(!reader.help_mode());
+        assert!(super::enter(&candidate_lua, &mut reader, || Ok(())).is_err());
+        drop(candidate);
+        assert!(
+            candidate_lua
+                .load("return lector.o.help_mode")
+                .eval::<bool>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn nested_hook_mutation_and_lua_errors_restore_parent_access() {
+        let mut reader = screen_reader();
+        let lua = super::install_configuration_context(&mut reader).unwrap();
+        super::enter(&lua, &mut reader, || {
+            lua.load(
+                r#"
+            local speak = lector.api.speak
+            lector.hooks.on_clipboard_change = function()
+                lector.o.help_mode = true
+                lector.hooks.on_clipboard_change = nil
+                error('nested hook error')
+            end
+            lector.hooks.on_speech_start = function()
+                lector.hooks.on_speech_start = function() lector.o.auto_read = false end
+                lector.clipboard.internal.text = 'entry'
+                speak('inner', false)
+                assert(lector.o.help_mode)
+            end
+            speak('outer', false)
+            assert(lector.o.help_mode)
+            assert(not lector.o.auto_read)
+            lector.o.help_mode = false
+        "#,
+            )
+            .exec()
+        })
+        .unwrap();
+        assert!(!reader.help_mode());
+        assert!(!reader.auto_read_enabled());
+        assert!(
+            reader
+                .take_runtime_error()
+                .unwrap()
+                .message
+                .contains("nested hook error")
+        );
+        assert!(
+            lua.load("return lector.o.help_mode")
+                .eval::<bool>()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn nested_rust_panic_restores_scopes_and_future_entry() {
+        let mut reader = screen_reader();
+        let lua = super::install_configuration_context(&mut reader).unwrap();
+        lua.globals()
+            .set(
+                "fail",
+                lua.create_function(|_, ()| -> mlua::Result<()> { panic!("neutral nested panic") })
+                    .unwrap(),
+            )
+            .unwrap();
+        super::enter(&lua, &mut reader, || {
+            lua.load("lector.hooks.on_speech_start = function() fail() end")
+                .exec()
+        })
+        .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::enter(&lua, &mut reader, || {
+                lua.load("lector.api.speak('outer', false)").exec()
+            })
+        }));
+        assert!(result.is_err());
+        assert!(
+            lua.load("return lector.o.help_mode")
+                .eval::<bool>()
+                .is_err()
+        );
+        super::enter(&lua, &mut reader, || lua.load("lector.hooks.on_speech_start = nil; lector.o.help_mode = true; lector.api.speak('recovered', false)").exec()).unwrap();
+        assert!(reader.help_mode());
+    }
+
+    #[test]
+    fn argument_metamethods_can_reenter_mutating_api_aliases() {
+        let mut reader = screen_reader();
+        let lua = super::install_configuration_context(&mut reader).unwrap();
+        super::enter(&lua, &mut reader, || {
+            lua.load(
+                r#"
+            local nested = function() lector.o.help_mode = true; return 'value' end
+            lector.bindings['M-v'] = setmetatable({}, { __index = function(_, key)
+                lector.o.help_mode = false
+                if key == 'help' then return nested() end
+                return function() lector.o.auto_read = false end
+            end })
+            lector.symbols['!'] = {'notice', 'all', 'never', false}
+            lector.api.set_speech(setmetatable({}, { __index = function(_, key)
+                nested()
+                if key == 'program' then return 'neutral-server' end
+                return {}
+            end }))
+            assert(lector.o.help_mode)
+        "#,
+            )
+            .exec()
+        })
+        .unwrap();
+        assert!(reader.help_mode());
+    }
+
+    #[test]
+    fn recursive_hooks_have_a_bounded_recoverable_entry_limit() {
+        let mut reader = screen_reader();
+        let lua = super::install_configuration_context(&mut reader).unwrap();
+        super::enter(&lua, &mut reader, || lua.load("lector.hooks.on_speech_start = function() lector.api.speak('nested', false) end; lector.api.speak('outer', false)").exec()).unwrap();
+        let report = reader.take_runtime_error().unwrap();
+        assert!(report.message.contains("nesting limit"));
+        super::enter(&lua, &mut reader, || {
+            lua.load("assert(lector.hooks.on_speech_start == nil); lector.hooks.on_clipboard_change = function() lector.o.help_mode = true end; lector.clipboard.internal.text = 'ordinary'").exec()
+        })
+        .unwrap();
+        assert!(reader.help_mode());
     }
 }

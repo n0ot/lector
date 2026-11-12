@@ -323,7 +323,9 @@ impl App {
         term_out: &mut dyn Write,
     ) -> Result<bool> {
         loop {
-            let yielded = match task.invocation.thread.resume::<Value>(response) {
+            let yielded = match crate::lua::enter(&task.invocation.lua, sr, || {
+                task.invocation.thread.resume::<Value>(response)
+            }) {
                 Ok(value) => value,
                 Err(error) => return Err(anyhow!("Lua key binding: {error}")),
             };
@@ -943,6 +945,35 @@ mod tests {
     }
 
     #[test]
+    fn reader_access_is_revoked_between_event_loop_resumes() {
+        let (mut app, mut sr, _, _, invocation) = setup("lector.o.help_mode = true");
+        let lua = Rc::clone(&invocation.lua);
+        crate::lua::setup_repl(&lua).unwrap();
+        let alias: Function = lua
+            .load("return function() lector.o.help_mode = true end")
+            .eval()
+            .unwrap();
+        let mut pty = Vec::new();
+        let mut terminal = Vec::new();
+        app.start_lua_invocation(&mut sr, invocation, &mut pty, &mut terminal)
+            .unwrap();
+        assert!(alias.call::<()>(()).is_err());
+        assert!(!sr.help_mode());
+        let utterance_id = active_utterance(&app);
+        sr.push_reader_speech_events([ReaderSpeechEvent {
+            utterance_id,
+            kind: ReaderSpeechEventKind::Ended,
+            position: Some(TextPosition::Utf8ByteOffset { offset: 5 }),
+            reason: Some("completed".to_owned()),
+        }]);
+        app.drive_lua_automation(&mut sr, &mut pty, &mut terminal)
+            .unwrap();
+        assert!(app.lua_task.is_none());
+        assert!(sr.help_mode());
+        assert!(alias.call::<()>(()).is_err());
+    }
+
+    #[test]
     fn reader_progress_moves_review_and_completion_restores_owned_state() {
         let (mut app, mut sr, spoken, stops, invocation) = setup(
             r#"
@@ -1067,8 +1098,7 @@ mod tests {
     fn public_lua_objects_hide_coroutine_requests_from_the_script() {
         let (mut app, mut sr, _spoken, _stops, _unused) = setup("return");
         let lua = Rc::new(Lua::new());
-        let sr_ptr = Rc::new(RefCell::new(&mut sr as *mut ScreenReader));
-        crate::lua::setup_repl(&lua, sr_ptr).unwrap();
+        crate::lua::setup_repl(&lua).unwrap();
         let function: Function = lua
             .load(
                 r#"
@@ -1111,8 +1141,7 @@ mod tests {
     fn empty_reader_range_completes_without_submitting_speech() {
         let (mut app, mut sr, spoken, _stops, _unused) = setup("return");
         let lua = Rc::new(Lua::new());
-        let sr_ptr = Rc::new(RefCell::new(&mut sr as *mut ScreenReader));
-        crate::lua::setup_repl(&lua, sr_ptr).unwrap();
+        crate::lua::setup_repl(&lua).unwrap();
         let function: Function = lua
             .load(
                 r#"
@@ -1214,8 +1243,7 @@ mod tests {
         let mut app = App::new(stack).unwrap();
         app.view_stack.root_mut().model().process_changes(b"alpha");
         let lua = Rc::new(Lua::new());
-        let sr_ptr = Rc::new(RefCell::new(&mut sr as *mut ScreenReader));
-        crate::lua::setup_repl(&lua, sr_ptr).unwrap();
+        crate::lua::setup_repl(&lua).unwrap();
         let function: Function = lua
             .load(
                 r#"
@@ -1538,8 +1566,7 @@ mod tests {
         present_live_view(&mut app, &mut terminal);
 
         let lua = Rc::new(Lua::new());
-        let sr_ptr = Rc::new(RefCell::new(&mut sr as *mut ScreenReader));
-        crate::lua::setup_repl(&lua, sr_ptr).unwrap();
+        crate::lua::setup_repl(&lua).unwrap();
         let function: Function = lua
             .load(
                 r#"
