@@ -343,8 +343,9 @@ replies because tmux is authoritative there.
 
 - `src/main.rs` owns process setup, polling, signal handling, and lifecycle.
 - `src/app.rs` and `src/app/` orchestrate input, views, presentation, and tmux
-  interactions. App applies connection transition results in protocol order;
-  it does not own connection-local tmux inventory or flow policy.
+  interactions. `TmuxConnectionState::step_control` in `src/app.rs` owns
+  connection-local inventory and flow transitions; `App::process_tmux_control`
+  applies their results in protocol order.
 - `src/terminal.rs` owns the concrete Ghostty adapter and normalized update,
   snapshot, and accessibility evidence contracts. Shared cell, row, style,
   cursor, mode, and effect leaf types are re-exported from `lector-ghostty`;
@@ -360,7 +361,8 @@ replies because tmux is authoritative there.
   and the bounded accessibility journal. `src/views/` owns concrete surfaces
   and the overlay stack.
 - `src/tmux_*.rs` contain protocol, topology, pane, input, prefix, and lifecycle
-  boundaries. `src/tmux_model.rs` owns connection-local control transitions.
+  boundaries. `src/tmux_model.rs` owns UI-independent topology and notification
+  reconciliation.
 - `src/speech/` contains Lector's speech manager, process client, supervisor,
   and asynchronous isolation.
 - `src/lua/` exposes configuration and the REPL. `src/lua/access.rs` owns
