@@ -1740,11 +1740,18 @@ impl StreamObserver {
             {
                 text.push(character);
             }
-            _ => self.operations.push(OperationSnapshot::WriteRun {
-                row: self.operation_row,
-                col: self.operation_col,
-                text: character.to_string(),
-            }),
+            _ => {
+                // This string is grown one character at a time. Use normal
+                // String growth from the first push, rather than allocating
+                // an exact one-byte string and reallocating on the next print.
+                let mut text = String::new();
+                text.push(character);
+                self.operations.push(OperationSnapshot::WriteRun {
+                    row: self.operation_row,
+                    col: self.operation_col,
+                    text,
+                });
+            }
         }
         self.operation_col = self.operation_col.saturating_add(1);
         self.last_printed = Some(character);

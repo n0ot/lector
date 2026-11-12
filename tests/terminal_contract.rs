@@ -386,6 +386,44 @@ fn update_summary_merges_print_boundaries_without_raw_byte_replay() {
 }
 
 #[test]
+fn printed_run_coalescing_preserves_boundary_text_across_every_grouping() {
+    let run = |boundary, text: &str| PrintedRun {
+        boundary,
+        text: text.into(),
+    };
+    let runs = [
+        run(PrintBoundary::Continue, "prefix"),
+        run(PrintBoundary::CarriageReturn, ""),
+        run(PrintBoundary::LineFeed, "first"),
+        run(PrintBoundary::Continue, " suffix"),
+        run(PrintBoundary::CarriageReturn, "replacement"),
+        run(PrintBoundary::LineFeed, "next"),
+    ];
+    let expected = vec![
+        run(PrintBoundary::Continue, "prefix"),
+        run(PrintBoundary::LineFeed, "first suffix"),
+        run(PrintBoundary::CarriageReturn, "replacement"),
+        run(PrintBoundary::LineFeed, "next"),
+    ];
+    for boundaries in 0..(1 << (runs.len() - 1)) {
+        let mut summary = UpdateSummary::default();
+        let mut start = 0;
+        for end in 1..=runs.len() {
+            if end == runs.len() || boundaries & (1 << (end - 1)) != 0 {
+                summary.merge(UpdateSummary {
+                    printed_runs: runs[start..end].to_vec(),
+                    batch_count: 1,
+                    ..UpdateSummary::default()
+                });
+                start = end;
+            }
+        }
+        assert_eq!(summary.printed_runs, expected, "grouping {boundaries}");
+        assert_eq!(summary.printed_text(), "prefix\nreplacement\nnext");
+    }
+}
+
+#[test]
 fn linear_output_completion_survives_fragmented_crlf_and_rejects_ambiguity() {
     let mut engine = engine(4, 20, 20);
 

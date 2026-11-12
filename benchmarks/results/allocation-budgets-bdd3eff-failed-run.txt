@@ -1,0 +1,11 @@
+Planned candidate repetition 3, source bdd3eff9281e50bdc98e780a9d9fca1d9631d494:
+
+error: Ghostty benchmark regression:
+scrolling-lf-receipts compositor throughput 0.208 MiB/s is below 0.220 MiB/s
+scrolling-lf-receipts compositor p95 latency 205500 ns exceeds 150000 ns
+
+All allocation gates passed. The CLI checks the baseline before writing its
+--output file, so no JSON exists for this failed invocation. The failure is
+retained here rather than silently replacing the planned third repetition.
+The bounded follow-up is recorded separately as base-3, candidate-3-report
+(without the gate), and candidate-4 (with the unchanged full baseline gate).
