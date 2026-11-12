@@ -9,15 +9,15 @@ host_target=$(rustc -vV | sed -n 's/^host: //p')
 prebuilt_root=${GHOSTTY_PREBUILT_ROOT:-"$repo_dir/target/ghostty-prebuilt"}
 
 debug_lector=$(LECTOR_GHOSTTY_OPTIMIZE=Debug \
-    "$cargo_bin" build --locked --features ghostty-vt --bin lector \
+    "$cargo_bin" build --locked --bin lector \
         --message-format=json-render-diagnostics | \
     "$repo_dir/scripts/cargo-artifact" lector bin)
 LECTOR_GHOSTTY_OPTIMIZE=Debug \
-    "$cargo_bin" test --locked --features ghostty-vt --test ghostty_build
-release_lector=$("$cargo_bin" build --locked --release --features ghostty-vt --bin lector \
+    "$cargo_bin" test --locked --test ghostty_build
+release_lector=$("$cargo_bin" build --locked --release --bin lector \
     --message-format=json-render-diagnostics | \
     "$repo_dir/scripts/cargo-artifact" lector bin)
-ghostty_test_binary=$("$cargo_bin" test --locked --release --features ghostty-vt \
+ghostty_test_binary=$("$cargo_bin" test --locked --release \
     --test ghostty_build --no-run --message-format=json-render-diagnostics | \
     "$repo_dir/scripts/cargo-artifact" ghostty_build test)
 "$ghostty_test_binary"

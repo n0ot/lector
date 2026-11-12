@@ -45,10 +45,6 @@ terminput = "0.5.12"
 thiserror = "2.0.17"
 lector-ghostty = { version = "0.1.0", path = "crates/lector-ghostty" }
 
-[features]
-default = ["ghostty-vt"]
-ghostty-vt = []
-
 [[bin]]
 name = "lector"
 path = "src/main.rs"
@@ -76,7 +72,6 @@ test = false
 [[bin]]
 name = "lector-ghostty-bench"
 path = "src/bin/lector-ghostty-bench.rs"
-required-features = ["ghostty-vt"]
 test = false
 bench = false
 

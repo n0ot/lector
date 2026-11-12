@@ -1,13 +1,10 @@
 use lector::terminal::{
-    ClipboardContent, ClipboardLocation, GhosttyEngine, ProgressState, TerminalEngine,
-    TerminalEvent, TerminalQuery,
+    ClipboardContent, ClipboardLocation, GhosttyEngine, ProgressState, TerminalEvent, TerminalQuery,
 };
 
-fn engine(rows: u16, cols: u16, scrollback: usize) -> Box<dyn TerminalEngine> {
-    Box::new(
-        GhosttyEngine::new_with_scrollback(rows, cols, scrollback)
-            .expect("create Ghostty terminal engine"),
-    )
+fn engine(rows: u16, cols: u16, scrollback: usize) -> GhosttyEngine {
+    GhosttyEngine::new_with_scrollback(rows, cols, scrollback)
+        .expect("create Ghostty terminal engine")
 }
 
 fn effect_stream() -> Vec<&'static [u8]> {
@@ -65,7 +62,7 @@ fn ghostty_preserves_typed_event_order_and_reported_values() {
     let mut engine = engine(4, 40, 100);
     let mut actual = Vec::new();
     for chunk in effect_stream() {
-        actual.extend(engine.advance(chunk).effects.events);
+        actual.extend(engine.advance_update(chunk).effects.events);
     }
 
     assert_eq!(actual, expected_effects());
@@ -79,15 +76,15 @@ fn ghostty_preserves_typed_event_order_and_reported_values() {
 #[test]
 fn mode_observation_tracks_focus_mouse_paste_and_kitty_keyboard_stack() {
     let mut engine = engine(4, 40, 100);
-    engine.advance(b"\x1B[?1004h\x1B[?1002h\x1B[?1006h\x1B[?2004h\x1B[>3u\x1B[=4;2u");
-    let modes = engine.snapshot().modes.clone();
+    engine.advance_update(b"\x1B[?1004h\x1B[?1002h\x1B[?1006h\x1B[?2004h\x1B[>3u\x1B[=4;2u");
+    let modes = engine.snapshot().modes;
     assert!(modes.focus_reporting);
     assert!(modes.bracketed_paste);
     assert_eq!(modes.kitty_keyboard_flags, 7);
     assert_ne!(modes.mouse_protocol, lector::terminal::MouseProtocol::None);
     assert_eq!(modes.mouse_encoding, lector::terminal::MouseEncoding::Sgr);
 
-    engine.advance(b"\x1B[<u\x1B[?1004l\x1B[?1002l\x1B[?1006l\x1B[?2004l");
+    engine.advance_update(b"\x1B[<u\x1B[?1004l\x1B[?1002l\x1B[?1006l\x1B[?2004l");
     let modes = &engine.snapshot().modes;
     assert!(!modes.focus_reporting);
     assert!(!modes.bracketed_paste);
@@ -98,25 +95,31 @@ fn mode_observation_tracks_focus_mouse_paste_and_kitty_keyboard_stack() {
 #[test]
 fn kitty_keyboard_flags_follow_the_active_screen_stack() {
     let mut engine = engine(4, 40, 100);
-    engine.advance(b"\x1B[>3u");
+    engine.advance_update(b"\x1B[>3u");
     assert_eq!(engine.snapshot().kitty_keyboard_flags(), 3);
 
-    engine.advance(b"\x1B[?1049h");
+    engine.advance_update(b"\x1B[?1049h");
     assert_eq!(engine.snapshot().kitty_keyboard_flags(), 0);
-    engine.advance(b"\x1B[>5u");
+    engine.advance_update(b"\x1B[>5u");
     assert_eq!(engine.snapshot().kitty_keyboard_flags(), 5);
 
-    engine.advance(b"\x1B[?1049l");
+    engine.advance_update(b"\x1B[?1049l");
     assert_eq!(engine.snapshot().kitty_keyboard_flags(), 3);
-    engine.advance(b"\x1B[?1049h");
+    engine.advance_update(b"\x1B[?1049h");
     assert_eq!(engine.snapshot().kitty_keyboard_flags(), 5);
 }
 
 #[test]
 fn unknown_sequences_are_fragment_safe_bounded_and_abortable() {
     let mut engine = engine(2, 20, 10);
-    assert!(engine.advance(b"\x1B_fragmented").effects.events.is_empty());
-    let completed = engine.advance(b" payload\x1B\\");
+    assert!(
+        engine
+            .advance_update(b"\x1B_fragmented")
+            .effects
+            .events
+            .is_empty()
+    );
+    let completed = engine.advance_update(b" payload\x1B\\");
     assert_eq!(
         completed.effects.events,
         [TerminalEvent::UnknownSequence {
@@ -128,7 +131,7 @@ fn unknown_sequences_are_fragment_safe_bounded_and_abortable() {
     let mut oversized = b"\x1B_".to_vec();
     oversized.extend(std::iter::repeat_n(b'x', 5_000));
     oversized.extend_from_slice(b"\x1B\\");
-    let update = engine.advance(&oversized);
+    let update = engine.advance_update(&oversized);
     assert_eq!(
         update.effects.events,
         [TerminalEvent::UnknownSequence {
@@ -139,7 +142,7 @@ fn unknown_sequences_are_fragment_safe_bounded_and_abortable() {
 
     assert!(
         engine
-            .advance(b"\x1B_aborted\x18")
+            .advance_update(b"\x1B_aborted\x18")
             .effects
             .events
             .is_empty()
@@ -149,9 +152,9 @@ fn unknown_sequences_are_fragment_safe_bounded_and_abortable() {
 #[test]
 fn terminal_reset_boundaries_are_exact() {
     let mut engine = engine(2, 20, 10);
-    assert!(!engine.advance(b"\x1B[0m\x1B[2J").terminal_reset);
-    assert!(engine.advance(b"\x1B[!p").terminal_reset);
-    assert!(engine.advance(b"\x1Bc").terminal_reset);
+    assert!(!engine.advance_update(b"\x1B[0m\x1B[2J").terminal_reset);
+    assert!(engine.advance_update(b"\x1B[!p").terminal_reset);
+    assert!(engine.advance_update(b"\x1Bc").terminal_reset);
 }
 
 #[test]
@@ -168,11 +171,11 @@ fn malformed_and_incomplete_effects_do_not_escape_as_partial_events() {
     .into_iter()
     .enumerate()
     {
-        let events = engine.advance(malformed).effects.events;
+        let events = engine.advance_update(malformed).effects.events;
         assert!(events.is_empty(), "malformed case {index}: {events:?}");
     }
 
-    let clipboard_query = engine.advance(b"\x1B]52;c;?\x1B\\");
+    let clipboard_query = engine.advance_update(b"\x1B]52;c;?\x1B\\");
     assert_eq!(
         clipboard_query.effects.events,
         [TerminalEvent::Query(TerminalQuery::Clipboard)]
@@ -182,7 +185,7 @@ fn malformed_and_incomplete_effects_do_not_escape_as_partial_events() {
     // OSC 9 is also Ghostty's desktop-notification protocol. An invalid
     // progress subcommand is a complete notification and must not be dropped.
     assert_eq!(
-        engine.advance(b"\x1B]9;4;9;50\x1B\\").effects.events,
+        engine.advance_update(b"\x1B]9;4;9;50\x1B\\").effects.events,
         [TerminalEvent::DesktopNotification {
             title: String::new(),
             body: "4;9;50".into(),
@@ -191,13 +194,13 @@ fn malformed_and_incomplete_effects_do_not_escape_as_partial_events() {
 
     assert!(
         engine
-            .advance(b"\x1B]777;notify;split;")
+            .advance_update(b"\x1B]777;notify;split;")
             .effects
             .events
             .is_empty()
     );
     assert_eq!(
-        engine.advance(b"body\x07").effects.events,
+        engine.advance_update(b"body\x07").effects.events,
         [TerminalEvent::DesktopNotification {
             title: "split".into(),
             body: "body".into(),
@@ -218,7 +221,7 @@ fn progress_reports_preserve_ghostty_defaults_clamping_and_missing_values() {
         b"\x1B]9;4;3;50\x1B\\",
         b"\x1B]9;4;4\x1B\\",
     ] {
-        events.extend(engine.advance(sequence).effects.events);
+        events.extend(engine.advance_update(sequence).effects.events);
     }
     assert_eq!(
         events,
@@ -270,7 +273,7 @@ fn clipboard_writes_accept_ghostty_base64_variants_and_reads_are_brokered() {
         b"\x1B]52;c;A\x1B\\",
         b"\x1B]52;c;Y=Q\x1B\\",
     ] {
-        events.extend(engine.advance(sequence).effects.events);
+        events.extend(engine.advance_update(sequence).effects.events);
     }
 
     assert_eq!(
@@ -312,7 +315,7 @@ fn supported_and_incomplete_apcs_are_not_reported_as_unknown() {
         b"\x1B_25a\x1B\\",
         b"\x1B_\x1B\\",
     ] {
-        assert!(engine.advance(sequence).effects.events.is_empty());
+        assert!(engine.advance_update(sequence).effects.events.is_empty());
     }
 }
 
@@ -321,7 +324,7 @@ fn fragmented_queries_emit_only_after_their_final_byte() {
     let mut engine = engine(2, 20, 10);
     let mut events = Vec::new();
     for byte in b"\x05\x1B[>q\x1B[18t\x1B[?996n\x1B[c" {
-        events.extend(engine.advance(&[*byte]).effects.events);
+        events.extend(engine.advance_update(&[*byte]).effects.events);
     }
     assert_eq!(
         events,
@@ -339,7 +342,7 @@ fn fragmented_queries_emit_only_after_their_final_byte() {
 fn every_exposed_size_and_device_query_form_is_typed_in_order() {
     let mut engine = engine(2, 20, 10);
     let events = engine
-        .advance(b"\x1B[14t\x1B[16t\x1B[18t\x1B[c\x1B[>c\x1B[=c\x1B[?996n")
+        .advance_update(b"\x1B[14t\x1B[16t\x1B[18t\x1B[c\x1B[>c\x1B[=c\x1B[?996n")
         .effects
         .events;
     assert_eq!(
@@ -374,8 +377,8 @@ fn pane_events_are_owned_until_that_view_finalizes_its_update() {
 #[test]
 fn empty_title_and_working_directory_are_preserved_as_reported_clears() {
     let mut engine = engine(2, 20, 10);
-    engine.advance(b"\x1B]2;set\x07\x1B]7;file://host/tmp\x1B\\");
-    let update = engine.advance(b"\x1B]2;\x07\x1B]7;\x1B\\");
+    engine.advance_update(b"\x1B]2;set\x07\x1B]7;file://host/tmp\x1B\\");
+    let update = engine.advance_update(b"\x1B]2;\x07\x1B]7;\x1B\\");
 
     assert_eq!(
         update.effects.events,
@@ -397,7 +400,7 @@ fn oversized_title_is_truncated_and_oversized_working_directory_is_ignored() {
     sequence.extend_from_slice(b"\x1B\\");
 
     let mut engine = engine(2, 20, 10);
-    let events = engine.advance(&sequence).effects.events;
+    let events = engine.advance_update(&sequence).effects.events;
     assert_eq!(events.len(), 1);
     assert!(matches!(&events[0], TerminalEvent::TitleChanged(value) if value.len() == 1024));
     assert_eq!(engine.snapshot().title.as_ref().unwrap().len(), 1024);

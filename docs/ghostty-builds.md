@@ -28,9 +28,17 @@ checked against Ghostty's installed headers during the automatic bootstrap.
 
 ## Authoritative engine
 
-The `ghostty-vt` Cargo feature is an empty, default flag accepted by project
-commands and benchmark target selection. It does not toggle the dependency or
-runtime engine: `lector-ghostty` is mandatory with or without default features.
+`lector-ghostty` is mandatory with or without default features. The former
+empty `ghostty-vt` Cargo feature has been removed. Migrate existing build, test,
+and benchmark commands by removing `--features ghostty-vt`; the benchmark binary
+is now available without a feature flag.
+
+The adapter uses concrete `GhosttyEngine` methods instead of the former
+`TerminalEngine` trait. Calls needing Lector's infallible update summaries use
+`advance_update`, `resize_update`, `resize_with_geometry_update`, and
+`reset_update`. The existing fallible inherent methods and `try_*` methods retain
+their behavior. Snapshot and viewport methods are directly available on the
+concrete engine. Ghostty handles remain bound to their constructing thread.
 
 CI runs the complete authoritative suite, recording corpus, fragmentation
 tests, accessibility harnesses, and debug/release static-link checks. Checked-in
@@ -326,7 +334,7 @@ matching Zig 0.17.0 on `PATH` and otherwise obtains the pinned toolchain:
 
 ```sh
 scripts/bootstrap_ghostty.sh --optimize ReleaseFast
-cargo build --locked --release --features ghostty-vt
+cargo build --locked --release
 ```
 
 On macOS, Zig 0.17.0 uses the macOS 26 SDK reported by `xcrun --sdk macosx`.
@@ -341,7 +349,7 @@ root when package policy does not permit build inputs under `target`:
 
 ```sh
 GHOSTTY_PREBUILT_ROOT=/opt/lector/ghostty-prebuilt \
-  cargo build --locked --release --features ghostty-vt
+  cargo build --locked --release
 ```
 
 Each profile directory must contain `static-lib/libghostty-vt.a` and the

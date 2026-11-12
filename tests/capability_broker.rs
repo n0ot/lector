@@ -1,8 +1,7 @@
 use lector::{
     harness::Harness,
     terminal::{
-        ClipboardContent, ClipboardLocation, GhosttyEngine, TerminalEngine, TerminalEvent,
-        TerminalGeometry,
+        ClipboardContent, ClipboardLocation, GhosttyEngine, TerminalEvent, TerminalGeometry,
     },
     terminal_protocol::{
         ApplicationReplyBroker, CapabilityOverrides, ColorScheme, DefaultColor, EffectDisposition,
@@ -661,7 +660,7 @@ fn unbrokered_pixel_mouse_theme_notification_and_resize_modes_stay_unsupported()
         "clearing pixel mouse must preserve the requested cell-coordinate SGR encoding"
     );
 
-    TerminalEngine::resize_with_geometry(&mut engine, TerminalGeometry::new(30, 100, 10, 20));
+    GhosttyEngine::resize_with_geometry_update(&mut engine, TerminalGeometry::new(30, 100, 10, 20));
     let after_resize = engine
         .advance(b"\x1b[?2048$p")
         .expect("query mode after resize")
@@ -700,7 +699,7 @@ fn fragmented_multi_mode_enable_is_corrected_only_after_its_complete_csi() {
         lector::terminal::MouseEncoding::Sgr
     );
 
-    TerminalEngine::resize_with_geometry(&mut engine, TerminalGeometry::new(30, 100, 10, 20));
+    GhosttyEngine::resize_with_geometry_update(&mut engine, TerminalGeometry::new(30, 100, 10, 20));
     assert!(
         engine
             .advance(b"")

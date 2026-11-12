@@ -320,7 +320,8 @@ impl RowSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CursorShapeSnapshot {
     Bar,
     #[default]
@@ -329,7 +330,8 @@ pub enum CursorShapeSnapshot {
     BlockHollow,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct CursorSnapshot {
     pub row: u16,
     pub col: u16,
@@ -337,7 +339,8 @@ pub struct CursorSnapshot {
     pub shape: CursorShapeSnapshot,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MouseProtocol {
     #[default]
     None,
@@ -347,7 +350,8 @@ pub enum MouseProtocol {
     AnyMotion,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MouseEncoding {
     #[default]
     Default,
@@ -355,7 +359,8 @@ pub enum MouseEncoding {
     Sgr,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct ModesSnapshot {
     pub application_keypad: bool,
     pub application_cursor: bool,

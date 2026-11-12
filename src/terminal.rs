@@ -1,31 +1,25 @@
-//! Engine-neutral terminal state and Lector's Ghostty terminal adapter.
+//! Terminal state and Lector's Ghostty terminal adapter.
 
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, ops::RangeInclusive, sync::Arc};
 
 pub use lector_ghostty::{
-    CellSnapshot as Cell, ColorSnapshot as Color, RowSnapshot as Row, StyleSnapshot as Style,
+    CellSnapshot as Cell, ClipboardContentSnapshot as ClipboardContent,
+    ClipboardLocationSnapshot as ClipboardLocation, ColorSnapshot as Color,
+    CursorShapeSnapshot as CursorShape, CursorSnapshot as Cursor, EffectSnapshot as TerminalEvent,
+    ModesSnapshot as TerminalModes, MouseEncoding, MouseProtocol,
+    ProgressStateSnapshot as ProgressState, QuerySnapshot as TerminalQuery, RowSnapshot as Row,
+    SemanticKindSnapshot as SemanticKind, StyleSnapshot as Style,
     UnderlineSnapshot as UnderlineStyle,
 };
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CursorShape {
-    Bar,
-    #[default]
-    Block,
-    Underline,
-    BlockHollow,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
-pub struct Cursor {
-    pub row: u16,
-    pub col: u16,
-    pub visible: bool,
-    pub shape: CursorShape,
-}
+/// A renderer optimization hint recorded alongside Ghostty mutation. Ghostty's
+/// resulting snapshot remains authoritative; consumers must validate an
+/// operation before translating it to physical-terminal bytes. Engine-produced
+/// `WriteRun` text is always ASCII, so its byte length is also its
+/// terminal-column count; the observer discards operation hints for non-ASCII
+/// output.
+pub use lector_ghostty::OperationSnapshot as TerminalOperation;
 
 /// Cell and pixel geometry for one terminal grid.
 ///
@@ -89,51 +83,10 @@ pub enum ScreenIdentity {
     Alternate,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MouseProtocol {
-    #[default]
-    None,
-    Press,
-    PressRelease,
-    ButtonMotion,
-    AnyMotion,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MouseEncoding {
-    #[default]
-    Default,
-    Utf8,
-    Sgr,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
-pub struct TerminalModes {
-    pub application_keypad: bool,
-    pub application_cursor: bool,
-    pub bracketed_paste: bool,
-    pub synchronized_output: bool,
-    pub focus_reporting: bool,
-    pub kitty_keyboard_flags: u8,
-    pub mouse_protocol: MouseProtocol,
-    pub mouse_encoding: MouseEncoding,
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct HistoryPosition {
     pub row: usize,
     pub col: u16,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SemanticKind {
-    PromptStart,
-    InputStart,
-    CommandStart,
-    CommandFinished { exit_code: Option<i32> },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,63 +101,6 @@ pub struct TerminalEffects {
     pub bells: usize,
     pub title_changed: bool,
     pub events: Vec<TerminalEvent>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ClipboardLocation {
-    Standard,
-    Selection,
-    Primary,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClipboardContent {
-    pub mime: String,
-    pub data: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProgressState {
-    Remove,
-    Set,
-    Error,
-    Indeterminate,
-    Pause,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TerminalQuery {
-    Enquiry,
-    XtVersion,
-    Size,
-    ColorScheme,
-    DeviceAttributes,
-    Clipboard,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TerminalEvent {
-    Bell,
-    TitleChanged(String),
-    WorkingDirectoryChanged(String),
-    ClipboardWrite {
-        location: ClipboardLocation,
-        contents: Vec<ClipboardContent>,
-    },
-    DesktopNotification {
-        title: String,
-        body: String,
-    },
-    ProgressReport {
-        state: ProgressState,
-        progress: Option<u8>,
-    },
-    Query(TerminalQuery),
-    PtyReply(Vec<u8>),
-    UnknownSequence {
-        content: Vec<u8>,
-        truncated: bool,
-    },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -263,24 +159,6 @@ pub enum LinearOutputEffect {
     Replace(LinearOutputReport),
     /// An ambiguity barrier with no later safe output.
     Clear,
-}
-
-/// A renderer optimization hint recorded alongside Ghostty mutation. Ghostty's
-/// resulting snapshot remains authoritative; consumers must validate an
-/// operation before translating it to physical-terminal bytes. Engine-produced
-/// `WriteRun` text is always ASCII, so its byte length is also its
-/// terminal-column count; the observer discards operation hints for non-ASCII
-/// output.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum TerminalOperation {
-    ScrollUp { top: u16, bottom: u16, count: u16 },
-    ScrollDown { top: u16, bottom: u16, count: u16 },
-    InsertLines { row: u16, bottom: u16, count: u16 },
-    DeleteLines { row: u16, bottom: u16, count: u16 },
-    InsertChars { row: u16, col: u16, count: u16 },
-    DeleteChars { row: u16, col: u16, count: u16 },
-    EraseChars { row: u16, col: u16, count: u16 },
-    WriteRun { row: u16, col: u16, text: String },
 }
 
 /// Coordinate-bearing printable writes retained for accessibility evidence.
@@ -1150,20 +1028,6 @@ fn append_row_contents(row: &Row, start: u16, width: u16, output: &mut String) {
     row.append_contents_range_to(output, usize::from(start), usize::from(width));
 }
 
-pub trait TerminalEngine {
-    fn advance(&mut self, bytes: &[u8]) -> UpdateSummary;
-    fn resize(&mut self, rows: u16, cols: u16) -> UpdateSummary {
-        self.resize_with_geometry(TerminalGeometry::from_cells(rows, cols))
-    }
-    fn resize_with_geometry(&mut self, geometry: TerminalGeometry) -> UpdateSummary;
-    fn reset(&mut self) -> UpdateSummary;
-    fn select_viewport(&mut self, viewport: Viewport);
-    fn viewport(&self) -> Viewport;
-    fn snapshot(&self) -> &TerminalSnapshot;
-    fn snapshot_with_history(&mut self) -> TerminalSnapshot;
-    fn scrollback_extent(&self) -> usize;
-}
-
 fn full_row_range(rows: u16) -> Vec<RangeInclusive<u16>> {
     (rows > 0).then(|| 0..=rows - 1).into_iter().collect()
 }
@@ -1317,7 +1181,7 @@ impl GhosttyEngine {
         self.synchronized_output_open_snapshot.take()
     }
 
-    /// Fallible direct adapter API. Production callers use `TerminalEngine`;
+    /// Fallible direct adapter API. Production callers use [`Self::advance_update`];
     /// diagnostics and adapter tests can retain the underlying error.
     pub fn advance(&mut self, bytes: &[u8]) -> Result<UpdateSummary, lector_ghostty::Error> {
         self.try_advance(bytes)
@@ -1584,13 +1448,20 @@ impl GhosttyEngine {
     }
 }
 
-impl TerminalEngine for GhosttyEngine {
-    fn advance(&mut self, bytes: &[u8]) -> UpdateSummary {
+impl GhosttyEngine {
+    /// Applies output and returns Lector's update summary, failing immediately
+    /// if the authoritative terminal cannot advance. Use [`Self::try_advance`]
+    /// when the caller can recover from the underlying adapter error.
+    pub fn advance_update(&mut self, bytes: &[u8]) -> UpdateSummary {
         self.try_advance(bytes)
             .unwrap_or_else(|error| panic!("Ghostty terminal advance failed: {error}"))
     }
 
-    fn resize_with_geometry(&mut self, geometry: TerminalGeometry) -> UpdateSummary {
+    pub fn resize_update(&mut self, rows: u16, cols: u16) -> UpdateSummary {
+        self.resize_with_geometry_update(TerminalGeometry::from_cells(rows, cols))
+    }
+
+    pub fn resize_with_geometry_update(&mut self, geometry: TerminalGeometry) -> UpdateSummary {
         let before = self.snapshot.clone();
         self.try_resize_with_geometry(geometry)
             .unwrap_or_else(|error| panic!("Ghostty terminal resize failed: {error}"));
@@ -1610,7 +1481,7 @@ impl TerminalEngine for GhosttyEngine {
         }
     }
 
-    fn reset(&mut self) -> UpdateSummary {
+    pub fn reset_update(&mut self) -> UpdateSummary {
         let before = self.snapshot.clone();
         self.try_reset()
             .unwrap_or_else(|error| panic!("Ghostty terminal reset failed: {error}"));
@@ -1630,7 +1501,7 @@ impl TerminalEngine for GhosttyEngine {
         }
     }
 
-    fn select_viewport(&mut self, viewport: Viewport) {
+    pub fn select_viewport(&mut self, viewport: Viewport) {
         let viewport = match viewport {
             Viewport::Scrollback(0) => Viewport::Live,
             viewport => viewport,
@@ -1643,21 +1514,17 @@ impl TerminalEngine for GhosttyEngine {
             .unwrap_or_else(|error| panic!("Ghostty viewport selection failed: {error}"));
     }
 
-    fn viewport(&self) -> Viewport {
+    pub fn viewport(&self) -> Viewport {
         self.viewport
     }
 
-    fn snapshot(&self) -> &TerminalSnapshot {
+    pub fn snapshot(&self) -> &TerminalSnapshot {
         &self.snapshot
     }
 
-    fn snapshot_with_history(&mut self) -> TerminalSnapshot {
+    pub fn snapshot_with_history(&mut self) -> TerminalSnapshot {
         self.normalized_snapshot_with_history()
             .unwrap_or_else(|error| panic!("Ghostty history snapshot failed: {error}"))
-    }
-
-    fn scrollback_extent(&self) -> usize {
-        self.terminal.scrollback_extent()
     }
 }
 
@@ -1676,20 +1543,11 @@ fn refresh_normalized_ghostty_metadata(
     snapshot: &GhosttySnapshot,
 ) {
     let (rows, cols) = snapshot.size();
-    normalized.cursor = normalize_ghostty_cursor(snapshot.cursor);
+    normalized.cursor = snapshot.cursor;
     normalized.geometry =
         TerminalGeometry::from_grid_pixels(rows, cols, snapshot.width_px, snapshot.height_px);
     normalized.screen = ghostty_screen_identity(snapshot.alternate_screen);
-    normalized.modes = TerminalModes {
-        application_keypad: snapshot.modes.application_keypad,
-        application_cursor: snapshot.modes.application_cursor,
-        bracketed_paste: snapshot.modes.bracketed_paste,
-        synchronized_output: snapshot.modes.synchronized_output,
-        focus_reporting: snapshot.modes.focus_reporting,
-        kitty_keyboard_flags: snapshot.modes.kitty_keyboard_flags,
-        mouse_protocol: normalize_ghostty_mouse_protocol(snapshot.modes.mouse_protocol),
-        mouse_encoding: normalize_ghostty_mouse_encoding(snapshot.modes.mouse_encoding),
-    };
+    normalized.modes = snapshot.modes;
     normalized.title.clone_from(&snapshot.title);
     normalized
         .working_directory
@@ -1698,14 +1556,7 @@ fn refresh_normalized_ghostty_metadata(
     normalized
         .semantic_marks
         .extend(snapshot.semantic_marks.iter().map(|mark| SemanticMark {
-            kind: match mark.kind {
-                GhosttySemanticKind::PromptStart => SemanticKind::PromptStart,
-                GhosttySemanticKind::InputStart => SemanticKind::InputStart,
-                GhosttySemanticKind::CommandStart => SemanticKind::CommandStart,
-                GhosttySemanticKind::CommandFinished { exit_code } => {
-                    SemanticKind::CommandFinished { exit_code }
-                }
-            },
+            kind: mark.kind,
             position: HistoryPosition {
                 row: mark.row,
                 col: mark.col,
@@ -1767,7 +1618,6 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
     let effects = update
         .effects
         .into_iter()
-        .map(normalize_ghostty_effect)
         .filter(|event| !matches!(event, TerminalEvent::PtyReply(_)))
         .collect::<Vec<_>>();
     let line_feed_boundaries = update
@@ -1776,11 +1626,7 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         .filter(|run| run.boundary == GhosttyPrintBoundary::LineFeed)
         .count();
     let linear_output_effect = normalize_ghostty_linear_output_effect(update.linear_output_effect);
-    let operations = update
-        .operations
-        .into_iter()
-        .map(normalize_ghostty_operation)
-        .collect::<Vec<_>>();
+    let operations = update.operations;
     let cell_writes = operations
         .iter()
         .filter_map(|operation| match operation {
@@ -1820,8 +1666,8 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
         scroll_operations: update.scroll_operations,
         history_changed: update.history_changed,
         changed_rows,
-        cursor_before: normalize_ghostty_cursor(update.cursor_before),
-        cursor_after: normalize_ghostty_cursor(update.cursor_after),
+        cursor_before: update.cursor_before,
+        cursor_after: update.cursor_after,
         screen_before: ghostty_screen_identity(update.alternate_screen_before),
         screen_after: ghostty_screen_identity(update.alternate_screen_after),
         synchronized_output: update.synchronized_output,
@@ -1835,121 +1681,11 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
     }
 }
 
-fn normalize_ghostty_operation(operation: GhosttyOperation) -> TerminalOperation {
-    match operation {
-        GhosttyOperation::ScrollUp { top, bottom, count } => {
-            TerminalOperation::ScrollUp { top, bottom, count }
-        }
-        GhosttyOperation::ScrollDown { top, bottom, count } => {
-            TerminalOperation::ScrollDown { top, bottom, count }
-        }
-        GhosttyOperation::InsertLines { row, bottom, count } => {
-            TerminalOperation::InsertLines { row, bottom, count }
-        }
-        GhosttyOperation::DeleteLines { row, bottom, count } => {
-            TerminalOperation::DeleteLines { row, bottom, count }
-        }
-        GhosttyOperation::InsertChars { row, col, count } => {
-            TerminalOperation::InsertChars { row, col, count }
-        }
-        GhosttyOperation::DeleteChars { row, col, count } => {
-            TerminalOperation::DeleteChars { row, col, count }
-        }
-        GhosttyOperation::EraseChars { row, col, count } => {
-            TerminalOperation::EraseChars { row, col, count }
-        }
-        GhosttyOperation::WriteRun { row, col, text } => {
-            TerminalOperation::WriteRun { row, col, text }
-        }
-    }
-}
-
-fn normalize_ghostty_effect(effect: GhosttyEffect) -> TerminalEvent {
-    match effect {
-        GhosttyEffect::Bell => TerminalEvent::Bell,
-        GhosttyEffect::TitleChanged(title) => TerminalEvent::TitleChanged(title),
-        GhosttyEffect::WorkingDirectoryChanged(path) => {
-            TerminalEvent::WorkingDirectoryChanged(path)
-        }
-        GhosttyEffect::ClipboardWrite { location, contents } => TerminalEvent::ClipboardWrite {
-            location: match location {
-                GhosttyClipboardLocation::Standard => ClipboardLocation::Standard,
-                GhosttyClipboardLocation::Selection => ClipboardLocation::Selection,
-                GhosttyClipboardLocation::Primary => ClipboardLocation::Primary,
-            },
-            contents: contents
-                .into_iter()
-                .map(|content: GhosttyClipboardContent| ClipboardContent {
-                    mime: content.mime,
-                    data: content.data,
-                })
-                .collect(),
-        },
-        GhosttyEffect::DesktopNotification { title, body } => {
-            TerminalEvent::DesktopNotification { title, body }
-        }
-        GhosttyEffect::ProgressReport { state, progress } => TerminalEvent::ProgressReport {
-            state: match state {
-                GhosttyProgressState::Remove => ProgressState::Remove,
-                GhosttyProgressState::Set => ProgressState::Set,
-                GhosttyProgressState::Error => ProgressState::Error,
-                GhosttyProgressState::Indeterminate => ProgressState::Indeterminate,
-                GhosttyProgressState::Pause => ProgressState::Pause,
-            },
-            progress,
-        },
-        GhosttyEffect::Query(query) => TerminalEvent::Query(match query {
-            GhosttyQuery::Enquiry => TerminalQuery::Enquiry,
-            GhosttyQuery::XtVersion => TerminalQuery::XtVersion,
-            GhosttyQuery::Size => TerminalQuery::Size,
-            GhosttyQuery::ColorScheme => TerminalQuery::ColorScheme,
-            GhosttyQuery::DeviceAttributes => TerminalQuery::DeviceAttributes,
-            GhosttyQuery::Clipboard => TerminalQuery::Clipboard,
-        }),
-        GhosttyEffect::PtyReply(bytes) => TerminalEvent::PtyReply(bytes),
-        GhosttyEffect::UnknownSequence { content, truncated } => {
-            TerminalEvent::UnknownSequence { content, truncated }
-        }
-    }
-}
-
-fn normalize_ghostty_cursor(cursor: GhosttyCursor) -> Cursor {
-    Cursor {
-        row: cursor.row,
-        col: cursor.col,
-        visible: cursor.visible,
-        shape: match cursor.shape {
-            lector_ghostty::CursorShapeSnapshot::Bar => CursorShape::Bar,
-            lector_ghostty::CursorShapeSnapshot::Block => CursorShape::Block,
-            lector_ghostty::CursorShapeSnapshot::Underline => CursorShape::Underline,
-            lector_ghostty::CursorShapeSnapshot::BlockHollow => CursorShape::BlockHollow,
-        },
-    }
-}
-
 fn ghostty_screen_identity(alternate: bool) -> ScreenIdentity {
     if alternate {
         ScreenIdentity::Alternate
     } else {
         ScreenIdentity::Primary
-    }
-}
-
-fn normalize_ghostty_mouse_protocol(value: lector_ghostty::MouseProtocol) -> MouseProtocol {
-    match value {
-        lector_ghostty::MouseProtocol::None => MouseProtocol::None,
-        lector_ghostty::MouseProtocol::Press => MouseProtocol::Press,
-        lector_ghostty::MouseProtocol::PressRelease => MouseProtocol::PressRelease,
-        lector_ghostty::MouseProtocol::ButtonMotion => MouseProtocol::ButtonMotion,
-        lector_ghostty::MouseProtocol::AnyMotion => MouseProtocol::AnyMotion,
-    }
-}
-
-fn normalize_ghostty_mouse_encoding(value: lector_ghostty::MouseEncoding) -> MouseEncoding {
-    match value {
-        lector_ghostty::MouseEncoding::Default => MouseEncoding::Default,
-        lector_ghostty::MouseEncoding::Utf8 => MouseEncoding::Utf8,
-        lector_ghostty::MouseEncoding::Sgr => MouseEncoding::Sgr,
     }
 }
 
@@ -1977,7 +1713,7 @@ mod tests {
         }
     }
 
-    use super::{GhosttyEngine, TerminalEngine, Viewport};
+    use super::{GhosttyEngine, Viewport};
 
     #[test]
     fn structural_prefix_does_not_taint_a_later_complete_linear_suffix() {

@@ -19,8 +19,8 @@ fn ghostty_dependency_and_source_revisions_are_exactly_pinned() {
     assert_eq!(ghostty::GHOSTTY_VERSION, "1.0.0");
 
     let manifest = include_str!("../Cargo.toml");
-    assert!(manifest.contains("default = [\"ghostty-vt\"]"));
-    assert!(manifest.contains("ghostty-vt = []"));
+    assert!(!manifest.contains("ghostty-vt ="));
+    assert!(!manifest.contains("required-features"));
     assert!(
         manifest
             .contains("lector-ghostty = { version = \"0.1.0\", path = \"crates/lector-ghostty\" }")
@@ -183,7 +183,7 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     let xtask = include_str!("../xtask/src/main.rs");
     assert!(xtask.contains("scripts/bootstrap_ghostty.sh"));
     assert!(xtask.contains("\"--release\""));
-    assert!(xtask.contains("\"ghostty-vt\""));
+    assert!(!xtask.contains("\"--features\""));
     assert!(xtask.contains("lector-ghostty-bench"));
 
     let bootstrap = include_str!("../crates/lector-ghostty/bootstrap/bootstrap_zig.sh");

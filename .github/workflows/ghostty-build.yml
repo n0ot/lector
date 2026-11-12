@@ -293,13 +293,12 @@ jobs:
         if: needs.changes.outputs.build == 'true'
         run: >-
           cargo check --locked --target "${{ matrix.target }}"
-          --features ghostty-vt
       - name: Link and inspect static Lector executable
         if: needs.changes.outputs.build == 'true'
         run: |
           artifact=$(
             cargo build --locked --release --target "${{ matrix.target }}" \
-              --features ghostty-vt --bin lector \
+              --bin lector \
               --message-format=json-render-diagnostics \
             | scripts/cargo-artifact lector bin
           )

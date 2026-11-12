@@ -21,7 +21,7 @@ pub fn validate_target(target: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Lector's ghostty-vt feature does not support target {target}; supported targets: {}",
+            "Lector's Ghostty adapter does not support target {target}; supported targets: {}",
             SUPPORTED_TARGETS.join(", ")
         ))
     }
