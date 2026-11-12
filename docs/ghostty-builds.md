@@ -449,8 +449,8 @@ Cargo home and identity; it never keys against the runner's rustup compiler.
 The Docker integration cache additionally uses the exact container image and
 compiler identity. Its source fingerprint includes Cargo manifests/lockfile and
 configuration, build scripts, the Ghostty adapter, Docker inputs, and the
-container runner's bootstrap helpers. An unrelated developer or test-runner
-script does not invalidate these artifacts. Add new transitive build helpers to
+container runner's bootstrap and compiler/linker helpers. An unrelated developer
+or test-runner script does not invalidate these artifacts. Add new transitive build helpers to
 `BUILD_SCRIPTS` in `.github/scripts/tmux_cache_key.py` when introducing them.
 Cargo still checks changed application/test sources, and restored native
 artifacts are verified before use. Cache misses and failed restores retain the

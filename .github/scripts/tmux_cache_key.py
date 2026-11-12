@@ -6,7 +6,7 @@ import subprocess
 import sys
 
 
-# Scripts used by the container runner and its native-artifact bootstrap chain.
+# Scripts used by the container runner, bootstrap, and Cargo compiler/linker chain.
 # Keep this boundary aligned when those scripts acquire another dependency;
 # unrelated developer/test runners do not change the container's build inputs.
 BUILD_SCRIPTS = frozenset({
@@ -14,7 +14,10 @@ BUILD_SCRIPTS = frozenset({
     'scripts/check-rust-toolchain',
     'scripts/bootstrap_ghostty.sh',
     'scripts/bootstrap_zig.sh',
+    'scripts/rustc-static-linux',
+    'scripts/static-pie-cc',
     'scripts/zig-cc',
+    'scripts/zig-lld',
 })
 
 
@@ -27,7 +30,8 @@ def fingerprint(root, identity):
             relative = path.relative_to(root).as_posix()
             if (name in ('Cargo.toml', 'build.rs')
                     or relative in BUILD_SCRIPTS
-                    or relative.startswith(('.cargo/', 'scripts/lib/', 'crates/lector-ghostty/', 'tests/docker/'))
+                    or relative.startswith(('.cargo/', 'build_support/', 'scripts/lib/',
+                                            'crates/lector-ghostty/', 'tests/docker/'))
                     or relative == '.github/scripts/tmux_cache_key.py'):
                 paths.add(path)
     digest = hashlib.sha256(identity.encode())
