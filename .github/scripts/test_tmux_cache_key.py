@@ -10,9 +10,17 @@ class ContainerCacheKeyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             files = ['Cargo.lock', 'rust-toolchain.toml', 'Cargo.toml',
-                     '.cargo/config.toml', 'scripts/bootstrap_ghostty.sh',
-                     'scripts/bootstrap_zig.sh', 'crates/lector-ghostty/build.rs',
-                     'tests/docker/real-tmux.Dockerfile']
+                     '.cargo/config.toml', 'build_support/ghostty.rs', 'scripts/lib/lock.sh',
+                     'crates/lector-ghostty/build.rs',
+                     'tests/docker/real-tmux.Dockerfile',
+                     'tests/docker/install-nextest.sh',
+                     '.github/scripts/tmux_cache_key.py',
+                     'scripts/test-real-tmux-docker', 'scripts/check-rust-toolchain',
+                     'scripts/bootstrap_ghostty.sh', 'scripts/bootstrap_zig.sh',
+                     # .cargo/config.toml selects this workspace compiler wrapper;
+                     # its GNU/MUSL branches select these linker helpers.
+                     'scripts/rustc-static-linux', 'scripts/static-pie-cc',
+                     'scripts/zig-cc', 'scripts/zig-lld']
             for name in files:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -34,6 +42,21 @@ class ContainerCacheKeyTests(unittest.TestCase):
             (root / 'src').mkdir()
             (root / 'src/lib.rs').write_text('source edit checked by Cargo fingerprints')
             self.assertEqual(baseline, fingerprint(root, identity))
+
+    def test_unrelated_runner_changes_do_not_discard_container_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'Cargo.lock').write_text('lock')
+            (root / 'rust-toolchain.toml').write_text('compiler')
+            (root / 'scripts').mkdir()
+            baseline = fingerprint(root, 'container and compiler identity')
+            runner = root / 'scripts/report-summary'
+            runner.write_text('first version')
+            self.assertEqual(baseline, fingerprint(root, 'container and compiler identity'))
+            runner.write_text('changed unrelated runner')
+            self.assertEqual(baseline, fingerprint(root, 'container and compiler identity'))
+            runner.unlink()
+            self.assertEqual(baseline, fingerprint(root, 'container and compiler identity'))
 
 
 if __name__ == '__main__':

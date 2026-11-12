@@ -443,3 +443,37 @@ The input fingerprint is part of the fallback prefix too, so changed lockfiles
 or configurations cannot restore a previous compilation archive. Alpine uses
 its own packaged compiler inside its disposable container, with a separate
 Cargo home and identity; it never keys against the runner's rustup compiler.
+
+### Container preparation and CI timing
+
+The Docker integration cache additionally uses the exact container image and
+compiler identity. Its source fingerprint includes Cargo manifests/lockfile and
+configuration, build scripts, the Ghostty adapter, Docker inputs, and the
+container runner's bootstrap and compiler/linker helpers. An unrelated developer
+or test-runner script does not invalidate these artifacts. Add new transitive build helpers to
+`BUILD_SCRIPTS` in `.github/scripts/tmux_cache_key.py` when introducing them.
+Cargo still checks changed application/test sources, and restored native
+artifacts are verified before use. Cache misses and failed restores retain the
+existing bounded rebuild fallback and full integration test enumeration.
+
+The November 12, 2026 investigation of #14 distinguished a cold miss from slow
+warm validation:
+
+| Hosted run | Container cache | Preparation | Docker tests | Linux x86-64 job |
+| --- | --- | --- | --- | --- |
+| [PR #45 final](https://github.com/n0ot/lector/actions/runs/43133497835) | Miss | 4m25s | 2s | 7m23s |
+| [Following master run](https://github.com/n0ot/lector/actions/runs/43134488184) | Restored | 26s | 3s | 3m59s |
+
+The cold run downloaded verified Zig, built Ghostty, and compiled Rust
+dependencies. Its restore at 01:20:51 UTC preceded the concurrent base run's
+cache save at 01:25:54 UTC; that
+cache was not yet available. The broad fingerprint also included the unrelated
+native-speech runner added in the base change, unnecessarily creating a new
+cache namespace. Narrowing script inputs prevents that source of future misses;
+it cannot eliminate necessary toolchain/image changes or concurrent cold fills.
+
+These are observed individual runs, not a controlled performance estimate for
+the new key. In the warm run macOS Intel took 5m19s and finished last. A separate
+Docker job would not have shortened that run, so the current job layout and
+required checks remain unchanged. Reconsider parallelization if repeated warm
+measurements put Docker back on the critical path.
