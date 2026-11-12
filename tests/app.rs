@@ -1852,6 +1852,61 @@ fn review_search_repeat_and_inner_word_yank_feed_f7_clipboard_paste() {
 }
 
 #[test]
+fn review_jump_history_is_protocol_invariant_and_survives_reopening() {
+    for scheduled in [false, true] {
+        for (older, newer) in [
+            (b"\x0f".as_slice(), b"\t".as_slice()),
+            (b"\x1b[111;5u".as_slice(), b"\x1b[105;5u".as_slice()),
+            (b"\x1b[27;5;111~".as_slice(), b"\x1b[27;5;105~".as_slice()),
+        ] {
+            let (mut app, mut sr, _, clock) = make_app();
+            if scheduled {
+                app.enable_output_scheduler(OutputSchedulerConfig::default());
+            }
+            let mut pty = Vec::new();
+            let mut term = Vec::new();
+            let present = |app: &mut App, sr: &mut ScreenReader, output: &mut Vec<u8>| {
+                clock.advance_ms(100);
+                if scheduled {
+                    app.drain_scheduled_output(output, false).unwrap();
+                }
+                app.handle_tick(sr, &mut Vec::new(), output).unwrap();
+            };
+            app.handle_pty(&mut sr, b"alpha beta gamma\x1b[H", &mut term)
+                .unwrap();
+            present(&mut app, &mut sr, &mut term);
+            app.handle_stdin(&mut sr, b"\x1br", &mut pty, &mut term)
+                .unwrap();
+            present(&mut app, &mut sr, &mut term);
+            app.handle_stdin(&mut sr, b"/beta\r", &mut pty, &mut term)
+                .unwrap();
+            app.handle_stdin(&mut sr, b"/gamma\r", &mut pty, &mut term)
+                .unwrap();
+            app.handle_stdin(&mut sr, older, &mut pty, &mut term)
+                .unwrap();
+            app.handle_stdin(&mut sr, b"yiwq", &mut pty, &mut term)
+                .unwrap();
+            present(&mut app, &mut sr, &mut term);
+            app.handle_stdin(&mut sr, b"\x1b[18~", &mut pty, &mut term)
+                .unwrap();
+            assert_eq!(pty, b"beta");
+            pty.clear();
+            app.handle_stdin(&mut sr, b"\x1br", &mut pty, &mut term)
+                .unwrap();
+            present(&mut app, &mut sr, &mut term);
+            app.handle_stdin(&mut sr, newer, &mut pty, &mut term)
+                .unwrap();
+            app.handle_stdin(&mut sr, b"yiwq", &mut pty, &mut term)
+                .unwrap();
+            present(&mut app, &mut sr, &mut term);
+            app.handle_stdin(&mut sr, b"\x1b[18~", &mut pty, &mut term)
+                .unwrap();
+            assert_eq!(pty, b"gamma");
+        }
+    }
+}
+
+#[test]
 fn review_marks_search_and_find_survive_overlay_lifecycle() {
     for scheduled in [false, true] {
         let (mut app, mut sr, _recorder, clock) = make_app();

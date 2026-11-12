@@ -360,6 +360,27 @@ impl ReviewView {
                 if !exact {
                     target.col = self.document.line_first_nonblank(target.row);
                 }
+                self.record_jump_to(target);
+                self.move_with_table_context(sr, target)
+            }
+            Command::TravelJump { forward, count } => {
+                let target = self.navigation.borrow_mut().travel_jump(
+                    &mut self.navigation_capture,
+                    self.cursor,
+                    forward,
+                    count,
+                );
+                let Some(target) = target else {
+                    sr.speak(
+                        if forward {
+                            "no newer jump"
+                        } else {
+                            "no older jump"
+                        },
+                        false,
+                    )?;
+                    return Ok(ViewAction::Bell);
+                };
                 self.move_with_table_context(sr, target)
             }
             Command::StartVisual(kind) => {
@@ -375,6 +396,15 @@ impl ReviewView {
                 let Some(target) = self.motion_target(motion, count) else {
                     return Ok(ViewAction::Bell);
                 };
+                if matches!(
+                    motion,
+                    Motion::DocumentStart
+                        | Motion::DocumentEnd
+                        | Motion::MatchingBrace
+                        | Motion::Prompt { .. }
+                ) {
+                    self.record_jump_to(target);
+                }
                 self.move_with_table_context(sr, target)
             }
             Command::ScrollPage { forward, count } => {
@@ -393,6 +423,11 @@ impl ReviewView {
                 let old = self.current_table_cell();
                 let previous = self.cursor;
                 let action = self.reposition_viewport(placement, line, first_nonblank);
+                if line.is_some() && previous != self.cursor {
+                    self.navigation
+                        .borrow_mut()
+                        .record_jump(&mut self.navigation_capture, previous);
+                }
                 self.announce_table_transition(sr, old)?;
                 self.queue_cursor_feedback(Some(previous));
                 Ok(action)
@@ -754,12 +789,21 @@ impl ReviewView {
     ) -> Result<ViewAction> {
         let old = self.current_table_cell();
         let previous = self.cursor;
+        self.record_jump_to(found.position);
         let action = self.move_to(found.position);
         self.announce_table_transition(sr, old)?;
         self.view
             .queue_internal_speech(self.document.search_feedback(previous, self.cursor));
         self.queue_feedback(format!("{} of {}", found.ordinal, found.total));
         Ok(action)
+    }
+
+    fn record_jump_to(&mut self, target: HistoryPosition) {
+        if self.document.clamp(target) != self.cursor {
+            self.navigation
+                .borrow_mut()
+                .record_jump(&mut self.navigation_capture, self.cursor);
+        }
     }
 
     fn review_mode(&self) -> ReviewMode {
@@ -1440,6 +1484,8 @@ fn semantic_key(key: &KeyInput) -> Key {
             0x02 => Key::Ctrl('b'),
             0x04 => Key::Ctrl('d'),
             0x06 => Key::Ctrl('f'),
+            0x09 => Key::Ctrl('i'),
+            0x0F => Key::Ctrl('o'),
             0x15 => Key::Ctrl('u'),
             _ => Key::Unknown,
         };
@@ -1458,6 +1504,7 @@ fn semantic_key(key: &KeyInput) -> Key {
         KeyCode::Esc => Key::Escape,
         KeyCode::Enter => Key::Enter,
         KeyCode::Backspace => Key::Backspace,
+        KeyCode::Tab => Key::Ctrl('i'),
         KeyCode::Left => Key::Left,
         KeyCode::Down => Key::Down,
         KeyCode::Up => Key::Up,
@@ -1474,6 +1521,8 @@ fn raw_key(byte: u8) -> Key {
         0x02 => Key::Ctrl('b'),
         0x04 => Key::Ctrl('d'),
         0x06 => Key::Ctrl('f'),
+        0x09 => Key::Ctrl('i'),
+        0x0F => Key::Ctrl('o'),
         0x15 => Key::Ctrl('u'),
         value if value.is_ascii() && !value.is_ascii_control() => Key::Char(value as char),
         _ => Key::Unknown,
@@ -1526,6 +1575,115 @@ mod tests {
 
     fn input(view: &mut ReviewView, sr: &mut ScreenReader, bytes: &[u8]) -> ViewAction {
         view.handle_input(sr, bytes, &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn jumps_record_search_marks_and_document_motions_but_not_small_moves() {
+        let (mut view, mut sr, _) = setup(b"one one\r\ntwo\r\nthree");
+        input(&mut view, &mut sr, b"lma");
+        input(&mut view, &mut sr, b"G");
+        input(&mut view, &mut sr, b"\x0f");
+        assert_eq!(view.cursor, HistoryPosition { row: 0, col: 1 });
+        input(&mut view, &mut sr, b"\t");
+        assert_eq!(view.cursor.row, 2);
+        input(&mut view, &mut sr, b"`a");
+        assert_eq!(view.cursor.col, 1);
+        input(&mut view, &mut sr, b"/one\r");
+        assert_eq!(view.cursor, HistoryPosition { row: 0, col: 4 });
+        input(&mut view, &mut sr, b"\x0f");
+        assert_eq!(view.cursor, HistoryPosition { row: 0, col: 1 });
+        // No-op/failed jumps and ordinary movements do not add entries.
+        let (mut view, mut sr, _) = setup(b"one\r\ntwo\r\nthree");
+        input(&mut view, &mut sr, b"gg");
+        input(&mut view, &mut sr, b"`z");
+        input(&mut view, &mut sr, b"llj");
+        assert!(matches!(
+            input(&mut view, &mut sr, b"\x0f"),
+            ViewAction::Bell
+        ));
+    }
+
+    #[test]
+    fn generated_jump_memory_is_independent_and_refresh_expires_positions() {
+        use crate::review::{document::ReviewDocument, navigation::SharedNavigation};
+        let (_, mut sr, _) = setup(b"");
+        let navigation = SharedNavigation::default();
+        let document =
+            || ReviewDocument::from_lines(&["first".into(), "second".into(), "third".into()], 30).0;
+        let mut view = ReviewView::new_generated(
+            3,
+            30,
+            "sample",
+            document(),
+            navigation.clone(),
+            HistoryPosition { row: 0, col: 1 },
+        );
+        input(&mut view, &mut sr, b"G");
+        drop(view);
+        let mut reopened = ReviewView::new_generated(
+            3,
+            30,
+            "sample",
+            document(),
+            navigation.clone(),
+            HistoryPosition { row: 2, col: 0 },
+        );
+        input(&mut reopened, &mut sr, b"\x0f");
+        assert_eq!(reopened.cursor, HistoryPosition { row: 0, col: 1 });
+        let mut other = ReviewView::new_generated(
+            3,
+            30,
+            "other",
+            document(),
+            SharedNavigation::default(),
+            HistoryPosition { row: 2, col: 0 },
+        );
+        assert!(matches!(
+            input(&mut other, &mut sr, b"\x0f"),
+            ViewAction::Bell
+        ));
+        navigation.borrow_mut().invalidate_from(0);
+        reopened.replace_generated_document(document(), HistoryPosition { row: 2, col: 0 });
+        assert!(matches!(
+            input(&mut reopened, &mut sr, b"\x0f"),
+            ViewAction::Bell
+        ));
+    }
+
+    #[test]
+    fn jumps_persist_across_sessions_and_remain_source_scoped() {
+        let (_, mut sr, _) = setup(b"");
+        let mut source = View::new(3, 30);
+        source.process_changes(b"first\r\nsecond\r\nthird");
+        source.set_review_history_position(HistoryPosition { row: 0, col: 2 });
+        let mut view = ReviewView::new(&mut source);
+        input(&mut view, &mut sr, b"G");
+        drop(view);
+        source.set_review_history_position(HistoryPosition { row: 2, col: 0 });
+        let mut reopened = ReviewView::new(&mut source);
+        input(&mut reopened, &mut sr, b"\x0f");
+        assert_eq!(reopened.cursor, HistoryPosition { row: 0, col: 2 });
+        drop(reopened);
+        let mut reopened = ReviewView::new(&mut source);
+        input(&mut reopened, &mut sr, b"\t");
+        assert_eq!(reopened.cursor, HistoryPosition { row: 2, col: 0 });
+        let mut other = View::new(3, 30);
+        assert!(matches!(
+            input(&mut ReviewView::new(&mut other), &mut sr, b"\x0f"),
+            ViewAction::Bell
+        ));
+        source.process_changes(b"\x1b[?1049hother");
+        assert!(matches!(
+            input(&mut ReviewView::new(&mut source), &mut sr, b"\x0f"),
+            ViewAction::Bell
+        ));
+        source.process_changes(b"\x1b[?1049l");
+        let mut primary = ReviewView::new(&mut source);
+        // A screen transition conservatively expires primary grid coordinates.
+        assert!(matches!(
+            input(&mut primary, &mut sr, b"\x0f"),
+            ViewAction::Bell
+        ));
     }
 
     #[test]

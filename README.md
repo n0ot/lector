@@ -560,6 +560,15 @@ Review has its own dependency-free vi command parser:
 - `ma` through `mz` set named marks. `'a` jumps to mark `a`'s line at its first
   nonblank character; `` `a `` jumps to its exact position. Setting a mark
   announces its name; an unset or expired mark is explained.
+- `C-o` and `C-i` visit older and newer jump locations; counts work. Legacy
+  terminals send Tab and `C-i` identically, so Tab also moves forward. Searches,
+  named-mark jumps, `gg`/`G` and line-number jumps, `%`, and prompt jumps record
+  their origin; ordinary line/character/word movements do not. History retains
+  up to 100 exact positions per source across Review sessions. New jumps from
+  the middle keep later entries, as in Neovim's default jumplist. Unlike its
+  line-based deduplication, Review retains distinct columns on the same line.
+  Frozen snapshots remain navigable; reopening discards positions whose source
+  identity expired, using the same conservative rules as marks.
 - `/` and `?` search the complete frozen scrollback using regular expressions.
   `n` repeats in the same direction and `N` repeats in the opposite direction;
   searches wrap at the ends.
