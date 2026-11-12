@@ -1,5 +1,9 @@
 # Split-scene and tmux-control baseline
 
+Historical pre-repair capture. The allocation failures below were subsequently
+repaired by #68. The [current baseline](split-scenes-372454f.md) uses the final
+overlapping fixture and passes every unchanged pre-existing gate.
+
 Source revision: `141e52e` (`141e52e4d33010b7e895817731f4cef7687303c1`); base: `099f35f`.
 The later baseline/artifact commit changes no executable benchmark source.
 
@@ -39,7 +43,7 @@ This accommodates timing noise without changing existing workload ceilings.
 | split-scene-overlays | 21,000–21,500 | 1,440,000 | 1,424,120,000 |
 | tmux-control-pane-output | 40,958–41,708 | 2,190,029 | 2,970,761,220 |
 
-## Unresolved existing gate failures
+## Gate failures at this historical revision
 
 All new workloads and correctness checks pass. The full
 `--check-baseline benchmarks/ghostty-release-baseline-macos-aarch64.json` run
@@ -60,8 +64,9 @@ measurement code has not substantively changed since the baseline revision
 The existing baseline dates to 2026-08-21 and Ghostty 0.1.0-dev. New allocation
 sites in linear-output suffix handling and cell-write evidence are candidates
 for investigation, not proven causes. No existing ceilings were relaxed and no
-product optimization was made. This remains an unresolved local validation
-blocker; passing correctness tests or CI does not make the full gate pass.
+product optimization was made. This was an unresolved local validation
+blocker at capture time; passing correctness tests or CI did not make the full
+gate pass. It was subsequently resolved by the separately reviewed #68 repair.
 
 Local successful checks at this source revision: release build; benchmark
 self-test; terminal suite (111); presentation suite (111); modeled tmux suite

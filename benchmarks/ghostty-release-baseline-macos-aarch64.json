@@ -253,17 +253,17 @@
       "measurement_scope": "scene-composition",
       "measured": {
         "latency_p50_ns": 19250,
-        "latency_p95_ns": 20625,
-        "latency_max_ns": 5093083,
+        "latency_p95_ns": 20083,
+        "latency_max_ns": 46084,
         "allocations": 1300000,
         "allocated_bytes": 1419440000,
         "output_bytes": 30150000,
-        "throughput_mib_per_second": 148.55678447768543,
+        "throughput_mib_per_second": 155.54886191099067,
         "completed_render_percent": 100.0
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 74.27839223884271,
-        "maximum_latency_p95_ns": 41250,
+        "minimum_throughput_mib_per_second": 77.77443095549533,
+        "maximum_latency_p95_ns": 40166,
         "maximum_allocations": 1430000,
         "maximum_allocated_bytes": 1561384001,
         "maximum_output_bytes": 33165001,
@@ -274,21 +274,21 @@
       "name": "split-scene-overlays",
       "measurement_scope": "scene-composition",
       "measured": {
-        "latency_p50_ns": 20167,
-        "latency_p95_ns": 21500,
-        "latency_max_ns": 1380333,
+        "latency_p50_ns": 20125,
+        "latency_p95_ns": 20375,
+        "latency_max_ns": 46291,
         "allocations": 1440000,
         "allocated_bytes": 1424120000,
-        "output_bytes": 31600000,
-        "throughput_mib_per_second": 152.1869072156526,
+        "output_bytes": 31640000,
+        "throughput_mib_per_second": 155.5844987862307,
         "completed_render_percent": 100.0
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 76.0934536078263,
-        "maximum_latency_p95_ns": 43000,
+        "minimum_throughput_mib_per_second": 77.79224939311536,
+        "maximum_latency_p95_ns": 40750,
         "maximum_allocations": 1584001,
         "maximum_allocated_bytes": 1566532001,
-        "maximum_output_bytes": 34760000,
+        "maximum_output_bytes": 34804000,
         "minimum_completed_render_percent": 100.0
       }
     },
@@ -296,20 +296,20 @@
       "name": "tmux-control-pane-output",
       "measurement_scope": "ingest-through-receipt",
       "measured": {
-        "latency_p50_ns": 39625,
-        "latency_p95_ns": 41708,
-        "latency_max_ns": 384667,
-        "allocations": 2190029,
-        "allocated_bytes": 2970761220,
+        "latency_p50_ns": 39709,
+        "latency_p95_ns": 40458,
+        "latency_max_ns": 161250,
+        "allocations": 2160030,
+        "allocated_bytes": 2968831284,
         "output_bytes": 471017,
-        "throughput_mib_per_second": 0.9178976865847892,
+        "throughput_mib_per_second": 0.9301408583244319,
         "completed_render_percent": 100.0
       },
       "limits": {
-        "minimum_throughput_mib_per_second": 0.4589488432923946,
-        "maximum_latency_p95_ns": 83416,
-        "maximum_allocations": 2409032,
-        "maximum_allocated_bytes": 3267837343,
+        "minimum_throughput_mib_per_second": 0.46507042916221597,
+        "maximum_latency_p95_ns": 80916,
+        "maximum_allocations": 2376033,
+        "maximum_allocated_bytes": 3265714413,
         "maximum_output_bytes": 518119,
         "minimum_completed_render_percent": 100.0
       }
@@ -377,7 +377,7 @@
     }
   ],
   "split_scene_tmux_provenance": {
-    "revision": "141e52e4d33010b7e895817731f4cef7687303c1",
+    "revision": "372454f37364353f75d0abf7c1e6c258016f14d9",
     "recorded_at": "2026-11-12",
     "target": "aarch64-apple-darwin",
     "rust": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
@@ -387,7 +387,10 @@
     "ghostty_version": "1.0.0",
     "ghostty_optimize": "ReleaseFast",
     "zig_version": "0.17.0",
-    "runs": "results/split-scenes-141e52e-{warmup,run1,run2,run3}.json",
-    "method": "One full-process warmup discarded, then three sequential full release runs with other workers CPU-idle. New measured values use worst repetition per metric. Existing thresholds unchanged. New limits: half minimum throughput, twice maximum p95, 10% allocation/byte/output headroom, 100% completed renders."
+    "runs": "results/split-scenes-372454f-{warmup,run1,run2,run3,gate}.json",
+    "method": "One full-process warmup discarded, then three sequential full release runs with other workers CPU-idle. New measured values use worst repetition per metric. All pre-existing master baseline entries remain unchanged. Only three added workload thresholds refreshed from final overlapping fixtures: half minimum throughput, twice maximum p95, 10% allocation/byte/output headroom, 100% completed renders.",
+    "base_revision": "fda95bdadcf6488e1319fae5567d2dffceade066",
+    "mlua_version": "0.12.2",
+    "overlay_overlap_cells": 10
   }
 }
