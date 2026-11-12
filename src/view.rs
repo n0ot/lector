@@ -295,6 +295,86 @@ pub(crate) struct AccessibilityCellWriteBoundary {
     revision: Option<ViewRevision>,
 }
 
+/// Text and physical-row hashes share one validity bit and retain their buffers
+/// across invalidation. Full-grid and history-inclusive documents remain lazy
+/// and independent, as do the current and finalized snapshots.
+#[derive(Default)]
+struct TextCache {
+    text: String,
+    row_hashes: Vec<u64>,
+    valid: bool,
+}
+
+impl TextCache {
+    fn invalidate(&mut self) {
+        self.valid = false;
+        self.row_hashes.clear();
+    }
+
+    fn refresh(&mut self, write: impl FnOnce(&mut String)) {
+        if self.valid {
+            return;
+        }
+        write(&mut self.text);
+        compute_row_hashes(&self.text, &mut self.row_hashes);
+        self.valid = true;
+    }
+
+    fn finalize_from(&mut self, current: &Self) {
+        if current.valid {
+            self.text.clone_from(&current.text);
+            self.row_hashes.clone_from(&current.row_hashes);
+            self.valid = true;
+        } else {
+            self.invalidate();
+        }
+    }
+}
+
+#[derive(Default)]
+struct TextCachePair {
+    current: TextCache,
+    previous: TextCache,
+}
+
+impl TextCachePair {
+    fn comparison(&self, evicted_rows: usize) -> (&str, &str, &[u64], &[u64]) {
+        debug_assert!(self.current.valid);
+        debug_assert!(self.previous.valid);
+        let evicted_rows = evicted_rows.min(self.previous.row_hashes.len());
+        let previous_byte_offset = row_byte_offset(&self.previous.text, evicted_rows);
+        (
+            &self.previous.text[previous_byte_offset..],
+            &self.current.text,
+            &self.previous.row_hashes[evicted_rows..],
+            &self.current.row_hashes,
+        )
+    }
+}
+
+#[derive(Default)]
+struct TextCaches {
+    full: TextCachePair,
+    document: TextCachePair,
+}
+
+impl TextCaches {
+    fn invalidate_current(&mut self) {
+        self.full.current.invalidate();
+        self.document.current.invalidate();
+    }
+
+    fn invalidate_previous(&mut self) {
+        self.full.previous.invalidate();
+        self.document.previous.invalidate();
+    }
+
+    fn finalize(&mut self) {
+        self.full.previous.finalize_from(&self.full.current);
+        self.document.previous.finalize_from(&self.document.current);
+    }
+}
+
 pub struct View {
     view_id: ViewId,
     review_navigation: [crate::review::navigation::SharedNavigation; 2],
@@ -368,18 +448,7 @@ pub struct View {
     application_cursor_indent_level: u16,
     application_semantic_indent_level: u16,
     fallback_semantic_input: Option<FallbackSemanticInput>,
-    cached_full: String,
-    cached_prev_full: String,
-    cached_full_valid: bool,
-    cached_prev_full_valid: bool,
-    cached_full_row_hashes: Vec<u64>,
-    cached_prev_full_row_hashes: Vec<u64>,
-    cached_document: String,
-    cached_prev_document: String,
-    cached_document_valid: bool,
-    cached_prev_document_valid: bool,
-    cached_document_row_hashes: Vec<u64>,
-    cached_prev_document_row_hashes: Vec<u64>,
+    text_caches: TextCaches,
 }
 
 impl View {
@@ -469,18 +538,7 @@ impl View {
             application_cursor_indent_level: 0,
             application_semantic_indent_level: 0,
             fallback_semantic_input: None,
-            cached_full: String::new(),
-            cached_prev_full: String::new(),
-            cached_full_valid: false,
-            cached_prev_full_valid: false,
-            cached_full_row_hashes: Vec::new(),
-            cached_prev_full_row_hashes: Vec::new(),
-            cached_document: String::new(),
-            cached_prev_document: String::new(),
-            cached_document_valid: false,
-            cached_prev_document_valid: false,
-            cached_document_row_hashes: Vec::new(),
-            cached_prev_document_row_hashes: Vec::new(),
+            text_caches: TextCaches::default(),
         }
     }
 
@@ -913,24 +971,7 @@ impl View {
             self.discard_accessibility_journal_through(self.presented_revision);
         }
         self.review_cursor_follow_pending = !frozen && self.review_cursor_screen_transition_pending;
-        if self.cached_full_valid {
-            self.cached_prev_full.clone_from(&self.cached_full);
-            self.cached_prev_full_valid = true;
-            self.cached_prev_full_row_hashes
-                .clone_from(&self.cached_full_row_hashes);
-        } else {
-            self.cached_prev_full_valid = false;
-            self.cached_prev_full_row_hashes.clear();
-        }
-        if self.cached_document_valid {
-            self.cached_prev_document.clone_from(&self.cached_document);
-            self.cached_prev_document_valid = true;
-            self.cached_prev_document_row_hashes
-                .clone_from(&self.cached_document_row_hashes);
-        } else {
-            self.cached_prev_document_valid = false;
-            self.cached_prev_document_row_hashes.clear();
-        }
+        self.text_caches.finalize();
     }
 
     /// Gets the current screen backing this view
@@ -2271,10 +2312,7 @@ impl View {
     fn install_accessible_document_baseline(&mut self, snapshot: TerminalSnapshot) {
         self.prev_screen = snapshot;
         self.completed_linear_record_cache = None;
-        self.cached_prev_full_valid = false;
-        self.cached_prev_full_row_hashes.clear();
-        self.cached_prev_document_valid = false;
-        self.cached_prev_document_row_hashes.clear();
+        self.text_caches.invalidate_previous();
     }
 
     /// Selects the checkpoint belonging to a primary/alternate-screen context
@@ -2728,10 +2766,7 @@ impl View {
     }
 
     fn invalidate_visible_cache(&mut self) {
-        self.cached_full_valid = false;
-        self.cached_full_row_hashes.clear();
-        self.cached_document_valid = false;
-        self.cached_document_row_hashes.clear();
+        self.text_caches.invalidate_current();
     }
 
     /// Gets the indentation level of the line under the review cursor,
@@ -3167,14 +3202,7 @@ impl View {
     }
 
     pub(crate) fn full_contents_from_cache(&self) -> (&str, &str, &[u64], &[u64]) {
-        debug_assert!(self.cached_full_valid);
-        debug_assert!(self.cached_prev_full_valid);
-        (
-            &self.cached_prev_full,
-            &self.cached_full,
-            &self.cached_prev_full_row_hashes,
-            &self.cached_full_row_hashes,
-        )
+        self.text_caches.full.comparison(0)
     }
 
     /// Returns the previous and current complete review documents: retained
@@ -3186,8 +3214,6 @@ impl View {
     }
 
     pub(crate) fn document_contents_cached(&self) -> (&str, &str, &[u64], &[u64]) {
-        debug_assert!(self.cached_document_valid);
-        debug_assert!(self.cached_prev_document_valid);
         // Align the two retained documents by absolute history row. When the
         // history cap evicts a prefix, comparing the raw strings could mistake
         // a repeated new tail for unchanged text. Removing that known-deleted
@@ -3195,20 +3221,13 @@ impl View {
         let evicted_rows = self
             .screen()
             .history_origin
-            .saturating_sub(self.prev_screen.history_origin)
-            .min(self.cached_prev_document_row_hashes.len());
-        let previous_byte_offset = row_byte_offset(&self.cached_prev_document, evicted_rows);
-        (
-            &self.cached_prev_document[previous_byte_offset..],
-            &self.cached_document,
-            &self.cached_prev_document_row_hashes[evicted_rows..],
-            &self.cached_document_row_hashes,
-        )
+            .saturating_sub(self.prev_screen.history_origin);
+        self.text_caches.document.comparison(evicted_rows)
     }
 
     #[cfg(test)]
     pub(crate) fn document_contents_cache_is_prepared_for_test(&self) -> bool {
-        self.cached_document_valid || self.cached_prev_document_valid
+        self.text_caches.document.current.valid || self.text_caches.document.previous.valid
     }
 
     /// Resolves document identity before automatic reading. Context switches,
@@ -3274,52 +3293,37 @@ impl View {
     }
 
     fn ensure_cached_full(&mut self) {
-        if self.cached_full_valid {
+        if self.text_caches.full.current.valid {
             return;
         }
-        let mut cached_full = std::mem::take(&mut self.cached_full);
-        self.screen().contents_full_into(&mut cached_full);
-        compute_row_hashes(&cached_full, &mut self.cached_full_row_hashes);
-        self.cached_full = cached_full;
-        self.cached_full_valid = true;
+        // Move the retained buffers out while borrowing the accessible screen;
+        // this does not clone the snapshot or allocate replacement buffers.
+        let mut cache = std::mem::take(&mut self.text_caches.full.current);
+        cache.refresh(|out| self.screen().contents_full_into(out));
+        self.text_caches.full.current = cache;
     }
 
     fn ensure_cached_prev_full(&mut self) {
-        if self.cached_prev_full_valid {
-            return;
-        }
-        let mut cached_prev_full = std::mem::take(&mut self.cached_prev_full);
-        self.prev_screen.contents_full_into(&mut cached_prev_full);
-        compute_row_hashes(&cached_prev_full, &mut self.cached_prev_full_row_hashes);
-        self.cached_prev_full = cached_prev_full;
-        self.cached_prev_full_valid = true;
+        self.text_caches
+            .full
+            .previous
+            .refresh(|out| self.prev_screen.contents_full_into(out));
     }
 
     fn ensure_cached_document(&mut self) {
-        if self.cached_document_valid {
+        if self.text_caches.document.current.valid {
             return;
         }
-        let mut cached_document = std::mem::take(&mut self.cached_document);
-        self.snapshot_with_history()
-            .document_contents_into(&mut cached_document);
-        compute_row_hashes(&cached_document, &mut self.cached_document_row_hashes);
-        self.cached_document = cached_document;
-        self.cached_document_valid = true;
+        let mut cache = std::mem::take(&mut self.text_caches.document.current);
+        cache.refresh(|out| self.snapshot_with_history().document_contents_into(out));
+        self.text_caches.document.current = cache;
     }
 
     fn ensure_cached_prev_document(&mut self) {
-        if self.cached_prev_document_valid {
-            return;
-        }
-        let mut cached_prev_document = std::mem::take(&mut self.cached_prev_document);
-        self.prev_screen
-            .document_contents_into(&mut cached_prev_document);
-        compute_row_hashes(
-            &cached_prev_document,
-            &mut self.cached_prev_document_row_hashes,
-        );
-        self.cached_prev_document = cached_prev_document;
-        self.cached_prev_document_valid = true;
+        self.text_caches
+            .document
+            .previous
+            .refresh(|out| self.prev_screen.document_contents_into(out));
     }
 }
 
@@ -3899,6 +3903,91 @@ mod tests {
         let (previous, current, previous_hashes, current_hashes) = view.full_contents_cached();
         assert_eq!(previous, current);
         assert_eq!(previous_hashes, current_hashes);
+    }
+
+    #[test]
+    fn text_caches_finalize_independently_and_reuse_invalidated_buffers() {
+        for prepare_full in [false, true] {
+            for prepare_document in [false, true] {
+                let mut view = View::new(2, 8);
+                // Warm both previous entries before invalidating the current
+                // entries, so cold finalization must discard a valid baseline.
+                view.prepare_full_contents_cache();
+                view.prepare_document_contents_cache();
+                view.process_changes(b"one\r\ntwo\r\nthree");
+                if prepare_full {
+                    view.prepare_full_contents_cache();
+                }
+                if prepare_document {
+                    view.prepare_document_contents_cache();
+                }
+                view.finalize_changes(1);
+                assert_eq!(view.text_caches.full.previous.valid, prepare_full);
+                assert_eq!(view.text_caches.document.previous.valid, prepare_document);
+
+                view.prepare_full_contents_cache();
+                view.prepare_document_contents_cache();
+                let full_capacity = view.text_caches.full.current.text.capacity();
+                let document_capacity = view.text_caches.document.current.text.capacity();
+                let full_hash_capacity = view.text_caches.full.current.row_hashes.capacity();
+                let document_hash_capacity =
+                    view.text_caches.document.current.row_hashes.capacity();
+                view.process_changes(b"\rnew");
+                assert!(!view.text_caches.full.current.valid);
+                assert!(!view.text_caches.document.current.valid);
+                assert!(view.text_caches.full.previous.valid);
+                assert!(view.text_caches.document.previous.valid);
+                assert_eq!(view.text_caches.full.current.text.capacity(), full_capacity);
+                assert_eq!(
+                    view.text_caches.document.current.text.capacity(),
+                    document_capacity
+                );
+                assert_eq!(
+                    view.text_caches.full.current.row_hashes.capacity(),
+                    full_hash_capacity
+                );
+                assert_eq!(
+                    view.text_caches.document.current.row_hashes.capacity(),
+                    document_hash_capacity
+                );
+
+                view.prepare_full_contents_cache();
+                view.prepare_document_contents_cache();
+                assert_eq!(view.text_caches.full.current.text.capacity(), full_capacity);
+                assert_eq!(
+                    view.text_caches.document.current.text.capacity(),
+                    document_capacity
+                );
+                assert_eq!(
+                    view.text_caches.full.current.row_hashes.capacity(),
+                    full_hash_capacity
+                );
+                assert_eq!(
+                    view.text_caches.document.current.row_hashes.capacity(),
+                    document_hash_capacity
+                );
+                let (previous, current, _, _) = view.full_contents_from_cache();
+                assert_eq!(previous, "two\nthree\n");
+                assert_eq!(current, "two\nnewee\n");
+                let (previous, current, _, _) = view.document_contents_cached();
+                assert_eq!(previous, "one\ntwo\nthree\n");
+                assert_eq!(current, "one\ntwo\nnewee\n");
+
+                // A baseline handoff invalidates only the previous snapshots.
+                let baseline = view.snapshot_with_history();
+                view.install_accessible_document_baseline(baseline);
+                assert!(view.text_caches.full.current.valid);
+                assert!(view.text_caches.document.current.valid);
+                assert!(!view.text_caches.full.previous.valid);
+                assert!(!view.text_caches.document.previous.valid);
+                view.prepare_full_contents_cache();
+                view.prepare_document_contents_cache();
+                let (previous, current, _, _) = view.full_contents_from_cache();
+                assert_eq!(previous, current);
+                let (previous, current, _, _) = view.document_contents_cached();
+                assert_eq!(previous, current);
+            }
+        }
     }
 
     #[test]
@@ -4968,6 +5057,8 @@ mod tests {
         let mut hashes = vec![0, 1, 2];
         compute_row_hashes("a\n\n", &mut hashes);
         assert_eq!(hashes, [fnv1a_64(b"a"), fnv1a_64(b"")]);
+        compute_row_hashes("", &mut hashes);
+        assert!(hashes.is_empty());
     }
 
     #[test]
