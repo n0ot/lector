@@ -830,108 +830,6 @@ fn direct_terminal_key_to_pixel_latency_stays_interactive() {
 }
 
 #[test]
-fn direct_native_speech_continues_after_startup_and_never_blocks_input() {
-    let _serial = serialize_live_pty_test();
-    let mut lector = LiveLector::spawn_with_native_speech("latency");
-    assert!(
-        lector.wait_for(Duration::from_secs(3), |output| output
-            .windows(LATENCY_READY.len())
-            .any(|window| window == LATENCY_READY.as_bytes())),
-        "native-speech Lector did not present its child"
-    );
-    let event_count = |speech: &str| {
-        speech
-            .lines()
-            .filter(|line| {
-                serde_json::from_str::<serde_json::Value>(line)
-                    .is_ok_and(|record| record["event"] == "begin")
-            })
-            .count()
-    };
-    let event_log = lector.outer_speech_log.clone();
-    assert!(
-        lector.wait_for_speech(
-            Duration::from_secs(5),
-            |speech| event_count(speech) >= 1,
-            &event_log,
-        ),
-        "native speech never began its startup utterance"
-    );
-    // Let any already-queued startup announcements begin before measuring the
-    // post-input utterance. M-i interrupts speech and immediately reads the
-    // current line, matching the ordering used by ordinary key interaction.
-    thread::sleep(Duration::from_millis(100));
-    let before = event_count(&lector.outer_speech());
-    let sent_at = Instant::now();
-    lector.send(b"\x1bi");
-    assert!(
-        lector.wait_for_speech(
-            Duration::from_secs(5),
-            |speech| event_count(speech) > before,
-            &event_log,
-        ),
-        "native speech did not begin another utterance after startup; events={:?}; rpc={:?}; output={:?}",
-        lector.outer_speech(),
-        fs::read_to_string(&lector.inner_speech_log).unwrap_or_default(),
-        String::from_utf8_lossy(&lector.output)
-    );
-    assert!(
-        sent_at.elapsed() < Duration::from_millis(250),
-        "replacement native speech took {:?} to begin",
-        sent_at.elapsed()
-    );
-
-    // Adjacent screen rows have one physical line boundary and therefore form
-    // one logical utterance. Wait until that substantial announcement has
-    // reached the native host, then prove that input is still serviced while
-    // the speech is active.
-    lector.send(b"s");
-    let rpc_log = lector.inner_speech_log.clone();
-    assert!(
-        lector.wait_for_speech(
-            Duration::from_secs(5),
-            |records| {
-                records.lines().any(|line| {
-                    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
-                        record["method"] == "speech.speak"
-                            && record["params"]["text"].as_str().is_some_and(|text| {
-                                text.len() > 64
-                                    && text.contains(' ')
-                                    && text
-                                        .chars()
-                                        .all(|character| character == 'x' || character == ' ')
-                            })
-                    })
-                })
-            },
-            &rpc_log,
-        ),
-        "native host never received the deliberately long screen announcement; rpc={:?}; speech={:?}; output={:?}",
-        fs::read_to_string(&lector.inner_speech_log).unwrap_or_default(),
-        lector.outer_speech(),
-        String::from_utf8_lossy(&lector.output)
-    );
-    let input_at = Instant::now();
-    lector.send_now(b"p");
-    assert!(
-        lector.wait_for_physical_terminal(Duration::from_secs(2), |terminal| {
-            physical_screen_contains(terminal, "LECTOR-LATENCY-ACK-01")
-        }),
-        "terminal input was blocked behind native speech"
-    );
-    assert!(
-        input_at.elapsed() < Duration::from_millis(100),
-        "native speech delayed terminal input/rendering for {:?}",
-        input_at.elapsed()
-    );
-    lector.send(b"q");
-    assert!(
-        lector.finish(Duration::from_secs(3)),
-        "native-speech Lector did not exit"
-    );
-}
-
-#[test]
 fn init_lua_process_argv_and_deferred_speech_cross_the_ready_boundary_in_order() {
     let _serial = serialize_live_pty_test();
     let config = fixture("tests/fixtures/pty/startup-speech.lua");
@@ -1341,55 +1239,6 @@ fn startup_config_resolution_honors_cli_environment_xdg_and_macos_legacy_order()
 }
 
 #[test]
-fn no_config_skips_the_default_init_lua() {
-    let _serial = serialize_live_pty_test();
-    let artifact_dir = fixture("target/test-artifacts/live-pty");
-    fs::create_dir_all(&artifact_dir).expect("create live PTY artifact directory");
-    let unique = format!(
-        "no-config-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos()
-    );
-    let config = artifact_dir.join(format!("{unique}.lua"));
-    let marker = artifact_dir.join(format!("{unique}.loaded"));
-    fs::write(
-        &config,
-        r#"
-            local marker = assert(io.open(os.getenv("LECTOR_NO_CONFIG_MARKER"), "w"))
-            marker:write("loaded")
-            marker:close()
-            error("--no-config unexpectedly loaded the default init.lua")
-        "#,
-    )
-    .expect("write default init.lua sentinel");
-
-    {
-        let mut lector = LiveLector::spawn_without_config("latency", &config, &marker);
-        assert!(
-            lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
-                physical_screen_contains(terminal, LATENCY_READY)
-            }),
-            "--no-config did not reach the child terminal; output={:?}",
-            String::from_utf8_lossy(&lector.output)
-        );
-        assert!(
-            !marker.exists(),
-            "--no-config loaded the init.lua selected by LECTOR_CONFIG"
-        );
-        lector.send(b"q");
-        assert!(
-            lector.finish(Duration::from_secs(3)),
-            "--no-config Lector did not exit"
-        );
-    }
-
-    fs::remove_file(&config).expect("remove sentinel init.lua");
-}
-
-#[test]
 fn live_pty_drains_output_that_was_ready_before_poll_registration_and_delivers_bells_promptly() {
     let _serial = serialize_live_pty_test();
     assert_bell_lifecycle(LiveLector::spawn("bell", false), "direct Lector");
@@ -1633,4 +1482,161 @@ fn outer_review_reads_inner_prompt_at_160_by_24() {
 fn outer_review_reads_inner_prompt_at_160_by_50() {
     let _serial = serialize_live_pty_test();
     assert_outer_review_reads_inner_prompt(TestTerminalSize::new(160, 50));
+}
+
+mod native_speech {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires native audio; run scripts/test-native-speech"]
+    fn direct_native_speech_continues_after_startup_and_never_blocks_input() {
+        let _serial = serialize_live_pty_test();
+        let mut lector = LiveLector::spawn_with_native_speech("latency");
+        assert!(
+            lector.wait_for(Duration::from_secs(3), |output| output
+                .windows(LATENCY_READY.len())
+                .any(|window| window == LATENCY_READY.as_bytes())),
+            "native-speech Lector did not present its child"
+        );
+        let event_count = |speech: &str| {
+            speech
+                .lines()
+                .filter(|line| {
+                    serde_json::from_str::<serde_json::Value>(line)
+                        .is_ok_and(|record| record["event"] == "begin")
+                })
+                .count()
+        };
+        let event_log = lector.outer_speech_log.clone();
+        assert!(
+            lector.wait_for_speech(
+                Duration::from_secs(5),
+                |speech| event_count(speech) >= 1,
+                &event_log,
+            ),
+            "native speech never began its startup utterance"
+        );
+        // Let any already-queued startup announcements begin before measuring the
+        // post-input utterance. M-i interrupts speech and immediately reads the
+        // current line, matching the ordering used by ordinary key interaction.
+        thread::sleep(Duration::from_millis(100));
+        let before = event_count(&lector.outer_speech());
+        let sent_at = Instant::now();
+        lector.send(b"\x1bi");
+        assert!(
+            lector.wait_for_speech(
+                Duration::from_secs(5),
+                |speech| event_count(speech) > before,
+                &event_log,
+            ),
+            "native speech did not begin another utterance after startup; events={:?}; rpc={:?}; output={:?}",
+            lector.outer_speech(),
+            fs::read_to_string(&lector.inner_speech_log).unwrap_or_default(),
+            String::from_utf8_lossy(&lector.output)
+        );
+        assert!(
+            sent_at.elapsed() < Duration::from_millis(250),
+            "replacement native speech took {:?} to begin",
+            sent_at.elapsed()
+        );
+
+        // Adjacent screen rows have one physical line boundary and therefore form
+        // one logical utterance. Wait until that substantial announcement has
+        // reached the native host, then prove that input is still serviced while
+        // the speech is active.
+        lector.send(b"s");
+        let rpc_log = lector.inner_speech_log.clone();
+        assert!(
+            lector.wait_for_speech(
+                Duration::from_secs(5),
+                |records| {
+                    records.lines().any(|line| {
+                        serde_json::from_str::<serde_json::Value>(line).is_ok_and(|record| {
+                            record["method"] == "speech.speak"
+                                && record["params"]["text"].as_str().is_some_and(|text| {
+                                    text.len() > 64
+                                        && text.contains(' ')
+                                        && text
+                                            .chars()
+                                            .all(|character| character == 'x' || character == ' ')
+                                })
+                        })
+                    })
+                },
+                &rpc_log,
+            ),
+            "native host never received the deliberately long screen announcement; rpc={:?}; speech={:?}; output={:?}",
+            fs::read_to_string(&lector.inner_speech_log).unwrap_or_default(),
+            lector.outer_speech(),
+            String::from_utf8_lossy(&lector.output)
+        );
+        let input_at = Instant::now();
+        lector.send_now(b"p");
+        assert!(
+            lector.wait_for_physical_terminal(Duration::from_secs(2), |terminal| {
+                physical_screen_contains(terminal, "LECTOR-LATENCY-ACK-01")
+            }),
+            "terminal input was blocked behind native speech"
+        );
+        assert!(
+            input_at.elapsed() < Duration::from_millis(100),
+            "native speech delayed terminal input/rendering for {:?}",
+            input_at.elapsed()
+        );
+        lector.send(b"q");
+        assert!(
+            lector.finish(Duration::from_secs(3)),
+            "native-speech Lector did not exit"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires native audio; run scripts/test-native-speech"]
+    fn no_config_skips_the_default_init_lua() {
+        let _serial = serialize_live_pty_test();
+        let artifact_dir = fixture("target/test-artifacts/live-pty");
+        fs::create_dir_all(&artifact_dir).expect("create live PTY artifact directory");
+        let unique = format!(
+            "no-config-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        );
+        let config = artifact_dir.join(format!("{unique}.lua"));
+        let marker = artifact_dir.join(format!("{unique}.loaded"));
+        fs::write(
+            &config,
+            r#"
+            local marker = assert(io.open(os.getenv("LECTOR_NO_CONFIG_MARKER"), "w"))
+            marker:write("loaded")
+            marker:close()
+            error("--no-config unexpectedly loaded the default init.lua")
+        "#,
+        )
+        .expect("write default init.lua sentinel");
+
+        {
+            let mut lector = LiveLector::spawn_without_config("latency", &config, &marker);
+            assert!(
+                lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+                    physical_screen_contains(terminal, LATENCY_READY)
+                }),
+                "--no-config did not reach the child terminal; output={:?}",
+                String::from_utf8_lossy(&lector.output)
+            );
+            assert!(
+                !marker.exists(),
+                "--no-config loaded the init.lua selected by LECTOR_CONFIG"
+            );
+            lector.send(b"q");
+            assert!(
+                lector.finish(Duration::from_secs(3)),
+                "--no-config Lector did not exit"
+            );
+        }
+
+        fs::remove_file(&config).expect("remove sentinel init.lua");
+    }
 }

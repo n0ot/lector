@@ -448,6 +448,14 @@ framing, initialization, deadlines, errors, process cleanup, and the 30-second
 restart policy. Speech RPC and deadlines run only on the speech worker, so a
 slow or hung server cannot add a polling floor or block Lector's terminal loop.
 
+### Silent test runs
+
+Ordinary Cargo/nextest tests do not start native speech. Native audio integration
+checks are a separate, muted opt-in suite: `scripts/test-native-speech` on a Mac
+with a working audio session. They have bounded failure deadlines and are
+required for native speech changes, not unrelated feature work. See
+[validation details](docs/performance.md).
+
 ### Recording a diagnostic session
 
 `scripts/lector-trace` is a transparent PTY shim for reproducing interactive

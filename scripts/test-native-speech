@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Real native speech requires a usable macOS audio session, even at zero volume.
+# Keep this opt-in separate from ordinary cargo test / nextest validation.
+if [[ $(uname -s) != Darwin ]]; then
+  echo 'Native speech integration tests require macOS with a working audio session.' >&2
+  exit 1
+fi
+cd "$(dirname "$0")/.."
+exec cargo nextest run --locked --test speech --test live_pty \
+  --profile native-speech --run-ignored only \
+  -E 'test(/(^|::)native_speech::/)'

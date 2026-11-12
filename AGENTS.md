@@ -26,6 +26,8 @@ Prefer explicit byte sequences and modeled state over launching real programs. T
 
 Use an external program only when Lector intentionally implements compatibility with that program or one of its concrete protocols, and make the test exercise that compatibility boundary directly. Run indispensable external integrations only inside Docker containers, never directly on the host, and keep ordinary test commands inert with respect to them. Platform-specific host tests may run only Lector and project-built fixtures. Express this policy through test structure rather than checks for particular names, paths, commands, or applications.
 
+Native speech integration tests are ignored by ordinary Cargo/nextest runs. Ordinary validation must remain silent and independent of native audio availability. Test protocol, timeout, event, and cleanup behavior with simulated state and project-built fixtures. For changes to native speech behavior or its integration harness, also run `scripts/test-native-speech` explicitly on a suitable Mac. This suite is muted and bounded, but still requires a working audio session; a timeout is a failure, not a pass or skip. Do not change system audio settings to make it pass. Unrelated feature changes do not require this suite. See `docs/performance.md` for execution details.
+
 ## Agent queue
 
 When orchestrating this repository's queue, run `python3 .github/scripts/rust_updates.py sync --project <PROJECT_NODE_ID>` before dispatch and at the existing 30-minute checkpoints. This imports only validated canonical Rust updates as review/merge cards. Use the normal independent-agent final-revision review and protected merge process; a separate GitHub reviewer account is not required. A stopped session leaves prepared updates waiting.

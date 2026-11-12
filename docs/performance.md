@@ -125,7 +125,9 @@ replaces several transient full-screen draws, blocks the final physical flush,
 and verifies that neither pixels nor speech escape. It then verifies that only
 the final text is read immediately after the exact close render flushes.
 
-The native speech regressions mute AVFoundation and exercise the actual Lector
+Ordinary `cargo test` and `cargo nextest run` leave native speech tests ignored;
+they use simulated speech and project-built fixtures without requiring audio.
+The opt-in native speech regressions mute AVFoundation and exercise the actual Lector
 binary and its internal host. They verify that speech begins again after the
 startup utterance, that a queued utterance can be stopped and replaced, and
 that terminal input still reaches pixels in under 100 ms while the native host
@@ -136,11 +138,29 @@ deadlines, strict 1 MiB framing, kill-and-reap recovery, and the boundary below,
 at, and above the 30-second restart interval without adding a timer to the
 interactive path.
 
-Run the focused gates with:
+Run the native suite explicitly when changing the native backend or its integration
+harness, on a Mac with a working audio session (requires `cargo-nextest`):
 
 ```sh
-cargo test --locked --test live_pty direct_native_speech_continues_after_startup_and_never_blocks_input
-cargo test --locked --test speech proc_driver::lector_tts_host_advances_past_its_first_utterance
+scripts/test-native-speech
+```
+
+The suite selects only ignored `native_speech` tests, runs them serially, and
+terminates a stalled test after 60 seconds plus a two-second shutdown grace.
+Individual protocol/completion waits also have deadlines and clean up their
+project-created host on failure. Muting only affects the test host, not system
+volume, and does not remove the native engine's dependency on an available
+audio session. An unavailable or stalled session is a test failure; do not
+interpret it as a product defect without evidence, change audio settings, or
+silently turn it into a pass. The real `--no-config` startup and native parent
+watchdog checks also belong to this suite because they can initialize native
+speech. Pure configuration-resolution and process-fixture tests remain in the
+default suite. Current hosted CI runs its full suite on Linux, so this explicit
+macOS validation complements existing CI rather than replacing a required job.
+
+Run the audio-independent focused gates with:
+
+```sh
 cargo test --locked --test app neovim_atomic_redraw
 cargo test --locked --test live_pty key_to_pixel_latency -- --nocapture
 ```
