@@ -1,22 +1,16 @@
 use lector::terminal::{
-    Cell, Color, Cursor, GhosttyEngine, MouseEncoding, MouseProtocol, PrintBoundary, PrintedRun,
-    ScreenIdentity, Style, TerminalDamage, TerminalEffects, TerminalEngine, TerminalModes,
+    Cell, Color, Cursor, CursorShape, GhosttyEngine, MouseEncoding, MouseProtocol, PrintBoundary,
+    PrintedRun, ScreenIdentity, Style, TerminalDamage, TerminalEffects, TerminalModes,
     TerminalOperation, TerminalSnapshot, UpdateSummary, Viewport,
 };
 
-fn assert_engine_contract<T: TerminalEngine>() {}
-
-fn engine(rows: u16, cols: u16, scrollback: usize) -> Box<dyn TerminalEngine> {
-    Box::new(
-        GhosttyEngine::new_with_scrollback(rows, cols, scrollback)
-            .expect("create Ghostty terminal engine"),
-    )
+fn engine(rows: u16, cols: u16, scrollback: usize) -> GhosttyEngine {
+    GhosttyEngine::new_with_scrollback(rows, cols, scrollback)
+        .expect("create Ghostty terminal engine")
 }
 
 #[test]
-fn ghostty_engine_implements_the_engine_neutral_contract() {
-    assert_engine_contract::<GhosttyEngine>();
-
+fn terminal_model_defaults_remain_available() {
     let _: TerminalSnapshot = TerminalSnapshot::default();
     let _: Cell = Cell::default();
     let _: Style = Style::default();
@@ -28,9 +22,66 @@ fn ghostty_engine_implements_the_engine_neutral_contract() {
 }
 
 #[test]
+fn shared_terminal_leaves_preserve_serialized_names_fields_and_defaults() {
+    use serde_json::{from_value, json, to_value};
+
+    assert_eq!(from_value::<Cursor>(json!({})).unwrap(), Cursor::default());
+    assert_eq!(
+        to_value(Cursor::default()).unwrap(),
+        json!({"row": 0, "col": 0, "visible": false, "shape": "block"})
+    );
+    for (shape, name) in [
+        (CursorShape::Bar, "bar"),
+        (CursorShape::Block, "block"),
+        (CursorShape::Underline, "underline"),
+        (CursorShape::BlockHollow, "block_hollow"),
+    ] {
+        let cursor = Cursor {
+            row: 2,
+            col: 3,
+            visible: true,
+            shape,
+        };
+        let encoded = json!({"row": 2, "col": 3, "visible": true, "shape": name});
+        assert_eq!(to_value(cursor).unwrap(), encoded);
+        assert_eq!(from_value::<Cursor>(encoded).unwrap(), cursor);
+    }
+
+    let defaults = json!({
+        "application_keypad": false, "application_cursor": false,
+        "bracketed_paste": false, "synchronized_output": false,
+        "focus_reporting": false, "kitty_keyboard_flags": 0,
+        "mouse_protocol": "none", "mouse_encoding": "default"
+    });
+    assert_eq!(to_value(TerminalModes::default()).unwrap(), defaults);
+    assert_eq!(
+        from_value::<TerminalModes>(json!({})).unwrap(),
+        TerminalModes::default()
+    );
+    for (protocol, name) in [
+        (MouseProtocol::None, "none"),
+        (MouseProtocol::Press, "press"),
+        (MouseProtocol::PressRelease, "press_release"),
+        (MouseProtocol::ButtonMotion, "button_motion"),
+        (MouseProtocol::AnyMotion, "any_motion"),
+    ] {
+        assert_eq!(to_value(protocol).unwrap(), json!(name));
+        assert_eq!(from_value::<MouseProtocol>(json!(name)).unwrap(), protocol);
+    }
+    for (encoding, name) in [
+        (MouseEncoding::Default, "default"),
+        (MouseEncoding::Utf8, "utf8"),
+        (MouseEncoding::Sgr, "sgr"),
+    ] {
+        assert_eq!(to_value(encoding).unwrap(), json!(name));
+        assert_eq!(from_value::<MouseEncoding>(json!(name)).unwrap(), encoding);
+    }
+}
+
+#[test]
 fn contract_exposes_cells_modes_semantics_effects_damage_and_replies() {
     let mut engine = engine(3, 10, 20);
-    let update = engine.advance(
+    let update = engine.advance_update(
         b"\x1B]0;engine title\x07\x1B]133;A\x07\x1B[1;31mA\x1B[0m e\xCC\x81\x07\x1B[?2004h\x1B[?1000h\x1B[?1006h",
     );
     let snapshot = engine.snapshot();
@@ -72,9 +123,9 @@ fn contract_exposes_cells_modes_semantics_effects_damage_and_replies() {
 #[test]
 fn update_summary_tracks_fragmented_prints_operations_screens_and_sync() {
     let mut engine = engine(3, 10, 20);
-    let mut update = engine.advance(b"one\r");
-    update.merge(engine.advance(b"\ntwo\x1B["));
-    update.merge(engine.advance(b"1D!\x1B[S\x1B[?2026h"));
+    let mut update = engine.advance_update(b"one\r");
+    update.merge(engine.advance_update(b"\ntwo\x1B["));
+    update.merge(engine.advance_update(b"1D!\x1B[S\x1B[?2026h"));
 
     assert_eq!(update.batch_count, 3);
     assert_eq!(update.printed_text(), "one\ntwo!");
@@ -88,7 +139,7 @@ fn update_summary_tracks_fragmented_prints_operations_screens_and_sync() {
     assert!(engine.snapshot().modes.synchronized_output);
     assert!(!update.changed_rows.is_empty());
 
-    let alternate = engine.advance(b"\x1B[?2026l\x1B[?1049h alt");
+    let alternate = engine.advance_update(b"\x1B[?2026l\x1B[?1049h alt");
     assert_eq!(alternate.screen_before, ScreenIdentity::Primary);
     assert_eq!(alternate.screen_after, ScreenIdentity::Alternate);
     assert!(!alternate.synchronized_output);
@@ -100,16 +151,16 @@ fn osc133_input_boundary_is_exact_across_visible_suffixes_and_fragmentation() {
     let prompt = b"\x1b]133;A\x07$ \x1b]133;B\x07";
 
     let mut exact_engine = engine(3, 40, 20);
-    let exact = exact_engine.advance(prompt);
+    let exact = exact_engine.advance_update(prompt);
     assert!(exact.semantic_input_boundary);
 
     let mut neutral_engine = engine(3, 40, 20);
     let neutral = neutral_engine
-        .advance(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[32m\x1b[?2004h\x1b[5 q\x1b]2;cwd\x07");
+        .advance_update(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[32m\x1b[?2004h\x1b[5 q\x1b]2;cwd\x07");
     assert!(neutral.semantic_input_boundary);
 
     let mut same_read_engine = engine(3, 40, 20);
-    let same_read = same_read_engine.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07partial");
+    let same_read = same_read_engine.advance_update(b"\x1b]133;A\x07$ \x1b]133;B\x07partial");
     assert!(!same_read.semantic_input_boundary);
 
     let mut fragmented_engine = engine(3, 40, 20);
@@ -119,12 +170,12 @@ fn osc133_input_boundary_is_exact_across_visible_suffixes_and_fragmentation() {
         b"B\x07pa".as_slice(),
         b"rtial".as_slice(),
     ] {
-        fragmented.merge(fragmented_engine.advance(chunk));
+        fragmented.merge(fragmented_engine.advance_update(chunk));
     }
     assert!(!fragmented.semantic_input_boundary);
 
     let mut continuation_engine = engine(3, 40, 20);
-    let continuation = continuation_engine.advance(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[");
+    let continuation = continuation_engine.advance_update(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b[");
     assert!(continuation.parser_continuation);
     assert!(!continuation.semantic_input_boundary);
 }
@@ -133,12 +184,12 @@ fn osc133_input_boundary_is_exact_across_visible_suffixes_and_fragmentation() {
 fn terminal_updates_are_invariant_to_byte_fragmentation() {
     let bytes = b"first red line\r\nsecond line";
     let mut whole_engine = engine(4, 40, 20);
-    let whole = whole_engine.advance(bytes);
+    let whole = whole_engine.advance_update(bytes);
 
     let mut fragmented_engine = engine(4, 40, 20);
     let mut fragmented = UpdateSummary::default();
     for byte in bytes {
-        fragmented.merge(fragmented_engine.advance(std::slice::from_ref(byte)));
+        fragmented.merge(fragmented_engine.advance_update(std::slice::from_ref(byte)));
     }
 
     assert!(!whole.operations.is_empty());
@@ -157,12 +208,12 @@ fn terminal_updates_are_invariant_to_byte_fragmentation() {
 fn safe_suffix_after_a_structural_boundary_is_invariant_to_byte_fragmentation() {
     let bytes = b"\x1b[Hfirst\r\nsecond\r\n";
     let mut whole_engine = engine(4, 40, 20);
-    let whole = whole_engine.advance(bytes);
+    let whole = whole_engine.advance_update(bytes);
 
     let mut fragmented_engine = engine(4, 40, 20);
     let mut fragmented = UpdateSummary::default();
     for byte in bytes {
-        fragmented.merge(fragmented_engine.advance(std::slice::from_ref(byte)));
+        fragmented.merge(fragmented_engine.advance_update(std::slice::from_ref(byte)));
     }
 
     assert_eq!(fragmented_engine.snapshot(), whole_engine.snapshot());
@@ -179,12 +230,12 @@ fn safe_suffix_after_a_structural_boundary_is_invariant_to_byte_fragmentation() 
 fn ambiguous_mid_record_suffix_is_invariant_to_byte_fragmentation() {
     let bytes = b"item\tvalue\r\n";
     let mut whole_engine = engine(4, 40, 20);
-    let whole = whole_engine.advance(bytes);
+    let whole = whole_engine.advance_update(bytes);
 
     let mut fragmented_engine = engine(4, 40, 20);
     let mut fragmented = UpdateSummary::default();
     for byte in bytes {
-        fragmented.merge(fragmented_engine.advance(std::slice::from_ref(byte)));
+        fragmented.merge(fragmented_engine.advance_update(std::slice::from_ref(byte)));
     }
 
     assert_eq!(fragmented_engine.snapshot(), whole_engine.snapshot());
@@ -381,7 +432,7 @@ fn update_summary_merges_print_boundaries_without_raw_byte_replay() {
     assert_eq!(summary.printed_text(), "replacement\nnext");
 
     let mut engine = engine(4, 20, 0);
-    let blank_lines = engine.advance(b"one\r\n\r\nthree");
+    let blank_lines = engine.advance_update(b"one\r\n\r\nthree");
     assert_eq!(blank_lines.printed_text(), "one\n\nthree");
 }
 
@@ -427,38 +478,39 @@ fn printed_run_coalescing_preserves_boundary_text_across_every_grouping() {
 fn linear_output_completion_survives_fragmented_crlf_and_rejects_ambiguity() {
     let mut engine = engine(4, 20, 20);
 
-    let mut fragmented = engine.advance(b"complete line\r");
+    let mut fragmented = engine.advance_update(b"complete line\r");
     assert!(!fragmented.completes_linear_output_record());
-    fragmented.merge(engine.advance(b"\n"));
+    fragmented.merge(engine.advance_update(b"\n"));
     assert!(fragmented.completes_linear_output_record());
     assert_eq!(fragmented.printed_text(), "complete line\n");
 
-    let styled = engine.advance(b"styled\x1b[31m line\x1b[0m\r\n\x1b[32m");
+    let styled = engine.advance_update(b"styled\x1b[31m line\x1b[0m\r\n\x1b[32m");
     assert!(styled.completes_linear_output_record());
 
-    let trailing = engine.advance(b"complete\r\npartial");
+    let trailing = engine.advance_update(b"complete\r\npartial");
     assert!(!trailing.completes_linear_output_record());
 
-    let overwrite = engine.advance(b"10%\r100%\r\n");
+    let overwrite = engine.advance_update(b"10%\r100%\r\n");
     assert!(!overwrite.completes_linear_output_record());
     assert_eq!(overwrite.printed_text(), "100%\n");
 
-    let readline = engine.advance(b"\x1b[?2004h\r\n\x1b[?2004l\rlorem ipsum\r\n\x1b[?2004h");
+    let readline = engine.advance_update(b"\x1b[?2004h\r\n\x1b[?2004l\rlorem ipsum\r\n\x1b[?2004h");
     assert!(!readline.output_report_structural);
     assert!(readline.completes_linear_output_record());
     assert_eq!(readline.printed_text(), "lorem ipsum\n");
 
     let mut mixed_mode_engine =
         GhosttyEngine::new_with_scrollback(4, 20, 20).expect("create mixed-mode engine");
-    let mixed_mode = TerminalEngine::advance(&mut mixed_mode_engine, b"\x1b[?2004;1004hrecord\r\n");
+    let mixed_mode =
+        GhosttyEngine::advance_update(&mut mixed_mode_engine, b"\x1b[?2004;1004hrecord\r\n");
     assert!(mixed_mode.output_report_structural);
     assert!(!mixed_mode.completes_linear_output_record());
 
-    let addressed = engine.advance(b"\x1b[Hscreen row\r\n");
+    let addressed = engine.advance_update(b"\x1b[Hscreen row\r\n");
     assert!(addressed.output_report_structural);
     assert!(addressed.completes_linear_output_record());
 
-    let incomplete_escape = engine.advance(b"record\r\n\x1b[");
+    let incomplete_escape = engine.advance_update(b"record\r\n\x1b[");
     assert!(incomplete_escape.parser_continuation);
     assert!(!incomplete_escape.completes_linear_output_record());
 
@@ -466,8 +518,9 @@ fn linear_output_completion_survives_fragmented_crlf_and_rejects_ambiguity() {
     for split in 1..kitty_apc.len() {
         let mut apc_engine =
             GhosttyEngine::new_with_scrollback(4, 20, 20).expect("create APC engine");
-        let mut fragmented_apc = TerminalEngine::advance(&mut apc_engine, &kitty_apc[..split]);
-        fragmented_apc.merge(TerminalEngine::advance(
+        let mut fragmented_apc =
+            GhosttyEngine::advance_update(&mut apc_engine, &kitty_apc[..split]);
+        fragmented_apc.merge(GhosttyEngine::advance_update(
             &mut apc_engine,
             &kitty_apc[split..],
         ));
@@ -480,14 +533,14 @@ fn linear_output_completion_survives_fragmented_crlf_and_rejects_ambiguity() {
 
     let mut c1_apc_engine =
         GhosttyEngine::new_with_scrollback(4, 20, 20).expect("create C1 APC engine");
-    let c1_apc = TerminalEngine::advance(&mut c1_apc_engine, b"record\r\n\x9fGa=q,i=1\x9c");
+    let c1_apc = GhosttyEngine::advance_update(&mut c1_apc_engine, b"record\r\n\x9fGa=q,i=1\x9c");
     assert!(c1_apc.output_report_structural);
     assert!(!c1_apc.completes_linear_output_record());
 
     let mut invalid_utf8_engine =
         GhosttyEngine::new_with_scrollback(4, 20, 20).expect("create invalid UTF-8 engine");
     let invalid_utf8_c1 =
-        TerminalEngine::advance(&mut invalid_utf8_engine, b"record\r\n\xe0\x9fGa=q,i=1\x9c");
+        GhosttyEngine::advance_update(&mut invalid_utf8_engine, b"record\r\n\xe0\x9fGa=q,i=1\x9c");
     assert!(
         invalid_utf8_c1.output_report_structural,
         "an invalid UTF-8 prefix must not hide a raw C1 APC introducer"
@@ -499,8 +552,8 @@ fn linear_output_completion_survives_fragmented_crlf_and_rejects_ambiguity() {
         let mut unicode_engine =
             GhosttyEngine::new_with_scrollback(4, 20, 20).expect("create Unicode engine");
         let mut fragmented_unicode =
-            TerminalEngine::advance(&mut unicode_engine, &unicode_record[..split]);
-        fragmented_unicode.merge(TerminalEngine::advance(
+            GhosttyEngine::advance_update(&mut unicode_engine, &unicode_record[..split]);
+        fragmented_unicode.merge(GhosttyEngine::advance_update(
             &mut unicode_engine,
             &unicode_record[split..],
         ));
@@ -514,16 +567,16 @@ fn linear_output_completion_survives_fragmented_crlf_and_rejects_ambiguity() {
         );
     }
 
-    let alternate = engine.advance(b"\x1b[?1049hrecord\r\n");
+    let alternate = engine.advance_update(b"\x1b[?1049hrecord\r\n");
     assert!(!alternate.completes_linear_output_record());
-    let synchronized = engine.advance(b"\x1b[?1049l\x1b[?2026hrecord\r\n\x1b[?2026l");
+    let synchronized = engine.advance_update(b"\x1b[?1049l\x1b[?2026hrecord\r\n\x1b[?2026l");
     assert!(!synchronized.completes_linear_output_record());
 }
 
 #[test]
 fn contract_selects_live_and_review_viewports_without_losing_stream_state() {
     let mut engine = engine(2, 8, 20);
-    engine.advance(b"one\r\ntwo\r\nthree");
+    engine.advance_update(b"one\r\ntwo\r\nthree");
     assert_eq!(engine.scrollback_extent(), 1);
     assert_eq!(engine.snapshot().contents(), "two\nthree");
 
@@ -531,23 +584,23 @@ fn contract_selects_live_and_review_viewports_without_losing_stream_state() {
     assert_eq!(engine.viewport(), Viewport::Scrollback(1));
     assert_eq!(engine.snapshot().contents(), "one\ntwo");
 
-    engine.advance(b"\r\npartial \xE7\x95");
+    engine.advance_update(b"\r\npartial \xE7\x95");
     engine.select_viewport(Viewport::Live);
-    engine.advance(b"\x8C");
+    engine.advance_update(b"\x8C");
     assert!(engine.snapshot().contents().contains("partial 界"));
 }
 
 #[test]
 fn full_snapshot_captures_history_wrapping_and_alternate_screen_identity() {
     let mut engine = engine(2, 5, 20);
-    engine.advance(b"12345X\r\nlast");
+    engine.advance_update(b"12345X\r\nlast");
     let snapshot = engine.snapshot_with_history();
 
     assert_eq!(snapshot.scrollback.len(), 1);
     assert!(snapshot.scrollback[0].wrapped);
     assert_eq!(snapshot.scrollback[0].contents(), "12345");
 
-    engine.advance(b"\x1B[?1049halt\x1B[?25l");
+    engine.advance_update(b"\x1B[?1049halt\x1B[?25l");
     assert_eq!(engine.snapshot().screen, ScreenIdentity::Alternate);
     assert!(!engine.snapshot().cursor.visible);
 }
@@ -555,19 +608,19 @@ fn full_snapshot_captures_history_wrapping_and_alternate_screen_identity() {
 #[test]
 fn resize_reset_and_fragmented_titles_follow_the_contract() {
     let mut engine = engine(2, 6, 20);
-    let partial = engine.advance(b"before\x1B]0;frag");
+    let partial = engine.advance_update(b"before\x1B]0;frag");
     assert!(!partial.effects.title_changed);
     assert_eq!(engine.snapshot().title, None);
 
-    let completed = engine.advance(b"mented\x1B\\");
+    let completed = engine.advance_update(b"mented\x1B\\");
     assert!(completed.effects.title_changed);
     assert_eq!(engine.snapshot().title.as_deref(), Some("fragmented"));
 
-    engine.resize(4, 9);
+    engine.resize_update(4, 9);
     assert_eq!(engine.snapshot().size(), (4, 9));
     assert!(engine.snapshot().contents().contains("before"));
 
-    engine.reset();
+    engine.reset_update();
     assert_eq!(engine.snapshot().size(), (4, 9));
     assert_eq!(engine.snapshot().contents(), "");
     assert_eq!(engine.snapshot().title, None);
@@ -577,7 +630,7 @@ fn resize_reset_and_fragmented_titles_follow_the_contract() {
 #[test]
 fn normalized_snapshot_covers_the_screen_read_contract() {
     let mut engine = engine(2, 8, 4);
-    engine.advance(b"one  two\x1B[?1h\x1B=\x1B[?25l");
+    engine.advance_update(b"one  two\x1B[?1h\x1B=\x1B[?25l");
     let snapshot = engine.snapshot();
     let mut full = String::from("stale");
     snapshot.contents_full_into(&mut full);
@@ -605,7 +658,7 @@ fn normalized_snapshot_covers_the_screen_read_contract() {
 #[test]
 fn content_extraction_preserves_wrapping_ranges_and_full_row_trimming() {
     let mut engine = engine(3, 5, 4);
-    engine.advance(b"abc  X");
+    engine.advance_update(b"abc  X");
     let snapshot = engine.snapshot();
 
     assert!(snapshot.row_wrapped(0));
@@ -618,12 +671,12 @@ fn content_extraction_preserves_wrapping_ranges_and_full_row_trimming() {
 fn visible_content_predicate_matches_trimmed_contents_without_allocating_a_screen() {
     let mut engine = engine(2, 8, 4);
 
-    engine.advance(" \t\u{00a0}".as_bytes());
+    engine.advance_update(" \t\u{00a0}".as_bytes());
     let whitespace = engine.snapshot();
     assert!(whitespace.contents().trim().is_empty());
     assert!(!whitespace.has_visible_non_whitespace_content());
 
-    engine.advance(b"x");
+    engine.advance_update(b"x");
     let content = engine.snapshot();
     assert!(!content.contents().trim().is_empty());
     assert!(content.has_visible_non_whitespace_content());

@@ -1,6 +1,5 @@
 use lector::terminal::{
     Color, GhosttyEngine, HistoryPosition, MouseEncoding, MouseProtocol, ScreenIdentity,
-    TerminalEngine,
 };
 use lector::view::View;
 use std::sync::Arc;

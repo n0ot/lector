@@ -5,7 +5,7 @@ use lector::{
     presentation::{PresentedScene, RenderStrategy},
     screen_reader::ScreenReader,
     speech,
-    terminal::{Color, GhosttyEngine, TerminalEngine, TerminalGeometry},
+    terminal::{Color, GhosttyEngine, TerminalGeometry},
     terminal_protocol::PhysicalTerminalProfile,
     view::View,
     views,

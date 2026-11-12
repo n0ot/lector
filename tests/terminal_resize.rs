@@ -1,5 +1,5 @@
 use lector::{
-    terminal::{GhosttyEngine, TerminalEngine, TerminalGeometry},
+    terminal::{GhosttyEngine, TerminalGeometry},
     view::View,
 };
 
@@ -8,7 +8,7 @@ fn engine_geometry_keeps_cells_and_pixels_separate() {
     let mut engine = GhosttyEngine::new_with_scrollback(2, 8, 20).expect("create Ghostty engine");
     let geometry = TerminalGeometry::new(4, 12, 9, 18);
 
-    TerminalEngine::resize_with_geometry(&mut engine, geometry);
+    GhosttyEngine::resize_with_geometry_update(&mut engine, geometry);
 
     assert_eq!(engine.snapshot().geometry, geometry);
     assert_eq!(engine.snapshot().size(), (4, 12));

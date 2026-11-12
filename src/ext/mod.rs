@@ -199,7 +199,7 @@ impl CellExt for Cell {
 mod tests {
     use super::{CellExt, ScreenExt};
 
-    use crate::terminal::{GhosttyEngine, TerminalEngine};
+    use crate::terminal::GhosttyEngine;
 
     fn parser(rows: u16, cols: u16, contents: &[u8]) -> GhosttyEngine {
         let mut parser =

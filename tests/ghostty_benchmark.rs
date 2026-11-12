@@ -1,5 +1,3 @@
-#![cfg(feature = "ghostty-vt")]
-
 use serde_json::Value;
 use std::process::Command;
 

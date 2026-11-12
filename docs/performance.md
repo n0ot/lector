@@ -115,7 +115,7 @@ gates catch both a return to per-read scene composition and a subtler regression
 which keeps cumulative accessibility metadata behind a blocked physical writer.
 
 ```sh
-cargo run --locked --release --features ghostty-vt \
+cargo run --locked --release \
   --bin lector-ghostty-bench -- \
   --check-baseline benchmarks/ghostty-release-baseline-macos-aarch64.json
 ```

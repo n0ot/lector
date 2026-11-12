@@ -42,8 +42,6 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 OsString::from("run"),
                 OsString::from("--locked"),
                 OsString::from("--release"),
-                OsString::from("--features"),
-                OsString::from("ghostty-vt"),
                 OsString::from("--bin"),
                 OsString::from("lector-ghostty-bench"),
                 OsString::from("--"),

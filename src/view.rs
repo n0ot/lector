@@ -10,8 +10,8 @@ use super::{
     },
     terminal::{
         GhosttyEngine, GhosttyReviewMark, HistoryPosition, SemanticKind as Osc133Kind,
-        SemanticMark as Osc133Mark, TerminalEngine, TerminalEvent, TerminalGeometry,
-        TerminalSnapshot, UpdateSummary, Viewport,
+        SemanticMark as Osc133Mark, TerminalEvent, TerminalGeometry, TerminalSnapshot,
+        UpdateSummary, Viewport,
     },
 };
 use std::{
@@ -607,7 +607,7 @@ impl View {
         // selected review viewport is restored afterward.
         self.engine.select_viewport(Viewport::Live);
         let old_cursor_row = old_live_start + usize::from(self.engine.snapshot().cursor.row);
-        let mut update = TerminalEngine::advance(&mut self.engine, buf);
+        let mut update = GhosttyEngine::advance_update(&mut self.engine, buf);
         let live_end =
             self.engine.snapshot().history_origin + self.engine.snapshot().scrollback_extent;
         if update.screen_before == update.screen_after && live_end < old_live_start {
@@ -2703,7 +2703,7 @@ impl View {
         if self.presentation_tracking {
             self.freeze_current_accessibility();
         }
-        TerminalEngine::resize_with_geometry(&mut self.engine, geometry);
+        GhosttyEngine::resize_with_geometry_update(&mut self.engine, geometry);
         if self.presentation_tracking {
             self.advance_live_revision();
             self.live_history_revision = self
@@ -3545,7 +3545,7 @@ fn snapshot_at_scrollback(snapshot: &TerminalSnapshot, scrollback: usize) -> Ter
         cursor,
         geometry: snapshot.geometry,
         screen: snapshot.screen,
-        modes: snapshot.modes.clone(),
+        modes: snapshot.modes,
         title: snapshot.title.clone(),
         working_directory: snapshot.working_directory.clone(),
         semantic_marks: snapshot.semantic_marks.clone(),

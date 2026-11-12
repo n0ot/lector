@@ -778,7 +778,7 @@ impl PresentedScene {
         presented.cursor_owner = scene.cursor_owner;
         if let Some(surface) = cursor_surface(scene) {
             presented.screen = surface.snapshot.screen;
-            presented.modes = surface.snapshot.modes.clone();
+            presented.modes = surface.snapshot.modes;
             let row = surface
                 .origin
                 .row
