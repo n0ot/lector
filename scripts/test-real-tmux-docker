@@ -64,6 +64,9 @@ else
 fi
 # The selected image must already exist; do not pull an unrelated replacement.
 run_args+=(--pull never)
+# Docker cannot create this nested mountpoint through the read-only source bind
+# in a fresh checkout (or when host Cargo uses a target directory elsewhere).
+mkdir -p "$repo_dir/target"
 docker run "${run_args[@]}" "$image" scripts/check-rust-toolchain
 docker run "${run_args[@]}" "$image" bash tests/docker/check-nextest-install.sh
 if [[ "${LECTOR_REAL_TMUX_PREPARE_ONLY:-0}" == 1 ]]; then

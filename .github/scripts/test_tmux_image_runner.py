@@ -3,8 +3,10 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 IMAGE = "sha256:" + "a" * 64
@@ -34,6 +36,19 @@ if sys.argv[1:3] == ['image', 'inspect']:
             result = subprocess.run([str(ROOT / 'scripts/test-real-tmux-docker')],
                                     env=env, text=True, capture_output=True)
             return result, [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
+
+    def test_fresh_checkout_prepares_nested_target_mountpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory)
+            script = checkout / 'scripts/test-real-tmux-docker'
+            script.parent.mkdir()
+            shutil.copy(ROOT / 'scripts/test-real-tmux-docker', script)
+            self.assertFalse((checkout / 'target').exists())
+            with patch(__name__ + '.ROOT', checkout):
+                result, _ = self.run_runner(LECTOR_REAL_TMUX_PLATFORM='linux/amd64',
+                                            LECTOR_REAL_TMUX_PREBUILT_IMAGE=IMAGE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((checkout / 'target').is_dir())
 
     def test_default_build_and_prebuilt_run_identical_test_commands(self):
         normal, normal_calls = self.run_runner(LECTOR_REAL_TMUX_PLATFORM='linux/amd64')
