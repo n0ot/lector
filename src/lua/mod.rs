@@ -17,6 +17,7 @@ pub(crate) mod automation;
 mod ext;
 mod inspect;
 mod meta;
+mod options;
 
 pub fn setup<F>(
     init_lua_file: PathBuf,
@@ -1330,5 +1331,138 @@ mod tests {
         })
         .unwrap();
         assert!(reader.help_mode());
+    }
+
+    #[test]
+    fn reader_option_names_defaults_aliases_and_rejected_values_are_stable() {
+        let mut reader = screen_reader();
+        let lua = Lua::new();
+        setup_repl(&lua).unwrap();
+        super::enter(&lua, &mut reader, || lua.load(r#"
+            local booleans = {
+                {'help_mode', false}, {'auto_read', true},
+                {'suppress_key_echo', false}, {'report_indentation', true},
+                {'review_follows_screen_cursor', true}, {'rev_follows', true},
+                {'highlight_tracking', false}, {'stop_speech_on_focus_loss', true},
+            }
+            local function rejects(name, value, detail)
+                local before = lector.o[name]
+                local ok, error = pcall(function() lector.o[name] = value end)
+                assert(not ok)
+                assert(string.find(tostring(error), 'set option: ' .. name .. ': ' .. detail, 1, true), tostring(error))
+                assert(lector.o[name] == before)
+            end
+            for _, option in ipairs(booleans) do
+                local name, default = option[1], option[2]
+                assert(lector.o[name] == default, name)
+                lector.o[name] = not default
+                assert(lector.o[name] == not default, name)
+                if name == 'review_follows_screen_cursor' then assert(not lector.o.rev_follows) end
+                if name == 'rev_follows' then assert(not lector.o.review_follows_screen_cursor) end
+                for _, value in ipairs({0, 1, 'false', {}, function() end}) do
+                    rejects(name, value, 'value must be a boolean')
+                end
+                rejects(name, nil, 'value must be a boolean')
+                lector.o[name] = default
+            end
+            local strings = {
+                {'symbol_level', 'some', {'none', 'some', 'most', 'all', 'character'}},
+                {'tmux_bells', 'audible', {'off', 'spoken', 'audible'}},
+                {'clipboard.default_register', '"', {'+', '"'}},
+                {'clipboard.system_provider', 'native', {'osc52', 'native'}},
+            }
+            for _, option in ipairs(strings) do
+                local name, default, values = option[1], option[2], option[3]
+                assert(lector.o[name] == default, name)
+                for _, value in ipairs(values) do
+                    lector.o[name] = value
+                    assert(lector.o[name] == value)
+                end
+                for _, value in ipairs({0, false, {}, function() end}) do
+                    rejects(name, value, 'value must be a string')
+                end
+                rejects(name, nil, 'value must be a string')
+                local before = lector.o[name]
+                local ok, error = pcall(function() lector.o[name] = 'unsupported' end)
+                assert(not ok, name)
+                -- Enum parser errors historically pass through without the
+                -- outer option prefix; wrong types retain the prefix above.
+                assert(not string.find(tostring(error), 'set option:', 1, true), tostring(error))
+                assert(lector.o[name] == before)
+                lector.o[name] = default
+            end
+            local function fails(action, message)
+                local ok, error = pcall(action)
+                assert(not ok and string.find(tostring(error), message, 1, true), tostring(error))
+            end
+            fails(function() return lector.o.missing end, 'get option: missing: unknown option')
+            fails(function() lector.o.missing = true end, 'set option: missing: unknown option')
+            fails(function() return lector.o.table_header_auto end, 'unknown option')
+            fails(function() return lector.o.speech.missing end, 'unknown speech option: missing')
+            fails(function() lector.o.speech.voices = {} end, 'lector.o.speech.voices is read-only')
+            fails(function() lector.o['speech.voices'] = {} end, 'set option: speech.voices: unknown option')
+            fails(function() return lector.o.clipboard.missing end, 'unknown clipboard option: missing')
+            fails(function() return lector.o[1] end, 'option name must be a string for indexing')
+            fails(function() lector.o[1] = true end, 'option name must be a string for assignment')
+        "#).exec()).unwrap();
+    }
+
+    #[test]
+    fn speech_number_dispatch_preserves_ranges_types_and_driver_calls() {
+        let rates = Rc::new(RefCell::new(Vec::new()));
+        let pitches = Rc::new(RefCell::new(Vec::new()));
+        let volumes = Rc::new(RefCell::new(Vec::new()));
+        let driver = SpeechOptionsDriver {
+            state: OptionState {
+                rate: Some(50.0),
+                rate_status: CapabilityStatus::Supported,
+                pitch: Some(1.0),
+                pitch_status: CapabilityStatus::Supported,
+                volume: Some(1.0),
+                volume_status: CapabilityStatus::Supported,
+                ..OptionState::default()
+            },
+            rates: rates.clone(),
+            pitches: pitches.clone(),
+            volumes: volumes.clone(),
+            voices: Rc::new(RefCell::new(Vec::new())),
+        };
+        let mut reader = ScreenReader::new(speech::Speech::new(Box::new(driver)));
+        let lua = Lua::new();
+        setup_repl(&lua).unwrap();
+        super::enter(&lua, &mut reader, || lua.load(r#"
+            for _, name in ipairs({'rate', 'pitch', 'volume'}) do
+                local function rejects(value, detail)
+                    local before = lector.o.speech[name]
+                    local ok, error = pcall(function() lector.o.speech[name] = value end)
+                    assert(not ok and string.find(tostring(error), 'set option: speech.' .. name, 1, true))
+                    assert(string.find(tostring(error), detail, 1, true), tostring(error))
+                    assert(lector.o.speech[name] == before)
+                end
+                for _, value in ipairs({false, '50', {}, function() end}) do
+                    rejects(value, 'value must be a number')
+                end
+                rejects(nil, 'value must be a number')
+                local detail = name == 'rate' and 'between 0 and 100 inclusive' or 'must be finite'
+                rejects(0/0, detail)
+                rejects(math.huge, detail)
+                rejects(-math.huge, detail)
+                rejects(1e100, detail)
+                if name == 'rate' then
+                    rejects(-0.1, detail)
+                    rejects(100.1, detail)
+                    lector.o.speech[name] = 0
+                    lector.o.speech[name] = 100
+                else
+                    -- Pitch and volume are backend-domain finite values,
+                    -- not normalized percentages.
+                    lector.o.speech[name] = -2
+                    lector.o.speech[name] = 2.5
+                end
+            end
+        "#).exec()).unwrap();
+        assert_eq!(*rates.borrow(), [0.0, 100.0]);
+        assert_eq!(*pitches.borrow(), [-2.0, 2.5]);
+        assert_eq!(*volumes.borrow(), [-2.0, 2.5]);
     }
 }

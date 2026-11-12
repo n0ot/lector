@@ -1,9 +1,9 @@
 use super::{access::ReaderAccess, ext::LuaResultExt};
 use crate::{
-    clipboard::{ClipboardRegister, SystemClipboardProvider},
+    clipboard::ClipboardRegister,
     keymap::KeyBindings,
     screen_reader::ScreenReader,
-    speech::{SetOptionOutcome, SpeechServerSpec, protocol::VoiceInfo, symbols},
+    speech::{SpeechServerSpec, protocol::VoiceInfo, symbols},
 };
 use anyhow::{Context as AnyhowContext, anyhow};
 use mlua::{Error, Function, IntoLua, Lua, Result, Table, Value};
@@ -60,24 +60,12 @@ pub fn setup_static(lua: &Lua, access: ReaderAccess) -> Result<()> {
 fn add_callbacks_static(lua: &Lua, tbl_callbacks: &Table, access: ReaderAccess) -> Result<()> {
     let set_option = lua.create_function({
         let access = access.clone();
-        move |_, (key, value): (String, mlua::Value)| {
-            if key == "speech.server" {
-                let spec = speech_server_spec_from_lua(value).map_err(Error::external)?;
-                return access.with_mut(|sr| {
-                    sr.set_startup_speech_server_spec(spec)
-                        .map_err(Error::external)
-                });
-            }
-            with_screen_reader_mut(&access, |sr| {
-                set_option(sr, &key, value)
-                    .map_err(|error| Error::external(anyhow!(format!("{error:#}"))))
-            })
-        }
+        move |_, (key, value): (String, mlua::Value)| super::options::set(&access, &key, value)
     })?;
     let get_option = lua.create_function({
         let access = access.clone();
         move |lua, key: String| {
-            let value = access.with(|sr| get_option(sr, &key).map_err(Error::external))?;
+            let value = super::options::get(&access, &key)?;
             value.into_lua(lua)
         }
     })?;
@@ -269,65 +257,6 @@ fn clipboard_register(name: &str) -> anyhow::Result<ClipboardRegister> {
     }
 }
 
-// Snapshot reader data before allocating Lua strings/tables: allocation can
-// collect userdata and run Lua finalizers.
-enum OptionValue {
-    Boolean(bool),
-    Integer(u64),
-    Number(Option<f32>),
-    Text(Option<String>),
-    Server(SpeechServerSpec),
-    Voices(Option<Vec<VoiceInfo>>),
-}
-
-impl IntoLua for OptionValue {
-    fn into_lua(self, lua: &Lua) -> Result<Value> {
-        match self {
-            Self::Boolean(value) => value.into_lua(lua),
-            Self::Integer(value) => value.into_lua(lua),
-            Self::Number(value) => value.into_lua(lua),
-            Self::Text(value) => value.into_lua(lua),
-            Self::Server(value) => speech_server_spec_to_lua(lua, &value),
-            Self::Voices(None) => Ok(Value::Nil),
-            Self::Voices(Some(voices)) => {
-                let result = lua.create_table()?;
-                for (index, voice) in voices.iter().enumerate() {
-                    result.set(index + 1, voice_info_to_lua(lua, voice)?)?;
-                }
-                Ok(Value::Table(result))
-            }
-        }
-    }
-}
-
-fn get_option(sr: &ScreenReader, option: &str) -> anyhow::Result<OptionValue> {
-    use OptionValue::*;
-    Ok(match option {
-        "speech.server" => Server(sr.speech_server_spec().clone()),
-        "speech.rate" => Number(sr.speech().rate()),
-        "speech.pitch" => Number(sr.speech().pitch()),
-        "speech.volume" => Number(sr.speech().volume()),
-        "speech.paragraph_pause_ms" => Integer(sr.speech().paragraph_pause_ms()),
-        "speech.voice" => Text(sr.speech().voice().map(|voice| voice.id)),
-        "speech.voices" => Voices(sr.speech().voices()),
-        "symbol_level" => Text(Some(sr.speech().symbol_level().to_string())),
-        "help_mode" => Boolean(sr.help_mode()),
-        "auto_read" => Boolean(sr.auto_read_enabled()),
-        "suppress_key_echo" => Boolean(sr.suppress_key_echo()),
-        "report_indentation" => Boolean(sr.indentation_reporting_enabled()),
-        "review_follows_screen_cursor" | "rev_follows" => {
-            Boolean(sr.review_follows_screen_cursor())
-        }
-        "highlight_tracking" => Boolean(sr.highlight_tracking_enabled()),
-        "stop_speech_on_focus_loss" => Boolean(sr.stop_speech_on_focus_loss()),
-        "legacy_escape_timeout_ms" => Integer(sr.legacy_escape_timeout_ms().into()),
-        "tmux_bells" => Text(Some(sr.tmux_bell_mode().to_string())),
-        "clipboard.default_register" => Text(Some(sr.clipboard_default_register().to_string())),
-        "clipboard.system_provider" => Text(Some(sr.system_clipboard_provider().to_string())),
-        _ => return Err(anyhow!("get option: {option}: unknown option")),
-    })
-}
-
 enum ParsedBinding {
     Clear,
     Builtin(crate::commands::Action),
@@ -396,213 +325,7 @@ fn get_binding(access: &ReaderAccess, lua: &Lua, key: &str) -> Result<Value> {
     value.into_lua(lua)
 }
 
-fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow::Result<()> {
-    use mlua::Value::*;
-    if option == "legacy_escape_timeout_ms" {
-        let Integer(value) = value else {
-            return Err(anyhow!(
-                "set option: legacy_escape_timeout_ms: value must be an integer from 0 through 1000"
-            ));
-        };
-        let milliseconds = u16::try_from(value).map_err(|_| {
-            anyhow!(
-                "set option: legacy_escape_timeout_ms: value must be an integer from 0 through 1000"
-            )
-        })?;
-        if milliseconds > 1_000 {
-            return Err(anyhow!(
-                "set option: legacy_escape_timeout_ms: value must be an integer from 0 through 1000"
-            ));
-        }
-        sr.set_legacy_escape_timeout_ms(milliseconds);
-        return Ok(());
-    }
-    if option == "speech.paragraph_pause_ms" {
-        let Integer(value) = value else {
-            return Err(anyhow!(
-                "set option: speech.paragraph_pause_ms: value must be a non-negative integer"
-            ));
-        };
-        let milliseconds = u64::try_from(value).map_err(|_| {
-            anyhow!("set option: speech.paragraph_pause_ms: value must be a non-negative integer")
-        })?;
-        return sr
-            .speech_mut()
-            .set_paragraph_pause_ms(milliseconds)
-            .map_err(anyhow::Error::new)
-            .context("set option: speech.paragraph_pause_ms");
-    }
-    if option == "speech.rate" {
-        let rate = match value {
-            Number(value) => value as f32,
-            Integer(value) => value as f32,
-            _ => return Err(anyhow!("set option: speech.rate: value must be a number")),
-        };
-        return sr
-            .speech_mut()
-            .set_rate_option(rate)
-            .and_then(|outcome| match outcome {
-                SetOptionOutcome::Accepted => Ok(()),
-                SetOptionOutcome::Unsupported => Err(crate::speech::Error::Driver(anyhow!(
-                    "lector.o.speech.rate is unavailable: speech host does not support setting rate"
-                ))),
-            })
-            .map_err(anyhow::Error::new)
-            .context("set option: speech.rate");
-    }
-    if option == "speech.pitch" {
-        let pitch = match value {
-            Number(value) => value as f32,
-            Integer(value) => value as f32,
-            _ => return Err(anyhow!("set option: speech.pitch: value must be a number")),
-        };
-        return sr
-            .speech_mut()
-            .set_pitch_option(pitch)
-            .and_then(|outcome| match outcome {
-                SetOptionOutcome::Accepted => Ok(()),
-                SetOptionOutcome::Unsupported => Err(crate::speech::Error::Driver(anyhow!(
-                    "lector.o.speech.pitch is unavailable: speech host does not support setting pitch"
-                ))),
-            })
-            .map_err(anyhow::Error::new)
-            .context("set option: speech.pitch");
-    }
-    if option == "speech.volume" {
-        let volume = match value {
-            Number(value) => value as f32,
-            Integer(value) => value as f32,
-            _ => return Err(anyhow!("set option: speech.volume: value must be a number")),
-        };
-        return sr
-            .speech_mut()
-            .set_volume_option(volume)
-            .and_then(|outcome| match outcome {
-                SetOptionOutcome::Accepted => Ok(()),
-                SetOptionOutcome::Unsupported => Err(crate::speech::Error::Driver(anyhow!(
-                    "lector.o.speech.volume is unavailable: speech host does not support setting volume"
-                ))),
-            })
-            .map_err(anyhow::Error::new)
-            .context("set option: speech.volume");
-    }
-    if option == "speech.voice" {
-        let String(value) = value else {
-            return Err(anyhow!("set option: speech.voice: value must be a string"));
-        };
-        let voice_id = lua_utf8(&value, "speech voice ID")?;
-        return sr
-            .speech_mut()
-            .set_voice_option(&voice_id)
-            .and_then(|outcome| match outcome {
-                SetOptionOutcome::Accepted => Ok(()),
-                SetOptionOutcome::Unsupported => Err(crate::speech::Error::Driver(anyhow!(
-                    "lector.o.speech.voice is unavailable: speech host does not support selecting a voice"
-                ))),
-            })
-            .map_err(anyhow::Error::new)
-            .context("set option: speech.voice");
-    }
-    (match option {
-        "symbol_level" => match value {
-            String(v) => {
-                let level = v
-                    .to_str()
-                    .map_err(|e| anyhow!("{}", e))?
-                    .parse::<symbols::Level>()?;
-                sr.speech_mut().set_symbol_level(level);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a string")),
-        },
-        "help_mode" => match value {
-            Boolean(v) => {
-                sr.set_help_mode(v);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a boolean")),
-        },
-        "auto_read" => match value {
-            Boolean(v) => {
-                sr.set_auto_read_enabled(v);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a boolean")),
-        },
-        "suppress_key_echo" => match value {
-            Boolean(v) => {
-                sr.set_suppress_key_echo(v);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a boolean")),
-        },
-        "report_indentation" => match value {
-            Boolean(v) => {
-                sr.set_indentation_reporting_enabled(v);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a boolean")),
-        },
-        "review_follows_screen_cursor" | "rev_follows" => match value {
-            Boolean(v) => {
-                sr.set_review_follows_screen_cursor(v);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a boolean")),
-        },
-        "highlight_tracking" => match value {
-            Boolean(v) => {
-                sr.set_highlight_tracking_enabled(v);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a boolean")),
-        },
-        "stop_speech_on_focus_loss" => match value {
-            Boolean(v) => {
-                sr.set_stop_speech_on_focus_loss(v);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a boolean")),
-        },
-        "tmux_bells" => match value {
-            String(v) => {
-                let mode = v
-                    .to_str()
-                    .map_err(|e| anyhow!(e.to_string()))?
-                    .parse::<crate::screen_reader::TmuxBellMode>()?;
-                sr.set_tmux_bell_mode(mode);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a string")),
-        },
-        "clipboard.default_register" => match value {
-            String(v) => {
-                let register = v
-                    .to_str()
-                    .map_err(|e| anyhow!(e.to_string()))?
-                    .parse::<ClipboardRegister>()?;
-                sr.set_clipboard_default_register(register);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a string")),
-        },
-        "clipboard.system_provider" => match value {
-            String(v) => {
-                let provider = v
-                    .to_str()
-                    .map_err(|e| anyhow!(e.to_string()))?
-                    .parse::<SystemClipboardProvider>()?;
-                sr.set_system_clipboard_provider(provider);
-                Ok(())
-            }
-            _ => Err(anyhow!("value must be a string")),
-        },
-        _ => Err(anyhow!("unknown option")),
-    })
-    .map_err(|e| anyhow!("set option: {}: {:?}", option, e))
-}
-
-fn voice_info_to_lua(lua: &Lua, voice: &VoiceInfo) -> mlua::Result<Table> {
+pub(super) fn voice_info_to_lua(lua: &Lua, voice: &VoiceInfo) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set("id", voice.id.as_str())?;
     table.set("name", voice.name.as_str())?;
@@ -716,7 +439,7 @@ fn parse_speech_server_args(table: Table) -> anyhow::Result<Vec<String>> {
     Ok(args)
 }
 
-fn lua_utf8(value: &mlua::LuaString, field: &str) -> anyhow::Result<String> {
+pub(super) fn lua_utf8(value: &mlua::LuaString, field: &str) -> anyhow::Result<String> {
     value
         .to_str()
         .map(|value| value.to_string())
