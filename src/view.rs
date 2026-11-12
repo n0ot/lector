@@ -53,6 +53,180 @@ struct AccessibilityJournalEntry {
     retained_bytes: usize,
 }
 
+impl AccessibilityJournalEntry {
+    fn retained_bytes(update: &UpdateSummary) -> usize {
+        let linear_output_bytes = match &update.linear_output_effect {
+            crate::terminal::LinearOutputEffect::Append(report)
+            | crate::terminal::LinearOutputEffect::Replace(report) => report
+                .printed_runs
+                .len()
+                .saturating_mul(std::mem::size_of::<crate::terminal::PrintedRun>())
+                .saturating_add(report.printed_runs.iter().map(|run| run.text.len()).sum()),
+            crate::terminal::LinearOutputEffect::Preserve
+            | crate::terminal::LinearOutputEffect::Clear => 0,
+        };
+        std::mem::size_of::<AccessibilityJournalEntry>()
+            .saturating_add(
+                update
+                    .printed_runs
+                    .len()
+                    .saturating_mul(std::mem::size_of::<crate::terminal::PrintedRun>()),
+            )
+            .saturating_add(
+                update
+                    .printed_runs
+                    .iter()
+                    .map(|run| run.text.len())
+                    .sum::<usize>(),
+            )
+            .saturating_add(linear_output_bytes)
+            .saturating_add(if update.cell_writes.spilled() {
+                update
+                    .cell_writes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<crate::terminal::TerminalCellWrite>())
+            } else {
+                // Inline spans are already included in the journal entry's
+                // fixed size above; count only additional heap-owned spans.
+                0
+            })
+            .saturating_add(
+                update
+                    .changed_rows
+                    .len()
+                    .saturating_mul(std::mem::size_of::<std::ops::RangeInclusive<u16>>()),
+            )
+    }
+}
+
+/// Exact parser evidence retained until physical receipt publication. Storage
+/// eviction and ownership handoff leave a gap until a finalized snapshot covers
+/// the discarded revisions; clearing entries alone must not erase that history.
+struct AccessibilityJournal {
+    entries: VecDeque<AccessibilityJournalEntry>,
+    retained_bytes: usize,
+    gap_start: Option<ViewRevision>,
+    discarded_through: ViewRevision,
+}
+
+impl Default for AccessibilityJournal {
+    fn default() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            retained_bytes: 0,
+            gap_start: None,
+            discarded_through: ViewRevision(0),
+        }
+    }
+}
+
+impl AccessibilityJournal {
+    fn insert(
+        &mut self,
+        epoch: AccessibilityEpoch,
+        revision: ViewRevision,
+        update: UpdateSummary,
+        requires_snapshot_diff: bool,
+    ) {
+        let retained_bytes = AccessibilityJournalEntry::retained_bytes(&update);
+        if retained_bytes > ACCESSIBILITY_JOURNAL_MAX_BYTES {
+            // A later parser report is incomplete until a finalized snapshot
+            // covers this missing record, even if older entries remain stored.
+            self.note_gap(revision);
+            return;
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.entries.push_back(AccessibilityJournalEntry {
+            epoch,
+            revision,
+            update,
+            requires_snapshot_diff,
+            retained_bytes,
+        });
+        while self.entries.len() > ACCESSIBILITY_JOURNAL_MAX_ENTRIES
+            || self.retained_bytes > ACCESSIBILITY_JOURNAL_MAX_BYTES
+        {
+            let Some(discarded) = self.pop_front() else {
+                break;
+            };
+            self.note_gap(discarded.revision);
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<AccessibilityJournalEntry> {
+        let entry = self.entries.pop_front()?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(entry.retained_bytes);
+        Some(entry)
+    }
+
+    fn pop_through(&mut self, revision: ViewRevision) -> Option<AccessibilityJournalEntry> {
+        if self
+            .entries
+            .front()
+            .is_some_and(|entry| entry.revision <= revision)
+        {
+            self.pop_front()
+        } else {
+            None
+        }
+    }
+
+    /// Consume only entries covered by the receipt, returning facts from its
+    /// exact epoch and exclusive lower revision bound. Future entries stay put.
+    fn pop_matching_through(
+        &mut self,
+        epoch: AccessibilityEpoch,
+        after: ViewRevision,
+        through: ViewRevision,
+    ) -> Option<AccessibilityJournalEntry> {
+        while let Some(entry) = self.pop_through(through) {
+            if entry.epoch == epoch && entry.revision > after {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    fn note_gap(&mut self, revision: ViewRevision) {
+        self.gap_start = Some(self.gap_start.map_or(revision, |start| start.min(revision)));
+        // The high-water mark remains monotonic even after a baseline closes
+        // the current gap. Later missing evidence opens a fresh gap_start.
+        self.discarded_through = self.discarded_through.max(revision);
+    }
+
+    fn has_gap(&self, after: ViewRevision, through: ViewRevision) -> bool {
+        self.gap_start
+            .is_some_and(|start| start <= through && self.discarded_through > after)
+    }
+
+    /// A finalized snapshot retires both entries and the covered portion of
+    /// a missing-evidence gap; receipt publication alone does not close a gap.
+    fn discard_through(&mut self, revision: ViewRevision) {
+        while self.pop_through(revision).is_some() {}
+        if let Some(gap_start) = self.gap_start
+            && revision >= gap_start
+        {
+            if revision >= self.discarded_through {
+                self.gap_start = None;
+            } else {
+                self.gap_start = Some(ViewRevision(revision.0.saturating_add(1)));
+            }
+        }
+    }
+
+    /// Drop storage on ownership handoff, preserving missing-evidence
+    /// provenance until a finalized snapshot covers the old live revisions.
+    /// Epoch advancement and receipt publication remain the View's decisions.
+    fn reset_for_handoff(&mut self, live: ViewRevision, finalized: ViewRevision) {
+        if live > finalized {
+            self.note_gap(ViewRevision(finalized.0.saturating_add(1)));
+            self.discarded_through = self.discarded_through.max(live);
+        }
+        self.entries.clear();
+        self.retained_bytes = 0;
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CompletedLinearRecordCache {
     epoch: AccessibilityEpoch,
@@ -393,10 +567,7 @@ pub struct View {
     pending_application_speech: VecDeque<PendingApplicationSpeech>,
     pending_application_speech_bytes: usize,
     internal_accessibility: bool,
-    accessibility_journal: VecDeque<AccessibilityJournalEntry>,
-    accessibility_journal_bytes: usize,
-    accessibility_journal_gap_start: Option<ViewRevision>,
-    accessibility_journal_discarded_through: ViewRevision,
+    accessibility_journal: AccessibilityJournal,
     completed_linear_record_cache: Option<CompletedLinearRecordCache>,
     completed_linear_record_report: String,
     completed_linear_record_presented: String,
@@ -491,10 +662,7 @@ impl View {
             pending_application_speech: VecDeque::new(),
             pending_application_speech_bytes: 0,
             internal_accessibility: false,
-            accessibility_journal: VecDeque::new(),
-            accessibility_journal_bytes: 0,
-            accessibility_journal_gap_start: None,
-            accessibility_journal_discarded_through: ViewRevision(0),
+            accessibility_journal: AccessibilityJournal::default(),
             completed_linear_record_cache: None,
             completed_linear_record_report: String::new(),
             completed_linear_record_presented: String::new(),
@@ -766,7 +934,7 @@ impl View {
                 // parser facts. Mark the hole so a later receipt can use the
                 // exact snapshot but cannot mistake surrounding facts for a
                 // complete summary.
-                self.note_accessibility_evidence_gap(self.live_revision);
+                self.accessibility_journal.note_gap(self.live_revision);
             }
         }
         // A repaint is not itself a cursor move. Full-screen applications
@@ -968,7 +1136,8 @@ impl View {
             self.presented_accessibility_evidence_revision = self.presented_revision;
             self.presented_accessibility_evidence_exact = true;
             self.presented_accessibility_requires_snapshot_diff = false;
-            self.discard_accessibility_journal_through(self.presented_revision);
+            self.accessibility_journal
+                .discard_through(self.presented_revision);
         }
         self.review_cursor_follow_pending = !frozen && self.review_cursor_screen_transition_pending;
         self.text_caches.finalize();
@@ -1505,15 +1674,9 @@ impl View {
     }
 
     fn reset_accessibility_journal_for_handoff(&mut self) {
-        if self.live_revision > self.finalized_presented_revision {
-            self.note_accessibility_evidence_gap(ViewRevision(
-                self.finalized_presented_revision.0.saturating_add(1),
-            ));
-            self.accessibility_journal_discarded_through = self.live_revision;
-        }
+        self.accessibility_journal
+            .reset_for_handoff(self.live_revision, self.finalized_presented_revision);
         self.completed_linear_record_cache = None;
-        self.accessibility_journal.clear();
-        self.accessibility_journal_bytes = 0;
         self.begin_accessibility_epoch();
         self.accessibility_epoch_floor_generation = self.live_accessibility_epoch.generation;
         self.presented_accessibility_epoch = self.live_accessibility_epoch;
@@ -1527,46 +1690,12 @@ impl View {
         update: UpdateSummary,
         requires_snapshot_diff: bool,
     ) {
-        let retained_bytes = accessibility_evidence_retained_bytes(&update);
-        if retained_bytes > ACCESSIBILITY_JOURNAL_MAX_BYTES {
-            // The snapshot remains exact, but no later parser report can be
-            // considered complete until a receipt through this missing record
-            // becomes the finalized diff baseline.
-            self.note_accessibility_evidence_gap(self.live_revision);
-            return;
-        }
-
-        self.accessibility_journal_bytes = self
-            .accessibility_journal_bytes
-            .saturating_add(retained_bytes);
-        self.accessibility_journal
-            .push_back(AccessibilityJournalEntry {
-                epoch: self.live_accessibility_epoch,
-                revision: self.live_revision,
-                update,
-                requires_snapshot_diff,
-                retained_bytes,
-            });
-        while self.accessibility_journal.len() > ACCESSIBILITY_JOURNAL_MAX_ENTRIES
-            || self.accessibility_journal_bytes > ACCESSIBILITY_JOURNAL_MAX_BYTES
-        {
-            let Some(discarded) = self.accessibility_journal.pop_front() else {
-                break;
-            };
-            self.accessibility_journal_bytes = self
-                .accessibility_journal_bytes
-                .saturating_sub(discarded.retained_bytes);
-            self.note_accessibility_evidence_gap(discarded.revision);
-        }
-    }
-
-    fn note_accessibility_evidence_gap(&mut self, revision: ViewRevision) {
-        self.accessibility_journal_gap_start = Some(
-            self.accessibility_journal_gap_start
-                .map_or(revision, |start| start.min(revision)),
+        self.accessibility_journal.insert(
+            self.live_accessibility_epoch,
+            self.live_revision,
+            update,
+            requires_snapshot_diff,
         );
-        self.accessibility_journal_discarded_through =
-            self.accessibility_journal_discarded_through.max(revision);
     }
 
     fn publish_accessibility_evidence(
@@ -1603,31 +1732,17 @@ impl View {
             self.presented_accessibility_evidence_revision = revision;
             return;
         }
-        let discarded_in_required_range =
-            self.accessibility_journal_gap_start.is_some_and(|start| {
-                start <= revision && self.accessibility_journal_discarded_through > required_after
-            });
-        self.presented_accessibility_evidence_exact &= !discarded_in_required_range;
+        self.presented_accessibility_evidence_exact &=
+            !self.accessibility_journal.has_gap(required_after, revision);
         if !self.presented_accessibility_evidence_exact {
             self.presented_update = snapshot_diff_provenance(&self.presented_update);
             self.advance_accessibility_update_generation();
         }
 
-        while self
-            .accessibility_journal
-            .front()
-            .is_some_and(|entry| entry.revision <= revision)
+        while let Some(entry) =
+            self.accessibility_journal
+                .pop_matching_through(epoch, required_after, revision)
         {
-            let entry = self
-                .accessibility_journal
-                .pop_front()
-                .expect("journal front was checked");
-            self.accessibility_journal_bytes = self
-                .accessibility_journal_bytes
-                .saturating_sub(entry.retained_bytes);
-            if entry.epoch != epoch || entry.revision <= required_after {
-                continue;
-            }
             self.presented_accessibility_requires_snapshot_diff |= entry.requires_snapshot_diff;
             if self.presented_accessibility_evidence_exact
                 && !self.presented_accessibility_requires_snapshot_diff
@@ -1643,32 +1758,6 @@ impl View {
             }
         }
         self.presented_accessibility_evidence_revision = revision;
-    }
-
-    fn discard_accessibility_journal_through(&mut self, revision: ViewRevision) {
-        while self
-            .accessibility_journal
-            .front()
-            .is_some_and(|entry| entry.revision <= revision)
-        {
-            let entry = self
-                .accessibility_journal
-                .pop_front()
-                .expect("journal front was checked");
-            self.accessibility_journal_bytes = self
-                .accessibility_journal_bytes
-                .saturating_sub(entry.retained_bytes);
-        }
-        if let Some(gap_start) = self.accessibility_journal_gap_start
-            && revision >= gap_start
-        {
-            if revision >= self.accessibility_journal_discarded_through {
-                self.accessibility_journal_gap_start = None;
-            } else {
-                self.accessibility_journal_gap_start =
-                    Some(ViewRevision(revision.0.saturating_add(1)));
-            }
-        }
     }
 
     fn live_snapshot_with_history(&mut self) -> TerminalSnapshot {
@@ -3393,50 +3482,6 @@ fn snapshot_diff_provenance(update: &UpdateSummary) -> UpdateSummary {
     }
 }
 
-fn accessibility_evidence_retained_bytes(update: &UpdateSummary) -> usize {
-    let linear_output_bytes = match &update.linear_output_effect {
-        crate::terminal::LinearOutputEffect::Append(report)
-        | crate::terminal::LinearOutputEffect::Replace(report) => report
-            .printed_runs
-            .len()
-            .saturating_mul(std::mem::size_of::<crate::terminal::PrintedRun>())
-            .saturating_add(report.printed_runs.iter().map(|run| run.text.len()).sum()),
-        crate::terminal::LinearOutputEffect::Preserve
-        | crate::terminal::LinearOutputEffect::Clear => 0,
-    };
-    std::mem::size_of::<AccessibilityJournalEntry>()
-        .saturating_add(
-            update
-                .printed_runs
-                .len()
-                .saturating_mul(std::mem::size_of::<crate::terminal::PrintedRun>()),
-        )
-        .saturating_add(
-            update
-                .printed_runs
-                .iter()
-                .map(|run| run.text.len())
-                .sum::<usize>(),
-        )
-        .saturating_add(linear_output_bytes)
-        .saturating_add(if update.cell_writes.spilled() {
-            update
-                .cell_writes
-                .capacity()
-                .saturating_mul(std::mem::size_of::<crate::terminal::TerminalCellWrite>())
-        } else {
-            // Inline spans are already included in the journal entry's
-            // fixed size above; count only additional heap-owned spans.
-            0
-        })
-        .saturating_add(
-            update
-                .changed_rows
-                .len()
-                .saturating_mul(std::mem::size_of::<std::ops::RangeInclusive<u16>>()),
-        )
-}
-
 fn history_window_end(snapshot: &TerminalSnapshot) -> usize {
     snapshot
         .history_origin
@@ -3648,7 +3693,7 @@ mod tests {
     fn cell_write_retained_bytes_count_inline_storage_once_and_spilled_capacity() {
         use crate::terminal::{TerminalCellWrite, UpdateSummary};
         let mut update = UpdateSummary::default();
-        let fixed = super::accessibility_evidence_retained_bytes(&update);
+        let fixed = super::AccessibilityJournalEntry::retained_bytes(&update);
         let write = |col| TerminalCellWrite {
             row: 0,
             col,
@@ -3656,16 +3701,19 @@ mod tests {
             revision: 1,
         };
         update.cell_writes.push(write(0));
-        assert_eq!(super::accessibility_evidence_retained_bytes(&update), fixed);
+        assert_eq!(
+            super::AccessibilityJournalEntry::retained_bytes(&update),
+            fixed
+        );
         update.cell_writes.push(write(2));
         update.cell_writes.reserve(8);
         assert_eq!(
-            super::accessibility_evidence_retained_bytes(&update),
+            super::AccessibilityJournalEntry::retained_bytes(&update),
             fixed + update.cell_writes.capacity() * std::mem::size_of::<TerminalCellWrite>(),
         );
         // Clearing logical evidence must not hide a retained heap allocation.
         update.cell_writes.clear();
-        assert!(super::accessibility_evidence_retained_bytes(&update) > fixed);
+        assert!(super::AccessibilityJournalEntry::retained_bytes(&update) > fixed);
     }
 
     use super::{
@@ -4300,6 +4348,171 @@ mod tests {
     }
 
     #[test]
+    fn journal_lookup_matches_exact_epoch_and_keeps_future_receipts() {
+        use super::{AccessibilityEpoch, AccessibilityJournal, ViewRevision};
+        use crate::terminal::UpdateSummary;
+
+        let epoch = AccessibilityEpoch {
+            generation: 1,
+            start_revision: ViewRevision(0),
+        };
+        let different_start = AccessibilityEpoch {
+            start_revision: ViewRevision(1),
+            ..epoch
+        };
+        let different_generation = AccessibilityEpoch {
+            generation: 2,
+            ..epoch
+        };
+        let mut journal = AccessibilityJournal::default();
+        for (revision, context) in [
+            (1, epoch),
+            (2, different_start),
+            (3, epoch),
+            (4, different_generation),
+            (5, epoch),
+        ] {
+            journal.insert(
+                context,
+                ViewRevision(revision),
+                UpdateSummary::default(),
+                revision == 3,
+            );
+        }
+        let one_entry = journal.entries.back().unwrap().retained_bytes;
+        let found = journal
+            .pop_matching_through(epoch, ViewRevision(1), ViewRevision(4))
+            .unwrap();
+        assert_eq!(found.revision, ViewRevision(3));
+        assert!(found.requires_snapshot_diff);
+        assert!(
+            journal
+                .pop_matching_through(epoch, ViewRevision(1), ViewRevision(4))
+                .is_none()
+        );
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(journal.entries.front().unwrap().revision, ViewRevision(5));
+        assert_eq!(journal.retained_bytes, one_entry);
+        assert!(!journal.has_gap(ViewRevision(0), ViewRevision(5)));
+    }
+
+    #[test]
+    fn journal_byte_overflow_and_partial_pruning_preserve_gap_accounting() {
+        use super::{
+            ACCESSIBILITY_JOURNAL_MAX_BYTES, AccessibilityEpoch, AccessibilityJournal, ViewRevision,
+        };
+        use crate::terminal::{PrintedRun, UpdateSummary};
+
+        let epoch = AccessibilityEpoch {
+            generation: 1,
+            start_revision: ViewRevision(0),
+        };
+        let update = |bytes| UpdateSummary {
+            printed_runs: vec![PrintedRun {
+                text: "x".repeat(bytes),
+                ..PrintedRun::default()
+            }],
+            ..UpdateSummary::default()
+        };
+        let mut journal = AccessibilityJournal::default();
+        for revision in 1..=2 {
+            journal.insert(
+                epoch,
+                ViewRevision(revision),
+                update(ACCESSIBILITY_JOURNAL_MAX_BYTES * 3 / 4),
+                false,
+            );
+        }
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(journal.entries.front().unwrap().revision, ViewRevision(2));
+        assert!(journal.retained_bytes <= ACCESSIBILITY_JOURNAL_MAX_BYTES);
+        assert_eq!(journal.gap_start, Some(ViewRevision(1)));
+
+        // An oversized missing revision must not discard the older stored row.
+        journal.insert(
+            epoch,
+            ViewRevision(3),
+            update(ACCESSIBILITY_JOURNAL_MAX_BYTES),
+            false,
+        );
+        journal.insert(epoch, ViewRevision(4), UpdateSummary::default(), false);
+        assert_eq!(journal.entries.len(), 2);
+        let last_bytes = journal.entries.back().unwrap().retained_bytes;
+        assert_eq!(
+            journal.retained_bytes,
+            journal
+                .entries
+                .iter()
+                .map(|entry| entry.retained_bytes)
+                .sum::<usize>()
+        );
+        assert_eq!(journal.discarded_through, ViewRevision(3));
+        journal.discard_through(ViewRevision(1));
+        assert_eq!(journal.gap_start, Some(ViewRevision(2)));
+        assert_eq!(
+            journal
+                .pop_matching_through(epoch, ViewRevision(1), ViewRevision(2))
+                .unwrap()
+                .revision,
+            ViewRevision(2)
+        );
+        assert_eq!(journal.retained_bytes, last_bytes);
+        assert!(journal.has_gap(ViewRevision(1), ViewRevision(3)));
+        journal.discard_through(ViewRevision(2));
+        assert_eq!(journal.gap_start, Some(ViewRevision(3)));
+        journal.discard_through(ViewRevision(3));
+        assert_eq!(journal.gap_start, None);
+        assert!(!journal.has_gap(ViewRevision(0), ViewRevision(4)));
+        assert_eq!(journal.entries.len(), 1);
+        journal.discard_through(ViewRevision(4));
+        assert_eq!(journal.retained_bytes, 0);
+        assert_eq!(journal.discarded_through, ViewRevision(3));
+    }
+
+    #[test]
+    fn journal_handoff_clears_storage_without_finalizing_missing_evidence() {
+        use super::{AccessibilityEpoch, AccessibilityJournal, ViewRevision};
+        use crate::terminal::UpdateSummary;
+
+        let epoch = AccessibilityEpoch {
+            generation: 1,
+            start_revision: ViewRevision(0),
+        };
+        let mut journal = AccessibilityJournal::default();
+        for revision in 1..=3 {
+            journal.insert(
+                epoch,
+                ViewRevision(revision),
+                UpdateSummary::default(),
+                false,
+            );
+        }
+        journal.reset_for_handoff(ViewRevision(3), ViewRevision(1));
+        assert!(journal.entries.is_empty());
+        assert_eq!(journal.retained_bytes, 0);
+        assert_eq!(journal.gap_start, Some(ViewRevision(2)));
+        assert_eq!(journal.discarded_through, ViewRevision(3));
+        assert!(journal.has_gap(ViewRevision(1), ViewRevision(3)));
+        assert!(!journal.has_gap(ViewRevision(3), ViewRevision(3)));
+        journal.reset_for_handoff(ViewRevision(3), ViewRevision(3));
+        assert_eq!(journal.gap_start, Some(ViewRevision(2)));
+        journal.discard_through(ViewRevision(3));
+        assert_eq!(journal.gap_start, None);
+        assert_eq!(journal.discarded_through, ViewRevision(3));
+
+        let next_epoch = AccessibilityEpoch {
+            generation: 2,
+            start_revision: ViewRevision(3),
+        };
+        journal.insert(next_epoch, ViewRevision(4), UpdateSummary::default(), false);
+        journal.reset_for_handoff(ViewRevision(4), ViewRevision(3));
+        assert!(journal.entries.is_empty());
+        assert_eq!(journal.retained_bytes, 0);
+        assert_eq!(journal.gap_start, Some(ViewRevision(4)));
+        assert_eq!(journal.discarded_through, ViewRevision(4));
+    }
+
+    #[test]
     fn accessibility_journal_is_bounded_and_falls_back_after_eviction() {
         let mut view = View::new(2, 40);
         view.enable_presentation_tracking();
@@ -4309,8 +4522,12 @@ mod tests {
         }
         let newest = view.capture_live_presentation_frame(SurfaceId(1));
 
-        assert!(view.accessibility_journal.len() <= super::ACCESSIBILITY_JOURNAL_MAX_ENTRIES);
-        assert!(view.accessibility_journal_bytes <= super::ACCESSIBILITY_JOURNAL_MAX_BYTES);
+        assert!(
+            view.accessibility_journal.entries.len() <= super::ACCESSIBILITY_JOURNAL_MAX_ENTRIES
+        );
+        assert!(
+            view.accessibility_journal.retained_bytes <= super::ACCESSIBILITY_JOURNAL_MAX_BYTES
+        );
         assert!(view.apply_presented_frame(newest));
         assert!(view.accessibility_update_summary().batch_count > 0);
         assert!(view.accessibility_update_summary().printed_runs.is_empty());
@@ -4343,9 +4560,13 @@ mod tests {
         }
 
         assert!(view.accessibility_awaiting_presentation());
-        assert!(view.accessibility_journal.len() <= super::ACCESSIBILITY_JOURNAL_MAX_ENTRIES);
-        assert!(view.accessibility_journal_bytes <= super::ACCESSIBILITY_JOURNAL_MAX_BYTES);
-        assert!(view.accessibility_journal_gap_start.is_some());
+        assert!(
+            view.accessibility_journal.entries.len() <= super::ACCESSIBILITY_JOURNAL_MAX_ENTRIES
+        );
+        assert!(
+            view.accessibility_journal.retained_bytes <= super::ACCESSIBILITY_JOURNAL_MAX_BYTES
+        );
+        assert!(view.accessibility_journal.gap_start.is_some());
 
         let legacy = view.update_summary();
         assert_eq!(legacy.batch_count, 0);
