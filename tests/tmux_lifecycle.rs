@@ -465,6 +465,47 @@ fn applied_pane_exit_during_inventory_cannot_be_overwritten_by_the_old_snapshot(
 }
 
 #[test]
+fn surviving_pane_output_is_applied_while_an_invalidated_inventory_drains() {
+    let (mut app, mut sr, _recorder, mut physical) = ready_app(multi_inventory());
+    app.handle_pty(&mut sr, b"%sessions-changed\n", &mut physical)
+        .unwrap();
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+
+    for (index, group) in multi_inventory().iter().enumerate() {
+        if index == 4 {
+            // Removal and fresh output must both survive the older inventory.
+            // The output event does not consume an expected command reply.
+            app.handle_pty(
+                &mut sr,
+                b"%pane-exited %23\n%output %20 FIRST\n",
+                &mut physical,
+            )
+            .unwrap();
+        }
+        app.handle_pty(&mut sr, &reply(500 + index, group, true), &mut physical)
+            .unwrap();
+    }
+    assert!(app.debug_tmux_pane_contents(1, 23).is_none());
+    assert!(
+        app.debug_tmux_pane_contents(1, 20)
+            .unwrap()
+            .contains("FIRST")
+    );
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+    app.handle_pty(&mut sr, b"%output %20 LAST\n", &mut physical)
+        .unwrap();
+    let contents = app.debug_tmux_pane_contents(1, 20).unwrap();
+    assert!(contents.contains("FIRST"));
+    assert!(contents.contains("LAST"));
+}
+
+#[test]
 fn failed_create_is_reviewable_and_portal_never_mirrors_live_child_output() {
     let (mut app, mut sr, _recorder, mut physical) = ready_app(multi_inventory());
     input(&mut app, &mut sr, &mut physical, b"\x01c");

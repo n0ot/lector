@@ -65,88 +65,6 @@ impl App {
         self.render_tmux_batched_updates(term_out, bell_count, batch.pane_updates())
     }
 
-    fn mark_tmux_pane_capture_required(flow: &mut TmuxPaneFlowState) {
-        flow.status = TmuxFlowStatus::Resynchronizing;
-        flow.final_resync_requested = false;
-        flow.resync_after_ms = None;
-        flow.recapture_hard_deadline_ms = None;
-        flow.limitations.extend([
-            TmuxResyncLimitation::KittyImages,
-            TmuxResyncLimitation::SemanticMetadata,
-        ]);
-    }
-
-    /// Coalesces output which races an authoritative capture without waiting
-    /// forever for a continuously active pane to become quiet. The first
-    /// raced byte starts a hard deadline; later bytes may move the soft quiet
-    /// deadline only up to that fixed boundary.
-    fn schedule_tmux_pane_recapture(flow: &mut TmuxPaneFlowState, now_ms: u128) {
-        if flow.final_resync_requested {
-            return;
-        }
-        let hard_deadline = *flow
-            .recapture_hard_deadline_ms
-            .get_or_insert_with(|| now_ms.saturating_add(TMUX_RECOVERY_HARD_DEADLINE_MS));
-        flow.resync_after_ms = Some(
-            now_ms
-                .saturating_add(TMUX_RECOVERY_QUIET_MS)
-                .min(hard_deadline),
-        );
-    }
-
-    fn tmux_flow_retry_delay_ms(consecutive_failures: u32) -> u128 {
-        let exponent = consecutive_failures.saturating_sub(1).min(5);
-        TMUX_FLOW_RETRY_BASE_MS
-            .saturating_mul(1_u128 << exponent)
-            .min(TMUX_FLOW_RETRY_MAX_MS)
-    }
-
-    fn tmux_capture_line_flags_unsupported(
-        status: crate::tmux_control::CommandStatus,
-        output: &[Vec<u8>],
-    ) -> bool {
-        status == crate::tmux_control::CommandStatus::Error
-            && output.iter().any(|line| {
-                line.windows(b"unknown flag".len())
-                    .any(|window| window == b"unknown flag")
-                    && line.windows(b"-F".len()).any(|window| window == b"-F")
-            })
-    }
-
-    fn complete_tmux_pane_resync(flow: &mut TmuxPaneFlowState) {
-        flow.status = TmuxFlowStatus::Running;
-        flow.is_paused = false;
-        flow.pause_requested = false;
-        flow.resume_requested = false;
-        flow.resync_requested = false;
-        flow.resync_in_flight = false;
-        flow.final_resync_requested = false;
-        flow.resync_after_ms = None;
-        flow.recapture_hard_deadline_ms = None;
-        flow.resync_count = flow.resync_count.saturating_add(1);
-        flow.consecutive_resync_failures = 0;
-        flow.resync_failure_announced = false;
-    }
-
-    fn tmux_pane_is_presented(
-        connection: &TmuxConnectionState,
-        connection_is_presented: bool,
-        active_gateway_path: &[(u64, crate::tmux_model::PaneId)],
-        pane_id: crate::tmux_model::PaneId,
-    ) -> bool {
-        let attached_window = connection
-            .topology
-            .attached_session()
-            .and_then(|session_id| connection.topology.session(session_id))
-            .and_then(|session| session.active_window);
-        (connection_is_presented
-            && connection
-                .topology
-                .pane(pane_id)
-                .is_some_and(|pane| Some(pane.window_id) == attached_window))
-            || active_gateway_path.contains(&(connection.id, pane_id))
-    }
-
     pub fn flush_application_replies(&mut self, pty_out: &mut dyn Write) -> Result<()> {
         // The child can run before the outer terminal answers Lector's
         // startup probes. Hold its generated replies only while the bounded
@@ -665,695 +583,109 @@ impl App {
             .view_stack
             .presented_tmux_connection_mut()
             .is_some_and(|view| view.connection_id() == connection_id && !view.is_showing_portal());
-        let mut request_resync = false;
-        let mut sync_topology = false;
-        let mut render_topology = false;
-        let mut bootstrap_reply = None;
-        let mut bootstrap_retry = None;
-        let mut pane_resync_probe = None;
-        let mut pane_resync_success = None;
-        let mut pane_resync_failure = None;
-        let mut pane_resync_raced = None;
-        let mut pane_resync_request = None;
-        let mut pane_resume_request = None;
+        let Some(connection) = self
+            .tmux_connections
+            .iter_mut()
+            .find(|connection| connection.id == connection_id)
+        else {
+            return Ok(());
+        };
+        let Some(step) = connection.step_control(
+            event,
+            now_ms,
+            connection_is_presented,
+            &active_gateway_path,
+        )?
+        else {
+            return Ok(());
+        };
+        let TmuxControlStep {
+            pane_resync_result,
+            carrier_reply,
+            request_resync,
+            sync_topology,
+            mut render_topology,
+            bootstrap_reply,
+            bootstrap_retry,
+            pane_resync_probe,
+            pane_resync_request,
+            pane_resume_request,
+            pane_output,
+            user_command_result,
+            mut notification_popup,
+            inventory_terminal_failure,
+            lost_gateway_carrier,
+            inventory_applied,
+            location_changed,
+            attached_session_changed,
+            destroyed_gateway_panes,
+            destroyed_gateway_windows,
+            native_copy_mode_panes,
+            open_review_for_native_copy_mode,
+        } = step;
+        // Apply order is part of the protocol contract. Keep late render,
+        // announcement and resume decisions mutable through capture application.
+        // See docs/tmux-control-transitions.md for the co-occurrence audit.
         let mut resume_after_pane_resync = None;
-        let mut pane_output = None;
-        let mut user_command_result = None;
-        let mut notification_popup = None;
-        let mut inventory_terminal_failure = None;
-        let mut carrier_lease_create_reply = None;
-        let mut carrier_lease_verify_reply = None;
-        let mut carrier_unlink_reply = None;
-        let mut carrier_session_switch_reply = None;
-        let mut carrier_move_reply = None;
-        let mut carrier_move_verify_reply = None;
-        let mut lost_gateway_carrier = None;
-        let mut inventory_applied = false;
-        let location_changed;
-        let attached_session_changed;
-        let mut destroyed_gateway_panes = Vec::new();
-        let mut destroyed_gateway_windows = Vec::new();
-        let mut native_copy_mode_panes = Vec::new();
-        let mut open_review_for_native_copy_mode = false;
-        {
-            let Some(connection) = self
-                .tmux_connections
-                .iter_mut()
-                .find(|connection| connection.id == connection_id)
-            else {
-                return Ok(());
-            };
-            let had_inventory = connection.has_inventory;
-            let previous_attached_session = connection.topology.attached_session();
-            let previous_location = connection.topology.attached_location();
-            match event {
-                crate::tmux_control::ControlEvent::Command { status, output, .. } => {
-                    if !connection.initial_command_seen {
-                        connection.initial_command_seen = true;
-                        return Ok(());
-                    }
-                    match connection.expected_replies.pop_front() {
-                        Some(ExpectedTmuxReply::Inventory) => {
-                            connection.inventory_replies_remaining =
-                                connection.inventory_replies_remaining.saturating_sub(1);
-                            if status == crate::tmux_control::CommandStatus::Success {
-                                connection.append_inventory(output);
-                            } else {
-                                connection.record_inventory_error(&output);
-                            }
-                            if connection.inventory_replies_remaining == 0 {
-                                connection.inventory_phase = TmuxInventoryPhase::Idle;
-                                let inventory = connection.take_inventory();
-                                let inventory_invalidated =
-                                    std::mem::take(&mut connection.inventory_invalidated);
-                                let previous_panes = connection
-                                    .topology
-                                    .panes()
-                                    .keys()
-                                    .copied()
-                                    .collect::<Vec<_>>();
-                                let previous_windows = connection
-                                    .topology
-                                    .windows()
-                                    .keys()
-                                    .copied()
-                                    .collect::<Vec<_>>();
-                                let inventory_error = if inventory_invalidated {
-                                    None
-                                } else if connection.inventory_failed {
-                                    Some(
-                                        connection.inventory_failure_detail.clone().unwrap_or_else(
-                                            || "tmux inventory transaction failed".to_owned(),
-                                        ),
-                                    )
-                                } else {
-                                    connection
-                                        .topology
-                                        .replace_inventory(&inventory)
-                                        .err()
-                                        .map(|error| error.to_string())
-                                };
-                                if inventory_invalidated {
-                                    // Inventory is a sequence of independent
-                                    // tmux commands. A topology notification
-                                    // between their replies proves this
-                                    // generation may be a mixed snapshot. Drain
-                                    // it, retain the last valid model, and begin
-                                    // a fresh generation after the notification.
-                                    connection.topology.mark_resync_required();
-                                    connection.inventory_retry_count = 0;
-                                    request_resync = true;
-                                } else if let Some(detail) = inventory_error {
-                                    connection.topology.mark_resync_required();
-                                    if connection.inventory_retry_count == 0 {
-                                        connection.inventory_retry_count = 1;
-                                        request_resync = true;
-                                    } else {
-                                        inventory_terminal_failure =
-                                            Some((connection.has_inventory, detail));
-                                    }
-                                } else {
-                                    connection.key_table_override = None;
-                                    let active_pane = connection.topology.attached_active_pane();
-                                    native_copy_mode_panes.extend(
-                                        connection
-                                            .topology
-                                            .panes()
-                                            .values()
-                                            .filter(|pane| pane.mode == "copy-mode")
-                                            .map(|pane| pane.id),
-                                    );
-                                    open_review_for_native_copy_mode = connection_is_presented
-                                        && active_pane.is_some_and(|active| {
-                                            native_copy_mode_panes.contains(&active)
-                                        });
-                                    for pane_id in &native_copy_mode_panes {
-                                        connection.topology.clear_native_copy_mode(*pane_id);
-                                    }
-                                    destroyed_gateway_panes.extend(
-                                        previous_panes.into_iter().filter(|pane_id| {
-                                            connection.topology.pane(*pane_id).is_none()
-                                        }),
-                                    );
-                                    destroyed_gateway_windows.extend(
-                                        previous_windows.into_iter().filter(|window_id| {
-                                            connection.topology.window(*window_id).is_none()
-                                        }),
-                                    );
-                                    connection.has_inventory = true;
-                                    connection.inventory_retry_count = 0;
-                                    inventory_applied = true;
-                                    sync_topology = true;
-                                    render_topology = true;
-                                    if connection.flow_control_verified == Some(false)
-                                        && !connection.flow_control_warning_announced
-                                    {
-                                        connection.flow_control_warning_announced = true;
-                                        notification_popup = Some((
-                                            true,
-                                            "tmux did not retain the pause-after=1 control-client flag; automatic loss-bounded pane recovery is unavailable in this tmux version"
-                                                .to_owned(),
-                                        ));
-                                    }
-                                }
-                                if !request_resync {
-                                    connection.reset_inventory_attempt();
-                                }
-                            }
-                        }
-                        Some(ExpectedTmuxReply::FlowControlPolicy) => {
-                            connection.flow_control_policy_accepted =
-                                Some(status == crate::tmux_control::CommandStatus::Success);
-                        }
-                        Some(ExpectedTmuxReply::FlowControlVerification) => {
-                            let retained = status == crate::tmux_control::CommandStatus::Success
-                                && output.iter().any(|line| {
-                                    line.split(|byte| *byte == b',')
-                                        .any(|flag| flag == b"pause-after=1")
-                                });
-                            connection.flow_control_verified = Some(
-                                connection.flow_control_policy_accepted == Some(true) && retained,
-                            );
-                        }
-                        Some(ExpectedTmuxReply::Bootstrap {
-                            pane_id,
-                            line_flags,
-                        }) => {
-                            if line_flags
-                                && Self::tmux_capture_line_flags_unsupported(status, &output)
-                                && let Some(pane) = connection.topology.pane(pane_id)
-                            {
-                                connection.capture_line_flags_supported = Some(false);
-                                bootstrap_retry = Some((
-                                    pane_id,
-                                    crate::tmux_panes::portable_capture_command(pane),
-                                ));
-                            } else {
-                                if line_flags
-                                    && status == crate::tmux_control::CommandStatus::Success
-                                {
-                                    connection.capture_line_flags_supported = Some(true);
-                                }
-                                bootstrap_reply = Some((pane_id, status, output, line_flags));
-                            }
-                        }
-                        Some(ExpectedTmuxReply::PaneResyncProbe(pane_id)) => {
-                            if let Some(flow) = connection.pane_flow.get_mut(&pane_id) {
-                                flow.resync_in_flight = false;
-                            }
-                            let metadata = (status == crate::tmux_control::CommandStatus::Success
-                                && output.len() == 1)
-                                .then(|| {
-                                    crate::tmux_model::parse_pane_capture_metadata(
-                                        &output[0], pane_id,
-                                    )
-                                    .ok()
-                                })
-                                .flatten();
-                            if let Some(metadata) = metadata {
-                                connection.pending_pane_captures.insert(
-                                    pane_id,
-                                    PendingTmuxPaneCapture {
-                                        metadata: metadata.clone(),
-                                        output: None,
-                                        pending_escape: Vec::new(),
-                                        line_flags: connection.capture_line_flags_supported
-                                            != Some(false),
-                                        parser_continuation_available: false,
-                                        failed: false,
-                                    },
-                                );
-                                pane_resync_probe = Some(metadata);
-                            } else {
-                                connection.pending_pane_captures.remove(&pane_id);
-                                pane_resync_failure = Some(pane_id);
-                            }
-                        }
-                        Some(ExpectedTmuxReply::PaneResyncContinue(pane_id)) => {
-                            let flow = connection.pane_flow.entry(pane_id).or_default();
-                            flow.pause_requested = false;
-                            flow.resume_requested = false;
-                            if status == crate::tmux_control::CommandStatus::Success {
-                                flow.is_paused = false;
-                            } else if let Some(capture) =
-                                connection.pending_pane_captures.get_mut(&pane_id)
-                            {
-                                // The capture commands later in this batch will
-                                // still run. Reject their snapshot: a failed
-                                // continue did not establish a clean boundary
-                                // with subsequent pane output.
-                                capture.failed = true;
-                            }
-                        }
-                        Some(ExpectedTmuxReply::PaneResyncCapture(pane_id)) => {
-                            if let Some(capture) =
-                                connection.pending_pane_captures.get_mut(&pane_id)
-                            {
-                                if status == crate::tmux_control::CommandStatus::Success {
-                                    capture.output = Some(output);
-                                } else {
-                                    capture.failed = true;
-                                }
-                            }
-                        }
-                        Some(ExpectedTmuxReply::PaneResyncPendingEscape(pane_id)) => {
-                            if let Some(capture) =
-                                connection.pending_pane_captures.get_mut(&pane_id)
-                                && status == crate::tmux_control::CommandStatus::Success
-                            {
-                                capture.pending_escape = join_tmux_command_output(&output);
-                                capture.parser_continuation_available = true;
-                            }
-                        }
-                        Some(ExpectedTmuxReply::PaneResyncVerify(pane_id)) => {
-                            if let Some(flow) = connection.pane_flow.get_mut(&pane_id) {
-                                flow.resync_in_flight = false;
-                            }
-                            let post_metadata = (status
-                                == crate::tmux_control::CommandStatus::Success
-                                && output.len() == 1)
-                                .then(|| {
-                                    crate::tmux_model::parse_pane_capture_metadata(
-                                        &output[0], pane_id,
-                                    )
-                                    .ok()
-                                })
-                                .flatten();
-                            let capture = connection.pending_pane_captures.remove(&pane_id);
-                            match (capture, post_metadata) {
-                                (Some(capture), Some(post_metadata))
-                                    if !capture.failed
-                                        && capture.output.is_some()
-                                        && capture
-                                            .metadata
-                                            .capture_basis_matches(&post_metadata) =>
-                                {
-                                    if connection
-                                        .topology
-                                        .update_pane_capture_metadata(&post_metadata)
-                                        .is_ok()
-                                    {
-                                        pane_resync_success = Some((
-                                            post_metadata,
-                                            capture.output.expect("capture output checked above"),
-                                            capture.pending_escape,
-                                            capture.line_flags,
-                                            capture.parser_continuation_available,
-                                        ));
-                                    } else {
-                                        pane_resync_failure = Some(pane_id);
-                                    }
-                                }
-                                (Some(capture), Some(_))
-                                    if !capture.failed && capture.output.is_some() =>
-                                {
-                                    pane_resync_raced = Some(pane_id);
-                                }
-                                _ => pane_resync_failure = Some(pane_id),
-                            }
-                        }
-                        Some(ExpectedTmuxReply::PanePause(pane_id)) => {
-                            let pane_is_presented = Self::tmux_pane_is_presented(
-                                connection,
-                                connection_is_presented,
-                                &active_gateway_path,
-                                pane_id,
-                            );
-                            let flow = connection.pane_flow.entry(pane_id).or_default();
-                            flow.pause_requested = false;
-                            if status == crate::tmux_control::CommandStatus::Error {
-                                flow.is_paused = false;
-                                if flow.final_resync_requested {
-                                    flow.final_resync_requested = false;
-                                    flow.status = TmuxFlowStatus::ResyncFailed;
-                                    flow.consecutive_resync_failures =
-                                        flow.consecutive_resync_failures.saturating_add(1);
-                                    flow.resync_failures = flow.resync_failures.saturating_add(1);
-                                    let retry_delay = Self::tmux_flow_retry_delay_ms(
-                                        flow.consecutive_resync_failures,
-                                    );
-                                    flow.resync_after_ms = pane_is_presented
-                                        .then_some(now_ms.saturating_add(retry_delay));
-                                } else if flow.status != TmuxFlowStatus::Running {
-                                    Self::mark_tmux_pane_capture_required(flow);
-                                    if pane_is_presented && !flow.resync_requested {
-                                        pane_resync_request = Some(pane_id);
-                                    }
-                                }
-                            } else {
-                                flow.is_paused = true;
-                                if flow.final_resync_requested
-                                    && pane_is_presented
-                                    && !flow.resync_requested
-                                {
-                                    pane_resync_request = Some(pane_id);
-                                }
-                            }
-                        }
-                        Some(ExpectedTmuxReply::PaneContinue(pane_id)) => {
-                            let pane_is_presented = Self::tmux_pane_is_presented(
-                                connection,
-                                connection_is_presented,
-                                &active_gateway_path,
-                                pane_id,
-                            );
-                            let flow = connection.pane_flow.entry(pane_id).or_default();
-                            flow.resume_requested = false;
-                            flow.pause_requested = false;
-                            if status == crate::tmux_control::CommandStatus::Success {
-                                let capture_preceded_resume = flow.resync_requested;
-                                flow.is_paused = false;
-                                if flow.status != TmuxFlowStatus::Running {
-                                    Self::mark_tmux_pane_capture_required(flow);
-                                    if capture_preceded_resume {
-                                        Self::schedule_tmux_pane_recapture(flow, now_ms);
-                                    } else if pane_is_presented {
-                                        pane_resync_request = Some(pane_id);
-                                    }
-                                }
-                            } else if (flow.is_paused || flow.pause_requested)
-                                && flow.status != TmuxFlowStatus::Running
-                            {
-                                Self::mark_tmux_pane_capture_required(flow);
-                                flow.consecutive_resync_failures =
-                                    flow.consecutive_resync_failures.saturating_add(1);
-                                flow.resync_failures = flow.resync_failures.saturating_add(1);
-                                let retry_delay = Self::tmux_flow_retry_delay_ms(
-                                    flow.consecutive_resync_failures,
-                                );
-                                flow.resync_after_ms =
-                                    pane_is_presented.then_some(now_ms.saturating_add(retry_delay));
-                            }
-                        }
-                        Some(ExpectedTmuxReply::CarrierLeaseCreate {
-                            session_id,
-                            window_id,
-                            index,
-                        }) => {
-                            carrier_lease_create_reply = Some((
-                                session_id,
-                                window_id,
-                                index,
-                                status == crate::tmux_control::CommandStatus::Success,
-                            ));
-                        }
-                        Some(ExpectedTmuxReply::CarrierLeaseVerify {
-                            session_id,
-                            window_id,
-                            index,
-                        }) => {
-                            carrier_lease_verify_reply = Some((
-                                session_id,
-                                window_id,
-                                index,
-                                status == crate::tmux_control::CommandStatus::Success,
-                                output,
-                            ));
-                        }
-                        Some(ExpectedTmuxReply::CarrierLeaseUnlink {
-                            session_id,
-                            window_id,
-                            index,
-                        }) => {
-                            carrier_unlink_reply = Some((
-                                session_id,
-                                window_id,
-                                index,
-                                status == crate::tmux_control::CommandStatus::Success,
-                            ));
-                        }
-                        Some(ExpectedTmuxReply::CarrierSessionSwitch { session_id }) => {
-                            carrier_session_switch_reply = Some((
-                                session_id,
-                                status == crate::tmux_control::CommandStatus::Success,
-                            ));
-                        }
-                        Some(ExpectedTmuxReply::CarrierLeaseMove {
-                            session_id,
-                            window_id,
-                            old_index,
-                            new_index,
-                        }) => {
-                            carrier_move_reply = Some((
-                                session_id,
-                                window_id,
-                                old_index,
-                                new_index,
-                                status == crate::tmux_control::CommandStatus::Success,
-                            ));
-                        }
-                        Some(ExpectedTmuxReply::CarrierLeaseMoveVerify {
-                            session_id,
-                            window_id,
-                            old_index,
-                            new_index,
-                        }) => {
-                            carrier_move_verify_reply = Some((
-                                session_id,
-                                window_id,
-                                old_index,
-                                new_index,
-                                status == crate::tmux_control::CommandStatus::Success,
-                                output,
-                            ));
-                        }
-                        Some(ExpectedTmuxReply::Ignored) => {}
-                        Some(ExpectedTmuxReply::UserCommand {
-                            description,
-                            show_success,
-                        }) => {
-                            if crate::tmux_prefix::command_may_change_key_configuration(
-                                &description,
-                            ) && connection.inventory_phase == TmuxInventoryPhase::Idle
-                            {
-                                connection.topology.mark_resync_required();
-                                connection.inventory_retry_count = 0;
-                                request_resync = true;
-                            }
-                            if status == crate::tmux_control::CommandStatus::Error
-                                || show_success
-                                || !output.is_empty()
-                            {
-                                user_command_result =
-                                    Some((status, description, output, show_success));
-                            }
-                        }
-                        None => {}
-                    }
-                }
-                crate::tmux_control::ControlEvent::Output { pane_id, bytes } => {
-                    let pane_id = crate::tmux_model::PaneId(pane_id);
-                    connection.pane_flow.entry(pane_id).or_default();
-                    pane_output = Some((pane_id, bytes));
-                }
-                crate::tmux_control::ControlEvent::ExtendedOutput {
-                    pane_id,
-                    age_ms,
-                    bytes,
-                    ..
-                } => {
-                    let pane_id = crate::tmux_model::PaneId(pane_id);
-                    let flow = connection.pane_flow.entry(pane_id).or_default();
-                    flow.last_extended_output_age_ms = Some(age_ms);
-                    pane_output = Some((pane_id, bytes));
-                }
-                crate::tmux_control::ControlEvent::Pause { pane_id } => {
-                    let pane_id = crate::tmux_model::PaneId(pane_id);
-                    if active_gateway_path.contains(&(connection_id, pane_id)) {
-                        // tmux's control-mode pause notification means bytes
-                        // for this client were discarded. A pane capture can
-                        // repair an ordinary terminal, but never a nested
-                        // control protocol stream.
-                        lost_gateway_carrier = Some(pane_id);
-                    } else {
-                        let pane_is_presented = Self::tmux_pane_is_presented(
-                            connection,
-                            connection_is_presented,
-                            &active_gateway_path,
-                            pane_id,
-                        );
-                        let flow = connection.pane_flow.entry(pane_id).or_default();
-                        flow.pause_requested = false;
-                        flow.is_paused = true;
-                        if !flow.final_resync_requested {
-                            Self::mark_tmux_pane_capture_required(flow);
-                        }
-                        if pane_is_presented
-                            && !flow.final_resync_requested
-                            && !flow.resume_requested
-                        {
-                            flow.resume_requested = true;
-                            pane_resume_request = Some(pane_id);
-                        }
-                    }
-                }
-                crate::tmux_control::ControlEvent::Continue { pane_id } => {
-                    let pane_id = crate::tmux_model::PaneId(pane_id);
-                    let pane_is_presented = Self::tmux_pane_is_presented(
-                        connection,
-                        connection_is_presented,
-                        &active_gateway_path,
-                        pane_id,
-                    );
-                    let flow = connection.pane_flow.entry(pane_id).or_default();
-                    if flow.final_resync_requested && flow.resync_requested {
-                        // This continue is the first command in the final
-                        // continue-and-capture batch. Keep recovery active;
-                        // the capture reply establishes the stream boundary.
-                        flow.pause_requested = false;
-                        flow.is_paused = false;
-                        flow.resume_requested = false;
-                    } else {
-                        let capture_preceded_resume = flow.resync_requested;
-                        flow.pause_requested = false;
-                        flow.is_paused = false;
-                        flow.resume_requested = false;
-                        if flow.status != TmuxFlowStatus::Running {
-                            Self::mark_tmux_pane_capture_required(flow);
-                            if capture_preceded_resume {
-                                Self::schedule_tmux_pane_recapture(flow, now_ms);
-                            } else if pane_is_presented {
-                                pane_resync_request = Some(pane_id);
-                            }
-                        }
-                    }
-                }
-                crate::tmux_control::ControlEvent::Notification { name, arguments } => {
-                    if matches!(name.as_slice(), b"message" | b"config-error") {
-                        notification_popup = Some((
-                            name == b"config-error",
-                            String::from_utf8_lossy(&arguments).into_owned(),
-                        ));
-                    } else {
-                        let inventory_phase = connection.inventory_phase;
-                        let previous_panes = connection
-                            .topology
-                            .panes()
-                            .keys()
-                            .copied()
-                            .collect::<Vec<_>>();
-                        let previous_windows = connection
-                            .topology
-                            .windows()
-                            .keys()
-                            .copied()
-                            .collect::<Vec<_>>();
-                        let outcome = connection.topology.apply_notification(&name, &arguments)?;
-                        if outcome == crate::tmux_model::ReconcileOutcome::Applied {
-                            destroyed_gateway_panes.extend(
-                                previous_panes
-                                    .into_iter()
-                                    .filter(|pane_id| connection.topology.pane(*pane_id).is_none()),
-                            );
-                            destroyed_gateway_windows.extend(previous_windows.into_iter().filter(
-                                |window_id| connection.topology.window(*window_id).is_none(),
-                            ));
-                        }
-                        if inventory_phase == TmuxInventoryPhase::InFlight
-                            && outcome != crate::tmux_model::ReconcileOutcome::Ignored
-                        {
-                            // Even an incrementally applicable notification is
-                            // newer than some unknown subset of the current
-                            // multi-command inventory. Do not let that older
-                            // generation overwrite the applied rename, focus,
-                            // pane exit, or other topology change.
-                            connection.inventory_invalidated = true;
-                        }
-                        if outcome == crate::tmux_model::ReconcileOutcome::ResyncRequired
-                            && inventory_phase == TmuxInventoryPhase::Idle
-                        {
-                            connection.inventory_retry_count = 0;
-                            request_resync = true;
-                        }
-                        sync_topology = connection.has_inventory
-                            && outcome == crate::tmux_model::ReconcileOutcome::Applied;
-                        render_topology = sync_topology;
-                    }
-                }
-                _ => {}
+        // 1. Carrier/hierarchy reconciliation, then location bookkeeping.
+        match carrier_reply {
+            Some(TmuxCarrierReply::Create(session_id, window_id, index, success)) => {
+                self.handle_tmux_carrier_lease_create_reply(
+                    connection_id,
+                    session_id,
+                    window_id,
+                    index,
+                    success,
+                );
             }
-            location_changed =
-                sync_topology && previous_location != connection.topology.attached_location();
-            attached_session_changed = had_inventory
-                && sync_topology
-                && previous_attached_session != connection.topology.attached_session();
-            if attached_session_changed {
-                // A control client receives pane output only for its attached
-                // session. Every pane in the session being entered may
-                // therefore have advanced since Lector last observed it.
-                // Mark the complete session stale: sync_tmux_panes queues an
-                // authoritative capture for its visible panes now and leaves
-                // hidden windows to be captured when they are presented.
-                let attached_windows = connection
-                    .topology
-                    .attached_session()
-                    .and_then(|session_id| connection.topology.session(session_id))
-                    .map(|session| session.windows.values().copied().collect::<BTreeSet<_>>())
-                    .unwrap_or_default();
-                let stale_panes = connection
-                    .topology
-                    .panes()
-                    .values()
-                    .filter(|pane| attached_windows.contains(&pane.window_id))
-                    .filter(|pane| !active_gateway_path.contains(&(connection_id, pane.id)))
-                    .map(|pane| pane.id)
-                    .collect::<Vec<_>>();
-                for pane_id in stale_panes {
-                    let flow = connection.pane_flow.entry(pane_id).or_default();
-                    Self::mark_tmux_pane_capture_required(flow);
-                }
+            Some(TmuxCarrierReply::Verify(session_id, window_id, index, success, output)) => {
+                self.handle_tmux_carrier_lease_verify_reply(
+                    connection_id,
+                    session_id,
+                    window_id,
+                    index,
+                    success,
+                    &output,
+                );
             }
-        }
-        if let Some((session_id, window_id, index, success)) = carrier_lease_create_reply {
-            self.handle_tmux_carrier_lease_create_reply(
-                connection_id,
-                session_id,
-                window_id,
-                index,
-                success,
-            );
-        }
-        if let Some((session_id, window_id, index, success, output)) = carrier_lease_verify_reply {
-            self.handle_tmux_carrier_lease_verify_reply(
-                connection_id,
-                session_id,
-                window_id,
-                index,
-                success,
-                &output,
-            );
-        }
-        if let Some((session_id, window_id, index, success)) = carrier_unlink_reply {
-            self.handle_tmux_carrier_unlink_reply(
-                connection_id,
-                session_id,
-                window_id,
-                index,
-                success,
-            );
-        }
-        if let Some((session_id, success)) = carrier_session_switch_reply {
-            self.handle_tmux_carrier_session_switch_reply(connection_id, session_id, success);
-        }
-        if let Some((session_id, window_id, old_index, new_index, success)) = carrier_move_reply {
-            self.handle_tmux_carrier_move_reply(
-                connection_id,
+            Some(TmuxCarrierReply::Unlink(session_id, window_id, index, success)) => {
+                self.handle_tmux_carrier_unlink_reply(
+                    connection_id,
+                    session_id,
+                    window_id,
+                    index,
+                    success,
+                );
+            }
+            Some(TmuxCarrierReply::SessionSwitch(session_id, success)) => {
+                self.handle_tmux_carrier_session_switch_reply(connection_id, session_id, success);
+            }
+            Some(TmuxCarrierReply::Move(session_id, window_id, old_index, new_index, success)) => {
+                self.handle_tmux_carrier_move_reply(
+                    connection_id,
+                    session_id,
+                    window_id,
+                    old_index,
+                    new_index,
+                    success,
+                );
+            }
+            Some(TmuxCarrierReply::MoveVerify(
                 session_id,
                 window_id,
                 old_index,
                 new_index,
                 success,
-            );
-        }
-        if let Some((session_id, window_id, old_index, new_index, success, output)) =
-            carrier_move_verify_reply
-        {
-            self.handle_tmux_carrier_move_verify_reply(
-                connection_id,
-                (session_id, window_id, old_index, new_index),
-                success,
-                &output,
-            );
+                output,
+            )) => {
+                self.handle_tmux_carrier_move_verify_reply(
+                    connection_id,
+                    (session_id, window_id, old_index, new_index),
+                    success,
+                    &output,
+                );
+            }
+            None => {}
         }
         if inventory_applied {
             self.reconcile_tmux_carrier_leases(connection_id);
@@ -1422,6 +754,7 @@ impl App {
         }
         let mut announce_tmux_location = location_changed;
 
+        // 2. Queue commands with their replies before synchronizing views.
         if let Some((pane_id, command)) = bootstrap_retry {
             self.pending_tmux_commands.push_back(PendingTmuxCommand {
                 connection_id,
@@ -1532,6 +865,7 @@ impl App {
         if let Some(pane_id) = pane_resync_request {
             self.queue_tmux_pane_resync(connection_id, pane_id)?;
         }
+        // 3. Remove gateways before pane synchronization and review.
         self.resolve_destroyed_tmux_gateways(
             sr,
             connection_id,
@@ -1549,6 +883,7 @@ impl App {
         {
             self.open_review(sr, false, term_out)?;
         }
+        // 4. Applying captures may raise new render/announcement/resume work.
         if let Some((pane_id, status, output, line_flags)) = bootstrap_reply {
             self.pending_tmux_background_output
                 .remove((connection_id, pane_id));
@@ -1575,7 +910,7 @@ impl App {
                 .iter()
                 .find(|connection| connection.id == connection_id)
                 .is_some_and(|connection| {
-                    Self::tmux_pane_is_presented(
+                    TmuxConnectionState::tmux_pane_is_presented(
                         connection,
                         connection_is_presented,
                         &active_gateway_path,
@@ -1623,8 +958,9 @@ impl App {
                 } else if status == crate::tmux_control::CommandStatus::Error {
                     flow.status = TmuxFlowStatus::ResyncFailed;
                     flow.recapture_hard_deadline_ms = None;
-                    let retry_delay =
-                        Self::tmux_flow_retry_delay_ms(flow.consecutive_resync_failures);
+                    let retry_delay = TmuxConnectionState::tmux_flow_retry_delay_ms(
+                        flow.consecutive_resync_failures,
+                    );
                     flow.resync_after_ms =
                         pane_is_presented.then_some(now_ms.saturating_add(retry_delay));
                 } else {
@@ -1635,157 +971,166 @@ impl App {
                 self.reset_inactive_tmux_pane_gateway(connection_id, pane_id);
             }
         }
-        if let Some((metadata, output, pending_escape, line_flags, parser_continuation_available)) =
-            pane_resync_success
-        {
-            let pane_id = metadata.pane_id;
-            let (pane_is_present, pane_is_presented) = self
-                .tmux_connections
-                .iter()
-                .find(|connection| connection.id == connection_id)
-                .map_or((false, false), |connection| {
-                    (
-                        connection.topology.pane(pane_id).is_some(),
-                        Self::tmux_pane_is_presented(
-                            connection,
-                            connection_is_presented,
-                            &active_gateway_path,
-                            pane_id,
-                        ),
-                    )
-                });
-            if pane_is_present {
-                if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
-                    view.apply_resync_capture_with_line_flags(
-                        &metadata,
-                        &output,
-                        &pending_escape,
-                        line_flags,
-                        self.clock.now_ms(),
-                    )?;
-                    render_topology = view.is_ready() && !view.is_showing_portal();
-                }
-                let mut resync_completed = false;
-                if let Some(flow) = self
+        match pane_resync_result {
+            Some(TmuxPaneResyncResult::Success(
+                metadata,
+                output,
+                pending_escape,
+                line_flags,
+                parser_continuation_available,
+            )) => {
+                let pane_id = metadata.pane_id;
+                let (pane_is_present, pane_is_presented) = self
                     .tmux_connections
-                    .iter_mut()
+                    .iter()
                     .find(|connection| connection.id == connection_id)
-                    .and_then(|connection| connection.pane_flow.get_mut(&pane_id))
-                {
-                    if !parser_continuation_available {
-                        flow.limitations
-                            .insert(TmuxResyncLimitation::ParserContinuation);
+                    .map_or((false, false), |connection| {
+                        (
+                            connection.topology.pane(pane_id).is_some(),
+                            TmuxConnectionState::tmux_pane_is_presented(
+                                connection,
+                                connection_is_presented,
+                                &active_gateway_path,
+                                pane_id,
+                            ),
+                        )
+                    });
+                if pane_is_present {
+                    if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
+                        view.apply_resync_capture_with_line_flags(
+                            &metadata,
+                            &output,
+                            &pending_escape,
+                            line_flags,
+                            self.clock.now_ms(),
+                        )?;
+                        render_topology = view.is_ready() && !view.is_showing_portal();
                     }
-                    if flow.is_paused || flow.pause_requested {
-                        // Non-final paused captures still need a fresh snapshot
-                        // after resuming. A final capture prefixes its capture
-                        // batch with continue, so it reaches this point unpaused.
-                        flow.status = TmuxFlowStatus::Resynchronizing;
-                        flow.resync_requested = false;
-                        flow.resync_after_ms = None;
-                        flow.recapture_hard_deadline_ms = None;
-                        flow.final_resync_requested = false;
-                        if pane_is_presented && !flow.resume_requested {
-                            resume_after_pane_resync = Some(pane_id);
+                    let mut resync_completed = false;
+                    if let Some(flow) = self
+                        .tmux_connections
+                        .iter_mut()
+                        .find(|connection| connection.id == connection_id)
+                        .and_then(|connection| connection.pane_flow.get_mut(&pane_id))
+                    {
+                        if !parser_continuation_available {
+                            flow.limitations
+                                .insert(TmuxResyncLimitation::ParserContinuation);
                         }
-                    } else if !flow.final_resync_requested && flow.resync_after_ms.is_some() {
-                        // Output arrived after the authoritative capture was
-                        // requested. Keep coalescing until the pane is quiet,
-                        // or this recovery epoch reaches its hard deadline,
-                        // then take one final snapshot.
-                        flow.status = TmuxFlowStatus::Resynchronizing;
-                        flow.resync_requested = false;
-                    } else {
-                        Self::complete_tmux_pane_resync(flow);
-                        resync_completed = true;
+                        if flow.is_paused || flow.pause_requested {
+                            // Non-final paused captures still need a fresh snapshot
+                            // after resuming. A final capture prefixes its capture
+                            // batch with continue, so it reaches this point unpaused.
+                            flow.status = TmuxFlowStatus::Resynchronizing;
+                            flow.resync_requested = false;
+                            flow.resync_after_ms = None;
+                            flow.recapture_hard_deadline_ms = None;
+                            flow.final_resync_requested = false;
+                            if pane_is_presented && !flow.resume_requested {
+                                resume_after_pane_resync = Some(pane_id);
+                            }
+                        } else if !flow.final_resync_requested && flow.resync_after_ms.is_some() {
+                            // Output arrived after the authoritative capture was
+                            // requested. Keep coalescing until the pane is quiet,
+                            // or this recovery epoch reaches its hard deadline,
+                            // then take one final snapshot.
+                            flow.status = TmuxFlowStatus::Resynchronizing;
+                            flow.resync_requested = false;
+                        } else {
+                            TmuxConnectionState::complete_tmux_pane_resync(flow);
+                            resync_completed = true;
+                        }
                     }
-                }
-                if resync_completed {
-                    self.reset_inactive_tmux_pane_gateway(connection_id, pane_id);
-                    let parser_note = if parser_continuation_available {
-                        "terminal parser continuation restored"
-                    } else {
-                        "terminal parser continuation may be unavailable"
-                    };
-                    self.log_event(&format!(
+                    if resync_completed {
+                        self.reset_inactive_tmux_pane_gateway(connection_id, pane_id);
+                        let parser_note = if parser_continuation_available {
+                            "terminal parser continuation restored"
+                        } else {
+                            "terminal parser continuation may be unavailable"
+                        };
+                        self.log_event(&format!(
                         "tmux connection {connection_id} pane {} resynchronized; text, history, cursor, geometry, screen mode, and {parser_note}; images and some semantic metadata may be unavailable",
                         pane_id.0,
                     ));
+                    }
                 }
             }
-        }
-        if let Some(pane_id) = pane_resync_raced {
-            let pane_is_presented = self
-                .tmux_connections
-                .iter()
-                .find(|connection| connection.id == connection_id)
-                .is_some_and(|connection| {
-                    Self::tmux_pane_is_presented(
-                        connection,
-                        connection_is_presented,
-                        &active_gateway_path,
-                        pane_id,
-                    )
-                });
-            if let Some(flow) = self
-                .tmux_connections
-                .iter_mut()
-                .find(|connection| connection.id == connection_id)
-                .and_then(|connection| connection.pane_flow.get_mut(&pane_id))
-            {
-                flow.status = TmuxFlowStatus::Resynchronizing;
-                flow.resync_requested = false;
-                flow.final_resync_requested = false;
-                flow.resync_after_ms =
-                    pane_is_presented.then_some(now_ms.saturating_add(TMUX_RECOVERY_QUIET_MS));
-            }
-        }
-        if let Some(pane_id) = pane_resync_failure {
-            let (pane_is_present, pane_is_presented) = self
-                .tmux_connections
-                .iter()
-                .find(|connection| connection.id == connection_id)
-                .map_or((false, false), |connection| {
-                    (
-                        connection.topology.pane(pane_id).is_some(),
-                        Self::tmux_pane_is_presented(
+            Some(TmuxPaneResyncResult::Raced(pane_id)) => {
+                let pane_is_presented = self
+                    .tmux_connections
+                    .iter()
+                    .find(|connection| connection.id == connection_id)
+                    .is_some_and(|connection| {
+                        TmuxConnectionState::tmux_pane_is_presented(
                             connection,
                             connection_is_presented,
                             &active_gateway_path,
                             pane_id,
-                        ),
-                    )
-                });
-            if pane_is_present {
-                let mut announce_failure = false;
+                        )
+                    });
                 if let Some(flow) = self
                     .tmux_connections
                     .iter_mut()
                     .find(|connection| connection.id == connection_id)
                     .and_then(|connection| connection.pane_flow.get_mut(&pane_id))
                 {
-                    flow.status = TmuxFlowStatus::ResyncFailed;
+                    flow.status = TmuxFlowStatus::Resynchronizing;
                     flow.resync_requested = false;
                     flow.final_resync_requested = false;
-                    flow.recapture_hard_deadline_ms = None;
-                    flow.consecutive_resync_failures =
-                        flow.consecutive_resync_failures.saturating_add(1);
-                    flow.resync_failures = flow.resync_failures.saturating_add(1);
-                    let retry_delay =
-                        Self::tmux_flow_retry_delay_ms(flow.consecutive_resync_failures);
                     flow.resync_after_ms =
-                        pane_is_presented.then_some(now_ms.saturating_add(retry_delay));
-                    announce_failure = !flow.resync_failure_announced;
-                    flow.resync_failure_announced = true;
+                        pane_is_presented.then_some(now_ms.saturating_add(TMUX_RECOVERY_QUIET_MS));
                 }
-                if announce_failure {
-                    self.log_event(&format!(
+            }
+            Some(TmuxPaneResyncResult::Failure(pane_id)) => {
+                let (pane_is_present, pane_is_presented) = self
+                    .tmux_connections
+                    .iter()
+                    .find(|connection| connection.id == connection_id)
+                    .map_or((false, false), |connection| {
+                        (
+                            connection.topology.pane(pane_id).is_some(),
+                            TmuxConnectionState::tmux_pane_is_presented(
+                                connection,
+                                connection_is_presented,
+                                &active_gateway_path,
+                                pane_id,
+                            ),
+                        )
+                    });
+                if pane_is_present {
+                    let mut announce_failure = false;
+                    if let Some(flow) = self
+                        .tmux_connections
+                        .iter_mut()
+                        .find(|connection| connection.id == connection_id)
+                        .and_then(|connection| connection.pane_flow.get_mut(&pane_id))
+                    {
+                        flow.status = TmuxFlowStatus::ResyncFailed;
+                        flow.resync_requested = false;
+                        flow.final_resync_requested = false;
+                        flow.recapture_hard_deadline_ms = None;
+                        flow.consecutive_resync_failures =
+                            flow.consecutive_resync_failures.saturating_add(1);
+                        flow.resync_failures = flow.resync_failures.saturating_add(1);
+                        let retry_delay = TmuxConnectionState::tmux_flow_retry_delay_ms(
+                            flow.consecutive_resync_failures,
+                        );
+                        flow.resync_after_ms =
+                            pane_is_presented.then_some(now_ms.saturating_add(retry_delay));
+                        announce_failure = !flow.resync_failure_announced;
+                        flow.resync_failure_announced = true;
+                    }
+                    if announce_failure {
+                        self.log_event(&format!(
                         "tmux connection {connection_id} pane {} resynchronization failed; retrying with backoff",
                         pane_id.0
                     ));
+                    }
                 }
             }
+            None => {}
         }
+        // 5. Consume late resume work before the ordered presentation choice.
         if let Some(pane_id) = resume_after_pane_resync {
             if let Some(flow) = self
                 .tmux_connections
@@ -1826,6 +1171,7 @@ impl App {
                 None => {}
             }
         }
+        // 6. Command-result UI precedes notification UI.
         if let Some((status, description, output, show_success)) = user_command_result {
             let detail = output
                 .iter()
@@ -2002,7 +1348,7 @@ impl App {
                         || flow.status == TmuxFlowStatus::Resynchronizing
                             && flow.resync_after_ms.is_some())
                 {
-                    Self::schedule_tmux_pane_recapture(flow, self.clock.now_ms());
+                    TmuxConnectionState::schedule_tmux_pane_recapture(flow, self.clock.now_ms());
                 }
                 true
             });
@@ -2105,7 +1451,7 @@ impl App {
                     return false;
                 }
                 flow.pause_requested = true;
-                Self::mark_tmux_pane_capture_required(flow);
+                TmuxConnectionState::mark_tmux_pane_capture_required(flow);
                 true
             });
         if should_pause {
@@ -2547,7 +1893,7 @@ impl App {
             {
                 flow.status = TmuxFlowStatus::Resynchronizing;
                 if flow.resync_in_flight {
-                    Self::schedule_tmux_pane_recapture(flow, now_ms);
+                    TmuxConnectionState::schedule_tmux_pane_recapture(flow, now_ms);
                 } else if !flow.resync_requested {
                     flow.resync_after_ms = None;
                     flow.recapture_hard_deadline_ms = None;
@@ -3261,7 +2607,8 @@ impl App {
                 flow.consecutive_resync_failures =
                     flow.consecutive_resync_failures.saturating_add(1);
                 flow.resync_failures = flow.resync_failures.saturating_add(1);
-                let retry_delay = Self::tmux_flow_retry_delay_ms(flow.consecutive_resync_failures);
+                let retry_delay =
+                    TmuxConnectionState::tmux_flow_retry_delay_ms(flow.consecutive_resync_failures);
                 flow.resync_after_ms = Some(now_ms.saturating_add(retry_delay));
             }
         }
@@ -3638,17 +2985,6 @@ impl App {
     }
 }
 
-fn join_tmux_command_output(lines: &[Vec<u8>]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        if index != 0 {
-            bytes.push(b'\n');
-        }
-        bytes.extend_from_slice(line);
-    }
-    bytes
-}
-
 /// Joins complete one-line tmux commands into a single parsed command
 /// sequence. Unlike several newline-delimited commands in one write, this
 /// cannot be split across control-client read callbacks between commands.
@@ -3668,17 +3004,20 @@ fn join_tmux_command_sequence(commands: &[Vec<u8>]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, join_tmux_command_sequence};
+    use super::{TmuxConnectionState, join_tmux_command_sequence};
 
     #[test]
     fn tmux_flow_retry_backoff_is_exponential_and_capped() {
-        assert_eq!(App::tmux_flow_retry_delay_ms(0), 100);
-        assert_eq!(App::tmux_flow_retry_delay_ms(1), 100);
-        assert_eq!(App::tmux_flow_retry_delay_ms(2), 200);
-        assert_eq!(App::tmux_flow_retry_delay_ms(3), 400);
-        assert_eq!(App::tmux_flow_retry_delay_ms(5), 1_600);
-        assert_eq!(App::tmux_flow_retry_delay_ms(6), 2_000);
-        assert_eq!(App::tmux_flow_retry_delay_ms(u32::MAX), 2_000);
+        assert_eq!(TmuxConnectionState::tmux_flow_retry_delay_ms(0), 100);
+        assert_eq!(TmuxConnectionState::tmux_flow_retry_delay_ms(1), 100);
+        assert_eq!(TmuxConnectionState::tmux_flow_retry_delay_ms(2), 200);
+        assert_eq!(TmuxConnectionState::tmux_flow_retry_delay_ms(3), 400);
+        assert_eq!(TmuxConnectionState::tmux_flow_retry_delay_ms(5), 1_600);
+        assert_eq!(TmuxConnectionState::tmux_flow_retry_delay_ms(6), 2_000);
+        assert_eq!(
+            TmuxConnectionState::tmux_flow_retry_delay_ms(u32::MAX),
+            2_000
+        );
     }
 
     #[test]
