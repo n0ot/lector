@@ -118,7 +118,7 @@ fn cargo_build_automatically_bootstraps_and_validates_the_native_cache() {
     assert!(!wrapper_build.contains("git clone"));
     assert!(!wrapper_build.contains("curl"));
 
-    let bootstrap = include_str!("../scripts/bootstrap_ghostty.sh");
+    let bootstrap = include_str!("../crates/lector-ghostty/bootstrap/bootstrap_ghostty.sh");
     assert!(bootstrap.contains(ghostty::GHOSTTY_COMMIT));
     assert!(bootstrap.contains(ghostty::GHOSTTY_ARCHIVE_SHA256));
     assert!(bootstrap.contains(ghostty::GHOSTTY_VERSION));
@@ -186,9 +186,9 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(xtask.contains("\"ghostty-vt\""));
     assert!(xtask.contains("lector-ghostty-bench"));
 
-    let bootstrap = include_str!("../scripts/bootstrap_zig.sh");
+    let bootstrap = include_str!("../crates/lector-ghostty/bootstrap/bootstrap_zig.sh");
     assert!(bootstrap.contains(ghostty::REQUIRED_ZIG_VERSION));
-    assert!(bootstrap.contains("target/toolchains"));
+    assert!(bootstrap.contains("$build_root/toolchains"));
     assert!(bootstrap.contains("shasum -a 256"));
     assert!(bootstrap.contains("ziglang.org/download"));
     for (platform, checksum) in [
@@ -253,9 +253,9 @@ fn owned_adapter_keeps_raw_ffi_private_and_auditable() {
 #[test]
 fn zig_policy_pins_an_exact_release_and_has_an_actionable_error() {
     assert_eq!(ghostty::REQUIRED_ZIG_VERSION, "0.17.0");
-    let bootstrap = include_str!("../scripts/bootstrap_ghostty.sh");
+    let bootstrap = include_str!("../crates/lector-ghostty/bootstrap/bootstrap_ghostty.sh");
     assert!(bootstrap.contains("actual_zig=$(\"$zig_bin\" version"));
-    assert!(bootstrap.contains("scripts/bootstrap_zig.sh"));
+    assert!(bootstrap.contains("$bootstrap_dir/bootstrap_zig.sh"));
     assert!(bootstrap.contains("actual_zig\" != \"$REQUIRED_ZIG_VERSION"));
 }
 

@@ -32,6 +32,15 @@ class CargoCacheKeyTests(unittest.TestCase):
             (self.root / name).write_text("changed")
             self.assertNotEqual(original, self.key())
 
+    def test_shared_bootstrap_inputs_invalidate(self):
+        for name in ("bootstrap_ghostty.sh", "bootstrap_zig.sh", "lock.sh"):
+            path = self.root / "crates/lector-ghostty/bootstrap" / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("baseline")
+            original = self.key()
+            path.write_text("changed")
+            self.assertNotEqual(original, self.key())
+
     def test_build_outputs_never_affect_input_key(self):
         original = self.key()
         (self.root / "target").mkdir()
