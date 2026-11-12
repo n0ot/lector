@@ -124,7 +124,21 @@ fn benchmark_runner_emits_a_machine_readable_complete_report() {
     let compositor_workloads = report["compositor_workloads"]
         .as_array()
         .expect("compositor workload array");
-    assert!(!compositor_workloads.is_empty());
+    for (name, scope) in [
+        ("split-scene-panes", "scene-composition"),
+        ("split-scene-overlays", "scene-composition"),
+        ("tmux-control-pane-output", "ingest-through-receipt"),
+    ] {
+        let workload = compositor_workloads
+            .iter()
+            .find(|w| w["name"] == name)
+            .unwrap_or_else(|| panic!("missing representative workload {name}"));
+        assert_eq!(workload["measurement_scope"], scope);
+        assert_eq!(workload["completed_renders"], workload["iterations"]);
+        assert!(workload["allocations"].as_u64().is_some_and(|v| v > 0));
+        assert!(workload["allocated_bytes"].as_u64().is_some_and(|v| v > 0));
+        assert!(workload["output_bytes"].as_u64().is_some_and(|v| v > 0));
+    }
     for workload in compositor_workloads {
         for field in [
             "name",
@@ -364,11 +378,14 @@ fn checked_in_release_baseline_has_regression_thresholds_for_every_workload() {
     let compositor_workloads = baseline["compositor_workloads"]
         .as_array()
         .expect("compositor baseline workloads");
-    assert_eq!(compositor_workloads.len(), 3);
+    assert_eq!(compositor_workloads.len(), 6);
     for workload_name in [
         "direct-compositor-pipeline",
         "direct-drain-coalescing",
         "scrolling-lf-receipts",
+        "split-scene-panes",
+        "split-scene-overlays",
+        "tmux-control-pane-output",
     ] {
         let compositor = compositor_workloads
             .iter()

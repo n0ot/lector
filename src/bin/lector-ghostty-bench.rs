@@ -4,11 +4,13 @@ use lector::{
     presentation::{
         CursorOwner, FullSceneVtRenderer, GridPoint, GridRect, IncrementalVtRenderer, MediaLimits,
         OutputTransaction, PaneMediaStore, PresentedScene, RenderBatch, RenderCapabilities,
-        RenderStrategy, RendererBackend, Scene, SceneDamage, SceneSurface, SurfaceId,
+        RenderOracle, RenderStrategy, RendererBackend, Scene, SceneDamage, SceneOverlay,
+        SceneSurface, SurfaceId,
     },
     screen_reader::ScreenReader,
     speech::{Driver, Speech},
     terminal::{GhosttyEngine, TerminalDamage, TerminalGeometry},
+    tmux_gateway::TmuxGatewayRouter,
     views::{PtyView, ViewStack},
 };
 use serde::{Deserialize, Serialize};
@@ -71,6 +73,7 @@ struct BenchmarkReport {
 
 #[derive(Serialize)]
 struct CompositorWorkloadReport {
+    measurement_scope: &'static str,
     name: &'static str,
     iterations: usize,
     updates: usize,
@@ -355,6 +358,14 @@ fn run() -> Result<(), String> {
         compositor_workloads: {
             let iterations = if self_test { 4 } else { 10_000 };
             vec![
+                run_split_scene_workload(iterations, false)?,
+                run_split_scene_workload(iterations, true)?,
+                run_compositor_workload(
+                    "tmux-control-pane-output",
+                    iterations,
+                    1,
+                    CompositorUpdateKind::TmuxControl,
+                )?,
                 run_compositor_workload(
                     "direct-compositor-pipeline",
                     iterations,
@@ -916,6 +927,7 @@ impl Driver for NoopSpeechDriver {
 #[derive(Clone, Copy)]
 enum CompositorUpdateKind {
     CellEdit,
+    TmuxControl,
     ScrollingLine { prefill_rows: usize },
 }
 
@@ -948,6 +960,16 @@ fn run_compositor_workload(
     if initial_report.completed_renders.len() != 1 {
         return Err("initial compositor render did not complete".to_owned());
     }
+
+    let mut router = if matches!(update_kind, CompositorUpdateKind::TmuxControl) {
+        Some(benchmark_tmux_connection(
+            &mut app,
+            &mut screen_reader,
+            &mut writer,
+        )?)
+    } else {
+        None
+    };
 
     if let CompositorUpdateKind::ScrollingLine { prefill_rows } = update_kind
         && prefill_rows != 0
@@ -994,6 +1016,11 @@ fn run_compositor_workload(
                 char::from(b'a' + (iteration % 26) as u8),
             )
             .into_bytes(),
+            CompositorUpdateKind::TmuxControl => {
+                // Octal escaping and fragmented control lines exercise the real
+                // gateway/parser boundary, not pre-decoded ControlEvent values.
+                format!("%output %20 \\033[1;1Hpane {iteration:06}\\033[K\n").into_bytes()
+            }
             CompositorUpdateKind::ScrollingLine { .. } => {
                 format!("streamed line {iteration:06}\r\n").into_bytes()
             }
@@ -1016,7 +1043,29 @@ fn run_compositor_workload(
         let iteration_started = Instant::now();
         app.begin_pty_presentation_batch();
         for update in drain_updates {
-            if let Err(error) = app.handle_pty(&mut screen_reader, update, &mut writer) {
+            let result = if let Some(router) = &mut router {
+                let split = update.len() / 2;
+                feed_tmux(
+                    &mut app,
+                    &mut screen_reader,
+                    router,
+                    &update[..split],
+                    &mut writer,
+                )
+                .and_then(|()| {
+                    feed_tmux(
+                        &mut app,
+                        &mut screen_reader,
+                        router,
+                        &update[split..],
+                        &mut writer,
+                    )
+                })
+            } else {
+                app.handle_pty(&mut screen_reader, update, &mut writer)
+                    .map_err(|error| error.to_string())
+            };
+            if let Err(error) = result {
                 app.cancel_pty_presentation_batch();
                 return Err(error.to_string());
             }
@@ -1032,10 +1081,23 @@ fn run_compositor_workload(
     let elapsed_ns = nanos(started.elapsed()).max(1);
     let allocations = ALLOCATIONS.load(Ordering::Relaxed);
     let allocated_bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
+    if router.is_some()
+        && !app
+            .debug_active_view_contents()
+            .contains(&format!("pane {:06}", update_count - 1))
+    {
+        return Err("tmux pane output was not published to the active view".into());
+    }
+    if completed_renders != iterations {
+        return Err(format!(
+            "{name}: completed {completed_renders}/{iterations} receipts"
+        ));
+    }
     latencies.sort_unstable();
     let seconds = elapsed_ns as f64 / 1_000_000_000.0;
 
     Ok(CompositorWorkloadReport {
+        measurement_scope: "ingest-through-receipt",
         name,
         iterations,
         updates: update_count,
@@ -1050,6 +1112,252 @@ fn run_compositor_workload(
         latency_max_ns: latencies.last().copied().unwrap_or(0),
         output_bytes: writer.bytes.saturating_sub(output_before),
         completed_renders,
+    })
+}
+
+// Setup uses neutral protocol fixtures and no child process. Measured updates
+// still enter through TmuxGatewayRouter and App::handle_tmux_gateway_event.
+fn feed_tmux(
+    app: &mut App,
+    sr: &mut ScreenReader,
+    router: &mut TmuxGatewayRouter,
+    bytes: &[u8],
+    writer: &mut dyn Write,
+) -> Result<(), String> {
+    for event in router.push(bytes).map_err(|error| error.to_string())? {
+        app.handle_tmux_gateway_event(sr, event, writer)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn benchmark_tmux_connection(
+    app: &mut App,
+    sr: &mut ScreenReader,
+    writer: &mut dyn Write,
+) -> Result<TmuxGatewayRouter, String> {
+    let mut router = TmuxGatewayRouter::with_first_connection_id(1);
+    feed_tmux(
+        app,
+        sr,
+        &mut router,
+        b"\x1bP1000p%begin 1 1 0\n%end 1 1 0\n",
+        writer,
+    )?;
+    app.drain_tmux_commands_for(1, &mut io::sink())
+        .map_err(|e| e.to_string())?;
+    let groups = [
+        "",
+        "attached,control-mode,pause-after=1",
+        "",
+        "S\t$1\tbench",
+        "W\t$1\t@10\t1\t1\tb25f,80x24,0,0,20\tb25f,80x24,0,0,20\t*\twindow",
+        "P\t@10\t%20\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tpane",
+        "A\t$1\tbench.example",
+        "O\tbase-index\t1",
+        "O\tpane-base-index\t1",
+        "C\tclient_name\tbench-client",
+        "O\tprefix\tC-a",
+        "O\tprefix2\tNone",
+        "O\tkey-table\troot",
+        "O\trepeat-time\t500",
+        "B\tn\t0\tnext-window",
+    ];
+    for (index, group) in groups.iter().enumerate() {
+        let serial = index + 2;
+        let body = if group.is_empty() {
+            String::new()
+        } else {
+            format!("{group}\n")
+        };
+        let reply = format!("%begin {serial} {serial} 0\n{body}%end {serial} {serial} 0\n");
+        feed_tmux(app, sr, &mut router, reply.as_bytes(), writer)?;
+    }
+    let mut commands = Vec::new();
+    app.drain_tmux_commands_for(1, &mut commands)
+        .map_err(|e| e.to_string())?;
+    if commands != b"capture-pane -p -e -F -J -S - -t %20\n" {
+        return Err(format!(
+            "unexpected benchmark tmux bootstrap commands: {commands:?}"
+        ));
+    }
+    feed_tmux(
+        app,
+        sr,
+        &mut router,
+        b"%begin 30 30 0\nready\n%end 30 30 0\n",
+        writer,
+    )?;
+    app.drain_scheduled_output(writer, true)
+        .map_err(|e| e.to_string())?;
+    if !app.debug_active_view_contents().contains("ready") {
+        return Err("benchmark tmux pane bootstrap did not publish ready state".into());
+    }
+    Ok(router)
+}
+
+/// Prebuilt alternating scenes isolate production composition
+/// from terminal ingestion and fixture allocation. A non-covering
+/// first pane and every overlay necessarily take the blit_surface path.
+fn run_split_scene_workload(
+    iterations: usize,
+    overlays: bool,
+) -> Result<CompositorWorkloadReport, String> {
+    let name = if overlays {
+        "split-scene-overlays"
+    } else {
+        "split-scene-panes"
+    };
+    let geometry = TerminalGeometry::from_cells(24, 80);
+    let mut scenes = Vec::new();
+    let mut input_bytes = 0u64;
+    for variant in 0..2 {
+        let mut scene = Scene::new(geometry);
+        // The left pane clips both top and left; the right clips bottom/right.
+        // The last pane is a full-width row, including its wrap metadata.
+        for (id, rows, cols, row, col) in
+            [(1, 24, 42, -1, -2), (2, 24, 42, 1, 40), (3, 1, 80, 23, 0)]
+        {
+            let mut engine = GhosttyEngine::new(rows, cols).map_err(|e| e.to_string())?;
+            let letter = if variant == 0 { 'a' } else { 'b' };
+            let mut content = Vec::new();
+            for line in 1..=rows {
+                let text = letter.to_string().repeat(usize::from(cols));
+                let style = match id {
+                    1 => "",
+                    2 => "\x1b[1;34m",
+                    _ => "\x1b]8;;https://example.invalid/bench\x1b\\",
+                };
+                content.extend_from_slice(
+                    format!("\x1b[{line};1H{style}{text}\x1b[0m\x1b]8;;\x1b\\").as_bytes(),
+                );
+            }
+            input_bytes += content.len() as u64;
+            engine.advance(&content).map_err(|e| e.to_string())?;
+            scene.panes.push(SceneSurface::new(
+                SurfaceId(id),
+                GridPoint::new(row, col),
+                engine.normalized_snapshot(),
+            ));
+        }
+        if overlays {
+            for (id, row, col, z) in [(4, 5, 30, 20), (5, -1, 70, 10)] {
+                let mut engine = GhosttyEngine::new(3, 20).map_err(|e| e.to_string())?;
+                let content = format!(
+                    "\x1b[1;33moverlay {variant}\r\n\x1b]8;;https://example.invalid/overlay\x1b\\linked\x1b]8;;\x1b\\"
+                );
+                input_bytes += content.len() as u64;
+                engine
+                    .advance(content.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                scene.overlays.push(SceneOverlay::new(
+                    SceneSurface::new(
+                        SurfaceId(id),
+                        GridPoint::new(row, col),
+                        engine.normalized_snapshot(),
+                    ),
+                    z,
+                ));
+            }
+        }
+        scenes.push(scene);
+    }
+    let mut renderer = FullSceneVtRenderer::new(RenderCapabilities::default());
+    let mut presented = PresentedScene::blank(geometry);
+    let mut oracle = RenderOracle::new(geometry).map_err(|e| e.to_string())?;
+    let mut expected = Vec::new();
+    // Independent destination-first reference: select the topmost covering
+    // source for every cell, including blank areas and clipped overlays.
+    for scene in &scenes {
+        let intended = PresentedScene::compose(scene).map_err(|e| e.to_string())?;
+        let snapshot = intended.clone().into_terminal_snapshot();
+        let blank = PresentedScene::blank(geometry).into_terminal_snapshot();
+        let mut overlays = scene.overlays.iter().collect::<Vec<_>>();
+        overlays.sort_by_key(|overlay| overlay.z_index);
+        let surfaces = scene
+            .panes
+            .iter()
+            .chain(overlays.iter().map(|o| &o.surface))
+            .collect::<Vec<_>>();
+        for row in 0..usize::from(geometry.rows) {
+            for col in 0..usize::from(geometry.cols) {
+                let cell = surfaces
+                    .iter()
+                    .rev()
+                    .find_map(|surface| {
+                        let source_row = usize::try_from(row as i32 - surface.origin.row).ok()?;
+                        let source_col = usize::try_from(col as i32 - surface.origin.col).ok()?;
+                        surface.snapshot.rows.get(source_row)?.cells.get(source_col)
+                    })
+                    .unwrap_or(&blank.rows[row].cells[col]);
+                if &snapshot.rows[row].cells[col] != cell {
+                    return Err(format!("{name}: incorrect composed cell at {row},{col}"));
+                }
+            }
+        }
+        expected.push(intended.clone());
+        let batch = renderer
+            .render(scene, &SceneDamage::Full, &presented)
+            .map_err(|e| e.to_string())?;
+        oracle
+            .verify(name, &intended, &batch)
+            .map_err(|e| format!("{e:?}"))?;
+        presented = batch.predicted;
+    }
+    let mut latencies = Vec::with_capacity(iterations);
+    let mut allocations = 0;
+    let mut allocated_bytes = 0;
+    let mut output_bytes = 0;
+    for iteration in 0..iterations {
+        let scene = &scenes[iteration % scenes.len()];
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        let started = Instant::now();
+        let intended = PresentedScene::compose(black_box(scene)).map_err(|e| e.to_string())?;
+        latencies.push(nanos(started.elapsed()).max(1));
+        allocations += ALLOCATIONS.load(Ordering::Relaxed);
+        allocated_bytes += ALLOCATED_BYTES.load(Ordering::Relaxed);
+        if intended != expected[iteration % expected.len()] {
+            return Err(format!(
+                "{name}: measured composition differs from validated scene"
+            ));
+        }
+        let batch = renderer
+            .render(scene, &SceneDamage::Full, &presented)
+            .map_err(|e| e.to_string())?;
+        // Correctness and oracle allocations are deliberately outside the fence.
+        oracle
+            .verify(name, &intended, &batch)
+            .map_err(|e| format!("{e:?}"))?;
+        output_bytes += batch
+            .transactions
+            .iter()
+            .map(|t| t.bytes.len() as u64)
+            .sum::<u64>();
+        presented = batch.predicted;
+    }
+    latencies.sort_unstable();
+    let elapsed_ns = latencies.iter().sum::<u64>();
+    // Encoded source bytes represented by each prebuilt scene, not wire input.
+    input_bytes = input_bytes / scenes.len() as u64 * iterations as u64;
+    Ok(CompositorWorkloadReport {
+        measurement_scope: "scene-composition",
+        name,
+        iterations,
+        updates: iterations,
+        updates_per_drain: 1,
+        input_bytes,
+        elapsed_ns,
+        throughput_mib_per_second: input_bytes as f64
+            / (1024.0 * 1024.0)
+            / (elapsed_ns as f64 / 1e9),
+        allocations,
+        allocated_bytes,
+        latency_p50_ns: percentile(&latencies, 50),
+        latency_p95_ns: percentile(&latencies, 95),
+        latency_max_ns: latencies.last().copied().unwrap_or(0),
+        output_bytes,
+        completed_renders: iterations,
     })
 }
 
