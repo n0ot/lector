@@ -1351,16 +1351,23 @@ fn blit_surface(target: &mut [Row], geometry: TerminalGeometry, surface: &SceneS
             continue;
         }
         let target_row = usize::try_from(target_row).expect("non-negative clipped row");
-        for (source_col_index, cell) in source_row.cells.iter().enumerate() {
-            let Ok(source_col_index) = i32::try_from(source_col_index) else {
-                break;
-            };
-            let target_col = surface.origin.col.saturating_add(source_col_index);
-            if target_col < 0 || target_col >= i32::from(geometry.cols) {
-                continue;
+        let mut visible_cells = source_row
+            .cells
+            .iter()
+            .enumerate()
+            .map_while(|(source_col_index, cell)| {
+                let source_col_index = i32::try_from(source_col_index).ok()?;
+                Some((surface.origin.col.saturating_add(source_col_index), cell))
+            })
+            .filter(|(col, _)| *col >= 0 && *col < i32::from(geometry.cols))
+            .peekable();
+        // Do not detach shared cells for a row with no visible writes.
+        if visible_cells.peek().is_some() {
+            let target_cells = Arc::make_mut(&mut target[target_row].cells);
+            for (target_col, cell) in visible_cells {
+                let target_col = usize::try_from(target_col).expect("non-negative clipped column");
+                target_cells[target_col] = cell.clone();
             }
-            let target_col = usize::try_from(target_col).expect("non-negative clipped column");
-            Arc::make_mut(&mut target[target_row].cells)[target_col] = cell.clone();
         }
         if surface.origin.col <= 0
             && surface

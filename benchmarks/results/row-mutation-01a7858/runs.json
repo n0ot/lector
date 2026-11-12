@@ -1,0 +1,50 @@
+[
+  {
+    "variant": "base",
+    "run": "warmup",
+    "exit_code": 0,
+    "seconds": 9.233
+  },
+  {
+    "variant": "candidate",
+    "run": "warmup",
+    "exit_code": 0,
+    "seconds": 8.898
+  },
+  {
+    "variant": "base",
+    "run": "run1",
+    "exit_code": 0,
+    "seconds": 8.952
+  },
+  {
+    "variant": "candidate",
+    "run": "run1",
+    "exit_code": 0,
+    "seconds": 8.604
+  },
+  {
+    "variant": "candidate",
+    "run": "run2",
+    "exit_code": 0,
+    "seconds": 8.612
+  },
+  {
+    "variant": "base",
+    "run": "run2",
+    "exit_code": 0,
+    "seconds": 8.909
+  },
+  {
+    "variant": "base",
+    "run": "run3",
+    "exit_code": 0,
+    "seconds": 8.899
+  },
+  {
+    "variant": "candidate",
+    "run": "run3",
+    "exit_code": 0,
+    "seconds": 8.6
+  }
+]

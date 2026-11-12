@@ -111,6 +111,81 @@ fn a_covering_pane_is_the_compositor_backing_grid_at_any_terminal_size() {
 }
 
 #[test]
+fn clipped_blits_preserve_shared_sources_cells_and_row_metadata() {
+    let geometry = TerminalGeometry::from_cells(2, 4);
+    let backing = presented(geometry, b"base\r\nkeep").into_terminal_snapshot();
+    let mut source = presented(
+        TerminalGeometry::from_cells(2, 6),
+        "\x1b[1;31m\x1b]8;;https://example.invalid/cell\x07界ABCD".as_bytes(),
+    )
+    .into_terminal_snapshot();
+    let rows = Arc::make_mut(&mut source.rows);
+    rows[1].cells = Arc::clone(&rows[0].cells);
+    rows[0].wrapped = true;
+    rows[1].wrapped = false;
+    let original = source.clone();
+    assert!(source.rows[0].cells[1].continuation);
+
+    for origin in [
+        GridPoint::new(0, -1),
+        GridPoint::new(-1, 0),
+        GridPoint::new(0, 1),
+        GridPoint::new(0, 0),
+        GridPoint::new(2, 0),
+        GridPoint::new(0, 4),
+        GridPoint::new(0, -6),
+        GridPoint::new(i32::MIN, i32::MIN),
+        GridPoint::new(i32::MAX, i32::MAX),
+    ] {
+        let mut scene = Scene::new(geometry);
+        scene.panes.push(SceneSurface::new(
+            SurfaceId(1),
+            GridPoint::new(0, 0),
+            backing.clone(),
+        ));
+        scene
+            .panes
+            .push(SceneSurface::new(SurfaceId(2), origin, source.clone()));
+        let composed = PresentedScene::compose(&scene)
+            .unwrap()
+            .into_terminal_snapshot();
+        for (row_index, row) in composed.rows.iter().enumerate() {
+            let source_row = i64::try_from(row_index).unwrap() - i64::from(origin.row);
+            let mut received_write = false;
+            for (col_index, cell) in row.cells.iter().enumerate() {
+                let source_col = i64::try_from(col_index).unwrap() - i64::from(origin.col);
+                let expected = if (0..2).contains(&source_row) && (0..6).contains(&source_col) {
+                    received_write = true;
+                    &source.rows[source_row as usize].cells[source_col as usize]
+                } else {
+                    &backing.rows[row_index].cells[col_index]
+                };
+                assert_eq!(
+                    cell, expected,
+                    "origin={origin:?}, row={row_index}, col={col_index}"
+                );
+            }
+            let covers_row =
+                (0..2).contains(&source_row) && origin.col <= 0 && i64::from(origin.col) + 6 >= 4;
+            let expected_wrapped = if covers_row {
+                source.rows[source_row as usize].wrapped
+            } else {
+                backing.rows[row_index].wrapped
+            };
+            assert_eq!(row.wrapped, expected_wrapped, "origin={origin:?}");
+            if !received_write {
+                assert!(
+                    Arc::ptr_eq(&row.cells, &backing.rows[row_index].cells),
+                    "fully clipped rows must not detach their shared cells: {origin:?}"
+                );
+            }
+        }
+        assert_eq!(source.rows, original.rows);
+        assert!(Arc::ptr_eq(&source.rows[0].cells, &source.rows[1].cells));
+    }
+}
+
+#[test]
 fn renderer_backend_receives_scene_damage_and_predicts_independent_state() {
     let scene = Scene::new(TerminalGeometry::from_cells(2, 4));
     let presented = PresentedScene::blank(scene.geometry);
