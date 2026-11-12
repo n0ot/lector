@@ -304,11 +304,18 @@ distinct from the checksum-verified native archives in `ghostty-prebuilt`.
 `cargo ghostty-check` bootstraps and verifies both native profiles, runs the
 linked build-information tests, and checks the resulting runtime linkage.
 
-The adapter's build script runs `scripts/bootstrap_ghostty.sh`; that script
-returns immediately for a verified cache hit. On its first run,
-`scripts/bootstrap_zig.sh` downloads Zig, and the Ghostty bootstrap downloads
-the pinned official source archive while Zig fetches packages pinned by
-Ghostty's `build.zig.zon`. Cargo consumes the verified output under:
+The repository scripts delegate to the implementation shipped inside
+`crates/lector-ghostty/bootstrap`, so the published adapter crate builds without
+repository-only files. Both entry points return immediately for a verified
+cache hit. On a cache miss they download checksum-pinned Zig, Ghostty source,
+and Ghostty dependency archives; Zig builds with those offline dependencies.
+The repository wrappers explicitly default `LECTOR_GHOSTTY_BUILD_ROOT` to the
+workspace's `target` directory. Direct standalone scripts default to the crate's
+`target`; standalone Cargo builds use a bootstrap directory under `OUT_DIR`.
+`LECTOR_GHOSTTY_BUILD_ROOT` overrides these defaults, while
+`LECTOR_TOOLCHAIN_ROOT` and `GHOSTTY_PREBUILT_ROOT` independently override the
+Zig installation and native archive roots. Cargo consumes the verified output
+under:
 
 ```text
 target/ghostty-prebuilt/<rust-target>/<Debug|ReleaseFast>/

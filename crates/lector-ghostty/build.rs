@@ -10,6 +10,8 @@ const REQUIRED_ZIG_VERSION: &str = "0.17.0";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=GHOSTTY_PREBUILT_ROOT");
+    println!("cargo:rerun-if-env-changed=LECTOR_GHOSTTY_BUILD_ROOT");
+    println!("cargo:rerun-if-env-changed=LECTOR_TOOLCHAIN_ROOT");
     println!("cargo:rerun-if-env-changed=LECTOR_GHOSTTY_OPTIMIZE");
     println!("cargo:rerun-if-env-changed=DOCS_RS");
     println!("cargo:rerun-if-env-changed=OPT_LEVEL");
@@ -33,6 +35,7 @@ fn main() {
 
     let mut watched_paths = vec![
         bootstrap_script.clone(),
+        crate_root.join("bootstrap/bootstrap_ghostty.sh"),
         crate_root.join("bootstrap/bootstrap_zig.sh"),
         crate_root.join("bootstrap/lock.sh"),
         crate_root.join("abi/build_info_probe.c"),
