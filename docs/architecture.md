@@ -110,7 +110,12 @@ captures it once. Cancellation invalidates incremental renderer state so the
 next successful publication reconstructs any model changes that were never
 presented.
 
-tmux control records remain ordered on the event-loop thread. Hidden panes do
+tmux control records remain ordered on the event-loop thread. Connection-local
+transitions return results to App, which applies commands, hierarchy changes,
+recovery, and presentation in the phases defined by the
+[control transition contract](tmux-control-transitions.md#ordered-app-effects).
+A transition result can carry several effects together; topology synchronization
+and rendering are not mutually exclusive outcomes. Hidden panes do
 not retain cumulative speech/render summaries: each pane batch is applied as a
 bounded delta, and only the active accessibility pane keeps metadata until its
 next stabilization point. Adjacent ordinary output records for the same pane
@@ -250,6 +255,13 @@ resynchronization without turning permanent output backpressure into unbounded
 retention. Terminal-title effects carry their own flush receipt because the
 outer terminal can apply an OSC title before a larger cell render completes.
 
+Visible-grid and complete-document text caches belong to `View`. Each cache
+keeps current and previous text with row hashes, is prepared lazily, and copies
+its prepared current value to the previous baseline on finalization. Mutation
+invalidates current contents while retaining reusable storage; an unprepared
+cache cannot supply a previous baseline. These caches accelerate comparison;
+they do not publish accessibility state or consume journal evidence.
+
 Each view also keeps a bounded, revisioned journal of accessibility evidence.
 The journal contains only facts which can affect a reading decision, such as
 completed print records, structural taint, parser continuation, cursor and
@@ -331,20 +343,30 @@ replies because tmux is authoritative there.
 
 - `src/main.rs` owns process setup, polling, signal handling, and lifecycle.
 - `src/app.rs` and `src/app/` orchestrate input, views, presentation, and tmux
-  interactions.
-- `src/terminal.rs` defines the normalized terminal contract and Ghostty-backed
-  engine.
+  interactions. App applies connection transition results in protocol order;
+  it does not own connection-local tmux inventory or flow policy.
+- `src/terminal.rs` owns the concrete Ghostty adapter and normalized update,
+  snapshot, and accessibility evidence contracts. Shared cell, row, style,
+  cursor, mode, and effect leaf types are re-exported from `lector-ghostty`;
+  consumers use this boundary rather than a parallel terminal implementation.
+- `src/terminal_protocol.rs` handles terminal protocol observations and policy;
+  `src/terminal_input.rs` encodes application input.
 - `src/presentation.rs` and `src/output_scheduler.rs` compose, render, order,
-  and recover physical output.
+  and recover physical output. Presentation owns scenes and receipt bundles;
+  the scheduler owns physical write/flush order, not accessibility policy.
 - `src/screen_reader.rs`, `src/screen_reader/`, and `src/commands/` implement
   speech policy, tracking, and user actions.
-- `src/view.rs` and `src/views/` implement the application surface and Lector's
-  overlay stack.
+- `src/view.rs` owns accessible-document state, text caches, comparison epochs,
+  and the bounded accessibility journal. `src/views/` owns concrete surfaces
+  and the overlay stack.
 - `src/tmux_*.rs` contain protocol, topology, pane, input, prefix, and lifecycle
-  boundaries.
+  boundaries. `src/tmux_model.rs` owns connection-local control transitions.
 - `src/speech/` contains Lector's speech manager, process client, supervisor,
   and asynchronous isolation.
-- `src/lua/` exposes configuration and the REPL.
+- `src/lua/` exposes configuration and the REPL. `src/lua/access.rs` owns
+  scoped reader access; `src/lua/options.rs` owns Lua option names, aliases,
+  conversion, and errors. Reader/speech storage, defaults, and invariant-enforcing
+  setters remain with their Rust owners.
 - `crates/lector-ghostty/` is the safe Rust boundary around the native Ghostty
   terminal engine.
 - `crates/lector-tts/` contains the cross-platform TTS library, standalone

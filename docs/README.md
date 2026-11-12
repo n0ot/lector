@@ -1,7 +1,8 @@
 # Lector documentation
 
 Start with [Architecture](architecture.md) for the runtime ownership model,
-data flow, concurrency boundaries, and source map. Contributors should also
+data flow, and concurrency boundaries; use its [source map](architecture.md#source-map)
+to locate implementation ownership. Contributors should also
 read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
 
 ## Build system
@@ -28,6 +29,8 @@ read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
 - [Control parser](tmux-control-parser.md) defines framing and failure bounds.
 - [Gateway routing](tmux-gateway.md) defines byte ownership at connection
   boundaries.
+- [Control transitions](tmux-control-transitions.md) defines connection-local
+  results and the ordered App effects that apply them.
 - [Topology](tmux-topology.md) describes identity and reconciliation.
 - [Pane composition](tmux-panes.md) describes pane-local engines and layout.
 - [Input and sizing](tmux-input.md) covers keyboard, paste, focus, mouse, and
