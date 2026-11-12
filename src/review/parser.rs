@@ -65,6 +65,10 @@ pub(crate) enum Command {
         name: char,
         exact: bool,
     },
+    TravelJump {
+        forward: bool,
+        count: usize,
+    },
     Move(Motion, usize),
     ScrollPage {
         forward: bool,
@@ -293,6 +297,13 @@ impl Parser {
                 let count = self.take_count();
                 self.finish(Command::RepeatSearch {
                     reverse: true,
+                    count,
+                })
+            }
+            Key::Ctrl('o') | Key::Ctrl('i') => {
+                let count = self.take_count();
+                self.finish(Command::TravelJump {
+                    forward: key == Key::Ctrl('i'),
                     count,
                 })
             }
@@ -705,6 +716,10 @@ pub(crate) const HELP_BINDINGS: &[(&str, &str)] = &[
         "cancel pending input, search or selection; otherwise announce review mode",
     ),
     ("[count]", "prefix a motion or yank with a decimal count"),
+    (
+        "C-o / C-i (Tab)",
+        "older / newer location in this source jump history",
+    ),
     ("h / Left", "move to the previous character"),
     ("j / Down", "move to the next line"),
     ("k / Up", "move to the previous line"),
@@ -818,6 +833,35 @@ mod tests {
 
     fn feed(parser: &mut Parser, keys: &[Key]) -> Vec<Command> {
         keys.iter().copied().map(|key| parser.feed(key)).collect()
+    }
+
+    #[test]
+    fn jump_history_counts_reset_and_do_not_become_yank_motions() {
+        let mut parser = Parser::default();
+        assert_eq!(parser.feed(Key::Char('3')), Command::None);
+        assert_eq!(
+            parser.feed(Key::Ctrl('o')),
+            Command::TravelJump {
+                forward: false,
+                count: 3
+            }
+        );
+        assert_eq!(
+            parser.feed(Key::Ctrl('i')),
+            Command::TravelJump {
+                forward: true,
+                count: 1
+            }
+        );
+        parser.feed(Key::Char('y'));
+        assert_eq!(parser.feed(Key::Ctrl('o')), Command::Bell);
+        assert_eq!(
+            parser.feed(Key::Ctrl('o')),
+            Command::TravelJump {
+                forward: false,
+                count: 1
+            }
+        );
     }
 
     #[test]
