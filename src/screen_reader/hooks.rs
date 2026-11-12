@@ -11,9 +11,13 @@ impl ScreenReader {
     }
 
     pub(crate) fn owns_lua_context(&self, lua: &Lua) -> bool {
+        self.owns_lua_generation(&lua.weak())
+    }
+
+    pub(crate) fn owns_lua_generation(&self, lua: &mlua::WeakLua) -> bool {
         self.lua_ctx_weak
             .as_ref()
-            .is_some_and(|context| *context == lua.weak())
+            .is_some_and(|context| context == lua)
     }
 
     pub fn set_hook(&mut self, lua: &Lua, name: &str, value: Value) -> Result<()> {
@@ -59,7 +63,7 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_startup else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let tbl = lua.create_table().map_err(Error::lua)?;
@@ -68,7 +72,7 @@ impl ScreenReader {
             .map_err(Error::lua)?;
         tbl.set("pid", std::process::id()).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>(tbl);
+        let result = crate::lua::enter(&lua, self, || func.call::<()>(tbl));
         self.finish_lua_hook_call("on_startup", result, |_| Ok(()))
     }
 
@@ -76,7 +80,7 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_reload else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let tbl = lua.create_table().map_err(Error::lua)?;
@@ -85,7 +89,7 @@ impl ScreenReader {
             .map_err(Error::lua)?;
         tbl.set("pid", std::process::id()).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>(tbl);
+        let result = crate::lua::enter(&lua, self, || func.call::<()>(tbl));
         self.finish_lua_hook_call("on_reload", result, |_| Ok(()))
     }
 
@@ -100,22 +104,24 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_shutdown else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        func.call::<()>(reason.to_string()).map_err(Error::lua)
+        crate::lua::enter(&lua, self, || func.call::<()>(reason.to_string())).map_err(Error::lua)
     }
 
     pub fn hook_on_error(&mut self, message: &str, context: &str) -> Result<()> {
         let Some(key) = &self.lua_hooks.on_error else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>((message.to_string(), context.to_string()));
+        let result = crate::lua::enter(&lua, self, || {
+            func.call::<()>((message.to_string(), context.to_string()))
+        });
         self.finish_lua_hook_call("on_error", result, |_| Ok(()))
     }
 
@@ -123,7 +129,7 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_screen_update else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let (rows, cols) = view.size();
@@ -146,7 +152,7 @@ impl ScreenReader {
         tbl.set("prev_screen", view.prev_screen().contents_full())
             .map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>(tbl);
+        let result = crate::lua::enter(&lua, self, || func.call::<()>(tbl));
         self.finish_lua_hook_call("on_screen_update", result, |_| Ok(()))
     }
 
@@ -161,7 +167,7 @@ impl ScreenReader {
         if old_pos == new_pos {
             return Ok(());
         }
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let tbl = lua.create_table().map_err(Error::lua)?;
@@ -170,7 +176,7 @@ impl ScreenReader {
         tbl.set("prev_row", old_pos.0).map_err(Error::lua)?;
         tbl.set("prev_col", old_pos.1).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>(tbl);
+        let result = crate::lua::enter(&lua, self, || func.call::<()>(tbl));
         self.finish_lua_hook_call("on_review_cursor_move", result, |_| Ok(()))
     }
 
@@ -181,11 +187,13 @@ impl ScreenReader {
         if old == new {
             return Ok(());
         }
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>((old.as_str().to_string(), new.as_str().to_string()));
+        let result = crate::lua::enter(&lua, self, || {
+            func.call::<()>((old.as_str().to_string(), new.as_str().to_string()))
+        });
         self.finish_lua_hook_call("on_mode_change", result, |_| Ok(()))
     }
 
@@ -193,7 +201,7 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_table_mode_enter else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let model = table_state.model();
@@ -210,7 +218,7 @@ impl ScreenReader {
         tbl.set("current_col", table_state.current_col())
             .map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>(tbl);
+        let result = crate::lua::enter(&lua, self, || func.call::<()>(tbl));
         self.finish_lua_hook_call("on_table_mode_enter", result, |_| Ok(()))
     }
 
@@ -218,11 +226,11 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_table_mode_exit else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>(());
+        let result = crate::lua::enter(&lua, self, || func.call::<()>(()));
         self.finish_lua_hook_call("on_table_mode_exit", result, |_| Ok(()))
     }
 
@@ -230,7 +238,7 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_clipboard_change else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let meta = lua.create_table().map_err(Error::lua)?;
@@ -244,7 +252,7 @@ impl ScreenReader {
             None => Value::Nil,
         };
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>((entry, meta));
+        let result = crate::lua::enter(&lua, self, || func.call::<()>((entry, meta)));
         self.finish_lua_hook_call("on_clipboard_change", result, |_| Ok(()))
     }
 
@@ -252,7 +260,7 @@ impl ScreenReader {
         let Some(key_ref) = &self.lua_hooks.on_key_unhandled else {
             return Ok(false);
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(false);
         };
         let func: Function = lua.registry_value(key_ref).map_err(Error::lua)?;
@@ -260,7 +268,9 @@ impl ScreenReader {
             Some(value) => Value::String(lua.create_string(value).map_err(Error::lua)?),
             None => Value::Nil,
         };
-        let result = func.call((key_value, mode.as_str().to_string()));
+        let result = crate::lua::enter(&lua, self, || {
+            func.call((key_value, mode.as_str().to_string()))
+        });
         let result: Value =
             self.finish_lua_hook_call("on_key_unhandled", result, |_| Ok(Value::Boolean(false)))?;
         Ok(matches!(result, Value::Boolean(true)))
@@ -275,14 +285,14 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_live_read else {
             return Ok(Some(text.to_string()));
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(Some(text.to_string()));
         };
         let meta = lua.create_table().map_err(Error::lua)?;
         meta.set("cursor_moves", cursor_moves).map_err(Error::lua)?;
         meta.set("scrolled", scrolled).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call((text.to_string(), meta));
+        let result = crate::lua::enter(&lua, self, || func.call((text.to_string(), meta)));
         let result: Value = self.finish_lua_hook_call("on_live_read", result, |lua| {
             lua.create_string(text).map(Value::String)
         })?;
@@ -308,13 +318,13 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_speech_start else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let meta = lua.create_table().map_err(Error::lua)?;
         meta.set("interrupt", interrupt).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>((text.to_string(), meta));
+        let result = crate::lua::enter(&lua, self, || func.call::<()>((text.to_string(), meta)));
         self.finish_lua_hook_call("on_speech_start", result, |_| Ok(()))
     }
 
@@ -327,14 +337,14 @@ impl ScreenReader {
         let Some(key) = &self.lua_hooks.on_speech_end else {
             return Ok(());
         };
-        let Some(lua) = self.lua_ctx.as_ref() else {
+        let Some(lua) = self.lua_ctx.clone() else {
             return Ok(());
         };
         let meta = lua.create_table().map_err(Error::lua)?;
         meta.set("interrupt", interrupt).map_err(Error::lua)?;
         meta.set("ok", ok).map_err(Error::lua)?;
         let func: Function = lua.registry_value(key).map_err(Error::lua)?;
-        let result = func.call::<()>((text.to_string(), meta));
+        let result = crate::lua::enter(&lua, self, || func.call::<()>((text.to_string(), meta)));
         self.finish_lua_hook_call("on_speech_end", result, |_| Ok(()))
     }
 

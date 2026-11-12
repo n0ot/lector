@@ -34,7 +34,6 @@ struct LuaReplState {
     env: Table,
     thread: Option<Thread>,
     print_buffer: Rc<RefCell<ReplOutput>>,
-    screen_reader_ptr: Rc<RefCell<*mut ScreenReader>>,
 }
 
 #[derive(Clone)]
@@ -56,8 +55,7 @@ impl LuaReplSession {
             .map_err(Error::lua)?;
         let print_buffer = Rc::new(RefCell::new(ReplOutput { lines: Vec::new() }));
         let print_buffer_clone = Rc::clone(&print_buffer);
-        let screen_reader_ptr = Rc::new(RefCell::new(std::ptr::null_mut()));
-        lua::setup_repl(&lua, Rc::clone(&screen_reader_ptr)).map_err(Error::lua)?;
+        lua::setup_repl(&lua).map_err(Error::lua)?;
         let print_fn = lua
             .create_function(move |_lua, args: MultiValue| {
                 let mut pieces = Vec::new();
@@ -88,7 +86,6 @@ impl LuaReplSession {
                 env,
                 thread: None,
                 print_buffer,
-                screen_reader_ptr,
             })),
         })
     }
@@ -114,11 +111,6 @@ impl LuaReplView {
 
     pub fn history(&self) -> Vec<String> {
         self.session.state.borrow().editor.history().to_vec()
-    }
-
-    fn set_screen_reader(&mut self, sr: &mut ScreenReader) {
-        let screen_reader_ptr = Rc::clone(&self.session.state.borrow().screen_reader_ptr);
-        *screen_reader_ptr.borrow_mut() = sr as *mut ScreenReader;
     }
 
     fn is_continuing(&self) -> bool {
@@ -281,12 +273,13 @@ impl LuaReplView {
         Ok(())
     }
 
-    fn resume_eval(&mut self) -> Result<(bool, Vec<String>)> {
+    fn resume_eval(&mut self, sr: &mut ScreenReader) -> Result<(bool, Vec<String>)> {
         let thread = self.session.state.borrow().thread.clone();
         let Some(thread) = thread else {
             return Ok((false, Vec::new()));
         };
-        match thread.resume::<MultiValue>(()) {
+        let lua = self.session.state.borrow().lua.clone();
+        match lua::enter(&lua, sr, || thread.resume::<MultiValue>(())) {
             Ok(values) => {
                 let mut added = Vec::new();
                 if thread.status() == ThreadStatus::Finished {
@@ -464,7 +457,6 @@ impl ViewController for LuaReplView {
         input: &[u8],
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
-        self.set_screen_reader(sr);
         if input == b"\x1B" {
             self.session.state.borrow_mut().thread = None;
             return Ok(ViewAction::Pop);
@@ -497,7 +489,6 @@ impl ViewController for LuaReplView {
         _raw: &[u8],
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
-        self.set_screen_reader(sr);
         if key.is_release() {
             return Ok(ViewAction::None);
         }
@@ -534,7 +525,6 @@ impl ViewController for LuaReplView {
         contents: &str,
         _pty_stream: &mut dyn Write,
     ) -> Result<ViewAction> {
-        self.set_screen_reader(sr);
         if self.session.state.borrow().thread.is_some() {
             return Ok(ViewAction::Bell);
         }
@@ -549,11 +539,10 @@ impl ViewController for LuaReplView {
     }
 
     fn tick(&mut self, sr: &mut ScreenReader, _pty_stream: &mut dyn Write) -> Result<ViewAction> {
-        self.set_screen_reader(sr);
         if self.session.state.borrow().thread.is_none() {
             return Ok(ViewAction::None);
         }
-        let (progressed, added) = self.resume_eval()?;
+        let (progressed, added) = self.resume_eval(sr)?;
         let printed = self.drain_print_buffer();
         if !added.is_empty() {
             self.write_output_lines(&added);

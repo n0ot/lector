@@ -1,5 +1,5 @@
 use crate::commands::{self, Action};
-use mlua::{Function, Lua, RegistryKey, Value};
+use mlua::{Function, IntoLua, Lua, RegistryKey, Value};
 use std::{
     cell::Cell,
     collections::{BTreeSet, HashMap},
@@ -89,6 +89,33 @@ impl LuaBinding {
     pub(crate) fn start(&self) -> Result<crate::lua::automation::Invocation> {
         let func: Function = self.lua.registry_value(&self.func).map_err(lua_error)?;
         crate::lua::automation::Invocation::new(Rc::clone(&self.lua), func).map_err(lua_error)
+    }
+}
+
+/// Owned response data, detached from the reader before Lua allocation.
+pub(crate) enum BindingValue {
+    Missing,
+    Builtin(Action),
+    Lua(String, Option<Function>),
+}
+
+impl IntoLua for BindingValue {
+    fn into_lua(self, lua: &Lua) -> mlua::Result<Value> {
+        match self {
+            Self::Missing => Ok(Value::Nil),
+            Self::Builtin(action) => format!(
+                "{}{}",
+                BUILTIN_PREFIX,
+                commands::builtin_action_name(action)
+            )
+            .into_lua(lua),
+            Self::Lua(help, function) => {
+                let table = lua.create_table()?;
+                table.set(1, help)?;
+                table.set(2, function)?;
+                Ok(Value::Table(table))
+            }
+        }
     }
 }
 
@@ -297,6 +324,7 @@ impl KeyBindings {
         }
     }
 
+    #[cfg(test)]
     pub fn binding_value_for_lua_mode(
         &self,
         mode: InputMode,
@@ -304,28 +332,28 @@ impl KeyBindings {
         lua: &Lua,
         allow_function: bool,
     ) -> mlua::Result<Value> {
-        let Some(binding) = self.binding_for_mode(mode, key) else {
-            return Ok(Value::Nil);
-        };
+        self.binding_snapshot_for_lua_mode(mode, key, allow_function)?
+            .into_lua(lua)
+    }
 
-        match binding {
-            Binding::Builtin(action) => Ok(Value::String(lua.create_string(format!(
-                "{}{}",
-                BUILTIN_PREFIX,
-                commands::builtin_action_name(*action)
-            ))?)),
-            Binding::Lua(binding) => {
-                let tbl = lua.create_table()?;
-                tbl.set(1, binding.help.as_str())?;
+    pub(crate) fn binding_snapshot_for_lua_mode(
+        &self,
+        mode: InputMode,
+        key: &str,
+        allow_function: bool,
+    ) -> mlua::Result<BindingValue> {
+        Ok(match self.binding_for_mode(mode, key) {
+            None => BindingValue::Missing,
+            Some(Binding::Builtin(action)) => BindingValue::Builtin(*action),
+            Some(Binding::Lua(binding)) => BindingValue::Lua(
+                binding.help.clone(),
                 if allow_function {
-                    let func: Function = binding.lua.registry_value(&binding.func)?;
-                    tbl.set(2, func)?;
+                    Some(binding.lua.registry_value(&binding.func)?)
                 } else {
-                    tbl.set(2, Value::Nil)?;
-                }
-                Ok(Value::Table(tbl))
-            }
-        }
+                    None
+                },
+            ),
+        })
     }
 
     pub fn builtin_action_from_value(value: &str) -> Result<Action> {

@@ -136,7 +136,6 @@ pub struct ScreenReader {
     config_dir: Option<PathBuf>,
     lua_ctx: Option<Rc<Lua>>,
     lua_ctx_weak: Option<WeakLua>,
-    lua_screen_reader_ptr: Option<Rc<RefCell<*mut ScreenReader>>>,
     lua_hooks: LuaHooks,
     lua_startup_speech_server_spec: Option<SpeechServerSpec>,
     lua_reload_staging: bool,
@@ -181,7 +180,6 @@ impl ScreenReader {
             config_dir: None,
             lua_ctx: None,
             lua_ctx_weak: None,
-            lua_screen_reader_ptr: None,
             lua_hooks: LuaHooks::default(),
             lua_startup_speech_server_spec: None,
             lua_reload_staging: false,
@@ -260,15 +258,6 @@ impl ScreenReader {
         self.lua_configuration_open = true;
     }
 
-    pub(crate) fn set_lua_runtime_context(
-        &mut self,
-        lua: Rc<Lua>,
-        screen_reader_ptr: Rc<RefCell<*mut ScreenReader>>,
-    ) {
-        self.set_lua_context(lua);
-        self.lua_screen_reader_ptr = Some(screen_reader_ptr);
-    }
-
     pub(crate) fn set_config_file(&mut self, config_file: Option<PathBuf>) {
         self.config_file = config_file;
     }
@@ -339,14 +328,6 @@ impl ScreenReader {
         self.speech
             .replace_lua_configuration_from(&mut candidate.speech);
 
-        if let Some(pointer) = self.lua_screen_reader_ptr.take() {
-            *pointer.borrow_mut() = std::ptr::null_mut();
-        }
-        let next_pointer = candidate.lua_screen_reader_ptr.take();
-        if let Some(pointer) = next_pointer.as_ref() {
-            *pointer.borrow_mut() = self as *mut ScreenReader;
-        }
-
         self.options = candidate.options;
         if !self.options.suppress_key_echo() {
             self.pending_key_echo.clear();
@@ -356,7 +337,6 @@ impl ScreenReader {
         self.key_bindings.replace_from(candidate.key_bindings);
         self.lua_ctx = candidate.lua_ctx;
         self.lua_ctx_weak = candidate.lua_ctx_weak;
-        self.lua_screen_reader_ptr = next_pointer;
         self.lua_hooks = candidate.lua_hooks;
         self.lua_configuration_open = false;
         for report in candidate.pending_runtime_errors {
