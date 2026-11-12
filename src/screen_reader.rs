@@ -924,6 +924,33 @@ mod tests {
     }
 
     #[test]
+    fn lua_option_dispatch_preserves_echo_reset_and_effective_auto_read() {
+        let (mut sr, _) = make_sr();
+        sr.set_suppress_key_echo(true);
+        sr.record_forwarded_character('x');
+        sr.key_echo_stream_active = true;
+        sr.set_reader_auto_read_suppressed(true);
+        let lua = mlua::Lua::new();
+        crate::lua::setup_repl(&lua).unwrap();
+        crate::lua::enter(&lua, &mut sr, || {
+            lua.load(
+                r#"
+            lector.o.suppress_key_echo = false
+            lector.o.suppress_key_echo = true
+            lector.o.auto_read = true
+            assert(not lector.o.auto_read)
+        "#,
+            )
+            .exec()
+        })
+        .unwrap();
+        assert!(sr.pending_key_echo.is_empty());
+        assert!(!sr.key_echo_stream_active);
+        sr.set_reader_auto_read_suppressed(false);
+        assert!(sr.auto_read_enabled());
+    }
+
+    #[test]
     fn auto_read_returns_false_when_unchanged() {
         let (mut sr, speaks) = make_sr();
         let mut view = View::new(4, 10);
