@@ -177,6 +177,7 @@ const TABLE_SETUP_BINDINGS: &[(&str, Action)] = &[
 
 pub(crate) struct BindingDescription {
     pub key: String,
+    pub action_id: String,
     pub help: String,
     pub inherited: bool,
 }
@@ -235,6 +236,16 @@ impl KeyBindings {
                 let help = binding.help_text();
                 Some(BindingDescription {
                     key: key.clone(),
+                    action_id: match binding {
+                        Binding::Builtin(action) => {
+                            format!("builtin:{}", crate::commands::builtin_action_name(*action))
+                        }
+                        Binding::Lua(binding) => binding
+                            .lua
+                            .registry_value::<Function>(&binding.func)
+                            .map(|func| format!("lua:{:p}", func.to_pointer()))
+                            .unwrap_or_else(|_| format!("key:{key}")),
+                    },
                     help: if help.is_empty() {
                         "custom binding (no description)".to_owned()
                     } else {

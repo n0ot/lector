@@ -58,45 +58,37 @@ pub(crate) struct BindingsView {
 
 fn entries(bindings: &KeyBindings) -> Vec<Entry> {
     let mut entries = Vec::new();
-    let mut add = |id: &str, text: &str| {
-        entries.push(Entry {
-            id: id.into(),
-            text: text.into(),
-        })
-    };
-    add("title", "Current key bindings");
-    add(
-        "usage",
-        "Use Review movement, / or ? to search, marks and yanks. q closes this buffer.",
-    );
-    add(
-        "precedence",
-        "Configured bindings take precedence over Review keys. Table contexts inherit normal bindings unless overridden.",
-    );
-    add(
-        "updates",
-        "Runtime changes refresh automatically. Removed entries move to the next surviving entry, then the previous one. Refresh cancels selections and invalidates this buffer's marks.",
-    );
     for mode in [InputMode::Normal, InputMode::Table, InputMode::TableSetup] {
         entries.push(Entry {
             id: format!("heading:{}", mode.as_str()),
             text: format!("{} bindings", mode.as_str()),
         });
-        for binding in bindings.describe_effective(mode) {
-            entries.push(Entry {
-                id: format!("{}:{}", mode.as_str(), binding.key),
-                text: format!(
-                    "{}  {}{}",
-                    binding.key,
-                    binding.help,
-                    if binding.inherited {
-                        " (inherited from normal)"
-                    } else {
-                        ""
-                    }
-                ),
-            });
+        let mut groups: Vec<(String, Entry)> = Vec::new();
+        for binding in bindings
+            .describe_effective(mode)
+            .into_iter()
+            .filter(|binding| !binding.inherited)
+        {
+            if let Some((_, entry)) = groups.iter_mut().find(|(id, _)| *id == binding.action_id) {
+                entry.text.push_str(&format!(", {}", binding.key));
+            } else {
+                // Builtins retain their row when shortcuts are added or removed.
+                // Custom rows retain their key across replacement callbacks.
+                let id = if binding.action_id.starts_with("builtin:") {
+                    binding.action_id.clone()
+                } else {
+                    binding.key.clone()
+                };
+                groups.push((
+                    binding.action_id,
+                    Entry {
+                        id: format!("{}:{id}", mode.as_str()),
+                        text: format!("{}  {}", binding.help, binding.key),
+                    },
+                ));
+            }
         }
+        entries.extend(groups.into_iter().map(|(_, entry)| entry));
     }
     entries.push(Entry {
         id: "heading:review".into(),
@@ -105,7 +97,7 @@ fn entries(bindings: &KeyBindings) -> Vec<Entry> {
     for (key, help) in HELP_BINDINGS {
         entries.push(Entry {
             id: format!("review:{key}"),
-            text: format!("{key}  {help}"),
+            text: format!("{help}  {key}"),
         });
     }
     entries
@@ -382,6 +374,90 @@ mod tests {
         &view.entries[index].id
     }
     #[test]
+    fn list_starts_with_bindings_and_groups_only_explicit_actions() {
+        let entries = entries(&KeyBindings::new());
+        assert_eq!(entries[0].id, "heading:normal");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.text.contains("inherited"))
+        );
+        let backspace = entries
+            .iter()
+            .find(|entry| entry.id == "normal:builtin:backspace")
+            .unwrap();
+        assert_eq!(
+            backspace.text,
+            format!("{}  Backspace, C-h", Action::Backspace.help_text())
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.id == "table:builtin:backspace")
+        );
+        let next = entries
+            .iter()
+            .find(|entry| entry.id == "table:builtin:table_row_next")
+            .unwrap();
+        assert_eq!(
+            next.text,
+            format!("{}  M-o, j", Action::TableRowNext.help_text())
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == "review:gx")
+                .unwrap()
+                .text,
+            "open the HTTP or HTTPS link under the Review cursor  gx"
+        );
+    }
+
+    #[test]
+    fn lua_aliases_group_by_callback_not_description() {
+        let lua = Rc::new(mlua::Lua::new());
+        let callback = lua.create_function(|_, ()| Ok(())).unwrap();
+        let different = lua.create_function(|_, ()| Ok(())).unwrap();
+        let mut bindings = KeyBindings::new();
+        for (key, function) in [("a", callback.clone()), ("b", callback), ("c", different)] {
+            bindings
+                .set_lua_binding_for_mode(
+                    InputMode::Normal,
+                    key.into(),
+                    "custom action".into(),
+                    lua.clone(),
+                    function,
+                )
+                .unwrap();
+        }
+        let entries = entries(&bindings);
+        let custom: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.text.starts_with("custom action"))
+            .collect();
+        assert_eq!(custom.len(), 2);
+        assert_eq!(custom[0].text, "custom action  a, b");
+        assert_eq!(custom[1].text, "custom action  c");
+    }
+
+    #[test]
+    fn removing_one_shortcut_preserves_the_action_row() {
+        let (mut sr, _) = setup();
+        let mut view = BindingsView::new(10, 80, BindingsSession::default(), &sr);
+        jump(&mut view, &mut sr, "normal:builtin:backspace");
+        sr.key_bindings_mut()
+            .clear_binding_for_mode(InputMode::Normal, "Backspace");
+        view.tick(&mut sr, &mut Vec::new()).unwrap();
+        assert_eq!(current_id(&view), "normal:builtin:backspace");
+        let row = view
+            .entries
+            .iter()
+            .find(|entry| entry.id == current_id(&view))
+            .unwrap();
+        assert_eq!(row.text, format!("{}  C-h", Action::Backspace.help_text()));
+    }
+
+    #[test]
     fn retired_view_destruction_cannot_overwrite_a_newer_session() {
         let (mut sr, _) = setup();
         let session = BindingsSession::default();
@@ -389,7 +465,7 @@ mod tests {
         jump(&mut old, &mut sr, "review:gx");
         old.on_close();
         let mut current = BindingsView::new(10, 80, session.clone(), &sr);
-        jump(&mut current, &mut sr, "normal:M-r");
+        jump(&mut current, &mut sr, "normal:builtin:open_review");
         input(&mut current, &mut sr, b"ma");
         current.on_close();
         drop(current);
@@ -397,9 +473,9 @@ mod tests {
         old.on_resize(8, 70);
         drop(old);
         let mut reopened = BindingsView::new(10, 80, session, &sr);
-        assert_eq!(current_id(&reopened), "normal:M-r");
+        assert_eq!(current_id(&reopened), "normal:builtin:open_review");
         input(&mut reopened, &mut sr, b"gg`a");
-        assert_eq!(current_id(&reopened), "normal:M-r");
+        assert_eq!(current_id(&reopened), "normal:builtin:open_review");
     }
 
     #[test]
@@ -421,7 +497,7 @@ mod tests {
     fn mutations_and_reload_preserve_entry_and_refresh_without_speech_or_idle_ticks() {
         let (mut sr, spoken) = setup();
         let mut view = BindingsView::new(10, 80, BindingsSession::default(), &sr);
-        jump(&mut view, &mut sr, "normal:M-r");
+        jump(&mut view, &mut sr, "normal:builtin:open_review");
         assert!(!view.wants_tick());
         sr.key_bindings_mut().set_builtin_binding_for_mode(
             InputMode::Normal,
@@ -434,7 +510,7 @@ mod tests {
             view.tick(&mut sr, &mut Vec::new()).unwrap(),
             ViewAction::Redraw
         ));
-        assert_eq!(current_id(&view), "normal:M-r");
+        assert_eq!(current_id(&view), "normal:builtin:open_review");
         assert!(spoken.borrow().is_empty());
         assert!(!view.wants_tick());
         let mut replacement = KeyBindings::new();
@@ -446,9 +522,18 @@ mod tests {
         sr.key_bindings_mut().replace_from(replacement);
         assert!(view.wants_tick());
         view.tick(&mut sr, &mut Vec::new()).unwrap();
-        assert!(view.entries.iter().any(|entry| entry.id == "normal:bbb"));
-        assert!(!view.entries.iter().any(|entry| entry.id == "normal:aaa"));
-        assert_eq!(current_id(&view), "normal:M-r");
+        assert!(
+            view.entries
+                .iter()
+                .any(|entry| entry.text.ends_with(", bbb"))
+        );
+        assert!(
+            !view
+                .entries
+                .iter()
+                .any(|entry| entry.text.ends_with(", aaa"))
+        );
+        assert_eq!(current_id(&view), "normal:builtin:open_review");
         assert!(spoken.borrow().is_empty());
     }
     #[test]
@@ -460,15 +545,17 @@ mod tests {
             Action::OpenBindings,
         );
         let mut view = BindingsView::new(10, 80, BindingsSession::default(), &sr);
-        jump(&mut view, &mut sr, "normal:aaa");
+        jump(&mut view, &mut sr, "normal:builtin:open_bindings");
         let old_index = view
             .entries
             .iter()
-            .position(|entry| entry.id == "normal:aaa")
+            .position(|entry| entry.id == "normal:builtin:open_bindings")
             .unwrap();
         let next = view.entries[old_index + 1].id.clone();
         sr.key_bindings_mut()
             .clear_binding_for_mode(InputMode::Normal, "aaa");
+        sr.key_bindings_mut()
+            .clear_binding_for_mode(InputMode::Normal, "M-?");
         view.tick(&mut sr, &mut Vec::new()).unwrap();
         assert_eq!(current_id(&view), next);
         view.on_resize(6, 25);
@@ -481,7 +568,8 @@ mod tests {
         let mut view = BindingsView::new(10, 80, session.clone(), &sr);
         input(&mut view, &mut sr, b"/open the HTTP\r");
         assert_eq!(current_id(&view), "review:gx");
-        input(&mut view, &mut sr, b"0mayy");
+        input(&mut view, &mut sr, b"0");
+        input(&mut view, &mut sr, b"mayy");
         assert!(sr.clipboard_text().unwrap().contains("open the HTTP"));
         view.on_close();
         drop(view);

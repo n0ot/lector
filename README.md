@@ -497,9 +497,10 @@ You don’t need to memorize everything. Help Mode will tell you what each key d
 ### Review overlay (reading past output)
 
 Press `M-?` (Alt+?) to open a searchable buffer of current bindings. It lists
-normal, table, and table-setup bindings, including Lua descriptions and inherited
-normal bindings, followed by Review command syntax. Configured bindings take
-precedence over Review keys. Use Review movement, `/` or `?`, marks, and yanks;
+normal, table, and table-setup bindings, including Lua descriptions, followed by
+Review command syntax. Each row shows the action first, with its shortcuts
+grouped together. Inherited normal bindings appear only in the normal section.
+Configured bindings take precedence over Review keys. Use Review movement, `/` or `?`, marks, and yanks;
 `q` returns to the underlying view. The `open_bindings` action can be rebound.
 
 This buffer has its own saved cursor, marks, search, and character-find state.
