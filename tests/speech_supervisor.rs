@@ -333,26 +333,31 @@ fn real_process_reconfiguration_is_transactional_and_preserves_exact_args() {
 }
 
 #[cfg(target_os = "macos")]
-#[test]
-fn native_speech_parent_watchdog_rejects_a_mismatched_parent_promptly() {
-    let started = Instant::now();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_lector"))
-        .args(["tts", "--parent-pid", &u32::MAX.to_string()])
-        .env("LECTOR_SPEECH_TEST_MUTE", "1")
-        .spawn()
-        .expect("spawn native speech helper with mismatched parent");
-    let deadline = started + Duration::from_secs(2);
-    loop {
-        if let Some(status) = child.try_wait().expect("query native speech helper") {
-            assert!(!status.success());
-            assert!(started.elapsed() < Duration::from_secs(2));
-            break;
+mod native_speech {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires native audio; run scripts/test-native-speech"]
+    fn native_speech_parent_watchdog_rejects_a_mismatched_parent_promptly() {
+        let started = Instant::now();
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_lector"))
+            .args(["tts", "--parent-pid", &u32::MAX.to_string()])
+            .env("LECTOR_SPEECH_TEST_MUTE", "1")
+            .spawn()
+            .expect("spawn native speech helper with mismatched parent");
+        let deadline = started + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().expect("query native speech helper") {
+                assert!(!status.success());
+                assert!(started.elapsed() < Duration::from_secs(2));
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("native speech parent watchdog did not exit within two seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("native speech parent watchdog did not exit within two seconds");
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }

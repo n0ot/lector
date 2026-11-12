@@ -14,3 +14,9 @@ test-group = 'real-tmux'
 [[profile.default.overrides]]
 filter = 'binary(live_pty) | binary(tmux_adversary_live)'
 test-group = 'live-pty'
+
+# Selected only by scripts/test-native-speech. A stalled native audio session
+# must fail within a bounded lifetime rather than strand local validation.
+[profile.native-speech]
+slow-timeout = { period = "15s", terminate-after = 4, grace-period = "2s" }
+test-threads = 1
