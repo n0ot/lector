@@ -87,6 +87,11 @@ pub(crate) enum Command {
     MoveVisual(Motion, usize),
     YankVisual(Option<ClipboardRegister>),
     StartSearch(SearchDirection),
+    SearchWord {
+        direction: SearchDirection,
+        whole: bool,
+        count: usize,
+    },
     RepeatSearch {
         reverse: bool,
         count: usize,
@@ -278,6 +283,18 @@ impl Parser {
             Key::Char('F') => self.start_find(FindDirection::Backward, false),
             Key::Char('t') => self.start_find(FindDirection::Forward, true),
             Key::Char('T') => self.start_find(FindDirection::Backward, true),
+            Key::Char('*') | Key::Char('#') => {
+                let count = self.take_count();
+                self.finish(Command::SearchWord {
+                    direction: if key == Key::Char('*') {
+                        SearchDirection::Forward
+                    } else {
+                        SearchDirection::Backward
+                    },
+                    whole: true,
+                    count,
+                })
+            }
             Key::Char('/') => {
                 let direction = SearchDirection::Forward;
                 self.finish(Command::StartSearch(direction))
@@ -415,6 +432,15 @@ impl Parser {
         let count = pending_count.unwrap_or(1).max(1);
         if self.visual.is_none() {
             let command = match (prefix, key) {
+                (Prefix::G, Key::Char('*') | Key::Char('#')) => Some(Command::SearchWord {
+                    direction: if key == Key::Char('*') {
+                        SearchDirection::Forward
+                    } else {
+                        SearchDirection::Backward
+                    },
+                    whole: false,
+                    count,
+                }),
                 (Prefix::G, Key::Char('x')) => Some(Command::OpenLink),
                 (Prefix::G, Key::Char('y')) => Some(Command::CopyLink(
                     self.register.unwrap_or(ClipboardRegister::Internal),
@@ -759,6 +785,14 @@ pub(crate) const HELP_BINDINGS: &[(&str, &str)] = &[
         "repeat character find in its original / opposite direction",
     ),
     ("%", "jump to matching parenthesis, bracket or brace"),
+    (
+        "* / #",
+        "search the nearest whole keyword forward / backward",
+    ),
+    (
+        "g* / g#",
+        "search the nearest word forward / backward without word boundaries",
+    ),
     ("m{a-z}", "set a named mark in this source document"),
     (
         "'{a-z}",
@@ -833,6 +867,44 @@ mod tests {
 
     fn feed(parser: &mut Parser, keys: &[Key]) -> Vec<Command> {
         keys.iter().copied().map(|key| parser.feed(key)).collect()
+    }
+
+    #[test]
+    fn word_search_bindings_preserve_direction_count_and_reset_prefixes() {
+        for (key, direction) in [
+            ('*', SearchDirection::Forward),
+            ('#', SearchDirection::Backward),
+        ] {
+            for whole in [false, true] {
+                let mut parser = Parser::default();
+                parser.feed(Key::Char('3'));
+                if !whole {
+                    assert_eq!(parser.feed(Key::Char('g')), Command::None);
+                }
+                assert_eq!(
+                    parser.feed(Key::Char(key)),
+                    Command::SearchWord {
+                        direction,
+                        whole,
+                        count: 3
+                    }
+                );
+                assert_eq!(
+                    parser.feed(Key::Char(key)),
+                    Command::SearchWord {
+                        direction,
+                        whole: true,
+                        count: 1
+                    }
+                );
+            }
+        }
+        let mut parser = Parser::default();
+        parser.feed(Key::Char('v'));
+        assert_eq!(parser.feed(Key::Char('*')), Command::Bell);
+        parser.feed(Key::Escape);
+        parser.feed(Key::Char('y'));
+        assert_eq!(parser.feed(Key::Char('#')), Command::Bell);
     }
 
     #[test]
