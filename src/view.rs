@@ -3910,6 +3910,10 @@ mod tests {
         for prepare_full in [false, true] {
             for prepare_document in [false, true] {
                 let mut view = View::new(2, 8);
+                // Warm both previous entries before invalidating the current
+                // entries, so cold finalization must discard a valid baseline.
+                view.prepare_full_contents_cache();
+                view.prepare_document_contents_cache();
                 view.process_changes(b"one\r\ntwo\r\nthree");
                 if prepare_full {
                     view.prepare_full_contents_cache();
