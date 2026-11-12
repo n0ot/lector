@@ -126,7 +126,9 @@ The additive schema-1 compositor workloads `split-scene-panes` and
 rendering, and RenderOracle replay are outside both latency and allocation
 fences. Non-covering panes guarantee `blit_surface` executes, including negative
 origins, right/bottom clipping, and a full-width hyperlinked row. Plain and
-styled panes and out-of-order overlays cover copying cells and z-ordering.
+styled panes and overlapping overlays inserted out of z-order cover copying
+cells, blank-cell occlusion and layer ordering. Setup rejects an overlay fixture
+without visible overlap.
 Both alternating scenes warm up once before measurement; representative cells
 are checked against source snapshots and every measured composition is checked
 against rendered VT using RenderOracle. Here `input_bytes` is the encoded fixture

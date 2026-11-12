@@ -1241,7 +1241,10 @@ fn run_split_scene_workload(
             ));
         }
         if overlays {
-            for (id, row, col, z) in [(4, 5, 30, 20), (5, -1, 70, 10)] {
+            // Deliberately insert the top layer first. The lower layer overlaps
+            // it and clips at the right edge, so insertion order cannot stand
+            // in for the compositor's z-order sort.
+            for (id, row, col, z) in [(4, 5, 60, 20), (5, 7, 70, 10)] {
                 let mut engine = GhosttyEngine::new(3, 20).map_err(|e| e.to_string())?;
                 let content = format!(
                     "\x1b[1;33moverlay {variant}\r\n\x1b]8;;https://example.invalid/overlay\x1b\\linked\x1b]8;;\x1b\\"
@@ -1272,15 +1275,31 @@ fn run_split_scene_workload(
         let intended = PresentedScene::compose(scene).map_err(|e| e.to_string())?;
         let snapshot = intended.clone().into_terminal_snapshot();
         let blank = PresentedScene::blank(geometry).into_terminal_snapshot();
-        let mut overlays = scene.overlays.iter().collect::<Vec<_>>();
-        overlays.sort_by_key(|overlay| overlay.z_index);
+        let mut ordered_overlays = scene.overlays.iter().collect::<Vec<_>>();
+        ordered_overlays.sort_by_key(|overlay| overlay.z_index);
         let surfaces = scene
             .panes
             .iter()
-            .chain(overlays.iter().map(|o| &o.surface))
+            .chain(ordered_overlays.iter().map(|o| &o.surface))
             .collect::<Vec<_>>();
+        let mut overlapping_overlay_cells = 0;
         for row in 0..usize::from(geometry.rows) {
             for col in 0..usize::from(geometry.cols) {
+                if scene
+                    .overlays
+                    .iter()
+                    .filter(|overlay| {
+                        let origin = overlay.surface.origin;
+                        let size = overlay.surface.snapshot.geometry;
+                        (origin.row..origin.row + i32::from(size.rows)).contains(&(row as i32))
+                            && (origin.col..origin.col + i32::from(size.cols))
+                                .contains(&(col as i32))
+                    })
+                    .count()
+                    > 1
+                {
+                    overlapping_overlay_cells += 1;
+                }
                 let cell = surfaces
                     .iter()
                     .rev()
@@ -1294,6 +1313,9 @@ fn run_split_scene_workload(
                     return Err(format!("{name}: incorrect composed cell at {row},{col}"));
                 }
             }
+        }
+        if overlays && overlapping_overlay_cells == 0 {
+            return Err("overlay fixture must exercise visible overlapping layers".into());
         }
         expected.push(intended.clone());
         let batch = renderer
