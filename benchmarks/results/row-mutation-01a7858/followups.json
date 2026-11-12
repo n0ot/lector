@@ -1,0 +1,26 @@
+[
+  {
+    "variant": "base",
+    "run": "followup1",
+    "exit_code": 0,
+    "seconds": 8.94
+  },
+  {
+    "variant": "candidate",
+    "run": "followup1",
+    "exit_code": 0,
+    "seconds": 8.615
+  },
+  {
+    "variant": "candidate",
+    "run": "followup2",
+    "exit_code": 0,
+    "seconds": 8.655
+  },
+  {
+    "variant": "base",
+    "run": "followup2",
+    "exit_code": 0,
+    "seconds": 8.937
+  }
+]
