@@ -1,0 +1,159 @@
+[
+  {
+    "profile": "default",
+    "overrides": {},
+    "builds": [
+      {
+        "phase": "clean",
+        "wall_seconds": 31.26943004108034,
+        "exit_code": 0
+      },
+      {
+        "phase": "noop",
+        "wall_seconds": 0.1908612500410527,
+        "exit_code": 0
+      },
+      {
+        "phase": "leaf-rebuild",
+        "wall_seconds": 13.429338374873623,
+        "exit_code": 0
+      }
+    ],
+    "binary_bytes": {
+      "lector": 11077296,
+      "lector-ghostty-bench": 7412000
+    },
+    "rustc_codegen_flags": {
+      "library": [
+        "-C opt-level=3",
+        "-C embed-bitcode=no",
+        "-C strip=debuginfo"
+      ],
+      "binary": [
+        "-C opt-level=3",
+        "-C embed-bitcode=no",
+        "-C strip=debuginfo"
+      ]
+    }
+  },
+  {
+    "profile": "thin",
+    "overrides": {
+      "CARGO_PROFILE_RELEASE_LTO": "thin"
+    },
+    "builds": [
+      {
+        "phase": "clean",
+        "wall_seconds": 44.59241120796651,
+        "exit_code": 0
+      },
+      {
+        "phase": "noop",
+        "wall_seconds": 0.19654883304610848,
+        "exit_code": 0
+      },
+      {
+        "phase": "leaf-rebuild",
+        "wall_seconds": 28.072499041911215,
+        "exit_code": 0
+      }
+    ],
+    "binary_bytes": {
+      "lector": 11358032,
+      "lector-ghostty-bench": 7733232
+    },
+    "rustc_codegen_flags": {
+      "library": [
+        "-C opt-level=3",
+        "-C linker-plugin-lto",
+        "-C strip=debuginfo"
+      ],
+      "binary": [
+        "-C opt-level=3",
+        "-C lto=thin",
+        "-C strip=debuginfo"
+      ]
+    }
+  },
+  {
+    "profile": "fat",
+    "overrides": {
+      "CARGO_PROFILE_RELEASE_LTO": "fat"
+    },
+    "builds": [
+      {
+        "phase": "clean",
+        "wall_seconds": 62.97997120814398,
+        "exit_code": 0
+      },
+      {
+        "phase": "noop",
+        "wall_seconds": 0.20038987509906292,
+        "exit_code": 0
+      },
+      {
+        "phase": "leaf-rebuild",
+        "wall_seconds": 48.595323459012434,
+        "exit_code": 0
+      }
+    ],
+    "binary_bytes": {
+      "lector": 9204800,
+      "lector-ghostty-bench": 6494976
+    },
+    "rustc_codegen_flags": {
+      "library": [
+        "-C opt-level=3",
+        "-C linker-plugin-lto",
+        "-C strip=debuginfo"
+      ],
+      "binary": [
+        "-C opt-level=3",
+        "-C lto=fat",
+        "-C strip=debuginfo"
+      ]
+    }
+  },
+  {
+    "profile": "fat-one",
+    "overrides": {
+      "CARGO_PROFILE_RELEASE_LTO": "fat",
+      "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "1"
+    },
+    "builds": [
+      {
+        "phase": "clean",
+        "wall_seconds": 77.39923624997027,
+        "exit_code": 0
+      },
+      {
+        "phase": "noop",
+        "wall_seconds": 0.1932389170397073,
+        "exit_code": 0
+      },
+      {
+        "phase": "leaf-rebuild",
+        "wall_seconds": 60.835034457966685,
+        "exit_code": 0
+      }
+    ],
+    "binary_bytes": {
+      "lector": 8744784,
+      "lector-ghostty-bench": 6285840
+    },
+    "rustc_codegen_flags": {
+      "library": [
+        "-C opt-level=3",
+        "-C linker-plugin-lto",
+        "-C codegen-units=1",
+        "-C strip=debuginfo"
+      ],
+      "binary": [
+        "-C opt-level=3",
+        "-C lto=fat",
+        "-C codegen-units=1",
+        "-C strip=debuginfo"
+      ]
+    }
+  }
+]
