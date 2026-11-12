@@ -1,0 +1,5 @@
+error: Ghostty benchmark regression:
+direct-compositor-pipeline compositor throughput 0.460 MiB/s is below 0.500 MiB/s
+direct-drain-coalescing compositor throughput 0.615 MiB/s is below 0.700 MiB/s
+direct-drain-coalescing compositor p95 latency 80791 ns exceeds 80000 ns
+scrolling-lf-receipts compositor p95 latency 180958 ns exceeds 150000 ns

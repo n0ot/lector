@@ -1,8 +1,12 @@
 # Release profile experiment
 
-Adopt only `[profile.release] lto = "thin"`. On this machine, four balanced-order runs show repeatable improvements in parser/history (median 8.6–10.1%), composition (2.2–7.1%), scheduler (5.5%) and media (4.4%). Thin's parser/history, split-scene, tmux, scheduler and media elapsed ranges do not overlap the default ranges. Renderer differences are small and overlapping (median -1.7% to +1.1%); they do not support a distinct renderer improvement. All 20 full baseline gates passed, with unchanged allocation counts/bytes, outputs and receipt counts. No workload, baseline, panic strategy or native dependency optimization changed.
+Retain the default release profile; no product setting is changed. Thin LTO was initially promising, but the current-base follow-up below failed a full timing gate while both default runs passed. Combined with higher build cost and a larger application binary, the mixed evidence does not justify global adoption.
 
-Fat LTO with implicit codegen defaults regressed split scenes by 14–16% and scheduling by 42%, despite parser gains. Fat LTO with one codegen unit removes those regressions and reduces binary size, but provides broadly similar runtime gains to thin while costing substantially more build time. Reject both alternatives. Results establish this macOS ARM64 tradeoff, not a universal cross-platform speedup; native/static CI remains required.
+## Original experiment
+
+On the original measured source, four balanced-order runs show repeatable improvements in parser/history (median 8.6–10.1%), composition (2.2–7.1%), scheduler (5.5%) and media (4.4%). Thin's parser/history, split-scene, tmux, scheduler and media elapsed ranges do not overlap the default ranges. Renderer differences are small and overlapping (median -1.7% to +1.1%); they do not support a distinct renderer improvement. All 20 full baseline gates passed, with unchanged allocation counts/bytes, outputs and receipt counts. No workload, baseline, panic strategy or native dependency optimization changed.
+
+Fat LTO with implicit codegen defaults regressed split scenes by 14–16% and scheduling by 42%, despite parser gains. Fat LTO with one codegen unit removes those regressions and reduces binary size, but provides broadly similar runtime gains to thin while costing substantially more build time. Neither fat alternative was selected. These original results describe one macOS ARM64 revision, not a universal cross-platform speedup or the final adoption decision.
 
 ## Fixed inputs and reproduction
 
@@ -30,7 +34,7 @@ Clean times include Rust dependencies, vendored C dependencies and all six binar
 | Fat | 62.98 | 0.20 | 48.60 | 9,204,800 | 6,494,976 |
 | Fat/1 | 77.40 | 0.19 | 60.84 | 8,744,784 | 6,285,840 |
 
-Thin increases observed clean build cost 43%, leaf rebuild 109%, and application size 2.5%. Accept this release-build cost for the repeated hot-path gains; ordinary development profiles remain unchanged.
+Thin increases observed clean build cost 43%, leaf rebuild 109%, and application size 2.5%. The current-base uncertainty below does not justify accepting this cost. All product profiles remain unchanged.
 
 ## Runtime samples
 
@@ -57,6 +61,24 @@ Each binary ran `lector-ghostty-bench --check-baseline benchmarks/ghostty-releas
 | backpressure-recovery | 73.99 (73.69–74.39) | -5.5% | +42.1% | -5.2% | -5.3% |
 | kitty-media-recomposition | 6.52 (6.52–6.57) | -4.4% | -3.8% | -4.6% | -3.9% |
 
-## Validation
+## Original candidate validation
 
-All four experimental release builds and all 20 full benchmark gates passed before the product change. After adopting the manifest setting, `cargo build -r --locked` passed using the thin target directory with no LTO environment override. The full workspace/all-target/all-feature host suite passed 1,461 tests. Release-mode library/App/live-PTY/presentation tests also passed (1,001 tests), including safe Lua unwind restoration and silent project fixtures. The final manifest-built benchmark passed the unchanged full baseline gate (`final-thin-gate.json`). The unchanged Docker harness passed private-terminfo 1/1 and real-tmux 11/11 using the verified Linux ARM64 image and shared artifact volumes; no retries or timeout changes. Current-revision CI is required before merge.
+All four experimental release builds and all 20 full benchmark gates passed before the product change. During the initial Thin LTO candidate validation, `cargo build -r --locked` passed using the thin target directory with no LTO environment override. The full workspace/all-target/all-feature host suite passed 1,461 tests. Release-mode library/App/live-PTY/presentation tests also passed (1,001 tests), including safe Lua unwind restoration and silent project fixtures. The final manifest-built benchmark passed the unchanged full baseline gate (`final-thin-gate.json`). The unchanged Docker harness passed private-terminfo 1/1 and real-tmux 11/11 using the verified Linux ARM64 image and shared artifact volumes; no retries or timeout changes. Current-revision CI is required before merge.
+
+## Current-master integration and final decision
+
+Original candidate head `2ee7e853bb81a3015d61f05df27afc855976601c` on `8f317bcf0d3f837a1d8268dbeedd478315168788` was independently reviewed and passed all native/static CI. A clean, patch-equivalent rebase produced `f9aee682b444886b1ebe87b402fca86d74994397` on `d4c1b1f3ab65207db37e177c0b36c91dd4425e55`. Intervening changes share terminal identity types/remove an obsolete feature wrapper (#70), encapsulate the bounded accessibility journal (#72), and reduce compositor row mutation (#74). The last change affects measured hot paths, so the original performance result was not assumed to transfer.
+
+Both profiles were rebuilt on this base in their isolated target directories. Thin used the temporary candidate manifest; default used `CARGO_PROFILE_RELEASE_LTO=false`, restoring the original Cargo release setting. Both retained the same Rust/Ghostty inputs. Full host tests passed 1,466 cases and the then-candidate release library/App/live-PTY/presentation suite passed 1,005. These checks did not resolve runtime timing behavior.
+
+A bounded quiet-window follow-up ran default1, thin1, thin2, then a separately authorized default2 continuation. Default1 and thin1 passed the unchanged full baseline; thin2 failed, emitted stderr, and emitted **no JSON report**. Default2 passed. Successful raw reports are `rebased-default-1.json`, `rebased-thin-1.json`, and `rebased-default-2.json`; exact failure is `rebased-thin-2-failure.txt`. No further timing retries were performed.
+
+The failed Thin run reported:
+
+- Direct pipeline throughput 0.460 MiB/s, below 0.500.
+- Drain coalescing throughput 0.615 MiB/s, below 0.700, and p95 80,791 ns, above 80,000.
+- Scrolling LF receipts p95 180,958 ns, above 150,000.
+
+The successful Thin sample retained split-scene/scheduler gains (panes 137 ms versus default 151–159 ms; overlays 150 versus 160–165; scheduler 570 versus 592–608), but shell workload time was 174 ms versus 161–166 ms and drain timing overlapped. This is mixed evidence, not a reproducible current-base improvement across all relevant workloads. No scheduling/load cause is inferred from the failure, and passing original-base CI or prior runs does not erase it.
+
+The final PR removes the proposed Cargo setting and preserves defaults. It changes only this experiment's evidence. After removing the candidate setting, final `cargo build -r --locked` passed with no LTO environment override. Product source is identical to the current-master default used for the two successful current-base gates; host tests are unchanged. No new Docker run is required for this evidence-only result: current-master compatibility was validated with the merged changes, and this final revision changes no product code, dependencies, profile, workload, or test behavior. Original candidate Docker results above remain historical evidence, not a newly executed current-base check.

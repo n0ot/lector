@@ -81,9 +81,6 @@ core-foundation = "0.10"
 [dev-dependencies]
 tempfile = "3.25.0"
 
-[profile.release]
-lto = "thin"
-
 [profile.test]
 debug = "line-tables-only"
 
