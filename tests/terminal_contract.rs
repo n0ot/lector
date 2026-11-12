@@ -391,7 +391,7 @@ fn printed_run_coalescing_preserves_boundary_text_across_every_grouping() {
         boundary,
         text: text.into(),
     };
-    let runs = vec![
+    let runs = [
         run(PrintBoundary::Continue, "prefix"),
         run(PrintBoundary::CarriageReturn, ""),
         run(PrintBoundary::LineFeed, "first"),
