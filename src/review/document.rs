@@ -19,6 +19,18 @@ pub(crate) struct SearchMatch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SearchMode {
+    Regex,
+    Word { whole_keyword: bool },
+}
+
+pub(crate) struct WordSearch {
+    pub query: String,
+    pub origin: HistoryPosition,
+    pub mode: SearchMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SearchFailure {
     InvalidPattern,
     NotFound,
@@ -43,6 +55,10 @@ struct Row {
 pub(crate) enum WordStyle {
     Word,
     BigWord,
+}
+
+fn is_keyword_character(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -638,7 +654,7 @@ impl ReviewDocument {
         };
         if ch.is_whitespace() {
             0
-        } else if style == WordStyle::BigWord || ch.is_alphanumeric() || ch == '_' {
+        } else if style == WordStyle::BigWord || is_keyword_character(ch) {
             1
         } else {
             2
@@ -804,6 +820,51 @@ impl ReviewDocument {
             .map(|p| self.clamp(p))
     }
 
+    /// Select a keyword under/after the cursor on this logical line, falling
+    /// back to the nonblank word under/after it when no keyword remains.
+    pub(crate) fn word_search(&self, position: HistoryPosition, whole: bool) -> Option<WordSearch> {
+        let position = self.clamp(position);
+        let line = self.logical_line_range(position.row);
+        let cells: Vec<_> = self
+            .positions
+            .iter()
+            .copied()
+            .filter(|p| line.contains(&p.row))
+            .collect();
+        let current = cells.iter().position(|p| *p >= position)?;
+        let keyword =
+            (current..cells.len()).find(|&i| self.word_class(cells[i], WordStyle::Word) == 1);
+        let (index, style) = if let Some(index) = keyword {
+            (index, WordStyle::Word)
+        } else {
+            (
+                (current..cells.len())
+                    .find(|&i| self.word_class(cells[i], WordStyle::BigWord) != 0)?,
+                WordStyle::BigWord,
+            )
+        };
+        let mut first = index;
+        let mut last = index;
+        while first > 0 && self.word_class(cells[first - 1], style) == 1 {
+            first -= 1;
+        }
+        while last + 1 < cells.len() && self.word_class(cells[last + 1], style) == 1 {
+            last += 1;
+        }
+        let text: String = cells[first..=last]
+            .iter()
+            .map(|p| self.cell_text(*p))
+            .collect();
+        Some(WordSearch {
+            query: regex::escape(&text),
+            origin: cells[first],
+            mode: SearchMode::Word {
+                whole_keyword: whole && keyword.is_some(),
+            },
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn search(
         &self,
         query: &str,
@@ -811,12 +872,66 @@ impl ReviewDocument {
         direction: SearchDirection,
         count: usize,
     ) -> Result<SearchMatch, SearchFailure> {
+        self.search_with_mode(query, position, direction, count, SearchMode::Regex)
+    }
+
+    pub(crate) fn search_with_mode(
+        &self,
+        query: &str,
+        position: HistoryPosition,
+        direction: SearchDirection,
+        count: usize,
+        mode: SearchMode,
+    ) -> Result<SearchMatch, SearchFailure> {
         let regex = RegexBuilder::new(query)
             .multi_line(true)
             .build()
             .map_err(|_| SearchFailure::InvalidPattern)?;
-        let matches = regex
-            .find_iter(&self.flat_text)
+        // Literal word matches cannot split a displayed grapheme. Whole-word
+        // boundaries use the same alphanumeric/underscore classification as
+        // Review movement, rather than the regex engine's broader Unicode \w.
+        let mut boundaries = Vec::new();
+        if matches!(mode, SearchMode::Word { .. }) {
+            boundaries.extend(self.flat_text.grapheme_indices(true).map(|(offset, text)| {
+                (
+                    offset,
+                    text.chars().next().is_some_and(is_keyword_character),
+                )
+            }));
+            boundaries.push((self.flat_text.len(), false));
+        }
+        let candidates: Box<dyn Iterator<Item = regex::Match<'_>> + '_> = match mode {
+            SearchMode::Regex => Box::new(regex.find_iter(&self.flat_text)),
+            SearchMode::Word { .. } => {
+                let mut offset = Some(0);
+                let regex = &regex;
+                let boundaries = &boundaries;
+                Box::new(std::iter::from_fn(move || {
+                    let found = regex.find_at(&self.flat_text, offset?)?;
+                    // A rejected partial-grapheme match must not hide a later
+                    // overlapping match that begins at a complete grapheme.
+                    let next = boundaries.partition_point(|(start, _)| *start <= found.start());
+                    offset = boundaries.get(next).map(|(start, _)| *start);
+                    Some(found)
+                }))
+            }
+        };
+        let matches = candidates
+            .filter(|found| {
+                let SearchMode::Word { whole_keyword } = mode else {
+                    return true;
+                };
+                let Ok(start) =
+                    boundaries.binary_search_by_key(&found.start(), |(offset, _)| *offset)
+                else {
+                    return false;
+                };
+                let Ok(end) = boundaries.binary_search_by_key(&found.end(), |(offset, _)| *offset)
+                else {
+                    return false;
+                };
+                !whole_keyword || ((start == 0 || !boundaries[start - 1].1) && !boundaries[end].1)
+            })
             .filter_map(|found| self.position_for_offset(found.start()))
             .collect::<Vec<_>>();
         if matches.is_empty() {
@@ -1166,6 +1281,134 @@ mod tests {
 
     fn pos(row: usize, col: u16) -> HistoryPosition {
         HistoryPosition { row, col }
+    }
+
+    #[test]
+    fn word_search_selects_keyword_then_nonblank_fallback_on_logical_line() {
+        let (document, _) =
+            ReviewDocument::from_lines(&["  -- alpha.beta  [.*]".into(), "next".into()], 8);
+        let selected = document.word_search(pos(0, 2), true).unwrap();
+        assert_eq!(selected.query, "alpha");
+        assert_eq!(selected.origin, pos(0, 5));
+        assert_eq!(
+            selected.mode,
+            super::SearchMode::Word {
+                whole_keyword: true
+            }
+        );
+        let selected = document.word_search(pos(1, 2), true).unwrap();
+        assert_eq!(selected.query, "beta");
+        let selected = document.word_search(pos(2, 1), true).unwrap();
+        assert_eq!(selected.query, regex::escape("[.*]"));
+        assert_eq!(
+            selected.mode,
+            super::SearchMode::Word {
+                whole_keyword: false
+            }
+        );
+        let (blank, _) = ReviewDocument::from_lines(&["   ".into(), "later".into()], 10);
+        assert!(blank.word_search(pos(0, 0), true).is_none());
+    }
+
+    #[test]
+    fn word_search_boundaries_counts_and_literal_punctuation_are_preserved() {
+        let (document, _) = ReviewDocument::from_lines(&["cat scatter cat cat".into()], 40);
+        let word = document.word_search(pos(0, 1), true).unwrap();
+        let find = |direction, count| {
+            document
+                .search_with_mode(&word.query, word.origin, direction, count, word.mode)
+                .unwrap()
+        };
+        assert_eq!(find(SearchDirection::Forward, 1).position, pos(0, 12));
+        assert_eq!(find(SearchDirection::Forward, 2).position, pos(0, 16));
+        assert_eq!(find(SearchDirection::Backward, 1).position, pos(0, 16));
+        let partial = document.word_search(pos(0, 0), false).unwrap();
+        assert_eq!(
+            document
+                .search_with_mode(
+                    &partial.query,
+                    partial.origin,
+                    SearchDirection::Forward,
+                    1,
+                    partial.mode
+                )
+                .unwrap()
+                .position,
+            pos(0, 5)
+        );
+        let (punctuation, _) = ReviewDocument::from_lines(&["[.*] [xx] [.*]".into()], 40);
+        // At the final token no keyword remains to the right: fallback must
+        // search punctuation literally, not interpret it as a regex.
+        let word = punctuation.word_search(pos(0, 11), true).unwrap();
+        assert_eq!(word.query, regex::escape("[.*]"));
+        let found = punctuation
+            .search_with_mode(
+                &word.query,
+                word.origin,
+                SearchDirection::Forward,
+                1,
+                word.mode,
+            )
+            .unwrap();
+        assert_eq!(found.position, pos(0, 0));
+        assert_eq!(found.total, 2);
+    }
+
+    #[test]
+    fn word_search_respects_unicode_graphemes_and_review_keyword_class() {
+        let (document, _) = ReviewDocument::from_lines(&["界é 界éx 界é".into()], 5);
+        let word = document.word_search(pos(0, 0), true).unwrap();
+        let found = document
+            .search_with_mode(
+                &word.query,
+                word.origin,
+                SearchDirection::Forward,
+                1,
+                word.mode,
+            )
+            .unwrap();
+        assert_eq!(found.total, 2);
+        let (document, _) = ReviewDocument::from_lines(&["e e\u{301} e".into()], 40);
+        let word = document.word_search(pos(0, 0), false).unwrap();
+        let found = document
+            .search_with_mode(
+                &word.query,
+                word.origin,
+                SearchDirection::Forward,
+                1,
+                word.mode,
+            )
+            .unwrap();
+        assert_eq!(found.position, pos(0, 4));
+        assert_eq!(found.total, 2); // literal searches never split e + accent
+        let (overlap, _) = ReviewDocument::from_lines(&["a\u{301}a a\u{301}a\u{301}a".into()], 40);
+        let word = overlap.word_search(pos(0, 0), false).unwrap();
+        let found = overlap
+            .search_with_mode(
+                &word.query,
+                word.origin,
+                SearchDirection::Forward,
+                1,
+                word.mode,
+            )
+            .unwrap();
+        assert_eq!(found.position, pos(0, 4));
+        assert_eq!(found.total, 2);
+        let (document, _) = ReviewDocument::from_lines(&["foo e\u{301}foo foo".into()], 40);
+        let word = document.word_search(pos(0, 0), true).unwrap();
+        assert_eq!(
+            document
+                .search_with_mode(
+                    &word.query,
+                    word.origin,
+                    SearchDirection::Forward,
+                    1,
+                    word.mode
+                )
+                .unwrap()
+                .total,
+            2
+        );
     }
 
     #[test]

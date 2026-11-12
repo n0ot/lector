@@ -1852,6 +1852,57 @@ fn review_search_repeat_and_inner_word_yank_feed_f7_clipboard_paste() {
 }
 
 #[test]
+fn review_word_searches_route_shifted_keys_and_counts_in_all_protocols() {
+    for scheduled in [false, true] {
+        for (star, hash) in [
+            (b"*".as_slice(), b"#".as_slice()),
+            (b"\x1b[42;2u".as_slice(), b"\x1b[35;2u".as_slice()),
+            (b"\x1b[27;2;42~".as_slice(), b"\x1b[27;2;35~".as_slice()),
+        ] {
+            for (prefix, key, expected) in [
+                (b"".as_slice(), star, "gamma"),
+                (b"".as_slice(), hash, "delta"),
+                (b"g".as_slice(), star, "beta"),
+                (b"2g".as_slice(), hash, "gamma"),
+            ] {
+                let (mut app, mut sr, _, clock) = make_app();
+                if scheduled {
+                    app.enable_output_scheduler(OutputSchedulerConfig::default());
+                }
+                let mut pty = Vec::new();
+                let mut term = Vec::new();
+                let present = |app: &mut App, sr: &mut ScreenReader, output: &mut Vec<u8>| {
+                    clock.advance_ms(100);
+                    if scheduled {
+                        app.drain_scheduled_output(output, false).unwrap();
+                    }
+                    app.handle_tick(sr, &mut Vec::new(), output).unwrap();
+                };
+                app.handle_pty(
+                    &mut sr,
+                    b"cat alpha scatter beta cat gamma cat delta\x1b[H",
+                    &mut term,
+                )
+                .unwrap();
+                present(&mut app, &mut sr, &mut term);
+                app.handle_stdin(&mut sr, b"\x1br", &mut pty, &mut term)
+                    .unwrap();
+                present(&mut app, &mut sr, &mut term);
+                app.handle_stdin(&mut sr, prefix, &mut pty, &mut term)
+                    .unwrap();
+                app.handle_stdin(&mut sr, key, &mut pty, &mut term).unwrap();
+                app.handle_stdin(&mut sr, b"wyiwq", &mut pty, &mut term)
+                    .unwrap();
+                present(&mut app, &mut sr, &mut term);
+                app.handle_stdin(&mut sr, b"\x1b[18~", &mut pty, &mut term)
+                    .unwrap();
+                assert_eq!(pty, expected.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
 fn review_jump_history_is_protocol_invariant_and_survives_reopening() {
     for scheduled in [false, true] {
         for (older, newer) in [

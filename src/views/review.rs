@@ -2,7 +2,7 @@ use super::{Result, ViewAction, ViewController, ViewKind};
 use crate::{
     line_editor::{EditorAction, LineEditor},
     review::{
-        document::{ReviewDocument, SearchDirection, SearchFailure, SearchMatch},
+        document::{ReviewDocument, SearchDirection, SearchFailure, SearchMatch, SearchMode},
         navigation::{LastFind, LastSearch, NavigationCapture, SharedNavigation, mark_index},
         parser::{
             Command, FindDirection, Key, Motion, Parser, TextObject, ViewportPlacement, VisualKind,
@@ -311,21 +311,28 @@ impl ReviewView {
 
     fn finish_search(&mut self, sr: &mut ScreenReader) -> Result<ViewAction> {
         let prompt = self.search_prompt.as_ref().expect("search prompt");
-        let query = if prompt.query.is_empty() {
+        let (query, mode) = if prompt.query.is_empty() {
             let Some(last) = self.navigation.borrow().search.clone() else {
                 sr.speak("no previous search", false)?;
                 return Ok(ViewAction::Bell);
             };
-            last.query.clone()
+            (last.query.clone(), last.mode)
         } else {
-            prompt.query.clone()
+            (prompt.query.clone(), SearchMode::Regex)
         };
         let direction = prompt.direction;
-        let found = match self.document.search(&query, self.cursor, direction, 1) {
+        let found = match self
+            .document
+            .search_with_mode(&query, self.cursor, direction, 1, mode)
+        {
             Ok(found) => found,
             Err(error) => return Self::announce_search_failure(sr, error),
         };
-        self.navigation.borrow_mut().search = Some(LastSearch { query, direction });
+        self.navigation.borrow_mut().search = Some(LastSearch {
+            query,
+            direction,
+            mode,
+        });
         self.search_prompt = None;
         self.present_search_match(sr, found)
     }
@@ -492,6 +499,32 @@ impl ReviewView {
                 self.render();
                 Ok(ViewAction::Redraw)
             }
+            Command::SearchWord {
+                direction,
+                whole,
+                count,
+            } => {
+                let Some(word) = self.document.word_search(self.cursor, whole) else {
+                    sr.speak("no word at or after cursor", false)?;
+                    return Ok(ViewAction::Bell);
+                };
+                let found = match self.document.search_with_mode(
+                    &word.query,
+                    word.origin,
+                    direction,
+                    count,
+                    word.mode,
+                ) {
+                    Ok(found) => found,
+                    Err(error) => return Self::announce_search_failure(sr, error),
+                };
+                self.navigation.borrow_mut().search = Some(LastSearch {
+                    query: word.query,
+                    direction,
+                    mode: word.mode,
+                });
+                self.present_search_match(sr, found)
+            }
             Command::RepeatSearch { reverse, count } => {
                 let Some(last) = self.navigation.borrow().search.clone() else {
                     sr.speak("no previous search", false)?;
@@ -502,10 +535,13 @@ impl ReviewView {
                 } else {
                     last.direction
                 };
-                let found = match self
-                    .document
-                    .search(&last.query, self.cursor, direction, count)
-                {
+                let found = match self.document.search_with_mode(
+                    &last.query,
+                    self.cursor,
+                    direction,
+                    count,
+                    last.mode,
+                ) {
                     Ok(found) => found,
                     Err(error) => return Self::announce_search_failure(sr, error),
                 };
@@ -1575,6 +1611,67 @@ mod tests {
 
     fn input(view: &mut ReviewView, sr: &mut ScreenReader, bytes: &[u8]) -> ViewAction {
         view.handle_input(sr, bytes, &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn word_searches_repeat_persist_and_record_exact_jump_origins() {
+        let (_, mut sr, _) = setup(b"");
+        let mut source = View::new(3, 40);
+        source.process_changes(b"cat scatter cat cat");
+        source.set_review_history_position(HistoryPosition { row: 0, col: 1 });
+        let mut view = ReviewView::new(&mut source);
+        input(&mut view, &mut sr, b"*");
+        assert_eq!(view.cursor.col, 12);
+        input(&mut view, &mut sr, b"\x0f");
+        assert_eq!(view.cursor.col, 1);
+        input(&mut view, &mut sr, b"n");
+        assert_eq!(view.cursor.col, 12);
+        input(&mut view, &mut sr, b"#");
+        assert_eq!(view.cursor.col, 0);
+        input(&mut view, &mut sr, b"n");
+        assert_eq!(view.cursor.col, 16);
+        input(&mut view, &mut sr, b"N");
+        assert_eq!(view.cursor.col, 0);
+        drop(view);
+        let mut reopened = ReviewView::new(&mut source);
+        input(&mut reopened, &mut sr, b"n");
+        assert_eq!(reopened.cursor.col, 0); // backward from source column 1
+        input(&mut reopened, &mut sr, b"/\r");
+        assert_eq!(reopened.cursor.col, 12); // retains whole-keyword mode
+        input(&mut reopened, &mut sr, b"/cat\r");
+        assert_eq!(reopened.cursor.col, 16);
+        input(&mut reopened, &mut sr, b"n");
+        assert_eq!(reopened.cursor.col, 0);
+        input(&mut reopened, &mut sr, b"n");
+        assert_eq!(reopened.cursor.col, 5); // explicit regex reset word mode
+        input(&mut reopened, &mut sr, b"0g*");
+        assert_eq!(reopened.cursor.col, 5);
+    }
+
+    #[test]
+    fn no_word_reports_failure_without_overwriting_search_memory() {
+        let (mut view, mut sr, spoken) = setup(b"word word\r\n    ");
+        input(&mut view, &mut sr, b"*");
+        let saved = view
+            .navigation
+            .borrow()
+            .search
+            .as_ref()
+            .unwrap()
+            .query
+            .clone();
+        input(&mut view, &mut sr, b"j");
+        assert!(matches!(input(&mut view, &mut sr, b"*"), ViewAction::Bell));
+        assert_eq!(
+            view.navigation.borrow().search.as_ref().unwrap().query,
+            saved
+        );
+        assert!(
+            spoken
+                .borrow()
+                .iter()
+                .any(|text| text == "no word at or after cursor")
+        );
     }
 
     #[test]

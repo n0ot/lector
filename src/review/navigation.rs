@@ -1,6 +1,9 @@
 //! Source-owned navigation memory. Captures retain validity guards, not live
 //! terminal references: frozen Review remains navigable while its source runs.
-use super::{document::SearchDirection, parser::FindDirection};
+use super::{
+    document::{SearchDirection, SearchMode},
+    parser::FindDirection,
+};
 use crate::terminal::HistoryPosition;
 use std::{
     cell::{Cell, RefCell},
@@ -11,6 +14,7 @@ use std::{
 pub(crate) struct LastSearch {
     pub query: String,
     pub direction: SearchDirection,
+    pub mode: SearchMode,
 }
 
 #[derive(Clone, Copy, Debug)]

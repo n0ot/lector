@@ -577,6 +577,13 @@ Review has its own dependency-free vi command parser:
   line-based deduplication, Review retains distinct columns on the same line.
   Frozen snapshots remain navigable; reopening discards positions whose source
   identity expired, using the same conservative rules as marks.
+- `*` / `#` search forward / backward for the whole keyword under the cursor
+  (or the next keyword on that logical line). `g*` / `g#` allow matches inside
+  larger words. If no keyword remains, they search the nonblank word under or
+  after the cursor literally. Keywords use Review's Unicode alphanumeric and
+  underscore rules; counts work and literal matches never split graphemes.
+  These searches become the remembered search for `n` / `N` and empty `/` / `?`.
+  An explicitly entered regular expression replaces the word-search mode.
 - `/` and `?` search the complete frozen scrollback using regular expressions.
   `n` repeats in the same direction and `N` repeats in the opposite direction;
   searches wrap at the ends.
