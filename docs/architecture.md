@@ -231,8 +231,10 @@ incomparable and yield `Reintroduce`; auto-read does not need a resize-, reset-,
 overlay-, or tmux-specific branch. A complete-history lineage gap yields the
 more limited `VisibleGrid` comparison instead of guessing history identity.
 
-Activation announcements use the title from the completed presentation bundle,
-not a later logical controller value. This keeps both the selected document and
+In-place application-title changes and tmux renames update the model silently.
+A context handoff announces the current title rather than the full tmux location
+label. Activation announcements use the title from the completed presentation
+bundle, not a later logical controller value. This keeps both the selected document and
 its spoken name tied to the same physically flushed scene.
 
 Views removed from the logical stack remain owned only while they are named by
@@ -447,7 +449,8 @@ terminal only; they do not change what Lector promises to applications.
 
 ## Ghostty adapter and composition
 
-The local `lector-ghostty` crate wraps the official C API with private raw
+The `lector-ghostty` engine is mandatory across Cargo feature selections.
+The local crate wraps the official C API with private raw
 bindings and bootstrap-checked ABI layouts. Native handles remain on their
 constructing thread. `GhosttyEngine` exposes snapshot and viewport methods;
 `advance_update`, `resize_update`, `resize_with_geometry_update`, and
