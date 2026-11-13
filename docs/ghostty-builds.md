@@ -1,281 +1,10 @@
 # Building with libghostty-vt
 
-Ghostty is Lector's mandatory and sole terminal engine. Every PTY byte is
-parsed by `GhosttyEngine`, and its normalized cells, cursor, history, modes,
-semantic anchors, and effects drive accessibility. Lector has no `vt100`
-dependency or second production grid parser. The mandatory compositor renders
-from Ghostty state and never replays source application bytes.
-
-Use ordinary Cargo commands. On a cache miss, the adapter build automatically
-downloads and verifies the pinned build inputs and prepares the native archive:
-
-```sh
-cargo build --locked
-cargo build --locked --release
-cargo build --locked --no-default-features # compatibility feature off; engine is unchanged
-```
-
-Ordinary development and test builds link the `ReleaseFast` Ghostty archive
-even when Rust itself uses its debuggable development profile. Terminal
-parsing is on the interactive hot path, and Ghostty's Zig `Debug` mode is too
-slow to remain responsive during sustained output such as `yes`. Set
-`LECTOR_GHOSTTY_OPTIMIZE=Debug` only when debugging the Ghostty core itself.
-
-Lector does not depend on a third-party Rust wrapper. The local
-`crates/lector-ghostty` crate is a deliberately small safe boundary around the
-official Ghostty C API. Its raw declarations are private and its C ABI layout is
-checked against Ghostty's installed headers during the automatic bootstrap.
-
-## Authoritative engine
-
-`lector-ghostty` is mandatory with or without default features. The former
-empty `ghostty-vt` Cargo feature has been removed. Migrate existing build, test,
-and benchmark commands by removing `--features ghostty-vt`; the benchmark binary
-is now available without a feature flag.
-
-The adapter uses concrete `GhosttyEngine` methods instead of the former
-`TerminalEngine` trait. Calls needing Lector's infallible update summaries use
-`advance_update`, `resize_update`, `resize_with_geometry_update`, and
-`reset_update`. The existing fallible inherent methods and `try_*` methods retain
-their behavior. Snapshot and viewport methods are directly available on the
-concrete engine. Ghostty handles remain bound to their constructing thread.
-
-CI runs the complete authoritative suite, recording corpus, fragmentation
-tests, accessibility harnesses, and debug/release static-link checks. Checked-in
-differential recordings are regression inputs; their classification fields are
-documentation, not runtime policy.
-
-The adapter normalizes Ghostty cells into Lector's grapheme, width, style,
-hyperlink, wrapping, and history model. Background-only cells combine Ghostty's
-cell content color with its style metadata, including when captured from
-scrollback, so erased regions retain their application-selected color.
-Lector exposes at most 10,000
-scrollback rows. Ghostty's allocator prunes complete pages and therefore may
-physically retain additional rows; the adapter disables the independent byte
-cap, configures 20,000 lines of physical headroom, and clips its public model
-to the newest 10,000 logical rows. Sparse review marks use Ghostty tracked grid references and become
-invalid when their cell falls outside that logical window, even if an older
-physical page has not yet been reclaimed.
-
-Ghostty's public cell and row semantic APIs distinguish prompt, input, and
-output content, but they do not expose every historical OSC 133 A/B/C/D
-boundary or the exit status carried by `D`. The owned adapter therefore keeps
-a narrow fragmented-stream OSC 133 observer alongside Ghostty and anchors each
-completed boundary to Ghostty with a tracked grid reference. This preserves
-exact command phases and exit status across scrolling and reflow without
-treating Ghostty's current `cursor_at_prompt` boolean as semantic history.
-
-Auto-read consumes an engine-neutral `UpdateSummary` produced by the same
-advance call that mutates terminal state. It records printable runs, cursor and
-explicit-scroll operation counts, Ghostty's official full/partial render
-damage, normalized changed-row ranges, cursor and screen identity before and
-after the write, synchronized-output mode, and whether the batch crossed an
-actual false-to-true DEC private mode 2026 boundary. At that boundary the
-adapter splits processing at the marker and captures a full screen-and-history
-snapshot. Clearing the marker's mode bit yields the exact committed model from
-immediately before the frame: preceding bytes in the same input slice are
-included and following bytes are excluded, even when the escape sequence was
-fragmented across reads.
-
-Ghostty exposes the final cursor, screen, mode, and render state but does not
-expose printable or cursor-operation callbacks. The owned adapter's
-narrow `vte` stream observer therefore collects operation hints, OSC 133
-boundaries, and the active OSC 8 URI needed to annotate semantic operation
-hints. For semantic rendering it speculatively tracks only the
-cursor, scroll margins, origin, autowrap, and horizontal-margin mode required
-to locate an operation. It owns no cells, history, or second terminal grid,
-and discards all hints unless its final cursor agrees with Ghostty's
-authoritative state. Changed rows come from Ghostty's stateful global and
-per-row dirty flags; the adapter acknowledges both layers after each snapshot
-so damage cannot leak into a later frame.
-
-The compositor maps pane-local dirty rows into clipped scene
-coordinates and compares only those candidate cells with its confirmed
-`PresentedScene`. Incremental runs use absolute cursor placement and
-self-contained style and hyperlink state. Failed or partial physical writes,
-resize, suspend/resume, changed image state, inconsistent shadows, and damaged
-wrap metadata all invalidate the optimization and use the full-scene,
-oracle-tested fallback. Text damage around unchanged images can still use the
-incremental path without retransmitting image data.
-
-When operation hints are consistent with the authoritative scene, the
-compositor can apply full or partial scrolling, line/character insertion and
-deletion, erasure, and adjacent ASCII write runs directly to both the physical
-terminal and a cloned shadow. It accepts that shadow only after affected rows
-match Ghostty's intended scene and the complete transaction is flushed. Any
-occlusion, clipping, media changes, wide-cell ambiguity, geometry mismatch,
-unsupported operation, or failed validation falls back to the same
-dirty-region or full-scene correctness path. The release benchmark checks
-semantic-path coverage and compares bytes and latency with a pure dirty-region
-renderer on both a tmux-style structural workload and a Zellij-style layered
-redraw workload. Both retain an independently constructed full-redraw result as
-the correctness reference; the checked-in baseline gates semantic coverage,
-bytes, latency, scheduler bounds, peak RSS, and media throughput.
-
-OSC 8 hyperlinks remain part of the modeled cell state and are closed at every
-physical transaction boundary. Ghostty-decoded Kitty graphics live in bounded
-pane-scoped stores: uploads and placements have separate lifetimes, unchanged
-pixel buffers are shared, and scene composition maps pane-local identifiers to
-collision-safe outer identifiers. Placements are clipped to pane and overlay
-geometry, including partial occlusion; hidden uploads can remain cached while
-their placements are removed and later restored without retransmission. The
-outer backend chunks uploads, deletes stale placement and upload identifiers,
-and conservatively rebuilds its cache after physical-state uncertainty. A
-terminal without advertised Kitty support receives the complete text scene and
-no graphics protocol. The default limits are 32 MiB per image, 64 MiB per
-pane, 128 MiB per scene, and 4,096 placements.
-
-After its bounded initial focus-mode ownership query, the live event loop
-routes physical presentation and capability-control bytes through a single
-`OutputScheduler`. Standard output is nonblocking while the loop runs and is
-registered for writable readiness only after `EAGAIN`; the original descriptor
-flags are restored before terminal lifecycle cleanup. Scheduler writes retry
-`EINTR`, resume partial transactions without interleaving, and confirm a
-predicted `PresentedScene` only after its bytes flush successfully. Fatal
-writer errors invalidate renderer state for an authoritative reconstruction.
-
-Physical input and child PTY output are also nonblocking. Each drain turn is
-limited to 32 KiB or 4 ms, with the time and byte limits checked between
-reads of at most 8 KiB. Hitting a limit schedules an immediate continuation so an
-edge-triggered readiness notification is not lost, while returning control to
-input, presentation, and other ready sources. An open DEC 2026 frame receives
-no larger PTY budget.
-
-Modeled visual updates become eligible at the end of their current bounded
-event-loop turn and have a 64 KiB per-drain write budget. An unstarted render
-can be replaced by the newest
-authoritative scene. A replacement compares the complete viewport against the
-last confirmed presentation, since the newest parser damage alone omits earlier
-unflushed changes. Started transactions, lifecycle/control bytes, and
-bells are retained. This bounds obsolete incremental visual work
-without delaying terminal replies or input sent to the application PTY.
-Application mode 2026 is pane-local batching intent: Lector owns at most one
-physical synchronized-output wrapper and strips nested renderer wrappers. Each
-render carries stable view identities, model revisions, visible snapshots, and
-shared changed-history generations. Replacement drops bytes and accessibility
-state together; started renders retain both through their successful flush.
-Raw application input and terminal replies are not held behind presentation.
-This does not eliminate the normal coordinate time-of-check to time-of-use race
-between reading a cell and sending input to an application that remains live.
-
-A real close makes its render eligible but publishes nothing to accessibility
-until that exact render flushes. Activity refreshes a 100 ms idle timeout, while
-a 2-second hard cap bounds a continuously updating transaction. On timeout the
-scheduler may release a partial render and ignores further holds in the epoch
-until its real close. The old frame remains readable during backpressure; after
-flush, the exact released generation becomes readable, never newer parser
-state. Lector-owned overlays and resizes remain responsive, and their active
-accessibility owner changes at the same completed scene boundary. Bells are
-emitted only after the visual transaction and its global synchronization
-boundary. Title,
-working-directory, progress, clipboard, and notification events remain typed
-scheduler work until activation; output policy is applied at that boundary
-instead of retaining raw escape strings. Pending effect payloads are bounded
-and UTF-8-safe, zero-byte secure-policy effects complete normally, and
-backpressured work counts against the same retention cap.
-
-The modeled compositor keeps the root terminal and every stacked Lector view as
-separate, stable-z scene surfaces. Source engines continue parsing while an
-overlay is visible; hidden source damage can therefore be confirmed as a valid
-zero-byte physical update when the overlay fully occludes it. Popping a layer
-recomposes from current authoritative snapshots instead of replaying buffered
-PTY data. Message, Review, Lua REPL, table-setup, and reviewable popup layers
-retain their existing input rules, while frozen Review and table-setup layers
-own independent cursors. Announcement and error popups produce a dismissal;
-confirmation popups distinguish `Enter` acceptance from `Escape` cancellation.
-
-Terminal side effects use the same pane boundary. Ghostty callbacks copy bell,
-title, working-directory, clipboard-write, desktop-notification, progress,
-query, and bounded unknown-sequence data into owned typed events before the
-callback returns. The callback userdata is boxed at a stable address, accessed
-only during synchronous terminal writes, drained after those writes return,
-and dropped after the Ghostty terminal handle. Unsupported APC payloads are
-limited to 256 bytes.
-
-Focus reporting, mouse protocol and encoding, bracketed paste, and Kitty
-keyboard flags are normalized into the terminal snapshot. Lector's existing
-focus, paste, mouse, and keyboard forwarding reads that pane-local state. Title
-and working-directory values are retained exactly as applications report them,
-including empty clears and raw `file://` URIs; they are not interpreted as SSH
-destinations.
-
-Lector virtualizes application-facing terminal identity. Application
-capability queries are never placed in physical-terminal output, are answered
-from the owning pane's stable Lector profile, and routed back only to that
-pane's PTY. A narrow observer fills
-the one current public-C-API gap for OSC 52 clipboard reads and generates the
-secure empty local reply; reads never reach the physical terminal.
-
-The child receives `TERM=xterm-256color`, and Lector removes inherited
-`TERMINFO`. It then supplies a target- and content-keyed private cache entry
-with the implemented terminfo `Sync` string. Lector prefers an overlay compiled
-from the host's own expanded `xterm-256color` entry, but the binary includes a
-compiled ncurses fallback for supported macOS and Linux systems when bounded
-`infocmp` or `tic` execution is unavailable or fails. If the normal cache is
-unusable or its bounded lock is contended, a process-owned temporary fallback
-survives for the child process's lifetime. Extraction is automatic and never
-modifies a system or normal user terminfo database. This makes DEC mode 2026
-discoverable to an ordinary local nested tmux client while the public,
-remotely portable terminal name remains unchanged. The private directory is not
-normally transported by SSH, so remote tmux uses its remote terminfo database
-and Lector's legacy stabilization path unless that host independently advertises
-`Sync`; direct mode-query replies can still traverse SSH. A pure `tmux -CC`
-client has no rendering tty and is not expected to expose `Sync` through
-`tmux info`; Lector instead stabilizes its `%output` stream at the compositor
-boundary. Lector does not inherit an outer vendor identity or advertise
-`xterm-ghostty`; the Ghostty engine supplies parsing and terminal state, not
-Ghostty's complete application-facing protocol contract. Lector derives a
-separate physical profile from conservative defaults, outer terminfo, bounded
-startup probes, and explicit overrides. DA1 is the final
-physical query, and probe replies are consumed through its processing fence
-before input parsing. Application-originated OSC 52 writes enter Lector's
-internal clipboard history regardless of its configured default register or
-system-clipboard provider; they never reach the host or outer-terminal
-clipboard. Desktop notifications and unknown APC effects are dropped; title,
-working directory, progress, hyperlink, and bell state remain modeled. This
-separation keeps application promises independent of the outer terminal's
-identity and capabilities.
-
-Resize handling reads the outer terminal's complete Unix `winsize`, derives
-per-cell pixel dimensions from its cell and grid-pixel fields, and routes the
-same geometry to both the child PTY and the pane model. The PTY receives rows,
-columns, and total grid pixels before the child is notified with `SIGWINCH`;
-Ghostty receives rows, columns, and per-cell pixels. Cell-only callers remain
-supported and explicitly carry zero pixel dimensions. Ghostty's primary-screen
-reflow and alternate-screen crop behavior are authoritative.
-
-The adapter enables a bounded 64 KiB replay continuation and exposes an
-explicitly diagnostic Ghostty snapshot round-trip. Automated tests encode and
-restore visible state, scrollback, geometry, modes, styles, and unfinished
-UTF-8 and CSI input. This is not used by live Lector behavior or presented as a
-stable persistence format: Ghostty snapshot format version 1 is unstable, and
-Lector's auxiliary OSC 133 history anchors are not serialized by this
-diagnostic path.
-
-## Pinned inputs
-
-- Lector adapter: `lector-ghostty = 0.1.0`, from this repository.
-- libghostty-vt: `1.0.0`, tag `vt-1.0.0`, source commit
-  `0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec`.
-- Official source archive SHA-256:
-  `4a6ef758be721923e1969e7b81b443dcc92d8dd3fb5a39600c03a8817a753676`.
-- Matching dependency archive SHA-256:
-  `4d5ea5e448e4c7ea8fb55ccbaa8668f2a97d44f438cee831e2b7ecd162d85c29`.
-- Zig: exactly `0.17.0` for building the archive.
-
-Lector targets the stable libghostty-vt C ABI `>=1.0.0, <2.0.0`, whose
-version is independent of the Ghostty application. Bundled builds remain
-pinned to the exact tested release and checksums above. Future 1.x upgrades
-require a tested PR; builds never resolve a moving latest version.
-
-Source and dependency archives come from
-`https://release.files.ghostty.org/libghostty-vt/1.0.0/`. Both checksums are
-verified before extraction. The source's `LIB_VERSION` selects the standalone
-library build, and `--system` supplies all dependencies without Zig fetching
-packages. Lector links `libghostty-vt.a` statically and never falls back to an
-arbitrary system library. Cached or externally supplied archives must match
-the exact release, target, optimization, ABI probe, and archive checksum;
-unsupported major versions are not accepted.
+Ordinary Cargo builds download, verify, and cache Lector's pinned terminal
+engine. The local `lector-ghostty` adapter links the official C API statically;
+installed Lector binaries need no Ghostty runtime installation. See the
+[adapter and composition model](architecture.md#ghostty-adapter-and-composition)
+for runtime ownership, snapshots, and rendering contracts.
 
 ## Fresh-clone developer build
 
@@ -373,7 +102,7 @@ Alpine build uses its packaged musl linker. Glibc targets use a small
 compiler-driver wrapper to select glibc's working `-static-pie` mode without
 rustc's conflicting `-static -no-pie` combination. The resulting ELF is
 position-independent and has neither a dynamic interpreter nor `DT_NEEDED`
-entries. Libc is resolved by the final Rust link; it is deliberately not copied
+entries. Libc is resolved by the final Rust link; it is not copied
 into `libghostty-vt.a`. macOS remains dynamically linked to Apple's system
 libraries, which are not available as supported static archives.
 
@@ -409,6 +138,31 @@ On Linux, that check also rejects a release artifact that is not PIE or has an
 ELF interpreter or `DT_NEEDED` entry. After both verified
 profiles exist, `scripts/check_build_paths.sh` confirms that ordinary Cargo
 commands reuse them without bootstrapping or network access.
+
+## Pinned inputs
+
+- Lector adapter: `lector-ghostty = 0.1.0`, from this repository.
+- libghostty-vt: `1.0.0`, tag `vt-1.0.0`, source commit
+  `0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec`.
+- Official source archive SHA-256:
+  `4a6ef758be721923e1969e7b81b443dcc92d8dd3fb5a39600c03a8817a753676`.
+- Matching dependency archive SHA-256:
+  `4d5ea5e448e4c7ea8fb55ccbaa8668f2a97d44f438cee831e2b7ecd162d85c29`.
+- Zig: exactly `0.17.0` for building the archive.
+
+Lector targets the stable libghostty-vt C ABI `>=1.0.0, <2.0.0`, whose
+version is independent of the Ghostty application. Bundled builds remain
+pinned to the exact tested release and checksums above. Future 1.x upgrades
+require a tested PR; builds never resolve a moving latest version.
+
+Source and dependency archives come from
+`https://release.files.ghostty.org/libghostty-vt/1.0.0/`. Both checksums are
+verified before extraction. The source's `LIB_VERSION` selects the standalone
+library build, and `--system` supplies all dependencies without Zig fetching
+packages. Lector links `libghostty-vt.a` statically and never falls back to an
+arbitrary system library. Cached or externally supplied archives must match
+the exact release, target, optimization, ABI probe, and archive checksum;
+unsupported major versions are not accepted.
 
 ## Upgrading Ghostty or Zig
 
@@ -470,25 +224,3 @@ or test-runner script does not invalidate these artifacts. Add new transitive bu
 Cargo still checks changed application/test sources, and restored native
 artifacts are verified before use. Cache misses and failed restores retain the
 existing bounded rebuild fallback and full integration test enumeration.
-
-The November 12, 2026 investigation of #14 distinguished a cold miss from slow
-warm validation:
-
-| Hosted run | Container cache | Preparation | Docker tests | Linux x86-64 job |
-| --- | --- | --- | --- | --- |
-| [PR #45 final](https://github.com/n0ot/lector/actions/runs/43133497835) | Miss | 4m25s | 2s | 7m23s |
-| [Following master run](https://github.com/n0ot/lector/actions/runs/43134488184) | Restored | 26s | 3s | 3m59s |
-
-The cold run downloaded verified Zig, built Ghostty, and compiled Rust
-dependencies. Its restore at 01:20:51 UTC preceded the concurrent base run's
-cache save at 01:25:54 UTC; that
-cache was not yet available. The broad fingerprint also included the unrelated
-native-speech runner added in the base change, unnecessarily creating a new
-cache namespace. Narrowing script inputs prevents that source of future misses;
-it cannot eliminate necessary toolchain/image changes or concurrent cold fills.
-
-These are observed individual runs, not a controlled performance estimate for
-the new key. In the warm run macOS Intel took 5m19s and finished last. A separate
-Docker job would not have shortened that run, so the current job layout and
-required checks remain unchanged. Reconsider parallelization if repeated warm
-measurements put Docker back on the critical path.

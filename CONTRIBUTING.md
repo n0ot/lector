@@ -1,28 +1,16 @@
 # Contributing to Lector
 
 Lector is a Cargo workspace containing the main `lector` package, the
-`lector-ghostty` native adapter, and the `lector-xtask` maintenance tool. Read
+`lector-ghostty` native adapter, the `lector-tts` speech library and host, and
+the `lector-xtask` maintenance tool. Read
 [the architecture guide](docs/architecture.md) before changing runtime
 ownership or protocol boundaries; [the documentation index](docs/README.md)
 links the more detailed contracts.
 
 ## Repository map
 
-- `src/main.rs`, `src/app.rs`, and `src/app/`: event-loop and application
-  orchestration.
-- `src/terminal.rs`, `src/presentation.rs`, and `src/output_scheduler.rs`:
-  terminal modeling and physical presentation.
-- `src/screen_reader/`, `src/commands/`, `src/views/`, `src/speech/`, and
-  `src/lua/`: accessible interaction and speech.
-- `src/tmux_*.rs`: tmux control-mode protocol and state boundaries.
-- `src/bin/`: explicitly declared support binaries and benchmarks.
-- `crates/lector-ghostty/` and `build_support/`: native Ghostty adapter and
-  shared build logic.
-- `xtask/`: pinned-dependency maintenance commands.
-- `tests/` and `tests/fixtures/pty/`: integration tests and Lua configuration
-  fixtures.
-- `scripts/`: developer checks, dependency bootstrap, tracing, and live tests.
-- `docs/`: design contracts and operational documentation.
+Use the [architecture source map](docs/architecture.md#source-map) to locate
+runtime components, crates, fixtures, and maintenance tools.
 
 ## Rust toolchain
 
@@ -118,11 +106,10 @@ create or reuse one PR and one Queued issue. It never resets an existing card's
 status. The worker follows the ordinary independent **agent** review, final-SHA
 CI and protected merge contract. Reviewer and merger may use the same authorized
 GitHub account; formal GitHub approvals and a separate reviewer service are not
-required. No script self-approves or merges the update.
+required.
 
 Run sync before dispatch and at the session's existing 30-minute checkpoints,
 not in a new model polling loop. When the session is stopped, scheduled branch
 preparation and CI still run, but creating/reviewing/merging the PR waits until
-an orchestrator resumes. This is not a persistent, unattended agent service.
-See [GitHub's dispatch documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
+an orchestrator resumes. See [GitHub's dispatch documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
 for why explicit dispatch is needed with workflow tokens.

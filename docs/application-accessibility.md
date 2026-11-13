@@ -3,8 +3,8 @@
 Full-screen terminal applications often know more than a terminal emulator can
 infer from cursor movement and changed cells. Lector supports a small, generic
 protocol through which any application can replace selected automatic
-heuristics with semantic speech. Lector does not identify the sending
-application and contains no application-specific behavior.
+heuristics with semantic speech. Messages are interpreted independently of the
+sending application.
 
 The integration is optional. An application which sends no protocol messages
 gets Lector's normal auto-reading, cursor tracking, and deletion announcements.
@@ -33,7 +33,7 @@ invariants.
 7. Keep state and speech pane-local in tmux control mode. Speech from a hidden
    or inactive pane is discarded and is never replayed after a pane switch.
 
-The reset rules are deliberately narrower than “anything which redraws”.
+Redrawing alone does not end a session.
 Attribute reset (`CSI 0 m`), erase-display (`CSI 2 J`), cursor addressing, and
 ordinary mode changes do not end an accessibility session. Full reset (`RIS`,
 `ESC c`) and soft reset (`DECSTR`, `CSI ! p`) do.
@@ -56,9 +56,6 @@ Invalid UTF-8, invalid hexadecimal, unknown versions or commands,
 duplicate/missing settings, incomplete strings, and truncated strings have no
 protocol effect.
 
-APC is private application-to-terminal control data. Lector does not assign a
-new meaning to OSC 200, 201, or 202.
-
 ## Focus and user settings
 
 Application policy is a suppressive overlay. It cannot turn on a Lector option
@@ -75,6 +72,5 @@ progress is interrupted at focus loss.
 
 [`n0ot/lector.nvim`](https://github.com/n0ot/lector.nvim) is the independently
 versioned MIT Neovim plugin which produces semantic editor events for this
-protocol. It is compatible with Lector and with any other terminal screen
-reader implementing the same protocol. Lector does not vendor its Lua source
-or contain Neovim-specific behavior.
+protocol. It works with Lector and other terminal screen readers implementing
+the same protocol; its Lua source is maintained in that repository.

@@ -1,4 +1,4 @@
-# Complete tmux control-mode behavior
+# tmux control mode
 
 Lector treats `tmux -CC` as a source of pane-local terminal byte streams. tmux
 remains authoritative for sessions, windows, pane geometry, layout, and process
@@ -47,7 +47,7 @@ It then reads `#{client_flags}` and requires the returned flag set to contain
 the policy stuck.
 
 This asks tmux to pause a pane after one second of unread control-client output
-instead of allowing an unlimited backlog. tmux pause is deliberately lossy: it
+instead of allowing an unlimited backlog. tmux pause is lossy: it
 discards queued pane blocks and advances the control client's pane offset while
 new output is ignored. `%pause %N` therefore marks Lector's shadow terminal as
 stale; it is not merely a quiet state. If the pane is in the presented window,
@@ -151,7 +151,7 @@ display-message -p -t %N -F <pane capture metadata>
 
 The first metadata sample chooses the current pane display or tmux-mode screen
 (`-M`). On the primary screen, `-S -` includes exposed history; on the current
-alternate screen, history is omitted. Lector deliberately does not use `-a`,
+alternate screen, history is omitted. Lector does not use `-a`,
 which selects `pane->base.saved_grid` rather than the currently displayed grid.
 `-e` preserves styles, `-F` preserves the line flags tmux
 exposes for prompt/output semantics and hyperlinks, and `-P` captures an
@@ -175,9 +175,8 @@ restore the state listed above, but cannot faithfully recover:
 - parser continuation if the installed tmux cannot complete the `-P` capture.
 
 Lector drops unrecoverable media during replacement, records the applicable
-limitations in pane flow state, and announces them after recovery. This is an
-intentional correctness boundary: guessed parser or media state would be more
-dangerous than a documented recovery limit.
+limitations in pane flow state, and announces them after recovery. Rerun
+image-producing output when media needs to be restored.
 
 ## Resource bounds and measured workloads
 
@@ -200,45 +199,27 @@ coalesce while preserving their ordering boundary. Unstarted visual renders
 can be replaced by the newest authoritative scene, while partial transactions
 and terminal effects complete without interleaving.
 
-The macOS ARM64 release baseline includes 5,000-iteration renderer workloads
-for both tmux-like structural edits and Zellij-like layered redraws. The
-checked-in completion measurements were:
-
-| Workload | p95 render | Output/full-scene ratio | Semantic coverage | Semantic/pure-diff bytes |
-| --- | ---: | ---: | ---: | ---: |
-| tmux-like structural edits | 67.0 us | 2.87% | 100% | 9.02% |
-| Zellij-like layered redraws | 72.7 us | 2.82% | 83.32% | 45.34% |
-
-The mixed tmux soak uses 16 panes across eight windows while switching,
-resizing, emitting output, images, and bells. It compares every presented
-frame with a second headless Ghostty terminal, asserts bounded scrollback and
-media, records process CPU time and PTY-to-render p95, and constructs a full
-redraw alongside every incremental result. Separate harnesses measure 10,000
-bytes of key-to-PTY queuing/encoding and 100 rapid connection switches. The
-benchmark also gates peak RSS, scheduler backlog/recovery, and Kitty media
-throughput. Real-PTY direct, attached-tmux, and control-mode key-to-pixel gates
-are documented separately in [performance.md](performance.md).
-
-The final macOS ARM64 release soak retained 1,056 scrollback rows, 2,336 text
-bytes, and 64 image bytes across its 16 panes (averages of 66 rows, 146 text
-bytes, and 4 image bytes per pane). Its PTY-to-render p95 was 404 us and the
-192-frame workload used 144 ms of process CPU. It emitted 157,163 bytes versus
-176,914 bytes for the independently constructed full redraws. The final
-benchmark run measured 67 us tmux-like and 73 us Zellij-like p95, a maximum
-127-byte scheduler backlog, and 161 MiB/s Kitty recomposition throughput.
+The release benchmark covers structural edits, layered redraws, a mixed
+16-pane soak, input encoding, connection switching, scheduler retention, and
+Kitty media throughput. See [performance gates](performance.md#regression-and-latency-gates)
+for measurement fences and the checked-in historical reports. Machine-specific
+measurements describe their recorded workload and revision, not a latency
+guarantee for other hosts.
 
 Run the completion gates with:
 
 ```sh
 cargo nextest run --locked --all-targets
-cargo test --release --test tmux tmux_completion:: -- --nocapture
+cargo test --locked --release --test tmux tmux_completion:: -- --nocapture
+scripts/test-real-tmux-docker
 cargo ghostty-bench
 ```
 
-Real tmux harnesses require `tmux` on `PATH` and permission to create disposable
-Unix sockets beneath `target/test-tmux`. CI builds and checks linked Ghostty
-metadata on all four Tier 1 targets and runs the complete suite on Linux
-x86-64.
+Ordinary Cargo/Nextest runs leave real-tmux cases ignored. The Docker runner
+provides tmux and disposable Unix sockets in a container; see
+[contributor verification](../CONTRIBUTING.md#full-verification) for prerequisites
+and cache behavior. CI checks linked Ghostty metadata on all four Tier 1 targets
+and runs the complete suite on Linux x86-64.
 
 ## Troubleshooting and recovery
 
@@ -251,7 +232,7 @@ x86-64.
   indicate that the control PTY cannot accept writes or the tmux client has
   disconnected.
 - A spoken resynchronization message means tmux paused lossy pane delivery or
-  Lector deliberately bounded an overloaded pane. Text/history and recoverable
+  Lector bounded an overloaded pane. Text/history and recoverable
   parser metadata were rebuilt, but rerun image-producing output if that state
   matters.
 - A spoken resynchronization failure means `capture-pane` failed. The pane will

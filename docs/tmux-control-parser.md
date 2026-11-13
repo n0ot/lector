@@ -2,7 +2,7 @@
 
 `lector::tmux_control::TmuxControlParser` is a standalone, streaming parser for
 one framed `tmux -CC` connection. It has no dependency on Lector's application,
-scene, accessibility, or future tmux-topology models.
+scene, accessibility, or topology models.
 
 ## Framing and records
 
@@ -54,7 +54,6 @@ and every unterminated state return a classified `ControlParseError`. An error
 poisons the parser so partially retained state cannot be reused accidentally.
 `reset` explicitly discards that state and returns to the start-marker boundary.
 
-The parser intentionally does not detect the marker inside an ordinary PTY byte
-stream or preserve bytes before and after a connection. Those source-boundary
-responsibilities belong to `TmuxGatewayRouter`, documented in
-[`tmux-gateway.md`](tmux-gateway.md).
+`TmuxGatewayRouter` detects markers in ordinary PTY output and preserves bytes
+around each connection. This parser consumes the framed stream; see
+[gateway byte ownership](tmux-gateway.md#exact-byte-ownership).

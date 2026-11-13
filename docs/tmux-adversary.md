@@ -45,32 +45,11 @@ Supported scenarios are:
 
 ## Concurrency and resource model
 
-Terminal, view-stack, tmux topology, parser, pane, and compositor state have
-one owner: Lector's polling event-loop thread. No worker can mutate that state,
-so ordering is explicit and there are no locks around the screen model. Each
-poll turn drains only a bounded amount of PTY work before handling physical
-input and scheduled output. Child output yields after 32 KiB or 4 ms, checked
-after each read of at most 8 KiB. Reaching either limit requests an immediate
-later turn without waiting for another readiness edge. DEC 2026 synchronized
-output uses the same budget rather than extending a flood's ownership of the
-loop.
-
-Each pane continues mutating its live terminal model during an open DEC 2026
-frame while accessibility reads the last physically completed generation. Raw
-input remains routable immediately. A close makes the working frame eligible;
-neither close nor timeout publishes it before the render flushes. An idle or
-hard timeout may release a partial render, after which the exact flushed partial
-generation becomes readable. A newer parser frame cannot be spoken ahead of
-the pixels. All visible panes in a split carry receipts in the same composed
-generation. Coordinate-based actions retain the ordinary time-of-check to
-time-of-use race because the pane is not frozen.
-
-Blocking external side effects do not run on that owner. The proc speech
-backend and diagnostic writer each own one process-lifetime worker. Producers
-only enter short in-memory queue critical sections; they never wait for backend
-pipe I/O, a filesystem, or stderr. Speech overload discards stale announcements while preserving and
-coalescing stop/rate controls. Logging overload retains the newest diagnostic
-tail and records loss counters.
+The [runtime ownership model](architecture.md#runtime-ownership-and-concurrency)
+keeps terminal state on the event-loop thread and blocking speech/logging on
+bounded workers. [Latency decisions](performance.md#latency-decisions) define
+fair turns and synchronized-output release. The scenarios below exercise those
+boundaries through first-party fixtures without a tmux socket.
 
 The principal limits are:
 
@@ -89,16 +68,9 @@ The principal limits are:
 | Physical-output scheduler | 2 MiB by default | Replace/drop unstarted visual work; cap bells |
 | Diagnostic memory/file | 2 MiB / 16 MiB | Keep newest queue/file generation |
 
-Exceptional transport controls are independent of ordinary tmux command/reply
-flow. Thus a reply-silent connection cannot consume the escape needed to back
-out. `M-C` opens the connection manager independently of the child; confirmed
-uppercase `D` first sends Control-backslash to the selected connection's
-transport. If the peer still does not exit within 750 ms, Lector abandons only
-the control parser and exposes the still-live raw root terminal or parent pane.
-This preserves the recovery channel for a raw `detach-client`, SSH escape, or
-other transport-specific command instead of terminating Lector's PTY child.
-Lowercase `d` is the normal graceful path and waits for nested descendants to
-exit deepest-first before detaching their parents.
+`M-C` remains available during silent or flooded output. Use `d` for graceful
+detach or confirmed `D` for raw-transport recovery, as described in
+[connection lifecycle controls](tmux-prefix.md#destructive-lifecycle-behavior).
 
 Run the automated live suite through the process-group watchdog:
 

@@ -26,7 +26,7 @@ Version 2 separates three responsibilities:
   guesses that an utterance finished.
 
 The protocol is designed for small native hosts, Speech Dispatcher adapters,
-and hosts written outside this repository. It deliberately exposes semantic
+and hosts written outside this repository. It exposes semantic
 guarantees, not platform API names or native utterance identifiers.
 
 ## 2. Selecting and owning a host process
@@ -95,15 +95,10 @@ the interactive terminal thread.
 
 ### 3.1 Why JSON-RPC over stdio
 
-JSON-RPC provides stable requests, responses, IDs, errors, and mature tooling;
-OpenRPC supplies a machine-readable contract. Stdio binds connection lifetime
-to the direct child without socket discovery or authentication. Measured JSON
-serialization and pipe round trips are small relative to native speech startup
-and do not run on the input thread. A binary protocol or dynamic library ABI
-would add compatibility and crash-containment costs without improving the
-state model.
-
-NDJSON is Lector-specific because JSON-RPC does not define stream framing.
+JSON-RPC supplies requests, responses, IDs, and errors; OpenRPC defines their
+machine-readable shape. Stdio ties the connection to the direct child process.
+NDJSON supplies the stream framing that JSON-RPC leaves unspecified. All
+transport work runs on the speech worker.
 
 ## 4. Initialization and version negotiation
 
@@ -228,7 +223,7 @@ This is particularly important for screen readers such as NVDA, whose voice is
 owned by the external screen reader: the built-in NVDA adapter advertises all
 three flags as false.
 
-This protocol version deliberately has no `isSpeaking` capability or method.
+This protocol version has no `isSpeaking` capability or method.
 Playback transitions rely on the negotiated lifecycle evidence described
 above, not on a sampled backend state.
 
@@ -503,7 +498,7 @@ suspension before the next paragraph.
   input invoke the one-way pause transition. `M-x` invokes the toggle action;
   `M-X` has no default speech binding.
 - `cancel_speaking` clears the active or paused item and every pending item,
-  then stops host playback. It is deliberately unbound by default.
+  then stops host playback. It is unbound by default.
 - If resumable pause is advertised, suspension retains the item and resume
   restarts at the beginning of the interrupted word.
 - Otherwise, suspension stops and retains the complete active utterance. Once
