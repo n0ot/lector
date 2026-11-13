@@ -179,6 +179,83 @@ fn app() -> (App, ScreenReader, Recorder, Vec<u8>) {
     (app, sr, recorder, Vec::new())
 }
 
+fn tick_external_transport(
+    app: &mut App,
+    sr: &mut ScreenReader,
+    connection_id: u64,
+    writer: &mut dyn Write,
+    physical: &mut Vec<u8>,
+) {
+    let mut root_output = Vec::new();
+    app.handle_tick(sr, &mut root_output, physical).unwrap();
+    // These connections are fed by external routers, so App owns no root
+    // transport. Never guess which external writer could own root bytes.
+    assert!(
+        root_output.is_empty(),
+        "external-router fixture produced unowned root output"
+    );
+    app.drain_tmux_commands_for(connection_id, writer).unwrap();
+    writer.flush().unwrap();
+}
+
+#[test]
+fn external_transport_tick_keeps_active_and_driven_connections_separate() {
+    let (mut app, mut sr, _recorder, mut physical) = app();
+    let mut first = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        inventory("alpha", "alpha", "alpha", "client-a"),
+        "alpha",
+    );
+    let mut second = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        2,
+        inventory("beta", "beta", "beta", "client-b"),
+        "beta",
+    );
+    assert!(
+        app.activate_tmux_connection(1, &mut sr, &mut physical)
+            .unwrap()
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut first,
+        b"%sessions-changed\n",
+        &mut physical,
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut second,
+        b"%sessions-changed\n",
+        &mut physical,
+    );
+    let mut second_output = Vec::new();
+    tick_external_transport(&mut app, &mut sr, 2, &mut second_output, &mut physical);
+    assert_eq!(app.active_tmux_connection(), Some(1));
+    assert_eq!(
+        second_output,
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+    assert_eq!(app.debug_tmux_expected_reply_count(1), Some(0));
+    assert_eq!(
+        app.debug_tmux_expected_reply_count(2),
+        Some(INVENTORY_REPLY_COUNT)
+    );
+    let mut first_output = Vec::new();
+    tick_external_transport(&mut app, &mut sr, 1, &mut first_output, &mut physical);
+    assert_eq!(
+        first_output,
+        lector::tmux_model::INVENTORY_COMMAND.as_bytes()
+    );
+    assert!(drain(&mut app, 2).is_empty());
+}
+
 #[test]
 fn unsupported_capture_line_flags_retry_with_the_portable_tmux_command() {
     let (mut app, mut sr, _recorder, mut physical) = app();
@@ -1157,12 +1234,11 @@ impl RealTransport {
         if done(app) {
             return;
         }
-        let result = super::drive_real_tmux_phase(|remaining| {
-            let chunk = self.receiver.recv_timeout(remaining)?;
-            feed(app, sr, &mut self.router, &chunk, physical);
-            app.drain_tmux_commands_for(self.connection_id, self.writer.as_mut())
-                .unwrap();
-            self.writer.flush().unwrap();
+        let result = super::drive_real_tmux_phase(&self.receiver, None, |chunk| {
+            if let Some(chunk) = chunk {
+                feed(app, sr, &mut self.router, &chunk, physical);
+            }
+            tick_external_transport(app, sr, self.connection_id, self.writer.as_mut(), physical);
             Ok::<_, mpsc::RecvTimeoutError>(done(app))
         });
         if let Err(error) = result {

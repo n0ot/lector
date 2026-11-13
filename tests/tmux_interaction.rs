@@ -15,9 +15,9 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     rc::Rc,
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::mpsc,
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 const SPLIT: &str = "b25f,80x24,0,0{40x24,0,0,20,39x24,41,0,23}";
@@ -1020,29 +1020,11 @@ fn drive_real_tmux(
     if done(app) {
         return;
     }
-    let mut idle_deadline = Instant::now() + Duration::from_secs(5);
-    let result = super::drive_real_tmux_phase(|phase_remaining| {
+    let result = super::drive_real_tmux_phase(receiver, Some(Duration::from_secs(5)), |chunk| {
+        if let Some(chunk) = chunk {
+            app.handle_pty(sr, &chunk, physical).unwrap();
+        }
         write_real_commands(app, sr, writer, physical);
-        let idle_remaining = idle_deadline.saturating_duration_since(Instant::now());
-        if idle_remaining.is_zero() {
-            return Err(RecvTimeoutError::Timeout);
-        }
-        match receiver.recv_timeout(
-            phase_remaining
-                .min(idle_remaining)
-                .min(Duration::from_millis(10)),
-        ) {
-            Ok(chunk) => {
-                idle_deadline = Instant::now() + Duration::from_secs(5);
-                app.handle_pty(sr, &chunk, physical).unwrap();
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // A pane update can race an authoritative capture and schedule
-                // a quiet recapture while the tmux control channel is idle.
-                // Keep driving Lector's timers until data arrives.
-            }
-            Err(error) => return Err(error),
-        }
         Ok(done(app))
     });
     if let Err(error) = result {
@@ -1131,15 +1113,17 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         |app| app.debug_active_view_contents().contains("FIRST"),
     );
 
-    writer
-        .write_all(
-            format!(
-                "new-session -d -s {second_session} \"/bin/sh -c 'read ready; printf SECOND; exec cat'\"\n"
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-    writer.flush().unwrap();
+    let control_client = super::real_tmux_fixture_client(&socket);
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            &second_session,
+            "/bin/sh -c 'read ready; printf SECOND; exec cat'",
+        ],
+    );
     drive_real_tmux(
         "second-session discovery",
         &mut app,
@@ -1152,16 +1136,17 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
                 .is_some_and(|dump| dump.contains(&second_session))
         },
     );
-    writer
-        .write_all(
-            format!(
-                "switch-client -t {second_session}\n\
-                 send-keys -t {second_session} Enter\n"
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "switch-client",
+            "-c",
+            &control_client,
+            "-t",
+            &second_session,
+        ],
+    );
+    super::run_real_tmux_fixture_command(&socket, &["send-keys", "-t", &second_session, "Enter"]);
     drive_real_tmux(
         "second-session bootstrap",
         &mut app,
@@ -1197,10 +1182,10 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         completed_while_away.status.success(),
         "failed to update the unattached session: {completed_while_away:?}"
     );
-    writer
-        .write_all(format!("switch-client -t {first_session}\n").as_bytes())
-        .unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &["switch-client", "-c", &control_client, "-t", &first_session],
+    );
     drive_real_tmux(
         "restore first session",
         &mut app,
@@ -1258,8 +1243,7 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         },
     );
 
-    writer.write_all(b"kill-server\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
     let _ = child.wait().unwrap();
     read_thread.join().unwrap();
     let _ = std::fs::remove_file(&socket);

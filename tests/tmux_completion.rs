@@ -1889,6 +1889,60 @@ fn output_after_capture_is_sent_forces_one_quiet_authoritative_recapture() {
 }
 
 #[test]
+fn idle_capture_progress_does_not_consume_another_clients_completion() {
+    let (mut app, mut sr, _recorder, clock, mut physical) = ready_app_with_clock(false);
+    start_visible_lossy_capture(&mut app, &mut sr, &mut physical, 40, 20);
+    app.handle_pty(&mut sr, b"%output %20 changed\n", &mut physical)
+        .unwrap();
+    finish_capture(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        42,
+        20,
+        &[b"snapshot".to_vec()],
+    );
+    assert!(drain(&mut app, &mut sr, &mut physical).is_empty());
+
+    // A fixture mutation completes on its own client while the App's timer
+    // becomes due. That completion must never enter the App-owned reply FIFO.
+    let (fixture_sender, fixture_receiver) = std::sync::mpsc::channel();
+    fixture_sender.send(reply(900, &[])).unwrap();
+    clock.advance(100);
+    let start = Instant::now();
+    let mut issued = Vec::new();
+    let result = super::drive_real_tmux_phase_with_clock(
+        Duration::from_secs(1),
+        None,
+        || start,
+        |_| panic!("the due command should be emitted before waiting"),
+        |chunk| {
+            assert!(chunk.is_none());
+            issued = drain(&mut app, &mut sr, &mut physical);
+            Ok(!issued.is_empty())
+        },
+    );
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        issued,
+        lector::tmux_model::pane_capture_metadata_command(PaneId(20))
+    );
+    assert_eq!(app.debug_tmux_expected_reply_count(1), Some(1));
+    assert_eq!(fixture_receiver.try_recv().unwrap(), reply(900, &[]));
+    assert_eq!(app.debug_tmux_expected_reply_count(1), Some(1));
+    app.handle_pty(
+        &mut sr,
+        &reply(45, &[pane_metadata_line(20)]),
+        &mut physical,
+    )
+    .unwrap();
+    assert_eq!(
+        drain(&mut app, &mut sr, &mut physical),
+        capture_pipeline(20)
+    );
+}
+
+#[test]
 fn screen_mode_change_during_capture_is_detected_and_retried() {
     let (mut app, mut sr, _recorder, clock, mut physical) = ready_app_with_clock(false);
     start_visible_lossy_capture(&mut app, &mut sr, &mut physical, 40, 20);

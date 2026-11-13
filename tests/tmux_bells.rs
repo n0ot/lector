@@ -699,9 +699,10 @@ fn drive_real_tmux(
     if done(app) {
         return;
     }
-    let result = super::drive_real_tmux_phase(|remaining| {
-        let chunk = receiver.recv_timeout(remaining)?;
-        app.handle_pty(sr, &chunk, physical).unwrap();
+    let result = super::drive_real_tmux_phase(receiver, None, |chunk| {
+        if let Some(chunk) = chunk {
+            app.handle_pty(sr, &chunk, physical).unwrap();
+        }
         write_real_commands(app, sr, writer, physical);
         Ok::<_, mpsc::RecvTimeoutError>(done(app))
     });
@@ -804,15 +805,17 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
     let topology = app.debug_tmux_topology(1).unwrap();
     let background_pane = pane_id_at_index(&topology, 0).expect("background pane id");
 
-    writer
-        .write_all(
-            format!(
-                "new-window -t {session} -n foreground \"/bin/sh -c 'printf FOREGROUND_READY; exec /bin/sh'\"\n"
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "new-window",
+            "-t",
+            &session,
+            "-n",
+            "foreground",
+            "/bin/sh -c 'printf FOREGROUND_READY; exec /bin/sh'",
+        ],
+    );
     drive_real_tmux(
         "foreground window bootstrap",
         &mut app,
@@ -828,13 +831,16 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
 
     sr.set_tmux_bell_mode(TmuxBellMode::Spoken);
     recorder.clear();
-    writer
-        .write_all(
-            format!("send-keys -t %{background_pane} \"printf BACKGROUND_DONE\" Enter\n")
-                .as_bytes(),
-        )
-        .unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "send-keys",
+            "-t",
+            &format!("%{background_pane}"),
+            "printf BACKGROUND_DONE",
+            "Enter",
+        ],
+    );
     drive_real_tmux(
         "background window activity",
         &mut app,
@@ -854,12 +860,16 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
     );
     assert!(app.last_tmux_bell_source().is_none());
 
-    writer
-        .write_all(
-            format!("send-keys -t %{background_pane} \"printf '\\\\007'\" Enter\n").as_bytes(),
-        )
-        .unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "send-keys",
+            "-t",
+            &format!("%{background_pane}"),
+            "printf '\\007'",
+            "Enter",
+        ],
+    );
     drive_real_tmux(
         "background pane bell",
         &mut app,
@@ -884,8 +894,7 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
         recorder.messages()
     );
 
-    writer.write_all(b"kill-server\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
     let _ = child.wait().unwrap();
     read_thread.join().unwrap();
     let _ = std::fs::remove_file(&socket);

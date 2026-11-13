@@ -593,9 +593,10 @@ fn drive_real_tmux_until(
     if ready(app) {
         return;
     }
-    let result = super::drive_real_tmux_phase(|remaining| {
-        let chunk = receiver.recv_timeout(remaining)?;
-        app.handle_pty(sr, &chunk, physical).unwrap();
+    let result = super::drive_real_tmux_phase(receiver, None, |chunk| {
+        if let Some(chunk) = chunk {
+            app.handle_pty(sr, &chunk, physical).unwrap();
+        }
         write_pending_real_commands(app, sr, writer, physical);
         Ok::<_, mpsc::RecvTimeoutError>(ready(app))
     });
@@ -859,8 +860,7 @@ fn real_tmux_byte_echo_paste_mouse_resize_and_output_flood_harness() {
         |app| app.debug_active_view_contents().contains("7a"),
     );
 
-    writer.write_all(b"kill-server\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
     drive_real_tmux_until(
         "input fixture exit",
         &mut app,

@@ -1818,9 +1818,11 @@ impl RealNestedHarness {
         if done(app) {
             return;
         }
-        let result = super::drive_real_tmux_phase(|remaining| {
-            let chunk = self.receiver.recv_timeout(remaining)?;
-            app.handle_pty(sr, &chunk, physical).unwrap();
+        let result = super::drive_real_tmux_phase(&self.receiver, None, |chunk| {
+            if let Some(chunk) = chunk {
+                app.handle_pty(sr, &chunk, physical).unwrap();
+            }
+            app.handle_tick(sr, self.writer.as_mut(), physical).unwrap();
             app.drain_tmux_commands_for(1, self.writer.as_mut())
                 .unwrap();
             self.writer.flush().unwrap();
@@ -1937,11 +1939,10 @@ fn real_tmux_nested_loopback_routes_control_and_child_input() {
         app.activate_tmux_connection(1, &mut sr, &mut physical)
             .unwrap()
     );
-    harness
-        .writer
-        .write_all(b"new-session -d -s nested-away /bin/sh\n")
-        .unwrap();
-    harness.writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &harness.outer_socket,
+        &["new-session", "-d", "-s", "nested-away", "/bin/sh"],
+    );
     harness.drive(
         "outer alternate-session discovery",
         &mut app,
