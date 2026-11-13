@@ -1,30 +1,51 @@
 # Contributing to Lector
 
-Lector is a Cargo workspace containing the main `lector` package, the
-`lector-ghostty` native adapter, the `lector-tts` speech library and host, and
-the `lector-xtask` maintenance tool. Read
-[the architecture guide](docs/architecture.md) before changing runtime
-ownership or protocol boundaries; [the documentation index](docs/README.md)
-links the more detailed contracts.
+Thanks for helping. This page covers how to set up, test, and submit a
+change.
 
-## Repository map
+## Finding your way around
 
-Use the [architecture source map](docs/architecture.md#source-map) to locate
-runtime components, crates, fixtures, and maintenance tools.
+Lector is a Cargo workspace:
 
-## Rust toolchain
+| Package | What it is |
+| --- | --- |
+| `lector` | The application |
+| `crates/lector-ghostty` | The terminal engine adapter |
+| `crates/lector-tts` | The speech library and speech server |
+| `xtask` | Maintenance commands |
 
-`rust-toolchain.toml` is the exact tested Rust release for local rustup,
-native/static CI, and the Ubuntu tmux image. Run `scripts/check-rust-toolchain`
-to verify the compiler actually invoked, including any environment override.
-CI also checks the native host or installed cross-target standard library.
-Alpine intentionally uses its distribution-packaged Rust as a separate
-compatibility lane: it has no rustup shim, so the repository pin does not
-select its compiler. That lane logs and verifies its compiler host explicitly.
+The [architecture overview](docs/internals/architecture.md) explains how the
+pieces fit, and its [source map](docs/internals/architecture.md#source-map)
+shows where each part lives. Read it before changing who owns what, or any
+protocol. The [documentation index](docs/README.md#internals) lists the
+deeper design notes.
 
-## Fast verification
+## Setting up
 
-Run these while iterating:
+Install the prerequisites from the
+[build guide](docs/internals/building.md#build-from-a-fresh-clone), then
+build once:
+
+```bash
+cargo build --locked
+```
+
+With rustup, `rust-toolchain.toml` selects the exact Rust version the project
+is tested with. `scripts/check-rust-toolchain` confirms which compiler is
+actually being used.
+
+The test commands use [cargo-nextest](https://nexte.st). Install the pinned
+version:
+
+```bash
+cargo install cargo-nextest --version 0.9.143 --locked
+```
+
+## Testing
+
+### While you work
+
+These are quick:
 
 ```bash
 cargo fmt --all -- --check
@@ -32,15 +53,18 @@ cargo check --locked --workspace --all-targets --all-features
 cargo test --locked --lib
 ```
 
-Add the narrow integration test affected by the change, for example
-`cargo test --locked --test core capability_broker::`. The consolidated
-integration targets are `app`, `core`, `terminal`, `presentation`, `speech`,
-`tmux`, `live_pty`, and `tmux_adversary_live`. The small `ghostty_build` target
-stays separate so CI can verify that its headless linkage has no GUI dependency.
+Add the integration test closest to your change, for example:
 
-## Full verification
+```bash
+cargo test --locked --test core capability_broker::
+```
 
-Before submitting a change, mirror the main CI checks:
+The integration test targets are `app`, `core`, `terminal`, `presentation`,
+`speech`, `tmux`, `live_pty`, and `tmux_adversary_live`.
+
+### Before you open a pull request
+
+Run what CI runs:
 
 ```bash
 cargo fmt --all -- --check
@@ -52,64 +76,135 @@ cargo ghostty-check
 scripts/check_build_paths.sh
 ```
 
-Nextest keeps the process-sensitive live PTY and real-tmux tests serialized and
-limits other process suites through `.config/nextest.toml`. Install
-the pinned project version with
-`cargo install cargo-nextest --version 0.9.143 --locked` when it is not already
-available.
+Also build a release binary, which is what users run:
 
-Changes to tmux control mode should also run the kill-bounded adversary suite:
+```bash
+cargo build -r --locked
+```
+
+### If you changed tmux support
+
+Run the adversarial suite:
 
 ```bash
 scripts/run-tmux-adversary --timeout 60 --nocapture
 ```
 
-The real-tmux integration group runs only in a disposable Ubuntu 24.04
-container, without using the host Rust toolchain, tmux binary, tmux server, or
-configuration. Ordinary Cargo and Nextest runs skip these tests:
+And the tests against a real tmux, which run only in Docker:
 
 ```bash
 scripts/test-real-tmux-docker
 ```
 
-The runner also checks host-terminfo integration against the container's
-`infocmp` and `tic`; ordinary unit tests use the bundled terminfo fixture.
-The checkout is mounted read-only. Docker-managed volumes retain Cargo,
-Ghostty, and test artifacts between runs; tmux processes are discarded with
-the container, while socket paths stay in container-local temporary storage rather than
-the checkout or host tmux runtime. The first run needs network access to build
-the image and populate those caches. Set
-`LECTOR_REAL_TMUX_PLATFORM`, for example to `linux/amd64`, when an explicitly
-emulated architecture is useful. Extra arguments are forwarded to Nextest.
+The Docker run never uses your own tmux, its server, or its configuration.
+Your checkout is mounted read-only. The first run needs network access to
+build the image. Later runs reuse cached build output. Extra arguments are
+passed to nextest. Set `LECTOR_REAL_TMUX_PLATFORM`, for example to
+`linux/amd64`, to test another architecture under emulation.
 
-Native dependency prerequisites, cache behavior, and supported targets are in
-[the Ghostty build guide](docs/ghostty-builds.md).
+See [testing tmux support](docs/internals/tmux/testing.md) for what each
+level covers.
 
-## Tested Rust updates
+### Native speech tests
 
-The weekly/manual `Tested Rust updates` workflow reads Rust's official stable
-manifest and maintains one `automation/rust-toolchain` branch containing only
-the canonical pin update. It explicitly dispatches the full build matrix with
-`GITHUB_TOKEN`; it does not need Actions PR-creation or review-approval permission.
-Failures leave master untouched and are visible in CI and the updater summary.
-Repeat runs reuse the branch and validation; rerun failed CI after fixing its
-cause. Unexpected edits on the reserved branch stop the updater safely.
+Ordinary test runs are silent. They never start real speech and do not need
+working audio.
 
-An active agent-queue orchestrator imports validated updates with:
+If you changed native speech or its test harness, also run the native suite
+on a Mac with a working audio session:
+
+```bash
+scripts/test-native-speech
+```
+
+The suite is muted and each test has a 60-second limit. A timeout is a
+failure, not a pass or a skip. Do not change system audio settings to make it
+pass. Changes unrelated to speech do not need this suite.
+
+### If you changed performance-sensitive code
+
+See [Performance](docs/internals/performance.md) for the latency gate and the
+release benchmark.
+
+## Writing tests
+
+- **Test the general rule, not the one report.** When you fix a bug, work out
+  which invariant was broken and test that, at the lowest layer that can
+  express it.
+- **Use simulated input.** Prefer explicit byte sequences and modeled state
+  over launching real programs. Use the project's own fixture programs when
+  process or platform behavior is the thing being tested.
+- **Keep reproductions neutral.** Reduce a bug report to minimal dummy data
+  that keeps only the structure that matters. Do not copy user data, command
+  output, or configuration into tests.
+- **External programs run only in Docker.** Use one only when Lector
+  deliberately implements compatibility with it, as with tmux. Ordinary test
+  commands must never run them on the host.
+
+## Submitting a change
+
+1. Work on a branch and open a pull request against `master`. Do not push to
+   `master` directly.
+2. Make sure the local checks above pass first. Passing CI does not replace
+   them.
+3. Wait for CI. A change is done only when every required check passes on the
+   latest revision and the branch is up to date with `master`.
+
+Pull requests that change only Markdown files skip compilation in CI.
+
+If you rename or add CI jobs, keep the `CI` gate job and the repository's
+branch protection in step, so that every required job stays enforced.
+
+## Documentation
+
+Documentation is organized by reader:
+
+| Folder | Reader | Style |
+| --- | --- | --- |
+| `README.md` | Someone deciding whether to try Lector | Short. Install, run, first keys. |
+| `docs/guide/` | People using Lector | Task-focused. No implementation detail. |
+| `docs/protocols/` | People writing software that talks to Lector | Precise specifications. |
+| `docs/internals/` | People changing Lector | How and why it works. |
+
+When you write:
+
+- Put each fact in one place and link to it from elsewhere.
+- Lead with what the reader needs to do or know. Put background after.
+- Prefer short sentences, lists, and tables to long paragraphs.
+- Keep implementation detail out of the user guide. Link to the internals.
+
+## Maintainer notes
+
+### Rust updates
+
+The weekly `Tested Rust updates` workflow reads Rust's stable release
+manifest and maintains one branch, `automation/rust-toolchain`, containing
+only the version bump. It runs the full build matrix on that branch.
+
+- A failure leaves `master` untouched and shows up in CI and the workflow
+  summary. Fix the cause and re-run the failed CI.
+- Unexpected edits on that branch stop the updater safely.
+
+An agent-queue orchestrator turns a validated update into a pull request and
+a queued issue:
 
 ```bash
 python3 .github/scripts/rust_updates.py sync --project <PROJECT_NODE_ID>
 ```
 
-This uses the session's existing `gh` repository/Projects authentication to
-create or reuse one PR and one Queued issue. It never resets an existing card's
-status. The worker follows the ordinary independent **agent** review, final-SHA
-CI and protected merge contract. Reviewer and merger may use the same authorized
-GitHub account; formal GitHub approvals and a separate reviewer service are not
+Run it before dispatching work and at the session's existing 30-minute
+checkpoints, not in a polling loop of its own. It uses the session's `gh`
+authentication, creates or reuses one pull request and one issue, and never
+resets an existing card's status. The update then goes through the normal
+review, CI, and protected merge. A separate GitHub reviewer account is not
 required.
 
-Run sync before dispatch and at the session's existing 30-minute checkpoints,
-not in a new model polling loop. When the session is stopped, scheduled branch
-preparation and CI still run, but creating/reviewing/merging the PR waits until
-an orchestrator resumes. See [GitHub's dispatch documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow)
-for why explicit dispatch is needed with workflow tokens.
+While no orchestrator is running, the branch and its CI are still prepared.
+The pull request simply waits.
+
+The workflow dispatches CI explicitly because GitHub does not start workflows
+from pushes made with a workflow token. See
+[GitHub's documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
+
+Alpine is a separate compatibility lane in CI. It uses Alpine's own packaged
+Rust, not the pinned version, and logs which compiler it used.

@@ -1,12 +1,23 @@
 # lector-tts
 
-This crate combines Lector's cross-platform TTS library with its standalone
-stdio speech host. The library remains available as `tts`, while the
-`lector-tts` binary implements the
-[speech-host protocol](../../docs/speech-driver-protocol.md).
-The implementation is shared with `lector tts`, so installing the main Lector
-binary is sufficient when the terminal and speech host run on the same
-machine.
+This crate contains two things:
+
+- a cross-platform text-to-speech library, available in Rust as `tts`; and
+- `lector-tts`, a small speech server that [Lector](../../README.md) talks to
+  over standard input and output.
+
+## The speech server
+
+You only need `lector-tts` when speech runs on a different machine from
+Lector. Lector itself includes the same server as `lector tts`.
+
+Install it from a clone of the repository:
+
+```shell
+cargo install --locked --path crates/lector-tts
+```
+
+See what is available and choose:
 
 ```shell
 lector-tts --list-backends
@@ -14,22 +25,19 @@ lector-tts --backend av-foundation --list-voices
 lector-tts --backend av-foundation --voice VOICE_ID
 ```
 
-With no listing option, stdin and stdout are reserved for bounded NDJSON
-JSON-RPC. `--backend auto` (the default) selects the first currently available
-engine. The [speech-host protocol](../../docs/speech-driver-protocol.md) defines
-backend metadata, independent capabilities, and normalized rate semantics.
-For terminal-side configuration and bridge examples, see the
-[user speech guide](../../README.md#speech).
+Without a listing option, the server speaks the
+[speech-host protocol](../../docs/protocols/speech-host.md) on stdin and
+stdout. `--backend auto`, the default, picks the first available engine.
 
-The host is portable independently of the full Lector application. It may be
-launched locally, across an SSH stdio bridge, or through another transport
-chosen by the user. The bridge owns authentication and reconnection policy.
+To connect Lector to it, including over SSH, see the
+[speech guide](../../docs/guide/speech.md#speech-from-another-machine).
 
-For NVDA, the controller-client DLL must be loadable. NVDA itself may start or
-stop while the host remains alive: speech and interruption requests received
-while it is absent are dropped rather than queued for replay. Voice and rate
-controls are not advertised for NVDA, and this protocol version does not
-expose `is_speaking`.
+### NVDA
+
+The NVDA backend needs the NVDA controller-client DLL to be loadable. NVDA
+may start or stop while the server keeps running. Anything spoken while NVDA
+is absent is dropped, not saved for later. NVDA manages its own voice and
+rate, so the server does not offer controls for them.
 
 The underlying library is based on
 [`tts-rs`](https://github.com/ndarilek/tts-rs); exact provenance is recorded in

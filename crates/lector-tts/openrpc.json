@@ -2,7 +2,7 @@
   "openrpc": "1.4.0",
   "info": {
     "title": "Lector speech-host protocol",
-    "description": "Version 2.2 of the bidirectional JSON-RPC interface between Lector and a speech host. Messages are UTF-8 NDJSON over stdio. See docs/speech-driver-protocol.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
+    "description": "Version 2.2 of the bidirectional JSON-RPC interface between Lector and a speech host. Messages are UTF-8 NDJSON over stdio. See docs/protocols/speech-host.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/license/mit"
@@ -11,7 +11,7 @@
   },
   "externalDocs": {
     "description": "Normative RFC-style protocol specification",
-    "url": "../../docs/speech-driver-protocol.md"
+    "url": "../../docs/protocols/speech-host.md"
   },
   "methods": [
     {
