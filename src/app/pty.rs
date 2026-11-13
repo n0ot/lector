@@ -625,7 +625,7 @@ impl App {
         } = step;
         // Apply order is part of the protocol contract. Keep late render,
         // announcement and resume decisions mutable through capture application.
-        // See docs/tmux-control-transitions.md for the co-occurrence audit.
+        // See docs/internals/tmux/transitions.md for the co-occurrence audit.
         let mut resume_after_pane_resync = None;
         // 1. Carrier/hierarchy reconciliation, then location bookkeeping.
         match carrier_reply {

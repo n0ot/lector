@@ -29,7 +29,7 @@ target/release/lector-ghostty-bench --output benchmarks/results/split-scenes-141
 Each new workload has 10,000 measured iterations. Scene workloads additionally
 warm each prebuilt variant once, excluding scene construction, rendering and
 oracle checks from composition fences. Tmux bootstrap is excluded; the measured
-input enters the real control parser in fragments. See `docs/performance.md`
+input enters the real control parser in fragments. See `docs/internals/performance.md`
 for counter meanings and correctness checks. Raw reports include all existing
 workloads and p50/p95/max latencies, throughput and allocation/output counters.
 No repetitions were discarded except the declared warmup. New baseline values

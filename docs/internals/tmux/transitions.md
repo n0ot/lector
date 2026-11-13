@@ -1,14 +1,23 @@
-# Tmux control transition boundary
+# Control transitions
 
-`TmuxConnectionState::step_control` consumes one event and, for command events,
-exactly one expected reply after the initial command. It owns connection-local
-inventory, topology and flow transitions. `App::process_tmux_control` owns command
-queueing, hierarchy, views, recovery application and presentation.
+Handling a tmux control event happens in two steps, in two places:
 
-## Co-occurrence audit
+1. `TmuxConnectionState::step_control` consumes one event and returns a
+   result. For command events it also consumes exactly one expected reply,
+   except for the initial command. It owns state local to the connection:
+   inventory, topology, and flow control.
+2. `App::process_tmux_control` applies that result. It owns command queueing,
+   the connection hierarchy, views, recovery, and presentation.
 
-The table shows which transition effects can occur together. An empty step
-still runs App bookkeeping; the initial command is a distinct early return.
+This page is the reference for what one step can produce, and the order in
+which App must apply it. Read it before changing either function.
+
+## What can happen together
+
+One step can carry several effects. This table lists, for each input, the
+work it defers to App and what else can occur alongside. A step with nothing
+to do still runs App's bookkeeping. The initial command is a separate early
+return.
 
 | Input | Deferred work | Work that can occur together |
 | --- | --- | --- |
@@ -31,14 +40,19 @@ still runs App bookkeeping; the initial command is a distinct early return.
 | Other notification | Reconcile topology | Inventory invalidation, removed panes/windows, sync/render and location/session changes can coexist |
 | Other control event | None | App bookkeeping still runs |
 
-Topology synchronization and rendering are not a mutually exclusive outcome enum.
-Neither are command results and inventory requests. Removed identities and native
-copy-mode panes carry data, rather than booleans. Only carrier reply kinds and
-capture verification results use enums: their match arms prove exclusivity.
+Two things follow from the table:
+
+- Effects are mostly independent fields, not one "outcome" enum. Topology
+  synchronization and rendering can both happen. So can a command result and
+  an inventory request. Removed identities and native copy-mode panes carry
+  data, not just a flag.
+- Only carrier reply kinds and capture verification results are enums. Those
+  really are exclusive, and their match arms prove it.
 
 ## Ordered App effects
 
-Preserve these phases, including when an earlier phase raises work for a later one:
+App applies a result in these phases. Keep the order, including when an
+earlier phase creates work for a later one.
 
 1. Carrier reply; inventory lease reconciliation; attached-session observation;
    lost-carrier failure. Then preferred location and bell acknowledgment.

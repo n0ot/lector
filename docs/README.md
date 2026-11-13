@@ -1,49 +1,44 @@
 # Lector documentation
 
-For installation and everyday use, start with the [user guide](../README.md).
-For implementation work, start with [Architecture](architecture.md) for the runtime ownership model,
-data flow, and concurrency boundaries; use its [source map](architecture.md#source-map)
-to locate implementation ownership. Contributors should also
-read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
+New here? Start with the [README](../README.md) to install Lector and learn
+the first few keys.
 
-## Build system
+## User guide
 
-- [Building with libghostty-vt](ghostty-builds.md) covers the pinned native
-  dependency, supported targets, offline builds, and upgrades.
+How to use Lector day to day.
 
-## Performance and diagnostics
+- [Keys](guide/keys.md): every default key binding.
+- [Review](guide/review.md): read, search, and copy earlier output.
+- [Tables](guide/tables.md): navigate tabular output.
+- [Clipboard](guide/clipboard.md): copy, paste, and clipboard history.
+- [Speech](guide/speech.md): voices, rate, and speech servers.
+- [tmux](guide/tmux.md): use Lector with `tmux -CC`.
+- [Configuration](guide/configuration.md): the config file and its options.
+- [Scripting](guide/scripting.md): key bindings, hooks, and automation in Lua.
+- [Troubleshooting](guide/troubleshooting.md): fixes for common problems.
 
-- [Interactive performance](performance.md) covers stabilization, latency gates,
-  native-audio validation, and diagnostic timelines.
+## Protocols
 
-## Speech
+Specifications for software that talks to Lector.
 
-- [Speech-host protocol](speech-driver-protocol.md) defines custom-host
-  configuration, bidirectional NDJSON JSON-RPC framing, capabilities, events,
-  queue and pause state, deadlines, restart policy, and process cleanup. Its
-  machine-readable method and message schema is
-  [`crates/lector-tts/openrpc.json`](../crates/lector-tts/openrpc.json).
-- [Application-authored accessibility](application-accessibility.md) documents
-  Lector's consumer contract, fail-safe lifecycle, and pane isolation, and links
-  the externally maintained producer specification. The
-  standalone [`lector.nvim`](https://github.com/n0ot/lector.nvim) plugin is its
-  Neovim producer.
+- [Speech-host protocol](protocols/speech-host.md): how Lector talks to a
+  speech server. Read this to write your own.
+- [Application accessibility protocol](protocols/application-accessibility.md):
+  how a terminal application can tell Lector what to say.
 
-## tmux control mode
+## Internals
 
-- [Control-mode behavior](tmux-completion.md) is the integration overview,
-  resource-bound reference, and troubleshooting guide.
-- [Control parser](tmux-control-parser.md) defines framing and failure bounds.
-- [Gateway routing](tmux-gateway.md) defines byte ownership at connection
-  boundaries.
-- [Control transitions](tmux-control-transitions.md) defines connection-local
-  results and the ordered App effects that apply them.
-- [Topology](tmux-topology.md) describes identity and reconciliation.
-- [Pane composition](tmux-panes.md) describes pane-local engines and layout.
-- [Input and sizing](tmux-input.md) covers keyboard, paste, focus, mouse, and
-  resize handling.
-- [Prefix handling](tmux-prefix.md) covers discovery, command routing, and
-  accessible choosers.
-- [Bell monitoring](tmux-bells.md) describes pane-scoped bell behavior.
-- [Adversarial testing](tmux-adversary.md) documents the hostile control peer
-  and live regression suite.
+How Lector works, for people changing it. Read
+[Contributing](../CONTRIBUTING.md) first for setup and testing.
+
+- [Architecture](internals/architecture.md): the big picture, threads, data
+  flow, and where the code lives. Start here.
+- [Reading model](internals/reading-model.md): how Lector decides what to
+  speak and when.
+- [Terminal](internals/terminal.md): terminal emulation, compatibility, and
+  rendering.
+- [Performance](internals/performance.md): latency targets, benchmarks, and
+  timing diagnostics.
+- [Building](internals/building.md): the native terminal engine, supported
+  targets, offline builds, and upgrades.
+- [tmux](internals/tmux/README.md): control-mode integration.

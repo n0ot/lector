@@ -1494,7 +1494,7 @@ struct TmuxControlStep {
 }
 
 impl TmuxConnectionState {
-    /// Connection-local event/reply transition; see docs/tmux-control-transitions.md.
+    /// Connection-local event/reply transition; see docs/internals/tmux/transitions.md.
     /// None preserves the initial-command early exit without consuming a reply.
     fn step_control(
         &mut self,

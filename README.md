@@ -1,879 +1,105 @@
 # Lector
 
-Lector is a terminal screen reader. It speaks what appears in your terminal and lets you review what’s on screen without disrupting the running program.
+Lector is a screen reader for the terminal. It speaks new output as it
+appears, and lets you go back and read anything on screen without disturbing
+the program you are running.
 
-## What Lector does
+## What you get
 
-- Reads new terminal output automatically as it appears.
-- Lets you review lines, words, and characters independently of the app cursor.
-- Helps navigate tables in terminal output.
-- Provides a clipboard history for quick copy/paste.
-- Can be customized with a simple Lua config file.
+- **Live reading.** New terminal output is spoken as it arrives.
+- **Review.** Read by line, word, or character, search, and copy text, all
+  without moving the application's cursor.
+- **Table navigation.** Move through terminal tables cell by cell, with row and
+  column headers.
+- **Clipboard history.** Keep the last ten things you copied and paste any of
+  them.
+- **tmux support.** Each pane of a `tmux -CC` session gets its own reading and
+  review state.
+- **Lua configuration.** Change options, rebind keys, and script your own
+  commands.
 
-## Get started
+## Install
 
-Build a release from a fresh clone with the standard Cargo command:
+Lector is built from source. You need:
 
-```bash
-cargo build --locked --release
-```
+- [Rust](https://rustup.rs), installed with rustup
+- `curl` and `tar`
+- On Linux, a C compiler (`build-essential` on Debian and Ubuntu,
+  `build-base` on Alpine)
+- On macOS, the Xcode command line tools (`xcode-select --install`)
 
-Run Lector with your shell:
-
-```bash
-cargo run -- --shell /bin/zsh
-```
-
-Or use the `SHELL` environment variable:
-
-```bash
-SHELL=/bin/zsh cargo run
-```
-
-In key names, `M-` means Alt (or Option) and `C-` means Control. Lector uses
-native speech by default. Press `M-x` to pause or resume speech, `M-r` to
-review output, and `F1` to hear what a key does.
-
-The [build guide](docs/ghostty-builds.md#fresh-clone-developer-build) lists
-prerequisites, supported targets, and offline packaging. The
-[documentation index](docs/README.md) links contributor and implementation guides.
-
-## Speech
-
-Lector uses native speech by default. `lector tts` runs its cross-platform
-speech host, keeping system speech and platform event loops away from terminal
-input and rendering. A normal Lector installation therefore remains
-self-contained; there is no second executable to install on the same machine.
-
-The same implementation is also built as the standalone `lector-tts` binary.
-The standalone host runs wherever its selected speech backend is supported,
-independently of the full Lector terminal application. A user-provided stdio
-bridge can connect Lector on Linux to speech on macOS or Windows.
-
-Inspect and select native engines and voices with:
+Then clone the repository and install:
 
 ```bash
-lector tts --list-backends
-lector tts --backend av-foundation --list-voices
-lector tts --backend av-foundation --voice VOICE_ID
-
-# The standalone executable has the same options and protocol behavior.
-lector-tts --backend nvda
+git clone https://github.com/n0ot/lector.git
+cd lector
+cargo install --locked --path . --bin lector
 ```
 
-The host reports its selected backend during protocol initialization. Rate,
-pitch, volume, voice listing, current-voice reporting, and voice selection are
-negotiated independently. Lector does not call unsupported setting operations
-or invent a `default` voice for externally managed backends such as NVDA.
+This puts `lector` in `~/.cargo/bin`, which rustup adds to your `PATH`. The
+first build downloads Lector's terminal engine and takes a few minutes.
 
-Speech selection is Lua configuration, not a command-line driver setting:
+To update later, run `git pull` and the same `cargo install` command again.
 
-```lua
--- The default.
-lector.o.speech.server = "native"
+Lector runs on macOS and Linux. The [build guide](docs/internals/building.md)
+covers supported platforms, offline builds, and build problems.
 
--- Or start a custom server with an exact argument vector.
-lector.o.speech.server = {
-  program = "/opt/lector/bin/lector-tts",
-  args = { "--backend", "speech-dispatcher" },
-}
-```
-
-For example, an SSH stdio bridge can be expressed without any special Lector
-transport support:
-
-```lua
-lector.o.speech.server = {
-  program = "ssh",
-  args = { "speech-mac", "lector-tts", "--backend", "av-foundation" },
-}
-```
-
-SSH setup, authentication, reconnect behavior, and the security of that link
-remain the user's responsibility.
-
-Lector invokes `program` directly; it does not perform shell parsing. At
-startup it loads `init.lua`, starts and initializes the selected server, and
-then restores configured speech settings only when the negotiated backend can
-set them. Assigning `lector.o.speech.server` is a startup-only configuration
-operation.
-
-Speech timing, numeric settings, and voice controls live in the same namespace:
-
-```lua
-lector.o.speech.rate = 65
-lector.o.speech.pitch = 1.0
-lector.o.speech.volume = 0.8
-
--- Delay between paragraphs; 100 milliseconds by default.
--- Set to 0 to add no paragraph delay.
-lector.o.speech.paragraph_pause_ms = 100
-
-local voices = lector.o.speech.voices
-if voices ~= nil then
-  for _, voice in ipairs(voices) do
-    print(voice.id, voice.name, voice.language, voice.gender)
-  end
-end
-
-lector.o.speech.voice = "backend-provided-voice-id"
-```
-
-Paragraph pause is Lector presentation policy rather than a speech-host
-setting. It must be a non-negative integer number of milliseconds, and changes
-apply to paragraph boundaries in speech submitted after the assignment.
-
-The negotiated operations remain independent. `rate`, `pitch`, `volume`,
-`voice`, or `voices` returns `nil` when the active host cannot report that
-value, and `voices` is a read-only array of `{id, name, language, gender}`
-tables when listing is available. Rate is normalized across hosts: `0` is the
-slowest supported rate, `50` is the backend's normal rate, and `100` is the
-fastest. This replaces the backend-native rate values accepted before speech
-protocol 2.2; migrate existing configurations explicitly, because an old value
-such as `1.0` is valid in the new range but now means nearly the slowest rate.
-Pitch and volume remain in the selected backend's domain. Assigning a rate
-outside `0..100`, assigning an unsupported setting or voice, or selecting an ID
-absent from an available voice list, raises a Lua error without changing the
-option. In the Lua REPL the submitted chunk stops and the prompt remains
-available. In `init.lua`, an immediately detectable error skips the rest of the
-chunk while earlier successful assignments remain in effect. A value that only
-the deferred speech-host handshake can reject fails the startup configuration
-boundary instead. Both cases open an error overlay, and configuration errors
-are also written to the structured diagnostic log when `--log` or `--log-file`
-enables logging.
-
-The Lua REPL and hooks can request a nonblocking, transactional runtime switch:
-
-```lua
-lector.api.set_speech("native")
-lector.api.set_speech({
-  program = "/opt/lector-speech/bin/other-server",
-  args = { "--voice", "Samantha" },
-})
-```
-
-The call returns immediately. Lector retains the old server for rollback while
-the candidate initializes; speech requested during that handshake waits in the
-bounded worker queue. A failed candidate leaves the old setting committed and
-opens an error popup after calling
-`lector.hooks.on_error(message, "speech-reconfigure")`.
-
-Custom servers use the bidirectional version 2 speech-host protocol: bounded
-UTF-8 NDJSON JSON-RPC 2.0 over stdin/stdout, with explicit capabilities and
-correlated lifecycle/progress events. The canonical
-[`crates/lector-tts/openrpc.json`](crates/lector-tts/openrpc.json) makes the
-methods machine-readable,
-and [the speech driver protocol](docs/speech-driver-protocol.md) defines exact
-framing, initialization, deadlines, errors, process cleanup, and the 30-second
-restart policy. Speech RPC and deadlines run only on the speech worker, keeping slow or hung servers independent of terminal input.
-
-### Silent test runs
-
-Ordinary Cargo/nextest tests do not start native speech. Native audio integration
-checks are a separate, muted opt-in suite: `scripts/test-native-speech` on a Mac
-with a working audio session. They have bounded failure deadlines and are
-required for native speech changes, not unrelated feature work. See
-[validation details](docs/performance.md).
-
-### Recording a diagnostic session
-
-`scripts/lector-trace` is a transparent PTY shim for reproducing interactive
-terminal problems while using the real TTS server. It records exact bytes in
-both directions and Lector's `--log` diagnostics in separate files. With the
-built-in native server, it also records every speech RPC, so the trace contains
-everything typed, displayed, and spoken. A custom server can provide the same
-speech trace by honoring `LECTOR_SPEECH_RPC_LOG`.
-
-When `lector` and `lector-trace` are installed together, run:
+## Run
 
 ```bash
-lector-trace --shell "$SHELL"
+lector
 ```
 
-The launcher creates a timestamped directory under the system temporary
-directory and prints its path before Lector starts and again after it exits.
-Pass `--trace-dir /path/to/new-directory` to choose the location.
-
-## How to use Lector
-
-Think of Lector as having two ways to listen:
-
-1) **Live reading**: Lector speaks new terminal output as it appears.
-2) **Review mode**: You can move a “review cursor” around the screen to read past output without moving the application cursor.
-
-If you ever forget keys, toggle **Help Mode** and press any key to hear what it does. (Default: `F1`.)
-
-### Core actions (with defaults)
-
-- **Pause/resume speech** with `M-x`. Ordinary input also pauses speech. A
-  capable host resumes at the beginning of the interrupted word; hosts with
-  safe stop-completion evidence can instead restart the current utterance from
-  its beginning. Pausing preserves queued announcements and paragraphs.
-- **Cancel speech** has no default binding. Cancellation stops speech and
-  discards the current utterance and everything queued behind it.
-- **Say the current overlay name**. Default: `M-w`.
-- **Reload Lua configuration** from the selected `init.lua`. Default: `M-R`.
-- **Toggle auto‑read** if you want to hear only on demand. Default: `M-'`.
-- **Toggle stop on focus loss** (interrupt speech when terminal focus leaves). Default: `M-g`.
-- **Move and read** by line/word/character using the review cursor.
-- **Set a mark and copy** text between the mark and the review cursor.
-- **Navigate terminal tables** from the frozen Review overlay.
-
-### Review overlay (reading past output)
-
-Press `M-r` to capture the current screen and retained scrollback in a frozen
-Review overlay. Move with arrows or `h`/`j`/`k`/`l`, search with `/`, and copy
-with `y` plus a motion or `yy` for a line. Output from the running application continues in the
-background, but cannot move or replace the snapshot. Press `q` to leave Review
-and return to the underlying terminal or overlay. `Escape` never
-closes Review: it cancels a pending count, motion, search, or visual selection.
-Pressing it with nothing to cancel says “review mode,” reminding you that `q`
-returns to the application.
-Review opens with its visible application cursor at the source view's review
-cursor. Inside Review, the left-click action (`M-{`) places that visible cursor
-at the independent review cursor instead of sending a mouse event to the
-background application.
-
-Navigation speech follows the frozen document: changing rows reads the
-destination line, a jump into another word reads that word, and a smaller move
-reads the destination character. Spaces and blank lines are named. Scrolling
-does not reread the newly exposed page, and repositioning the viewport without
-moving the document cursor stays silent. This feedback works with auto-read
-disabled and honors the indentation-reporting setting.
-
-Review announces entry into characterwise or linewise Visual mode and says
-“review mode” when a selection ends or a search completes or is cancelled.
-`v` and `V` switch selection types; pressing the active type again cancels it.
-Search entry announces “search forward” (`/`) or “search backward” (`?`).
-Enter, `n`, and `N` read the destination line when the row changes, or the
-word at the match on the same line, followed by a compact count such as
-“21 of 29.” This also confirms a match already under the cursor. Escape from
-search says only “review mode.” Search typing and pasting honor the suppress-key-echo
-setting. Invalid patterns, missing matches, and the lack
-of a previous search receive spoken explanations; failed searches stay open
-for correction or Escape.
-
-Review supports these vi-style commands:
-
-- Move with `h`/`j`/`k`/`l` or the arrow keys. `w`, `W`, `b`, `B`, `e`, and
-  `E` move by words; `0`, `^`, and `$` move within a line; `gg` and `G` move to
-  the beginning and end. Counts work, so `3w` moves forward three words.
-- `C-b` and `C-f` move by pages. Moving above or below the displayed page with
-  `k` or `j` scrolls the frozen snapshot one line at a time.
-- `zt`, `zz`, and `zb` place the cursor line at the top, center, or bottom of
-  the terminal. `z<Enter>`, `z.`, and `z-` do the same and move to the first
-  nonblank character. A count selects the one-based snapshot line first.
-- `[p` and `]p` jump to previous and next OSC 133 prompt markers.
-- `f`, `F`, `t`, and `T` find a character on the logical line; `;` and `,`
-  repeat that find in its original or opposite direction, respectively. Neither
-  changes the original direction, and repeats start at the current cursor.
-  `%` finds and jumps between matching `()`, `[]`, and `{}`.
-- `ma` through `mz` set named marks. `'a` jumps to mark `a`'s line at its first
-  nonblank character; `` `a `` jumps to its exact position. Setting a mark
-  announces its name; an unset or expired mark is explained.
-- `C-o` and `C-i` visit older and newer jump locations; counts work. Legacy
-  terminals send Tab and `C-i` identically, so Tab also moves forward. Searches,
-  named-mark jumps, `gg`/`G` and line-number jumps, `%`, and prompt jumps record
-  their origin; ordinary line/character/word movements do not. History retains
-  up to 100 exact positions per source across Review sessions. New jumps from
-  the middle keep later entries, as in Neovim's default jumplist. Unlike its
-  line-based deduplication, Review retains distinct columns on the same line.
-  Frozen snapshots remain navigable; reopening discards positions whose source
-  identity expired, using the same conservative rules as marks.
-- `*` / `#` search forward / backward for the whole keyword under the cursor
-  (or the next keyword on that logical line). `g*` / `g#` allow matches inside
-  larger words. If no keyword remains, they search the nonblank word under or
-  after the cursor literally. Keywords use Review's Unicode alphanumeric and
-  underscore rules; counts work and literal matches never split graphemes.
-  These searches become the remembered search for `n` / `N` and empty `/` / `?`.
-  An explicitly entered regular expression replaces the word-search mode.
-- `/` and `?` search the complete frozen scrollback using regular expressions.
-  `n` repeats in the same direction and `N` repeats in the opposite direction;
-  searches wrap at the ends.
-- `y` supports motions and counts, `yy` yanks lines, `yiw`/`yaw` (and the `W`
-  variants) yank text objects, and `v`/`V` start character/line selections.
-  Yanked text is placed in the configured default register and is ready for
-  `F7`. Prefix a yank with `""` for Lector's internal history or `"+` for the
-  system clipboard; for example, `"+yiw` copies the inner word to the system
-  clipboard.
-
-Named marks, the last accepted search and its direction, and the last character
-find survive closing and reopening Review within one Lector process. Each source
-view or tmux pane owns separate memory for its primary and alternate screen.
-`n` and `N` reuse the remembered search; an empty `/` or `?` submission reuses
-its pattern with the requested direction.
-
-Marks track retained document rows through ordinary append/scrolling, not screen
-coordinates. Eviction, reset, and resize/reflow can make a mark unavailable.
-Mutable screen rows are conservatively invalidated when output may replace them,
-even if their new text looks identical. Earlier retained history survives a grid
-repaint. Marks created from an older, not-yet-current physical presentation stay
-local to that frozen Review. Existing marks remain usable in the open frozen
-snapshot even while the source changes; reopening checks their validity. State
-is kept in memory only and disappears when Lector exits.
-
-Review also provides link commands at its vi navigation cursor:
-
-- `gx` opens an HTTP or HTTPS link with the desktop URL handler (`open` on
-  macOS, `xdg-open` on Linux). Opening is explicit and never changes mouse
-  handling in the underlying application.
-- `gy` copies its destination to Lector's internal clipboard, regardless of the
-  configured default register. `""gy` explicitly selects the internal clipboard;
-  `"+gy` copies to the system clipboard using the configured provider. Ordinary
-  yanks still honor the default register.
-
-OSC 8 link metadata takes precedence over the visible label and preserves the
-exact destination for copying, including non-HTTP schemes. Without metadata,
-Lector recognizes HTTP(S) URLs under the cursor across terminal soft wraps,
-but never joins hard newlines. Whitespace, quotes, backticks, and angle brackets
-end a plain-text URL; trailing sentence punctuation and unmatched closing
-brackets are excluded. Encoded punctuation avoids that plain-text ambiguity.
-The separate Lector inspection cursor does not change the target of `gx`/`gy`;
-`M-{` can first move the vi cursor to that inspection position.
-
-The desktop opener runs independently of terminal input and Review's lifetime.
-Failures are spoken. Only one opener may run at a time; another `gx` reports
-that it is busy. Some Linux handlers remain running until the browser closes;
-Lector does not kill the browser to enforce a timeout. `gy` remains available.
-
-Invalid chords, unavailable prompt/search/find targets, unmatched `%` braces,
-and motions past a boundary ring the terminal bell. Ordinary Lector review
-commands (`M-u`/`M-o`, `M-j`/`M-l`, and so on) remain available in the overlay
-and are bounded by its currently displayed page.
-
-Lector retains up to 10,000 primary-screen rows. `M-r` works through both the
-xterm Meta encoding used by non-Kitty terminals and Kitty keyboard events.
-`M-PageUp`/`M-PageDown` and `M-Up`/`M-Down` pass through to the running
-application.
-
-While active, Lector requests Kitty's disambiguate-escape-codes and
-report-alternate-keys flags from supporting outer terminals and xterm
-modifyOtherKeys mode 2 otherwise. The alternate-key metadata preserves shifted
-punctuation according to the active keyboard layout. Lector decodes that
-physical protocol to semantic keys, then encodes each key for the active
-child's independently modeled keyboard mode, removing metadata which the child
-did not request. Terminals which ignore both enhancement requests retain the
-unavoidable legacy ambiguity between a standalone Escape-prefixed key and the
-start of a terminal sequence. Only that fallback uses
-`lector.o.legacy_escape_timeout_ms` (30 ms by default); probe timeouts are
-separate and are not changed by this option.
-
-Resizing keeps the captured Review document frozen but creates a new viewport
-for the new terminal geometry. Lector keeps the cursor at the same screen row
-and column when possible. At the top, bottom, or horizontal content boundary,
-it shifts the viewport to show additional surrounding content instead; a
-narrower viewport pans without changing the cursor's logical position. Page
-motions use the new height immediately.
-
-When a shell emits the OSC 133 `B` input-boundary marker, ordinary unmodified
-Up/Down history navigation speaks the recalled editable input without the
-primary prompt. Readline does not emit a fresh marker for every history item;
-Lector correlates the forwarded arrow with the redraw after the existing `B`
-marker. If a temporary interface reuses that primary screen while the shell
-marker remains, an exact visual-focus transfer takes precedence over the stale
-semantic boundary. Without OSC 133 integration, speech uses cursor/diff
-behavior. A stable multi-row repaint joined by terminal soft-wrap metadata is
-read as one logical cursor line; because no semantic prompt boundary exists in
-that fallback, the prompt may be included.
-
-### Binding browser
-
-Press `M-?` (Alt+?) to open a searchable buffer of current bindings. It lists
-normal, table, and table-setup bindings, including Lua descriptions, followed by
-Review command syntax. Each row shows the action first, with its shortcuts
-grouped together. Inherited normal bindings appear only in the normal section.
-Configured bindings take precedence over Review keys. Use Review movement, `/` or `?`, marks, and yanks;
-`q` returns to the underlying view. The `open_bindings` action can be rebound.
-
-This buffer has its own saved cursor, marks, search, and character-find state.
-Runtime binding edits and successful configuration reloads refresh it while it
-is open without reading the whole buffer aloud. The cursor stays with the same
-binding; if that entry disappears, it moves to the next surviving entry, then
-the previous one. Content changes or rewrapping invalidate this buffer's marks
-and selections while retaining search state. Application Review memory remains
-independent.
-
-### Copy/paste and clipboard history
-
-- Set a mark with `F5`, move the review cursor, then copy with `F6`.
-- Paste the configured default clipboard register with `F7`.
-- Speak the configured default clipboard register with `M-c`.
-- Cycle clipboard history with `M-[` (previous) and `M-]` (next).
-
-The default register is `"`, Lector's ten-entry internal history. The `+`
-register is the system clipboard. Native system clipboard access works on
-macOS, Windows, Wayland, and X11 hosts supported by `arboard`. The optional
-`osc52` provider writes through the outer terminal instead, which is useful
-when Lector is running remotely; OSC 52 cannot read the terminal's clipboard,
-so system-register paste and read operations report that the provider is
-write-only.
-
-## Table navigation
-
-### Supported table types
-
-Lector table mode supports:
-
-- Pipe tables with `|` separators (with or without leading/trailing `|`), including separator/banner rows.
-- Fixed-width terminal tables where columns are separated by vertical blank gutters.
-- Manually-marked fixed-width tables with custom column names and optional bounds.
-
-### How to use table mode
-
-1. Open Review with `M-r`. Its Vim cursor can reach every retained scrollback
-   row, not only the visible page.
-2. Move the Review overlay application cursor onto a table and press `gt` to
-   detect it. `gt` always discards the previous active table before attempting
-   detection; if detection fails, no table remains active. `gT` has the same
-   replacement behavior before starting manual setup.
-3. Move by logical cell:
-
-- `[|`: previous cell, wrapping to the preceding row.
-- `]|`: next cell, wrapping to the following row.
-- `{|`: same column in the row above.
-- `}|`: same column in the row below.
-
-Cell jumps temporarily suppress ordinary cursor tracking and speak the row,
-column label, and complete cell as separate utterances. Ordinary Vim motions
-remain available and announce table, row, and column boundaries when crossed.
-If an ordinary motion leaves the active table, a cell motion re-enters at the
-first cell in its requested direction. The active table lasts until Review
-closes or `gt` or `gT` replaces it.
-
-Press `gH` on a column to use its cells as optional row headers. On a row
-change, Lector speaks the row number, row-header cell, destination column, and
-destination cell as separate utterances. Press `gH` on that column again to
-turn row headers off, or press it on another column to move the designation.
-
-### Manual table setup (tabstops)
-
-Use this when automatic detection is wrong for a screen layout.
-
-1. In Review, move to the table's header row or first data row and press `gT`.
-2. Navigate with ordinary Vim motions and press `Space` at the start of each
-   column. The first tabstop is the table's left boundary; the final column
-   consumes the rest of each row by default.
-3. Press `H` to switch between “headers from first row” and “no header row; use
-   custom names or column numbers.”
-4. Press `c` anywhere at or after a tabstop to edit that column's name. `Enter`
-   saves the name, `Escape` discards the current edit, and `C-u` clears the
-   field. Unnamed columns are announced as `column N`.
-5. Optionally move to the final data row and press `gB` to mark the bottom.
-   Move to the final display column that should be included and press `gR` to
-   set an optional right edge. Repeating either command on its marker clears
-   it.
-6. Press `Enter` to save and begin cell navigation, or `Escape` to cancel the
-   entire setup.
-
-Manual setup, column names, and the row-header designation last for the active
-Review table only. Cancelling a fresh `gT` setup does not restore the table it
-replaced.
-
-## tmux control mode
-
-Run `tmux -CC` from a shell inside Lector. Lector discovers the server's prefix
-and bindings and gives each pane independent terminal and Review state.
-Press `M-C` to switch connections, including nested or remote connections.
-In the connection manager, `d` detaches gracefully, deepest child first.
-Confirmed `D` sends Control-backslash; after 750 ms without an exit, it exposes
-the underlying terminal or parent pane for raw commands or an SSH escape.
-The PTY and SSH process remain alive.
-
-A stale pane is rebuilt from tmux's captured text; images and missing parser or
-semantic state may require rerunning the application output. See
-[tmux control mode](docs/tmux-completion.md) for recovery and resource bounds,
-and [prefix interaction](docs/tmux-prefix.md) for bindings, choosers, and nested
-connection restrictions.
-
-## Virtual terminal capabilities
-
-Lector presents `TERM=xterm-256color`, with 256 colors, true color, OSC 8 links,
-and a private terminfo entry advertising synchronized output. Kitty graphics
-are rendered when the outer terminal supports them. Application clipboard
-writes enter Lector's history; reads return an empty reply by default.
-Application writes never change the system clipboard.
-
-See [terminal compatibility](docs/architecture.md#terminal-compatibility-and-reading-behavior)
-for query ownership, terminfo and SSH behavior, unsupported modes, outer-terminal
-overrides, and reading heuristics. [Interactive performance](docs/performance.md)
-explains when a presented update becomes speech.
-
-## Configuration (Lua)
-
-On Unix, Lector reads `$XDG_CONFIG_HOME/lector/init.lua` on startup, with the
-configuration root defaulting to `$HOME/.config`. `XDG_CONFIG_HOME` must be an
-absolute path, as required by the
-[XDG Base Directory specification](https://specifications.freedesktop.org/basedir/latest/);
-an unset, empty, or relative value uses `$HOME/.config`. On other platforms,
-an absolute `XDG_CONFIG_HOME` is also honored; otherwise Lector uses the
-platform-native configuration directory.
-
-Configuration is selected in this order:
-
-1. The file passed to `--config PATH`.
-2. The file named by `LECTOR_CONFIG`.
-3. The XDG path above.
-
-`lector.config_dir` is the absolute directory containing the selected config
-file. Lector's Lua module loader searches that directory before Lua's ordinary
-filesystem paths, so a sibling `pager.lua` can be loaded with
-`local pager = require("pager")`. Dotted names such as `require("tools.pager")`
-resolve to `tools/pager.lua` or `tools/pager/init.lua` below the config
-directory. `lector.config_dir` is `nil` under `--no-config`.
-
-An explicit file selected by `--config` or `LECTOR_CONFIG` must exist. On
-macOS, Lector also recognizes the former
-`~/Library/Application Support/lector/init.lua` location when no valid
-`XDG_CONFIG_HOME` was explicitly selected and the new XDG file does not exist.
-This compatibility fallback lets existing installations migrate without
-changing the XDG behavior.
-
-Use `--no-config` to skip every configuration source and start with defaults,
-including native speech. It is mutually exclusive with `--config` and takes
-precedence over `LECTOR_CONFIG`.
+Lector starts the shell named by your `SHELL` environment variable. To use a
+different one:
 
 ```bash
-lector --shell /bin/zsh --config ./lector-demo.lua
-lector --shell /bin/zsh --no-config
+lector --shell /bin/zsh
 ```
 
-Press `M-R` to reload the selected configuration. Lector evaluates `init.lua`
-and its required modules in a fresh Lua VM, so edits to files such as
-`pager.lua` take effect without clearing `package.loaded`. Bindings, hooks, and
-symbol definitions are published as one generation only after the complete
-file succeeds. If loading fails, Lector opens an error popup and leaves the
-previous generation active.
+Exit your shell to leave Lector.
 
-Reload preserves live session state and starts the replacement keymap from
-Lector's built-in defaults. Removing a custom binding or hook from `init.lua`
-therefore removes it on the next successful reload. Startup-only settings must
-remain unchanged; for example, changing `lector.o.speech.server` requires a
-restart. The shell and PTY are selected before Lua runs and likewise cannot be
-changed by reload. Reload is unavailable under `--no-config`.
+## Your first five minutes
 
-While a replacement is being evaluated, APIs with immediate external effects
-(`lector.api.speak`, `lector.api.set_speech`, and system clipboard access) are
-unavailable. Put post-reload work in `lector.hooks.on_reload`; it runs only
-after the new generation has committed.
+In key names, `M-` means Alt (Option on a Mac) and `C-` means Control.
 
-### Common options
+| Key | What it does |
+| --- | --- |
+| `F1` | Toggle help mode. While it is on, press any key to hear what it does. |
+| `M-x` | Pause or resume speech. |
+| `M-i` | Read the current line. `M-u` and `M-o` read the previous and next line. |
+| `M-r` | Open Review to read, search, and copy earlier output. Press `q` to leave. |
+| `M-'` | Turn automatic reading off or on. |
+| `M-?` | Browse every key binding. |
 
-```lua
--- speech backend; this top-level option is read before speech starts
-lector.o.speech.server = "native"
+Typing also pauses speech, so you never have to wait for Lector to finish.
 
--- speaking rate
-lector.o.speech.rate = 50
+## Documentation
 
--- backend-domain pitch and volume, when negotiated
-lector.o.speech.pitch = 1.0
-lector.o.speech.volume = 0.8
+**Using Lector**
 
--- milliseconds of additional silence between paragraphs
-lector.o.speech.paragraph_pause_ms = 100
+- [Keys](docs/guide/keys.md): every default key binding.
+- [Review](docs/guide/review.md): read, search, and copy earlier output.
+- [Tables](docs/guide/tables.md): navigate tabular output.
+- [Clipboard](docs/guide/clipboard.md): copy, paste, and clipboard history.
+- [Speech](docs/guide/speech.md): voices, rate, and speech servers.
+- [tmux](docs/guide/tmux.md): use Lector with `tmux -CC`.
+- [Configuration](docs/guide/configuration.md): the config file and its options.
+- [Scripting](docs/guide/scripting.md): key bindings, hooks, and automation in Lua.
+- [Troubleshooting](docs/guide/troubleshooting.md): fixes for common problems.
 
--- backend-provided voice ID; inspect lector.o.speech.voices after startup
-lector.o.speech.voice = "voice-id"
+**Building on Lector**
 
--- how many symbols should be spoken
-lector.o.symbol_level = "most"  -- "none", "some", "most", "all", "character"
+- [Speech-host protocol](docs/protocols/speech-host.md): write your own speech
+  server.
+- [Application accessibility protocol](docs/protocols/application-accessibility.md):
+  let your terminal application tell Lector what to say.
 
--- live reading on/off
-lector.o.auto_read = true
+**Working on Lector**
 
--- suppress terminal output that echoes recently typed keys (disabled by default)
-lector.o.suppress_key_echo = false
+- [Contributing](CONTRIBUTING.md): set up, test, and submit changes.
+- [Internals](docs/README.md#internals): architecture and design notes.
 
--- report indentation changes for the application and review cursors
--- (enabled by default; set to false to disable)
-lector.o.report_indentation = false
+## License
 
--- interrupt speech immediately when terminal focus is lost
-lector.o.stop_speech_on_focus_loss = true
-
--- legacy ESC-prefix ambiguity only; enhanced keyboard input is immediate
-lector.o.legacy_escape_timeout_ms = 30
-
--- tmux pane bells: "audible" (default), "spoken", or "off"
-lector.o.tmux_bells = "spoken"
-
--- `"` uses Lector's history; `+` uses the system clipboard
-lector.o.clipboard.default_register = '"'
-
--- "native" (default) uses arboard; "osc52" writes through the outer terminal
-lector.o.clipboard.system_provider = "native"
-```
-
-### Clipboard API
-
-The internal ring and system clipboard have separate namespaces. `entries` is
-a newest-first snapshot and `index` is one-based.
-
-```lua
-local current = lector.clipboard.internal.text
-local history = lector.clipboard.internal.entries
-local selected = lector.clipboard.internal.index
-
-lector.clipboard.internal.text = "save in Lector's history"
-lector.clipboard.internal.index = 2
-lector.clipboard.internal.text = nil -- clear all internal entries
-
-local system_text = lector.clipboard.system.text -- native provider only
-lector.clipboard.system.text = "copy outside Lector"
-lector.clipboard.system.text = nil -- clear the system clipboard
-```
-
-Explicit binding actions `lector.paste_internal`, `lector.paste_system`,
-`lector.say_internal_clipboard`, and `lector.say_system_clipboard` bypass the
-configured default register.
-
-### Simple key customization
-
-You can remap keys or add your own Lua functions:
-
-```lua
--- this is the default pause/resume binding
-lector.bindings["M-x"] = "lector.toggle_speaking"
-
--- this is the default configuration reload binding
-lector.bindings["M-R"] = "lector.reload_config"
-
--- optional one-way controls; these keys are otherwise unbound by Lector
-lector.bindings["M-z"] = "lector.pause_speaking"
-lector.bindings["M-Z"] = "lector.resume_speaking"
-lector.bindings["C-M-z"] = "lector.cancel_speaking"
-
--- toggle stop-on-focus-loss behavior
-lector.bindings["M-g"] = "lector.toggle_stop_speech_on_focus_loss"
-
--- send mouse clicks to a mouse-aware terminal application at the review cursor
--- these are the default bindings
-lector.bindings["M-{"] = "lector.left_click"
-lector.bindings["M-}"] = "lector.right_click"
-
--- add a custom command
-lector.bindings["M-v"] = {
-  "speak current time",
-  function()
-    lector.api.speak(os.date("%H:%M"), true)
-  end,
-}
-```
-
-`lector.api.speak(text, interrupt)` returns an opaque string logical speech ID
-when speech is submitted, or `nil` when empty/unfocused speech is suppressed.
-With reliable terminal events, one logical request can contain several
-protocol utterances at paragraph boundaries. Otherwise Lector conservatively
-submits one normalized utterance. Treat the returned ID as a string; its
-format is not an API.
-
-The four speech controls above are binding action names, not functions in
-`lector.api`. `pause_speaking` and `resume_speaking` are idempotent one-way
-actions, `toggle_speaking` switches between them, and `cancel_speaking` is the
-only action that discards retained speech. A non-interrupting
-`speak` appends while speech is playing. If speech has been paused, any new
-`speak` request replaces the retained speech and begins the new request;
-`interrupt = true` always performs that replacement even while speech is
-playing.
-
-### View and reader automation
-
-Lua key bindings may use blocking-looking view automation without blocking
-Lector's terminal event loop. `lector.api.view()` returns an immutable snapshot
-of the view which has actually reached the physical terminal. `view.review` is
-the review cursor and `view.cursor` is the presented application's
-`{row=..., col=..., visible=...}` cursor. Coordinates are zero-based and ranges
-are start-inclusive/end-exclusive:
-
-```lua
-local view = lector.api.view()
-local reader = lector.api.reader()
-local result = reader:read(
-  view,
-  view.review,
-  {row = view.rows - 1, col = 0}
-)
-reader:close()
-```
-
-[`examples/lua-config`](examples/lua-config) is a complete configuration folder
-that binds `M-P` to continuous pager reading. Its `init.lua` uses
-`require("pager")`, so the folder works both as a starting point for a real
-configuration and directly through `--config examples/lua-config/init.lua`.
-
-`reader:read(view, first, last)` suspends only the Lua binding. It returns
-`{status="completed"|"cancelled", cause=..., position={row=..., col=...}}`, and
-the review cursor follows host-reported word progress. Reader acquisition
-raises a Lua error unless the negotiated speech host provides reliable
-completed/cancelled events, UTF-8 word progress, and confirmed stop. A reader
-temporarily disables auto read and restores the exact prior setting when it is
-closed, the binding returns, the binding fails, or a state change invalidates
-the reader.
-
-Reader utterances use the same configured symbol, emoji, repeated-symbol, and
-mixed-case transformations as ordinary speech. Lector retains a byte-offset
-map for the transformed utterance so host word progress still moves the review
-cursor through coordinates in the original view text.
-
-An error raised by a Lua key binding ends that binding, restores every reader
-and auto-read resource it owned, and opens an error popup with the Lua
-traceback. If owned speech cannot be cancelled during that cleanup, Lector
-exits through terminal cleanup.
-
-Any physical key requests a speech stop (reader acquisition has already
-established confirmed-stop support) and immediately resumes the suspended
-`reader:read()` with `status="cancelled"` and `cause="key"`; the key is consumed
-instead of being sent to the application. Lua should use that result to return
-or perform cleanup, and the reader remains owned until Lua closes it or the
-binding returns. A view, overlay, screen, speech-host generation, resize, or
-content change during `read` also cancels it conservatively.
-
-Use `view:send_keys(spec)` for Neovim-style key notation: text outside angle
-brackets is literal, while tokens include `<Space>`, `<Esc>`, `<CR>`, `<Tab>`,
-`<BS>`, `<C-x>`, and `<lt>`. `view:send_text(text)` is always literal. Both
-return an input receipt; `receipt:wait_for_stable_screen()` waits for a
-post-input physical presentation and then the same adaptive quiet/DEC 2026
-evidence used by auto read, but a line ending alone does not complete a
-whole-screen wait. It returns
-`{status="presented"|"no_response"|"cancelled", view=..., content_changed=...,
-effects={bells=...}}`. `presented` confirms that at least one screen or bell
-presentation crossed a physical-terminal flush before the quiet boundary;
-`no_response` conservatively reports that the application produced no
-observable presentation before the timeout. It does not mean end-of-file. A
-physical key produces `cancelled` when the suspended task owns a reader, so Lua
-can unwind its reader and other temporary settings.
-Bell counts belong to the receipt interval rather than persistent screen
-state. `view:same_content(other)` compares the exact readable lines, geometry,
-and row-wrapping semantics of two snapshots while ignoring visual-only style
-and cursor changes. A view, overlay, or screen handoff aborts the suspended Lua
-binding instead of returning a response from a different context.
-
-### Lua hooks
-
-Hooks let you respond to Lector events.
-
-```lua
--- set a hook
-lector.hooks.on_screen_update = function(ev)
-  -- ev.screen / ev.prev_screen are full screen strings
-end
-
--- unset a hook
-lector.hooks.on_screen_update = nil
-```
-
-Available hooks:
-
-```lua
--- lifecycle
-lector.hooks.on_startup = function(ctx) end         -- ctx: { config_path, version, pid }
-lector.hooks.on_reload = function(ctx) end          -- ctx: { config_path, version, pid }
-lector.hooks.on_shutdown = function(reason) end     -- reason: "exit" | "error"
-lector.hooks.on_error = function(message, context) end
-
--- screen + live reading
-lector.hooks.on_screen_update = function(ev) end    -- ev: { rows, cols, cursor_row, cursor_col, prev_cursor_row, prev_cursor_col, changed, overlay, screen, prev_screen }
-lector.hooks.on_live_read = function(text, meta)    -- meta: { cursor_moves, scrolled }, return string or nil to suppress
-  return text
-end
-
--- speech
-lector.hooks.on_speech_start = function(text, meta) end  -- meta: { interrupt }
-lector.hooks.on_speech_end = function(text, meta) end    -- meta: { interrupt, ok }
-
--- navigation + mode
-lector.hooks.on_review_cursor_move = function(pos) end   -- pos: { row, col, prev_row, prev_col }
-lector.hooks.on_mode_change = function(old, new) end     -- "normal" | "table" | "table_setup"
-lector.hooks.on_table_mode_enter = function(meta) end    -- meta: { top, bottom, columns, header_row, current_col }
-lector.hooks.on_table_mode_exit = function() end
-
--- Internal clipboard ring only. System clipboard changes do not call this hook.
--- meta: { op, index, size }
--- op: "push" | "prev" | "next" | "select" | "clear"
--- entry is nil after clear; otherwise it is the selected internal entry.
-lector.hooks.on_clipboard_change = function(entry, meta) end
-lector.hooks.on_key_unhandled = function(key, mode)          -- return true to consume
-  return false
-end
-```
-
-`on_speech_start` and `on_speech_end` bracket submission to Lector's speech
-manager; they do not claim that audible playback started or ended. Playback
-lifecycle is correlated internally by the speech-host events documented in
-the protocol.
-
-If a runtime hook raises an error or returns an invalid value, Lector disables
-that hook for the current configuration generation and opens an error popup.
-Disabling it before presentation prevents the popup's own screen and speech
-events from repeatedly invoking the failed callback. Observer hooks fall back
-conservatively: `on_key_unhandled` does not consume the key, and a failed
-`on_live_read` leaves the original text unchanged. `on_shutdown` is the
-exception because Lector no longer owns an interactive terminal on which an
-error popup can be recovered; a shutdown-hook error is reported after terminal
-cleanup.
-
-Runtime recovery is limited to boundaries which can prove that their owned
-state has been restored. Terminal and PTY transport failures, compositor or
-registry corruption, failed reader cleanup, and other internal invariant
-failures still terminate Lector through its normal terminal-cleanup path. If
-rendering or announcing an error popup itself fails, that secondary failure is
-fatal as well.
-
-`on_startup` is the post-start boundary. It runs only after `init.lua` has
-finished, the selected speech server has initialized, the physical terminal
-and startup probes are active, and initial child output has been presented. It
-runs immediately before the normal input loop, so startup announcements belong
-there rather than at top level:
-
-```lua
-lector.hooks.on_startup = function(_)
-  lector.api.speak("welcome to Lector", false)
-end
-```
-
-`on_reload` is the corresponding post-commit boundary for a successful
-`M-R`. `on_startup` is not run again, and a failed candidate never installs or
-runs its `on_reload` hook.
-
-## Lua REPL
-
-Lector has a built‑in Lua REPL so you can try commands while it’s running. Open it with `M-L`, experiment, then close it when you’re done.
-
-- Lua automatically continues incomplete statements and expressions at a `... ` prompt.
-- Press `C-c` to discard a pending multiline chunk, or `C-u` to clear the current line.
-- Press `C-l` to clear submitted input and output. Unsubmitted input and the `Esc to close` banner remain visible.
-- The transcript, unsubmitted input, history, and Lua environment are preserved after closing and reopening the overlay.
-- Commands that start with a space and consecutive duplicate commands are not added to REPL history.
-- Use `lector.inspect(value)` to pretty-print nested tables. It returns a string, so entering `lector.inspect(my_table)` displays it directly. Cycles are shown as `<cycle>`, and nesting beyond 20 table levels as `<max depth>`.
-
-The REPL runs trusted Lua scripts cooperatively on Lector's UI thread. Each
-resume must return or explicitly call `coroutine.yield()` so Lector can process
-input and redraw before the next resume. A non-yielding script or blocking
-native call can block the UI; cancellation keys cannot be handled while that
-resume is running. There is no guaranteed execution-time budget or automatic
-preemption.
-
-For cooperative work, place `coroutine.yield()` between bounded pieces of work.
-Lector resumes the submitted coroutine on later UI ticks; values passed to
-`coroutine.yield(...)` are not displayed, while final return values are displayed.
-When input can be processed between resumes, `Escape` cancels the suspended
-evaluation and closes the overlay. Reopening it keeps the Lua environment and
-transcript, including changes already made before cancellation; cancellation
-does not roll them back. `C-c` discards an incomplete multiline chunk, rather
-than cancelling an evaluation.
-
-A completed evaluation or a reported Lua error returns to the prompt without
-resetting the session, so another command can use existing variables. Closing
-and reopening the overlay does not recover control from a resume that never
-returns.
-
-## Tips
-
-- If you want Lector to read *only* what you ask for, turn off auto‑read.
-- Use Review table navigation when terminal output is column‑structured (CSV, tables, list views).
-- If speech feels too fast or slow, adjust `lector.o.speech.rate`.
-
-## Troubleshooting
-
-- If nothing speaks, check that your system TTS works.
-- If keys don’t behave as expected, toggle Help Mode and press the key to confirm its mapping.
+Lector is released under the [MIT License](LICENSE).
