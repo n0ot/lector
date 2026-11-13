@@ -9,7 +9,7 @@ import subprocess
 
 CONFIG_PATHS = (
     "Cargo.lock", "Cargo.toml", "rust-toolchain.toml", ".cargo/config.toml",
-    ".github/workflows/ghostty-build.yml", "scripts/rustc-static-linux",
+    "scripts/rustc-static-linux",
     "scripts/static-pie-cc", "scripts/zig-cc", "scripts/zig-lld",
     "scripts/bootstrap_zig.sh", "scripts/bootstrap_ghostty.sh",
 )
@@ -20,9 +20,20 @@ def fingerprint(root, compiler, target, lane):
     for value in (compiler, target, lane):
         digest.update(value.encode() + b"\0")
     paths = set(CONFIG_PATHS)
-    for directory in ("crates", "xtask", "build_support"):
-        paths.update(str(path.relative_to(root)) for path in (root / directory).rglob("*")
-                     if path.is_file())
+    # Workspace outputs are pruned by rust-cache. Ordinary Rust source edits
+    # must not discard third-party dependencies; Cargo fingerprints those edits.
+    # Keep manifests and native/build helpers in the fallback compatibility key.
+    for directory, directories, files in os.walk(root):
+        directories[:] = [name for name in directories if name not in ("target", ".git")]
+        for name in files:
+            path = Path(directory) / name
+            relative = path.relative_to(root).as_posix()
+            if (name in ("Cargo.toml", "build.rs")
+                    or relative.startswith((".cargo/", "build_support/", "scripts/lib/",
+                                            "crates/lector-ghostty/bootstrap/",
+                                            "crates/lector-ghostty/abi/",
+                                            "crates/lector-tts/android/"))):
+                paths.add(relative)
     for name in sorted(paths):
         path = root / name
         if path.is_file():

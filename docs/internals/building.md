@@ -216,11 +216,36 @@ command still runs.
   Rust target, profile and features, lockfile, Cargo configuration, and build
   and linker inputs. A changed lockfile or configuration can never restore an
   older cache. Alpine uses its own packaged compiler in a disposable
-  container, with a separate cache identity.
+  container, with a separate cache identity. Ordinary workspace source and
+  workflow edits do not invalidate dependency caches. Cargo checks source
+  changes, and the cache action prunes workspace output before saving. When
+  adding a native build helper, include it in `cargo_cache_key.py`'s input
+  boundary. If a workflow changes profiles or feature sets, update its cache
+  lane as well. PRs continue to restore and save their own caches.
 - **Docker test cache.** Also keyed by the exact container image and compiler.
   Its fingerprint covers Cargo manifests, build scripts, the Ghostty adapter,
   Docker inputs, and the container runner's helpers. When you add a new build
   helper that these depend on, add it to `BUILD_SCRIPTS` in
   `.github/scripts/tmux_cache_key.py`.
+
+The `Cache retention` workflow runs after build workflows, daily, and on
+manual dispatch. It deletes caches scoped to confirmed closed pull requests
+and keeps the two newest Docker compilation snapshots per branch, compatible
+build identity, and cache format. Open PR caches, Cargo dependency caches, and
+Ghostty/Zig caches are preserved. Different build identities still expire under
+GitHub's normal eviction policy. This reduces duplicate storage within the free
+allowance; it does not reserve space for any branch or raise the storage limit.
+
+Inspect the proposed deletions without changing GitHub:
+
+```bash
+python3 .github/scripts/cache_retention.py --repo OWNER/REPO
+```
+
+Add `--apply` to delete only those cache IDs. Closed PR state is checked again
+before deletion. API failures stop cleanup; an already evicted ID is harmless.
+The workflow executes only default-branch code, including when triggered by a
+PR's completed CI. Closed PRs that produce no further build run are handled by
+the daily cleanup.
 
 Restored native artifacts are verified before use.

@@ -41,6 +41,36 @@ class CargoCacheKeyTests(unittest.TestCase):
             path.write_text("changed")
             self.assertNotEqual(original, self.key())
 
+    def test_workspace_sources_and_workflow_do_not_discard_dependencies(self):
+        original = self.key()
+        for name in ("src/main.rs", "crates/lector-tts/src/lib.rs",
+                     "crates/lector-ghostty/src/lib.rs", "xtask/src/main.rs",
+                     ".github/workflows/ghostty-build.yml", "docs/building.md"):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("first revision")
+            self.assertEqual(original, self.key(), name)
+            path.write_text("another revision")
+            self.assertEqual(original, self.key(), name)
+            path.unlink()
+            self.assertEqual(original, self.key(), name)
+
+    def test_manifests_build_scripts_and_native_inputs_partition_fallbacks(self):
+        for name in ("crates/sample/Cargo.toml", "crates/sample/build.rs",
+                     "crates/lector-ghostty/abi/build_info_probe.c",
+                     "crates/lector-tts/android/Bridge.java", "build_support/helper.rs",
+                     "scripts/zig-cc", "scripts/static-pie-cc"):
+            path = self.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            original = self.key()
+            path.write_text("first revision")
+            self.assertNotEqual(original, self.key(), name)
+            before = self.key()
+            path.write_text("changed")
+            self.assertNotEqual(before, self.key(), name)
+            path.unlink()
+            self.assertEqual(original, self.key(), name)
+
     def test_build_outputs_never_affect_input_key(self):
         original = self.key()
         (self.root / "target").mkdir()
