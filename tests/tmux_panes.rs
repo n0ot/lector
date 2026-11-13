@@ -911,10 +911,17 @@ fn real_tmux_split_resize_zoom_close_and_bootstrap_match_the_render_oracle() {
     verify_app_scene("real-tmux-one-pane", &mut app, &physical);
 
     let before_split = physical.len();
-    writer
-        .write_all(b"split-window -h -d \"printf 'second-pane\\n'; exec cat\"\n")
-        .unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "split-window",
+            "-h",
+            "-d",
+            "-t",
+            &session,
+            "printf 'second-pane\\n'; exec cat",
+        ],
+    );
     drive_real_tmux_until(
         "split",
         &mut app,
@@ -949,8 +956,7 @@ fn real_tmux_split_resize_zoom_close_and_bootstrap_match_the_render_oracle() {
         .map(|surface| surface.snapshot.geometry.cols)
         .collect::<Vec<_>>();
     let before_resize = physical.len();
-    writer.write_all(b"resize-pane -t %0 -R 5\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["resize-pane", "-t", "%0", "-R", "5"]);
     drive_real_tmux_until(
         "resize",
         &mut app,
@@ -979,8 +985,7 @@ fn real_tmux_split_resize_zoom_close_and_bootstrap_match_the_render_oracle() {
     verify_app_scene("real-tmux-resize", &mut app, &physical);
 
     let before_zoom = physical.len();
-    writer.write_all(b"resize-pane -Z -t %1\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["resize-pane", "-Z", "-t", "%1"]);
     drive_real_tmux_until(
         "zoom",
         &mut app,
@@ -1002,9 +1007,8 @@ fn real_tmux_split_resize_zoom_close_and_bootstrap_match_the_render_oracle() {
     verify_app_scene("real-tmux-zoom", &mut app, &physical);
 
     let before_close = physical.len();
-    writer.write_all(b"resize-pane -Z -t %1\n").unwrap();
-    writer.write_all(b"kill-pane -t %1\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["resize-pane", "-Z", "-t", "%1"]);
+    super::run_real_tmux_fixture_command(&socket, &["kill-pane", "-t", "%1"]);
     drive_real_tmux_until(
         "close",
         &mut app,
@@ -1029,8 +1033,7 @@ fn real_tmux_split_resize_zoom_close_and_bootstrap_match_the_render_oracle() {
     );
     verify_app_scene("real-tmux-close", &mut app, &physical);
 
-    writer.write_all(b"kill-server\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
     drive_real_tmux_until(
         "exit",
         &mut app,

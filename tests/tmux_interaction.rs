@@ -1113,15 +1113,17 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         |app| app.debug_active_view_contents().contains("FIRST"),
     );
 
-    writer
-        .write_all(
-            format!(
-                "new-session -d -s {second_session} \"/bin/sh -c 'read ready; printf SECOND; exec cat'\"\n"
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-    writer.flush().unwrap();
+    let control_client = super::real_tmux_fixture_client(&socket);
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "new-session",
+            "-d",
+            "-s",
+            &second_session,
+            "/bin/sh -c 'read ready; printf SECOND; exec cat'",
+        ],
+    );
     drive_real_tmux(
         "second-session discovery",
         &mut app,
@@ -1134,16 +1136,17 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
                 .is_some_and(|dump| dump.contains(&second_session))
         },
     );
-    writer
-        .write_all(
-            format!(
-                "switch-client -t {second_session}\n\
-                 send-keys -t {second_session} Enter\n"
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "switch-client",
+            "-c",
+            &control_client,
+            "-t",
+            &second_session,
+        ],
+    );
+    super::run_real_tmux_fixture_command(&socket, &["send-keys", "-t", &second_session, "Enter"]);
     drive_real_tmux(
         "second-session bootstrap",
         &mut app,
@@ -1179,10 +1182,10 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         completed_while_away.status.success(),
         "failed to update the unattached session: {completed_while_away:?}"
     );
-    writer
-        .write_all(format!("switch-client -t {first_session}\n").as_bytes())
-        .unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &["switch-client", "-c", &control_client, "-t", &first_session],
+    );
     drive_real_tmux(
         "restore first session",
         &mut app,
@@ -1240,8 +1243,7 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
         },
     );
 
-    writer.write_all(b"kill-server\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
     let _ = child.wait().unwrap();
     read_thread.join().unwrap();
     let _ = std::fs::remove_file(&socket);

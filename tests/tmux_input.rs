@@ -860,8 +860,7 @@ fn real_tmux_byte_echo_paste_mouse_resize_and_output_flood_harness() {
         |app| app.debug_active_view_contents().contains("7a"),
     );
 
-    writer.write_all(b"kill-server\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
     drive_real_tmux_until(
         "input fixture exit",
         &mut app,

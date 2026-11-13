@@ -836,13 +836,30 @@ fn real_tmux_discovers_c_a_and_executes_next_window_through_control_mode() {
         |app| app.debug_active_view_contents().contains("FIRST"),
     );
 
-    writer
-        .write_all(
-            b"new-window -d -n second \"/bin/sh -c 'printf SECOND; exec cat'\"\n\
-new-window -d -t :10 -n tenth \"/bin/sh -c 'printf TENTH; exec cat'\"\n",
-        )
-        .unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "new-window",
+            "-d",
+            "-t",
+            &format!("{session}:"),
+            "-n",
+            "second",
+            "/bin/sh -c 'printf SECOND; exec cat'",
+        ],
+    );
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "new-window",
+            "-d",
+            "-t",
+            &format!("{session}:10"),
+            "-n",
+            "tenth",
+            "/bin/sh -c 'printf TENTH; exec cat'",
+        ],
+    );
     drive_real_tmux(
         "second-window discovery",
         &mut app,
@@ -860,8 +877,10 @@ new-window -d -t :10 -n tenth \"/bin/sh -c 'printf TENTH; exec cat'\"\n",
     // Let the bootstrap capture for the newly discovered pane complete before
     // exercising input. Visiting both windows also proves the following
     // prefix action, rather than setup, caused the final transition.
-    writer.write_all(b"select-window -t :second\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &["select-window", "-t", &format!("{session}:second")],
+    );
     drive_real_tmux(
         "second-window bootstrap",
         &mut app,
@@ -871,8 +890,7 @@ new-window -d -t :10 -n tenth \"/bin/sh -c 'printf TENTH; exec cat'\"\n",
         &mut physical,
         |app| app.debug_active_view_contents().contains("SECOND"),
     );
-    writer.write_all(b"previous-window\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["previous-window", "-t", &session]);
     drive_real_tmux(
         "restore first window",
         &mut app,
@@ -930,8 +948,7 @@ new-window -d -t :10 -n tenth \"/bin/sh -c 'printf TENTH; exec cat'\"\n",
         "window ten was selected but its title was not announced"
     );
 
-    writer.write_all(b"kill-server\n").unwrap();
-    writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
     let _ = child.wait().unwrap();
     read_thread.join().unwrap();
     let _ = std::fs::remove_file(&socket);

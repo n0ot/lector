@@ -1939,11 +1939,10 @@ fn real_tmux_nested_loopback_routes_control_and_child_input() {
         app.activate_tmux_connection(1, &mut sr, &mut physical)
             .unwrap()
     );
-    harness
-        .writer
-        .write_all(b"new-session -d -s nested-away /bin/sh\n")
-        .unwrap();
-    harness.writer.flush().unwrap();
+    super::run_real_tmux_fixture_command(
+        &harness.outer_socket,
+        &["new-session", "-d", "-s", "nested-away", "/bin/sh"],
+    );
     harness.drive(
         "outer alternate-session discovery",
         &mut app,
