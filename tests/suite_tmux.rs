@@ -1,5 +1,5 @@
 use std::{
-    sync::{Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard, mpsc},
     time::{Duration, Instant},
 };
 
@@ -7,32 +7,70 @@ static REAL_TMUX_TEST_LOCK: Mutex<()> = Mutex::new(());
 // PTY reads have no protocol-level boundary. Bound each fixture phase by
 // elapsed time so arbitrary stream fragmentation cannot consume its budget.
 const REAL_TMUX_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
+const REAL_TMUX_PROGRESS_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Eq, PartialEq)]
-enum RealTmuxPhaseError<E> {
+enum RealTmuxPhaseError {
     Deadline,
-    Step(E),
+    Step(mpsc::RecvTimeoutError),
 }
 
-fn drive_real_tmux_phase<E>(
-    step: impl FnMut(Duration) -> Result<bool, E>,
-) -> Result<(), RealTmuxPhaseError<E>> {
-    drive_real_tmux_phase_with_clock(REAL_TMUX_PHASE_TIMEOUT, Instant::now, step)
+// Each step feeds optional PTY bytes, advances timers, drains commands, then
+// observes its predicate. A receive wakeup is not the phase or idle deadline.
+fn drive_real_tmux_phase(
+    receiver: &mpsc::Receiver<Vec<u8>>,
+    idle_timeout: Option<Duration>,
+    step: impl FnMut(Option<Vec<u8>>) -> Result<bool, mpsc::RecvTimeoutError>,
+) -> Result<(), RealTmuxPhaseError> {
+    drive_real_tmux_phase_with_clock(
+        REAL_TMUX_PHASE_TIMEOUT,
+        idle_timeout,
+        Instant::now,
+        |wait| receiver.recv_timeout(wait),
+        step,
+    )
 }
 
-fn drive_real_tmux_phase_with_clock<E>(
+fn drive_real_tmux_phase_with_clock(
     timeout: Duration,
+    idle_timeout: Option<Duration>,
     mut now: impl FnMut() -> Instant,
-    mut step: impl FnMut(Duration) -> Result<bool, E>,
-) -> Result<(), RealTmuxPhaseError<E>> {
-    let deadline = now() + timeout;
+    mut receive: impl FnMut(Duration) -> Result<Vec<u8>, mpsc::RecvTimeoutError>,
+    mut step: impl FnMut(Option<Vec<u8>>) -> Result<bool, mpsc::RecvTimeoutError>,
+) -> Result<(), RealTmuxPhaseError> {
+    let start = now();
+    let deadline = start + timeout;
+    let mut idle_deadline = idle_timeout.map(|timeout| start + timeout);
+    // Drive pending commands and timers even when the peer has nothing to send.
+    if step(None).map_err(RealTmuxPhaseError::Step)? {
+        return Ok(());
+    }
     loop {
         let current = now();
         if current >= deadline {
             return Err(RealTmuxPhaseError::Deadline);
         }
-        let remaining = deadline.duration_since(current);
-        if step(remaining).map_err(RealTmuxPhaseError::Step)? {
+        let mut wait = deadline
+            .duration_since(current)
+            .min(REAL_TMUX_PROGRESS_INTERVAL);
+        if let Some(idle_deadline) = idle_deadline {
+            if current >= idle_deadline {
+                return Err(RealTmuxPhaseError::Step(mpsc::RecvTimeoutError::Timeout));
+            }
+            wait = wait.min(idle_deadline.duration_since(current));
+        }
+        let chunk = match receive(wait) {
+            Ok(chunk) => {
+                idle_deadline = idle_timeout.map(|timeout| now() + timeout);
+                Some(chunk)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(error) => return Err(RealTmuxPhaseError::Step(error)),
+        };
+        if now() >= deadline {
+            return Err(RealTmuxPhaseError::Deadline);
+        }
+        if step(chunk).map_err(RealTmuxPhaseError::Step)? {
             return Ok(());
         }
     }
@@ -50,41 +88,152 @@ fn serialize_real_tmux_test() -> MutexGuard<'static, ()> {
 }
 
 #[test]
-fn tmux_phase_budget_depends_on_time_not_stream_fragment_count() {
+fn tmux_phase_drives_pending_work_without_incoming_bytes() {
     let start = Instant::now();
-    let fragments = std::cell::Cell::new(0_usize);
+    let elapsed = std::cell::Cell::new(Duration::ZERO);
+    let ticks = std::cell::Cell::new(0);
+    let receives = std::cell::Cell::new(0);
     let result = drive_real_tmux_phase_with_clock(
         Duration::from_secs(1),
-        || start,
-        |_| {
-            fragments.set(fragments.get() + 1);
-            Ok::<_, ()>(fragments.get() == 10_000)
+        None,
+        || start + elapsed.get(),
+        |wait| {
+            // An idle peer does not wake us. Only the driver's receive budget
+            // lets a pending timer expire and its command become observable.
+            receives.set(receives.get() + 1);
+            elapsed.set(elapsed.get() + wait);
+            Err(mpsc::RecvTimeoutError::Timeout)
+        },
+        |chunk| {
+            assert_eq!(chunk, None);
+            ticks.set(ticks.get() + 1);
+            Ok(elapsed.get() >= Duration::from_millis(30))
         },
     );
-
     assert_eq!(result, Ok(()));
-    assert_eq!(fragments.get(), 10_000);
+    assert_eq!(receives.get(), 3);
+    assert_eq!(ticks.get(), 4);
 }
 
 #[test]
-fn tmux_phase_keeps_a_hard_elapsed_time_bound() {
+fn tmux_phase_budget_depends_on_time_not_stream_fragment_count() {
     let start = Instant::now();
-    let clock_reads = std::cell::Cell::new(0_usize);
-    let steps = std::cell::Cell::new(0_usize);
+    let mut fragments = 0;
     let result = drive_real_tmux_phase_with_clock(
         Duration::from_secs(1),
-        || {
-            let elapsed = clock_reads.replace(clock_reads.get() + 1);
-            start + Duration::from_secs(elapsed as u64)
-        },
-        |_| {
-            steps.set(steps.get() + 1);
-            Ok::<_, ()>(false)
+        None,
+        || start,
+        |_| Ok(vec![0]),
+        |chunk| {
+            if chunk.is_some() {
+                fragments += 1;
+            }
+            Ok(fragments == 10_000)
         },
     );
+    assert_eq!(result, Ok(()));
+    assert_eq!(fragments, 10_000);
+}
 
-    assert_eq!(result, Err(RealTmuxPhaseError::Deadline));
-    assert_eq!(steps.get(), 0);
+#[test]
+fn tmux_phase_keeps_a_hard_elapsed_time_bound_when_idle_or_receiving() {
+    for incoming in [false, true] {
+        let start = Instant::now();
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let mut steps = 0;
+        let result = drive_real_tmux_phase_with_clock(
+            Duration::from_millis(25),
+            None,
+            || start + elapsed.get(),
+            |wait| {
+                elapsed.set(elapsed.get() + wait);
+                if incoming {
+                    Ok(vec![0])
+                } else {
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                }
+            },
+            |_| {
+                steps += 1;
+                Ok(false)
+            },
+        );
+        assert_eq!(result, Err(RealTmuxPhaseError::Deadline));
+        assert_eq!(elapsed.get(), Duration::from_millis(25));
+        assert_eq!(steps, 3);
+    }
+}
+
+#[test]
+fn tmux_phase_preserves_receive_shutdown_and_step_errors() {
+    let start = Instant::now();
+    let mut steps = 0;
+    let result = drive_real_tmux_phase_with_clock(
+        Duration::from_secs(1),
+        None,
+        || start,
+        |_| Err(mpsc::RecvTimeoutError::Disconnected),
+        |_| {
+            steps += 1;
+            Ok(false)
+        },
+    );
+    assert_eq!(
+        result,
+        Err(RealTmuxPhaseError::Step(
+            mpsc::RecvTimeoutError::Disconnected
+        ))
+    );
+    assert_eq!(steps, 1);
+
+    let result = drive_real_tmux_phase_with_clock(
+        Duration::from_secs(1),
+        None,
+        || start,
+        |_| panic!("a failed step must stop before receiving"),
+        |_| Err(mpsc::RecvTimeoutError::Timeout),
+    );
+    assert_eq!(
+        result,
+        Err(RealTmuxPhaseError::Step(mpsc::RecvTimeoutError::Timeout))
+    );
+}
+
+#[test]
+fn tmux_phase_idle_deadline_is_bounded_and_reset_only_by_bytes() {
+    let start = Instant::now();
+    let elapsed = std::cell::Cell::new(Duration::ZERO);
+    let mut waits = Vec::new();
+    let mut receives = 0;
+    let result = drive_real_tmux_phase_with_clock(
+        Duration::from_secs(1),
+        Some(Duration::from_millis(15)),
+        || start + elapsed.get(),
+        |wait| {
+            waits.push(wait);
+            elapsed.set(elapsed.get() + wait);
+            receives += 1;
+            if receives == 1 {
+                Ok(vec![0])
+            } else {
+                Err(mpsc::RecvTimeoutError::Timeout)
+            }
+        },
+        |_| Ok(false),
+    );
+    assert_eq!(
+        result,
+        Err(RealTmuxPhaseError::Step(mpsc::RecvTimeoutError::Timeout))
+    );
+    assert_eq!(elapsed.get(), Duration::from_millis(25));
+    assert_eq!(
+        waits,
+        [
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(5)
+        ]
+    );
 }
 
 #[path = "tmux_bells.rs"]

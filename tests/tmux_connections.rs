@@ -1157,9 +1157,11 @@ impl RealTransport {
         if done(app) {
             return;
         }
-        let result = super::drive_real_tmux_phase(|remaining| {
-            let chunk = self.receiver.recv_timeout(remaining)?;
-            feed(app, sr, &mut self.router, &chunk, physical);
+        let result = super::drive_real_tmux_phase(&self.receiver, None, |chunk| {
+            if let Some(chunk) = chunk {
+                feed(app, sr, &mut self.router, &chunk, physical);
+            }
+            app.handle_tick(sr, self.writer.as_mut(), physical).unwrap();
             app.drain_tmux_commands_for(self.connection_id, self.writer.as_mut())
                 .unwrap();
             self.writer.flush().unwrap();

@@ -1818,9 +1818,11 @@ impl RealNestedHarness {
         if done(app) {
             return;
         }
-        let result = super::drive_real_tmux_phase(|remaining| {
-            let chunk = self.receiver.recv_timeout(remaining)?;
-            app.handle_pty(sr, &chunk, physical).unwrap();
+        let result = super::drive_real_tmux_phase(&self.receiver, None, |chunk| {
+            if let Some(chunk) = chunk {
+                app.handle_pty(sr, &chunk, physical).unwrap();
+            }
+            app.handle_tick(sr, self.writer.as_mut(), physical).unwrap();
             app.drain_tmux_commands_for(1, self.writer.as_mut())
                 .unwrap();
             self.writer.flush().unwrap();

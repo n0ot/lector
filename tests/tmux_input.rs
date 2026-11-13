@@ -593,9 +593,10 @@ fn drive_real_tmux_until(
     if ready(app) {
         return;
     }
-    let result = super::drive_real_tmux_phase(|remaining| {
-        let chunk = receiver.recv_timeout(remaining)?;
-        app.handle_pty(sr, &chunk, physical).unwrap();
+    let result = super::drive_real_tmux_phase(receiver, None, |chunk| {
+        if let Some(chunk) = chunk {
+            app.handle_pty(sr, &chunk, physical).unwrap();
+        }
         write_pending_real_commands(app, sr, writer, physical);
         Ok::<_, mpsc::RecvTimeoutError>(ready(app))
     });

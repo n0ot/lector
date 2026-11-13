@@ -15,9 +15,9 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     rc::Rc,
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::mpsc,
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 const SPLIT: &str = "b25f,80x24,0,0{40x24,0,0,20,39x24,41,0,23}";
@@ -1020,29 +1020,11 @@ fn drive_real_tmux(
     if done(app) {
         return;
     }
-    let mut idle_deadline = Instant::now() + Duration::from_secs(5);
-    let result = super::drive_real_tmux_phase(|phase_remaining| {
+    let result = super::drive_real_tmux_phase(receiver, Some(Duration::from_secs(5)), |chunk| {
+        if let Some(chunk) = chunk {
+            app.handle_pty(sr, &chunk, physical).unwrap();
+        }
         write_real_commands(app, sr, writer, physical);
-        let idle_remaining = idle_deadline.saturating_duration_since(Instant::now());
-        if idle_remaining.is_zero() {
-            return Err(RecvTimeoutError::Timeout);
-        }
-        match receiver.recv_timeout(
-            phase_remaining
-                .min(idle_remaining)
-                .min(Duration::from_millis(10)),
-        ) {
-            Ok(chunk) => {
-                idle_deadline = Instant::now() + Duration::from_secs(5);
-                app.handle_pty(sr, &chunk, physical).unwrap();
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // A pane update can race an authoritative capture and schedule
-                // a quiet recapture while the tmux control channel is idle.
-                // Keep driving Lector's timers until data arrives.
-            }
-            Err(error) => return Err(error),
-        }
         Ok(done(app))
     });
     if let Err(error) = result {
