@@ -18,304 +18,25 @@ Build a release from a fresh clone with the standard Cargo command:
 cargo build --locked --release
 ```
 
-Cargo automatically downloads, verifies, builds, and caches Lector's pinned
-terminal engine when needed. Normal development and release builds reuse the
-same cached native archive; installed Lector binaries have no extra runtime
-dependency. Exact pins, supported targets, offline packaging, upgrades, and
-maintainer diagnostics are documented in
-[docs/ghostty-builds.md](docs/ghostty-builds.md).
-
-For a concise map of runtime ownership, data flow, concurrency boundaries, and
-source directories, see [architecture source map](docs/architecture.md#source-map).
-The [documentation index](docs/README.md) and [contributor guide](CONTRIBUTING.md)
-collect the deeper design notes and verification commands.
-
 Run Lector with your shell:
 
 ```bash
 cargo run -- --shell /bin/zsh
 ```
 
-The modeled compositor is Lector's only presentation path. Application PTY
-bytes are parsed by Ghostty and never written directly to the physical
-terminal. After its initial full reconstruction, the compositor consumes
-Ghostty's cell/row damage and emits only changed runs. It keeps a confirmed
-physical-terminal shadow and falls back to a full redraw after resize, failed
-or partial writes, uncertain state, or unsupported content. For unobscured,
-rectangular terminal updates it also translates validated scrolling,
-line/character insertion and deletion, erasure, and adjacent write hints into
-semantic VT operations. Clipped, overlaid, media-changing, ambiguous, or
-inconsistent hints automatically return to the dirty-region or full-scene
-oracle-tested path. Text damage around unchanged images remains incremental.
-
-OSC 8 hyperlinks are reconstructed with an explicit text-only fallback and
-are closed at every output-transaction boundary. Kitty graphics are decoded by
-Ghostty into pane-scoped media stores, mapped to collision-safe outer IDs, and
-clipped against panes and overlays. Pixel uploads and placement state have
-separate lifetimes, so opening an overlay can remove placements and closing it
-can restore them without decoding, copying, or retransmitting unchanged pixel
-data. Default limits are 32 MiB per image, 64 MiB per pane, 128 MiB per scene,
-and 4,096 placements; stale outer uploads are explicitly deleted. If the outer
-terminal does not advertise Kitty graphics, Lector renders text and emits no
-graphics protocol.
-
-The application and every Lector overlay are independent scene layers. The
-application terminal engine continues consuming output while
-Message, Review, Lua REPL, or popup layers are visible, so closing
-an overlay reveals the current composed source scene without replaying deferred
-PTY bytes. Review retains a frozen, independently navigable snapshot, and its
-table setup operates within that same full-history document. Reviewable
-announcement, error, and confirmation popups close with
-`Enter` or `Escape`; confirmations report accept and cancel separately.
-
-### tmux control mode
-
-Run `tmux -CC` from a shell inside Lector to enter the accessible control-mode
-integration. Each tmux pane keeps an independent Ghostty engine, scrollback,
-review state, and media namespace; splits, hidden windows, overlays, images,
-multiple servers, and nested SSH/tmux connections use the same compositor as
-ordinary terminal mode. Lector discovers the server's actual prefix and
-bindings instead of assuming `C-b` or `C-a`.
-
-Pane state follows tmux's stable `%pane` and `@window` IDs rather than session
-names or window indexes. Moving or linking a window therefore preserves the
-same Review cursor, terminal and media state, modes, and APC accessibility
-settings. Returning to an ordinary session authoritatively refreshes panes
-which may have changed while its control client was elsewhere. For a nested
-`tmux -CC` running through SSH, Lector first creates and verifies a hidden
-high-index carrier winlink in the destination session, so the framed child
-stream remains live for hours without a tunnel or remote helper.
-
-Press `M-C` while any tmux connection exists to open Lector's connection
-manager. It can switch to another local, nested, or remote connection even
-when the selected control process is silent or flooding. Its active row starts
-with `*`; compact rows show the stable ID, optional custom label, and tmux
-server host without repeating `connection` or `tmux`. With no tmux connections,
-`M-C` announces `no tmux connections active`. Press `d` to
-detach the selected connection tree gracefully, deepest child first. Confirmed `D`
-first sends Control-backslash; if the transport remains stuck, Lector stops
-parsing that stream as tmux control and exposes the underlying terminal or
-parent pane so commands such as `detach-client` or an SSH `~.` escape can be
-entered directly.
-
-Lector requests bounded tmux output flow control, coalesces pause/resume, and
-rebuilds pane text/history from an authoritative capture if tmux reports stale
-incremental output. A capture cannot reconstruct images, partial parser state,
-or already-consumed semantic metadata, so those limitations are explicit and
-spoken rather than guessed. Setup, bounds, performance measurements,
-troubleshooting, and recovery are in
-[docs/tmux-completion.md](docs/tmux-completion.md); prefix and chooser behavior
-is in [docs/tmux-prefix.md](docs/tmux-prefix.md).
-
-An in-place application title change or tmux rename updates Lector's model but
-is not announced automatically. A context handoff announces the current title
-only after the matching composed frame is physically stable; it does not read
-the full `tmux session index title` label. Each overlay, base view, tmux pane,
-and primary or alternate terminal screen is an independently checkpointed
-accessible document. The checkpoint is the exact document presented when the
-user left. Returning compares the current document with that checkpoint, so
-only output which arrived while it was hidden is read; an unchanged return is
-not introduced again. A context with no checkpoint reads its visible screen in
-full. Resize/reflow and terminal reset increment the document's comparison
-epoch, making an older checkpoint incomparable and conservatively introducing
-the current visible screen.
-
-For crash and hang diagnosis, the repository includes a socket-free hostile
-control peer and a kill-bounded live suite covering malformed records, silent
-and unread transports, active and hidden floods, window switching, and nested
-SSH-like control sessions. See
-[`docs/tmux-adversary.md`](docs/tmux-adversary.md).
-
-After the initial outer focus-mode ownership query, all live presentation,
-effect, bell, and lifecycle output passes through one serialized scheduler. It
-coalesces modeled scene updates within each bounded event-loop turn and makes
-the resulting scene immediately eligible, completes any started escape
-transaction before beginning another,
-and keeps application input and terminal replies independent of presentation
-backpressure. Child PTY output also yields after 32 KiB or 4 ms, checked after
-each read of at most 8 KiB; synchronized output does not receive a larger turn.
-
-Each render carries the exact accessibility state represented by its pixels.
-Screen-reading and review commands advance only after that render successfully
-flushes; coalesced, replaced, capacity-dropped, or backpressured candidates
-remain private. Changed scrollback is revisioned and shared, so ordinary frames
-do not copy the bounded history on every update. Raw application input remains
-independent of presentation. Consequently, reading a cell and then sending
-coordinate-based input has the normal UI time-of-check to time-of-use race.
-The latency design, live direct/tmux gates, and diagnostic timeline are in
-[docs/performance.md](docs/performance.md).
-
-Auto-read treats retained history followed by the visible grid as one terminal
-document. Ordinary bottom-margin scrolling is therefore an append: rows moving
-from the grid into history keep their document position and are not announced
-again. The parallel print observer remains a fast, causally precise path for
-validated line-oriented output; structural or ambiguous output falls back to
-the authoritative document diff. Cursor-addressed TUIs normally replace the
-visible suffix, so they retain the existing fine-grained TUI diff behavior.
-
-DEC private mode 2026 gates when a scene may be presented. A real close makes
-the final candidate eligible but does not make it readable before its physical
-flush. A frame idle for 100 ms, or continuously open for 2 seconds, is released
-as a bounded failure case so a broken application cannot freeze the terminal.
-Once that exact partial render flushes, accessibility advances to the same
-partial generation a sighted user sees; review can inspect it immediately and
-auto-read resumes through the ordinary quiet/streaming fallback from that
-receipt. The stale opening marker is ignored until its real close, and newer
-parser state cannot leak ahead of its pixels. Visible tmux panes commit as one
-composed generation, and overlay/base
-announcements follow the physically completed active view. On outer terminals
-that support synchronized output, Lector owns one global update boundary.
-Audible bells follow the completed visual transaction.
-
-### Virtual terminal capabilities
-
-Lector launches the child with `TERM=xterm-256color`. It removes any inherited
-`TERMINFO`, then supplies a target- and content-keyed private cache entry with
-the implemented `Sync` capability. When available, bounded `infocmp` and `tic`
-runs adapt the host's own `xterm-256color` entry. Lector also embeds a compiled
-ncurses entry and extracts it automatically on supported macOS and Linux
-systems when those tools are unavailable, fail, or time out. If the normal
-cache cannot be used, a process-owned temporary entry remains alive as long as
-the child process needs it. Lector writes neither the system terminfo database
-nor the user's normal terminfo database, and requires no setup command. This
-lets an ordinary local nested tmux client bracket its redraws with DEC mode 2026
-without changing the public terminal name sent over SSH. Lector also answers
-direct `DECRQM 2026` capability queries. This is the widely installed
-compatibility contract implemented by the compositor. Lector deliberately does
-not inherit the physical terminal's vendor identity or advertise
-`xterm-ghostty`: using Ghostty's parser does not mean Lector implements every
-Ghostty extension. Device, mode, geometry, pixel-size, color-scheme, keyboard,
-focus, and clipboard queries from Lector's root child are answered locally by
-its Ghostty engine. tmux owns the PTYs behind a control connection and answers
-those pane queries itself; Lector's pane engines are observational shadows and
-discard their duplicate replies.
-Lector puts DA1 last in its bounded physical-terminal startup probes and
-consumes replies through that processing fence; those replies are never sent to
-the application. A timeout releases pending input while retaining ownership of
-the delayed reply vocabulary; the ordered DA1 response is the exact point at
-which the broker relinquishes the input stream completely. The same probe set
-reads the outer terminal's exact OSC 10/11
-default foreground and background plus its native light/dark report when
-available. Lector mirrors those values into OSC 10/11 and color-scheme replies
-for direct children, including applications which query during startup; the
-wait for outer replies is strictly bounded. For tmux-owned panes, Lector routes
-the exact OSC 10/11 values through tmux's report API when tmux asks for them;
-native color-scheme query handling remains tmux-owned. A semantic light/dark
-report wins over a luminance guess while the exact colors themselves are
-preserved, so one-shot adaptive-theme queries see the same startup defaults
-they would see without Lector in the path.
-
-Ghostty's parser recognizes more private modes than Lector implements end to
-end. URXVT mouse encoding 1015, pixel-coordinate mouse mode 1016, live
-color-scheme notifications 2031, and in-band resize reports 2048 are therefore
-reported as unsupported and kept reset even when an application enables them
-without querying first. This keeps applications on Lector's implemented mouse
-encodings and normal PTY resize path instead of advertising a partially working
-extension.
-
-The private database is local process state: SSH normally sends the public
-`TERM` name, not Lector's `TERMINFO` directory. A tmux client on a remote host
-therefore uses its remote terminfo database and the bounded legacy stabilization
-path unless that host independently advertises `Sync`. Direct mode queries can
-still traverse SSH and be answered by the local Lector terminal.
-
-Accessibility stabilization uses declared boundaries before timers. A DEC 2026
-close and an OSC 133 `B` prompt-input boundary commit immediately after their
-exact render flushes. A structurally safe primary-screen record ending in LF
-or CRLF is validated against those presented pixels and read immediately; this
-keeps line-oriented programs snappy without inferring anything from the Enter
-key. After recent user input, a redraw ending in a real hidden-to-visible cursor
-transition is a conservative legacy hint. Remaining unmarked output starts
-with a 30 ms quiet window, adapts per view between 8 and 60 ms, increases
-immediately after a detected late continuation, and retains the 300 ms
-streaming-output cap.
-
-A cursor-addressed primary-screen repaint which hides the application cursor
-and newly populates multiple previously blank rows is treated as a bounded new
-interface or modal and that changed region is read in full. Cursor-addressed
-transcript growth above a prompt cursor uses the inserted-text diff. Parallel
-status changes remain readable during streaming output, typing, and mode
-transitions: their position, length, or timing does not prove they are
-incidental. When the application cursor moves while another row changes,
-Lector reads the changed text and then tracks the destination. Key-echo
-suppression consumes only an exact terminal acknowledgement of queued input;
-it does not discard changes elsewhere in the same frame.
-
-Deletion feedback waits for a confirmed edit. An unchanged presentation cannot
-distinguish an ignored key from a delayed edit, so Lector retains the intent
-within its bounded presentation lifetime. Incompatible redraws still discard
-it, and no deleted character is spoken without confirming evidence.
-
-For TUIs which hide or park the hardware cursor, or leave it at an input prompt,
-Lector can also recognize two deliberately narrow visual-focus representations
-without depending on a particular framework, color, or key binding. The common
-gate requires a decoded key press with nonempty input actually sent to the
-application and a causally later presented frame. Lector assigns no meaning to
-the key itself, so application-defined bindings, access keys, and remaps use the
-same path as arrows.
-
-A style-only move must be either one exact reciprocal style transfer between
-bounded text runs or a bounded row bundle of one or more reciprocal style
-transitions between exactly two stable rows. In a bundle, at least one
-component must move a selected style which is demonstrably rarer than its
-baseline across meaningful text, and every
-directional component must identify the same destination. This permits a theme
-to style one bounded payload run, match fragments within it, and a separate
-gutter independently without assigning application-specific meaning to the
-exact color or emphasis values. A textual line pointer may instead move one
-compact, punctuation-like token between the same
-leading-gutter columns of two stable, aligned item rows. Its glyph is learned
-from the frame, so `>`, Unicode pointers, and configured markers behave
-identically; an unchanged copy at the prompt is irrelevant. A marker-only list
-needs an unchanged peer row, while a two-row list needs corroborating reciprocal
-styling. A marker printed directly against its item text is likewise accepted
-only with reciprocal style evidence. Geometry, wrapping, links, cursor
-visibility, and cursor shape remain exact; coordinates may differ only while
-the cursor remains hidden. Global restyles, ambiguous style swaps, prompt
-edits, spinners, marker replacements, multiple simultaneous moves, scrolling or
-reordering, unrelated text updates, conceal/blink changes, and real cursor
-movement stay on the existing reading paths rather than being guessed as focus.
-
-The virtual terminal implements 256 colors, true color, OSC 8 hyperlinks, and
-the ordinary `xterm-256color` contract, so an inherited `COLORTERM` remains
-valid. Application-originated OSC 52 clipboard reads return an empty local
-reply by default, while application-originated writes always enter Lector's
-internal clipboard history. This terminal-effect policy is independent of
-`lector.o.clipboard.default_register` and
-`lector.o.clipboard.system_provider`; it never writes the host or
-outer-terminal clipboard. Desktop notifications and unknown APC effects are
-dropped. Titles, working directories, progress, hyperlinks, and bells remain
-modeled Lector state. In the live scheduler, title, working-directory,
-progress, clipboard, and notification events remain typed
-until the scheduler applies their explicit output policy; sensitive clipboard
-and notification payloads are never replayed as raw terminal bytes.
-
-Inside Lector, after attaching a fresh ordinary tmux client, the loaded
-capability can be checked with:
-
-```sh
-infocmp -1 -x xterm-256color | grep Sync
-tmux info | grep Sync
-```
-
-The `tmux info` check applies only to an ordinary tty client. A pure `tmux -CC`
-client has no rendering tty, so it is not expected to report or use `Sync`;
-Lector stabilizes control-mode `%output` at its own compositor boundary instead.
-
-Physical-terminal rendering starts conservatively, then applies terminfo,
-bounded probes, and finally explicit environment overrides. The supported
-overrides are `LECTOR_OUTER_COLORS` (an integer) and these boolean variables:
-`LECTOR_OUTER_TRUE_COLOR`, `LECTOR_OUTER_HYPERLINKS`, `LECTOR_OUTER_SYNC`,
-`LECTOR_OUTER_KITTY_KEYBOARD`, `LECTOR_OUTER_KITTY_GRAPHICS`,
-`LECTOR_OUTER_FOCUS`, and `LECTOR_OUTER_CLIPBOARD_READ`. Boolean values accept
-`true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`. These describe the outer
-terminal only; they do not change what Lector promises to applications.
-
 Or use the `SHELL` environment variable:
 
 ```bash
 SHELL=/bin/zsh cargo run
 ```
+
+In key names, `M-` means Alt (or Option) and `C-` means Control. Lector uses
+native speech by default. Press `M-x` to pause or resume speech, `M-r` to
+review output, and `F1` to hear what a key does.
+
+The [build guide](docs/ghostty-builds.md#fresh-clone-developer-build) lists
+prerequisites, supported targets, and offline packaging. The
+[documentation index](docs/README.md) links contributor and implementation guides.
 
 ## Speech
 
@@ -325,10 +46,9 @@ input and rendering. A normal Lector installation therefore remains
 self-contained; there is no second executable to install on the same machine.
 
 The same implementation is also built as the standalone `lector-tts` binary.
-It is not Windows-specific: it can run wherever its selected backend is
-supported, independently of whether the full Lector terminal application runs
-there. This makes arrangements such as Lector on Linux with speech on macOS or
-Windows possible over a user-provided stdio bridge.
+The standalone host runs wherever its selected speech backend is supported,
+independently of the full Lector terminal application. A user-provided stdio
+bridge can connect Lector on Linux to speech on macOS or Windows.
 
 Inspect and select native engines and voices with:
 
@@ -445,8 +165,7 @@ correlated lifecycle/progress events. The canonical
 methods machine-readable,
 and [the speech driver protocol](docs/speech-driver-protocol.md) defines exact
 framing, initialization, deadlines, errors, process cleanup, and the 30-second
-restart policy. Speech RPC and deadlines run only on the speech worker, so a
-slow or hung server cannot add a polling floor or block Lector's terminal loop.
+restart policy. Speech RPC and deadlines run only on the speech worker, keeping slow or hung servers independent of terminal input.
 
 ### Silent test runs
 
@@ -500,27 +219,11 @@ If you ever forget keys, toggle **Help Mode** and press any key to hear what it 
 - **Set a mark and copy** text between the mark and the review cursor.
 - **Navigate terminal tables** from the frozen Review overlay.
 
-You don’t need to memorize everything. Help Mode will tell you what each key does.
-
 ### Review overlay (reading past output)
 
-Press `M-?` (Alt+?) to open a searchable buffer of current bindings. It lists
-normal, table, and table-setup bindings, including Lua descriptions, followed by
-Review command syntax. Each row shows the action first, with its shortcuts
-grouped together. Inherited normal bindings appear only in the normal section.
-Configured bindings take precedence over Review keys. Use Review movement, `/` or `?`, marks, and yanks;
-`q` returns to the underlying view. The `open_bindings` action can be rebound.
-
-This buffer has its own saved cursor, marks, search, and character-find state.
-Runtime binding edits and successful configuration reloads refresh it while it
-is open without reading the whole buffer aloud. The cursor stays with the same
-binding; if that entry disappears, it moves to the next surviving entry, then
-the previous one. Content changes or rewrapping invalidate this buffer's marks
-and selections while retaining search state. Application Review memory remains
-independent.
-
 Press `M-r` to capture the current screen and retained scrollback in a frozen
-Review overlay. Output from the running application continues in the
+Review overlay. Move with arrows or `h`/`j`/`k`/`l`, search with `/`, and copy
+with `y` plus a motion or `yy` for a line. Output from the running application continues in the
 background, but cannot move or replace the snapshot. Press `q` to leave Review
 and return to the underlying terminal or overlay. `Escape` never
 closes Review: it cancels a pending count, motion, search, or visual selection.
@@ -550,7 +253,7 @@ setting. Invalid patterns, missing matches, and the lack
 of a previous search receive spoken explanations; failed searches stay open
 for correction or Escape.
 
-Review has its own dependency-free vi command parser:
+Review supports these vi-style commands:
 
 - Move with `h`/`j`/`k`/`l` or the arrow keys. `w`, `W`, `b`, `B`, `e`, and
   `E` move by words; `0`, `^`, and `$` move within a line; `gg` and `G` move to
@@ -673,6 +376,23 @@ behavior. A stable multi-row repaint joined by terminal soft-wrap metadata is
 read as one logical cursor line; because no semantic prompt boundary exists in
 that fallback, the prompt may be included.
 
+### Binding browser
+
+Press `M-?` (Alt+?) to open a searchable buffer of current bindings. It lists
+normal, table, and table-setup bindings, including Lua descriptions, followed by
+Review command syntax. Each row shows the action first, with its shortcuts
+grouped together. Inherited normal bindings appear only in the normal section.
+Configured bindings take precedence over Review keys. Use Review movement, `/` or `?`, marks, and yanks;
+`q` returns to the underlying view. The `open_bindings` action can be rebound.
+
+This buffer has its own saved cursor, marks, search, and character-find state.
+Runtime binding edits and successful configuration reloads refresh it while it
+is open without reading the whole buffer aloud. The cursor stays with the same
+binding; if that entry disappears, it moves to the next surviving entry, then
+the previous one. Content changes or rewrapping invalidate this buffer's marks
+and selections while retaining search state. Application Review memory remains
+independent.
+
 ### Copy/paste and clipboard history
 
 - Set a mark with `F5`, move the review cursor, then copy with `F6`.
@@ -749,9 +469,34 @@ Manual setup, column names, and the row-header designation last for the active
 Review table only. Cancelling a fresh `gT` setup does not restore the table it
 replaced.
 
-## Clipboard history
+## tmux control mode
 
-Lector keeps multiple clipboard entries (not just one). You can cycle back and forth between them and paste the one you want.
+Run `tmux -CC` from a shell inside Lector. Lector discovers the server's prefix
+and bindings and gives each pane independent terminal and Review state.
+Press `M-C` to switch connections, including nested or remote connections.
+In the connection manager, `d` detaches gracefully, deepest child first.
+Confirmed `D` sends Control-backslash; after 750 ms without an exit, it exposes
+the underlying terminal or parent pane for raw commands or an SSH escape.
+The PTY and SSH process remain alive.
+
+A stale pane is rebuilt from tmux's captured text; images and missing parser or
+semantic state may require rerunning the application output. See
+[tmux control mode](docs/tmux-completion.md) for recovery and resource bounds,
+and [prefix interaction](docs/tmux-prefix.md) for bindings, choosers, and nested
+connection restrictions.
+
+## Virtual terminal capabilities
+
+Lector presents `TERM=xterm-256color`, with 256 colors, true color, OSC 8 links,
+and a private terminfo entry advertising synchronized output. Kitty graphics
+are rendered when the outer terminal supports them. Application clipboard
+writes enter Lector's history; reads return an empty reply by default.
+Application writes never change the system clipboard.
+
+See [terminal compatibility](docs/architecture.md#terminal-compatibility-and-reading-behavior)
+for query ownership, terminfo and SSH behavior, unsupported modes, outer-terminal
+overrides, and reading heuristics. [Interactive performance](docs/performance.md)
+explains when a presented update becomes speech.
 
 ## Configuration (Lua)
 
@@ -925,7 +670,7 @@ format is not an API.
 The four speech controls above are binding action names, not functions in
 `lector.api`. `pause_speaking` and `resume_speaking` are idempotent one-way
 actions, `toggle_speaking` switches between them, and `cancel_speaking` is the
-only action that deliberately discards retained speech. A non-interrupting
+only action that discards retained speech. A non-interrupting
 `speak` appends while speech is playing. If speech has been paused, any new
 `speak` request replaces the retained speech and begins the new request;
 `interrupt = true` always performs that replacement even while speech is
@@ -973,7 +718,7 @@ cursor through coordinates in the original view text.
 An error raised by a Lua key binding ends that binding, restores every reader
 and auto-read resource it owned, and opens an error popup with the Lua
 traceback. If owned speech cannot be cancelled during that cleanup, Lector
-exits instead of pretending that the binding was safely contained.
+exits through terminal cleanup.
 
 Any physical key requests a speech stop (reader acquisition has already
 established confirmed-stop support) and immediately resumes the suspended
@@ -1106,10 +851,7 @@ resume must return or explicitly call `coroutine.yield()` so Lector can process
 input and redraw before the next resume. A non-yielding script or blocking
 native call can block the UI; cancellation keys cannot be handled while that
 resume is running. There is no guaranteed execution-time budget or automatic
-preemption. The current LuaJIT instruction hook does not provide reliable
-scheduling or cancellation: compiled code can bypass it, and LuaJIT does not
-support yielding from an instruction hook. If that hook reports
-`attempt to yield from a hook`, the evaluation ends with an error.
+preemption.
 
 For cooperative work, place `coroutine.yield()` between bounded pieces of work.
 Lector resumes the submitted coroutine on later UI ticks; values passed to
@@ -1123,8 +865,7 @@ than cancelling an evaluation.
 A completed evaluation or a reported Lua error returns to the prompt without
 resetting the session, so another command can use existing variables. Closing
 and reopening the overlay does not recover control from a resume that never
-returns. Reliable cancellation through isolated execution is deferred to
-[research spike #80](https://github.com/n0ot/lector/issues/80).
+returns.
 
 ## Tips
 

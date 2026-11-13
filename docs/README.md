@@ -1,6 +1,7 @@
 # Lector documentation
 
-Start with [Architecture](architecture.md) for the runtime ownership model,
+For installation and everyday use, start with the [user guide](../README.md).
+For implementation work, start with [Architecture](architecture.md) for the runtime ownership model,
 data flow, and concurrency boundaries; use its [source map](architecture.md#source-map)
 to locate implementation ownership. Contributors should also
 read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
@@ -10,6 +11,11 @@ read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
 - [Building with libghostty-vt](ghostty-builds.md) covers the pinned native
   dependency, supported targets, offline builds, and upgrades.
 
+## Performance and diagnostics
+
+- [Interactive performance](performance.md) covers stabilization, latency gates,
+  native-audio validation, and diagnostic timelines.
+
 ## Speech
 
 - [Speech-host protocol](speech-driver-protocol.md) defines custom-host
@@ -17,14 +23,15 @@ read the repository-root [CONTRIBUTING guide](../CONTRIBUTING.md).
   queue and pause state, deadlines, restart policy, and process cleanup. Its
   machine-readable method and message schema is
   [`crates/lector-tts/openrpc.json`](../crates/lector-tts/openrpc.json).
-- [Application-authored accessibility](application-accessibility.md) defines
-  the generic terminal protocol, fail-safe lifecycle, and pane isolation. The
+- [Application-authored accessibility](application-accessibility.md) documents
+  Lector's consumer contract, fail-safe lifecycle, and pane isolation, and links
+  the externally maintained producer specification. The
   standalone [`lector.nvim`](https://github.com/n0ot/lector.nvim) plugin is its
   Neovim producer.
 
 ## tmux control mode
 
-- [Complete behavior](tmux-completion.md) is the integration overview,
+- [Control-mode behavior](tmux-completion.md) is the integration overview,
   resource-bound reference, and troubleshooting guide.
 - [Control parser](tmux-control-parser.md) defines framing and failure bounds.
 - [Gateway routing](tmux-gateway.md) defines byte ownership at connection

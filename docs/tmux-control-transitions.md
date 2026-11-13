@@ -7,7 +7,7 @@ queueing, hierarchy, views, recovery application and presentation.
 
 ## Co-occurrence audit
 
-This map records the original event/reply arms before extraction. An empty step
+The table shows which transition effects can occur together. An empty step
 still runs App bookkeeping; the initial command is a distinct early return.
 
 | Input | Deferred work | Work that can occur together |
@@ -52,7 +52,7 @@ Preserve these phases, including when an earlier phase raises work for a later o
    topology render**. Do not freeze presentation decisions at transition time.
 6. User command result, then notification popup (including inventory failure).
 
-Errors propagate at the same boundary; missing connections and the initial reply
+Errors propagate through App; missing connections and the initial reply
 skip the apply phases. Presentation context and time are sampled by App before
-transition, as before. Empty vectors and optional outcomes do not allocate; payload
-ownership is moved and existing inventory/capture allocations remain unchanged.
+transition. Payload ownership moves from the connection-local result into these
+ordered effects.

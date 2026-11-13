@@ -40,14 +40,7 @@ of its panes until it is visited. The last presented source retains its
 connection, session, window, and pane IDs and labels. That state is discarded
 if its connection or pane disappears, so it cannot point at a stale target.
 
-`tests/tmux_bells.rs` covers active and inactive split panes, hidden windows,
-silent background activity, repeated BEL suppression, audible index speech,
-and rearming after a window visit,
-synthetic output from an unattached session, multiple and inactive
-connections, overlays, synchronized-output spans, a 10,000-BEL flood,
-source-local duplicate coalescing, Lua configuration, stale-source cleanup,
-and scheduler transaction order. The audible render is replayed through a
-second headless Ghostty terminal and produces an oracle failure artifact on a
-mismatch. Its Docker-only real-server harness creates a second tmux window,
-causes ordinary shell output in the first window, and checks the stable source
-reported by Lector without timing sleeps.
+`tests/tmux_bells.rs`, in the `tmux` target, checks pane and connection scopes,
+suppression/rearming, stale-stream loss, configuration, and scheduler ordering.
+Audible output is verified with a second Ghostty render oracle. Its ignored
+real-server case runs through `scripts/test-real-tmux-docker`.

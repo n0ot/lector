@@ -55,18 +55,12 @@ resulting location.
 
 ## Regression harness
 
-`tests/tmux_gateway.rs` covers one-shot, every-boundary, and bytewise routing;
-marker lookalikes; arbitrary launcher input; startup command errors; immediate
-exit; same-read pre-marker and post-ST bytes; portal navigation; scheduled
-physical output; and final state through a second Ghostty render oracle. Its
-real PTY test starts an isolated disposable tmux server with an explicit socket
-under `target/test-tmux`, captures an actual `-CC` lifecycle, and replays it one
-byte at a time through `App`. The test requires `tmux` on `PATH` and permission
-to create a local Unix socket.
+`tests/tmux_gateway.rs` and `tests/tmux_recovery.rs`, in the `tmux` target, check
+fragmented markers, exact byte ownership, portal transitions, malformed streams,
+EOF and timeout cleanup, and parent restoration. Physical output is checked
+through a second Ghostty render oracle.
 
-`tests/tmux_recovery.rs` cuts EOF at every byte of a complete stream and covers
-clean and incomplete endings, malformed protocol, reconstructed shell output,
-timeouts, repeated cleanup, parent-pane loss, scoped exceptional writes, write
-faults, and spoken recovery context. Its real harness kills an isolated tmux
-server, removes the observed final ST to inject abrupt nested transport loss,
-and proves the preserved parent pane resumes after the bounded timeout.
+The real-PTY cases capture a tmux lifecycle and inject abrupt transport loss.
+They are ignored by ordinary Cargo runs and selected by
+`scripts/test-real-tmux-docker`. The container provides tmux and isolated Unix
+sockets; see the [Docker procedure](../CONTRIBUTING.md#full-verification).

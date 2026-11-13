@@ -7,24 +7,14 @@ after the physical output flush succeeds.
 
 ## Latency decisions
 
-- Lector's terminal process does not pump `CFRunLoopRunInMode` or cap every
-  `mio` wait at 10 ms. The default native TTS backend runs in an internal speech
-  host process. Only that host services AVFoundation's main run loop, using a
-  zero-wait pump on a 10 ms idle cadence. Cancellation settlement is likewise
-  confined to the host.
-- Native TTS and custom process speech both sit behind the bounded asynchronous
-  speech worker. A slow pipe or AVFoundation utterance build cannot block
-  terminal input, tmux processing, rendering, or teardown. Lector's
-  host-independent manager keeps a bounded queue and submits only one active
-  utterance to the native host, so it never floods `AVSpeechSynthesizer`
-  before lifecycle callbacks arrive.
-- Speech transport uses nonblocking readiness and absolute deadlines: five
-  seconds for initialization and one second for an ordinary RPC. Those clocks
-  exist only while the speech worker has a call in flight. They never cap a
-  `mio` wait, pump the terminal process's Core Foundation run loop, or poll on
-  the main thread. A hung process becomes a bounded speech failure while the
-  terminal continues at full speed. See the
-  [speech protocol](speech-driver-protocol.md) for restart and shutdown policy.
+- The bounded asynchronous speech worker owns native and custom-process speech
+  transport, using readiness and absolute deadlines: five seconds for
+  initialization and one second for ordinary RPCs. The host-independent manager
+  queues speech and submits one active utterance at a time. Only the native host
+  pumps AVFoundation's main run loop, with zero-wait work on a 10 ms idle cadence.
+  Terminal input and presentation therefore remain independent of speech I/O.
+  See [speech recovery](speech-driver-protocol.md#10-errors-failure-recovery-and-shutdown)
+  for restart and shutdown policy.
 - The output scheduler has no intentional visual delay. One PTY readiness turn
   already drains and coalesces immediately ready data up to its 32 KiB or 4 ms
   fairness bound. Every read mutates the terminal model and emits replies in
@@ -80,7 +70,7 @@ alternate-screen boundary may be opaque there. Lector applies the same safety
 classifier to the stream it can observe, but otherwise relies on tmux's outer
 DEC 2026 transaction or the bounded quiet fallback. Cursor visibility is only
 a painting hint: applications such as fzf and Neovim can restore it in the
-middle of a larger redraw, so it is deliberately not a speech boundary.
+middle of a larger redraw, so it is not a speech boundary.
 Control mode adds parsing and `send-keys -H` routing, but no timer-based delay.
 
 ## Regression and latency gates
@@ -100,8 +90,7 @@ The 2026-08-19 local macOS run measured:
 | Ordinary attached tmux | 1.08 ms | 1.18 ms |
 | tmux `-CC` | 1.38 ms | 1.43 ms |
 
-The small control-mode delta supports treating tmux parsing and routing as
-normal processing cost, not as the earlier timer-shaped latency source.
+These measurements describe that local run and are not guarantees for other hosts.
 
 The release benchmark separately exercises the production compositor with one
 update per drain, with four modeled reads per drain, and with one LF per receipt
@@ -150,11 +139,9 @@ six compositor workloads, as the benchmark contract test does.
 
 The merged [row-mutation report](../benchmarks/results/row-mutation-01a7858/README.md)
 records paired compositor measurements and raw artifacts with unchanged gates.
-Its five measured pairs on one Apple M1 Pro/macOS aarch64 environment showed
-lower pane/overlay composition time with identical allocation and byte counters;
-small collateral timing increases remain disclosed. These measurements cover
-that machine and the report's measurement fences, not other platforms or
-end-to-end user latency. Release profile defaults remain unchanged.
+The report scopes its Apple M1 Pro/macOS measurements, including collateral
+timing changes, to the recorded workload fences. It does not measure other
+platforms or end-to-end user latency.
 
 The deterministic Neovim-style regression in `tests/app.rs` opens DEC 2026,
 replaces several transient full-screen draws, blocks the final physical flush,

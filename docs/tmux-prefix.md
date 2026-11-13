@@ -2,13 +2,9 @@
 
 Lector owns the prefix state while a ready tmux control connection is visible.
 It does not assume `C-b`, `C-a`, zero-based windows, or Emacs keys. Every full
-inventory transaction asks the active tmux server for `prefix`, `prefix2`,
-`base-index`, `pane-base-index`, `key-table`, `repeat-time`, and every key table
-using a machine-oriented format:
-
-```text
-B<TAB>#{key_table}<TAB>#{key_string}<TAB>#{key_repeat}<TAB>#{key_command}
-```
+inventory transaction discovers the active server options and key tables.
+The [inventory contract](tmux-topology.md#explicit-inventory-transaction) describes
+the queries and canonical `bind-key` parsing.
 
 This query travels through the owning control connection. A nested tmux reached
 through SSH therefore supplies its own live bindings, including plugin-created
@@ -163,7 +159,7 @@ physical write is never retried, because replaying a signal byte after the
 transport changes could affect an unrelated shell. Navigation, connection
 loss, or target removal cancels a pending confirmation.
 
-The portal is deliberately not a second live rendering of the child pane. It
+The portal is not a second live rendering of the child pane. It
 remains a read-only explanation of the control transport while child output is
 processed only in the child engine. Enter is the normal route back to that
 connection; other portal input is consumed without reaching either transport.
@@ -240,13 +236,11 @@ topology notifications when it still exists; destroyed targets disappear and
 selection moves to the first remaining match. Long lists scroll within a
 bounded viewport while keeping the selection and help line visible. Resize
 rebuilds the chooser from its logical state. The physical application cursor
-sits on the selected row; no synthetic moving `>` marker is drawn.
+sits on the selected row.
 
-The top-level connection chooser lists every live tmux connection. Rows always
-include the stable connection ID, so duplicate user labels remain unambiguous.
-Use Up/Down to select, Enter to switch, lowercase `d` for graceful teardown,
-uppercase `D` for the confirmed raw-transport fallback, and Escape to cancel.
-`rename_tmux_connection` changes only the current stable identity;
+The connection chooser uses the [manager controls](#destructive-lifecycle-behavior)
+described above. Rows include stable connection IDs, so duplicate labels remain
+unambiguous. `rename_tmux_connection` changes only the current stable identity;
 the label survives inventory resynchronization but is discarded when that
 connection ends. The corresponding configurable actions are
 `open_tmux_connection_chooser`, `rename_tmux_connection`,
@@ -260,15 +254,13 @@ controls. Enter submits, Escape cancels, Up/Down traverse a per-connection
 100-entry history, and long input follows the cursor without splitting a
 grapheme. Pasted control characters are rendered as visible symbols and a
 command containing NUL, carriage return, or newline is rejected before it can
-reach the control FIFO. Server-aware completion is not guessed locally;
-history is the practical completion aid until a typed tmux completion query is
-designed.
+reach the control FIFO. Use the per-connection history to recall commands.
 
 Command output and errors, tmux `%message` and `%config-error` notifications,
 and Lector-owned confirmations use temporary reviewable popup overlays. Enter
 or Escape dismisses announcements; confirmations preserve their distinct
 confirm/cancel responses. `M-w` names the current tmux location as, for
-example, `tmux, dev, 1: codex`, or `tmux, dev, 1.1: codex` when the active
+example, `tmux, dev, 1: editor`, or `tmux, dev, 1.1: editor` when the active
 window is split. A window change announces that window title. A session change
 announces the new session followed by its window title. Empty pane contents are
 silent rather than being described as a blank screen. Ordinary terminal mode
@@ -276,58 +268,12 @@ retains its separate `terminal` wording.
 
 ## Regression harnesses
 
-`tests/tmux_prefix.rs` uses representative records in tmux's runtime inventory
-format, including repeatable pane motion, confirmations, quoted format
-expressions, command chains, `send-prefix`, and custom key-table toggles. Its
-application harness covers primary and secondary prefixes, exact everyday
-commands, fragmented Kitty key events, indefinite prefix waits, cancel, repeat expiry,
-confirmation accept/cancel, command errors, malformed data, binding reload,
-portal/connection changes, and safe fallback behavior.
+The `tmux` test target includes modeled prefix, chooser, lifecycle, connection,
+and nested-stream coverage in `tests/tmux_prefix.rs`, `tests/tmux_interaction.rs`,
+`tests/tmux_lifecycle.rs`, `tests/tmux_connections.rs`, and `tests/tmux_nested.rs`.
+These check discovered commands, stable targeting, independent state, bounded
+cleanup, carrier transactions, and recovery through physical render oracles.
 
-The Docker-only real-server oracle launches an isolated tmux instance with a
-small `C-a` fixture, discovers live windows 1 and 10, and proves that Lector's
-emulated `C-a n` and `C-a 0` change the actual control client's active window.
-The latter assertion verifies stable-ID resolution of a numeric target. It
-uses bounded channel waits and no timing sleeps.
-
-`tests/tmux_interaction.rs` covers duplicate names, stable-ID search and
-selection, empty and destroyed scopes, external renames, bounded scrolling,
-cancel/resize, speech, command history and rejection, popups, `M-w`, and a
-second-Ghostty physical render oracle. Its Docker-only isolated real-server
-harness switches a live session through the chooser and carries a command and
-its result through the actual control connection.
-
-`tests/tmux_lifecycle.rs` adds deterministic one/multiple-connection detach
-selection, active/inactive stable kill targets, only-window loss and recovery,
-failed commands, stale confirmations, simultaneous server/target destruction,
-portal isolation, and recursive gateway ownership. Its Docker-only destructive
-harness creates, splits, kills a pane, kills a window, and detaches through an
-isolated real tmux server. It uses bounded event waits with no sleeps and a drop
-guard that kills the disposable server on success or panic. `tests/tmux_panes.rs`
-also proves that pane removal releases Kitty media and the closed engine without
-disturbing survivors.
-
-`tests/tmux_connections.rs` gives separate routers identical tmux object IDs and
-proves connection-scoped pane state, input, replies, popups, speech, prefix
-state, command history, detach targets, labels, and removal. It includes 50
-rapid bidirectional switches and a Docker-only harness with two independent
-disposable tmux servers and PTYs.
-
-`tests/tmux_nested.rs` fragments a decoded child marker one byte at a time,
-checks binary pane output and parent bytes on both sides of the child, routes
-commands through one and two nested layers, repeats identical object IDs at
-every level, preserves parent and sibling engines, exercises startup failure
-and cleanup bounds, and verifies detector release. Its Docker-only local
-loopback harness launches an outer tmux on a real PTY, starts a second real
-`tmux -CC` inside that pane, and proves discovery, portal ownership, bootstrap,
-and echoed child input through both control transports with bounded waits and
-panic-safe server cleanup.
-
-`tests/tmux_recovery.rs` adds every-byte EOF, malformed/timeout/parent-loss
-recovery, direct and nested exceptional-action scoping, confirmation, and
-at-most-once write-fault coverage. Its Docker-only real-server case kills tmux,
-fault-injects a lost final terminator into a nested parent pane, and verifies
-that ordinary parent-shell output resumes.
-
-Pane-wide bell behavior and its `off`, `spoken`, and `audible` Lua option are
-documented separately in [tmux-bells.md](tmux-bells.md).
+Real-server cases are ignored by ordinary Cargo/Nextest runs. Use the
+[Docker integration procedure](../CONTRIBUTING.md#full-verification) to validate
+those boundaries with isolated servers, sockets, and bounded event waits.

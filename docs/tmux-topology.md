@@ -38,16 +38,10 @@ half-updated topology or bindings. A failed transaction retries once; a second
 startup failure becomes a persistent accessible error instead of an indefinite
 readiness screen, while a failed refresh retains the last valid topology.
 
-Command output is arbitrary text. Only `%end` or `%error` carrying the exact
-tag from the surrounding `%begin` terminates a block; block-looking lines with
-other tags remain payload. This matters when `capture-pane` contains the text
-of a nested control client. A genuinely malformed protocol-looking record is
-quarantined rather than exposed as terminal text. Lector immediately drops its
-logical connection state but does not write speculative recovery bytes into a
-transport which may already be an SSH client or returned shell. Control-looking
-records remain quarantined until a complete ordinary line positively identifies
-the parent transport, which is then replayed through its preserved terminal
-parser.
+Reply blocks use exact matching tags; see [parser framing](tmux-control-parser.md#framing-and-records).
+Malformed control-looking records follow the [gateway quarantine and recovery
+contract](tmux-gateway.md#exact-byte-ownership), preserving the parent parser
+without sending speculative transport bytes.
 
 `list-windows -a` and `list-panes -a` repeat objects linked into more than one
 session. Identical pane records are deduplicated by stable ID; conflicting

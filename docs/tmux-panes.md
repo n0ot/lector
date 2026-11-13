@@ -7,24 +7,17 @@ and `%extended-output` bytes are delivered only to that engine. Escape, UTF-8,
 and graphics parser fragments can consequently remain unfinished while another
 pane or window is active and resume in their original owner later.
 
-That same pane-owned `View` also owns user and application accessibility state:
-the Review cursor and modes, APC auto-read and cursor-tracking policy, pending
-speech metadata, accessible-document departure checkpoints, and image
-namespace. Selecting another pane deactivates only the old pane document; it
-does not clear every pane's update state. When the pane is selected again,
-Lector compares its current complete document with the exact document which
-was presented at departure and reads only the hidden interval's changes. A
-tmux winlink is only another address for the stable `@window`; it never creates
-another pane `View`. Manual
-`link-window`, `move-window`, renumbering, and selection through a different
-session consequently preserve one in-memory copy of all of this state.
+The pane-owned `View` also retains accessibility policy, Review state, departure
+checkpoints, and media. Window links and moves select that same object; only
+pane removal releases it. See [stable topology identities](tmux-topology.md)
+and [accessible document contexts](architecture.md#accessible-document-contexts).
 
 ## Initial-state bootstrap
 
 After a complete inventory, Lector sends one machine-generated `capture-pane`
 command per new pane. Normal primary screens use `-p -e -F -J -S -` to include
-attributes, line flags, and all available tmux history. Alternate screens use
-`-a`; panes in a tmux mode use `-M`. The inventory supplies geometry, cursor position and
+attributes, line flags, and all available tmux history. Alternate screens capture the current display without history; panes in a
+tmux mode use `-M`. The `-a` flag would select the saved grid, so it is omitted. The inventory supplies geometry, cursor position and
 visibility, named cursor shape, alternate-screen state, tmux-mode state, and
 reported history size.
 
@@ -66,19 +59,10 @@ resync behind outstanding capture replies without either response class being
 misinterpreted. Failed inventories retry once, remain transactional, and do
 not loop forever on a persistent tmux error.
 
-tmux cannot export a byte-for-byte copy of an existing terminal and media
-store. `capture-pane -F` lets Lector rebuild the prompt/output line flags and
-hyperlinks tmux retained, and `capture-pane -P` restores a pending escape
-sequence. Captures cannot faithfully reconstruct preexisting Kitty or
-Sixel media, semantic state tmux did not retain, the complete mode save/restore
-stack, or exact historical wrap-cell representation. Lector seeds the state
-tmux does expose and treats subsequent live bytes as authoritative.
-
-The same boundary applies when flow control reports stale incremental output.
-Lector performs a fresh capture, explicitly drops unrecoverable media, and
-keeps a failed capture stale while retrying with bounded backoff. See
-[`tmux-completion.md`](tmux-completion.md) for the flow policy and recovery
-procedure.
+Capture restores the text and metadata tmux exposes, rather than a serialized
+terminal. See [authoritative text resynchronization](tmux-completion.md#authoritative-text-resynchronization)
+for pending escape capture, media and mode limitations, stale-state handling,
+and recovery.
 
 ## Layout and rendering
 
@@ -112,16 +96,10 @@ do not pause hidden pane engines.
 
 ## Regression harnesses
 
-`tests/tmux_panes.rs` covers single, horizontal, vertical, nested, zoomed,
-malformed, and adversarial layouts; border intersections; history, cursor,
-alternate-screen, and tmux-mode bootstrap; quiet accessibility handoff; bounded
-pre-inventory output; hidden windows; close cleanup; active-pane changes;
-overlapping request/reply classes; partial sequences across pane switches; and
-incremental pane damage through `RenderOracle` failure artifacts.
-
-Its non-ignored live fixture launches an isolated tmux server without timing
-sleeps, lets `App` perform the actual inventory and captures, and drives a real
-split, pane resize, zoom, unzoom, and close. Every stable stage is replayed into
-a second Ghostty terminal and compared with the intended composed scene. The
-fixture rejects protocol leakage and flicker-prone full-terminal clears and
-uses a disposable socket under `target/test-tmux`.
+`tests/tmux_panes.rs`, in the `tmux` target, checks layout validation, bootstrap
+races, persistent pane state, request correlation, and incremental composition
+through `RenderOracle`. Its real-server fixture exercises split, resize, zoom,
+and close against a second Ghostty terminal. That fixture is ignored by ordinary
+Cargo runs and selected by `scripts/test-real-tmux-docker`; tmux and disposable
+Unix sockets belong to the container environment. See the
+[Docker procedure](../CONTRIBUTING.md#full-verification).

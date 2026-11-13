@@ -69,24 +69,11 @@ limit follows ordinary hook-error recovery without disabling unrelated hooks.
 This boundary uses safe Rust and mlua's scoped borrowing APIs, with no custom
 raw-pointer lifetime or aliasing mechanism.
 
-Runtime speech sequencing is owned by a host-independent manager. It sends at
-most one active utterance to a version 2 host, advances its bounded queue only
-from correlated terminal evidence, and models playing, suspended, replacing,
-and cancelling as distinct transitions. `M-x` toggles suspension; typing and
-other ordinary input suspend in one direction. Both preserve the active item
-and unsent queue. New non-interrupting speech appends while playback is active,
-but replaces retained speech while suspended. Interrupting speech and the
-explicit, unbound cancel action always replace or discard the retained queue.
-Paragraph gaps are nonblocking manager deadlines which suspension can freeze.
-Runtime speech-host replacement is transactional. A candidate process
-initializes and restores configured speech settings while the old generation remains
-owned for rollback; only then is the active generation swapped and the old
-child terminated and reaped. Transport failures never replay an uncertain
-in-flight speech call.
-The supervisor permits a restart only when the preceding recorded crash was at
-least 30 seconds earlier, and otherwise asks the event loop to restore the
-terminal and exit nonzero. The exact process and protocol contract is in
-[`speech-driver-protocol.md`](speech-driver-protocol.md).
+A host-independent speech manager owns a bounded queue and sends at most one
+active utterance to the host. The supervisor owns transactional host replacement,
+rollback, restart, and cleanup. See the [speech playback state machine](speech-driver-protocol.md#9-lector-playback-and-queue-semantics)
+and [failure recovery](speech-driver-protocol.md#10-errors-failure-recovery-and-shutdown)
+for lifecycle evidence, queue transitions, and deadlines.
 
 Terminal input, PTYs, and physical-terminal output are nonblocking and drained
 in bounded turns. Physical input and child PTY output each yield after 32 KiB
@@ -244,8 +231,10 @@ incomparable and yield `Reintroduce`; auto-read does not need a resize-, reset-,
 overlay-, or tmux-specific branch. A complete-history lineage gap yields the
 more limited `VisibleGrid` comparison instead of guessing history identity.
 
-Activation announcements use the title from the completed presentation bundle,
-not a later logical controller value. This keeps both the selected document and
+In-place application-title changes and tmux renames update the model silently.
+A context handoff announces the current title rather than the full tmux location
+label. Activation announcements use the title from the completed presentation
+bundle, not a later logical controller value. This keeps both the selected document and
 its spoken name tied to the same physically flushed scene.
 
 Views removed from the logical stack remain owned only while they are named by
@@ -273,23 +262,21 @@ evidence caused by an oversized or evicted journal range is sticky until that
 range is baselined, forcing the authoritative snapshot-diff fallback instead
 of guessing.
 
-Accessibility commit policy is one ordered decision table shared by deadline
-scheduling and finalization. An application-declared DEC 2026 close comes
-first. OSC 133 prompt, input, command-start, and command-end marks remain
-semantic history only; they do not participate in screen stabilization. A
-structurally safe, LF-complete primary-screen record may commit after its exact
-physical receipt when its reported text validates against the newly presented
-logical-line tail. Whole-frame structural provenance remains sticky for the
+Accessibility finalization and deadline scheduling share one ordered decision
+table: synchronized-output close, validated LF-complete primary-screen record,
+quiet window, then hard deadline. OSC 133 marks remain semantic history; cursor
+restoration records painting provenance. Neither accelerates stabilization.
+Incomplete escape sequences cannot quiet-commit, structural and title-only
+bursts do not train the timer, and context switches discard transient deadlines.
+See [latency decisions](performance.md#latency-decisions) for timing and record
+validation.
+
+Whole-frame structural provenance remains sticky for the
 fallback diff, while the terminal adapter separately records the ordered safe
 print suffix after the latest ambiguity. The suffix composes across parser and
 presentation fragmentation, so a later record which begins at a physical
 record boundary can recover progressive reading after an earlier structural
-batch. Mid-record ambiguity remains on the authoritative diff path. Cursor
-restoration after recent input is a conservative legacy
-boundary. Everything else uses the per-view adaptive quiet deadline and the
-bounded hard deadline. Incomplete escape sequences cannot quiet-commit,
-structural and title-only bursts do not train the timer, and context switches
-discard transient deadline state.
+batch. Mid-record ambiguity remains on the authoritative diff path.
 
 Auto-read's authoritative comparison document is the retained history followed
 by the live grid—the same complete terminal document exposed by Review. This
@@ -319,6 +306,283 @@ a partially written transaction during nonblocking backpressure; Lector does
 not claim an accessibility model for half an escape stream, but it never reads
 ahead of the last completed generation and converges exactly when the render
 flushes.
+
+## Terminal compatibility and reading behavior
+
+Lector launches the child with `TERM=xterm-256color`. It removes any inherited
+`TERMINFO`, then supplies a target- and content-keyed private cache entry with
+the implemented `Sync` capability. When available, bounded `infocmp` and `tic`
+runs adapt the host's own `xterm-256color` entry. Lector also embeds a compiled
+ncurses entry and extracts it automatically on supported macOS and Linux
+systems when those tools are unavailable, fail, or time out. If the normal
+cache cannot be used, a process-owned temporary entry remains alive as long as
+the child process needs it. Lector writes neither the system terminfo database
+nor the user's normal terminfo database, and requires no setup command. This
+lets an ordinary local nested tmux client bracket its redraws with DEC mode 2026
+without changing the public terminal name sent over SSH. Lector also answers
+direct `DECRQM 2026` capability queries. This is the widely installed
+compatibility contract implemented by the compositor. Lector does
+not inherit the physical terminal's vendor identity or advertise
+`xterm-ghostty`: using Ghostty's parser does not mean Lector implements every
+Ghostty extension. Device, mode, geometry, pixel-size, color-scheme, keyboard,
+focus, and clipboard queries from Lector's root child are answered locally by
+its Ghostty engine. tmux owns the PTYs behind a control connection and answers
+those pane queries itself; Lector's pane engines are observational shadows and
+discard their duplicate replies.
+Lector puts DA1 last in its bounded physical-terminal startup probes and
+consumes replies through that processing fence; those replies are never sent to
+the application. A timeout releases pending input while retaining ownership of
+the delayed reply vocabulary; the ordered DA1 response is the exact point at
+which the broker relinquishes the input stream completely. The same probe set
+reads the outer terminal's exact OSC 10/11
+default foreground and background plus its native light/dark report when
+available. Lector mirrors those values into OSC 10/11 and color-scheme replies
+for direct children, including applications which query during startup; the
+wait for outer replies is strictly bounded. For tmux-owned panes, Lector routes
+the exact OSC 10/11 values through tmux's report API when tmux asks for them;
+native color-scheme query handling remains tmux-owned. A semantic light/dark
+report wins over a luminance guess while the exact colors themselves are
+preserved, so one-shot adaptive-theme queries see the same startup defaults
+they would see without Lector in the path.
+
+Ghostty's parser recognizes more private modes than Lector implements end to
+end. URXVT mouse encoding 1015, pixel-coordinate mouse mode 1016, live
+color-scheme notifications 2031, and in-band resize reports 2048 are therefore
+reported as unsupported and kept reset even when an application enables them
+without querying first. This keeps applications on Lector's implemented mouse
+encodings and normal PTY resize path instead of advertising a partially working
+extension.
+
+The private database is local process state: SSH normally sends the public
+`TERM` name, not Lector's `TERMINFO` directory. A tmux client on a remote host
+therefore uses its remote terminfo database and the bounded legacy stabilization
+path unless that host independently advertises `Sync`. Direct mode queries can
+still traverse SSH and be answered by the local Lector terminal.
+
+Accessibility uses physically presented output: synchronized-output close,
+validated linear-output records, an adaptive quiet window, and a hard deadline.
+OSC 133 marks annotate semantic history and cursor restoration records painting
+provenance; neither is a speech boundary. See [stabilization policy](performance.md#latency-decisions)
+for timing and validation rules.
+
+A cursor-addressed primary-screen repaint which hides the application cursor
+and newly populates multiple previously blank rows is treated as a bounded new
+interface or modal and that changed region is read in full. Cursor-addressed
+transcript growth above a prompt cursor uses the inserted-text diff. Parallel
+status changes remain readable during streaming output, typing, and mode
+transitions: their position, length, or timing does not prove they are
+incidental. When the application cursor moves while another row changes,
+Lector reads the changed text and then tracks the destination. Key-echo
+suppression consumes only an exact terminal acknowledgement of queued input;
+it does not discard changes elsewhere in the same frame.
+
+Deletion feedback waits for a confirmed edit. An unchanged presentation cannot
+distinguish an ignored key from a delayed edit, so Lector retains the intent
+within its bounded presentation lifetime. Incompatible redraws still discard
+it, and no deleted character is spoken without confirming evidence.
+
+For TUIs which hide or park the hardware cursor, or leave it at an input prompt,
+Lector can also recognize two narrow visual-focus representations
+without depending on a particular framework, color, or key binding. The common
+gate requires a decoded key press with nonempty input actually sent to the
+application and a causally later presented frame. Lector assigns no meaning to
+the key itself, so application-defined bindings, access keys, and remaps use the
+same path as arrows.
+
+A style-only move must be either one exact reciprocal style transfer between
+bounded text runs or a bounded row bundle of one or more reciprocal style
+transitions between exactly two stable rows. In a bundle, at least one
+component must move a selected style which is demonstrably rarer than its
+baseline across meaningful text, and every
+directional component must identify the same destination. This permits a theme
+to style one bounded payload run, match fragments within it, and a separate
+gutter independently without assigning application-specific meaning to the
+exact color or emphasis values. A textual line pointer may instead move one
+compact, punctuation-like token between the same
+leading-gutter columns of two stable, aligned item rows. Its glyph is learned
+from the frame, so `>`, Unicode pointers, and configured markers behave
+identically; an unchanged copy at the prompt is irrelevant. A marker-only list
+needs an unchanged peer row, while a two-row list needs corroborating reciprocal
+styling. A marker printed directly against its item text is likewise accepted
+only with reciprocal style evidence. Geometry, wrapping, links, cursor
+visibility, and cursor shape remain exact; coordinates may differ only while
+the cursor remains hidden. Global restyles, ambiguous style swaps, prompt
+edits, spinners, marker replacements, multiple simultaneous moves, scrolling or
+reordering, unrelated text updates, conceal/blink changes, and real cursor
+movement stay on the existing reading paths rather than being guessed as focus.
+
+The virtual terminal implements 256 colors, true color, OSC 8 hyperlinks, and
+the ordinary `xterm-256color` contract, so an inherited `COLORTERM` remains
+valid. Application-originated OSC 52 clipboard reads return an empty local
+reply by default, while application-originated writes always enter Lector's
+internal clipboard history. This terminal-effect policy is independent of
+`lector.o.clipboard.default_register` and
+`lector.o.clipboard.system_provider`; it never writes the host or
+outer-terminal clipboard. Desktop notifications and unknown APC effects are
+dropped. Titles, working directories, progress, hyperlinks, and bells remain
+modeled Lector state. In the live scheduler, title, working-directory,
+progress, clipboard, and notification events remain typed
+until the scheduler applies their explicit output policy; sensitive clipboard
+and notification payloads are never replayed as raw terminal bytes.
+
+Inside Lector, after attaching a fresh ordinary tmux client, the loaded
+capability can be checked with:
+
+```sh
+infocmp -1 -x xterm-256color | grep Sync
+tmux info | grep Sync
+```
+
+The `tmux info` check applies only to an ordinary tty client. A pure `tmux -CC`
+client has no rendering tty, so it is not expected to report or use `Sync`;
+Lector stabilizes control-mode `%output` at its own compositor boundary instead.
+
+Physical-terminal rendering starts conservatively, then applies terminfo,
+bounded probes, and finally explicit environment overrides. The supported
+overrides are `LECTOR_OUTER_COLORS` (an integer) and these boolean variables:
+`LECTOR_OUTER_TRUE_COLOR`, `LECTOR_OUTER_HYPERLINKS`, `LECTOR_OUTER_SYNC`,
+`LECTOR_OUTER_KITTY_KEYBOARD`, `LECTOR_OUTER_KITTY_GRAPHICS`,
+`LECTOR_OUTER_FOCUS`, and `LECTOR_OUTER_CLIPBOARD_READ`. Boolean values accept
+`true`/`false`, `yes`/`no`, `on`/`off`, or `1`/`0`. These describe the outer
+terminal only; they do not change what Lector promises to applications.
+
+
+## Ghostty adapter and composition
+
+The `lector-ghostty` engine is mandatory across Cargo feature selections.
+The local crate wraps the official C API with private raw
+bindings and bootstrap-checked ABI layouts. Native handles remain on their
+constructing thread. `GhosttyEngine` exposes snapshot and viewport methods;
+`advance_update`, `resize_update`, `resize_with_geometry_update`, and
+`reset_update` produce Lector's update summaries, alongside fallible inherent
+and `try_*` methods.
+
+The adapter normalizes Ghostty cells into Lector's grapheme, width, style,
+hyperlink, wrapping, and history model. Background-only cells combine Ghostty's
+cell content color with its style metadata, including when captured from
+scrollback, so erased regions retain their application-selected color.
+Lector exposes at most 10,000
+scrollback rows. Ghostty's allocator prunes complete pages and therefore may
+physically retain additional rows; the adapter disables the independent byte
+cap, configures 20,000 lines of physical headroom, and clips its public model
+to the newest 10,000 logical rows. Sparse review marks use Ghostty tracked grid references and become
+invalid when their cell falls outside that logical window, even if an older
+physical page has not yet been reclaimed.
+
+Ghostty's public cell and row semantic APIs distinguish prompt, input, and
+output content, but they do not expose every historical OSC 133 A/B/C/D
+boundary or the exit status carried by `D`. The owned adapter therefore keeps
+a narrow fragmented-stream OSC 133 observer alongside Ghostty and anchors each
+completed boundary to Ghostty with a tracked grid reference. This preserves
+exact command phases and exit status across scrolling and reflow without
+treating Ghostty's current `cursor_at_prompt` boolean as semantic history.
+
+Auto-read consumes an engine-neutral `UpdateSummary` produced by the same
+advance call that mutates terminal state. It records printable runs, cursor and
+explicit-scroll operation counts, Ghostty's official full/partial render
+damage, normalized changed-row ranges, cursor and screen identity before and
+after the write, synchronized-output mode, and whether the batch crossed an
+actual false-to-true DEC private mode 2026 boundary. At that boundary the
+adapter splits processing at the marker and captures a full screen-and-history
+snapshot. Clearing the marker's mode bit yields the exact committed model from
+immediately before the frame: preceding bytes in the same input slice are
+included and following bytes are excluded, even when the escape sequence was
+fragmented across reads.
+
+Ghostty exposes the final cursor, screen, mode, and render state but does not
+expose printable or cursor-operation callbacks. The owned adapter's
+narrow `vte` stream observer therefore collects operation hints, OSC 133
+boundaries, and the active OSC 8 URI needed to annotate semantic operation
+hints. For semantic rendering it speculatively tracks only the
+cursor, scroll margins, origin, autowrap, and horizontal-margin mode required
+to locate an operation. It owns no cells, history, or second terminal grid,
+and discards all hints unless its final cursor agrees with Ghostty's
+authoritative state. Changed rows come from Ghostty's stateful global and
+per-row dirty flags; the adapter acknowledges both layers after each snapshot
+so damage cannot leak into a later frame.
+
+The compositor maps pane-local dirty rows into clipped scene
+coordinates and compares only those candidate cells with its confirmed
+`PresentedScene`. Incremental runs use absolute cursor placement and
+self-contained style and hyperlink state. Failed or partial physical writes,
+resize, suspend/resume, changed image state, inconsistent shadows, and damaged
+wrap metadata all invalidate the optimization and use the full-scene,
+oracle-tested fallback. Text damage around unchanged images can still use the
+incremental path without retransmitting image data.
+
+When operation hints are consistent with the authoritative scene, the
+compositor can apply full or partial scrolling, line/character insertion and
+deletion, erasure, and adjacent ASCII write runs directly to both the physical
+terminal and a cloned shadow. It accepts that shadow only after affected rows
+match Ghostty's intended scene and the complete transaction is flushed. Any
+occlusion, clipping, media changes, wide-cell ambiguity, geometry mismatch,
+unsupported operation, or failed validation falls back to the same
+dirty-region or full-scene correctness path. The release benchmark checks
+semantic-path coverage and compares bytes and latency with a pure dirty-region
+renderer on both a tmux-style structural workload and a Zellij-style layered
+redraw workload. Both retain an independently constructed full-redraw result as
+the correctness reference; the checked-in baseline gates semantic coverage,
+bytes, latency, scheduler bounds, peak RSS, and media throughput.
+
+OSC 8 hyperlinks remain part of the modeled cell state and are closed at every
+physical transaction boundary. Ghostty-decoded Kitty graphics live in bounded
+pane-scoped stores: uploads and placements have separate lifetimes, unchanged
+pixel buffers are shared, and scene composition maps pane-local identifiers to
+collision-safe outer identifiers. Placements are clipped to pane and overlay
+geometry, including partial occlusion; hidden uploads can remain cached while
+their placements are removed and later restored without retransmission. The
+outer backend chunks uploads, deletes stale placement and upload identifiers,
+and conservatively rebuilds its cache after physical-state uncertainty. A
+terminal without advertised Kitty support receives the complete text scene and
+no graphics protocol. The default limits are 32 MiB per image, 64 MiB per
+pane, 128 MiB per scene, and 4,096 placements.
+
+Terminal side effects use the same pane boundary. Ghostty callbacks copy bell,
+title, working-directory, clipboard-write, desktop-notification, progress,
+query, and bounded unknown-sequence data into owned typed events before the
+callback returns. The callback userdata is boxed at a stable address, accessed
+only during synchronous terminal writes, drained after those writes return,
+and dropped after the Ghostty terminal handle. Unsupported APC payloads are
+limited to 256 bytes.
+
+Focus reporting, mouse protocol and encoding, bracketed paste, and Kitty
+keyboard flags are normalized into the terminal snapshot. Lector's existing
+focus, paste, mouse, and keyboard forwarding reads that pane-local state. Title
+and working-directory values are retained exactly as applications report them,
+including empty clears and raw `file://` URIs; they are not interpreted as SSH
+destinations.
+
+Resize handling reads the outer terminal's complete Unix `winsize`, derives
+per-cell pixel dimensions from its cell and grid-pixel fields, and routes the
+same geometry to both the child PTY and the pane model. The PTY receives rows,
+columns, and total grid pixels before the child is notified with `SIGWINCH`;
+Ghostty receives rows, columns, and per-cell pixels. Cell-only callers remain
+supported and explicitly carry zero pixel dimensions. Ghostty's primary-screen
+reflow and alternate-screen crop behavior are authoritative.
+
+The adapter enables a bounded 64 KiB replay continuation and exposes an
+explicitly diagnostic Ghostty snapshot round-trip. Automated tests encode and
+restore visible state, scrollback, geometry, modes, styles, and unfinished
+UTF-8 and CSI input. This is not used by live Lector behavior or presented as a
+stable persistence format: Ghostty snapshot format version 1 is unstable, and
+Lector's auxiliary OSC 133 history anchors are not serialized by this
+diagnostic path.
+
+The compositor gives the root terminal and every stacked Lector view a stable
+scene layer. Hidden engines keep parsing; a fully occluded update may complete
+with zero physical bytes. Popping a layer recomposes current snapshots. Frozen
+Review and table setup own independent cursors. Announcement/error popups report
+dismissal, and confirmations distinguish Enter acceptance from Escape cancellation.
+
+After the initial focus-mode query, stdout is nonblocking and registered for
+writable readiness only after `EAGAIN`. Scheduler writes retry `EINTR`, resume
+partial transactions without interleaving, and restore descriptor flags before
+terminal cleanup. Modeled updates have a 64 KiB per-drain write budget.
+Replacement renders compare the complete viewport with the confirmed scene,
+including earlier unflushed changes. Typed title, working-directory, progress,
+clipboard, and notification effects receive policy at activation; their bounded,
+UTF-8-safe payloads count toward retention even under backpressure. Zero-byte
+secure-policy effects complete normally.
 
 ## Data flow
 

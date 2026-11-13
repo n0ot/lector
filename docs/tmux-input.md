@@ -41,15 +41,9 @@ until Lector has either learned the outer terminal's exact defaults or reached
 the bounded probe deadline; the reported colors are then reconciled with the
 same profile used for direct children.
 
-Physical-terminal startup probes have the same durable ownership rule. The
-inactivity deadline makes ordinary keyboard input ready, but delayed responses
-to Lector's earlier physical queries remain Lector-owned until the final DA1
-response arrives. That ordered response is a processing fence: after consuming
-it, the startup broker passes every subsequent byte through without classifying
-escape prefixes. Application queries are answered by the root virtual engine
-and are never emitted to the physical terminal. Thus slow or backpressured
-physical replies cannot later appear as keys in a full-screen application such
-as Codex, while post-fence Meta keys do not pay the probe timeout.
+Physical startup-probe ownership is shared with direct terminal mode; see
+[terminal query ownership](architecture.md#terminal-compatibility-and-reading-behavior)
+for deadlines, delayed replies, and the final DA1 processing fence.
 
 ## Focus and mouse
 
@@ -86,23 +80,10 @@ needed, and immediately uses the new height for page motions. Closing Review
 therefore reveals a tmux view that has already adopted tmux's authoritative
 post-resize layout.
 
-At connection startup Lector requests `pause-after=1`. tmux discards pane
-output while a control client is paused, so `%pause %N` also marks Lector's
-pane model stale. When the pane is visible, Lector queues exactly one
-`refresh-client -A '%N:continue'` in the ordered control FIFO even if pause
-notifications repeat, then rebuilds the pane from `capture-pane`. `%continue`
-clears the transport's paused state, as does the successful reply to the
-explicit resume command (tmux may place `%continue %N` inside that command's
-output block). If output keeps racing ordinary recovery until its hard deadline,
-Lector pauses again and sends the final `continue` and capture as one parsed
-tmux command sequence, making the snapshot the boundary at which incremental
-delivery restarts.
-The age in `%extended-output` is delivery telemetry, not evidence of dropped
-bytes, so even old records remain ordinary incremental output. `%pause` is the
-loss boundary that starts an authoritative capture while further bytes in that
-interval are coalesced. The complete policy, recovery guarantees, and
-media/parser limitations are documented in
-[`tmux-completion.md`](tmux-completion.md).
+Startup requests `pause-after=1`. A `%pause` marks the pane stale; visibility
+queues one ordered continue and authoritative capture. Input, resize, and recovery
+commands share the same FIFO. See [flow control](tmux-completion.md#flow-control)
+for coalescing, loss boundaries, race handling, and capture limits.
 
 ## Regression harnesses
 
@@ -119,4 +100,4 @@ output flood through the actual control client. The child renders each received
 byte as hexadecimal, providing an independent end-to-end input oracle without
 timing sleeps. The harness is ignored by ordinary Cargo runs and selected by
 `scripts/test-real-tmux-docker`. The release latency check queues and encodes
-10,000 adjacent bytes under a deliberately generous regression budget.
+10,000 adjacent bytes under a generous regression budget.

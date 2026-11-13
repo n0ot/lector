@@ -2,8 +2,8 @@
 
 This crate combines Lector's cross-platform TTS library with its standalone
 stdio speech host. The library remains available as `tts`, while the
-`lector-tts` binary speaks the versioned protocol documented in
-[`../../docs/speech-driver-protocol.md`](../../docs/speech-driver-protocol.md).
+`lector-tts` binary implements the
+[speech-host protocol](../../docs/speech-driver-protocol.md).
 The implementation is shared with `lector tts`, so installing the main Lector
 binary is sufficient when the terminal and speech host run on the same
 machine.
@@ -16,10 +16,10 @@ lector-tts --backend av-foundation --voice VOICE_ID
 
 With no listing option, stdin and stdout are reserved for bounded NDJSON
 JSON-RPC. `--backend auto` (the default) selects the first currently available
-engine. Stable backend IDs, selected backend metadata, rate support, and the
-three voice operations are reported explicitly rather than inferred.
-Protocol 2.2 exposes rate as `0` (slowest) through `100` (fastest); the host
-converts that normalized value to each selected backend's native units.
+engine. The [speech-host protocol](../../docs/speech-driver-protocol.md) defines
+backend metadata, independent capabilities, and normalized rate semantics.
+For terminal-side configuration and bridge examples, see the
+[user speech guide](../../README.md#speech).
 
 The host is portable independently of the full Lector application. It may be
 launched locally, across an SSH stdio bridge, or through another transport
