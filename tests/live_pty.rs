@@ -845,7 +845,7 @@ fn init_lua_process_argv_and_deferred_speech_cross_the_ready_boundary_in_order()
         lector.wait_for(Duration::from_secs(3), |output| output
             .windows(STARTUP_HOOK_MARKER.len())
             .any(|window| window == STARTUP_HOOK_MARKER)),
-        "on_startup could not speak through the configured server; speech={:?}; output={:?}",
+        "on_startup did not emit its physical marker; speech={:?}; output={:?}",
         lector.outer_speech(),
         String::from_utf8_lossy(&lector.output)
     );
@@ -863,6 +863,15 @@ fn init_lua_process_argv_and_deferred_speech_cross_the_ready_boundary_in_order()
     assert!(
         initial_frame < startup_hook,
         "on_startup ran before the initial child frame was presented; output={:?}",
+        String::from_utf8_lossy(&lector.output)
+    );
+
+    // The physical marker precedes submission of the asynchronous request;
+    // observe speech readiness independently before asserting complete order.
+    assert!(
+        lector.wait_for_outer_speech(Duration::from_secs(3), "LECTOR-STARTUP-HOOK-SPEAK"),
+        "on_startup could not speak through the configured server; speech={:?}; output={:?}",
+        lector.outer_speech(),
         String::from_utf8_lossy(&lector.output)
     );
 
