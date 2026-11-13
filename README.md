@@ -1101,6 +1101,31 @@ Lector has a built‑in Lua REPL so you can try commands while it’s running. O
 - Commands that start with a space and consecutive duplicate commands are not added to REPL history.
 - Use `lector.inspect(value)` to pretty-print nested tables. It returns a string, so entering `lector.inspect(my_table)` displays it directly. Cycles are shown as `<cycle>`, and nesting beyond 20 table levels as `<max depth>`.
 
+The REPL runs trusted Lua scripts cooperatively on Lector's UI thread. Each
+resume must return or explicitly call `coroutine.yield()` so Lector can process
+input and redraw before the next resume. A non-yielding script or blocking
+native call can block the UI; cancellation keys cannot be handled while that
+resume is running. There is no guaranteed execution-time budget or automatic
+preemption. The current LuaJIT instruction hook does not provide reliable
+scheduling or cancellation: compiled code can bypass it, and LuaJIT does not
+support yielding from an instruction hook. If that hook reports
+`attempt to yield from a hook`, the evaluation ends with an error.
+
+For cooperative work, place `coroutine.yield()` between bounded pieces of work.
+Lector resumes the submitted coroutine on later UI ticks; values passed to
+`coroutine.yield(...)` are not displayed, while final return values are displayed.
+When input can be processed between resumes, `Escape` cancels the suspended
+evaluation and closes the overlay. Reopening it keeps the Lua environment and
+transcript, including changes already made before cancellation; cancellation
+does not roll them back. `C-c` discards an incomplete multiline chunk, rather
+than cancelling an evaluation.
+
+A completed evaluation or a reported Lua error returns to the prompt without
+resetting the session, so another command can use existing variables. Closing
+and reopening the overlay does not recover control from a resume that never
+returns. Reliable cancellation through isolated execution is deferred to
+[research spike #80](https://github.com/n0ot/lector/issues/80).
+
 ## Tips
 
 - If you want Lector to read *only* what you ask for, turn off auto‑read.
