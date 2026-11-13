@@ -34,6 +34,10 @@ With rustup, `rust-toolchain.toml` selects the exact Rust version the project
 is tested with. `scripts/check-rust-toolchain` confirms which compiler is
 actually being used.
 
+The pinned components include `llvm-tools`, which supplies the LLVM shared
+library used by Rust's debug-stripping tools on macOS. Keep it installed
+when installing the toolchain manually as well.
+
 The test commands use [cargo-nextest](https://nexte.st). Install the pinned
 version:
 

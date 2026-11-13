@@ -81,7 +81,7 @@ jobs:
         if: env.RUN_BUILD == 'true'
         run: >-
           rustup toolchain install "$(scripts/check-rust-toolchain --channel)"
-          --profile minimal --component clippy,rustfmt --target "${{ matrix.target }}"
+          --profile minimal --component clippy,llvm-tools,rustfmt --target "${{ matrix.target }}"
       - name: Cache verified Ghostty and Zig artifacts
         if: env.RUN_BUILD == 'true'
         # actions/cache v5
@@ -263,7 +263,7 @@ jobs:
         if: needs.changes.outputs.build == 'true'
         run: >-
           rustup toolchain install "$(scripts/check-rust-toolchain --channel)"
-          --profile minimal --component clippy,rustfmt --target "${{ matrix.target }}"
+          --profile minimal --component clippy,llvm-tools,rustfmt --target "${{ matrix.target }}"
       - name: Cache verified Ghostty and Zig artifacts
         if: needs.changes.outputs.build == 'true'
         # actions/cache v5
