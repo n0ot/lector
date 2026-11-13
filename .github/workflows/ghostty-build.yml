@@ -50,8 +50,12 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/cargo
       CARGO_INCREMENTAL: 0
+      # A master-only target is validated after merge and on manual dispatch.
+      # On pull requests its job reports success without building, like every
+      # job does for a Markdown-only change.
+      RUN_BUILD: ${{ needs.changes.outputs.build == 'true' && !(matrix.master_only && github.event_name == 'pull_request') }}
     name: ${{ matrix.name }}
-    runs-on: ${{ needs.changes.outputs.build == 'true' && matrix.runner || 'ubuntu-24.04' }}
+    runs-on: ${{ needs.changes.outputs.build == 'true' && !(matrix.master_only && github.event_name == 'pull_request') && matrix.runner || 'ubuntu-24.04' }}
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +66,7 @@ jobs:
           - name: macOS x86-64
             runner: macos-15-intel
             target: x86_64-apple-darwin
+            master_only: true
           - name: Linux ARM64 glibc
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
@@ -71,14 +76,14 @@ jobs:
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        if: needs.changes.outputs.build == 'true'
+        if: env.RUN_BUILD == 'true'
       - name: Install repository Rust toolchain
-        if: needs.changes.outputs.build == 'true'
+        if: env.RUN_BUILD == 'true'
         run: >-
           rustup toolchain install "$(scripts/check-rust-toolchain --channel)"
           --profile minimal --component clippy,rustfmt --target "${{ matrix.target }}"
       - name: Cache verified Ghostty and Zig artifacts
-        if: needs.changes.outputs.build == 'true'
+        if: env.RUN_BUILD == 'true'
         # actions/cache v5
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
@@ -87,16 +92,16 @@ jobs:
             target/toolchains
           key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
       - name: Verify canonical compiler and native architecture
-        if: needs.changes.outputs.build == 'true'
+        if: env.RUN_BUILD == 'true'
         run: >-
           scripts/check-rust-toolchain --host "${{ matrix.target }}"
           --target "${{ matrix.target }}"
       - name: Identify Cargo cache inputs
-        if: needs.changes.outputs.build == 'true'
+        if: env.RUN_BUILD == 'true'
         id: cargo-cache-key
         run: python3 .github/scripts/cargo_cache_key.py --target "${{ matrix.target }}" --lane native-debug-release-all-features
       - name: Cache Cargo dependencies
-        if: needs.changes.outputs.build == 'true'
+        if: env.RUN_BUILD == 'true'
         # Swatinem/rust-cache v2.9.3: prunes workspace binaries and incremental artifacts.
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         continue-on-error: true
@@ -107,36 +112,36 @@ jobs:
           cache-bin: false
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST LECTOR GHOSTTY
       - name: Build and test linked Ghostty metadata
-        if: needs.changes.outputs.build == 'true'
+        if: env.RUN_BUILD == 'true'
         run: cargo ghostty-check
       - name: Check Rust formatting
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo fmt --all -- --check
       - name: Lint workspace
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Check shell scripts
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: >-
           git grep -Il -E '^#!.*(ba)?sh' -- scripts tests/fixtures/pty
           | xargs shellcheck -x
       - name: Install cargo-nextest
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7
         with:
           tool: nextest
           version: 0.9.143
       - name: Run complete suite
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo nextest run --locked --workspace --all-targets --all-features
       - name: Set up tmux image builder
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         # docker/setup-buildx-action v3
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - name: Build cached tmux image
         id: tmux-image
         timeout-minutes: 10
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         continue-on-error: true
         # docker/build-push-action v7
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
@@ -150,7 +155,7 @@ jobs:
       - name: Build tmux image without cache after cache failure
         id: tmux-image-cold
         timeout-minutes: 10
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-image.outcome == 'failure'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-image.outcome == 'failure'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
         with:
           context: .
@@ -160,7 +165,7 @@ jobs:
           no-cache: true
       - name: Identify container compilation cache
         id: tmux-cache-key
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           TMUX_IMAGE: ${{ steps.tmux-image-cold.outputs.imageid || steps.tmux-image.outputs.imageid }}
         run: |
@@ -168,7 +173,7 @@ jobs:
       - name: Restore container compilation cache
         id: tmux-cache
         timeout-minutes: 5
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         continue-on-error: true
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
         with:
@@ -183,7 +188,7 @@ jobs:
       - name: Validate restored container compilation cache
         id: tmux-cache-check
         timeout-minutes: 10
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         continue-on-error: true
         env:
           LECTOR_REAL_TMUX_PREBUILT_IMAGE: ${{ steps.tmux-image-cold.outputs.imageid || steps.tmux-image.outputs.imageid }}
@@ -197,10 +202,10 @@ jobs:
           fi
           scripts/test-real-tmux-docker
       - name: Discard unusable container compilation cache
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache-check.outcome == 'failure'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache-check.outcome == 'failure'
         run: sudo rm -rf -- "${RUNNER_TEMP:?}/lector-tmux-cache"
       - name: Run real tmux tests in Docker
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           LECTOR_REAL_TMUX_PREBUILT_IMAGE: ${{ steps.tmux-image-cold.outputs.imageid || steps.tmux-image.outputs.imageid }}
           LECTOR_REAL_TMUX_PLATFORM: linux/amd64
@@ -209,11 +214,11 @@ jobs:
           : "${LECTOR_REAL_TMUX_PREBUILT_IMAGE:?image build did not return an ID}"
           scripts/test-real-tmux-docker
       - name: Make container artifacts readable for cache upload
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache.outputs.cache-hit != 'true'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache.outputs.cache-hit != 'true'
         run: sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP:?}/lector-tmux-cache"
       - name: Save container compilation cache
         timeout-minutes: 5
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache.outputs.cache-hit != 'true'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
         with:
@@ -225,7 +230,7 @@ jobs:
             ${{ runner.temp }}/lector-tmux-cache/target/toolchains
           key: ${{ steps.tmux-cache-key.outputs.prefix }}-${{ github.sha }}
       - name: Run documentation tests
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        if: env.RUN_BUILD == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo test --locked --workspace --doc --all-features
 
   tier-two-static:
