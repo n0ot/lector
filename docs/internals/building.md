@@ -53,6 +53,12 @@ Tier 1, required to build:
 - `aarch64-unknown-linux-gnu`
 - `x86_64-unknown-linux-gnu`
 
+CI builds every Tier 1 target on each pull request, except Intel macOS
+(`x86_64-apple-darwin`). That target is built after each merge to `master`
+and on manual runs. Its runners are the slowest and are being retired, so a
+pull request does not wait for it. An Intel-only failure shows up as a red
+run on `master`.
+
 Tier 2, recognized by the build but not yet claimed as supported:
 
 - `aarch64-unknown-linux-musl`
