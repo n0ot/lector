@@ -116,10 +116,6 @@ jobs:
     env:
       CARGO_TARGET_DIR: target/cargo
       CARGO_INCREMENTAL: 0
-      CC_aarch64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-cc
-      CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/scripts/zig-cc
-      LECTOR_ZIG_CC_TARGET: ${{ matrix.zig_target }}
-      CARGO_BUILD_TARGET: ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -128,12 +124,10 @@ jobs:
             target: aarch64-unknown-linux-musl
             host: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
-            zig_target: aarch64-linux-musl
           - name: Linux x86-64 musl
             target: x86_64-unknown-linux-musl
             host: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
-            zig_target: x86_64-linux-musl
     steps:
       # actions/checkout v4.2.2
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -143,6 +137,9 @@ jobs:
         run: >-
           rustup toolchain install "$(scripts/check-rust-toolchain --channel)"
           --profile minimal --component clippy,llvm-tools,rustfmt --target "${{ matrix.target }}"
+      - name: Configure ordinary Cargo commands for Linux
+        if: needs.changes.outputs.build == 'true'
+        run: scripts/setup
       - name: Cache verified Ghostty and Zig artifacts
         if: needs.changes.outputs.build == 'true'
         # actions/cache v5

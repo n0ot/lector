@@ -9,7 +9,7 @@ import subprocess
 
 CONFIG_PATHS = (
     "Cargo.lock", "Cargo.toml", "rust-toolchain.toml", ".cargo/config.toml",
-    "scripts/rustc-static-linux", "scripts/cargo-musl",
+    "scripts/rustc-static-linux", "scripts/cargo-musl", "scripts/setup",
     "scripts/zig-cc", "scripts/zig-lld",
     "scripts/bootstrap_zig.sh", "scripts/bootstrap_ghostty.sh",
 )

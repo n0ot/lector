@@ -45,10 +45,10 @@ version:
 cargo install cargo-nextest --version 0.9.143 --locked
 ```
 
-On glibc-based Linux hosts, install the musl Rust target described in the
-[build guide](docs/internals/building.md#build-from-a-fresh-clone), and replace
-`cargo` below with `scripts/cargo-musl`. The wrapper also passes the selected
-target to nested Cargo commands such as `ghostty-check`.
+On Linux, run `scripts/setup` once after cloning. It installs the matching
+musl Rust target and writes ignored configuration for this checkout. All
+Cargo commands below then work as written, including maintenance aliases.
+macOS needs no target setup.
 
 ## Testing
 

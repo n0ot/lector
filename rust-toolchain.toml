@@ -2,3 +2,5 @@
 channel = "1.100.0"
 profile = "minimal"
 components = ["clippy", "llvm-tools", "rustfmt"]
+# Keep Linux defaults usable after a pinned-toolchain update as well.
+targets = ["aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]

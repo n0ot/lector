@@ -30,7 +30,8 @@ done
 # Every cross-compiled musl workspace executable, including test harnesses,
 # must use the same linker/unwinder as the release binary. A host GNU linker
 # can otherwise mix its libgcc unwinder with Rust's bundled LLVM unwinder.
-if [[ "$target" == *-linux-musl && -n "${LECTOR_ZIG_CC_TARGET:-}" ]]; then
+if [[ "$target" == aarch64-unknown-linux-musl || "$target" == x86_64-unknown-linux-musl ]]; then
+    export LECTOR_ZIG_CC_TARGET=${target/-unknown/}
     wrapper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
     exec "$rustc_bin" "${rustc_args[@]}" \
         -C target-feature=+crt-static \

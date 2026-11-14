@@ -40,13 +40,12 @@ Then clone the repository and install:
 ```bash
 git clone https://github.com/n0ot/lector.git
 cd lector
-# macOS and Alpine's packaged Rust:
+scripts/setup
 cargo install --locked --path . --bin lector
-
-# Other Linux distributions (x86-64 or ARM64):
-rustup target add "$(uname -m)-unknown-linux-musl"
-scripts/cargo-musl install --locked --path . --bin lector
 ```
+
+`scripts/setup` is a one-time Linux setup step; it is harmless on macOS.
+After setup, use ordinary Cargo commands for builds, tests, and installation.
 
 This puts `lector` in `~/.cargo/bin`, which rustup adds to your `PATH`. The
 first build downloads Lector's terminal engine and takes a few minutes.

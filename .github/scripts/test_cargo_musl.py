@@ -83,7 +83,8 @@ class WorkspaceLinkerTests(unittest.TestCase):
             compiler = Path(directory) / 'compiler'
             compiler.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
             compiler.chmod(0o755)
-            env = dict(os.environ, LECTOR_ZIG_CC_TARGET='aarch64-linux-musl')
+            env = {key: value for key, value in os.environ.items()
+                   if key != 'LECTOR_ZIG_CC_TARGET'}
             for target in ('aarch64-unknown-linux-musl', 'aarch64-unknown-linux-gnu'):
                 for kind in (['--test'], ['--crate-type', 'bin']):
                     args = ['--crate-name', 'sample', '--target', target, *kind]

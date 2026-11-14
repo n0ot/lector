@@ -27,25 +27,27 @@ You need:
 - On macOS, the Xcode command line tools. Zig uses the macOS SDK that
   `xcrun --sdk macosx` reports.
 
-Then:
+On Linux, run `scripts/setup` once after cloning, before the first Cargo
+build. It installs the matching musl Rust target and writes
+`.cargo/lector-local.toml`, which is ignored by Git and applies only to this
+checkout. macOS needs no setup; running the script there is harmless.
+The toolchain pin includes both musl standard libraries, so a Rust upgrade
+does not require repeating target installation.
 
 ```sh
+scripts/setup
 cargo build --locked --release
+cargo install --locked --path . --bin lector
 ```
 
-On a glibc-based Linux build host, install the matching Rust target and use
-our Cargo wrapper instead of plain `cargo`:
-
-```sh
-rustup target add "$(uname -m)-unknown-linux-musl"
-scripts/cargo-musl build --locked --release
-```
-
-The wrapper selects the musl target and the pinned Zig C compiler. It also
-works with `install`, `nextest`, `clippy`, and the maintenance aliases. Use
-`CARGO_BUILD_TARGET` or `--target` to select the other supported architecture;
-executing those artifacts requires a matching machine or emulation. Alpine's
-packaged Rust already targets musl and can use plain Cargo.
+Ordinary Cargo commands now select the right target and pinned Zig compiler;
+no wrapper command or environment exports are required. The generated
+configuration also keeps maintenance aliases and nested Cargo builds on the
+same target. Alpine's packaged Rust keeps its native musl target and linker.
+The existing `scripts/cargo-musl` helper remains available for automation and
+read-only checkouts. Explicit cross builds can use `--target` after installing
+the desired Rust target; running those artifacts requires a matching machine
+or emulation.
 
 To install the result, see the [README](../../README.md#install).
 

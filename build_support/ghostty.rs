@@ -19,7 +19,7 @@ pub fn validate_target(target: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Lector's Ghostty adapter does not support target {target}; Linux builds require musl (use scripts/cargo-musl); supported targets: {}",
+            "Lector's Ghostty adapter does not support target {target}; Linux builds require musl (run scripts/setup once, then retry Cargo); supported targets: {}",
             SUPPORTED_TARGETS.join(", ")
         ))
     }

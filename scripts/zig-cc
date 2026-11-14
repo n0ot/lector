@@ -2,7 +2,8 @@
 set -euo pipefail
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-zig_target=${LECTOR_ZIG_CC_TARGET:-}
+zig_target=${TARGET:-${CARGO_BUILD_TARGET:-${LECTOR_ZIG_CC_TARGET:-}}}
+zig_target=${zig_target/-unknown/}
 
 case "$zig_target" in
     aarch64-linux-musl|x86_64-linux-musl) ;;
