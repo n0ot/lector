@@ -31,11 +31,13 @@ lector_acquire_lock() {
             stale_dir="$lock_dir.stale.$$.$RANDOM"
             if mv "$lock_dir" "$stale_dir" 2>/dev/null; then
                 rm -rf -- "$stale_dir"
-                echo "reclaimed stale $description lock from pid $owner" >&2
+                if [[ "${LECTOR_BOOTSTRAP_QUIET:-0}" != 1 ]]; then
+                    echo "reclaimed stale $description lock from pid $owner" >&2
+                fi
                 continue
             fi
         fi
-        if [[ "$announced" == false ]]; then
+        if [[ "$announced" == false && "${LECTOR_BOOTSTRAP_QUIET:-0}" != 1 ]]; then
             echo "waiting for $description lock: $lock_dir" >&2
             announced=true
         fi
