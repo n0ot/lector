@@ -430,6 +430,9 @@ fn with_callbacks(backend_id: u64, f: impl FnOnce(&mut Callbacks)) {
 
 /// Bound with `RegisterNatives`, since the bridge's own class loader puts it out of reach of
 /// symbol-based binding. Names are `lowerCamelCase`d and must match _android/Bridge.java_.
+// jni 0.22's generated initialization uses AtomicBool::fetch_update, deprecated
+// in Rust 1.100. Keep this allowance confined to the upstream macro expansion.
+#[allow(deprecated)]
 const BRIDGE_METHODS: &[NativeMethod] = &[
     native_method! { fn on_init(status: jint), },
     native_method! { fn on_start(utterance_id: JString), },

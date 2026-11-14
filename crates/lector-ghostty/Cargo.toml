@@ -15,5 +15,5 @@ test = false
 doctest = false
 
 [dependencies]
-serde = { version = "1.0.203", features = ["derive", "rc"] }
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 vte = "0.15.0"

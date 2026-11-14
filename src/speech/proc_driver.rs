@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -340,11 +340,11 @@ impl ProcDriver {
         let child = Arc::new(Mutex::new(child));
         register(TerminationHandle(Arc::clone(&child)));
 
-        if let Err(error) = make_nonblocking(stdin.as_raw_fd(), "make RPC stdin nonblocking") {
+        if let Err(error) = make_nonblocking(stdin.as_fd(), "make RPC stdin nonblocking") {
             terminate_and_reap_shared_child(&child);
             return Err(error);
         }
-        if let Err(error) = make_nonblocking(stdout.as_raw_fd(), "make RPC stdout nonblocking") {
+        if let Err(error) = make_nonblocking(stdout.as_fd(), "make RPC stdout nonblocking") {
             terminate_and_reap_shared_child(&child);
             return Err(error);
         }
@@ -1014,7 +1014,7 @@ impl Drop for ProcDriver {
     }
 }
 
-fn make_nonblocking(fd: std::os::fd::RawFd, operation: &'static str) -> Result<()> {
+fn make_nonblocking(fd: std::os::fd::BorrowedFd<'_>, operation: &'static str) -> Result<()> {
     let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(|error| Error::Io {
         operation,
         source: error.into(),

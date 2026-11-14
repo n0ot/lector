@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -896,6 +896,12 @@ impl Write for PtyStream {
     }
 }
 
+impl AsFd for PtyStream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
 impl AsRawFd for PtyStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
@@ -929,7 +935,7 @@ mod tests {
     };
     use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+    use std::os::fd::{AsFd, BorrowedFd};
     use std::path::Path;
     use std::sync::{
         Arc, Barrier, Mutex, MutexGuard,
@@ -1206,10 +1212,10 @@ mod tests {
     fn nonblocking_pty_writes_are_buffered_and_overflow_is_reported_not_returned() {
         let (_read, write) = pipe().expect("create PTY-write stand-in pipe");
         let original = OFlag::from_bits_truncate(
-            fcntl(write.as_raw_fd(), FcntlArg::F_GETFL).expect("read pipe flags"),
+            fcntl(write.as_fd(), FcntlArg::F_GETFL).expect("read pipe flags"),
         );
         fcntl(
-            write.as_raw_fd(),
+            write.as_fd(),
             FcntlArg::F_SETFL(original | OFlag::O_NONBLOCK),
         )
         .expect("make pipe nonblocking");

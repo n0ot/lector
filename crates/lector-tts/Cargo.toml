@@ -29,21 +29,29 @@ serde = []
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6.7", default-features = false, features = [
+    "std",
+    "color",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+    "derive",
+] }
 dyn-clonable = "0.9"
 hound = "3.5"
 oxilangtag = "0.1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tracing = "0.1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.28", features = ["process"] }
+nix = { version = "0.31.3", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
-libloading = "0.8"
+libloading = "0.9.1"
 tolk = { version = "0.5", optional = true }
 windows = { version = "0.62", features = [
     "Foundation",
@@ -58,7 +66,11 @@ windows = { version = "0.62", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 ssip-client-async = "0.19"
 ssip = "=0.5.0"
-zbus = "5"
+zbus = { version = "6.3.0", default-features = false, features = ["default-rt", "proxy"] }
+
+# In-process D-Bus fixtures exercise the client protocol without a daemon.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = { version = "6.3.0", default-features = false, features = ["default-rt", "proxy", "service", "p2p"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 block2 = "0.6"
@@ -75,10 +87,8 @@ objc2-avf-audio = { version = "0.3", default-features = false, features = [
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSArray",
-    "NSDate",
     "NSEnumerator",
-    "NSObjCRuntime",
-    "NSRunLoop",
+    "NSRange",
     "NSString",
 ] }
 
