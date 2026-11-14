@@ -20,33 +20,42 @@ rust-version = "1.100"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.86"
-arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
-chrono = "0.4.38"
-clap = { version = "4.5.11", features = ["derive", "env"] }
-dirs = "6.0.0"
-emojis = "0.8.0"
-mio = { version = "1.1.1", features = ["os-ext", "os-poll"] }
-nix = { version = "0.28.0", features = ["fs", "process", "signal", "term"] }
-phf = { version = "0.13.1", features = ["macros"] }
+anyhow = "1.0.104"
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+clap = { version = "4.6.7", default-features = false, features = [
+    "std",
+    "color",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+    "derive",
+    "env",
+] }
+dirs = "7.0.0"
+emojis = "0.9.1"
+mio = { version = "1.2.5", default-features = false, features = ["os-ext", "os-poll"] }
+nix = { version = "0.31.3", features = ["fs", "process", "signal", "term"] }
+phf = { version = "0.14.0", default-features = false, features = ["macros"] }
 portable-pty = "=0.9.0"
-regex = { version = "1.10.5", default-features = false, features = [
+regex = { version = "1.13.1", default-features = false, features = [
     "std",
     "perf",
     "unicode-bool",
 ] }
-serde = { version = "1.0.203", features = ["derive", "rc"] }
-serde_json = "1.0.120"
-signal-hook = "0.3.17"
-signal-hook-mio = { version = "0.2.3", features = ["support-v1_0"] }
-smallvec = "1.15.1"
-similar = { version = "2.5.0", features = ["unicode"] }
-unicode-segmentation = "1.11.0"
-unicode-width = "0.2.2"
+serde = { version = "1.0.229", features = ["derive", "rc"] }
+serde_json = "1.0.154"
+signal-hook = { version = "0.4.6", default-features = false, features = ["iterator"] }
+signal-hook-mio = { version = "0.3.0", features = ["support-v1_0"] }
+smallvec = "1.16.5"
+similar = { version = "3.2.1", default-features = false, features = ["std", "unicode"] }
+unicode-segmentation = "1.13.3"
+unicode-width = { version = "0.2.3", default-features = false }
 mlua = { version = "0.12.2", features = ["luajit", "vendored", "error-send"] }
 tts = { package = "lector-tts", version = "0.1.0", path = "crates/lector-tts" }
-terminput = "0.5.12"
-thiserror = "2.0.17"
+terminput = "0.5.16"
+thiserror = "2.0.21"
 lector-ghostty = { version = "0.1.0", path = "crates/lector-ghostty" }
 
 [[bin]]
@@ -83,10 +92,10 @@ bench = false
 core-foundation = "0.10"
 
 [dev-dependencies]
-tempfile = "3.25.0"
+tempfile = "3.27.0"
 
 [build-dependencies]
-cc = "1.2.50"
+cc = "1.11.2"
 
 [profile.test]
 debug = "line-tables-only"

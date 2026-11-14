@@ -17,7 +17,7 @@ use signal_hook::consts::signal::*;
 use signal_hook_mio::v1_0::Signals;
 use std::{
     io::{ErrorKind, Read, Write},
-    os::fd::{AsFd, AsRawFd, RawFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd},
     path::{Path, PathBuf},
     sync::{Arc, atomic::AtomicBool},
     thread, time,
@@ -257,17 +257,24 @@ fn startup_deadline_poll_timeout(
 }
 
 struct NonblockingFdGuard {
-    fd: RawFd,
+    fd: OwnedFd,
     original: OFlag,
     restored: bool,
 }
 
 impl NonblockingFdGuard {
-    fn enable(fd: RawFd) -> Result<Self> {
+    fn enable(fd: impl AsFd) -> Result<Self> {
+        // Status flags belong to the shared open-file description. Owning a
+        // duplicate keeps restoration valid without borrowing the I/O owner
+        // throughout the event loop.
+        let fd = fd
+            .as_fd()
+            .try_clone_to_owned()
+            .context("retain descriptor for flag restoration")?;
         let original = OFlag::from_bits_truncate(
-            fcntl(fd, FcntlArg::F_GETFL).context("read descriptor flags")?,
+            fcntl(&fd, FcntlArg::F_GETFL).context("read descriptor flags")?,
         );
-        fcntl(fd, FcntlArg::F_SETFL(original | OFlag::O_NONBLOCK))
+        fcntl(&fd, FcntlArg::F_SETFL(original | OFlag::O_NONBLOCK))
             .context("make descriptor nonblocking")?;
         Ok(Self {
             fd,
@@ -280,7 +287,7 @@ impl NonblockingFdGuard {
         if self.restored {
             return Ok(());
         }
-        fcntl(self.fd, FcntlArg::F_SETFL(self.original)).context("restore descriptor flags")?;
+        fcntl(&self.fd, FcntlArg::F_SETFL(self.original)).context("restore descriptor flags")?;
         self.restored = true;
         Ok(())
     }
@@ -290,7 +297,7 @@ impl NonblockingFdGuard {
             return Ok(());
         }
         fcntl(
-            self.fd,
+            &self.fd,
             FcntlArg::F_SETFL(self.original | OFlag::O_NONBLOCK),
         )
         .context("make descriptor nonblocking after resume")?;
@@ -343,9 +350,10 @@ impl Drop for EmergencyTerminalGuard {
         // the normal shutdown reactor is fully constructed. Never let a
         // stopped or backpressured terminal turn the fallback itself into an
         // unbounded cleanup phase.
-        let _nonblocking_output = NonblockingFdGuard::enable(stdout.as_raw_fd()).ok();
-        let _ = stdout.write(&emergency_terminal_cleanup_bytes(self.focus_was_enabled));
-        let _ = stdout.flush();
+        if let Ok(_nonblocking_output) = NonblockingFdGuard::enable(stdout.as_fd()) {
+            let _ = stdout.write(&emergency_terminal_cleanup_bytes(self.focus_was_enabled));
+            let _ = stdout.flush();
+        }
         let _ = termios::tcsetattr(
             std::io::stdin().as_fd(),
             termios::SetArg::TCSADRAIN,
@@ -559,7 +567,7 @@ fn drain_shutdown_handoff_input<R: Read>(
 /// Consume terminal input through the response to a freshly emitted DA1
 /// request. The descriptor is temporarily nonblocking so one readiness edge
 /// can be drained completely. Unsupported terminals are bounded by `timeout`.
-fn wait_for_shutdown_fence<R: Read + AsRawFd>(
+fn wait_for_shutdown_fence<R: Read + AsRawFd + AsFd>(
     stdin: &mut R,
     replies_to_ignore: usize,
     timeout: time::Duration,
@@ -567,7 +575,7 @@ fn wait_for_shutdown_fence<R: Read + AsRawFd>(
     let mut broker = ShutdownFenceBroker::new(replies_to_ignore);
     let mut poll = mio::Poll::new().context("create shutdown-fence poll")?;
     let stdin_fd = stdin.as_raw_fd();
-    let _nonblocking_input = NonblockingFdGuard::enable(stdin_fd)
+    let _nonblocking_input = NonblockingFdGuard::enable(stdin.as_fd())
         .context("make terminal input nonblocking for shutdown fence")?;
     let mut source = mio::unix::SourceFd(&stdin_fd);
     poll.registry()
@@ -905,7 +913,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         io::{self, Read, Write},
-        os::fd::AsRawFd,
+        os::fd::AsFd,
         path::PathBuf,
         thread,
         time::{Duration, Instant},
@@ -1493,18 +1501,18 @@ mod tests {
     fn nonblocking_output_guard_sets_and_restores_the_original_descriptor_flags() {
         let (_read, write) = nix::unistd::pipe().expect("create pipe");
         let original = OFlag::from_bits_truncate(
-            fcntl(write.as_raw_fd(), FcntlArg::F_GETFL).expect("read original flags"),
+            fcntl(write.as_fd(), FcntlArg::F_GETFL).expect("read original flags"),
         );
         {
             let _guard =
-                NonblockingFdGuard::enable(write.as_raw_fd()).expect("enable nonblocking output");
+                NonblockingFdGuard::enable(write.as_fd()).expect("enable nonblocking output");
             let active = OFlag::from_bits_truncate(
-                fcntl(write.as_raw_fd(), FcntlArg::F_GETFL).expect("read active flags"),
+                fcntl(write.as_fd(), FcntlArg::F_GETFL).expect("read active flags"),
             );
             assert!(active.contains(OFlag::O_NONBLOCK));
         }
         let restored = OFlag::from_bits_truncate(
-            fcntl(write.as_raw_fd(), FcntlArg::F_GETFL).expect("read restored flags"),
+            fcntl(write.as_fd(), FcntlArg::F_GETFL).expect("read restored flags"),
         );
         assert_eq!(restored, original);
     }
@@ -1513,28 +1521,28 @@ mod tests {
     fn nonblocking_output_guard_can_be_reenabled_after_a_suspend_boundary() {
         let (_read, write) = nix::unistd::pipe().expect("create pipe");
         let original = OFlag::from_bits_truncate(
-            fcntl(write.as_raw_fd(), FcntlArg::F_GETFL).expect("read original flags"),
+            fcntl(write.as_fd(), FcntlArg::F_GETFL).expect("read original flags"),
         );
         let mut guard =
-            NonblockingFdGuard::enable(write.as_raw_fd()).expect("enable nonblocking output");
+            NonblockingFdGuard::enable(write.as_fd()).expect("enable nonblocking output");
         guard.restore().expect("restore for suspend");
         assert_eq!(
             OFlag::from_bits_truncate(
-                fcntl(write.as_raw_fd(), FcntlArg::F_GETFL).expect("read suspended flags")
+                fcntl(write.as_fd(), FcntlArg::F_GETFL).expect("read suspended flags")
             ),
             original
         );
 
         guard.enable_again().expect("reenable after resume");
         let resumed = OFlag::from_bits_truncate(
-            fcntl(write.as_raw_fd(), FcntlArg::F_GETFL).expect("read resumed flags"),
+            fcntl(write.as_fd(), FcntlArg::F_GETFL).expect("read resumed flags"),
         );
         assert!(resumed.contains(OFlag::O_NONBLOCK));
 
         guard.restore().expect("restore after resumed run");
         assert_eq!(
             OFlag::from_bits_truncate(
-                fcntl(write.as_raw_fd(), FcntlArg::F_GETFL).expect("read final flags")
+                fcntl(write.as_fd(), FcntlArg::F_GETFL).expect("read final flags")
             ),
             original
         );
@@ -1980,7 +1988,7 @@ fn do_events(
     let mut emergency_terminal = EmergencyTerminalGuard::new(initial_term_attrs);
     let mut pty_stream = process.stream().context("get PTY stream")?;
     let _nonblocking_pty =
-        NonblockingFdGuard::enable(pty_stream.as_raw_fd()).context("make child PTY nonblocking")?;
+        NonblockingFdGuard::enable(pty_stream.as_fd()).context("make child PTY nonblocking")?;
     // Set stdin to raw, so that input is read character by character,
     // and so that signals like SIGINT aren't sent when pressing keys like ^C.
     pty::set_raw(std::io::stdin().as_fd()).context("set STDIN to raw")?;
@@ -2029,10 +2037,10 @@ fn do_events(
     } = query_focus_mode(&mut stdin, &mut stdout);
     emergency_terminal.set_prior_focus_mode(focus_was_enabled);
     let mut nonblocking_input =
-        NonblockingFdGuard::enable(stdin.as_raw_fd()).context("make terminal input nonblocking")?;
+        NonblockingFdGuard::enable(stdin.as_fd()).context("make terminal input nonblocking")?;
     let stdout_fd = stdout.as_raw_fd();
     let mut nonblocking_output =
-        NonblockingFdGuard::enable(stdout_fd).context("make terminal output nonblocking")?;
+        NonblockingFdGuard::enable(stdout.as_fd()).context("make terminal output nonblocking")?;
     let mut stdout_source = mio::unix::SourceFd(&stdout_fd);
     let mut stdout_registered = false;
     let mut pty_writable_registered = false;
