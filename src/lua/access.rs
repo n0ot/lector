@@ -19,6 +19,7 @@ use crate::screen_reader::ScreenReader;
 use mlua::{AnyUserData, Error, Lua, Result, WeakLua};
 use std::{
     cell::{Cell, RefCell},
+    mem::DropGuard,
     rc::Rc,
 };
 
@@ -80,18 +81,6 @@ impl ReaderAccess {
     }
 }
 
-struct Restore {
-    access: ReaderAccess,
-    previous: Option<AnyUserData>,
-}
-
-impl Drop for Restore {
-    fn drop(&mut self) {
-        self.access.0.active.replace(self.previous.take());
-        self.access.0.depth.set(self.access.0.depth.get() - 1);
-    }
-}
-
 /// Call only after cloning all Lua handles and snapshotting reader arguments;
 /// the closure must not capture any reference into `reader`.
 pub(crate) fn enter<T>(
@@ -114,7 +103,10 @@ pub(crate) fn enter<T>(
         let handle = scope.create_any_userdata_ref_mut(reader)?;
         let previous = access.0.active.replace(Some(handle));
         access.0.depth.set(access.0.depth.get() + 1);
-        let _restore = Restore { access, previous };
+        let _restore = DropGuard::new((access, previous), |(access, previous)| {
+            access.0.active.replace(previous);
+            access.0.depth.set(access.0.depth.get() - 1);
+        });
         call()
     })
 }

@@ -8,13 +8,13 @@ use nix::sys::{
     signal::{Signal, kill},
     termios,
 };
-use nix::unistd::{Pid, dup};
+use nix::unistd::Pid;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -100,8 +100,7 @@ struct TerminfoCacheLock {
 
 impl Drop for TerminfoCacheLock {
     fn drop(&mut self) {
-        // SAFETY: `file` remains open for this call and is owned by the guard.
-        let _ = unsafe { nix::libc::flock(self.file.as_raw_fd(), nix::libc::LOCK_UN) };
+        let _ = self.file.unlock();
     }
 }
 
@@ -265,23 +264,15 @@ fn acquire_terminfo_cache_lock(cache: &Path, timeout: Duration) -> io::Result<Te
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(cache.join(".lock"))?;
     loop {
-        // SAFETY: `file` is open and owned by this function. `LOCK_NB` keeps
-        // acquisition bounded; the resulting advisory lock is released by the
-        // returned guard.
-        let result =
-            unsafe { nix::libc::flock(file.as_raw_fd(), nix::libc::LOCK_EX | nix::libc::LOCK_NB) };
-        if result == 0 {
-            return Ok(TerminfoCacheLock {
-                _process: process,
-                file,
-            });
-        }
-        let error = io::Error::last_os_error();
-        let blocked = error
-            .raw_os_error()
-            .is_some_and(|code| code == nix::libc::EWOULDBLOCK || code == nix::libc::EAGAIN);
-        if !blocked {
-            return Err(error);
+        match file.try_lock() {
+            Ok(()) => {
+                return Ok(TerminfoCacheLock {
+                    _process: process,
+                    file,
+                });
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
         }
         wait_for_terminfo_cache_lock(deadline)?;
     }
@@ -615,9 +606,13 @@ impl Process {
             .master
             .as_raw_fd()
             .ok_or_else(|| anyhow!("PTY master does not expose a file descriptor"))?;
-        let stream_fd = dup(master_fd).context("duplicate PTY master")?;
+        // SAFETY: the master is owned by `self` and remains open for this borrow.
+        let master_fd = unsafe { BorrowedFd::borrow_raw(master_fd) };
+        let stream_fd = master_fd
+            .try_clone_to_owned()
+            .context("duplicate PTY master")?;
         Ok(PtyStream {
-            inner: unsafe { File::from_raw_fd(stream_fd) },
+            inner: File::from(stream_fd),
             pending_write: VecDeque::new(),
             dropped_write_bytes: 0,
         })
@@ -746,11 +741,12 @@ fn pty_size(geometry: TerminalGeometry) -> PtySize {
 }
 
 /// Reads cell and pixel geometry from a terminal file descriptor.
-pub fn terminal_geometry(fd: RawFd) -> Result<TerminalGeometry> {
+pub fn terminal_geometry(fd: BorrowedFd<'_>) -> Result<TerminalGeometry> {
     let mut size = std::mem::MaybeUninit::<nix::libc::winsize>::zeroed();
     // SAFETY: `size` points to writable `winsize` storage and `fd` is borrowed
     // only for this ioctl. Success guarantees the structure was initialized.
-    let result = unsafe { nix::libc::ioctl(fd, nix::libc::TIOCGWINSZ, size.as_mut_ptr()) };
+    let result =
+        unsafe { nix::libc::ioctl(fd.as_raw_fd(), nix::libc::TIOCGWINSZ, size.as_mut_ptr()) };
     Errno::result(result).context("read terminal geometry")?;
     // SAFETY: the successful ioctl initialized the complete `winsize`.
     let size = unsafe { size.assume_init() };
@@ -906,8 +902,7 @@ impl AsRawFd for PtyStream {
     }
 }
 
-pub fn set_raw(fd: RawFd) -> Result<()> {
-    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+pub fn set_raw(fd: BorrowedFd<'_>) -> Result<()> {
     let mut attrs = termios::tcgetattr(fd).context("read terminal settings")?;
     termios::cfmakeraw(&mut attrs);
     termios::tcsetattr(fd, termios::SetArg::TCSANOW, &attrs)
@@ -934,7 +929,7 @@ mod tests {
     };
     use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
     use std::path::Path;
     use std::sync::{
         Arc, Barrier, Mutex, MutexGuard,
@@ -1145,6 +1140,31 @@ mod tests {
     }
 
     #[test]
+    fn cache_file_lock_contends_across_handles_and_is_released_on_drop() {
+        let root = tempfile::tempdir().expect("create lock directory");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root.path().join(".lock"))
+            .expect("open independent lock handle");
+        file.try_lock().expect("hold independent file lock");
+        let error = acquire_terminfo_cache_lock(root.path(), Duration::from_millis(20))
+            .err()
+            .expect("independent file lock must prevent acquisition");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        file.unlock().expect("release independent file lock");
+        let held = acquire_terminfo_cache_lock(root.path(), Duration::from_secs(2))
+            .expect("acquire after release");
+        assert!(matches!(
+            file.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        file.try_lock().expect("guard drop releases file lock");
+    }
+
+    #[test]
     fn contended_cache_lock_falls_back_within_its_deadline() {
         let root = tempfile::tempdir().expect("create contended terminfo cache");
         let cache = root.path().join("cache");
@@ -1233,7 +1253,7 @@ mod tests {
     #[test]
     #[ignore = "helper process for process_stream_is_duplex_and_reports_eof_after_child_exit"]
     fn duplex_probe() {
-        let geometry = terminal_geometry(std::io::stdin().as_raw_fd()).expect("read PTY geometry");
+        let geometry = terminal_geometry(std::io::stdin().as_fd()).expect("read PTY geometry");
         println!("PTY_SIZE:{} {}", geometry.rows, geometry.cols);
         std::io::stdout().flush().expect("flush PTY size");
         let mut input = String::new();
@@ -1285,14 +1305,14 @@ mod tests {
     #[test]
     #[ignore = "helper process for resize_updates_the_child_terminal_dimensions"]
     fn resize_probe() {
-        let geometry = terminal_geometry(std::io::stdin().as_raw_fd()).expect("read PTY geometry");
+        let geometry = terminal_geometry(std::io::stdin().as_fd()).expect("read PTY geometry");
         println!("PTY_INITIAL_SIZE:{} {}", geometry.rows, geometry.cols);
         std::io::stdout().flush().expect("flush initial PTY size");
         let mut input = String::new();
         std::io::stdin()
             .read_line(&mut input)
             .expect("wait for resize");
-        let geometry = terminal_geometry(std::io::stdin().as_raw_fd()).expect("read resized PTY");
+        let geometry = terminal_geometry(std::io::stdin().as_fd()).expect("read resized PTY");
         println!("PTY_RESIZED_SIZE:{} {}", geometry.rows, geometry.cols);
     }
 
@@ -1353,8 +1373,8 @@ mod tests {
             signals.forever().next(),
             Some(signal_hook::consts::SIGWINCH)
         );
-        let geometry = terminal_geometry(std::io::stdin().as_raw_fd())
-            .expect("read resized terminal geometry");
+        let geometry =
+            terminal_geometry(std::io::stdin().as_fd()).expect("read resized terminal geometry");
         println!(
             "PTY_SIGNAL:{} {} {} {}",
             geometry.rows,
@@ -1551,10 +1571,11 @@ mod tests {
             .expect("open PTY");
         let fd = pair.master.as_raw_fd().expect("PTY raw fd");
 
+        // SAFETY: `pair.master` owns the descriptor throughout this test.
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
         set_raw(fd).expect("set PTY raw mode");
 
-        let attrs = termios::tcgetattr(unsafe { BorrowedFd::borrow_raw(fd) })
-            .expect("read raw terminal attributes");
+        let attrs = termios::tcgetattr(fd).expect("read raw terminal attributes");
         assert!(!attrs.local_flags.contains(LocalFlags::ECHO));
         assert!(!attrs.local_flags.contains(LocalFlags::ICANON));
         assert!(!attrs.local_flags.contains(LocalFlags::ISIG));

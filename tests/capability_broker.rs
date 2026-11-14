@@ -124,7 +124,7 @@ fn startup_probe_replies_are_fragment_safe_out_of_order_and_never_become_input()
     let replies = b"a\x1b[?2026;1$y\x1b[?0u\x1b[8;30;100t\x1b[6;20;10t\x1b[4;600;1000t\x1b[>41;301;0c\x1b[?1004;2$y\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?64;22cz";
     let mut user_input = Vec::new();
     for byte in replies {
-        user_input.extend(broker.ingest(&[*byte], 11));
+        user_input.extend_from_slice(&broker.ingest(&[*byte], 11));
     }
     assert_eq!(user_input, b"az");
     assert_eq!(broker.outstanding_primary_device_attributes_replies(), 0);
@@ -156,12 +156,26 @@ fn startup_da1_fence_relinquishes_the_input_stream_in_the_same_read() {
     let input = b"\x1b[?64;22c\x1bi\x1bP\x1b]\x1b[\x1bO\x1b_";
 
     assert_eq!(
-        broker.ingest(input, 1),
+        broker.ingest(input, 1).as_ref(),
         b"\x1bi\x1bP\x1b]\x1b[\x1bO\x1b_",
         "bytes following the ordered fence are ordinary input, even when they resemble reply introducers",
     );
     assert!(broker.is_finished());
     assert_eq!(broker.next_deadline_ms(), None);
+}
+
+#[test]
+fn fenced_probe_borrows_input_without_filtering_or_allocating() {
+    let profile = PhysicalTerminalProfile::conservative(geometry());
+    let mut broker = StartupProbeBroker::new(profile, ProbePolicy::safe(), 0);
+    broker.startup_queries();
+    assert!(broker.ingest(b"\x1b[?64;22c", 1).is_empty());
+    assert!(broker.is_finished());
+    let input = b"key\x1b[?2026;1$y";
+    let output = broker.ingest(input, 2);
+    assert!(matches!(output, std::borrow::Cow::Borrowed(_)));
+    assert_eq!(output.as_ref(), input);
+    assert_eq!(output.as_ptr(), input.as_ptr());
 }
 
 #[test]
@@ -365,7 +379,7 @@ fn startup_probe_bounds_malicious_replies_and_releases_unrelated_input_on_timeou
     assert!(broker.ingest(&malicious, 101).is_empty());
     assert!(broker.buffered_reply_bytes() <= 4_096);
     assert_eq!(broker.malformed_replies(), 1);
-    assert_eq!(broker.ingest(b"\x1b\\key", 102), b"key");
+    assert_eq!(broker.ingest(b"\x1b\\key", 102).as_ref(), b"key");
 
     assert!(broker.ingest(b"\x1b[?2026;", 103).is_empty());
     assert_eq!(broker.next_deadline_ms(), Some(154));
@@ -401,12 +415,12 @@ fn timed_out_probe_broker_still_owns_delayed_terminal_replies() {
     let delayed = b"c\x1b[>41;301;0c\x1b[?0u\x1b[8;24;80t\x1b[?64;22cz";
     let mut application_input = Vec::new();
     for byte in delayed {
-        application_input.extend(broker.ingest(&[*byte], 101));
+        application_input.extend_from_slice(&broker.ingest(&[*byte], 101));
     }
     assert_eq!(application_input, b"cz");
     assert!(broker.profile().kitty_keyboard);
 
-    assert_eq!(broker.ingest(b"\x1b", 102), b"\x1b");
+    assert_eq!(broker.ingest(b"\x1b", 102).as_ref(), b"\x1b");
     assert_eq!(broker.next_deadline_ms(), None);
     assert!(broker.finish_if_timed_out(153).is_empty());
 }
