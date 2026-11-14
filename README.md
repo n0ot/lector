@@ -20,7 +20,14 @@ the program you are running.
 
 ## Install
 
-Lector is built from source. You need:
+For portable Linux binaries, download the `lector-<target>` artifact from a
+successful [CI run](https://github.com/n0ot/lector/actions/workflows/ghostty-build.yml).
+Choose `x86_64-unknown-linux-musl` for x86-64 or
+`aarch64-unknown-linux-musl` for ARM64, extract the contained `.tar.gz`, and
+place `lector` on your `PATH`. These executables work on both glibc and musl
+distributions without installing Rust or a separate musl runtime.
+
+To build from source, you need:
 
 - [Rust](https://rustup.rs), installed with rustup
 - `curl` and `tar`
