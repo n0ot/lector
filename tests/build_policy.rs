@@ -153,13 +153,13 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(cargo_config.contains("scripts/rustc-static-linux"));
 
     let static_wrapper = include_str!("../scripts/rustc-static-linux");
-    assert!(static_wrapper.contains("*-linux-musl"));
+    assert!(static_wrapper.contains("aarch64-unknown-linux-musl"));
     assert!(static_wrapper.contains("target-feature=+crt-static"));
     assert!(static_wrapper.contains("relocation-model=pic"));
     assert!(static_wrapper.contains("zig-lld"));
     assert!(static_wrapper.contains("linker-flavor=ld.lld"));
     assert!(static_wrapper.contains("LECTOR_ZIG_CC_TARGET"));
-    assert!(static_wrapper.contains("is_test"));
+    assert!(static_wrapper.contains("LECTOR_STATIC"));
 
     let zig_lld = include_str!("../scripts/zig-lld");
     assert!(zig_lld.contains("ld.lld"));
@@ -214,8 +214,8 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(!ci.contains("setup-zig"));
     assert!(ci.contains("cargo ghostty-check"));
     assert!(!ci.contains("cargo ghostty-bootstrap"));
-    assert!(ci.contains("cargo check --locked --target"));
-    assert!(ci.contains("cargo build --locked --release --target"));
+    assert!(ci.contains("cargo check --locked"));
+    assert!(ci.contains("scripts/cargo-musl build --locked --release"));
     assert!(ci.contains("scripts/check-static-pie"));
     assert!(ci.contains("alpine:3.24"));
 }
@@ -254,12 +254,14 @@ fn zig_policy_pins_an_exact_release_and_has_an_actionable_error() {
 }
 
 #[test]
-fn target_policy_supports_macos_and_only_musl_linux() {
+fn target_policy_supports_native_platforms_and_optional_static_musl() {
     assert_eq!(
         ghostty::SUPPORTED_TARGETS,
         [
             "aarch64-apple-darwin",
             "x86_64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
             "aarch64-unknown-linux-musl",
             "x86_64-unknown-linux-musl",
             "aarch64-alpine-linux-musl",
@@ -268,13 +270,6 @@ fn target_policy_supports_macos_and_only_musl_linux() {
     );
     for target in ghostty::SUPPORTED_TARGETS {
         assert!(ghostty::validate_target(target).is_ok());
-    }
-    for target in ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"] {
-        assert!(
-            ghostty::validate_target(target)
-                .unwrap_err()
-                .contains("Linux builds require musl")
-        );
     }
     let error = ghostty::validate_target("riscv64gc-unknown-linux-musl").unwrap_err();
     assert!(error.contains("does not support target"));

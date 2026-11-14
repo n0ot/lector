@@ -1,5 +1,4 @@
 /target
-/.cargo/lector-local.toml
 /nvim.log
 .aider*
 __pycache__/

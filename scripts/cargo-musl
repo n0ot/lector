@@ -28,6 +28,15 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
     esac
 done
 export CARGO_BUILD_TARGET=$build_target
+export LECTOR_STATIC=1
+# Environment rustflags override the native dynamic-libc Cargo configuration.
+# Preserve caller flags and make the requested C runtime choice explicit last.
+if [[ -n "${CARGO_ENCODED_RUSTFLAGS+x}" ]]; then
+    export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${CARGO_ENCODED_RUSTFLAGS:+$'\x1f'}-C"$'\x1f'"target-feature=+crt-static"
+else
+    caller_flags=${RUSTFLAGS-${CARGO_BUILD_RUSTFLAGS:-}}
+    export RUSTFLAGS="${caller_flags:+$caller_flags }-C target-feature=+crt-static"
+fi
 case "$CARGO_BUILD_TARGET" in
     aarch64-unknown-linux-musl|x86_64-unknown-linux-musl)
         export LECTOR_ZIG_CC_TARGET=${CARGO_BUILD_TARGET/-unknown/}

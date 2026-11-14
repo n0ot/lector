@@ -47,7 +47,7 @@ def main():
     compiler = subprocess.check_output(
         ['docker', 'run', '--rm', '--pull', 'never', '--platform', platform,
          image, 'rustc', '-vV'], text=True)
-    identity = f'{image}\n{platform}\n{compiler}\nnextest-lib-and-tmux/default-features/debug\n'
+    identity = f'{image}\n{platform}\n{compiler}\nnative-dynamic/nextest-lib-and-tmux/default-features/debug\n'
     print(fingerprint(Path(__file__).resolve().parents[2], identity))
 
 

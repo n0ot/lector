@@ -45,10 +45,10 @@ version:
 cargo install cargo-nextest --version 0.9.143 --locked
 ```
 
-On Linux, run `scripts/setup` once after cloning. It installs the matching
-musl Rust target and writes ignored configuration for this checkout. All
-Cargo commands below then work as written, including maintenance aliases.
-macOS needs no target setup.
+Ordinary Cargo commands build for the native platform and dynamically link
+its C runtime. No target setup or environment exports are required. See the
+[build guide](docs/internals/building.md#optional-static-linux-builds) for
+explicitly requested static Linux builds.
 
 ## Testing
 
@@ -105,9 +105,11 @@ And the tests against a real tmux, which run only in Docker:
 scripts/test-real-tmux-docker
 ```
 
-The Docker runner builds Lector and its fixtures for musl and executes them
-on Ubuntu. Set `LECTOR_LINUX_FULL_SUITE=1` to also run the full workspace
-suite, Clippy, documentation tests, and Ghostty build checks inside Docker.
+The Docker runner builds native dynamically linked Lector and project
+fixtures on Ubuntu. Set `LECTOR_TEST_STATIC=1` to exercise the optional
+static musl path instead. Set `LECTOR_LINUX_FULL_SUITE=1` to also run the full
+workspace suite, Clippy, documentation tests, and Ghostty build checks inside
+Docker.
 
 The Docker run never uses your own tmux, its server, or its configuration.
 Your checkout is mounted read-only. The first run needs network access to

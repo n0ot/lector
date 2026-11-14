@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class MuslCargoTests(unittest.TestCase):
-    def run_helper(self, host, args=(), target=None):
+    def run_helper(self, host, args=(), target=None, flags=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             compiler = root / "rustc"
@@ -20,14 +20,19 @@ class MuslCargoTests(unittest.TestCase):
 import json, os, sys
 print(json.dumps({'args': sys.argv[1:], 'target': os.environ['CARGO_BUILD_TARGET'],
                   'zig': os.environ.get('LECTOR_ZIG_CC_TARGET'),
+                  'static': os.environ.get('LECTOR_STATIC'),
+                  'rustflags': os.environ.get('RUSTFLAGS'),
+                  'encoded': os.environ.get('CARGO_ENCODED_RUSTFLAGS'),
                   'cc': os.environ.get('CC_' + os.environ['CARGO_BUILD_TARGET'].replace('-', '_'))}))
 """)
             compiler.chmod(0o755)
             cargo.chmod(0o755)
             env = {key: value for key, value in os.environ.items()
-                   if key not in ('CARGO_BUILD_TARGET', 'LECTOR_ZIG_CC_TARGET')
+                   if key not in ('CARGO_BUILD_TARGET', 'LECTOR_ZIG_CC_TARGET',
+                                  'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'CARGO_BUILD_RUSTFLAGS')
                    and not key.startswith('CC_')}
             env.update(PATH=f"{root}:{env['PATH']}", FIXTURE_HOST=host)
+            env.update(flags or {})
             if target is not None:
                 env['CARGO_BUILD_TARGET'] = target
             return subprocess.run([str(ROOT / 'scripts/cargo-musl'), *args],
@@ -41,6 +46,8 @@ print(json.dumps({'args': sys.argv[1:], 'target': os.environ['CARGO_BUILD_TARGET
                 call = json.loads(result.stdout)
                 self.assertEqual(call['target'], f'{arch}-unknown-linux-musl')
                 self.assertEqual(call['zig'], f'{arch}-linux-musl')
+                self.assertEqual(call['static'], '1')
+                self.assertIn('target-feature=+crt-static', call['rustflags'])
                 self.assertEqual(call['cc'], str(ROOT / 'scripts/zig-cc'))
                 self.assertEqual(call['args'], ['build', '--locked'])
 
@@ -59,6 +66,17 @@ print(json.dumps({'args': sys.argv[1:], 'target': os.environ['CARGO_BUILD_TARGET
                                  ['run', '--', '--target', 'application-option'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['target'], 'x86_64-unknown-linux-musl')
+
+    def test_static_request_preserves_caller_compiler_flags(self):
+        for flags in ({'RUSTFLAGS': '-C debuginfo=1'},
+                      {'CARGO_BUILD_RUSTFLAGS': '-C debuginfo=1'},
+                      {'CARGO_ENCODED_RUSTFLAGS': '-C\x1fdebuginfo=1'}):
+            result = self.run_helper('x86_64-unknown-linux-gnu', ['build'], flags=flags)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            call = json.loads(result.stdout)
+            effective = call['encoded'] if call['encoded'] is not None else call['rustflags']
+            self.assertIn('debuginfo=1', effective)
+            self.assertTrue(effective.endswith('target-feature=+crt-static'))
 
     def test_native_packaged_musl_preserves_distribution_linker(self):
         result = self.run_helper('x86_64-alpine-linux-musl', ['build'])
@@ -84,20 +102,23 @@ class WorkspaceLinkerTests(unittest.TestCase):
             compiler.write_text('#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n')
             compiler.chmod(0o755)
             env = {key: value for key, value in os.environ.items()
-                   if key != 'LECTOR_ZIG_CC_TARGET'}
-            for target in ('aarch64-unknown-linux-musl', 'aarch64-unknown-linux-gnu'):
-                for kind in (['--test'], ['--crate-type', 'bin']):
-                    args = ['--crate-name', 'sample', '--target', target, *kind]
-                    result = subprocess.run([str(ROOT / 'scripts/rustc-static-linux'),
-                                             str(compiler), *args], env=env,
-                                            text=True, capture_output=True, check=True)
-                    forwarded = json.loads(result.stdout)
-                    self.assertEqual(forwarded[:len(args)], args)
-                    if target.endswith('musl'):
-                        self.assertIn('linker=' + str(ROOT / 'scripts/zig-lld'), forwarded)
-                        self.assertIn('target-feature=+crt-static', forwarded)
-                    else:
-                        self.assertEqual(forwarded, args)
+                   if key not in ('LECTOR_ZIG_CC_TARGET', 'LECTOR_STATIC')}
+            for static in ('0', '1'):
+                env['LECTOR_STATIC'] = static
+                for target in ('aarch64-unknown-linux-musl', 'aarch64-unknown-linux-gnu'):
+                    for kind in (['--test'], ['--crate-type', 'bin']):
+                        args = ['--crate-name', 'sample', '--target', target, *kind]
+                        result = subprocess.run([str(ROOT / 'scripts/rustc-static-linux'),
+                                                 str(compiler), *args], env=env,
+                                                text=True, capture_output=True, check=True)
+                        forwarded = json.loads(result.stdout)
+                        self.assertEqual(forwarded[:len(args)], args)
+                        if static == '1' and target.endswith('musl'):
+                            self.assertIn('linker=' + str(ROOT / 'scripts/zig-lld'), forwarded)
+                            self.assertIn('target-feature=+crt-static', forwarded)
+                        else:
+                            self.assertEqual(forwarded, args)
+
 
 
 if __name__ == '__main__':

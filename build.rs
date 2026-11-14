@@ -8,7 +8,10 @@ fn main() {
     let target = env::var("TARGET").expect("Cargo must set TARGET for build scripts");
     ghostty::validate_target(&target).unwrap_or_else(|error| panic!("{error}"));
     println!("cargo:rerun-if-changed=build_support/eh_frames.c");
-    if target.ends_with("-linux-musl") {
+    println!("cargo:rerun-if-env-changed=LECTOR_STATIC");
+    println!("cargo:rustc-check-cfg=cfg(lector_static_musl)");
+    if target.ends_with("-linux-musl") && env::var("LECTOR_STATIC").as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=lector_static_musl");
         println!("cargo:rerun-if-changed=scripts/zig-cc");
         cc::Build::new()
             .file("build_support/eh_frames.c")

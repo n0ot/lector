@@ -20,16 +20,9 @@ the program you are running.
 
 ## Install
 
-For portable Linux binaries, download the `lector-<target>` artifact from a
-successful [CI run](https://github.com/n0ot/lector/actions/workflows/ghostty-build.yml).
-Choose `x86_64-unknown-linux-musl` for x86-64 or
-`aarch64-unknown-linux-musl` for ARM64, extract the contained `.tar.gz`, and
-place `lector` on your `PATH`. These executables work on both glibc and musl
-distributions without installing Rust or a separate musl runtime.
-
 To build from source, you need:
 
-- [Rust](https://rustup.rs), installed with rustup
+- [Rust](https://rustup.rs), using rustup or Alpine's `rust` and `cargo` packages
 - `curl` and `tar`
 - On Linux, a C compiler (`build-essential` on Debian and Ubuntu,
   `build-base` on Alpine)
@@ -40,22 +33,19 @@ Then clone the repository and install:
 ```bash
 git clone https://github.com/n0ot/lector.git
 cd lector
-scripts/setup
 cargo install --locked --path . --bin lector
 ```
-
-`scripts/setup` is a one-time Linux setup step; it is harmless on macOS.
-After setup, use ordinary Cargo commands for builds, tests, and installation.
 
 This puts `lector` in `~/.cargo/bin`, which rustup adds to your `PATH`. The
 first build downloads Lector's terminal engine and takes a few minutes.
 
 To update later, run `git pull` and the same install command again.
 
-Lector runs on macOS and Linux. Linux builds statically link musl so the
-executable can run on both musl and glibc distributions of the same CPU
-architecture. The [build guide](docs/internals/building.md)
-covers supported platforms, offline builds, and build problems.
+Lector runs on macOS and Linux, including glibc distributions and Alpine.
+Ordinary Cargo commands use the host platform and dynamically link its C
+runtime. No setup script or custom environment is required. The
+[build guide](docs/internals/building.md) covers optional static Linux builds,
+supported platforms, offline builds, and build problems.
 
 ## Run
 

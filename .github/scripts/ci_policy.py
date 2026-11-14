@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-BUILD_JOBS = ("macos", "linux-musl", "alpine-static")
+BUILD_JOBS = ("macos", "linux-native", "linux-static", "alpine-native")
 
 
 def requires_build(paths):

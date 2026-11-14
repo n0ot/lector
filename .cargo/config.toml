@@ -1,5 +1,3 @@
-include = [{ path = "lector-local.toml", optional = true }]
-
 [alias]
 ghostty-bootstrap = "run --locked --package lector-xtask -- ghostty-bootstrap"
 ghostty-check = "run --locked --package lector-xtask -- ghostty-check"
@@ -8,6 +6,7 @@ ghostty-bench = "run --locked --package lector-xtask -- ghostty-bench"
 [build]
 rustc-workspace-wrapper = "scripts/rustc-static-linux"
 
-[env]
-CC_aarch64_unknown_linux_musl = { value = "scripts/zig-cc", relative = true }
-CC_x86_64_unknown_linux_musl = { value = "scripts/zig-cc", relative = true }
+# Rust's musl targets otherwise default to a static C runtime. Native builds
+# use the platform libc dynamically; the optional static helper overrides this.
+[target.'cfg(all(target_os = "linux", target_env = "musl"))']
+rustflags = ["-C", "target-feature=-crt-static"]
