@@ -46,7 +46,7 @@ impl Options {
     }
 
     pub(super) fn toggle_help_mode(&mut self) -> bool {
-        self.help_mode = !self.help_mode;
+        self.help_mode.toggle();
         self.help_mode
     }
 
@@ -59,7 +59,7 @@ impl Options {
     }
 
     pub(super) fn toggle_auto_read(&mut self) -> bool {
-        self.auto_read = !self.auto_read;
+        self.auto_read.toggle();
         self.auto_read
     }
 
@@ -88,7 +88,7 @@ impl Options {
     }
 
     pub(super) fn toggle_review_follows_screen_cursor(&mut self) -> bool {
-        self.review_follows_screen_cursor = !self.review_follows_screen_cursor;
+        self.review_follows_screen_cursor.toggle();
         self.review_follows_screen_cursor
     }
 
@@ -105,7 +105,7 @@ impl Options {
     }
 
     pub(super) fn toggle_table_header_auto(&mut self) -> bool {
-        self.table_header_auto = !self.table_header_auto;
+        self.table_header_auto.toggle();
         self.table_header_auto
     }
 
@@ -118,7 +118,7 @@ impl Options {
     }
 
     pub(super) fn toggle_stop_speech_on_focus_loss(&mut self) -> bool {
-        self.stop_speech_on_focus_loss = !self.stop_speech_on_focus_loss;
+        self.stop_speech_on_focus_loss.toggle();
         self.stop_speech_on_focus_loss
     }
 

@@ -217,7 +217,9 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(ci.contains("cargo check --locked"));
     assert!(ci.contains("scripts/cargo-musl build --locked --release"));
     assert!(ci.contains("scripts/check-static-pie"));
-    assert!(ci.contains("alpine:3.24"));
+    assert!(ci.contains("tests/docker/alpine.Dockerfile"));
+    let alpine = include_str!("docker/alpine.Dockerfile");
+    assert!(alpine.contains("FROM alpine:3.24"));
 }
 
 #[test]

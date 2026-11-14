@@ -2991,7 +2991,7 @@ impl App {
 fn join_tmux_command_sequence(commands: &[Vec<u8>]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for (index, command) in commands.iter().enumerate() {
-        let command = command.strip_suffix(b"\n").unwrap_or(command);
+        let command = command.trim_suffix(b"\n");
         debug_assert!(!command.contains(&b'\n'));
         if index != 0 {
             bytes.extend_from_slice(b" ; ");

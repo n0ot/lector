@@ -142,7 +142,7 @@ pub fn scope_select_window_command(topology: &TmuxTopology, command: &str) -> Se
         return SelectWindowScope::NotApplicable;
     }
     let target = raw_target.trim_matches(|character| matches!(character, '\'' | '"'));
-    let Ok(index) = target.strip_prefix(":=").unwrap_or(target).parse() else {
+    let Ok(index) = target.trim_prefix(":=").parse() else {
         return SelectWindowScope::NotApplicable;
     };
     let Some(session) = topology

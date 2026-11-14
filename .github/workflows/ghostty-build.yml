@@ -388,8 +388,8 @@ jobs:
           path: |
             target/ghostty-prebuilt
             target/toolchains
-          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-alpine-3.24-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
-      - name: Prepare Alpine's packaged compiler
+          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-alpine-3.24-rustup-musl-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
+      - name: Prepare Alpine with the repository Rust toolchain
         if: needs.changes.outputs.build == 'true'
         id: alpine
         run: |
@@ -397,23 +397,22 @@ jobs:
           export CARGO_HOME="$RUNNER_TEMP/alpine-cargo"
           echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
           mkdir -p "$CARGO_HOME"
+          docker build --file tests/docker/alpine.Dockerfile --tag lector-alpine:ci .
           docker run --detach --name lector-alpine --dns 1.1.1.1 \
             --volume "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             --volume "$CARGO_HOME:$CARGO_HOME" --workdir "$GITHUB_WORKSPACE" \
             --env CARGO_HOME --env CARGO_TARGET_DIR --env CARGO_INCREMENTAL \
-            alpine:3.24 sleep infinity
-          docker exec lector-alpine apk add --no-cache \
-            bash binutils build-base ca-certificates cargo curl file git pkgconf rust tar xz
+            lector-alpine:ci sleep infinity
           echo "uid=$(id -u):$(id -g)" >> "$GITHUB_OUTPUT"
           docker exec --user "$(id -u):$(id -g)" lector-alpine \
-            scripts/check-rust-toolchain --packaged --host x86_64-alpine-linux-musl
+            scripts/check-rust-toolchain --host x86_64-unknown-linux-musl --target x86_64-unknown-linux-musl
           docker exec lector-alpine rustc -vV > "$RUNNER_TEMP/alpine-rustc.txt"
-      - name: Identify packaged Cargo cache inputs
+      - name: Identify Alpine Cargo cache inputs
         if: needs.changes.outputs.build == 'true'
         id: cargo-cache-key
         run: >-
-          python3 .github/scripts/cargo_cache_key.py --target x86_64-alpine-linux-musl
-          --lane alpine-packaged-release-default --compiler-metadata "$RUNNER_TEMP/alpine-rustc.txt"
+          python3 .github/scripts/cargo_cache_key.py --target x86_64-unknown-linux-musl
+          --lane alpine-rustup-release-default --compiler-metadata "$RUNNER_TEMP/alpine-rustc.txt"
       - name: Cache Cargo dependencies
         if: needs.changes.outputs.build == 'true'
         # Swatinem/rust-cache v2.9.3: prunes workspace binaries and incremental artifacts.
@@ -426,10 +425,10 @@ jobs:
           cmd-format: docker exec --user ${{ steps.alpine.outputs.uid }} lector-alpine {0}
           cache-bin: false
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST LECTOR GHOSTTY
-      - name: Build and inspect with Alpine's packaged Rust
+      - name: Build and inspect with pinned Rust on Alpine
         if: needs.changes.outputs.build == 'true'
         run: |
-          docker exec --user "$(id -u):$(id -g)" lector-alpine sh -lc '
+          docker exec --user "$(id -u):$(id -g)" lector-alpine sh -ec '
             set -eu
             cargo build --locked --release --bin lector
             scripts/check-dynamic-libc "$CARGO_TARGET_DIR/release/lector"

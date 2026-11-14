@@ -30,8 +30,9 @@ build once:
 cargo build --locked
 ```
 
-With rustup, `rust-toolchain.toml` selects the exact Rust version the project
-is tested with. `scripts/check-rust-toolchain` confirms which compiler is
+`rust-toolchain.toml` selects the exact Rust version through rustup on every
+platform, including Alpine. The workspace manifests also declare Rust 1.100
+as the minimum supported version. `scripts/check-rust-toolchain` confirms which compiler is
 actually being used.
 
 The pinned components include `llvm-tools`, which supplies the LLVM shared
@@ -221,5 +222,5 @@ The workflow dispatches CI explicitly because GitHub does not start workflows
 from pushes made with a workflow token. See
 [GitHub's documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow).
 
-Alpine is a separate compatibility lane in CI. It uses Alpine's own packaged
-Rust, not the pinned version, and logs which compiler it used.
+Alpine is a separate native-musl compatibility lane in CI. Like every other
+lane, it installs Rust through rustup and enforces the repository pin.

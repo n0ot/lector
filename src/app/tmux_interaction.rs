@@ -518,7 +518,7 @@ impl App {
         let Some(target) = target else {
             return TmuxSessionChange::Unsafe;
         };
-        let target = target.strip_prefix('=').unwrap_or(target);
+        let target = target.trim_prefix('=');
         if let Some(id) = target
             .strip_prefix('$')
             .and_then(|id| id.parse::<u64>().ok())
