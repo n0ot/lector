@@ -143,7 +143,7 @@ pub struct ProcDriver {
     poll: Poll,
     events: Events,
     request_buf: Vec<u8>,
-    response_buf: Vec<u8>,
+    response_buf: ResponseFrames,
     next_id: u64,
     rate: f32,
     timeouts: RpcTimeouts,
@@ -154,6 +154,57 @@ pub struct ProcDriver {
     next_compatibility_id: u64,
     last_compatibility_id: Option<UtteranceId>,
     unavailable: bool,
+}
+
+/// Newline-delimited response frames shared by synchronous calls and idle
+/// notification reads. Limits include the newline and apply per frame, not
+/// per pipe read. At most one read chunk beyond an incomplete frame is retained.
+#[derive(Default)]
+struct ResponseFrames {
+    pending: Vec<u8>,
+    scanned: usize,
+}
+
+impl ResponseFrames {
+    fn next_frame(&mut self) -> Result<Option<Vec<u8>>> {
+        if let Some(offset) = self.pending[self.scanned..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+        {
+            let end = self.scanned + offset + 1;
+            if end > MAX_RPC_FRAME_BYTES {
+                return Err(Error::ResponseFrameTooLarge {
+                    limit: MAX_RPC_FRAME_BYTES,
+                });
+            }
+            self.scanned = 0;
+            return Ok(Some(self.pending.drain(..end).collect()));
+        }
+        if self.pending.len() >= MAX_RPC_FRAME_BYTES {
+            return Err(Error::ResponseFrameTooLarge {
+                limit: MAX_RPC_FRAME_BYTES,
+            });
+        }
+        self.scanned = self.pending.len();
+        Ok(None)
+    }
+
+    /// Returns false when the nonblocking pipe has no more readable bytes.
+    /// EOF, including a truncated final frame, remains a transport failure.
+    fn read_from(&mut self, reader: &mut impl Read, operation: &'static str) -> Result<bool> {
+        let mut chunk = [0u8; 8192];
+        match reader.read(&mut chunk) {
+            Ok(0) => Err(Error::Closed),
+            Ok(read) => {
+                self.pending.extend_from_slice(&chunk[..read]);
+                Ok(true)
+            }
+            // Yield to the caller so synchronous reads recheck their deadline.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => Err(io_error(operation)(error)),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -325,7 +376,7 @@ impl ProcDriver {
             poll,
             events: Events::with_capacity(4),
             request_buf: Vec::with_capacity(256),
-            response_buf: Vec::with_capacity(256),
+            response_buf: ResponseFrames::default(),
             next_id: 1,
             rate: NORMAL_RATE,
             timeouts,
@@ -606,50 +657,14 @@ impl ProcDriver {
     ) -> Result<Vec<u8>> {
         loop {
             check_deadline(deadline, method, timeout)?;
-            if let Some(newline) = self.response_buf.iter().position(|byte| *byte == b'\n') {
-                if newline.saturating_add(1) > MAX_RPC_FRAME_BYTES {
-                    return Err(Error::ResponseFrameTooLarge {
-                        limit: MAX_RPC_FRAME_BYTES,
-                    });
-                }
-                let remaining = self.response_buf.split_off(newline + 1);
-                let frame = std::mem::replace(&mut self.response_buf, remaining);
+            if let Some(frame) = self.response_buf.next_frame()? {
                 return Ok(frame);
             }
-            if self.response_buf.len() >= MAX_RPC_FRAME_BYTES {
-                return Err(Error::ResponseFrameTooLarge {
-                    limit: MAX_RPC_FRAME_BYTES,
-                });
-            }
-
-            let mut chunk = [0u8; 8192];
-            match self.stdout.read(&mut chunk) {
-                Ok(0) => return Err(Error::Closed),
-                Ok(read) => {
-                    if let Some(newline) = chunk[..read].iter().position(|byte| *byte == b'\n') {
-                        if self
-                            .response_buf
-                            .len()
-                            .saturating_add(newline)
-                            .saturating_add(1)
-                            > MAX_RPC_FRAME_BYTES
-                        {
-                            return Err(Error::ResponseFrameTooLarge {
-                                limit: MAX_RPC_FRAME_BYTES,
-                            });
-                        }
-                    } else if self.response_buf.len().saturating_add(read) > MAX_RPC_FRAME_BYTES {
-                        return Err(Error::ResponseFrameTooLarge {
-                            limit: MAX_RPC_FRAME_BYTES,
-                        });
-                    }
-                    self.response_buf.extend_from_slice(&chunk[..read]);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.wait_for(STDOUT_TOKEN, deadline, method, timeout)?;
-                }
-                Err(error) => return Err(io_error("read RPC response")(error)),
+            if !self
+                .response_buf
+                .read_from(&mut self.stdout, "read RPC response")?
+            {
+                self.wait_for(STDOUT_TOKEN, deadline, method, timeout)?;
             }
         }
     }
@@ -731,14 +746,7 @@ impl ProcDriver {
 
     fn read_available_notifications(&mut self) -> Result<()> {
         loop {
-            while let Some(newline) = self.response_buf.iter().position(|byte| *byte == b'\n') {
-                if newline.saturating_add(1) > MAX_RPC_FRAME_BYTES {
-                    return Err(Error::ResponseFrameTooLarge {
-                        limit: MAX_RPC_FRAME_BYTES,
-                    });
-                }
-                let remaining = self.response_buf.split_off(newline + 1);
-                let frame = std::mem::replace(&mut self.response_buf, remaining);
+            while let Some(frame) = self.response_buf.next_frame()? {
                 let message: Value = serde_json::from_slice(&frame).map_err(Error::Parse)?;
                 if message.get("method").is_none() {
                     return Err(Error::InvalidResponse(
@@ -747,26 +755,11 @@ impl ProcDriver {
                 }
                 self.handle_notification(message)?;
             }
-            if self.response_buf.len() >= MAX_RPC_FRAME_BYTES {
-                return Err(Error::ResponseFrameTooLarge {
-                    limit: MAX_RPC_FRAME_BYTES,
-                });
-            }
-
-            let mut chunk = [0u8; 8192];
-            match self.stdout.read(&mut chunk) {
-                Ok(0) => return Err(Error::Closed),
-                Ok(read) => {
-                    if self.response_buf.len().saturating_add(read) > MAX_RPC_FRAME_BYTES {
-                        return Err(Error::ResponseFrameTooLarge {
-                            limit: MAX_RPC_FRAME_BYTES,
-                        });
-                    }
-                    self.response_buf.extend_from_slice(&chunk[..read]);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) => return Err(io_error("read RPC notification")(error)),
+            if !self
+                .response_buf
+                .read_from(&mut self.stdout, "read RPC notification")?
+            {
+                return Ok(());
             }
         }
     }
@@ -1156,7 +1149,9 @@ fn legacy_capabilities() -> SpeechCapabilities {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, EventInbox, TerminationHandle, parse_response};
+    use super::{
+        Error, EventInbox, MAX_RPC_FRAME_BYTES, ResponseFrames, TerminationHandle, parse_response,
+    };
     use serde_json::json;
     use std::{
         process::Command,
@@ -1164,6 +1159,119 @@ mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    fn decode_chunks(wire: &[u8], chunk_size: usize) -> super::Result<Vec<Vec<u8>>> {
+        let mut frames = ResponseFrames::default();
+        let mut decoded = Vec::new();
+        for mut chunk in wire.chunks(chunk_size) {
+            while !chunk.is_empty() {
+                assert!(frames.read_from(&mut chunk, "simulated read")?);
+                while let Some(frame) = frames.next_frame()? {
+                    decoded.push(frame);
+                }
+            }
+        }
+        Ok(decoded)
+    }
+
+    #[test]
+    fn response_framing_is_independent_of_read_boundaries() {
+        let wire = b"{}\n{\"value\":1}\n\ntrailing";
+        for size in 1..=wire.len() {
+            assert_eq!(
+                decode_chunks(wire, size).unwrap(),
+                [
+                    b"{}\n".to_vec(),
+                    b"{\"value\":1}\n".to_vec(),
+                    b"\n".to_vec()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn response_limits_include_newline_and_apply_to_each_frame() {
+        let mut wire = vec![b'x'; MAX_RPC_FRAME_BYTES - 1];
+        wire.extend_from_slice(b"\n{}\n");
+        for size in [8191, 8192, wire.len()] {
+            let decoded = decode_chunks(&wire, size).unwrap();
+            assert_eq!(decoded.len(), 2);
+            assert_eq!(decoded[0].len(), MAX_RPC_FRAME_BYTES);
+            assert_eq!(decoded[1], b"{}\n");
+        }
+        for suffix in [b"".as_slice(), b"\n"] {
+            let mut oversized = vec![b'x'; MAX_RPC_FRAME_BYTES];
+            oversized.extend_from_slice(suffix);
+            for size in [8191, oversized.len()] {
+                assert!(matches!(
+                    decode_chunks(&oversized, size),
+                    Err(Error::ResponseFrameTooLarge { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn complete_frames_precede_later_oversize_or_eof() {
+        let mut frames = ResponseFrames::default();
+        let mut input = b"{}\npartial".as_slice();
+        frames.read_from(&mut input, "simulated read").unwrap();
+        assert_eq!(frames.next_frame().unwrap().unwrap(), b"{}\n");
+        assert!(frames.next_frame().unwrap().is_none());
+        assert!(matches!(
+            frames.read_from(&mut input, "simulated read"),
+            Err(Error::Closed)
+        ));
+
+        let mut input = vec![b'x'; MAX_RPC_FRAME_BYTES];
+        input.splice(..0, b"{}\n".iter().copied());
+        let mut input = input.as_slice();
+        let mut frames = ResponseFrames::default();
+        frames.read_from(&mut input, "simulated read").unwrap();
+        assert_eq!(frames.next_frame().unwrap().unwrap(), b"{}\n");
+        while !input.is_empty() {
+            assert!(frames.next_frame().unwrap().is_none());
+            frames.read_from(&mut input, "simulated read").unwrap();
+        }
+        assert!(matches!(
+            frames.next_frame(),
+            Err(Error::ResponseFrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn response_reads_preserve_nonblocking_and_error_semantics() {
+        struct Failure(std::io::ErrorKind);
+        impl std::io::Read for Failure {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+        }
+        let mut frames = ResponseFrames::default();
+        assert!(
+            !frames
+                .read_from(
+                    &mut Failure(std::io::ErrorKind::WouldBlock),
+                    "simulated read"
+                )
+                .unwrap()
+        );
+        assert!(
+            frames
+                .read_from(
+                    &mut Failure(std::io::ErrorKind::Interrupted),
+                    "simulated read"
+                )
+                .unwrap()
+        );
+        assert!(
+            matches!(frames.read_from(&mut Failure(std::io::ErrorKind::BrokenPipe), "simulated read"), Err(Error::Io { operation: "simulated read", source }) if source.kind() == std::io::ErrorKind::BrokenPipe)
+        );
+        assert!(matches!(
+            frames.read_from(&mut b"".as_slice(), "simulated read"),
+            Err(Error::Closed)
+        ));
+    }
 
     #[test]
     fn decoded_events_precede_a_later_transport_error() {

@@ -1770,7 +1770,7 @@ fn main() -> Result<()> {
     let load_config = !cli.no_config;
     let logging_enabled = cli.log || cli.log_file.is_some();
     let terminal_geometry =
-        pty::terminal_geometry(std::io::stdin().as_raw_fd()).context("cannot get terminal size")?;
+        pty::terminal_geometry(std::io::stdin().as_fd()).context("cannot get terminal size")?;
 
     // Keep PTY creation ahead of the speech host and anything else that may
     // start threads. Unix PTY launchers still require a small post-fork setup
@@ -1983,7 +1983,7 @@ fn do_events(
         NonblockingFdGuard::enable(pty_stream.as_raw_fd()).context("make child PTY nonblocking")?;
     // Set stdin to raw, so that input is read character by character,
     // and so that signals like SIGINT aren't sent when pressing keys like ^C.
-    pty::set_raw(std::io::stdin().as_raw_fd()).context("set STDIN to raw")?;
+    pty::set_raw(std::io::stdin().as_fd()).context("set STDIN to raw")?;
     emergency_terminal.arm();
 
     // Set up a mio poll, to select between reading from stdin, and the PTY.
@@ -2249,7 +2249,7 @@ fn do_events(
                             match terminal_signal_action(signal) {
                                 Some(TerminalSignalAction::Resize) => {
                                     let geometry =
-                                        pty::terminal_geometry(std::io::stdin().as_raw_fd())?;
+                                        pty::terminal_geometry(std::io::stdin().as_fd())?;
                                     process.resize_with_geometry(geometry)?;
                                     app.on_resize_with_geometry(geometry, &mut stdout)?;
                                 }
@@ -2271,14 +2271,14 @@ fn do_events(
                                     // Reclaim immediately so no input or output is processed
                                     // while the terminal remains in its restored state. The
                                     // queued SIGCONT action below is deliberately idempotent.
-                                    pty::set_raw(std::io::stdin().as_raw_fd())
+                                    pty::set_raw(std::io::stdin().as_fd())
                                         .context("set STDIN to raw after resume")?;
                                     nonblocking_input.enable_again()?;
                                     nonblocking_output.enable_again()?;
                                     app.resume_physical_terminal(&mut stdout)?;
                                 }
                                 Some(TerminalSignalAction::Resume) => {
-                                    pty::set_raw(std::io::stdin().as_raw_fd())
+                                    pty::set_raw(std::io::stdin().as_fd())
                                         .context("set STDIN to raw after SIGCONT")?;
                                     nonblocking_input.enable_again()?;
                                     nonblocking_output.enable_again()?;

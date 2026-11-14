@@ -3,7 +3,7 @@
 use regex::Regex;
 use std::{
     process::{Command, Stdio},
-    sync::{OnceLock, mpsc},
+    sync::{LazyLock, mpsc},
     thread,
 };
 
@@ -11,8 +11,10 @@ use std::{
 /// whitespace and hard newlines terminate a URL. Terminal soft wraps are
 /// removed by ReviewDocument before this function is called.
 pub(crate) fn plain_url_at(text: &str, offset: usize) -> Option<&str> {
-    static URL: OnceLock<Regex> = OnceLock::new();
-    let pattern = URL.get_or_init(|| Regex::new(r#"(?i-u:https?)://[^\s<>"'`]+"#).unwrap());
+    static URL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?i-u:https?)://[^\s<>"'`]+"#).expect("URL pattern must be valid")
+    });
+    let pattern = &*URL;
     for found in pattern.find_iter(text) {
         if text[..found.start()]
             .chars()

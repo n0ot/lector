@@ -14,7 +14,7 @@ impl App {
         let input = if let Some(broker) = self.startup_probe_broker.as_mut() {
             broker.ingest(input, self.clock.now_ms())
         } else {
-            input.to_vec()
+            std::borrow::Cow::Borrowed(input)
         };
         self.refresh_probed_profile(term_out)?;
         self.handle_filtered_terminal_input(sr, &input, pty_out, term_out)?;

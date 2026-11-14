@@ -9,7 +9,7 @@ use crate::{
     host_command::run_bounded_output,
     terminal::{TerminalEvent, TerminalGeometry},
 };
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 const PROBE_INACTIVITY_TIMEOUT_MS: u128 = 50;
 const MAX_PROBE_REPLY_BYTES: usize = 4_096;
@@ -485,7 +485,7 @@ impl StartupProbeBroker {
         queries
     }
 
-    pub fn ingest(&mut self, input: &[u8], now_ms: u128) -> Vec<u8> {
+    pub fn ingest<'a>(&mut self, input: &'a [u8], now_ms: u128) -> Cow<'a, [u8]> {
         // Readable input wins a race with the fallback deadline. A large
         // initial render can make an immediate terminal reply reach this
         // method after the inactivity deadline has elapsed even though it was
@@ -495,7 +495,7 @@ impl StartupProbeBroker {
             self.last_activity_at_ms = now_ms;
         }
         if self.state == StartupProbeState::Fenced {
-            return input.to_vec();
+            return Cow::Borrowed(input);
         }
 
         let mut output = Vec::new();
@@ -547,7 +547,7 @@ impl StartupProbeBroker {
                 }
             }
         }
-        output
+        Cow::Owned(output)
     }
 
     pub fn finish_if_timed_out(&mut self, now_ms: u128) -> Vec<u8> {

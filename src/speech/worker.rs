@@ -107,15 +107,18 @@ impl Mailbox {
 
     fn discard_speech(state: &mut MailboxState) -> usize {
         let mut discarded = 0usize;
-        let mut index = 0;
-        while index < state.requests.len() {
-            if state.requests[index].is_speech() {
-                let _ = Self::remove_request(state, index);
-                discarded = discarded.saturating_add(1);
+        let mut discarded_bytes = 0usize;
+        state.requests.retain(|request| {
+            if request.is_speech() {
+                discarded += 1;
+                discarded_bytes += request.speech_bytes();
+                false
             } else {
-                index += 1;
+                true
             }
-        }
+        });
+        state.speech_items = state.speech_items.saturating_sub(discarded);
+        state.speech_bytes = state.speech_bytes.saturating_sub(discarded_bytes);
         discarded
     }
 
@@ -776,6 +779,52 @@ mod tests {
         fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn discarding_interleaved_speech_preserves_controls_and_exact_accounting() {
+        let mailbox = Mailbox::new();
+        mailbox
+            .enqueue_speech(&UtteranceId::new("one"), "first", false)
+            .unwrap();
+        mailbox.enqueue_pause().unwrap();
+        mailbox
+            .enqueue_speech(&UtteranceId::new("two"), "second", false)
+            .unwrap();
+        mailbox.enqueue_resume().unwrap();
+        mailbox
+            .enqueue_speech(&UtteranceId::new("three"), "third", false)
+            .unwrap();
+        let mut state = mailbox.lock().unwrap();
+        assert_eq!(state.speech_items, 3);
+        assert_eq!(
+            state.speech_bytes,
+            state
+                .requests
+                .iter()
+                .map(Request::speech_bytes)
+                .sum::<usize>()
+        );
+        assert_eq!(Mailbox::discard_speech(&mut state), 3);
+        assert_eq!((state.speech_items, state.speech_bytes), (0, 0));
+        assert!(matches!(state.requests.front(), Some(Request::Pause)));
+        assert!(matches!(state.requests.back(), Some(Request::Resume)));
+        assert_eq!(state.requests.len(), 2);
+        assert_eq!(Mailbox::discard_speech(&mut state), 0);
+        drop(state);
+        mailbox
+            .enqueue_speech(&UtteranceId::new("new"), "replacement", false)
+            .unwrap();
+        let state = mailbox.lock().unwrap();
+        assert_eq!(state.speech_items, 1);
+        assert_eq!(
+            state.speech_bytes,
+            state
+                .requests
+                .iter()
+                .map(Request::speech_bytes)
+                .sum::<usize>()
+        );
     }
 
     #[test]
