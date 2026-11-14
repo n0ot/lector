@@ -23,7 +23,8 @@ static size_t entry_size(const unsigned char *entry, int *is_cie)
     memcpy(&length, entry, sizeof length);
     if (!length) return 0;
     if (length == UINT32_MAX) {
-        uint64_t extended_length, id;
+        uint64_t extended_length;
+        uint32_t id;
         memcpy(&extended_length, entry + 4, sizeof extended_length);
         if (extended_length < sizeof id || extended_length > SIZE_MAX - 12)
             abort();

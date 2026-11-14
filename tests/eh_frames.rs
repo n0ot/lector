@@ -49,10 +49,13 @@ fn single_frame_registration_does_not_read_past_the_frame() {
 #[test]
 fn extended_lengths_and_unaligned_tables_preserve_original_frame_addresses() {
     let mut table = vec![0];
-    for id in [0_u64, 24] {
+    for id in [0_u32, 24] {
         table.extend(u32::MAX.to_le_bytes());
         table.extend(8_u64.to_le_bytes());
         table.extend(id.to_le_bytes());
+        // .eh_frame retains a 32-bit ID after the extended length. A CIE's
+        // following nonzero version byte must not be read as part of its ID.
+        table.extend([1, 0, 0, 0]);
     }
     table.extend(0_u32.to_le_bytes());
     assert_eq!(visited(&table[1..]), [20]);
