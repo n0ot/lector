@@ -350,9 +350,10 @@ impl Drop for EmergencyTerminalGuard {
         // the normal shutdown reactor is fully constructed. Never let a
         // stopped or backpressured terminal turn the fallback itself into an
         // unbounded cleanup phase.
-        let _nonblocking_output = NonblockingFdGuard::enable(stdout.as_fd()).ok();
-        let _ = stdout.write(&emergency_terminal_cleanup_bytes(self.focus_was_enabled));
-        let _ = stdout.flush();
+        if let Ok(_nonblocking_output) = NonblockingFdGuard::enable(stdout.as_fd()) {
+            let _ = stdout.write(&emergency_terminal_cleanup_bytes(self.focus_was_enabled));
+            let _ = stdout.flush();
+        }
         let _ = termios::tcsetattr(
             std::io::stdin().as_fd(),
             termios::SetArg::TCSADRAIN,
