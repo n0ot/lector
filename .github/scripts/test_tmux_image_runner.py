@@ -31,7 +31,7 @@ if sys.argv[1:3] == ['image', 'inspect']:
             docker.chmod(0o755)
             calls = root / "calls"
             env = {key: value for key, value in os.environ.items()
-                   if not key.startswith('LECTOR_REAL_TMUX_')}
+                   if not key.startswith('LECTOR_REAL_TMUX_') and key not in ('LECTOR_LINUX_FULL_SUITE', 'LECTOR_TEST_STATIC')}
             env.update(PATH=f"{root}:{env['PATH']}", DOCKER_CALLS=str(calls), **settings)
             result = subprocess.run([str(ROOT / 'scripts/test-real-tmux-docker')],
                                     env=env, text=True, capture_output=True)
@@ -83,7 +83,7 @@ if sys.argv[1:3] == ['image', 'inspect']:
                 self.assertNotIn('lector-real-tmux-target:/work/target', call)
             commands = [call[call.index(IMAGE) + 1:] for call in runs]
             self.assertIn(['bash', 'scripts/bootstrap_zig.sh'], commands)
-            self.assertIn(['bash', 'scripts/bootstrap_ghostty.sh', '--optimize', 'ReleaseFast'], commands)
+            self.assertIn(['cargo', 'ghostty-bootstrap', '--optimize', 'ReleaseFast'], commands)
             self.assertEqual(sum(command[:3] == ['cargo', 'nextest', 'list'] for command in commands), 2)
             self.assertFalse(any(command[:3] == ['cargo', 'nextest', 'run'] for command in commands))
             failed, failed_calls = self.run_runner(
@@ -100,6 +100,14 @@ if sys.argv[1:3] == ['image', 'inspect']:
                                                LECTOR_REAL_TMUX_PLATFORM=platform)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(calls, [])
+
+    def test_static_compatibility_requires_explicit_selection(self):
+        result, calls = self.run_runner(LECTOR_TEST_STATIC='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        commands = [call[call.index('lector-real-tmux:ubuntu-24.04') + 1:]
+                    for call in calls if call[0] == 'run']
+        self.assertEqual(sum(command[:3] == ['scripts/cargo-musl', 'nextest', 'run']
+                             for command in commands), 2)
 
     def test_wrong_platform_or_missing_local_image_never_runs_or_builds(self):
         for extra in [{'IMAGE_PLATFORM': 'linux/arm64'}, {'MISSING_IMAGE': '1'}]:

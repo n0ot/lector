@@ -20,9 +20,9 @@ the program you are running.
 
 ## Install
 
-Lector is built from source. You need:
+To build from source, you need:
 
-- [Rust](https://rustup.rs), installed with rustup
+- [Rust](https://rustup.rs), using rustup or Alpine's `rust` and `cargo` packages
 - `curl` and `tar`
 - On Linux, a C compiler (`build-essential` on Debian and Ubuntu,
   `build-base` on Alpine)
@@ -39,10 +39,13 @@ cargo install --locked --path . --bin lector
 This puts `lector` in `~/.cargo/bin`, which rustup adds to your `PATH`. The
 first build downloads Lector's terminal engine and takes a few minutes.
 
-To update later, run `git pull` and the same `cargo install` command again.
+To update later, run `git pull` and the same install command again.
 
-Lector runs on macOS and Linux. The [build guide](docs/internals/building.md)
-covers supported platforms, offline builds, and build problems.
+Lector runs on macOS and Linux, including glibc distributions and Alpine.
+Ordinary Cargo commands use the host platform and dynamically link its C
+runtime. No setup script or custom environment is required. The
+[build guide](docs/internals/building.md) covers optional static Linux builds,
+supported platforms, offline builds, and build problems.
 
 ## Run
 

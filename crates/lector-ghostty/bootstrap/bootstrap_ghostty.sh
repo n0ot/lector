@@ -13,7 +13,7 @@ crate_dir=$(cd "$bootstrap_dir/.." && pwd)
 # shellcheck disable=SC1091
 source "$bootstrap_dir/lock.sh"
 build_root=${LECTOR_GHOSTTY_BUILD_ROOT:-"$crate_dir/target"}
-target=$(rustc -vV | sed -n 's/^host: //p')
+target=${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}
 optimize=Debug
 prebuilt_root=${GHOSTTY_PREBUILT_ROOT:-"$build_root/ghostty-prebuilt"}
 

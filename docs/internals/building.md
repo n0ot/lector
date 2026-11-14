@@ -21,17 +21,24 @@ You need:
 - A stable Rust toolchain. With rustup, `rust-toolchain.toml` selects the
   tested version automatically.
 - `curl`, `tar`, and either `shasum` or `sha256sum`.
-- On Linux, a C compiler and the static libc development files:
-  `build-essential` and `libc6-dev` on Debian-family systems, or `build-base`
-  on Alpine.
+- On Linux, a C compiler (`build-essential` on Debian-family systems or
+  `build-base` on Alpine). GNU/Linux hosts use the pinned Zig compiler for
+  musl C dependencies; installing a system musl toolchain is unnecessary.
 - On macOS, the Xcode command line tools. Zig uses the macOS SDK that
   `xcrun --sdk macosx` reports.
 
-Then:
+Build and install with ordinary Cargo commands on macOS, Ubuntu and other
+glibc distributions, or Alpine:
 
 ```sh
 cargo build --locked --release
+cargo install --locked --path . --bin lector
 ```
+
+Cargo selects the native CPU and operating system. The executable links the
+system C runtime dynamically, including musl on Alpine. No setup script,
+checkout-local configuration, or environment exports are required. Explicit
+cross compilation can still use Cargo's `--target` option.
 
 To install the result, see the [README](../../README.md#install).
 
@@ -46,29 +53,28 @@ Otherwise both debug and release Rust builds share one optimized
 
 ## Supported targets
 
-Tier 1, required to build:
+Native supported targets:
 
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 - `aarch64-unknown-linux-gnu`
 - `x86_64-unknown-linux-gnu`
-
-CI builds every Tier 1 target on each pull request, except Intel macOS
-(`x86_64-apple-darwin`). That target is built after each merge to `master`
-and on manual runs. Its runners are the slowest and are being retired, so a
-pull request does not wait for it. An Intel-only failure shows up as a red
-run on `master`.
-
-Tier 2, recognized by the build but not yet claimed as supported:
-
-- `aarch64-unknown-linux-musl`
-- `x86_64-unknown-linux-musl`
 - `aarch64-alpine-linux-musl`
 - `x86_64-alpine-linux-musl`
 
-The `alpine` names are what Alpine's packaged Rust uses. They build the same
-way as the `unknown` musl targets. Any other target fails early with this
-list.
+CI checks native dynamic libc linkage on Ubuntu ARM64 and x86-64 and with
+Alpine's packaged Rust. The complete workspace suite runs on both Ubuntu
+architectures. External tmux integrations run only inside Docker. Intel
+macOS builds after merges to `master` and on manual runs; pull requests do
+not wait for its retiring runners.
+
+The optional static Linux targets are `aarch64-unknown-linux-musl` and
+`x86_64-unknown-linux-musl`. CI checks their static PIE linkage and LuaJIT
+unwind compatibility. These are validation builds; binary release packaging
+and publishing are outside this workflow.
+
+Alpine's packaged target names and rustup's `unknown-linux-musl` names are
+both recognized. Other targets fail early with the supported target list.
 
 ## What the build downloads
 
@@ -154,22 +160,50 @@ supported.
 
 ## Static linking
 
-- **Linux.** All targets enable Rust's `crt-static`. The result is a static,
-  position-independent executable with no dynamic loader and no shared
-  library dependencies. `cargo ghostty-check` rejects a release build that is
-  not.
-  - glibc targets use a small compiler wrapper to get glibc's `-static-pie`
-    mode.
-  - musl cross targets link with Zig's bundled `ld.lld`. Native Alpine uses
-    its packaged musl linker.
-- **macOS.** The binary links Apple's system libraries dynamically, because
-  Apple does not provide static versions. `libghostty-vt` itself is still
-  linked statically.
+Native builds dynamically link the platform's C runtime. On Linux,
+`cargo ghostty-check` verifies an ELF interpreter and a shared libc dependency.
+On macOS the binary uses Apple's system libraries. `libghostty-vt` remains
+statically bundled on every platform, so it is never a separate installation
+requirement.
 
-One caveat for glibc: a fully static glibc program may still load NSS
-modules at run time for user or host name lookups. Wayland clipboard support
-and Lua C modules can also load platform libraries. For the most
-self-contained binary, use a musl target.
+A dynamically linked Linux binary needs a compatible host libc; building on
+a newer glibc distribution can require a newer glibc than older systems
+provide. A musl binary is useful when distributing one self-contained Linux
+executable across different distributions.
+
+### Optional static Linux builds
+
+On a Linux host using rustup, install the desired standard library and build
+through the explicit static helper:
+
+```sh
+rustup target add "$(uname -m)-unknown-linux-musl"
+scripts/cargo-musl build --locked --release --bin lector
+```
+
+The executable is under `target/<target>/release/lector`. The helper selects
+static musl, uses the pinned Zig C compiler/linker for cross builds, and
+preserves caller Rust flags. Native Alpine's packaged compiler can use
+`scripts/cargo-musl build --locked --release --bin lector` without rustup.
+Use `CARGO_BUILD_TARGET` or `--target` for another supported musl architecture.
+
+Verify the optional path with:
+
+```sh
+scripts/cargo-musl ghostty-check
+scripts/cargo-musl test --locked --test core eh_frames::
+```
+
+Static musl cannot load native shared-library modules. Pure Lua modules and
+external speech services remain available. User/group and DNS lookup behavior
+follows musl. CPU and kernel requirements still apply. macOS does not support
+a fully static system C runtime.
+
+For static cross builds, Rust's bundled LLVM unwinder accepts individual
+DWARF frame descriptions, while GNU-style C callers such as LuaJIT supply
+whole tables. `build_support/eh_frames.c` adapts that boundary only for
+explicit static musl builds. JIT compilation and exception unwinding stay
+enabled. Native dynamic builds use the system compiler and unwinder.
 
 ## Troubleshooting
 

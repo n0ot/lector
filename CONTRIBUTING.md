@@ -34,12 +34,21 @@ With rustup, `rust-toolchain.toml` selects the exact Rust version the project
 is tested with. `scripts/check-rust-toolchain` confirms which compiler is
 actually being used.
 
+The pinned components include `llvm-tools`, which supplies the LLVM shared
+library used by Rust's debug-stripping tools on macOS. Keep it installed
+when installing the toolchain manually as well.
+
 The test commands use [cargo-nextest](https://nexte.st). Install the pinned
 version:
 
 ```bash
 cargo install cargo-nextest --version 0.9.143 --locked
 ```
+
+Ordinary Cargo commands build for the native platform and dynamically link
+its C runtime. No target setup or environment exports are required. See the
+[build guide](docs/internals/building.md#optional-static-linux-builds) for
+explicitly requested static Linux builds.
 
 ## Testing
 
@@ -95,6 +104,12 @@ And the tests against a real tmux, which run only in Docker:
 ```bash
 scripts/test-real-tmux-docker
 ```
+
+The Docker runner builds native dynamically linked Lector and project
+fixtures on Ubuntu. Set `LECTOR_TEST_STATIC=1` to exercise the optional
+static musl path instead. Set `LECTOR_LINUX_FULL_SUITE=1` to also run the full
+workspace suite, Clippy, documentation tests, and Ghostty build checks inside
+Docker.
 
 The Docker run never uses your own tmux, its server, or its configuration.
 Your checkout is mounted read-only. The first run needs network access to

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -ne 1 || ! -f "$1" ]]; then
+    echo "usage: $0 ELF_EXECUTABLE" >&2
+    exit 2
+fi
+artifact=$1
+if ! readelf -l "$artifact" | grep -q 'Requesting program interpreter'; then
+    echo "native executable has no dynamic interpreter: $artifact" >&2
+    exit 1
+fi
+if ! readelf -d "$artifact" | grep -Eq '\(NEEDED\).*\[libc(\.[^]]+)?\.so(\.[^]]+)?\]'; then
+    echo "native executable does not dynamically depend on libc: $artifact" >&2
+    exit 1
+fi
+printf 'verified dynamic libc: %s\n' "$artifact"

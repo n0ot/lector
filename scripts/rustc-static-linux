@@ -3,58 +3,27 @@ set -euo pipefail
 
 rustc_bin=$1
 shift
-rustc_args=("$@")
-crate_name=
+# Native builds use Cargo's platform linker and the dynamic C runtime.
+if [[ "${LECTOR_STATIC:-0}" != 1 ]]; then
+    exec "$rustc_bin" "$@"
+fi
+arguments=("$@")
 target=
-is_test=false
-
-for ((index = 0; index < ${#rustc_args[@]}; index++)); do
-    argument=${rustc_args[$index]}
-    case "$argument" in
-        --crate-name)
-            if ((index + 1 < ${#rustc_args[@]})); then
-                crate_name=${rustc_args[$((index + 1))]}
-            fi
-            ;;
-        --crate-name=*) crate_name=${argument#--crate-name=} ;;
-        --target)
-            if ((index + 1 < ${#rustc_args[@]})); then
-                target=${rustc_args[$((index + 1))]}
-            fi
-            ;;
-        --target=*) target=${argument#--target=} ;;
-        --test) is_test=true ;;
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+    case "${arguments[$index]}" in
+        --target=*) target=${arguments[$index]#--target=} ;;
+        --target) target=${arguments[$((index + 1))]} ;;
     esac
 done
-
-# Target-wide rustflags also reach host proc-macro crates on a native Linux
-# build, where crt-static is incompatible with their required shared objects.
-# Add static-link flags only to Lector's final rustc invocation instead.
-if [[ "$crate_name" == lector && "$is_test" == false ]]; then
-    if [[ -z "$target" ]]; then
-        target=$("$rustc_bin" -vV | sed -n 's/^host: //p')
-    fi
-    case "$target" in
-        *-linux-musl)
-            if [[ -n "${LECTOR_ZIG_CC_TARGET:-}" ]]; then
-                wrapper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-                exec "$rustc_bin" "${rustc_args[@]}" \
-                    -C target-feature=+crt-static \
-                    -C relocation-model=pic \
-                    -C linker="$wrapper_dir/zig-lld" \
-                    -C linker-flavor=ld.lld
-            fi
-            exec "$rustc_bin" "${rustc_args[@]}" \
-                -C target-feature=+crt-static
-            ;;
-        *-linux-gnu)
-            wrapper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-            exec "$rustc_bin" "${rustc_args[@]}" \
-                -C target-feature=+crt-static \
-                -C relocation-model=pic \
-                -C linker="$wrapper_dir/static-pie-cc"
-            ;;
-    esac
+# Static cross builds use one linker/unwinder for binaries and test harnesses.
+# Native Alpine keeps its packaged linker; cargo-musl supplies +crt-static.
+if [[ "$target" == aarch64-unknown-linux-musl || "$target" == x86_64-unknown-linux-musl ]]; then
+    export LECTOR_ZIG_CC_TARGET=${target/-unknown/}
+    wrapper_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    exec "$rustc_bin" "${arguments[@]}" \
+        -C target-feature=+crt-static \
+        -C relocation-model=pic \
+        -C linker="$wrapper_dir/zig-lld" \
+        -C linker-flavor=ld.lld
 fi
-
-exec "$rustc_bin" "${rustc_args[@]}"
+exec "$rustc_bin" "${arguments[@]}"

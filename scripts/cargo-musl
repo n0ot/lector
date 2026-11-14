@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep the compiler's host ABI separate from the Linux executable's ABI.
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+host=$(rustc -vV | sed -n 's/^host: //p')
+case "$host" in
+    aarch64-*-linux-*|x86_64-*-linux-*) ;;
+    *) echo "cargo-musl requires an ARM64 or x86-64 Linux build host" >&2; exit 2 ;;
+esac
+default_target=${host%%-*}-unknown-linux-musl
+case "$host" in
+    *-alpine-linux-musl) default_target=$host ;;
+esac
+build_target=${CARGO_BUILD_TARGET:-$default_target}
+arguments=("$@")
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+    case "${arguments[$index]}" in
+        --) break ;;
+        --target=*) build_target=${arguments[$index]#--target=} ;;
+        --target)
+            if ((index + 1 >= ${#arguments[@]})); then
+                echo "missing value for --target" >&2
+                exit 2
+            fi
+            build_target=${arguments[$((index + 1))]}
+            ;;
+    esac
+done
+export CARGO_BUILD_TARGET=$build_target
+export LECTOR_STATIC=1
+# Environment rustflags override the native dynamic-libc Cargo configuration.
+# Preserve caller flags and make the requested C runtime choice explicit last.
+if [[ -n "${CARGO_ENCODED_RUSTFLAGS+x}" ]]; then
+    export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${CARGO_ENCODED_RUSTFLAGS:+$'\x1f'}-C"$'\x1f'"target-feature=+crt-static"
+else
+    caller_flags=${RUSTFLAGS-${CARGO_BUILD_RUSTFLAGS:-}}
+    export RUSTFLAGS="${caller_flags:+$caller_flags }-C target-feature=+crt-static"
+fi
+case "$CARGO_BUILD_TARGET" in
+    aarch64-unknown-linux-musl|x86_64-unknown-linux-musl)
+        export LECTOR_ZIG_CC_TARGET=${CARGO_BUILD_TARGET/-unknown/}
+        export CC_aarch64_unknown_linux_musl="$repo_dir/scripts/zig-cc"
+        export CC_x86_64_unknown_linux_musl="$repo_dir/scripts/zig-cc"
+        ;;
+    aarch64-alpine-linux-musl|x86_64-alpine-linux-musl)
+        # Alpine's packaged Rust uses the distribution's native musl linker.
+        ;;
+    *) echo "unsupported Linux build target: $CARGO_BUILD_TARGET; select a musl target" >&2; exit 2 ;;
+esac
+exec cargo "$@"

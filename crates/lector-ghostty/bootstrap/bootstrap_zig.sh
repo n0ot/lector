@@ -12,6 +12,12 @@ toolchain_root=${LECTOR_TOOLCHAIN_ROOT:-"$build_root/toolchains"}
 install_dir="$toolchain_root/zig/$ZIG_VERSION"
 zig_bin="$install_dir/zig"
 
+progress() {
+    if [[ "${LECTOR_BOOTSTRAP_QUIET:-0}" != 1 ]]; then
+        echo "$@" >&2
+    fi
+}
+
 case "$(uname -s):$(uname -m)" in
     Darwin:arm64)
         platform=aarch64-macos
@@ -54,7 +60,7 @@ if [[ -x "$zig_bin" && -f "$marker" ]] &&
     grep -Fxq "version=$ZIG_VERSION" "$marker" &&
     grep -Fxq "platform=$platform" "$marker" &&
     grep -Fxq "archive_sha256=$archive_sha" "$marker"; then
-    echo "reusing verified Zig $ZIG_VERSION at $install_dir" >&2
+    progress "reusing verified Zig $ZIG_VERSION at $install_dir"
     printf '%s\n' "$zig_bin"
     exit 0
 fi
@@ -83,7 +89,7 @@ sha256() {
 
 if [[ ! -f "$archive" ]]; then
     archive_part="$archive.part"
-    echo "downloading pinned Zig $ZIG_VERSION for $platform" >&2
+    progress "downloading pinned Zig $ZIG_VERSION for $platform"
     curl --proto '=https' --tlsv1.2 --fail --location \
         --output "$archive_part" "$url"
     mv "$archive_part" "$archive"
@@ -113,5 +119,5 @@ fi
 mv "$extract_dir" "$install_dir"
 extract_dir=
 
-echo "installed verified Zig $ZIG_VERSION at $install_dir" >&2
+progress "installed verified Zig $ZIG_VERSION at $install_dir"
 printf '%s\n' "$zig_bin"

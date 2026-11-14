@@ -21,8 +21,8 @@ class ContainerCacheKeyTests(unittest.TestCase):
                      'scripts/test-real-tmux-docker', 'scripts/check-rust-toolchain',
                      'scripts/bootstrap_ghostty.sh', 'scripts/bootstrap_zig.sh',
                      # .cargo/config.toml selects this workspace compiler wrapper;
-                     # its GNU/MUSL branches select these linker helpers.
-                     'scripts/rustc-static-linux', 'scripts/static-pie-cc',
+                     # its musl branch selects these linker helpers.
+                     'scripts/rustc-static-linux', 'scripts/cargo-musl',
                      'scripts/zig-cc', 'scripts/zig-lld']
             for name in files:
                 path = root / name

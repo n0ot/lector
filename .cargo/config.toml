@@ -5,3 +5,8 @@ ghostty-bench = "run --locked --package lector-xtask -- ghostty-bench"
 
 [build]
 rustc-workspace-wrapper = "scripts/rustc-static-linux"
+
+# Rust's musl targets otherwise default to a static C runtime. Native builds
+# use the platform libc dynamically; the optional static helper overrides this.
+[target.'cfg(all(target_os = "linux", target_env = "musl"))']
+rustflags = ["-C", "target-feature=-crt-static"]

@@ -59,7 +59,7 @@ class CargoCacheKeyTests(unittest.TestCase):
         for name in ("crates/sample/Cargo.toml", "crates/sample/build.rs",
                      "crates/lector-ghostty/abi/build_info_probe.c",
                      "crates/lector-tts/android/Bridge.java", "build_support/helper.rs",
-                     "scripts/zig-cc", "scripts/static-pie-cc"):
+                     "scripts/zig-cc", "scripts/cargo-musl"):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             original = self.key()

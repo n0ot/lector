@@ -153,15 +153,13 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(cargo_config.contains("scripts/rustc-static-linux"));
 
     let static_wrapper = include_str!("../scripts/rustc-static-linux");
-    assert!(static_wrapper.contains("*-linux-musl"));
-    assert!(static_wrapper.contains("*-linux-gnu"));
+    assert!(static_wrapper.contains("aarch64-unknown-linux-musl"));
     assert!(static_wrapper.contains("target-feature=+crt-static"));
     assert!(static_wrapper.contains("relocation-model=pic"));
-    assert!(static_wrapper.contains("static-pie-cc"));
     assert!(static_wrapper.contains("zig-lld"));
     assert!(static_wrapper.contains("linker-flavor=ld.lld"));
     assert!(static_wrapper.contains("LECTOR_ZIG_CC_TARGET"));
-    assert!(static_wrapper.contains("is_test"));
+    assert!(static_wrapper.contains("LECTOR_STATIC"));
 
     let zig_lld = include_str!("../scripts/zig-lld");
     assert!(zig_lld.contains("ld.lld"));
@@ -170,10 +168,6 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(zig_lld.contains("rcrt1.o"));
     assert!(zig_lld.contains("crtbeginS.o"));
     assert!(zig_lld.contains("crtendS.o"));
-
-    let static_linker = include_str!("../scripts/static-pie-cc");
-    assert!(static_linker.contains("-static|-no-pie|-pie|-static-pie"));
-    assert!(static_linker.contains("-static-pie"));
 
     let static_check = include_str!("../scripts/check-static-pie");
     assert!(static_check.contains("Requesting program interpreter"));
@@ -220,8 +214,8 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(!ci.contains("setup-zig"));
     assert!(ci.contains("cargo ghostty-check"));
     assert!(!ci.contains("cargo ghostty-bootstrap"));
-    assert!(ci.contains("cargo check --locked --target"));
-    assert!(ci.contains("cargo build --locked --release --target"));
+    assert!(ci.contains("cargo check --locked"));
+    assert!(ci.contains("scripts/cargo-musl build --locked --release"));
     assert!(ci.contains("scripts/check-static-pie"));
     assert!(ci.contains("alpine:3.24"));
 }
@@ -260,7 +254,7 @@ fn zig_policy_pins_an_exact_release_and_has_an_actionable_error() {
 }
 
 #[test]
-fn target_policy_matches_the_documented_tier_one_and_tier_two_matrix() {
+fn target_policy_supports_native_platforms_and_optional_static_musl() {
     assert_eq!(
         ghostty::SUPPORTED_TARGETS,
         [
@@ -277,7 +271,7 @@ fn target_policy_matches_the_documented_tier_one_and_tier_two_matrix() {
     for target in ghostty::SUPPORTED_TARGETS {
         assert!(ghostty::validate_target(target).is_ok());
     }
-    let error = ghostty::validate_target("riscv64gc-unknown-linux-gnu").unwrap_err();
+    let error = ghostty::validate_target("riscv64gc-unknown-linux-musl").unwrap_err();
     assert!(error.contains("does not support target"));
     assert!(error.contains("x86_64-unknown-linux-musl"));
 }

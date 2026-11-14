@@ -1043,15 +1043,16 @@ impl ReviewDocument {
             last.col = self.line_last_col(last.row);
         }
         let mut text = String::new();
-        for row_index in first.row..=last.row {
+        for (offset, row) in self.rows[first.row..=last.row].iter().enumerate() {
+            let row_index = first.row + offset;
             let start = if row_index == first.row { first.col } else { 0 };
             let end = if row_index == last.row {
                 last.col.saturating_add(1)
             } else {
-                self.rows[row_index].end
+                row.end
             };
-            for col in start..end.min(self.rows[row_index].end) {
-                let cell = &self.rows[row_index].cells[usize::from(col)];
+            for col in start..end.min(row.end) {
+                let cell = &row.cells[usize::from(col)];
                 if cell.wide_continuation {
                     continue;
                 }
@@ -1064,7 +1065,7 @@ impl ReviewDocument {
             while text.ends_with(' ') && (linewise || row_index != last.row) {
                 text.pop();
             }
-            if row_index != last.row && !self.rows[row_index].wrapped {
+            if row_index != last.row && !row.wrapped {
                 text.push('\n');
             }
         }
