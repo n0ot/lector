@@ -12,7 +12,7 @@ case "$zig_target" in
         ;;
 esac
 
-zig_bin=$("$repo_dir/scripts/bootstrap_zig.sh")
+zig_bin=$(LECTOR_BOOTSTRAP_QUIET=1 "$repo_dir/scripts/bootstrap_zig.sh")
 linker_args=()
 while (($# > 0)); do
     case "$1" in

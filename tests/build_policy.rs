@@ -154,10 +154,8 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
 
     let static_wrapper = include_str!("../scripts/rustc-static-linux");
     assert!(static_wrapper.contains("*-linux-musl"));
-    assert!(static_wrapper.contains("*-linux-gnu"));
     assert!(static_wrapper.contains("target-feature=+crt-static"));
     assert!(static_wrapper.contains("relocation-model=pic"));
-    assert!(static_wrapper.contains("static-pie-cc"));
     assert!(static_wrapper.contains("zig-lld"));
     assert!(static_wrapper.contains("linker-flavor=ld.lld"));
     assert!(static_wrapper.contains("LECTOR_ZIG_CC_TARGET"));
@@ -170,10 +168,6 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     assert!(zig_lld.contains("rcrt1.o"));
     assert!(zig_lld.contains("crtbeginS.o"));
     assert!(zig_lld.contains("crtendS.o"));
-
-    let static_linker = include_str!("../scripts/static-pie-cc");
-    assert!(static_linker.contains("-static|-no-pie|-pie|-static-pie"));
-    assert!(static_linker.contains("-static-pie"));
 
     let static_check = include_str!("../scripts/check-static-pie");
     assert!(static_check.contains("Requesting program interpreter"));
@@ -260,14 +254,12 @@ fn zig_policy_pins_an_exact_release_and_has_an_actionable_error() {
 }
 
 #[test]
-fn target_policy_matches_the_documented_tier_one_and_tier_two_matrix() {
+fn target_policy_supports_macos_and_only_musl_linux() {
     assert_eq!(
         ghostty::SUPPORTED_TARGETS,
         [
             "aarch64-apple-darwin",
             "x86_64-apple-darwin",
-            "aarch64-unknown-linux-gnu",
-            "x86_64-unknown-linux-gnu",
             "aarch64-unknown-linux-musl",
             "x86_64-unknown-linux-musl",
             "aarch64-alpine-linux-musl",
@@ -277,7 +269,14 @@ fn target_policy_matches_the_documented_tier_one_and_tier_two_matrix() {
     for target in ghostty::SUPPORTED_TARGETS {
         assert!(ghostty::validate_target(target).is_ok());
     }
-    let error = ghostty::validate_target("riscv64gc-unknown-linux-gnu").unwrap_err();
+    for target in ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"] {
+        assert!(
+            ghostty::validate_target(target)
+                .unwrap_err()
+                .contains("Linux builds require musl")
+        );
+    }
+    let error = ghostty::validate_target("riscv64gc-unknown-linux-musl").unwrap_err();
     assert!(error.contains("does not support target"));
     assert!(error.contains("x86_64-unknown-linux-musl"));
 }

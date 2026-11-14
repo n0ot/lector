@@ -12,8 +12,13 @@ case "$zig_target" in
         ;;
 esac
 
-zig_bin=$("$repo_dir/scripts/bootstrap_zig.sh")
-compiler_args=()
+zig_bin=$(LECTOR_BOOTSTRAP_QUIET=1 "$repo_dir/scripts/bootstrap_zig.sh")
+# GNU's frame-registration API accepts a CIE-led table; LLVM libunwind's
+# same-named API accepts one FDE. Route C callers through the ABI adapter.
+compiler_args=(
+    -D__register_frame=lector_register_eh_frames
+    -D__deregister_frame=lector_deregister_eh_frames
+)
 while (($# > 0)); do
     case "$1" in
         --target=*|-target=*) shift ;;
@@ -31,13 +36,20 @@ while (($# > 0)); do
 done
 
 is_link=true
+has_input=false
 for argument in "${compiler_args[@]}"; do
     case "$argument" in
         -c|-E|-S) is_link=false ;;
+        *.c|*.cc|*.cpp|*.o|*.a) has_input=true ;;
     esac
 done
 
 if [[ "$is_link" == true ]]; then
+    # Vendored libraries can build their own helper executables before Cargo
+    # links Lector. Give those executables the same frame-registration ABI.
+    if [[ "$has_input" == true ]]; then
+        compiler_args+=("$repo_dir/build_support/eh_frames.c")
+    fi
     compiler_args+=(-lunwind)
 fi
 

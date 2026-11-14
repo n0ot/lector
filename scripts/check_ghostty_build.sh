@@ -5,7 +5,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_dir"
 
 cargo_bin=${CARGO:-cargo}
-host_target=$(rustc -vV | sed -n 's/^host: //p')
+build_target=${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}
 prebuilt_root=${GHOSTTY_PREBUILT_ROOT:-"$repo_dir/target/ghostty-prebuilt"}
 
 debug_lector=$(LECTOR_GHOSTTY_OPTIMIZE=Debug \
@@ -25,7 +25,7 @@ ghostty_test_binary=$("$cargo_bin" test --locked --release \
 "$debug_lector" --version
 "$release_lector" --version
 
-ghostty_archive="$prebuilt_root/$host_target/ReleaseFast/static-lib/libghostty-vt.a"
+ghostty_archive="$prebuilt_root/$build_target/ReleaseFast/static-lib/libghostty-vt.a"
 if [[ ! -f "$ghostty_archive" ]]; then
     echo "release build did not produce the expected static libghostty-vt archive" >&2
     exit 1

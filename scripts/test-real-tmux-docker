@@ -69,19 +69,27 @@ run_args+=(--pull never)
 mkdir -p "$repo_dir/target"
 docker run "${run_args[@]}" "$image" scripts/check-rust-toolchain
 docker run "${run_args[@]}" "$image" bash tests/docker/check-nextest-install.sh
+if [[ "${LECTOR_LINUX_FULL_SUITE:-0}" == 1 ]]; then
+    docker run "${run_args[@]}" "$image" scripts/cargo-musl clippy --locked \
+        --workspace --all-targets --all-features -- -D warnings
+    docker run "${run_args[@]}" "$image" scripts/cargo-musl nextest run --locked \
+        --workspace --all-targets --all-features
+    docker run "${run_args[@]}" "$image" scripts/cargo-musl test --locked --workspace --doc --all-features
+    docker run "${run_args[@]}" "$image" scripts/cargo-musl ghostty-check
+fi
 if [[ "${LECTOR_REAL_TMUX_PREPARE_ONLY:-0}" == 1 ]]; then
     # Validate restored native artifacts even when Cargo fingerprints are fresh.
     docker run "${run_args[@]}" "$image" bash scripts/bootstrap_zig.sh
-    docker run "${run_args[@]}" "$image" bash scripts/bootstrap_ghostty.sh --optimize ReleaseFast
-    docker run "${run_args[@]}" "$image" cargo nextest list --locked --lib \
+    docker run "${run_args[@]}" "$image" scripts/cargo-musl ghostty-bootstrap --optimize ReleaseFast
+    docker run "${run_args[@]}" "$image" scripts/cargo-musl nextest list --locked --lib \
         -E 'test(private_terminfo_overlay_advertises_synchronized_output)' >/dev/null
-    docker run "${run_args[@]}" "$image" cargo nextest list --locked --test tmux \
+    docker run "${run_args[@]}" "$image" scripts/cargo-musl nextest list --locked --test tmux \
         -E "$test_filter" >/dev/null
     exit 0
 fi
 docker run "${run_args[@]}" "$image" \
-    cargo nextest run --locked --lib --run-ignored only \
+    scripts/cargo-musl nextest run --locked --lib --run-ignored only \
     -E 'test(private_terminfo_overlay_advertises_synchronized_output)'
 docker run "${run_args[@]}" "$image" \
-    cargo nextest run --locked --test tmux --no-fail-fast --run-ignored only \
+    scripts/cargo-musl nextest run --locked --test tmux --no-fail-fast --run-ignored only \
     -E "$test_filter" "$@"

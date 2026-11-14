@@ -45,6 +45,11 @@ version:
 cargo install cargo-nextest --version 0.9.143 --locked
 ```
 
+On glibc-based Linux hosts, install the musl Rust target described in the
+[build guide](docs/internals/building.md#build-from-a-fresh-clone), and replace
+`cargo` below with `scripts/cargo-musl`. The wrapper also passes the selected
+target to nested Cargo commands such as `ghostty-check`.
+
 ## Testing
 
 ### While you work
@@ -99,6 +104,10 @@ And the tests against a real tmux, which run only in Docker:
 ```bash
 scripts/test-real-tmux-docker
 ```
+
+The Docker runner builds Lector and its fixtures for musl and executes them
+on Ubuntu. Set `LECTOR_LINUX_FULL_SUITE=1` to also run the full workspace
+suite, Clippy, documentation tests, and Ghostty build checks inside Docker.
 
 The Docker run never uses your own tmux, its server, or its configuration.
 Your checkout is mounted read-only. The first run needs network access to

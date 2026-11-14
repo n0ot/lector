@@ -13,7 +13,7 @@ crate_dir=$(cd "$bootstrap_dir/.." && pwd)
 # shellcheck disable=SC1091
 source "$bootstrap_dir/lock.sh"
 build_root=${LECTOR_GHOSTTY_BUILD_ROOT:-"$crate_dir/target"}
-target=$(rustc -vV | sed -n 's/^host: //p')
+target=${CARGO_BUILD_TARGET:-$(rustc -vV | sed -n 's/^host: //p')}
 optimize=Debug
 prebuilt_root=${GHOSTTY_PREBUILT_ROOT:-"$build_root/ghostty-prebuilt"}
 
@@ -70,8 +70,6 @@ esac
 case "$target" in
     aarch64-apple-darwin) zig_target=aarch64-macos-none ;;
     x86_64-apple-darwin) zig_target=x86_64-macos-none ;;
-    aarch64-unknown-linux-gnu) zig_target=aarch64-linux-gnu ;;
-    x86_64-unknown-linux-gnu) zig_target=x86_64-linux-gnu ;;
     aarch64-unknown-linux-musl) zig_target=aarch64-linux-musl ;;
     x86_64-unknown-linux-musl) zig_target=x86_64-linux-musl ;;
     aarch64-alpine-linux-musl) zig_target=aarch64-linux-musl ;;

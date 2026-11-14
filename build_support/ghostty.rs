@@ -8,8 +8,6 @@ pub const GHOSTTY_ARCHIVE_SHA256: &str =
 pub const SUPPORTED_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",
     "aarch64-alpine-linux-musl",
@@ -21,7 +19,7 @@ pub fn validate_target(target: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "Lector's Ghostty adapter does not support target {target}; supported targets: {}",
+            "Lector's Ghostty adapter does not support target {target}; Linux builds require musl (use scripts/cargo-musl); supported targets: {}",
             SUPPORTED_TARGETS.join(", ")
         ))
     }

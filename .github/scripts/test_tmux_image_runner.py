@@ -31,7 +31,7 @@ if sys.argv[1:3] == ['image', 'inspect']:
             docker.chmod(0o755)
             calls = root / "calls"
             env = {key: value for key, value in os.environ.items()
-                   if not key.startswith('LECTOR_REAL_TMUX_')}
+                   if not key.startswith('LECTOR_REAL_TMUX_') and key != 'LECTOR_LINUX_FULL_SUITE'}
             env.update(PATH=f"{root}:{env['PATH']}", DOCKER_CALLS=str(calls), **settings)
             result = subprocess.run([str(ROOT / 'scripts/test-real-tmux-docker')],
                                     env=env, text=True, capture_output=True)
@@ -83,9 +83,9 @@ if sys.argv[1:3] == ['image', 'inspect']:
                 self.assertNotIn('lector-real-tmux-target:/work/target', call)
             commands = [call[call.index(IMAGE) + 1:] for call in runs]
             self.assertIn(['bash', 'scripts/bootstrap_zig.sh'], commands)
-            self.assertIn(['bash', 'scripts/bootstrap_ghostty.sh', '--optimize', 'ReleaseFast'], commands)
-            self.assertEqual(sum(command[:3] == ['cargo', 'nextest', 'list'] for command in commands), 2)
-            self.assertFalse(any(command[:3] == ['cargo', 'nextest', 'run'] for command in commands))
+            self.assertIn(['scripts/cargo-musl', 'ghostty-bootstrap', '--optimize', 'ReleaseFast'], commands)
+            self.assertEqual(sum(command[:3] == ['scripts/cargo-musl', 'nextest', 'list'] for command in commands), 2)
+            self.assertFalse(any(command[:3] == ['scripts/cargo-musl', 'nextest', 'run'] for command in commands))
             failed, failed_calls = self.run_runner(
                 LECTOR_REAL_TMUX_CACHE_DIR=directory, LECTOR_REAL_TMUX_PREBUILT_IMAGE=IMAGE,
                 LECTOR_REAL_TMUX_PLATFORM='linux/amd64', LECTOR_REAL_TMUX_PREPARE_ONLY='1',

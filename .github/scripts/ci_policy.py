@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-BUILD_JOBS = ("tier-one", "tier-two-static", "alpine-static")
+BUILD_JOBS = ("macos", "linux-musl", "alpine-static")
 
 
 def requires_build(paths):

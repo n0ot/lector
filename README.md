@@ -33,15 +33,22 @@ Then clone the repository and install:
 ```bash
 git clone https://github.com/n0ot/lector.git
 cd lector
+# macOS and Alpine's packaged Rust:
 cargo install --locked --path . --bin lector
+
+# Other Linux distributions (x86-64 or ARM64):
+rustup target add "$(uname -m)-unknown-linux-musl"
+scripts/cargo-musl install --locked --path . --bin lector
 ```
 
 This puts `lector` in `~/.cargo/bin`, which rustup adds to your `PATH`. The
 first build downloads Lector's terminal engine and takes a few minutes.
 
-To update later, run `git pull` and the same `cargo install` command again.
+To update later, run `git pull` and the same install command again.
 
-Lector runs on macOS and Linux. The [build guide](docs/internals/building.md)
+Lector runs on macOS and Linux. Linux builds statically link musl so the
+executable can run on both musl and glibc distributions of the same CPU
+architecture. The [build guide](docs/internals/building.md)
 covers supported platforms, offline builds, and build problems.
 
 ## Run

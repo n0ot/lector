@@ -15,7 +15,7 @@ BUILD_SCRIPTS = frozenset({
     'scripts/bootstrap_ghostty.sh',
     'scripts/bootstrap_zig.sh',
     'scripts/rustc-static-linux',
-    'scripts/static-pie-cc',
+    'scripts/cargo-musl',
     'scripts/zig-cc',
     'scripts/zig-lld',
 })
