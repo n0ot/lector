@@ -18,8 +18,9 @@ statically. You do not install Ghostty or Zig yourself, and the finished
 
 You need:
 
-- A stable Rust toolchain. With rustup, `rust-toolchain.toml` selects the
-  tested version automatically.
+- [rustup](https://rustup.rs/), which selects the tested Rust version from
+  `rust-toolchain.toml` on every platform, including Alpine. Rust 1.100 is the
+  minimum version declared in the workspace manifests.
 - `curl`, `tar`, and either `shasum` or `sha256sum`.
 - On Linux, a C compiler (`build-essential` on Debian-family systems or
   `build-base` on Alpine). GNU/Linux hosts use the pinned Zig compiler for
@@ -59,11 +60,11 @@ Native supported targets:
 - `x86_64-apple-darwin`
 - `aarch64-unknown-linux-gnu`
 - `x86_64-unknown-linux-gnu`
-- `aarch64-alpine-linux-musl`
-- `x86_64-alpine-linux-musl`
+- `aarch64-unknown-linux-musl` (Alpine)
+- `x86_64-unknown-linux-musl` (Alpine)
 
 CI checks native dynamic libc linkage on Ubuntu ARM64 and x86-64 and with
-Alpine's packaged Rust. The complete workspace suite runs on both Ubuntu
+Alpine using the same pinned rustup toolchain. The complete workspace suite runs on both Ubuntu
 architectures. External tmux integrations run only inside Docker. Intel
 macOS builds after merges to `master` and on manual runs; pull requests do
 not wait for its retiring runners.
@@ -73,8 +74,8 @@ The optional static Linux targets are `aarch64-unknown-linux-musl` and
 unwind compatibility. These are validation builds; binary release packaging
 and publishing are outside this workflow.
 
-Alpine's packaged target names and rustup's `unknown-linux-musl` names are
-both recognized. Other targets fail early with the supported target list.
+The build also recognizes Alpine's distribution-specific target aliases.
+Other targets fail early with the supported target list.
 
 ## What the build downloads
 
@@ -183,8 +184,7 @@ scripts/cargo-musl build --locked --release --bin lector
 
 The executable is under `target/<target>/release/lector`. The helper selects
 static musl, uses the pinned Zig C compiler/linker for cross builds, and
-preserves caller Rust flags. Native Alpine's packaged compiler can use
-`scripts/cargo-musl build --locked --release --bin lector` without rustup.
+preserves caller Rust flags. The same command works natively on Alpine.
 Use `CARGO_BUILD_TARGET` or `--target` for another supported musl architecture.
 
 Verify the optional path with:
@@ -249,7 +249,7 @@ command still runs.
 - **Cargo cache.** Keyed by compiler version, runner OS and architecture,
   Rust target, profile and features, lockfile, Cargo configuration, and build
   and linker inputs. A changed lockfile or configuration can never restore an
-  older cache. Alpine uses its own packaged compiler in a disposable
+  older cache. Alpine uses the pinned rustup compiler in a disposable
   container, with a separate cache identity. Ordinary workspace source and
   workflow edits do not invalidate dependency caches. Cargo checks source
   changes, and the cache action prunes workspace output before saving. When

@@ -24,7 +24,7 @@ class CargoCacheKeyTests(unittest.TestCase):
         original = self.key()
         self.assertNotEqual(original, self.key(compiler="compiler-b"))
         self.assertNotEqual(original, self.key(target="cross-target"))
-        self.assertNotEqual(original, self.key(lane="alpine-packaged-release-default"))
+        self.assertNotEqual(original, self.key(lane="alpine-rustup-release-default"))
 
     def test_lockfile_and_configuration_invalidate(self):
         for name in ("Cargo.lock", ".cargo/config.toml"):

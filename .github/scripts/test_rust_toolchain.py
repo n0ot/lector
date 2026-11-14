@@ -41,14 +41,14 @@ class RustToolchainTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Compiler mismatch", result.stderr)
 
-    def test_rejects_wrong_host_even_in_packaged_lane(self):
-        self.assertNotEqual(self.check("--packaged", "--host", "other-host").returncode, 0)
+    def test_rejects_wrong_host(self):
+        self.assertNotEqual(self.check("--host", "other-host").returncode, 0)
 
-    def test_packaged_lane_explicitly_reports_version_exception(self):
+    def test_removed_version_exception_is_rejected(self):
         self.env["TEST_RELEASE"] = "9.9.9"
         result = self.check("--packaged", "--host", self.env["TEST_HOST"])
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("Distribution-packaged compiler", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("usage:", result.stderr)
 
     def test_cross_target_requires_installed_standard_library(self):
         self.assertNotEqual(self.check("--target", "example-target").returncode, 0)

@@ -1333,12 +1333,10 @@ fn allocate_outer_id(seed: u64, used: &mut BTreeSet<u32>) -> u32 {
 }
 
 fn blank_rows(geometry: TerminalGeometry) -> Vec<Row> {
-    (0..geometry.rows)
-        .map(|_| Row {
-            cells: Arc::new(vec![Cell::default(); usize::from(geometry.cols)]),
-            wrapped: false,
-        })
-        .collect()
+    Vec::from_fn(usize::from(geometry.rows), |_| Row {
+        cells: Arc::new(vec![Cell::default(); usize::from(geometry.cols)]),
+        wrapped: false,
+    })
 }
 
 fn blit_surface(target: &mut [Row], geometry: TerminalGeometry, surface: &SceneSurface) {
