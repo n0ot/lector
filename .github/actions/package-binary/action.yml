@@ -1,0 +1,32 @@
+name: Package Lector binary
+description: Preserve the executable and license in a platform-specific release archive
+inputs:
+  executable:
+    description: Path to the built Lector executable
+    required: true
+  target:
+    description: Rust target triple
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Create release archive
+      shell: bash
+      env:
+        EXECUTABLE: ${{ inputs.executable }}
+        TARGET: ${{ inputs.target }}
+      run: |
+        staging=$(mktemp -d)
+        trap 'rm -rf "$staging"' EXIT
+        install -m 755 "$EXECUTABLE" "$staging/lector"
+        cp LICENSE "$staging/"
+        mkdir -p dist
+        tar -czf "dist/lector-$TARGET.tar.gz" -C "$staging" lector LICENSE
+    # actions/upload-artifact v7.0.2
+    - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+      with:
+        name: lector-${{ inputs.target }}
+        path: dist/lector-${{ inputs.target }}.tar.gz
+        if-no-files-found: error
+        overwrite: true
+        compression-level: 0

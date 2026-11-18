@@ -121,6 +121,23 @@ passed to nextest. Set `LECTOR_REAL_TMUX_PLATFORM`, for example to
 See [testing tmux support](docs/internals/tmux/testing.md) for what each
 level covers.
 
+### Publishing binaries
+
+When a push to `master` runs the build matrix and passes the required
+`CI` job, the workflow publishes the macOS and Linux archives with
+`SHA256SUMS` on GitHub Releases. Markdown-only pushes skip builds and
+publishing.
+
+- For a stable release, bump the root package version in `Cargo.toml`
+  and the matching `lector` entry in `Cargo.lock` in a PR. The workflow
+  publishes `v<version>` from the merged commit.
+- With the same package version, the workflow publishes a prerelease
+  tagged `build-<commit-sha>`. The executable reports the Cargo version.
+
+If publishing fails, rerun the failed workflow jobs on the same push.
+The publish job can resume a draft and checks that any existing tag
+points to the commit being released.
+
 ### Native speech tests
 
 Ordinary test runs are silent. They never start real speech and do not need
