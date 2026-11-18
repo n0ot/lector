@@ -20,6 +20,12 @@ the program you are running.
 
 ## Install
 
+Download a binary archive from [GitHub Releases](https://github.com/n0ot/lector/releases),
+verify it against the release's `SHA256SUMS` file, then extract it and put
+`lector` on your `PATH`. Choose `aarch64` for ARM64 (including Apple
+Silicon) or `x86_64` for Intel and AMD. On Linux, choose `gnu` for a
+compatible glibc system or `musl` for a statically linked build.
+
 To build from source, you need:
 
 - [Rust](https://rustup.rs), using rustup or Alpine's `rust` and `cargo` packages
