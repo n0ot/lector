@@ -84,7 +84,7 @@ jobs:
           path: |
             target/ghostty-prebuilt
             target/toolchains
-          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
+          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'build_support/ghostty.rs', 'crates/lector-ghostty/build.rs', 'crates/lector-ghostty/bootstrap/**', 'crates/lector-ghostty/abi/**') }}
       - name: Verify canonical compiler and native architecture
         if: env.RUN_BUILD == 'true'
         run: >-
@@ -161,7 +161,7 @@ jobs:
           path: |
             target/ghostty-prebuilt
             target/toolchains
-          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
+          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'build_support/ghostty.rs', 'crates/lector-ghostty/build.rs', 'crates/lector-ghostty/bootstrap/**', 'crates/lector-ghostty/abi/**') }}
       - name: Verify canonical compiler and cross target
         if: needs.changes.outputs.build == 'true'
         run: scripts/check-rust-toolchain --host "${{ matrix.host }}" --target "${{ matrix.target }}"
@@ -262,8 +262,20 @@ jobs:
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         env:
           TMUX_IMAGE: ${{ steps.tmux-image-cold.outputs.imageid || steps.tmux-image.outputs.imageid }}
-        run: |
-          echo "prefix=$(python3 .github/scripts/tmux_cache_key.py "$TMUX_IMAGE" linux/amd64)" >> "$GITHUB_OUTPUT"
+        # Two keys: the Ghostty/Zig artifacts do not depend on Rust sources or
+        # manifests, and Cargo output restores the newest compatible snapshot.
+        run: python3 .github/scripts/tmux_cache_key.py "$TMUX_IMAGE" linux/amd64 >> "$GITHUB_OUTPUT"
+      - name: Restore container Ghostty and Zig artifacts
+        id: tmux-ghostty-cache
+        timeout-minutes: 5
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
+        continue-on-error: true
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
+            ${{ runner.temp }}/lector-tmux-cache/target/ghostty-prebuilt
+            ${{ runner.temp }}/lector-tmux-cache/target/toolchains
+          key: ${{ steps.tmux-cache-key.outputs.ghostty }}
       - name: Restore container compilation cache
         id: tmux-cache
         timeout-minutes: 5
@@ -275,10 +287,8 @@ jobs:
             ${{ runner.temp }}/lector-tmux-cache/cargo-git
             ${{ runner.temp }}/lector-tmux-cache/cargo-registry
             ${{ runner.temp }}/lector-tmux-cache/target/debug
-            ${{ runner.temp }}/lector-tmux-cache/target/ghostty-prebuilt
-            ${{ runner.temp }}/lector-tmux-cache/target/toolchains
-          key: ${{ steps.tmux-cache-key.outputs.prefix }}-${{ github.sha }}
-          restore-keys: ${{ steps.tmux-cache-key.outputs.prefix }}-
+          key: ${{ steps.tmux-cache-key.outputs.cargo }}-${{ github.sha }}
+          restore-keys: ${{ steps.tmux-cache-key.outputs.cargo }}-
       - name: Validate restored container compilation cache
         id: tmux-cache-check
         timeout-minutes: 10
@@ -290,9 +300,15 @@ jobs:
           LECTOR_REAL_TMUX_CACHE_DIR: ${{ runner.temp }}/lector-tmux-cache
           LECTOR_REAL_TMUX_PREPARE_ONLY: '1'
           CACHE_RESTORE_OUTCOME: ${{ steps.tmux-cache.outcome }}
+          GHOSTTY_RESTORE_OUTCOME: ${{ steps.tmux-ghostty-cache.outcome }}
         run: |
+          cache=${RUNNER_TEMP:?}/lector-tmux-cache
+          # A failed restore may leave partial files; drop only that part.
+          if [[ "$GHOSTTY_RESTORE_OUTCOME" != success ]]; then
+            rm -rf -- "$cache/target/ghostty-prebuilt" "$cache/target/toolchains"
+          fi
           if [[ "$CACHE_RESTORE_OUTCOME" != success ]]; then
-            rm -rf -- "${RUNNER_TEMP:?}/lector-tmux-cache"
+            rm -rf -- "$cache/cargo-git" "$cache/cargo-registry" "$cache/target/debug"
           fi
           scripts/test-real-tmux-docker
       - name: Discard unusable container compilation cache
@@ -308,7 +324,7 @@ jobs:
           : "${LECTOR_REAL_TMUX_PREBUILT_IMAGE:?image build did not return an ID}"
           scripts/test-real-tmux-docker
       - name: Make container artifacts readable for cache upload
-        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-cache.outputs.cache-hit != 'true'
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && (steps.tmux-cache.outputs.cache-hit != 'true' || steps.tmux-ghostty-cache.outputs.cache-hit != 'true')
         run: sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP:?}/lector-tmux-cache"
       - name: Save container compilation cache
         timeout-minutes: 5
@@ -320,9 +336,17 @@ jobs:
             ${{ runner.temp }}/lector-tmux-cache/cargo-git
             ${{ runner.temp }}/lector-tmux-cache/cargo-registry
             ${{ runner.temp }}/lector-tmux-cache/target/debug
+          key: ${{ steps.tmux-cache-key.outputs.cargo }}-${{ github.sha }}
+      - name: Save container Ghostty and Zig artifacts
+        timeout-minutes: 5
+        if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' && steps.tmux-ghostty-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: |
             ${{ runner.temp }}/lector-tmux-cache/target/ghostty-prebuilt
             ${{ runner.temp }}/lector-tmux-cache/target/toolchains
-          key: ${{ steps.tmux-cache-key.outputs.prefix }}-${{ github.sha }}
+          key: ${{ steps.tmux-cache-key.outputs.ghostty }}
       - name: Run documentation tests
         if: needs.changes.outputs.build == 'true' && matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo test --locked --workspace --doc --all-features
@@ -361,7 +385,7 @@ jobs:
           path: |
             target/ghostty-prebuilt
             target/toolchains
-          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
+          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'build_support/ghostty.rs', 'crates/lector-ghostty/build.rs', 'crates/lector-ghostty/bootstrap/**', 'crates/lector-ghostty/abi/**') }}
       - name: Identify Cargo cache inputs
         if: needs.changes.outputs.build == 'true'
         id: cargo-cache-key
@@ -418,7 +442,7 @@ jobs:
           path: |
             target/ghostty-prebuilt
             target/toolchains
-          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-alpine-3.24-rustup-musl-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'crates/lector-ghostty/**') }}
+          key: ghostty-v1-${{ runner.os }}-${{ runner.arch }}-alpine-3.24-rustup-musl-${{ hashFiles('scripts/bootstrap_*.sh', 'scripts/lib/lock.sh', 'build_support/ghostty.rs', 'crates/lector-ghostty/build.rs', 'crates/lector-ghostty/bootstrap/**', 'crates/lector-ghostty/abi/**') }}
       - name: Prepare Alpine with the repository Rust toolchain
         if: needs.changes.outputs.build == 'true'
         id: alpine

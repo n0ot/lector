@@ -256,11 +256,17 @@ command still runs.
   adding a native build helper, include it in `cargo_cache_key.py`'s input
   boundary. If a workflow changes profiles or feature sets, update its cache
   lane as well. PRs continue to restore and save their own caches.
-- **Docker test cache.** Also keyed by the exact container image and compiler.
-  Its fingerprint covers Cargo manifests, build scripts, the Ghostty adapter,
-  Docker inputs, and the container runner's helpers. When you add a new build
-  helper that these depend on, add it to `BUILD_SCRIPTS` in
-  `.github/scripts/tmux_cache_key.py`.
+- **Ghostty/Zig cache.** Keyed by runner OS and architecture, target, and the
+  bootstrap inputs: the bootstrap scripts, `build_support/ghostty.rs`, the
+  adapter's `build.rs`, and its ABI probe. Rust source edits never invalidate
+  it, and the bootstrap re-verifies a restored archive's metadata before use.
+- **Docker test cache.** Two parts, both keyed by the exact container image
+  and platform. The Ghostty/Zig part uses the same bootstrap inputs as above.
+  The Cargo part also covers the compiler, lockfile, manifests, build scripts,
+  Docker inputs, and the container runner's helpers, and restores the newest
+  snapshot with matching inputs, so source edits rebuild only workspace
+  crates. When you add a new build helper that these depend on, add it to
+  `BUILD_SCRIPTS` or the Ghostty inputs in `.github/scripts/tmux_cache_key.py`.
 
 The `Cache retention` workflow runs after build workflows, daily, and on
 manual dispatch. It deletes caches scoped to confirmed closed pull requests

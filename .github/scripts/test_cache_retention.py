@@ -6,9 +6,9 @@ from unittest.mock import patch
 from cache_retention import deletion_plan, inventory, main
 
 
-def cache(number, ref="refs/heads/master", identity="a", version="format-a"):
+def cache(number, ref="refs/heads/master", identity="a", version="format-a", family="v1"):
     return {"id": number, "ref": ref, "version": version,
-            "key": f"tmux-container-v1-{identity * 64}-{number:040x}",
+            "key": f"tmux-container-{family}-{identity * 64}-{number:040x}",
             "created_at": f"2026-01-{number:02d}T00:00:00Z", "size_in_bytes": 100}
 
 
@@ -34,6 +34,15 @@ class CacheRetentionTests(unittest.TestCase):
         # Enumeration and access order do not determine which snapshots survive.
         self.assertEqual(deletion_plan(entries[::-1], {11: "open"}),
                          deletion_plan(entries, {11: "open"}))
+
+    def test_each_key_format_keeps_its_own_two_newest_snapshots(self):
+        entries = [cache(i, family="v1") for i in range(1, 4)]
+        entries += [cache(i, family="v2") for i in range(4, 7)]
+        self.assertEqual([c["id"] for c, _ in deletion_plan(entries, {})], [1, 4])
+        # Ghostty/Zig artifacts have one entry per input key and are never pruned.
+        ghostty = cache(7)
+        ghostty["key"] = f"tmux-ghostty-v1-{'c' * 64}"
+        self.assertEqual(deletion_plan([ghostty], {}), [])
 
     def test_unknown_keys_and_refs_survive_and_zero_retention_is_rejected(self):
         entry = cache(1)
