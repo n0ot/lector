@@ -19,11 +19,13 @@ that keep it that way, and how to measure a slow path.
   `send-keys` routing, but no timer-based delay.
 - **Reading waits for evidence, not a clock, where it can.** See
   [when output is stable](reading-model.md#when-output-is-stable).
-- **Unchanged rows are not decoded or copied again.** A plain row (no
-  styling, grapheme clusters, or hyperlinks) is matched against the previous
-  refresh by its raw Ghostty cell values, so scrolling decodes only the new
-  line. Composition shares rows that a surface covers exactly, and row
-  comparisons skip shared rows.
+- **Unchanged rows are not decoded or copied again.** A row without
+  grapheme clusters or hyperlinks is matched against the previous refresh by
+  its raw Ghostty cell values and, when styled, each cell's resolved style, so
+  scrolling decodes only the new line. Composition shares rows that a surface
+  covers exactly, and row comparisons skip shared rows.
+- **Plain text is parsed in bulk.** Lector's stream observer parses runs of
+  ASCII together and still stops on the exact byte that ends a write segment.
 
 ## Latency gate
 

@@ -3549,16 +3549,18 @@ impl Terminal {
         if self.force_general_row_reads {
             return self.read_row_from_raw(row, cols, raw_row);
         }
-        // Styled and hyperlink flags may report false positives, which only
-        // send a plain row to the general reader.
+        // The hyperlink flag may report false positives, which only send a
+        // row to the general reader.
         let index = usize::from(row);
-        if row_query::<bool>(raw_row, ffi::ROW_DATA_STYLED)?
-            || row_query::<bool>(raw_row, ffi::ROW_DATA_GRAPHEME)?
+        if row_query::<bool>(raw_row, ffi::ROW_DATA_GRAPHEME)?
             || row_query::<bool>(raw_row, ffi::ROW_DATA_HYPERLINK)?
         {
             pool.clear(index);
             return self.read_row_from_raw(row, cols, raw_row);
         }
+        // A styled row's cells also depend on each cell's resolved style. The
+        // flag may report false positives, which only cost the style reads.
+        let styled = row_query::<bool>(raw_row, ffi::ROW_DATA_STYLED)?;
         let wrapped = row_query::<bool>(raw_row, ffi::ROW_DATA_WRAP)?;
         let mut view = ffi::CellsView {
             ptr: std::ptr::null(),
@@ -3577,28 +3579,81 @@ impl Terminal {
         // which stay valid until the render state is next updated. The slice
         // is consumed before this function returns and before any update.
         let raw = unsafe { std::slice::from_raw_parts(view.ptr, view.len) };
-        let cells = if let Some(previous) = pool.find(index, raw) {
-            previous
-        } else {
-            // The row previously at this position usually differs in only a
-            // few columns (an edited line), and an identical raw cell in a
-            // plain row decodes identically.
-            let Some(cells) = decode_plain_cells(raw, pool.entry(index))? else {
+        let cells = if styled {
+            let Some(cells) = self.read_styled_row_cells(raw, index, pool)? else {
                 pool.clear(index);
                 return self.read_row_from_raw(row, cols, raw_row);
             };
-            #[cfg(test)]
-            {
-                self.snapshot_row_decodes = self.snapshot_row_decodes.saturating_add(1);
-            }
-            Arc::new(cells)
+            cells
+        } else {
+            let cells = if let Some(previous) = pool.find_plain(index, raw) {
+                previous
+            } else {
+                // The row previously at this position usually differs in only
+                // a few columns (an edited line), and an identical raw cell in
+                // a plain row decodes identically.
+                let Some(cells) = decode_plain_cells(raw, pool.plain_entry(index))? else {
+                    pool.clear(index);
+                    return self.read_row_from_raw(row, cols, raw_row);
+                };
+                #[cfg(test)]
+                {
+                    self.snapshot_row_decodes = self.snapshot_row_decodes.saturating_add(1);
+                }
+                Arc::new(cells)
+            };
+            pool.set(index, raw, None, Arc::clone(&cells));
+            cells
         };
         #[cfg(test)]
         {
             self.snapshot_row_reads = self.snapshot_row_reads.saturating_add(1);
         }
-        pool.set(index, raw, Arc::clone(&cells));
         Ok(RowSnapshot { cells, wrapped })
+    }
+
+    /// Reads a styled row's cells, which also depend on each cell's resolved
+    /// style. Returns `None` for any value the general reader must handle.
+    fn read_styled_row_cells(
+        &mut self,
+        raw: &[ffi::Cell],
+        index: usize,
+        pool: &mut PlainRowPool,
+    ) -> Result<Option<Arc<Vec<CellSnapshot>>>, Error> {
+        let mut cells = self.row_cells.as_ptr();
+        row_iterator_query_into(
+            &self.row_iterator,
+            ffi::RENDER_STATE_ROW_DATA_CELLS,
+            &mut cells,
+        )?;
+        if cells != self.row_cells.as_ptr() {
+            return Err(Error::InvalidValue);
+        }
+        let mut styles = std::mem::take(&mut pool.scratch_styles);
+        styles.clear();
+        for _ in raw {
+            // SAFETY: the row-cells iterator was populated for the current
+            // render row and has not been invalidated.
+            if !unsafe { ffi::ghostty_render_state_row_cells_next(self.row_cells.as_ptr()) } {
+                return Err(Error::NoValue);
+            }
+            styles.push(normalize_style(row_cell_style(&self.row_cells)?)?);
+        }
+        let cells = if let Some(previous) = pool.find_styled(index, raw, &styles) {
+            Some(previous)
+        } else {
+            let decoded = decode_styled_cells(raw, &styles, pool.styled_entry(index))?;
+            #[cfg(test)]
+            if decoded.is_some() {
+                self.snapshot_row_decodes = self.snapshot_row_decodes.saturating_add(1);
+            }
+            decoded.map(Arc::new)
+        };
+        if let Some(cells) = &cells {
+            pool.set(index, raw, Some(&styles), Arc::clone(cells));
+        }
+        pool.scratch_styles = styles;
+        Ok(cells)
     }
 
     fn read_row_from_raw(
@@ -3776,17 +3831,23 @@ impl Terminal {
     }
 }
 
-/// Plain viewport rows, each pairing a row's raw cell values with the cells
-/// decoded from them. Lookups compare content, never position, so an entry is
-/// a correct pair wherever it sits; entries are updated in place as rows are
-/// read, and the worst outcome of an overwritten entry is a missed reuse.
-/// Raw values live in one flat buffer so steady-state refreshes allocate
+/// Decoded viewport rows. Each entry pairs a row's raw cell values (and, for
+/// a styled row, every cell's normalized style) with the cells decoded from
+/// them; together these fully determine the cells of a row without grapheme
+/// clusters or hyperlinks. Lookups compare that content, never positions, so
+/// an entry is a correct pair wherever it sits; entries are updated in place
+/// as rows are read, and the worst outcome of an overwritten entry is a missed
+/// reuse. Keys live in flat buffers so steady-state refreshes allocate
 /// nothing here.
 #[derive(Default)]
 struct PlainRowPool {
     cols: usize,
     raw: Vec<ffi::Cell>,
-    cells: Vec<Option<Arc<Vec<CellSnapshot>>>>,
+    /// Per-cell styles, meaningful only for styled entries.
+    styles: Vec<StyleSnapshot>,
+    cells: Vec<Option<PoolCells>>,
+    /// Reused buffer for the styles of the row being read.
+    scratch_styles: Vec<StyleSnapshot>,
     /// Offset of the most recent match, probed first so a scroll usually
     /// matches on its first comparison.
     probe_offset: isize,
@@ -3802,44 +3863,109 @@ impl PlainRowPool {
         self.cols = cols;
         self.raw.clear();
         self.raw.resize(rows.saturating_mul(cols), 0);
+        self.styles.clear();
+        self.styles
+            .resize(rows.saturating_mul(cols), StyleSnapshot::default());
         self.cells.clear();
         self.cells.resize(rows, None);
         self.probe_offset = 0;
     }
 
-    fn matching(&self, row: usize, raw: &[ffi::Cell]) -> Option<&Arc<Vec<CellSnapshot>>> {
-        let cells = self.cells.get(row)?.as_ref()?;
-        let start = row.checked_mul(self.cols)?;
-        let previous = self.raw.get(start..start.checked_add(self.cols)?)?;
-        (previous == raw).then_some(cells)
+    fn range(&self, row: usize) -> std::ops::Range<usize> {
+        row * self.cols..(row + 1) * self.cols
     }
 
-    fn find(&mut self, row: usize, raw: &[ffi::Cell]) -> Option<Arc<Vec<CellSnapshot>>> {
-        if let Some(index) = row.checked_add_signed(self.probe_offset)
-            && let Some(cells) = self.matching(index, raw)
+    /// Whether a plain entry with exactly these raw cells is stored here.
+    #[inline(always)]
+    fn plain_matches(&self, row: usize, raw: &[ffi::Cell]) -> bool {
+        matches!(self.cells.get(row), Some(Some(entry)) if !entry.styled)
+            && self.raw[self.range(row)] == *raw
+    }
+
+    /// Whether a styled entry with exactly these raw cells and styles is
+    /// stored here.
+    #[inline(always)]
+    fn styled_matches(&self, row: usize, raw: &[ffi::Cell], styles: &[StyleSnapshot]) -> bool {
+        matches!(self.cells.get(row), Some(Some(entry)) if entry.styled)
+            && self.raw[self.range(row)] == *raw
+            && self.styles[self.range(row)] == *styles
+    }
+
+    #[inline(always)]
+    fn find_by(
+        &mut self,
+        row: usize,
+        matches: impl Fn(&Self, usize) -> bool,
+    ) -> Option<Arc<Vec<CellSnapshot>>> {
+        let probe = row
+            .checked_add_signed(self.probe_offset)
+            .filter(|&index| matches(self, index));
+        let index = match probe {
+            Some(index) => index,
+            None => {
+                let index = (0..self.cells.len()).find(|&index| matches(self, index))?;
+                self.probe_offset = index as isize - row as isize;
+                index
+            }
+        };
+        self.cells[index]
+            .as_ref()
+            .map(|entry| Arc::clone(&entry.cells))
+    }
+
+    fn find_plain(&mut self, row: usize, raw: &[ffi::Cell]) -> Option<Arc<Vec<CellSnapshot>>> {
+        self.find_by(row, |pool, index| pool.plain_matches(index, raw))
+    }
+
+    fn find_styled(
+        &mut self,
+        row: usize,
+        raw: &[ffi::Cell],
+        styles: &[StyleSnapshot],
+    ) -> Option<Arc<Vec<CellSnapshot>>> {
+        self.find_by(row, |pool, index| pool.styled_matches(index, raw, styles))
+    }
+
+    /// A plain entry stored at a position, whatever its content.
+    fn plain_entry(&self, row: usize) -> Option<(&[ffi::Cell], &[CellSnapshot])> {
+        let entry = self.cells.get(row)?.as_ref()?;
+        (!entry.styled).then(|| (&self.raw[self.range(row)], entry.cells.as_slice()))
+    }
+
+    /// A styled entry stored at a position, whatever its content.
+    fn styled_entry(&self, row: usize) -> Option<StyledEntry<'_>> {
+        let entry = self.cells.get(row)?.as_ref()?;
+        let range = self.range(row);
+        entry.styled.then(|| StyledEntry {
+            raw: &self.raw[range.clone()],
+            styles: &self.styles[range],
+            cells: entry.cells.as_slice(),
+        })
+    }
+
+    fn set(
+        &mut self,
+        row: usize,
+        raw: &[ffi::Cell],
+        styles: Option<&[StyleSnapshot]>,
+        cells: Arc<Vec<CellSnapshot>>,
+    ) {
+        if raw.len() != self.cols
+            || styles.is_some_and(|styles| styles.len() != self.cols)
+            || row >= self.cells.len()
         {
-            return Some(Arc::clone(cells));
-        }
-        let index = (0..self.cells.len()).find(|&index| self.matching(index, raw).is_some())?;
-        self.probe_offset = index as isize - row as isize;
-        self.matching(index, raw).map(Arc::clone)
-    }
-
-    /// The entry stored at a position, whatever its content.
-    fn entry(&self, row: usize) -> Option<(&[ffi::Cell], &[CellSnapshot])> {
-        let cells = self.cells.get(row)?.as_ref()?;
-        let start = row.checked_mul(self.cols)?;
-        let raw = self.raw.get(start..start.checked_add(self.cols)?)?;
-        Some((raw, cells.as_slice()))
-    }
-
-    fn set(&mut self, row: usize, raw: &[ffi::Cell], cells: Arc<Vec<CellSnapshot>>) {
-        if raw.len() != self.cols || row >= self.cells.len() {
+            self.clear(row);
             return;
         }
-        let start = row * self.cols;
-        self.raw[start..start + self.cols].copy_from_slice(raw);
-        self.cells[row] = Some(cells);
+        let range = self.range(row);
+        self.raw[range.clone()].copy_from_slice(raw);
+        if let Some(styles) = styles {
+            self.styles[range].clone_from_slice(styles);
+        }
+        self.cells[row] = Some(PoolCells {
+            cells,
+            styled: styles.is_some(),
+        });
     }
 
     /// Forgets a row read by the general reader, so the pool never keeps a
@@ -3851,10 +3977,24 @@ impl PlainRowPool {
     }
 }
 
+/// An entry's decoded cells and whether its key includes styles.
+#[derive(Clone)]
+struct PoolCells {
+    cells: Arc<Vec<CellSnapshot>>,
+    styled: bool,
+}
+
+#[derive(Clone, Copy)]
+struct StyledEntry<'a> {
+    raw: &'a [ffi::Cell],
+    styles: &'a [StyleSnapshot],
+    cells: &'a [CellSnapshot],
+}
+
 /// Decodes a row whose flags rule out styling, grapheme clusters, and
-/// hyperlinks. Returns `None` for any value the general reader must handle.
-/// `donor` is another plain row's raw cells and their decoded cells; a
-/// column whose raw value matches the donor's reuses its decoded cell.
+/// hyperlinks. `donor` is another plain row's raw cells and their decoded
+/// cells; a column whose raw value matches the donor's reuses its decoded
+/// cell. Returns `None` for any value the general reader must handle.
 fn decode_plain_cells(
     raw: &[ffi::Cell],
     donor: Option<(&[ffi::Cell], &[CellSnapshot])>,
@@ -3887,9 +4027,46 @@ fn decode_plain_cells(
     Ok(Some(cells))
 }
 
+/// Decodes a styled row whose flags rule out grapheme clusters and hyperlinks
+/// from its raw cells and their normalized styles. A column whose raw value
+/// and style match the previous column or the donor's reuses that cell.
+fn decode_styled_cells(
+    raw: &[ffi::Cell],
+    styles: &[StyleSnapshot],
+    donor: Option<StyledEntry<'_>>,
+) -> Result<Option<Vec<CellSnapshot>>, Error> {
+    let mut cells: Vec<CellSnapshot> = Vec::with_capacity(raw.len());
+    for (col, (&cell, style)) in raw.iter().zip(styles).enumerate() {
+        if col > 0
+            && raw[col - 1] == cell
+            && styles[col - 1] == *style
+            && let Some(last) = cells.last()
+        {
+            let repeated = last.clone();
+            cells.push(repeated);
+            continue;
+        }
+        if let Some(donor) = donor
+            && donor.raw.get(col) == Some(&cell)
+            && donor.styles.get(col) == Some(style)
+            && let Some(donated) = donor.cells.get(col)
+        {
+            cells.push(donated.clone());
+            continue;
+        }
+        let Some(decoded) = decode_plain_cell(cell, style)? else {
+            return Ok(None);
+        };
+        cells.push(decoded);
+    }
+    Ok(Some(cells))
+}
+
+/// Decodes one cell from its raw value and its normalized style, for a row
+/// without grapheme clusters or hyperlinks.
 fn decode_plain_cell(
     cell: ffi::Cell,
-    default_style: &StyleSnapshot,
+    cell_style: &StyleSnapshot,
 ) -> Result<Option<CellSnapshot>, Error> {
     let (width, continuation) = match cell_query::<ffi::CellWide>(cell, ffi::CELL_DATA_WIDE)? {
         ffi::CELL_WIDE_NARROW => (1, false),
@@ -3897,7 +4074,7 @@ fn decode_plain_cell(
         ffi::CELL_WIDE_SPACER_TAIL | ffi::CELL_WIDE_SPACER_HEAD => (0, true),
         _ => return Err(Error::InvalidValue),
     };
-    let mut style = default_style.clone();
+    let mut style = cell_style.clone();
     let grapheme = match cell_query::<ffi::CellContentTag>(cell, ffi::CELL_DATA_CONTENT_TAG)? {
         ffi::CELL_CONTENT_CODEPOINT => {
             let codepoint = cell_query::<u32>(cell, ffi::CELL_DATA_CODEPOINT)?;
@@ -4836,16 +5013,48 @@ mod tests {
             b"\x1b[1;5Hab",
             b"\x1b[41m\x1b[1;8H\x1b[2X\x1b[0m",
             b"\x1b[1;80HZ",
+            b"\x1b[1;1H\x1b[31mabc\x1b[0m",
+            b"\x1b[1;1H\x1b[34mabc\x1b[0m",
+            b"\x1b[1;1H\x1b[1;4:3;58;2;1;2;3mfancy\x1b[0m\x1b[44m\x1b[K\x1b[0m",
+            b"\x1b[1;1Habc\x1b[2m\x1b[1;2Hb\x1b[0m",
+            // Freeing a style and then printing the same text in a new style
+            // can reuse the style id, leaving the raw cells unchanged.
+            b"\x1b[2J\x1b[1;1H\x1b[31mabc\x1b[0m",
+            b"\x1b[1;1H\x1b[2K\x1b[34mabc\x1b[0m",
+            b"\x1b[1;1H\x1b[2K\x1b[1;7mabc\x1b[0m",
         ];
         let mut scrolling = Vec::new();
         for line in 0..40 {
             scrolling.extend_from_slice(format!("line {line}\r\n").as_bytes());
+            scrolling.extend_from_slice(
+                format!(
+                    "\x1b[3{}mcolored\x1b[0m line {line} \x1b[1mbold\x1b[0m\r\n",
+                    line % 8
+                )
+                .as_bytes(),
+            );
+        }
+        let mut style_churn = Vec::new();
+        for index in 0..300_usize {
+            style_churn.extend_from_slice(
+                format!(
+                    "\x1b[2;1H\x1b[38;5;{};48;5;{}mchurn\x1b[0m\x1b[3;1H\x1b[38;2;{};1;2mchurn\x1b[0m",
+                    index % 256,
+                    (index * 7) % 256,
+                    index % 256
+                )
+                .as_bytes(),
+            );
         }
 
         let mut fast = Terminal::new(24, 80).expect("create fast terminal");
         let mut general = Terminal::new(24, 80).expect("create general terminal");
         general.force_general_row_reads = true;
-        for chunk in chunks.iter().copied().chain([scrolling.as_slice()]) {
+        for chunk in chunks
+            .iter()
+            .copied()
+            .chain([style_churn.as_slice(), scrolling.as_slice()])
+        {
             fast.advance(chunk).expect("advance fast terminal");
             general.advance(chunk).expect("advance general terminal");
             assert_eq!(
@@ -4912,6 +5121,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn scrolling_styled_output_reuses_rows_that_only_moved() {
+        let mut terminal = Terminal::new(24, 80).expect("create terminal");
+        let line = |index: usize| {
+            format!("\x1b[32m   Compiling\x1b[0m crate-{index:02} (\x1b[1msrc\x1b[0m)\r\n")
+        };
+        for index in 0..30 {
+            terminal
+                .advance(line(index).as_bytes())
+                .expect("fill screen");
+        }
+        terminal.snapshot_row_decodes = 0;
+
+        terminal
+            .advance(line(30).as_bytes())
+            .expect("scroll one line");
+
+        assert!(
+            terminal.snapshot_row_decodes <= 2,
+            "a one-line scroll decoded {} rows",
+            terminal.snapshot_row_decodes
+        );
+        assert_eq!(
+            terminal.snapshot().rows[22].text(),
+            "   Compiling crate-30 (src)"
+        );
+        assert_eq!(
+            terminal.snapshot().rows[22].cells[3].style.foreground,
+            super::ColorSnapshot::Indexed(2)
+        );
+        assert!(terminal.snapshot().rows[22].cells[23].style.bold);
     }
 
     #[test]
