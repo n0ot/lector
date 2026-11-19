@@ -2564,8 +2564,13 @@ impl Terminal {
         let mut observed = 0;
         let mut next_mark = None;
         while fed < bytes.len() {
+            // Per-byte parsing (tests only) scans exactly the byte about to be
+            // parsed, reproducing the original interleaving.
+            let scan_end = if bytewise { fed + 1 } else { bytes.len() };
             if next_mark.is_none() {
-                while let Some(&byte) = bytes.get(observed) {
+                while observed < scan_end
+                    && let Some(&byte) = bytes.get(observed)
+                {
                     observed += 1;
                     if self.stream_observer.observe_raw_byte(byte) {
                         next_mark = Some(observed - 1);
@@ -5127,7 +5132,7 @@ mod tests {
     fn scrolling_styled_output_reuses_rows_that_only_moved() {
         let mut terminal = Terminal::new(24, 80).expect("create terminal");
         let line = |index: usize| {
-            format!("\x1b[32m   Compiling\x1b[0m crate-{index:02} (\x1b[1msrc\x1b[0m)\r\n")
+            format!("\x1b[32m   status\x1b[0m item-{index:02} (\x1b[1mbold\x1b[0m)\r\n")
         };
         for index in 0..30 {
             terminal
@@ -5147,13 +5152,13 @@ mod tests {
         );
         assert_eq!(
             terminal.snapshot().rows[22].text(),
-            "   Compiling crate-30 (src)"
+            "   status item-30 (bold)"
         );
         assert_eq!(
             terminal.snapshot().rows[22].cells[3].style.foreground,
             super::ColorSnapshot::Indexed(2)
         );
-        assert!(terminal.snapshot().rows[22].cells[23].style.bold);
+        assert!(terminal.snapshot().rows[22].cells[19].style.bold);
     }
 
     #[test]
