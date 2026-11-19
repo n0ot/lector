@@ -2410,6 +2410,8 @@ pub struct Terminal {
     /// values. Lookups compare content, never position, so an entry stays a
     /// correct (raw, decoded) pair even when rows move.
     plain_row_pool: PlainRowPool,
+    /// Reused raw-cell buffer for plain history rows.
+    history_raw_scratch: RefCell<Vec<ffi::Cell>>,
     #[cfg(test)]
     snapshot_row_reads: usize,
     #[cfg(test)]
@@ -2491,6 +2493,7 @@ impl Terminal {
             semantic_marks: Vec::new(),
             kitty_image_cache: RefCell::new(BTreeMap::new()),
             plain_row_pool: PlainRowPool::default(),
+            history_raw_scratch: RefCell::new(Vec::new()),
             #[cfg(test)]
             snapshot_row_reads: 0,
             #[cfg(test)]
@@ -2852,6 +2855,7 @@ impl Terminal {
             semantic_marks: Vec::new(),
             kitty_image_cache: RefCell::new(BTreeMap::new()),
             plain_row_pool: PlainRowPool::default(),
+            history_raw_scratch: RefCell::new(Vec::new()),
             #[cfg(test)]
             snapshot_row_reads: 0,
             #[cfg(test)]
@@ -3072,8 +3076,9 @@ impl Terminal {
         let origin = actual_extent.saturating_sub(logical_extent);
         let (_, cols) = snapshot.size();
         let mut history = Vec::with_capacity(logical_extent);
+        let mut raw = self.history_raw_scratch.borrow_mut();
         for row in origin..actual_extent {
-            history.push(self.read_grid_row(row, cols)?);
+            history.push(self.read_grid_row(row, cols, &mut raw)?);
         }
         snapshot.scrollback = history;
         snapshot.scrollback_extent = logical_extent;
@@ -3095,8 +3100,9 @@ impl Terminal {
             .saturating_add(logical_start);
         let (_, cols) = self.snapshot.size();
         let mut history = Vec::with_capacity(logical_extent.saturating_sub(logical_start));
+        let mut raw = self.history_raw_scratch.borrow_mut();
         for row in physical_start..actual_extent {
-            history.push(self.read_grid_row(row, cols)?);
+            history.push(self.read_grid_row(row, cols, &mut raw)?);
         }
         Ok(history)
     }
@@ -3634,7 +3640,15 @@ impl Terminal {
         Ok(())
     }
 
-    fn read_grid_row(&self, row: usize, cols: u16) -> Result<RowSnapshot, Error> {
+    /// Reads one history row. Like the viewport reader, a row whose flags
+    /// rule out styling, grapheme clusters, and hyperlinks is decoded from its
+    /// raw cell values; any other row uses the general cell reader.
+    fn read_grid_row(
+        &self,
+        row: usize,
+        cols: u16,
+        raw: &mut Vec<ffi::Cell>,
+    ) -> Result<RowSnapshot, Error> {
         #[cfg(test)]
         self.history_row_reads
             .set(self.history_row_reads.get().saturating_add(1));
@@ -3642,6 +3656,28 @@ impl Terminal {
         let row_reference = terminal_grid_ref(&self.terminal, ffi::POINT_TAG_HISTORY, 0, row)?;
         let raw_row = grid_ref_query_row(&row_reference)?;
         let wrapped = row_query::<bool>(raw_row, ffi::ROW_DATA_WRAP)?;
+        #[cfg(test)]
+        let plain_path = !self.force_general_row_reads;
+        #[cfg(not(test))]
+        let plain_path = true;
+        if plain_path
+            && !row_query::<bool>(raw_row, ffi::ROW_DATA_STYLED)?
+            && !row_query::<bool>(raw_row, ffi::ROW_DATA_GRAPHEME)?
+            && !row_query::<bool>(raw_row, ffi::ROW_DATA_HYPERLINK)?
+        {
+            raw.clear();
+            for col in 0..cols {
+                let reference =
+                    terminal_grid_ref(&self.terminal, ffi::POINT_TAG_HISTORY, col, row)?;
+                raw.push(grid_ref_query_cell(&reference)?);
+            }
+            if let Some(cells) = decode_plain_cells(raw)? {
+                return Ok(RowSnapshot {
+                    cells: Arc::new(cells),
+                    wrapped,
+                });
+            }
+        }
         let mut cells = Vec::with_capacity(usize::from(cols));
         for col in 0..cols {
             let reference = terminal_grid_ref(&self.terminal, ffi::POINT_TAG_HISTORY, col, row)?;
@@ -4668,8 +4704,8 @@ mod tests {
         assert_eq!(terminal.snapshot().rows[0].text(), "one line");
     }
 
-    /// The plain-row path must be an exact substitute for the general
-    /// reader: after every chunk, both readers produce identical rows.
+    /// The plain-row paths must be exact substitutes for the general reader:
+    /// after every chunk, both produce identical viewport and history rows.
     #[test]
     fn plain_row_reader_matches_general_reader() {
         let wide_wrap = "\u{4e2d}".repeat(41);
@@ -4706,7 +4742,26 @@ mod tests {
                 "rows diverged after {:?}",
                 String::from_utf8_lossy(chunk)
             );
+            assert_eq!(
+                fast.snapshot_with_history()
+                    .expect("fast history")
+                    .scrollback,
+                general
+                    .snapshot_with_history()
+                    .expect("general history")
+                    .scrollback,
+                "history diverged after {:?}",
+                String::from_utf8_lossy(chunk)
+            );
         }
+        assert!(
+            !fast
+                .snapshot_with_history()
+                .expect("fast history")
+                .scrollback
+                .is_empty(),
+            "the fixture must exercise history rows"
+        );
     }
 
     #[test]
