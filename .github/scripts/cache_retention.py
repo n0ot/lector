@@ -9,7 +9,7 @@ import subprocess
 
 
 PR_REF = re.compile(r"refs/pull/([1-9][0-9]*)/merge")
-SNAPSHOT = re.compile(r"(tmux-container-v1-[0-9a-f]{64})-[0-9a-f]{40}")
+SNAPSHOT = re.compile(r"(tmux-container-v[1-9][0-9]*-[0-9a-f]{64})-[0-9a-f]{40}")
 
 
 def api(path, method="GET"):
