@@ -7,6 +7,7 @@ assert(expected_config ~= nil)
 lector.o.speech.server = {
     program = speech_server,
     args = {
+        "speech",
         "--legacy",
         "--startup-argv-probe",
         "argument with spaces",

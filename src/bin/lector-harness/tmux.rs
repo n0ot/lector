@@ -91,7 +91,7 @@ impl Wire {
     }
 }
 
-fn main() -> Result<()> {
+pub(super) fn run() -> Result<()> {
     if let Some(pid_file) = std::env::var_os("LECTOR_TEST_BLOCKING_APP_PID_FILE") {
         std::fs::write(pid_file, format!("{}\n", std::process::id()))?;
         loop {

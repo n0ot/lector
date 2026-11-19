@@ -16,11 +16,10 @@ use lector::{
 use serde::{Deserialize, Serialize};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    env, fs,
+    fs,
     hint::black_box,
     io::{self, Write},
     path::PathBuf,
-    process::ExitCode,
     sync::atomic::{AtomicU64, Ordering},
     time::Instant,
 };
@@ -290,22 +289,11 @@ struct SchedulerWorkload {
     iterations: usize,
 }
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("error: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn run() -> Result<(), String> {
+pub(super) fn run(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<(), String> {
     let mut self_test = false;
     let mut output = None;
     let mut check_baseline = None;
     let mut validate_baseline = None;
-    let mut args = env::args_os().skip(1);
     while let Some(argument) = args.next() {
         if argument == "--self-test" {
             self_test = true;

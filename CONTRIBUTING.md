@@ -69,6 +69,11 @@ Add the integration test closest to your change, for example:
 cargo test --locked --test core capability_broker::
 ```
 
+Cargo builds `lector-harness` automatically for tests. To run a fixture
+by hand, use `cargo run --locked --features test-tools --bin lector-harness
+-- <mode>`. The modes are `script`, `speech`, `pty`, `tmux`, and
+`ghostty-bench`.
+
 The integration test targets are `app`, `core`, `terminal`, `presentation`,
 `speech`, `tmux`, `live_pty`, and `tmux_adversary_live`.
 

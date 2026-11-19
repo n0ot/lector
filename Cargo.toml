@@ -64,34 +64,21 @@ path = "src/main.rs"
 
 [[bin]]
 name = "lector-harness"
-path = "src/bin/lector-harness.rs"
-test = false
-
-[[bin]]
-name = "proc_stub_server"
-path = "src/bin/proc_stub_server.rs"
-test = false
-
-[[bin]]
-name = "tmux-control-adversary"
-path = "src/bin/tmux-control-adversary.rs"
-test = false
-
-[[bin]]
-name = "pty-test-fixture"
-path = "src/bin/pty-test-fixture.rs"
-test = false
-
-[[bin]]
-name = "lector-ghostty-bench"
-path = "src/bin/lector-ghostty-bench.rs"
+path = "src/bin/lector-harness/main.rs"
+required-features = ["test-tools"]
 test = false
 bench = false
+
+[features]
+test-tools = []
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 
 [dev-dependencies]
+# Enable the fixture binary for tests from the checkout without including it
+# in normal builds or installs. Cargo strips path-only dev dependencies when packaging.
+lector = { path = ".", features = ["test-tools"] }
 tempfile = "3.27.0"
 
 [build-dependencies]

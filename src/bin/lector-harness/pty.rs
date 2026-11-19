@@ -28,7 +28,7 @@ use std::{
 
 const MODE_ENV: &str = "LECTOR_TEST_PTY_MODE";
 
-fn main() -> Result<()> {
+pub(super) fn run() -> Result<()> {
     match std::env::var(MODE_ENV).as_deref() {
         Ok("bell") => bell(),
         Ok("flood") => flood(),

@@ -18,8 +18,9 @@ use std::{
 
 #[test]
 fn proc_driver_smoke() {
-    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
-    let mut driver = ProcDriver::new(&server_path).expect("spawn proc stub server");
+    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_lector-harness"));
+    let mut driver =
+        ProcDriver::new_with_args(&server_path, ["speech"]).expect("spawn proc stub server");
     assert!((driver.get_rate() - 50.0).abs() < f32::EPSILON);
     driver.speak("hello", true).expect("speak");
     driver.set_rate(65.0).expect("set_rate");
@@ -29,8 +30,9 @@ fn proc_driver_smoke() {
 
 #[test]
 fn proc_driver_negotiates_the_current_protocol() {
-    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
-    let mut driver = ProcDriver::new(&server_path).expect("spawn proc stub server");
+    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_lector-harness"));
+    let mut driver =
+        ProcDriver::new_with_args(&server_path, ["speech"]).expect("spawn proc stub server");
     assert!(!driver.is_legacy_protocol());
     assert_eq!(Host::backend_info(&driver).unwrap().id, "stub");
     assert!(Host::capabilities(&driver).voices.list);
@@ -85,8 +87,8 @@ fn proc_driver_negotiates_the_current_protocol() {
 
 #[test]
 fn proc_driver_accepts_a_method_not_found_initialize_as_legacy() {
-    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
-    let mut driver = ProcDriver::new_with_args(&server_path, ["--legacy"])
+    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_lector-harness"));
+    let mut driver = ProcDriver::new_with_args(&server_path, ["speech", "--legacy"])
         .expect("spawn legacy proc stub server");
     assert!(driver.is_legacy_protocol());
     driver.speak("legacy speech", false).expect("legacy speak");
@@ -96,7 +98,8 @@ fn proc_driver_accepts_a_method_not_found_initialize_as_legacy() {
 
 #[test]
 fn rpc_discover_is_available_before_initialize() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_proc_stub_server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lector-harness"))
+        .arg("speech")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -137,11 +140,11 @@ fn rpc_discover_is_available_before_initialize() {
 
 #[test]
 fn proc_driver_initialize_has_an_absolute_deadline() {
-    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
+    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_lector-harness"));
     let started = Instant::now();
     let error = ProcDriver::new_with_args_and_timeouts(
         &server_path,
-        ["--adversary", "stall-on-initialize"],
+        ["speech", "--adversary", "stall-on-initialize"],
         short_timeouts(),
     )
     .err()
@@ -153,13 +156,13 @@ fn proc_driver_initialize_has_an_absolute_deadline() {
 
 #[test]
 fn initialization_publishes_a_termination_handle_before_waiting() {
-    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
+    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_lector-harness"));
     let (handle_tx, handle_rx) = mpsc::sync_channel(1);
     let started = Instant::now();
     let constructor = thread::spawn(move || {
         ProcDriver::new_with_args_and_registration(
             &server_path,
-            ["--adversary", "stall-on-initialize"],
+            ["speech", "--adversary", "stall-on-initialize"],
             RpcTimeouts {
                 initialize: Duration::from_secs(5),
                 call: Duration::from_millis(150),
@@ -243,8 +246,8 @@ fn proc_driver_bounds_response_frames() {
     // intentionally allowed more time than the tiny hang tests. This test is
     // about the frame bound, not the ordinary call deadline.
     let mut driver = ProcDriver::new_with_args_and_timeouts(
-        &PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server")),
-        ["--adversary", "oversized-after-initialize"],
+        &PathBuf::from(env!("CARGO_BIN_EXE_lector-harness")),
+        ["speech", "--adversary", "oversized-after-initialize"],
         RpcTimeouts {
             initialize: Duration::from_secs(2),
             call: Duration::from_secs(2),
@@ -269,8 +272,8 @@ fn short_timeouts() -> RpcTimeouts {
 
 fn adversarial_driver(mode: &str) -> ProcDriver {
     ProcDriver::new_with_args_and_timeouts(
-        &PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server")),
-        ["--adversary", mode],
+        &PathBuf::from(env!("CARGO_BIN_EXE_lector-harness")),
+        ["speech", "--adversary", mode],
         RpcTimeouts {
             initialize: Duration::from_secs(2),
             call: Duration::from_millis(150),
@@ -281,8 +284,9 @@ fn adversarial_driver(mode: &str) -> ProcDriver {
 
 #[test]
 fn proc_driver_handles_requests_larger_than_the_server_read_chunk() {
-    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
-    let mut driver = ProcDriver::new(&server_path).expect("spawn proc stub server");
+    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_lector-harness"));
+    let mut driver =
+        ProcDriver::new_with_args(&server_path, ["speech"]).expect("spawn proc stub server");
 
     driver
         .speak(&"x".repeat(8 * 1024), false)
@@ -304,8 +308,9 @@ fn proc_driver_reports_spawn_failures_with_the_requested_path() {
 
 #[test]
 fn proc_driver_rejects_invalid_normalized_rate_without_changing_it() {
-    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_proc_stub_server"));
-    let mut driver = ProcDriver::new(&server_path).expect("spawn proc stub server");
+    let server_path = PathBuf::from(env!("CARGO_BIN_EXE_lector-harness"));
+    let mut driver =
+        ProcDriver::new_with_args(&server_path, ["speech"]).expect("spawn proc stub server");
 
     for rate in [-0.01, 100.01, f32::NAN] {
         let error = driver.set_rate(rate).unwrap_err();
@@ -334,7 +339,8 @@ fn proc_server_can_record_the_rpc_requests_used_for_real_speech() {
         "lector-speech-rpc-{}-{unique}.jsonl",
         std::process::id()
     ));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_proc_stub_server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lector-harness"))
+        .arg("speech")
         .env("LECTOR_SPEECH_RPC_LOG", &log_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -692,7 +698,8 @@ fn native_test_frame_waits_preserve_events_and_require_natural_completion() {
 #[test]
 fn native_test_host_cleanup_reaps_an_unresponsive_project_fixture() {
     let mut host = NativeTestHost::spawn(
-        Command::new(env!("CARGO_BIN_EXE_proc_stub_server"))
+        Command::new(env!("CARGO_BIN_EXE_lector-harness"))
+            .arg("speech")
             .args(["--adversary", "stall-on-initialize"]),
     );
     let pid = host.child.id();
