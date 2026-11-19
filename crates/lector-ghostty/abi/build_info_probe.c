@@ -256,6 +256,17 @@ _Static_assert(GHOSTTY_CELL_DATA_HAS_HYPERLINK == 7,
                "GhosttyCellData hyperlink value changed");
 _Static_assert(GHOSTTY_ROW_DATA_WRAP == 1,
                "GhosttyRowData values changed");
+_Static_assert(GHOSTTY_ROW_DATA_GRAPHEME == 3 &&
+                   GHOSTTY_ROW_DATA_STYLED == 4 &&
+                   GHOSTTY_ROW_DATA_HYPERLINK == 5,
+               "GhosttyRowData content flag values changed");
+_Static_assert(GHOSTTY_RENDER_STATE_ROW_DATA_CELLS_RAW == 5,
+               "GhosttyRenderStateRowData raw cells value changed");
+_Static_assert(sizeof(GhosttyCellsView) == sizeof(void *) + sizeof(size_t) &&
+                   sizeof(GhosttyCell) == sizeof(uint64_t),
+               "GhosttyCellsView layout changed");
+_Static_assert(GHOSTTY_CELL_DATA_CODEPOINT == 1,
+               "GhosttyCellData codepoint value changed");
 _Static_assert(GHOSTTY_POINT_TAG_HISTORY == 3,
                "GhosttyPointTag values changed");
 _Static_assert(GHOSTTY_STYLE_COLOR_RGB == 2,

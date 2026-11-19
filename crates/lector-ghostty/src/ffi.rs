@@ -169,6 +169,7 @@ pub(crate) type RenderStateRowData = c_int;
 pub(crate) const RENDER_STATE_ROW_DATA_DIRTY: RenderStateRowData = 1;
 pub(crate) const RENDER_STATE_ROW_DATA_RAW: RenderStateRowData = 2;
 pub(crate) const RENDER_STATE_ROW_DATA_CELLS: RenderStateRowData = 3;
+pub(crate) const RENDER_STATE_ROW_DATA_CELLS_RAW: RenderStateRowData = 5;
 
 pub(crate) type RenderStateRowOption = c_int;
 pub(crate) const RENDER_STATE_ROW_OPTION_DIRTY: RenderStateRowOption = 1;
@@ -180,6 +181,7 @@ pub(crate) const RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8: RenderStateRowCells
 
 pub(crate) type Cell = u64;
 pub(crate) type CellData = c_int;
+pub(crate) const CELL_DATA_CODEPOINT: CellData = 1;
 pub(crate) const CELL_DATA_CONTENT_TAG: CellData = 2;
 pub(crate) const CELL_DATA_WIDE: CellData = 3;
 pub(crate) const CELL_DATA_HAS_HYPERLINK: CellData = 7;
@@ -201,6 +203,18 @@ pub(crate) const CELL_WIDE_SPACER_HEAD: CellWide = 3;
 pub(crate) type Row = u64;
 pub(crate) type RowData = c_int;
 pub(crate) const ROW_DATA_WRAP: RowData = 1;
+pub(crate) const ROW_DATA_GRAPHEME: RowData = 3;
+pub(crate) const ROW_DATA_STYLED: RowData = 4;
+pub(crate) const ROW_DATA_HYPERLINK: RowData = 5;
+
+/// A borrowed row of raw cell values (`GhosttyCellsView`). Valid only until
+/// the producing render state is next updated.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CellsView {
+    pub(crate) ptr: *const Cell,
+    pub(crate) len: usize,
+}
 
 pub(crate) type PointTag = c_int;
 pub(crate) const POINT_TAG_VIEWPORT: PointTag = 1;
