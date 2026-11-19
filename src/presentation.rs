@@ -905,20 +905,21 @@ fn rows_physically_match(left: &[Row], right: &[Row]) -> bool {
     left.len() == right.len()
         && left.iter().zip(right).all(|(left, right)| {
             left.wrapped == right.wrapped
-                && left.cells.len() == right.cells.len()
-                && left
-                    .cells
-                    .iter()
-                    .zip(right.cells.iter())
-                    .all(|(left, right)| {
-                        let left_blank = matches!(left.grapheme.as_ref(), "" | " ");
-                        let right_blank = matches!(right.grapheme.as_ref(), "" | " ");
-                        (left.grapheme == right.grapheme || left_blank && right_blank)
-                            && left.width == right.width
-                            && left.continuation == right.continuation
-                            && left.style == right.style
-                            && left.hyperlink == right.hyperlink
-                    })
+                && (Arc::ptr_eq(&left.cells, &right.cells)
+                    || left.cells.len() == right.cells.len()
+                        && left
+                            .cells
+                            .iter()
+                            .zip(right.cells.iter())
+                            .all(|(left, right)| {
+                                let left_blank = matches!(left.grapheme.as_ref(), "" | " ");
+                                let right_blank = matches!(right.grapheme.as_ref(), "" | " ");
+                                (left.grapheme == right.grapheme || left_blank && right_blank)
+                                    && left.width == right.width
+                                    && left.continuation == right.continuation
+                                    && left.style == right.style
+                                    && left.hyperlink == right.hyperlink
+                            }))
         })
 }
 
@@ -1333,13 +1334,17 @@ fn allocate_outer_id(seed: u64, used: &mut BTreeSet<u32>) -> u32 {
 }
 
 fn blank_rows(geometry: TerminalGeometry) -> Vec<Row> {
+    // Rows are copy-on-write, so every blank row can share one cell vector.
+    let blank = Arc::new(vec![Cell::default(); usize::from(geometry.cols)]);
     Vec::from_fn(usize::from(geometry.rows), |_| Row {
-        cells: Arc::new(vec![Cell::default(); usize::from(geometry.cols)]),
+        cells: Arc::clone(&blank),
         wrapped: false,
     })
 }
 
 fn blit_surface(target: &mut [Row], geometry: TerminalGeometry, surface: &SceneSurface) {
+    let target_cols = i64::from(geometry.cols);
+    let origin_col = i64::from(surface.origin.col);
     for (source_row_index, source_row) in surface.snapshot.rows.iter().enumerate() {
         let Ok(source_row_index) = i32::try_from(source_row_index) else {
             break;
@@ -1349,22 +1354,25 @@ fn blit_surface(target: &mut [Row], geometry: TerminalGeometry, surface: &SceneS
             continue;
         }
         let target_row = usize::try_from(target_row).expect("non-negative clipped row");
-        let mut visible_cells = source_row
-            .cells
-            .iter()
-            .enumerate()
-            .map_while(|(source_col_index, cell)| {
-                let source_col_index = i32::try_from(source_col_index).ok()?;
-                Some((surface.origin.col.saturating_add(source_col_index), cell))
-            })
-            .filter(|(col, _)| *col >= 0 && *col < i32::from(geometry.cols))
-            .peekable();
-        // Do not detach shared cells for a row with no visible writes.
-        if visible_cells.peek().is_some() {
-            let target_cells = Arc::make_mut(&mut target[target_row].cells);
-            for (target_col, cell) in visible_cells {
-                let target_col = usize::try_from(target_col).expect("non-negative clipped column");
-                target_cells[target_col] = cell.clone();
+        let source_cols = i64::try_from(source_row.cells.len()).unwrap_or(i64::MAX);
+        if origin_col == 0 && source_cols == target_cols {
+            // Every target cell is overwritten by the same source cell, so
+            // the row can share the source cells instead of copying them.
+            target[target_row].cells = Arc::clone(&source_row.cells);
+        } else {
+            // Source columns whose target column lies inside the grid form
+            // one contiguous range.
+            let first = (-origin_col).max(0);
+            let last = source_cols.min(target_cols - origin_col);
+            // Do not detach shared cells for a row with no visible writes.
+            if first < last {
+                let source_range = usize::try_from(first).expect("non-negative source column")
+                    ..usize::try_from(last).expect("non-negative source column");
+                let target_start =
+                    usize::try_from(origin_col + first).expect("non-negative clipped column");
+                let target_cells = Arc::make_mut(&mut target[target_row].cells);
+                target_cells[target_start..target_start + source_range.len()]
+                    .clone_from_slice(&source_row.cells[source_range]);
             }
         }
         if surface.origin.col <= 0
@@ -2594,6 +2602,9 @@ fn changed_cell_ranges(
     end: usize,
 ) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
+    if Arc::ptr_eq(&previous.cells, &intended.cells) {
+        return ranges;
+    }
     let mut run_start = None;
     for col in start..end {
         let changed = !cells_physically_match(&previous.cells[col], &intended.cells[col]);

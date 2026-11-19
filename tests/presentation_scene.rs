@@ -186,6 +186,47 @@ fn clipped_blits_preserve_shared_sources_cells_and_row_metadata() {
 }
 
 #[test]
+fn full_width_blits_share_source_cells_and_keep_row_metadata() {
+    let geometry = TerminalGeometry::from_cells(3, 4);
+    let backing = presented(geometry, b"aaaa\r\nbbbb\r\ncccc").into_terminal_snapshot();
+    let mut source = presented(
+        TerminalGeometry::from_cells(2, 4),
+        "\x1b[1;31m\x1b]8;;https://example.invalid/cell\x07界AB\r\nwxyz".as_bytes(),
+    )
+    .into_terminal_snapshot();
+    Arc::make_mut(&mut source.rows)[0].wrapped = true;
+
+    for origin_row in [-1, 0, 1, 2, 3] {
+        let mut scene = Scene::new(geometry);
+        scene.panes.push(SceneSurface::new(
+            SurfaceId(1),
+            GridPoint::new(0, 0),
+            backing.clone(),
+        ));
+        scene.panes.push(SceneSurface::new(
+            SurfaceId(2),
+            GridPoint::new(origin_row, 0),
+            source.clone(),
+        ));
+        let composed = PresentedScene::compose(&scene)
+            .unwrap()
+            .into_terminal_snapshot();
+        for (row_index, row) in composed.rows.iter().enumerate() {
+            let source_row = i32::try_from(row_index).unwrap() - origin_row;
+            let expected = usize::try_from(source_row)
+                .ok()
+                .and_then(|source_row| source.rows.get(source_row))
+                .unwrap_or(&backing.rows[row_index]);
+            assert_eq!(row, expected, "origin_row={origin_row}, row={row_index}");
+            assert!(
+                Arc::ptr_eq(&row.cells, &expected.cells),
+                "a full-width row must share its source cells: origin_row={origin_row}"
+            );
+        }
+    }
+}
+
+#[test]
 fn renderer_backend_receives_scene_damage_and_predicts_independent_state() {
     let scene = Scene::new(TerminalGeometry::from_cells(2, 4));
     let presented = PresentedScene::blank(scene.geometry);

@@ -1660,20 +1660,23 @@ impl StreamObserver {
     /// 8-bit C1 APC byte is structural when it occurs at a UTF-8 code-point
     /// boundary. Track continuation bytes across updates so the same byte in a
     /// valid multibyte character does not unnecessarily disable linear output.
-    fn observe_raw_byte(&mut self, byte: u8) {
+    /// Advances the raw-byte scanner, which runs ahead of the parser. Returns
+    /// whether this byte starts an application program command; the caller
+    /// must mark structural output before the parser receives the byte. This
+    /// scanner state is read nowhere else, so it may run ahead of parsing.
+    #[must_use]
+    fn observe_raw_byte(&mut self, byte: u8) -> bool {
         if self.raw_utf8_continuations > 0 {
             if (self.raw_utf8_next_min..=self.raw_utf8_next_max).contains(&byte) {
                 self.raw_utf8_continuations -= 1;
                 self.raw_utf8_next_min = 0x80;
                 self.raw_utf8_next_max = 0xbf;
                 self.raw_escape_pending = false;
-                return;
+                return false;
             }
             self.raw_utf8_continuations = 0;
         }
-        if byte == 0x9f || (self.raw_escape_pending && byte == b'_') {
-            self.mark_structural_output();
-        }
+        let starts_command = byte == 0x9f || (self.raw_escape_pending && byte == b'_');
         self.raw_escape_pending = byte == b'\x1b';
         (
             self.raw_utf8_continuations,
@@ -1689,6 +1692,7 @@ impl StreamObserver {
             0xf4 => (3, 0x80, 0x8f),
             _ => (0, 0, 0),
         };
+        starts_command
     }
 
     fn mark_visible_output(&mut self) {
@@ -1746,10 +1750,12 @@ impl StreamObserver {
                 text.push(character);
             }
             _ => {
-                // This string is grown one character at a time. Use normal
-                // String growth from the first push, rather than allocating
-                // an exact one-byte string and reallocating on the next print.
-                let mut text = String::new();
+                // A run holds ASCII written left to right on one row and ends
+                // before the right margin, so the columns remaining after
+                // this one bound its length; it never reallocates.
+                let mut text = String::with_capacity(usize::from(
+                    self.operation_cols.saturating_sub(self.operation_col),
+                ));
                 text.push(character);
                 self.operations.push(OperationSnapshot::WriteRun {
                     row: self.operation_row,
@@ -1951,8 +1957,19 @@ struct StreamUpdate {
 }
 
 impl vte::Perform for StreamObserver {
+    fn terminated(&self) -> bool {
+        self.has_boundary_events()
+    }
+
     fn print(&mut self, character: char) {
         self.mark_visible_output();
+        if self.current_print.is_empty() {
+            // Printed text usually runs to the end of the line; size for it
+            // rather than doubling one character at a time.
+            self.current_print.reserve(usize::from(
+                self.operation_cols.saturating_sub(self.operation_col),
+            ));
+        }
         self.current_print.push(character);
         self.record_write(character);
     }
@@ -2386,6 +2403,11 @@ pub struct Terminal {
     snapshot: TerminalSnapshot,
     scrollback_capacity: usize,
     stream_parser: vte::Parser,
+    /// The last byte given to `stream_parser` was not ASCII, so it may hold a
+    /// partial UTF-8 sequence. The parser's callbacks for non-ASCII input
+    /// depend on how bytes are split, so only ASCII that follows ASCII is
+    /// parsed in bulk.
+    stream_parser_after_non_ascii: bool,
     stream_observer: StreamObserver,
     /// Monotonic identity of the oldest row in Lector's bounded primary
     /// history window. Never derive this directly from Ghostty's current
@@ -2406,8 +2428,20 @@ pub struct Terminal {
     /// the presentation pipeline. Each inspection compares Ghostty's borrowed
     /// bytes before reusing an entry, so in-place image mutation remains exact.
     kitty_image_cache: RefCell<BTreeMap<u32, CachedKittyImage>>,
+    /// Plain viewport rows from the latest refresh, keyed by their raw cell
+    /// values. Lookups compare content, never position, so an entry stays a
+    /// correct (raw, decoded) pair even when rows move.
+    plain_row_pool: PlainRowPool,
+    /// Reused raw-cell buffer for plain history rows.
+    history_raw_scratch: RefCell<Vec<ffi::Cell>>,
     #[cfg(test)]
     snapshot_row_reads: usize,
+    #[cfg(test)]
+    snapshot_row_decodes: usize,
+    #[cfg(test)]
+    force_general_row_reads: bool,
+    #[cfg(test)]
+    force_bytewise_parsing: bool,
     #[cfg(test)]
     history_row_reads: Cell<usize>,
     _thread_bound: PhantomData<Rc<()>>,
@@ -2475,6 +2509,7 @@ impl Terminal {
             snapshot: TerminalSnapshot::default(),
             scrollback_capacity,
             stream_parser: vte::Parser::new(),
+            stream_parser_after_non_ascii: false,
             stream_observer: StreamObserver::default(),
             primary_history_origin: 0,
             primary_history_high_water: 0,
@@ -2482,8 +2517,16 @@ impl Terminal {
             history_changed_since_open_checkpoint: false,
             semantic_marks: Vec::new(),
             kitty_image_cache: RefCell::new(BTreeMap::new()),
+            plain_row_pool: PlainRowPool::default(),
+            history_raw_scratch: RefCell::new(Vec::new()),
             #[cfg(test)]
             snapshot_row_reads: 0,
+            #[cfg(test)]
+            snapshot_row_decodes: 0,
+            #[cfg(test)]
+            force_general_row_reads: false,
+            #[cfg(test)]
+            force_bytewise_parsing: false,
             #[cfg(test)]
             history_row_reads: Cell::new(0),
             _thread_bound: PhantomData,
@@ -2506,14 +2549,69 @@ impl Terminal {
         let mut history_origin_at_latest_checkpoint = history_origin_before;
         let mut history_changed_before_latest_checkpoint = false;
         let new_semantic_start = self.semantic_marks.len();
+        // Segments end immediately after any byte that produces a boundary
+        // event. The parser reports termination while a boundary is pending,
+        // so it stops on exactly that byte while runs of ASCII are parsed in
+        // bulk; every other byte is parsed alone, as before. The raw scanner
+        // runs ahead and stops parsing at each byte that needs a structural
+        // mark before the parser sees it.
+        #[cfg(test)]
+        let bytewise = self.force_bytewise_parsing;
+        #[cfg(not(test))]
+        let bytewise = false;
         let mut segment_start = 0;
-        for (index, byte) in bytes.iter().copied().enumerate() {
-            self.stream_observer.observe_raw_byte(byte);
-            self.stream_parser
-                .advance(&mut self.stream_observer, &[byte]);
+        let mut fed = 0;
+        let mut observed = 0;
+        let mut next_mark = None;
+        while fed < bytes.len() {
+            // Per-byte parsing (tests only) scans exactly the byte about to be
+            // parsed, reproducing the original interleaving.
+            let scan_end = if bytewise { fed + 1 } else { bytes.len() };
+            if next_mark.is_none() {
+                while observed < scan_end
+                    && let Some(&byte) = bytes.get(observed)
+                {
+                    observed += 1;
+                    if self.stream_observer.observe_raw_byte(byte) {
+                        next_mark = Some(observed - 1);
+                        break;
+                    }
+                }
+            }
+            let limit = next_mark.unwrap_or(bytes.len());
+            if fed == limit {
+                self.stream_observer.mark_structural_output();
+                next_mark = None;
+                continue;
+            }
+            let consumed = if bytewise
+                || self.stream_observer.has_boundary_events()
+                || self.stream_parser_after_non_ascii
+                || !bytes[fed].is_ascii()
+            {
+                // A boundary left pending by the previous segment ends the
+                // next byte's segment too, exactly as per-byte parsing did.
+                0
+            } else {
+                let run = bytes[fed..limit]
+                    .iter()
+                    .position(|byte| !byte.is_ascii())
+                    .map_or(limit, |offset| fed + offset);
+                self.stream_parser
+                    .advance_until_terminated(&mut self.stream_observer, &bytes[fed..run])
+            };
+            fed += if consumed == 0 {
+                self.stream_parser
+                    .advance(&mut self.stream_observer, &bytes[fed..=fed]);
+                1
+            } else {
+                consumed
+            };
+            self.stream_parser_after_non_ascii = !bytes[fed - 1].is_ascii();
             if !self.stream_observer.has_boundary_events() {
                 continue;
             }
+            let index = fed - 1;
             let synchronized_before = self.snapshot.modes.synchronized_output;
             let cursor_visible_before = self.snapshot.cursor.visible;
             self.write_vt(&bytes[segment_start..=index]);
@@ -2827,6 +2925,9 @@ impl Terminal {
             snapshot: TerminalSnapshot::default(),
             scrollback_capacity,
             stream_parser,
+            stream_parser_after_non_ascii: observer_continuation
+                .last()
+                .is_some_and(|byte| *byte >= 0x80),
             stream_observer,
             primary_history_origin,
             primary_history_high_water,
@@ -2838,8 +2939,16 @@ impl Terminal {
             // diagnostic path yet. Runtime correctness never restores here.
             semantic_marks: Vec::new(),
             kitty_image_cache: RefCell::new(BTreeMap::new()),
+            plain_row_pool: PlainRowPool::default(),
+            history_raw_scratch: RefCell::new(Vec::new()),
             #[cfg(test)]
             snapshot_row_reads: 0,
+            #[cfg(test)]
+            snapshot_row_decodes: 0,
+            #[cfg(test)]
+            force_general_row_reads: false,
+            #[cfg(test)]
+            force_bytewise_parsing: false,
             #[cfg(test)]
             history_row_reads: Cell::new(0),
             _thread_bound: PhantomData,
@@ -2860,6 +2969,7 @@ impl Terminal {
         // SAFETY: the terminal handle is valid.
         unsafe { ffi::ghostty_terminal_reset(self.terminal.as_ptr()) };
         self.stream_parser = vte::Parser::new();
+        self.stream_parser_after_non_ascii = false;
         self.stream_observer = StreamObserver::default();
         self.history_changed_since_open_checkpoint = true;
         let _ = self.effect_sink.take()?;
@@ -3054,8 +3164,9 @@ impl Terminal {
         let origin = actual_extent.saturating_sub(logical_extent);
         let (_, cols) = snapshot.size();
         let mut history = Vec::with_capacity(logical_extent);
+        let mut raw = self.history_raw_scratch.borrow_mut();
         for row in origin..actual_extent {
-            history.push(self.read_grid_row(row, cols)?);
+            history.push(self.read_grid_row(row, cols, &mut raw)?);
         }
         snapshot.scrollback = history;
         snapshot.scrollback_extent = logical_extent;
@@ -3077,8 +3188,9 @@ impl Terminal {
             .saturating_add(logical_start);
         let (_, cols) = self.snapshot.size();
         let mut history = Vec::with_capacity(logical_extent.saturating_sub(logical_start));
+        let mut raw = self.history_raw_scratch.borrow_mut();
         for row in physical_start..actual_extent {
-            history.push(self.read_grid_row(row, cols)?);
+            history.push(self.read_grid_row(row, cols, &mut raw)?);
         }
         Ok(history)
     }
@@ -3264,6 +3376,8 @@ impl Terminal {
                 .rows
                 .iter()
                 .all(|row| row.cells.len() == usize::from(cols));
+        let mut pool = std::mem::take(&mut self.plain_row_pool);
+        pool.prepare(usize::from(rows), usize::from(cols));
         let mut normalized_rows = Vec::with_capacity(usize::from(rows));
         let mut replacement_rows = Vec::new();
         let mut dirty_ranges = Vec::new();
@@ -3278,12 +3392,15 @@ impl Terminal {
             if dirty {
                 append_dirty_row(&mut dirty_ranges, row);
             }
+            let index = usize::from(row);
             if can_reuse_rows {
                 if dirty {
-                    replacement_rows.push((usize::from(row), self.read_row(row, cols)?));
+                    let snapshot_row = self.read_viewport_row(row, cols, &mut pool)?;
+                    replacement_rows.push((index, snapshot_row));
                 }
             } else {
-                normalized_rows.push(self.read_row(row, cols)?);
+                let snapshot_row = self.read_viewport_row(row, cols, &mut pool)?;
+                normalized_rows.push(snapshot_row);
             }
             let clean = false;
             // SAFETY: the iterator is positioned on the current live row and
@@ -3325,13 +3442,15 @@ impl Terminal {
                 } {
                     return Err(Error::NoValue);
                 }
-                normalized_rows.push(self.read_row(row, cols)?);
+                let snapshot_row = self.read_viewport_row(row, cols, &mut pool)?;
+                normalized_rows.push(snapshot_row);
             }
             // SAFETY: same iterator validity as above.
             if unsafe { ffi::ghostty_render_state_row_iterator_next(self.row_iterator.as_ptr()) } {
                 return Err(Error::InvalidValue);
             }
         }
+        self.plain_row_pool = pool;
         if can_reuse_rows {
             normalized_rows = Arc::unwrap_or_clone(std::mem::take(&mut self.snapshot.rows));
             for (row, replacement) in replacement_rows {
@@ -3416,13 +3535,143 @@ impl Terminal {
         }
     }
 
-    fn read_row(&mut self, row: u16, cols: u16) -> Result<RowSnapshot, Error> {
+    /// Reads the viewport row under the row iterator.
+    ///
+    /// When Ghostty's row flags rule out styling, grapheme clusters, and
+    /// hyperlinks, every cell is fully described by its raw value. Such a row
+    /// reuses the decoded cells of an identical raw row from the previous
+    /// refresh, or is decoded from the raw values alone. Every other row, and
+    /// any raw value this path does not recognize, uses the general reader.
+    fn read_viewport_row(
+        &mut self,
+        row: u16,
+        cols: u16,
+        pool: &mut PlainRowPool,
+    ) -> Result<RowSnapshot, Error> {
+        let raw_row =
+            row_iterator_query::<ffi::Row>(&self.row_iterator, ffi::RENDER_STATE_ROW_DATA_RAW)?;
+        #[cfg(test)]
+        if self.force_general_row_reads {
+            return self.read_row_from_raw(row, cols, raw_row);
+        }
+        // The hyperlink flag may report false positives, which only send a
+        // row to the general reader.
+        let index = usize::from(row);
+        if row_query::<bool>(raw_row, ffi::ROW_DATA_GRAPHEME)?
+            || row_query::<bool>(raw_row, ffi::ROW_DATA_HYPERLINK)?
+        {
+            pool.clear(index);
+            return self.read_row_from_raw(row, cols, raw_row);
+        }
+        // A styled row's cells also depend on each cell's resolved style. The
+        // flag may report false positives, which only cost the style reads.
+        let styled = row_query::<bool>(raw_row, ffi::ROW_DATA_STYLED)?;
+        let wrapped = row_query::<bool>(raw_row, ffi::ROW_DATA_WRAP)?;
+        let mut view = ffi::CellsView {
+            ptr: std::ptr::null(),
+            len: 0,
+        };
+        row_iterator_query_into(
+            &self.row_iterator,
+            ffi::RENDER_STATE_ROW_DATA_CELLS_RAW,
+            &mut view,
+        )?;
+        if view.ptr.is_null() || view.len != usize::from(cols) {
+            pool.clear(index);
+            return self.read_row_from_raw(row, cols, raw_row);
+        }
+        // SAFETY: Ghostty documents the view as `len` contiguous raw cells
+        // which stay valid until the render state is next updated. The slice
+        // is consumed before this function returns and before any update.
+        let raw = unsafe { std::slice::from_raw_parts(view.ptr, view.len) };
+        let cells = if styled {
+            let Some(cells) = self.read_styled_row_cells(raw, index, pool)? else {
+                pool.clear(index);
+                return self.read_row_from_raw(row, cols, raw_row);
+            };
+            cells
+        } else {
+            let cells = if let Some(previous) = pool.find_plain(index, raw) {
+                previous
+            } else {
+                // The row previously at this position usually differs in only
+                // a few columns (an edited line), and an identical raw cell in
+                // a plain row decodes identically.
+                let Some(cells) = decode_plain_cells(raw, pool.plain_entry(index))? else {
+                    pool.clear(index);
+                    return self.read_row_from_raw(row, cols, raw_row);
+                };
+                #[cfg(test)]
+                {
+                    self.snapshot_row_decodes = self.snapshot_row_decodes.saturating_add(1);
+                }
+                Arc::new(cells)
+            };
+            pool.set(index, raw, None, Arc::clone(&cells));
+            cells
+        };
         #[cfg(test)]
         {
             self.snapshot_row_reads = self.snapshot_row_reads.saturating_add(1);
         }
-        let raw_row =
-            row_iterator_query::<ffi::Row>(&self.row_iterator, ffi::RENDER_STATE_ROW_DATA_RAW)?;
+        Ok(RowSnapshot { cells, wrapped })
+    }
+
+    /// Reads a styled row's cells, which also depend on each cell's resolved
+    /// style. Returns `None` for any value the general reader must handle.
+    fn read_styled_row_cells(
+        &mut self,
+        raw: &[ffi::Cell],
+        index: usize,
+        pool: &mut PlainRowPool,
+    ) -> Result<Option<Arc<Vec<CellSnapshot>>>, Error> {
+        let mut cells = self.row_cells.as_ptr();
+        row_iterator_query_into(
+            &self.row_iterator,
+            ffi::RENDER_STATE_ROW_DATA_CELLS,
+            &mut cells,
+        )?;
+        if cells != self.row_cells.as_ptr() {
+            return Err(Error::InvalidValue);
+        }
+        let mut styles = std::mem::take(&mut pool.scratch_styles);
+        styles.clear();
+        for _ in raw {
+            // SAFETY: the row-cells iterator was populated for the current
+            // render row and has not been invalidated.
+            if !unsafe { ffi::ghostty_render_state_row_cells_next(self.row_cells.as_ptr()) } {
+                return Err(Error::NoValue);
+            }
+            styles.push(normalize_style(row_cell_style(&self.row_cells)?)?);
+        }
+        let cells = if let Some(previous) = pool.find_styled(index, raw, &styles) {
+            Some(previous)
+        } else {
+            let decoded = decode_styled_cells(raw, &styles, pool.styled_entry(index))?;
+            #[cfg(test)]
+            if decoded.is_some() {
+                self.snapshot_row_decodes = self.snapshot_row_decodes.saturating_add(1);
+            }
+            decoded.map(Arc::new)
+        };
+        if let Some(cells) = &cells {
+            pool.set(index, raw, Some(&styles), Arc::clone(cells));
+        }
+        pool.scratch_styles = styles;
+        Ok(cells)
+    }
+
+    fn read_row_from_raw(
+        &mut self,
+        row: u16,
+        cols: u16,
+        raw_row: ffi::Row,
+    ) -> Result<RowSnapshot, Error> {
+        #[cfg(test)]
+        {
+            self.snapshot_row_reads = self.snapshot_row_reads.saturating_add(1);
+            self.snapshot_row_decodes = self.snapshot_row_decodes.saturating_add(1);
+        }
         let wrapped = row_query::<bool>(raw_row, ffi::ROW_DATA_WRAP)?;
         let mut cells = self.row_cells.as_ptr();
         row_iterator_query_into(
@@ -3537,7 +3786,15 @@ impl Terminal {
         Ok(())
     }
 
-    fn read_grid_row(&self, row: usize, cols: u16) -> Result<RowSnapshot, Error> {
+    /// Reads one history row. Like the viewport reader, a row whose flags
+    /// rule out styling, grapheme clusters, and hyperlinks is decoded from its
+    /// raw cell values; any other row uses the general cell reader.
+    fn read_grid_row(
+        &self,
+        row: usize,
+        cols: u16,
+        raw: &mut Vec<ffi::Cell>,
+    ) -> Result<RowSnapshot, Error> {
         #[cfg(test)]
         self.history_row_reads
             .set(self.history_row_reads.get().saturating_add(1));
@@ -3545,6 +3802,28 @@ impl Terminal {
         let row_reference = terminal_grid_ref(&self.terminal, ffi::POINT_TAG_HISTORY, 0, row)?;
         let raw_row = grid_ref_query_row(&row_reference)?;
         let wrapped = row_query::<bool>(raw_row, ffi::ROW_DATA_WRAP)?;
+        #[cfg(test)]
+        let plain_path = !self.force_general_row_reads;
+        #[cfg(not(test))]
+        let plain_path = true;
+        if plain_path
+            && !row_query::<bool>(raw_row, ffi::ROW_DATA_STYLED)?
+            && !row_query::<bool>(raw_row, ffi::ROW_DATA_GRAPHEME)?
+            && !row_query::<bool>(raw_row, ffi::ROW_DATA_HYPERLINK)?
+        {
+            raw.clear();
+            for col in 0..cols {
+                let reference =
+                    terminal_grid_ref(&self.terminal, ffi::POINT_TAG_HISTORY, col, row)?;
+                raw.push(grid_ref_query_cell(&reference)?);
+            }
+            if let Some(cells) = decode_plain_cells(raw, None)? {
+                return Ok(RowSnapshot {
+                    cells: Arc::new(cells),
+                    wrapped,
+                });
+            }
+        }
         let mut cells = Vec::with_capacity(usize::from(cols));
         for col in 0..cols {
             let reference = terminal_grid_ref(&self.terminal, ffi::POINT_TAG_HISTORY, col, row)?;
@@ -3555,6 +3834,286 @@ impl Terminal {
             wrapped,
         })
     }
+}
+
+/// Decoded viewport rows. Each entry pairs a row's raw cell values (and, for
+/// a styled row, every cell's normalized style) with the cells decoded from
+/// them; together these fully determine the cells of a row without grapheme
+/// clusters or hyperlinks. Lookups compare that content, never positions, so
+/// an entry is a correct pair wherever it sits; entries are updated in place
+/// as rows are read, and the worst outcome of an overwritten entry is a missed
+/// reuse. Keys live in flat buffers so steady-state refreshes allocate
+/// nothing here.
+#[derive(Default)]
+struct PlainRowPool {
+    cols: usize,
+    raw: Vec<ffi::Cell>,
+    /// Per-cell styles, meaningful only for styled entries.
+    styles: Vec<StyleSnapshot>,
+    cells: Vec<Option<PoolCells>>,
+    /// Reused buffer for the styles of the row being read.
+    scratch_styles: Vec<StyleSnapshot>,
+    /// Offset of the most recent match, probed first so a scroll usually
+    /// matches on its first comparison.
+    probe_offset: isize,
+}
+
+impl PlainRowPool {
+    /// Keeps entries when the geometry is unchanged and empties the pool
+    /// otherwise.
+    fn prepare(&mut self, rows: usize, cols: usize) {
+        if self.cols == cols && self.cells.len() == rows {
+            return;
+        }
+        self.cols = cols;
+        self.raw.clear();
+        self.raw.resize(rows.saturating_mul(cols), 0);
+        self.styles.clear();
+        self.styles
+            .resize(rows.saturating_mul(cols), StyleSnapshot::default());
+        self.cells.clear();
+        self.cells.resize(rows, None);
+        self.probe_offset = 0;
+    }
+
+    fn range(&self, row: usize) -> std::ops::Range<usize> {
+        row * self.cols..(row + 1) * self.cols
+    }
+
+    /// Whether a plain entry with exactly these raw cells is stored here.
+    #[inline(always)]
+    fn plain_matches(&self, row: usize, raw: &[ffi::Cell]) -> bool {
+        matches!(self.cells.get(row), Some(Some(entry)) if !entry.styled)
+            && self.raw[self.range(row)] == *raw
+    }
+
+    /// Whether a styled entry with exactly these raw cells and styles is
+    /// stored here.
+    #[inline(always)]
+    fn styled_matches(&self, row: usize, raw: &[ffi::Cell], styles: &[StyleSnapshot]) -> bool {
+        matches!(self.cells.get(row), Some(Some(entry)) if entry.styled)
+            && self.raw[self.range(row)] == *raw
+            && self.styles[self.range(row)] == *styles
+    }
+
+    #[inline(always)]
+    fn find_by(
+        &mut self,
+        row: usize,
+        matches: impl Fn(&Self, usize) -> bool,
+    ) -> Option<Arc<Vec<CellSnapshot>>> {
+        let probe = row
+            .checked_add_signed(self.probe_offset)
+            .filter(|&index| matches(self, index));
+        let index = match probe {
+            Some(index) => index,
+            None => {
+                let index = (0..self.cells.len()).find(|&index| matches(self, index))?;
+                self.probe_offset = index as isize - row as isize;
+                index
+            }
+        };
+        self.cells[index]
+            .as_ref()
+            .map(|entry| Arc::clone(&entry.cells))
+    }
+
+    fn find_plain(&mut self, row: usize, raw: &[ffi::Cell]) -> Option<Arc<Vec<CellSnapshot>>> {
+        self.find_by(row, |pool, index| pool.plain_matches(index, raw))
+    }
+
+    fn find_styled(
+        &mut self,
+        row: usize,
+        raw: &[ffi::Cell],
+        styles: &[StyleSnapshot],
+    ) -> Option<Arc<Vec<CellSnapshot>>> {
+        self.find_by(row, |pool, index| pool.styled_matches(index, raw, styles))
+    }
+
+    /// A plain entry stored at a position, whatever its content.
+    fn plain_entry(&self, row: usize) -> Option<(&[ffi::Cell], &[CellSnapshot])> {
+        let entry = self.cells.get(row)?.as_ref()?;
+        (!entry.styled).then(|| (&self.raw[self.range(row)], entry.cells.as_slice()))
+    }
+
+    /// A styled entry stored at a position, whatever its content.
+    fn styled_entry(&self, row: usize) -> Option<StyledEntry<'_>> {
+        let entry = self.cells.get(row)?.as_ref()?;
+        let range = self.range(row);
+        entry.styled.then(|| StyledEntry {
+            raw: &self.raw[range.clone()],
+            styles: &self.styles[range],
+            cells: entry.cells.as_slice(),
+        })
+    }
+
+    fn set(
+        &mut self,
+        row: usize,
+        raw: &[ffi::Cell],
+        styles: Option<&[StyleSnapshot]>,
+        cells: Arc<Vec<CellSnapshot>>,
+    ) {
+        if raw.len() != self.cols
+            || styles.is_some_and(|styles| styles.len() != self.cols)
+            || row >= self.cells.len()
+        {
+            self.clear(row);
+            return;
+        }
+        let range = self.range(row);
+        self.raw[range.clone()].copy_from_slice(raw);
+        if let Some(styles) = styles {
+            self.styles[range].clone_from_slice(styles);
+        }
+        self.cells[row] = Some(PoolCells {
+            cells,
+            styled: styles.is_some(),
+        });
+    }
+
+    /// Forgets a row read by the general reader, so the pool never keeps a
+    /// replaced row's cells alive.
+    fn clear(&mut self, row: usize) {
+        if let Some(entry) = self.cells.get_mut(row) {
+            *entry = None;
+        }
+    }
+}
+
+/// An entry's decoded cells and whether its key includes styles.
+#[derive(Clone)]
+struct PoolCells {
+    cells: Arc<Vec<CellSnapshot>>,
+    styled: bool,
+}
+
+#[derive(Clone, Copy)]
+struct StyledEntry<'a> {
+    raw: &'a [ffi::Cell],
+    styles: &'a [StyleSnapshot],
+    cells: &'a [CellSnapshot],
+}
+
+/// Decodes a row whose flags rule out styling, grapheme clusters, and
+/// hyperlinks. `donor` is another plain row's raw cells and their decoded
+/// cells; a column whose raw value matches the donor's reuses its decoded
+/// cell. Returns `None` for any value the general reader must handle.
+fn decode_plain_cells(
+    raw: &[ffi::Cell],
+    donor: Option<(&[ffi::Cell], &[CellSnapshot])>,
+) -> Result<Option<Vec<CellSnapshot>>, Error> {
+    let default_style = normalize_style(ffi::Style::init())?;
+    let mut cells: Vec<CellSnapshot> = Vec::with_capacity(raw.len());
+    let mut previous: Option<ffi::Cell> = None;
+    for (col, &cell) in raw.iter().enumerate() {
+        if previous == Some(cell)
+            && let Some(last) = cells.last()
+        {
+            let repeated = last.clone();
+            cells.push(repeated);
+            continue;
+        }
+        if let Some((donor_raw, donor_cells)) = donor
+            && donor_raw.get(col) == Some(&cell)
+            && let Some(donated) = donor_cells.get(col)
+        {
+            previous = Some(cell);
+            cells.push(donated.clone());
+            continue;
+        }
+        let Some(decoded) = decode_plain_cell(cell, &default_style)? else {
+            return Ok(None);
+        };
+        previous = Some(cell);
+        cells.push(decoded);
+    }
+    Ok(Some(cells))
+}
+
+/// Decodes a styled row whose flags rule out grapheme clusters and hyperlinks
+/// from its raw cells and their normalized styles. A column whose raw value
+/// and style match the previous column or the donor's reuses that cell.
+fn decode_styled_cells(
+    raw: &[ffi::Cell],
+    styles: &[StyleSnapshot],
+    donor: Option<StyledEntry<'_>>,
+) -> Result<Option<Vec<CellSnapshot>>, Error> {
+    let mut cells: Vec<CellSnapshot> = Vec::with_capacity(raw.len());
+    for (col, (&cell, style)) in raw.iter().zip(styles).enumerate() {
+        if col > 0
+            && raw[col - 1] == cell
+            && styles[col - 1] == *style
+            && let Some(last) = cells.last()
+        {
+            let repeated = last.clone();
+            cells.push(repeated);
+            continue;
+        }
+        if let Some(donor) = donor
+            && donor.raw.get(col) == Some(&cell)
+            && donor.styles.get(col) == Some(style)
+            && let Some(donated) = donor.cells.get(col)
+        {
+            cells.push(donated.clone());
+            continue;
+        }
+        let Some(decoded) = decode_plain_cell(cell, style)? else {
+            return Ok(None);
+        };
+        cells.push(decoded);
+    }
+    Ok(Some(cells))
+}
+
+/// Decodes one cell from its raw value and its normalized style, for a row
+/// without grapheme clusters or hyperlinks.
+fn decode_plain_cell(
+    cell: ffi::Cell,
+    cell_style: &StyleSnapshot,
+) -> Result<Option<CellSnapshot>, Error> {
+    let (width, continuation) = match cell_query::<ffi::CellWide>(cell, ffi::CELL_DATA_WIDE)? {
+        ffi::CELL_WIDE_NARROW => (1, false),
+        ffi::CELL_WIDE_WIDE => (2, false),
+        ffi::CELL_WIDE_SPACER_TAIL | ffi::CELL_WIDE_SPACER_HEAD => (0, true),
+        _ => return Err(Error::InvalidValue),
+    };
+    let mut style = cell_style.clone();
+    let grapheme = match cell_query::<ffi::CellContentTag>(cell, ffi::CELL_DATA_CONTENT_TAG)? {
+        ffi::CELL_CONTENT_CODEPOINT => {
+            let codepoint = cell_query::<u32>(cell, ffi::CELL_DATA_CODEPOINT)?;
+            if codepoint == 0 {
+                Cow::Borrowed("")
+            } else {
+                let Some(character) = char::from_u32(codepoint) else {
+                    return Ok(None);
+                };
+                let mut buffer = [0; 4];
+                compact_utf8_grapheme(character.encode_utf8(&mut buffer).as_bytes())?
+            }
+        }
+        ffi::CELL_CONTENT_BG_COLOR_PALETTE => {
+            style.background =
+                ColorSnapshot::Indexed(cell_query(cell, ffi::CELL_DATA_COLOR_PALETTE)?);
+            Cow::Borrowed("")
+        }
+        ffi::CELL_CONTENT_BG_COLOR_RGB => {
+            let rgb = cell_query::<ffi::ColorRgb>(cell, ffi::CELL_DATA_COLOR_RGB)?;
+            style.background = ColorSnapshot::Rgb(rgb.r, rgb.g, rgb.b);
+            Cow::Borrowed("")
+        }
+        // A grapheme cell contradicts the row flag; defer to the general reader.
+        ffi::CELL_CONTENT_CODEPOINT_GRAPHEME => return Ok(None),
+        _ => return Err(Error::InvalidValue),
+    };
+    Ok(Some(CellSnapshot {
+        grapheme,
+        width,
+        continuation,
+        style,
+        hyperlink: None,
+    }))
 }
 
 fn signed_offset(expected: usize, observed: usize) -> Result<isize, Error> {
@@ -4432,6 +4991,196 @@ mod tests {
             "an ordinary one-line update must not re-read the other 23 rows"
         );
         assert_eq!(terminal.snapshot().rows[0].text(), "one line");
+    }
+
+    /// The plain-row paths must be exact substitutes for the general reader:
+    /// after every chunk, both produce identical viewport and history rows.
+    #[test]
+    fn plain_row_reader_matches_general_reader() {
+        let wide_wrap = "\u{4e2d}".repeat(41);
+        let chunks: &[&[u8]] = &[
+            b"plain ascii\r\n",
+            "wide \u{4e2d}\u{6587} text\r\n".as_bytes(),
+            b"\x1b[41m\x1b[2Kpalette erase\x1b[0m\r\n",
+            b"\x1b[48;2;1;2;3m\x1b[Krgb erase\x1b[0m\r\n",
+            b"\x1b[1;31mstyled\x1b[0m plain tail\r\n",
+            "e\u{301} combining\r\n".as_bytes(),
+            b"\x1b]8;;https://example.invalid\x07link\x1b]8;;\x07 after\r\n",
+            b"\x7f del and tab\there\r\n",
+            &[b'w'; 100],
+            b"\r\n",
+            wide_wrap.as_bytes(),
+            b"\r\n\x1b[3;1Hover\x1b[Kwritten\x1b[24;1H",
+            b"\x1b[?1049halternate\r\nscreen\x1b[?1049l",
+            b"\x1b[5;10r\x1b[10;1Hregion\r\nscroll\r\n\x1b[r",
+            b"\x1b[1;3HX",
+            "\x1b[1;5H\u{4e2d}".as_bytes(),
+            b"\x1b[1;5Hab",
+            b"\x1b[41m\x1b[1;8H\x1b[2X\x1b[0m",
+            b"\x1b[1;80HZ",
+            b"\x1b[1;1H\x1b[31mabc\x1b[0m",
+            b"\x1b[1;1H\x1b[34mabc\x1b[0m",
+            b"\x1b[1;1H\x1b[1;4:3;58;2;1;2;3mfancy\x1b[0m\x1b[44m\x1b[K\x1b[0m",
+            b"\x1b[1;1Habc\x1b[2m\x1b[1;2Hb\x1b[0m",
+            // Freeing a style and then printing the same text in a new style
+            // can reuse the style id, leaving the raw cells unchanged.
+            b"\x1b[2J\x1b[1;1H\x1b[31mabc\x1b[0m",
+            b"\x1b[1;1H\x1b[2K\x1b[34mabc\x1b[0m",
+            b"\x1b[1;1H\x1b[2K\x1b[1;7mabc\x1b[0m",
+        ];
+        let mut scrolling = Vec::new();
+        for line in 0..40 {
+            scrolling.extend_from_slice(format!("line {line}\r\n").as_bytes());
+            scrolling.extend_from_slice(
+                format!(
+                    "\x1b[3{}mcolored\x1b[0m line {line} \x1b[1mbold\x1b[0m\r\n",
+                    line % 8
+                )
+                .as_bytes(),
+            );
+        }
+        let mut style_churn = Vec::new();
+        for index in 0..300_usize {
+            style_churn.extend_from_slice(
+                format!(
+                    "\x1b[2;1H\x1b[38;5;{};48;5;{}mchurn\x1b[0m\x1b[3;1H\x1b[38;2;{};1;2mchurn\x1b[0m",
+                    index % 256,
+                    (index * 7) % 256,
+                    index % 256
+                )
+                .as_bytes(),
+            );
+        }
+
+        let mut fast = Terminal::new(24, 80).expect("create fast terminal");
+        let mut general = Terminal::new(24, 80).expect("create general terminal");
+        general.force_general_row_reads = true;
+        for chunk in chunks
+            .iter()
+            .copied()
+            .chain([style_churn.as_slice(), scrolling.as_slice()])
+        {
+            fast.advance(chunk).expect("advance fast terminal");
+            general.advance(chunk).expect("advance general terminal");
+            assert_eq!(
+                fast.snapshot().rows,
+                general.snapshot().rows,
+                "rows diverged after {:?}",
+                String::from_utf8_lossy(chunk)
+            );
+            assert_eq!(
+                fast.snapshot_with_history()
+                    .expect("fast history")
+                    .scrollback,
+                general
+                    .snapshot_with_history()
+                    .expect("general history")
+                    .scrollback,
+                "history diverged after {:?}",
+                String::from_utf8_lossy(chunk)
+            );
+        }
+        assert!(
+            !fast
+                .snapshot_with_history()
+                .expect("fast history")
+                .scrollback
+                .is_empty(),
+            "the fixture must exercise history rows"
+        );
+    }
+
+    /// Parsing ASCII runs in bulk must report exactly what parsing one byte
+    /// at a time reported, however the stream is split into writes.
+    #[test]
+    fn bulk_parsing_reports_match_bytewise_parsing() {
+        let streams: &[&[u8]] = &[
+            b"plain text\r\nmore text\r\n",
+            b"\x1b]133;A\x07$ \x1b]133;B\x07ls\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07",
+            b"\x1b[?2026hframe one\x1b[?2026l\x1b[?2026h\x1b[2Jtwo\x1b[?2026l",
+            b"\x1b[?25lhidden\x1b[?25h shown\x1b[?1016h\x1b[?2031h",
+            b"before\x1b_Gq=1\x1b\\after\x9fraw apc\x9cend",
+            b"\x1b]52;c;?\x07\x1b]10;?\x07\x1b]11;?\x1b\\tail",
+            &[
+                0xc2, 0x9b, b'3', b'1', b'm', b'a', 0xff, 0xe2, 0x82, b'x', 0xed, 0xa0, b'y',
+            ],
+            "wide \u{4e2d}\u{6587} e\u{301} done\r\n".as_bytes(),
+            b"\x1b[31mred\x1b[0m\ttab\x08back\x7fdel\x1b(0qq\x1b(B\r\n",
+            b"\x1b]8;;https://example.invalid\x07link\x1b]8;;\x07\x1b]2;title\x07",
+        ];
+        for split in [1, 2, 5, 13, usize::MAX] {
+            let mut bulk = Terminal::new(6, 20).expect("create bulk terminal");
+            let mut bytewise = Terminal::new(6, 20).expect("create bytewise terminal");
+            bytewise.force_bytewise_parsing = true;
+            for stream in streams {
+                for chunk in stream.chunks(split.min(stream.len())) {
+                    let bulk_update = bulk.advance(chunk).expect("bulk advance");
+                    let bytewise_update = bytewise.advance(chunk).expect("bytewise advance");
+                    assert_eq!(
+                        bulk_update,
+                        bytewise_update,
+                        "split {split}, chunk {:?}",
+                        String::from_utf8_lossy(chunk)
+                    );
+                    assert_eq!(bulk.snapshot(), bytewise.snapshot(), "split {split}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scrolling_styled_output_reuses_rows_that_only_moved() {
+        let mut terminal = Terminal::new(24, 80).expect("create terminal");
+        let line = |index: usize| {
+            format!("\x1b[32m   status\x1b[0m item-{index:02} (\x1b[1mbold\x1b[0m)\r\n")
+        };
+        for index in 0..30 {
+            terminal
+                .advance(line(index).as_bytes())
+                .expect("fill screen");
+        }
+        terminal.snapshot_row_decodes = 0;
+
+        terminal
+            .advance(line(30).as_bytes())
+            .expect("scroll one line");
+
+        assert!(
+            terminal.snapshot_row_decodes <= 2,
+            "a one-line scroll decoded {} rows",
+            terminal.snapshot_row_decodes
+        );
+        assert_eq!(
+            terminal.snapshot().rows[22].text(),
+            "   status item-30 (bold)"
+        );
+        assert_eq!(
+            terminal.snapshot().rows[22].cells[3].style.foreground,
+            super::ColorSnapshot::Indexed(2)
+        );
+        assert!(terminal.snapshot().rows[22].cells[19].style.bold);
+    }
+
+    #[test]
+    fn scrolling_plain_output_reuses_rows_that_only_moved() {
+        let mut terminal = Terminal::new(24, 80).expect("create terminal");
+        for line in 0..30 {
+            terminal
+                .advance(format!("line {line}\r\n").as_bytes())
+                .expect("fill screen");
+        }
+        terminal.snapshot_row_decodes = 0;
+
+        terminal.advance(b"line 30\r\n").expect("scroll one line");
+
+        assert!(
+            terminal.snapshot_row_decodes <= 2,
+            "a one-line scroll decoded {} rows",
+            terminal.snapshot_row_decodes
+        );
+        assert_eq!(terminal.snapshot().rows[0].text(), "line 8");
+        assert_eq!(terminal.snapshot().rows[22].text(), "line 30");
+        assert_eq!(terminal.snapshot().rows[23].text(), "");
     }
 
     #[test]
