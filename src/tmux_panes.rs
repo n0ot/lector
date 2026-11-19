@@ -531,6 +531,16 @@ pub struct TmuxPaneSet {
     prebootstrap_bytes: usize,
     presentation_tracking: bool,
     virtual_terminal_colors: crate::terminal_protocol::VirtualTerminalColors,
+    /// The last border grid with the exact inputs that produced it. Borders
+    /// depend only on the dividers and geometry, and their rows are shared
+    /// copy-on-write, so an unchanged layout reuses the same grid.
+    border_cache: Option<BorderCache>,
+}
+
+struct BorderCache {
+    geometry: TerminalGeometry,
+    dividers: Vec<Divider>,
+    snapshot: TerminalSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -566,6 +576,7 @@ impl TmuxPaneSet {
             virtual_terminal_colors: crate::terminal_protocol::VirtualTerminalColors::for_scheme(
                 crate::terminal_protocol::ColorScheme::Dark,
             ),
+            border_cache: None,
         }
     }
 
@@ -1221,6 +1232,26 @@ impl TmuxPaneSet {
         self.compose_layout_with_model(&layout, active_pane, &window.name, geometry, model)
     }
 
+    fn border_snapshot(
+        &mut self,
+        layout: &TmuxLayout,
+        geometry: TerminalGeometry,
+    ) -> TerminalSnapshot {
+        if let Some(cache) = &self.border_cache
+            && cache.geometry == geometry
+            && cache.dividers == layout.dividers
+        {
+            return cache.snapshot.clone();
+        }
+        let snapshot = layout.border_snapshot(geometry);
+        self.border_cache = Some(BorderCache {
+            geometry,
+            dividers: layout.dividers.clone(),
+            snapshot: snapshot.clone(),
+        });
+        snapshot
+    }
+
     fn compose_layout_with_model(
         &mut self,
         layout: &TmuxLayout,
@@ -1233,7 +1264,7 @@ impl TmuxPaneSet {
         scene.panes.push(SceneSurface::new(
             self.border_id,
             GridPoint::new(0, 0),
-            layout.border_snapshot(geometry),
+            self.border_snapshot(layout, geometry),
         ));
         for pane in layout.panes() {
             let state = self
@@ -1866,6 +1897,43 @@ mod synchronization_tests {
 
         panes.pane_view_mut(PaneId(20)).unwrap().finalize_changes(1);
         assert_eq!(panes.pending_update(PaneId(20)).unwrap().batch_count, 0);
+    }
+
+    #[test]
+    fn border_grid_is_reused_only_for_identical_dividers_and_geometry() {
+        let topology = split_topology();
+        let mut panes = TmuxPaneSet::new(1);
+        for request in panes.reconcile(&topology).expect("reconcile") {
+            panes
+                .apply_bootstrap(request.pane_id, CommandStatus::Success, &[], 0)
+                .expect("bootstrap");
+        }
+        let split = TmuxLayout::parse(SPLIT).expect("layout");
+        let moved = TmuxLayout::parse("abce,20x4,0,0{12x4,0,0,20,7x4,13,0,21}").expect("layout");
+        let small = crate::terminal::TerminalGeometry::from_cells(4, 20);
+        let large = crate::terminal::TerminalGeometry::from_cells(5, 20);
+        let border = |panes: &mut TmuxPaneSet, layout: &TmuxLayout, geometry| {
+            let scene = panes
+                .compose_layout(layout, Some(PaneId(20)), "editor", geometry)
+                .expect("compose");
+            let border = scene.panes[0].snapshot.clone();
+            assert_eq!(border, layout.border_snapshot(geometry), "{geometry:?}");
+            border
+        };
+
+        let first = border(&mut panes, &split, small);
+        let repeated = border(&mut panes, &split, small);
+        assert!(std::sync::Arc::ptr_eq(&first.rows, &repeated.rows));
+        assert_eq!(first.cell(0, 10).unwrap().contents(), "│");
+
+        let moved_border = border(&mut panes, &moved, small);
+        assert_eq!(moved_border.cell(0, 12).unwrap().contents(), "│");
+        assert_eq!(moved_border.cell(0, 10).unwrap().contents(), "");
+
+        let resized = border(&mut panes, &moved, large);
+        assert_eq!(resized.rows.len(), 5);
+        let restored = border(&mut panes, &split, small);
+        assert_eq!(restored, first);
     }
 
     #[test]
