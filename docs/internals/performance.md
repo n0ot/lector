@@ -19,6 +19,11 @@ that keep it that way, and how to measure a slow path.
   `send-keys` routing, but no timer-based delay.
 - **Reading waits for evidence, not a clock, where it can.** See
   [when output is stable](reading-model.md#when-output-is-stable).
+- **Unchanged rows are not decoded or copied again.** A plain row (no
+  styling, grapheme clusters, or hyperlinks) is matched against the previous
+  refresh by its raw Ghostty cell values, so scrolling decodes only the new
+  line. Composition shares rows that a surface covers exactly, and row
+  comparisons skip shared rows.
 
 ## Latency gate
 
