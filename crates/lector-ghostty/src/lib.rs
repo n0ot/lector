@@ -1660,20 +1660,23 @@ impl StreamObserver {
     /// 8-bit C1 APC byte is structural when it occurs at a UTF-8 code-point
     /// boundary. Track continuation bytes across updates so the same byte in a
     /// valid multibyte character does not unnecessarily disable linear output.
-    fn observe_raw_byte(&mut self, byte: u8) {
+    /// Advances the raw-byte scanner, which runs ahead of the parser. Returns
+    /// whether this byte starts an application program command; the caller
+    /// must mark structural output before the parser receives the byte. This
+    /// scanner state is read nowhere else, so it may run ahead of parsing.
+    #[must_use]
+    fn observe_raw_byte(&mut self, byte: u8) -> bool {
         if self.raw_utf8_continuations > 0 {
             if (self.raw_utf8_next_min..=self.raw_utf8_next_max).contains(&byte) {
                 self.raw_utf8_continuations -= 1;
                 self.raw_utf8_next_min = 0x80;
                 self.raw_utf8_next_max = 0xbf;
                 self.raw_escape_pending = false;
-                return;
+                return false;
             }
             self.raw_utf8_continuations = 0;
         }
-        if byte == 0x9f || (self.raw_escape_pending && byte == b'_') {
-            self.mark_structural_output();
-        }
+        let starts_command = byte == 0x9f || (self.raw_escape_pending && byte == b'_');
         self.raw_escape_pending = byte == b'\x1b';
         (
             self.raw_utf8_continuations,
@@ -1689,6 +1692,7 @@ impl StreamObserver {
             0xf4 => (3, 0x80, 0x8f),
             _ => (0, 0, 0),
         };
+        starts_command
     }
 
     fn mark_visible_output(&mut self) {
@@ -1746,10 +1750,12 @@ impl StreamObserver {
                 text.push(character);
             }
             _ => {
-                // This string is grown one character at a time. Use normal
-                // String growth from the first push, rather than allocating
-                // an exact one-byte string and reallocating on the next print.
-                let mut text = String::new();
+                // A run holds ASCII written left to right on one row and ends
+                // before the right margin, so the columns remaining after
+                // this one bound its length; it never reallocates.
+                let mut text = String::with_capacity(usize::from(
+                    self.operation_cols.saturating_sub(self.operation_col),
+                ));
                 text.push(character);
                 self.operations.push(OperationSnapshot::WriteRun {
                     row: self.operation_row,
@@ -1951,8 +1957,19 @@ struct StreamUpdate {
 }
 
 impl vte::Perform for StreamObserver {
+    fn terminated(&self) -> bool {
+        self.has_boundary_events()
+    }
+
     fn print(&mut self, character: char) {
         self.mark_visible_output();
+        if self.current_print.is_empty() {
+            // Printed text usually runs to the end of the line; size for it
+            // rather than doubling one character at a time.
+            self.current_print.reserve(usize::from(
+                self.operation_cols.saturating_sub(self.operation_col),
+            ));
+        }
         self.current_print.push(character);
         self.record_write(character);
     }
@@ -2386,6 +2403,11 @@ pub struct Terminal {
     snapshot: TerminalSnapshot,
     scrollback_capacity: usize,
     stream_parser: vte::Parser,
+    /// The last byte given to `stream_parser` was not ASCII, so it may hold a
+    /// partial UTF-8 sequence. The parser's callbacks for non-ASCII input
+    /// depend on how bytes are split, so only ASCII that follows ASCII is
+    /// parsed in bulk.
+    stream_parser_after_non_ascii: bool,
     stream_observer: StreamObserver,
     /// Monotonic identity of the oldest row in Lector's bounded primary
     /// history window. Never derive this directly from Ghostty's current
@@ -2418,6 +2440,8 @@ pub struct Terminal {
     snapshot_row_decodes: usize,
     #[cfg(test)]
     force_general_row_reads: bool,
+    #[cfg(test)]
+    force_bytewise_parsing: bool,
     #[cfg(test)]
     history_row_reads: Cell<usize>,
     _thread_bound: PhantomData<Rc<()>>,
@@ -2485,6 +2509,7 @@ impl Terminal {
             snapshot: TerminalSnapshot::default(),
             scrollback_capacity,
             stream_parser: vte::Parser::new(),
+            stream_parser_after_non_ascii: false,
             stream_observer: StreamObserver::default(),
             primary_history_origin: 0,
             primary_history_high_water: 0,
@@ -2500,6 +2525,8 @@ impl Terminal {
             snapshot_row_decodes: 0,
             #[cfg(test)]
             force_general_row_reads: false,
+            #[cfg(test)]
+            force_bytewise_parsing: false,
             #[cfg(test)]
             history_row_reads: Cell::new(0),
             _thread_bound: PhantomData,
@@ -2522,14 +2549,64 @@ impl Terminal {
         let mut history_origin_at_latest_checkpoint = history_origin_before;
         let mut history_changed_before_latest_checkpoint = false;
         let new_semantic_start = self.semantic_marks.len();
+        // Segments end immediately after any byte that produces a boundary
+        // event. The parser reports termination while a boundary is pending,
+        // so it stops on exactly that byte while runs of ASCII are parsed in
+        // bulk; every other byte is parsed alone, as before. The raw scanner
+        // runs ahead and stops parsing at each byte that needs a structural
+        // mark before the parser sees it.
+        #[cfg(test)]
+        let bytewise = self.force_bytewise_parsing;
+        #[cfg(not(test))]
+        let bytewise = false;
         let mut segment_start = 0;
-        for (index, byte) in bytes.iter().copied().enumerate() {
-            self.stream_observer.observe_raw_byte(byte);
-            self.stream_parser
-                .advance(&mut self.stream_observer, &[byte]);
+        let mut fed = 0;
+        let mut observed = 0;
+        let mut next_mark = None;
+        while fed < bytes.len() {
+            if next_mark.is_none() {
+                while let Some(&byte) = bytes.get(observed) {
+                    observed += 1;
+                    if self.stream_observer.observe_raw_byte(byte) {
+                        next_mark = Some(observed - 1);
+                        break;
+                    }
+                }
+            }
+            let limit = next_mark.unwrap_or(bytes.len());
+            if fed == limit {
+                self.stream_observer.mark_structural_output();
+                next_mark = None;
+                continue;
+            }
+            let consumed = if bytewise
+                || self.stream_observer.has_boundary_events()
+                || self.stream_parser_after_non_ascii
+                || !bytes[fed].is_ascii()
+            {
+                // A boundary left pending by the previous segment ends the
+                // next byte's segment too, exactly as per-byte parsing did.
+                0
+            } else {
+                let run = bytes[fed..limit]
+                    .iter()
+                    .position(|byte| !byte.is_ascii())
+                    .map_or(limit, |offset| fed + offset);
+                self.stream_parser
+                    .advance_until_terminated(&mut self.stream_observer, &bytes[fed..run])
+            };
+            fed += if consumed == 0 {
+                self.stream_parser
+                    .advance(&mut self.stream_observer, &bytes[fed..=fed]);
+                1
+            } else {
+                consumed
+            };
+            self.stream_parser_after_non_ascii = !bytes[fed - 1].is_ascii();
             if !self.stream_observer.has_boundary_events() {
                 continue;
             }
+            let index = fed - 1;
             let synchronized_before = self.snapshot.modes.synchronized_output;
             let cursor_visible_before = self.snapshot.cursor.visible;
             self.write_vt(&bytes[segment_start..=index]);
@@ -2843,6 +2920,9 @@ impl Terminal {
             snapshot: TerminalSnapshot::default(),
             scrollback_capacity,
             stream_parser,
+            stream_parser_after_non_ascii: observer_continuation
+                .last()
+                .is_some_and(|byte| *byte >= 0x80),
             stream_observer,
             primary_history_origin,
             primary_history_high_water,
@@ -2863,6 +2943,8 @@ impl Terminal {
             #[cfg(test)]
             force_general_row_reads: false,
             #[cfg(test)]
+            force_bytewise_parsing: false,
+            #[cfg(test)]
             history_row_reads: Cell::new(0),
             _thread_bound: PhantomData,
         };
@@ -2882,6 +2964,7 @@ impl Terminal {
         // SAFETY: the terminal handle is valid.
         unsafe { ffi::ghostty_terminal_reset(self.terminal.as_ptr()) };
         self.stream_parser = vte::Parser::new();
+        self.stream_parser_after_non_ascii = false;
         self.stream_observer = StreamObserver::default();
         self.history_changed_since_open_checkpoint = true;
         let _ = self.effect_sink.take()?;
@@ -4791,6 +4874,44 @@ mod tests {
                 .is_empty(),
             "the fixture must exercise history rows"
         );
+    }
+
+    /// Parsing ASCII runs in bulk must report exactly what parsing one byte
+    /// at a time reported, however the stream is split into writes.
+    #[test]
+    fn bulk_parsing_reports_match_bytewise_parsing() {
+        let streams: &[&[u8]] = &[
+            b"plain text\r\nmore text\r\n",
+            b"\x1b]133;A\x07$ \x1b]133;B\x07ls\x1b]133;C\x07\r\nout\r\n\x1b]133;D;0\x07",
+            b"\x1b[?2026hframe one\x1b[?2026l\x1b[?2026h\x1b[2Jtwo\x1b[?2026l",
+            b"\x1b[?25lhidden\x1b[?25h shown\x1b[?1016h\x1b[?2031h",
+            b"before\x1b_Gq=1\x1b\\after\x9fraw apc\x9cend",
+            b"\x1b]52;c;?\x07\x1b]10;?\x07\x1b]11;?\x1b\\tail",
+            &[
+                0xc2, 0x9b, b'3', b'1', b'm', b'a', 0xff, 0xe2, 0x82, b'x', 0xed, 0xa0, b'y',
+            ],
+            "wide \u{4e2d}\u{6587} e\u{301} done\r\n".as_bytes(),
+            b"\x1b[31mred\x1b[0m\ttab\x08back\x7fdel\x1b(0qq\x1b(B\r\n",
+            b"\x1b]8;;https://example.invalid\x07link\x1b]8;;\x07\x1b]2;title\x07",
+        ];
+        for split in [1, 2, 5, 13, usize::MAX] {
+            let mut bulk = Terminal::new(6, 20).expect("create bulk terminal");
+            let mut bytewise = Terminal::new(6, 20).expect("create bytewise terminal");
+            bytewise.force_bytewise_parsing = true;
+            for stream in streams {
+                for chunk in stream.chunks(split.min(stream.len())) {
+                    let bulk_update = bulk.advance(chunk).expect("bulk advance");
+                    let bytewise_update = bytewise.advance(chunk).expect("bytewise advance");
+                    assert_eq!(
+                        bulk_update,
+                        bytewise_update,
+                        "split {split}, chunk {:?}",
+                        String::from_utf8_lossy(chunk)
+                    );
+                    assert_eq!(bulk.snapshot(), bytewise.snapshot(), "split {split}");
+                }
+            }
+        }
     }
 
     #[test]
