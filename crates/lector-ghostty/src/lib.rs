@@ -3497,7 +3497,10 @@ impl Terminal {
         let cells = if let Some(previous) = pool.find(index, raw) {
             previous
         } else {
-            let Some(cells) = decode_plain_cells(raw)? else {
+            // The row previously at this position usually differs in only a
+            // few columns (an edited line), and an identical raw cell in a
+            // plain row decodes identically.
+            let Some(cells) = decode_plain_cells(raw, pool.entry(index))? else {
                 pool.clear(index);
                 return self.read_row_from_raw(row, cols, raw_row);
             };
@@ -3671,7 +3674,7 @@ impl Terminal {
                     terminal_grid_ref(&self.terminal, ffi::POINT_TAG_HISTORY, col, row)?;
                 raw.push(grid_ref_query_cell(&reference)?);
             }
-            if let Some(cells) = decode_plain_cells(raw)? {
+            if let Some(cells) = decode_plain_cells(raw, None)? {
                 return Ok(RowSnapshot {
                     cells: Arc::new(cells),
                     wrapped,
@@ -3739,6 +3742,14 @@ impl PlainRowPool {
         self.matching(index, raw).map(Arc::clone)
     }
 
+    /// The entry stored at a position, whatever its content.
+    fn entry(&self, row: usize) -> Option<(&[ffi::Cell], &[CellSnapshot])> {
+        let cells = self.cells.get(row)?.as_ref()?;
+        let start = row.checked_mul(self.cols)?;
+        let raw = self.raw.get(start..start.checked_add(self.cols)?)?;
+        Some((raw, cells.as_slice()))
+    }
+
     fn set(&mut self, row: usize, raw: &[ffi::Cell], cells: Arc<Vec<CellSnapshot>>) {
         if raw.len() != self.cols || row >= self.cells.len() {
             return;
@@ -3759,16 +3770,29 @@ impl PlainRowPool {
 
 /// Decodes a row whose flags rule out styling, grapheme clusters, and
 /// hyperlinks. Returns `None` for any value the general reader must handle.
-fn decode_plain_cells(raw: &[ffi::Cell]) -> Result<Option<Vec<CellSnapshot>>, Error> {
+/// `donor` is another plain row's raw cells and their decoded cells; a
+/// column whose raw value matches the donor's reuses its decoded cell.
+fn decode_plain_cells(
+    raw: &[ffi::Cell],
+    donor: Option<(&[ffi::Cell], &[CellSnapshot])>,
+) -> Result<Option<Vec<CellSnapshot>>, Error> {
     let default_style = normalize_style(ffi::Style::init())?;
     let mut cells: Vec<CellSnapshot> = Vec::with_capacity(raw.len());
     let mut previous: Option<ffi::Cell> = None;
-    for &cell in raw {
+    for (col, &cell) in raw.iter().enumerate() {
         if previous == Some(cell)
             && let Some(last) = cells.last()
         {
             let repeated = last.clone();
             cells.push(repeated);
+            continue;
+        }
+        if let Some((donor_raw, donor_cells)) = donor
+            && donor_raw.get(col) == Some(&cell)
+            && let Some(donated) = donor_cells.get(col)
+        {
+            previous = Some(cell);
+            cells.push(donated.clone());
             continue;
         }
         let Some(decoded) = decode_plain_cell(cell, &default_style)? else {
@@ -4724,6 +4748,11 @@ mod tests {
             b"\r\n\x1b[3;1Hover\x1b[Kwritten\x1b[24;1H",
             b"\x1b[?1049halternate\r\nscreen\x1b[?1049l",
             b"\x1b[5;10r\x1b[10;1Hregion\r\nscroll\r\n\x1b[r",
+            b"\x1b[1;3HX",
+            "\x1b[1;5H\u{4e2d}".as_bytes(),
+            b"\x1b[1;5Hab",
+            b"\x1b[41m\x1b[1;8H\x1b[2X\x1b[0m",
+            b"\x1b[1;80HZ",
         ];
         let mut scrolling = Vec::new();
         for line in 0..40 {
