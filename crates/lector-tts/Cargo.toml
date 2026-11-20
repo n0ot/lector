@@ -1,6 +1,6 @@
 [package]
 name = "lector-tts"
-version = "0.4.2"
+version = "0.1.0"
 authors = ["Nolan Darilek <nolan@thewordnerd.info>"]
 edition = "2024"
 rust-version.workspace = true

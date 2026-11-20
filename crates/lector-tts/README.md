@@ -11,10 +11,10 @@ This crate contains two things:
 You only need `lector-tts` when speech runs on a different machine from
 Lector. Lector itself includes the same server as `lector tts`.
 
-Install the standalone server from crates.io.
+Install it from a clone of the repository:
 
 ```shell
-cargo install --locked lector-tts
+cargo install --locked --path crates/lector-tts
 ```
 
 See what is available and choose:

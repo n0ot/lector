@@ -28,14 +28,13 @@ compatible glibc system or `musl` for a statically linked build.
 
 To build from source, you need:
 
-- [Rust](https://rustup.rs) 1.100 or newer, using rustup or Alpine's `rust` and `cargo` packages
+- [Rust](https://rustup.rs), using rustup or Alpine's `rust` and `cargo` packages
 - `curl` and `tar`
 - On Linux, a C compiler (`build-essential` on Debian and Ubuntu,
   `build-base` on Alpine)
 - On macOS, the Xcode command line tools (`xcode-select --install`)
 
-Install the latest release from crates.io with `cargo install --locked lector`.
-To install from a checkout instead, run the following.
+Then clone the repository and install:
 
 ```bash
 git clone https://github.com/n0ot/lector.git
@@ -46,8 +45,7 @@ cargo install --locked --path .
 This puts `lector` in `~/.cargo/bin`, which rustup adds to your `PATH`. The
 first build downloads Lector's terminal engine and takes a few minutes.
 
-To update from crates.io, run the registry install command again. For a
-checkout, run `git pull` and repeat the checkout install command.
+To update later, run `git pull` and the same install command again.
 
 Lector runs on macOS and Linux, including glibc distributions and Alpine.
 Ordinary Cargo commands use the host platform and dynamically link its C

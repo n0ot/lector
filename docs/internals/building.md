@@ -103,7 +103,7 @@ Everything lands under `target/`:
 
 | Input | Pin |
 | --- | --- |
-| `lector-ghostty` adapter | Version pinned by `Cargo.lock`, from this repository |
+| `lector-ghostty` adapter | `0.1.0`, from this repository |
 | libghostty-vt | `1.0.0`, tag `vt-1.0.0`, commit `0fa3d577a5614150ff8e2c152de5fb9d5c6d2dec` |
 | Source archive SHA-256 | `4a6ef758be721923e1969e7b81b443dcc92d8dd3fb5a39600c03a8817a753676` |
 | Dependency archive SHA-256 | `4d5ea5e448e4c7ea8fb55ccbaa8668f2a97d44f438cee831e2b7ecd162d85c29` |
