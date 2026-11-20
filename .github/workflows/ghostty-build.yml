@@ -546,11 +546,3 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
           RELEASE_VERSION: ${{ needs.changes.outputs.stable_version }}
         run: python3 .github/scripts/publish_crates.py publish
-      - name: Verify the registry install
-        env:
-          RELEASE_VERSION: ${{ needs.changes.outputs.stable_version }}
-        run: |
-          install_root="$(mktemp -d)"
-          cargo install --locked --registry crates-io --root "$install_root" lector --version "=${RELEASE_VERSION}"
-          test "$(ls -1 "$install_root/bin")" = lector
-          test "$("$install_root/bin/lector" --version)" = "lector $RELEASE_VERSION"

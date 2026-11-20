@@ -181,8 +181,7 @@ branch protection in step, so that every required job stays enforced.
 Merge a version-bump PR into `master`. After CI passes, Actions creates
 the `v<version>` tag and publishes the GitHub release with macOS and Linux
 archives and `SHA256SUMS`. It then publishes to crates.io and checks that
-`cargo install --locked lector` installs the expected version as a single
-executable.
+each package builds with Cargo's standard publish verification.
 
 1. Use the same new version in the `lector`, `lector-ghostty`, and
    `lector-tts` manifests. Choose a version newer than the published
