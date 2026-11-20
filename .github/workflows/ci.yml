@@ -521,6 +521,42 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/publish_release.py
 
+  publish-homebrew:
+    name: Update Homebrew tap
+    needs: [changes, publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.changes.outputs.stable_version != '' && needs.publish.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: homebrew-tap
+    concurrency:
+      group: publish-homebrew
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          repository: n0ot/homebrew-tap
+          ref: main
+          path: homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+      - name: Publish stable formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.changes.outputs.stable_version }}
+        run: |
+          gh release download "v$RELEASE_VERSION" --pattern SHA256SUMS --dir "$RUNNER_TEMP"
+          python3 .github/scripts/publish_homebrew.py "$RELEASE_VERSION" \
+            "$RUNNER_TEMP/SHA256SUMS" homebrew-tap/Formula/lector.rb
+          git -C homebrew-tap add Formula/lector.rb
+          if git -C homebrew-tap diff --cached --quiet; then
+            exit 0
+          fi
+          git -C homebrew-tap -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -m "Update Lector to $RELEASE_VERSION"
+          git -C homebrew-tap push origin HEAD:main
+
   publish-crates:
     name: Publish crates.io packages
     needs: [changes, publish]

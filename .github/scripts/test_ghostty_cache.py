@@ -50,6 +50,9 @@ import json, os, sys
 if sys.argv[1] == 'version':
     print(os.environ['FIXTURE_VERSION'])
 else:
+    if (os.environ.get('GIT_CEILING_DIRECTORIES') != os.path.realpath('..')
+            or any(name in os.environ for name in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR'))):
+        sys.exit('Git discovery can escape the source archive')
     with open(os.environ['FIXTURE_CALLS'], 'a') as log:
         log.write(json.dumps([os.environ['ZIG_GLOBAL_CACHE_DIR'],
                              sys.argv[sys.argv.index('--cache-dir') + 1]]) + '\\n')
@@ -59,7 +62,9 @@ else:
                     binary.chmod(0o755)
                 calls = root / 'calls'
                 env = dict(os.environ, PATH=f'{binaries}:{os.environ["PATH"]}',
-                           LECTOR_GHOSTTY_BUILD_ROOT=str(build_root), FIXTURE_CALLS=str(calls))
+                           LECTOR_GHOSTTY_BUILD_ROOT=str(build_root), FIXTURE_CALLS=str(calls),
+                           GIT_DIR=str(root / '.git'), GIT_WORK_TREE=str(root),
+                           GIT_COMMON_DIR=str(root / '.git'))
                 env.pop('GHOSTTY_PREBUILT_ROOT', None)
                 original = (ROOT / 'crates/lector-ghostty/bootstrap/bootstrap_ghostty.sh').read_text()
                 for version in ('10.0.0', '11.0.0'):
