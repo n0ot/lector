@@ -202,7 +202,7 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     let gitignore = include_str!("../.gitignore");
     assert!(gitignore.lines().any(|line| line == "/target"));
 
-    let ci = include_str!("../.github/workflows/ghostty-build.yml");
+    let ci = include_str!("../.github/workflows/ci.yml");
     assert!(!ci.contains("setup-zig"));
     assert!(ci.contains("cargo ghostty-check"));
     assert!(!ci.contains("cargo ghostty-bootstrap"));

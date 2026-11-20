@@ -1,5 +1,5 @@
 ---
-name: Ghostty build matrix
+name: Lector CI
 
 "on":
   push:
@@ -193,7 +193,7 @@ jobs:
       - name: Build and test linked Ghostty metadata
         if: needs.changes.outputs.build == 'true'
         run: cargo ghostty-check
-      - name: Compile authoritative Ghostty path
+      - name: Check Lector compilation
         if: needs.changes.outputs.build == 'true'
         run: >-
           cargo check --locked
