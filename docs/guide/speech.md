@@ -93,11 +93,11 @@ server while speaking on your Mac or Windows machine.
 
 On machines that run Lector, the same speech server is available as
 `lector tts`. Use the standalone `lector-tts` server on a speech host where
-you cannot build Lector, such as Windows. Install it explicitly there from
-a clone of this repository:
+you cannot build Lector, such as Windows. Install it explicitly there with
+Cargo.
 
 ```bash
-cargo install --locked --path crates/lector-tts
+cargo install --locked lector-tts
 ```
 
 Then point Lector at it, for example over SSH:
