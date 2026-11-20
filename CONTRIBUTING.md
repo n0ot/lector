@@ -180,8 +180,8 @@ branch protection in step, so that every required job stays enforced.
 
 Merge a version-bump PR into `master`. After CI passes, Actions creates
 the `v<version>` tag and publishes the GitHub release with macOS and Linux
-archives and `SHA256SUMS`. It then publishes to crates.io and checks that
-each package builds with Cargo's standard publish verification.
+archives and `SHA256SUMS`. The downstream jobs update the Homebrew tap and
+publish to crates.io with Cargo's standard publish verification.
 
 1. Use the same new version in the `lector`, `lector-ghostty`, and
    `lector-tts` manifests. Choose a version newer than the published
@@ -189,9 +189,10 @@ each package builds with Cargo's standard publish verification.
 2. Set both internal dependency requirements in the root manifest to
    `=<version>`, keeping their existing paths. Run
    `cargo update --workspace` and include `Cargo.lock` in the PR.
-3. Merge the PR after the required checks pass. Follow **Publish binaries**
-   and **Publish crates.io packages** on the resulting `master` run. The
-   registry job publishes the two dependencies first, then `lector`.
+3. Merge the PR after the required checks pass. Follow **Publish binaries**,
+   **Update Homebrew tap**, and **Publish crates.io packages** on the resulting
+   `master` run. The registry job publishes the two dependencies first, then
+   `lector`.
 
 Builds with an unchanged package version publish a GitHub-only prerelease
 tagged `build-<commit-sha>`. Markdown-only pushes skip publishing.
@@ -199,6 +200,13 @@ tagged `build-<commit-sha>`. Markdown-only pushes skip publishing.
 If publishing fails, rerun the failed jobs from the same push. The GitHub
 job can resume a draft. The registry job can resume when the versions that
 are already on crates.io came from the same release commit.
+
+### Homebrew tap credentials
+
+The `homebrew-tap` GitHub Actions environment is restricted to `master`.
+Its `HOMEBREW_TAP_DEPLOY_KEY` secret stores the private half of the writable
+deploy key on `n0ot/homebrew-tap`. The release job uses it to update the
+generated formula after the stable release assets are public.
 
 ### One-time crates.io setup
 

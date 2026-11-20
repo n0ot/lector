@@ -20,6 +20,14 @@ the program you are running.
 
 ## Install
 
+Homebrew installs the latest stable Lector binary. To build the current
+development version from source, install with `--HEAD`.
+
+```sh
+brew install n0ot/tap/lector
+brew install --HEAD n0ot/tap/lector
+```
+
 Download a binary archive from [GitHub Releases](https://github.com/n0ot/lector/releases),
 verify it against the release's `SHA256SUMS` file, then extract it and put
 `lector` on your `PATH`. Choose `aarch64` for ARM64 (including Apple
