@@ -33,7 +33,7 @@ glibc distributions, or Alpine:
 
 ```sh
 cargo build --locked --release
-cargo install --locked --path . --bin lector
+cargo install --locked --path .
 ```
 
 Cargo selects the native CPU and operating system. The executable links the

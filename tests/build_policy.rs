@@ -20,7 +20,6 @@ fn ghostty_dependency_and_source_revisions_are_exactly_pinned() {
 
     let manifest = include_str!("../Cargo.toml");
     assert!(!manifest.contains("ghostty-vt ="));
-    assert!(!manifest.contains("required-features"));
     assert!(
         manifest
             .contains("lector-ghostty = { version = \"0.1.0\", path = \"crates/lector-ghostty\" }")
@@ -54,29 +53,18 @@ fn tts_host_is_registry_publishable_and_matches_the_pinned_upstream() {
 }
 
 #[test]
-fn root_binary_targets_are_explicit() {
+fn default_install_selects_only_lector() {
     let manifest = include_str!("../Cargo.toml");
-    let binaries = [
-        ("lector", "src/main.rs"),
-        ("lector-harness", "src/bin/lector-harness.rs"),
-        ("proc_stub_server", "src/bin/proc_stub_server.rs"),
-        (
-            "tmux-control-adversary",
-            "src/bin/tmux-control-adversary.rs",
-        ),
-        ("pty-test-fixture", "src/bin/pty-test-fixture.rs"),
-        ("lector-ghostty-bench", "src/bin/lector-ghostty-bench.rs"),
-    ];
-
+    let binaries: Vec<_> = manifest.split("[[bin]]").skip(1).collect();
+    assert_eq!(binaries.len(), 2);
     assert!(manifest.contains("autobins = false"));
     assert!(manifest.contains("default-run = \"lector\""));
-    assert_eq!(manifest.matches("[[bin]]").count(), binaries.len());
-    for (name, path) in binaries {
-        assert!(
-            manifest.contains(&format!("name = \"{name}\"\npath = \"{path}\"")),
-            "missing explicit binary target {name} at {path}"
-        );
-    }
+    assert!(binaries[0].contains("name = \"lector\"\npath = \"src/main.rs\""));
+    assert!(!binaries[0].contains("required-features"));
+    assert!(binaries[1].contains("name = \"lector-harness\""));
+    assert!(binaries[1].contains("required-features = [\"test-tools\"]"));
+    assert!(manifest.contains("[features]\ntest-tools = []"));
+    assert!(!manifest.contains("default ="));
     assert!(!manifest.contains("cargo-clippy"));
 }
 
@@ -177,8 +165,8 @@ fn maintainer_aliases_use_the_same_verified_automatic_bootstrap() {
     let xtask = include_str!("../xtask/src/main.rs");
     assert!(xtask.contains("scripts/bootstrap_ghostty.sh"));
     assert!(xtask.contains("\"--release\""));
-    assert!(!xtask.contains("\"--features\""));
-    assert!(xtask.contains("lector-ghostty-bench"));
+    assert!(xtask.contains("lector-harness"));
+    assert!(xtask.contains("ghostty-bench"));
 
     let bootstrap = include_str!("../crates/lector-ghostty/bootstrap/bootstrap_zig.sh");
     assert!(bootstrap.contains(ghostty::REQUIRED_ZIG_VERSION));

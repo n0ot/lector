@@ -9,6 +9,7 @@ assert(rpc_log ~= nil)
 lector.o.speech.server = {
     program = speech_server,
     args = {
+        "speech",
         "--lifecycle-state", lifecycle_state,
         "--rpc-log", rpc_log,
         "--crash-speak-generations", "1,2",

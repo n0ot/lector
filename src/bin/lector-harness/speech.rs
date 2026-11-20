@@ -47,8 +47,7 @@ struct Options {
     identity: String,
 }
 
-fn main() -> Result<()> {
-    let mut args = std::env::args().skip(1);
+pub(super) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     let mut options = Options::default();
     while let Some(arg) = args.next() {
         match arg.as_str() {

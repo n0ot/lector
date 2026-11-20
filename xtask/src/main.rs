@@ -42,9 +42,12 @@ fn run(args: Vec<OsString>) -> Result<(), String> {
                 OsString::from("run"),
                 OsString::from("--locked"),
                 OsString::from("--release"),
+                OsString::from("--features"),
+                OsString::from("test-tools"),
                 OsString::from("--bin"),
-                OsString::from("lector-ghostty-bench"),
+                OsString::from("lector-harness"),
                 OsString::from("--"),
+                OsString::from("ghostty-bench"),
             ];
             cargo_args.extend_from_slice(task_args);
             cargo(&root, cargo_args)

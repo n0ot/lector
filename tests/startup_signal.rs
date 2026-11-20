@@ -102,17 +102,18 @@ fn sigterm_during_stalled_speech_initialize_cleans_up_and_is_reraised() {
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_lector"));
     command.args([
         "--shell",
-        env!("CARGO_BIN_EXE_tmux-control-adversary"),
+        env!("CARGO_BIN_EXE_lector-harness"),
         "--config",
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/pty/startup-signal.lua")
             .to_str()
             .expect("UTF-8 config fixture"),
     ]);
+    command.env("LECTOR_TEST_SHELL_FIXTURE", "tmux");
     command.env("TERM", "xterm-256color");
     command.env(
         "LECTOR_TEST_STARTUP_SIGNAL_SERVER",
-        env!("CARGO_BIN_EXE_proc_stub_server"),
+        env!("CARGO_BIN_EXE_lector-harness"),
     );
     command.env("LECTOR_TEST_STARTUP_SIGNAL_PID_FILE", &speech_pid_file);
     command.env("LECTOR_TEST_BLOCKING_APP_PID_FILE", &app_pid_file);

@@ -33,10 +33,9 @@ Parser fixtures are described in
 
 ## The adversarial peer
 
-`tmux-control-adversary` is a standalone program that speaks control mode
-and behaves badly. Lector runs it as its shell, so every scenario crosses the
-real PTY, polling, compositor, input, logging, and shutdown code. It creates
-no tmux socket and never touches a real tmux server.
+`lector-harness` includes a fixture that simulates a tmux control-mode peer.
+Lector runs it as its shell, so every scenario crosses the real PTY, polling,
+compositor, input, logging, and shutdown code. It creates no tmux socket.
 
 ### Scenarios
 
@@ -69,22 +68,22 @@ on timeout.
 Build Lector, the peer, and a silent speech server:
 
 ```sh
-cargo build --bin lector --bin tmux-control-adversary --bin proc_stub_server
+cargo build --locked --features test-tools
 ```
 
 Write a config that uses the silent server, so no real speech is produced:
 
 ```lua
 -- /tmp/lector-adversary.lua
-lector.o.speech.server = { program = "target/debug/proc_stub_server" }
+lector.o.speech.server = { program = "target/debug/lector-harness", args = { "speech" } }
 ```
 
 Then choose a scenario with `LECTOR_TMUX_ADVERSARY`:
 
 ```sh
-LECTOR_TMUX_ADVERSARY=hidden-flood \
+LECTOR_TEST_SHELL_FIXTURE=tmux LECTOR_TMUX_ADVERSARY=hidden-flood \
   target/debug/lector \
-  --shell target/debug/tmux-control-adversary \
+  --shell target/debug/lector-harness \
   --config /tmp/lector-adversary.lua \
   --log-file /tmp/lector-hidden-flood.jsonl
 ```

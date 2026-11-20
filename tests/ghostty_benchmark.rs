@@ -8,8 +8,8 @@ const BASELINE: &str = concat!(
 
 #[test]
 fn benchmark_runner_emits_a_machine_readable_complete_report() {
-    let output = Command::new(env!("CARGO_BIN_EXE_lector-ghostty-bench"))
-        .arg("--self-test")
+    let output = Command::new(env!("CARGO_BIN_EXE_lector-harness"))
+        .args(["ghostty-bench", "--self-test"])
         .output()
         .expect("run Ghostty benchmark self-test");
     assert!(
@@ -502,8 +502,8 @@ fn checked_in_release_baseline_has_regression_thresholds_for_every_workload() {
 
 #[test]
 fn benchmark_runner_validates_the_checked_in_baseline_contract() {
-    let output = Command::new(env!("CARGO_BIN_EXE_lector-ghostty-bench"))
-        .args(["--validate-baseline", BASELINE])
+    let output = Command::new(env!("CARGO_BIN_EXE_lector-harness"))
+        .args(["ghostty-bench", "--validate-baseline", BASELINE])
         .output()
         .expect("validate Ghostty benchmark baseline");
     assert!(

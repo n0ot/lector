@@ -39,7 +39,7 @@ Then clone the repository and install:
 ```bash
 git clone https://github.com/n0ot/lector.git
 cd lector
-cargo install --locked --path . --bin lector
+cargo install --locked --path .
 ```
 
 This puts `lector` in `~/.cargo/bin`, which rustup adds to your `PATH`. The

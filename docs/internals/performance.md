@@ -70,12 +70,9 @@ The release benchmark runs the production compositor and checks results
 against a checked-in baseline:
 
 ```sh
-cargo run --locked --release \
-  --bin lector-ghostty-bench -- \
+cargo ghostty-bench \
   --check-baseline benchmarks/ghostty-release-baseline-macos-aarch64.json
 ```
-
-`cargo ghostty-bench` is a shortcut for the benchmark run.
 
 It gates semantic-rendering coverage, output bytes, latency, scheduler
 bounds, peak memory, allocations, and image throughput.

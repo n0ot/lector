@@ -58,6 +58,7 @@ fn stub_spec(
     let state = directory.path(&format!("{prefix}-state"));
     let log = directory.path(&format!("{prefix}-rpc.jsonl"));
     let mut args = vec![
+        "speech".to_owned(),
         "--lifecycle-state".to_owned(),
         state.display().to_string(),
         "--rpc-log".to_owned(),
@@ -81,7 +82,7 @@ fn stub_spec(
         state,
         log,
         spec: SpeechServerSpec::Process {
-            program: env!("CARGO_BIN_EXE_proc_stub_server").to_owned(),
+            program: env!("CARGO_BIN_EXE_lector-harness").to_owned(),
             args,
         },
     }

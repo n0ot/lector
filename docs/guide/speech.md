@@ -91,9 +91,10 @@ The speech server talks to Lector over standard input and output, so it can
 run anywhere you can pipe to. A common setup is running Lector on a Linux
 server while speaking on your Mac or Windows machine.
 
-The speech server is also available as a small standalone program,
-`lector-tts`, so the speaking machine does not need all of Lector. Install it
-there from a clone of this repository:
+On machines that run Lector, the same speech server is available as
+`lector tts`. Use the standalone `lector-tts` server on a speech host where
+you cannot build Lector, such as Windows. Install it explicitly there from
+a clone of this repository:
 
 ```bash
 cargo install --locked --path crates/lector-tts

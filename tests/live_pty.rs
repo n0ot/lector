@@ -263,7 +263,7 @@ impl LiveLector {
         let pair = native_pty_system()
             .openpty(size.pty_size())
             .expect("open physical PTY");
-        let pty_fixture = Path::new(env!("CARGO_BIN_EXE_pty-test-fixture"));
+        let pty_fixture = Path::new(env!("CARGO_BIN_EXE_lector-harness"));
         let mut command = if parent_shell {
             CommandBuilder::new(pty_fixture)
         } else {
@@ -304,6 +304,7 @@ impl LiveLector {
             }
             command
         };
+        command.env("LECTOR_TEST_SHELL_FIXTURE", "pty");
         command.env("TERM", "xterm-ghostty");
         command.env("COLORTERM", "truecolor");
         command.env("LECTOR_OUTER_COLORS", "256");
@@ -326,7 +327,7 @@ impl LiveLector {
             command.env("LECTOR_PROC_STUB_LOG", &outer_speech_log);
             command.env(
                 "LECTOR_TEST_SPEECH_SERVER",
-                env!("CARGO_BIN_EXE_proc_stub_server"),
+                env!("CARGO_BIN_EXE_lector-harness"),
             );
             command.env(
                 "LECTOR_TEST_SPEECH_CONFIG",
@@ -341,7 +342,7 @@ impl LiveLector {
             } => {
                 command.env(
                     "LECTOR_TEST_STARTUP_SPEECH_SERVER",
-                    env!("CARGO_BIN_EXE_proc_stub_server"),
+                    env!("CARGO_BIN_EXE_lector-harness"),
                 );
                 command.env("LECTOR_TEST_STARTUP_CONFIG", config);
                 command.env("LECTOR_TEST_STARTUP_ORDER_LOG", &inner_speech_log);
@@ -662,7 +663,7 @@ fn write_config_resolution_fixture(path: &Path, identity: &str) {
                 marker:close()
                 lector.o.speech.server = {{
                     program = assert(os.getenv("LECTOR_TEST_SPEECH_SERVER")),
-                    args = {{}},
+                    args = {{ "speech" }},
                 }}
             "#
         ),

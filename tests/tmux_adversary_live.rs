@@ -65,7 +65,7 @@ impl LiveAdversary {
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_lector"));
         command.args([
             "--shell",
-            env!("CARGO_BIN_EXE_tmux-control-adversary"),
+            env!("CARGO_BIN_EXE_lector-harness"),
             "--config",
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("tests/fixtures/pty/proc-speech.lua")
@@ -74,6 +74,7 @@ impl LiveAdversary {
             "--log-file",
             log.to_str().expect("UTF-8 diagnostic path"),
         ]);
+        command.env("LECTOR_TEST_SHELL_FIXTURE", "tmux");
         command.env("TERM", "xterm-ghostty");
         command.env("COLORTERM", "truecolor");
         command.env("LECTOR_TMUX_ADVERSARY", scenario);
@@ -81,7 +82,7 @@ impl LiveAdversary {
         command.env("LECTOR_PROC_STUB_LOG", &speech_log);
         command.env(
             "LECTOR_TEST_SPEECH_SERVER",
-            env!("CARGO_BIN_EXE_proc_stub_server"),
+            env!("CARGO_BIN_EXE_lector-harness"),
         );
         if stall_speech {
             command.env("LECTOR_PROC_STUB_STALL_SPEECH", "1");
