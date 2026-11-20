@@ -986,7 +986,7 @@ fn lua_binding_is_immediate_after_probe_fence_with_enhanced_outer_keyboards() {
         assert!(pty_out.is_empty(), "binding leaked to child for {name}");
 
         for (input, expected) in [
-            (line_input, "current line"),
+            (line_input, "say current line"),
             (csi_prefix_input, "previous clipboard"),
             (osc_prefix_input, "next clipboard"),
             (apc_prefix_input, "this key is unmapped"),

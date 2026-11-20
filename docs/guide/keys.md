@@ -14,18 +14,20 @@ Two things help when you forget a key:
 - Press `F1` to turn on help mode, then press any key to hear what it does.
   Press `F1` again to leave.
 - Press `M-?` to open a searchable list of every binding. It works like
-  [Review](review.md), and `q` closes it.
+  [Review](review.md), and `q` closes it. Each mode lists related built-in
+  actions together, followed by custom Lua actions in key order. Review keys
+  and command syntax appear at the end.
 
 ## Speech and reading
 
 | Key | Action |
 | --- | --- |
-| `M-x` | Pause or resume speech |
+| `M-x` | Toggle speech pause |
 | `M-'` | Toggle automatic reading of new output |
-| `M-s` | Change how much punctuation is spoken |
+| `M-s` | Cycle symbol level (how much punctuation is spoken) |
 | `M-g` | Toggle stopping speech when the terminal loses focus |
 | `M-w` | Say where you are (the current overlay or tmux location) |
-| `F12` | Say the time |
+| `F12` | Say time |
 
 Typing also pauses speech. Pausing keeps whatever was waiting to be spoken, so
 `M-x` picks up where it left off.
@@ -36,14 +38,17 @@ The review cursor reads the screen without moving the application's cursor.
 
 | Key | Action |
 | --- | --- |
-| `M-u` / `M-i` / `M-o` | Previous, current, next line |
+| `M-u` / `M-o` | Previous / next line |
+| `M-i` | Say current line |
 | `M-U` / `M-O` | Previous, next non-blank line |
-| `M-j` / `M-k` / `M-l` | Previous, current, next word |
-| `M-m` / `M-,` / `M-.` | Previous, current, next character |
-| `M-<` | Current character, spelled phonetically |
+| `M-j` / `M-l` | Previous / next word |
+| `M-k` | Say current word |
+| `M-m` / `M-.` | Previous / next character |
+| `M-,` | Say current character |
+| `M-<` | Say current character phonetically |
 | `M-h` / `M-;` | Beginning, end of the line |
 | `M-y` / `M-p` | Top, bottom of the screen |
-| `M-a` | Read text attributes at the cursor |
+| `M-a` | Say attributes at the review cursor |
 | `M-"` | Toggle whether the review cursor follows the application cursor |
 | `M-{` / `M-}` | Left click, right click at the review cursor |
 
@@ -57,7 +62,7 @@ To read output that has scrolled off the screen, open [Review](review.md) with
 | `F5` | Set a mark at the review cursor |
 | `F6` | Copy from the mark to the review cursor |
 | `F7` | Paste |
-| `M-c` | Say the clipboard |
+| `M-c` | Say clipboard |
 | `M-[` / `M-]` | Previous, next clipboard history entry |
 
 See [Clipboard](clipboard.md) for registers and history.

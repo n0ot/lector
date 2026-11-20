@@ -113,19 +113,72 @@ macro_rules! define_actions {
     };
 }
 
+// Declaration order is the display order for builtins in the bindings viewer.
 define_actions! {
-    ToggleHelp => ("toggle help", "toggle_help"),
-    ToggleAutoRead => ("toggle auto read", "toggle_auto_read"),
-    ToggleReviewCursorFollowsScreenCursor => (
-        "toggle whether review cursor follows screen cursor",
-        "toggle_review_cursor_follows_screen_cursor"
-    ),
-    ToggleSymbolLevel => ("toggle symbol level", "toggle_symbol_level"),
+    // Help and Lector controls.
+    ToggleHelp => ("toggle help mode", "toggle_help"),
+    OpenBindings => ("open bindings viewer", "open_bindings"),
+    OpenReview => ("open Review", "open_review"),
     SayOverlay => ("say current overlay", "say_overlay"),
+    SayTime => ("say time", "say_time"),
+    PassNextKey => ("forward next key press", "pass_next_key"),
     ReloadConfig => ("reload Lua configuration", "reload_config"),
     OpenLuaRepl => ("open Lua REPL", "open_lua_repl"),
-    OpenReview => ("enter review mode", "open_review"),
-    OpenBindings => ("show current key bindings", "open_bindings"),
+
+    // Speech controls and settings.
+    ToggleSpeaking => ("toggle speech pause", "toggle_speaking"),
+    PauseSpeaking => ("pause speaking", "pause_speaking"),
+    ResumeSpeaking => ("resume speaking", "resume_speaking"),
+    CancelSpeaking => ("cancel speaking", "cancel_speaking"),
+    ToggleAutoRead => ("toggle automatic reading", "toggle_auto_read"),
+    ToggleSymbolLevel => ("cycle symbol level", "toggle_symbol_level"),
+    ToggleStopSpeechOnFocusLoss => (
+        "toggle stopping speech on focus loss",
+        "toggle_stop_speech_on_focus_loss"
+    ),
+
+    // Review cursor.
+    RevLinePrev => ("previous line", "review_line_prev"),
+    RevLineRead => ("say current line", "review_line_read"),
+    RevLineNext => ("next line", "review_line_next"),
+    RevLinePrevNonBlank => ("previous non-blank line", "review_line_prev_non_blank"),
+    RevLineNextNonBlank => ("next non-blank line", "review_line_next_non_blank"),
+    RevWordPrev => ("previous word", "review_word_prev"),
+    RevWordRead => ("say current word", "review_word_read"),
+    RevWordNext => ("next word", "review_word_next"),
+    RevCharPrev => ("previous character", "review_char_prev"),
+    RevCharRead => ("say current character", "review_char_read"),
+    RevCharNext => ("next character", "review_char_next"),
+    RevCharReadPhonetic => ("say current character phonetically", "review_char_read_phonetic"),
+    RevFirst => ("beginning of line", "review_first"),
+    RevLast => ("end of line", "review_last"),
+    RevTop => ("top of screen", "review_top"),
+    RevBottom => ("bottom of screen", "review_bottom"),
+    RevReadAttributes => ("say attributes", "review_read_attributes"),
+    ToggleReviewCursorFollowsScreenCursor => (
+        "toggle whether the review cursor follows the application cursor",
+        "toggle_review_cursor_follows_screen_cursor"
+    ),
+    LeftClick => ("left click at review cursor", "left_click"),
+    RightClick => ("right click at review cursor", "right_click"),
+
+    // Clipboard.
+    SetMark => ("set mark", "set_mark"),
+    Copy => ("copy", "copy"),
+    Paste => ("paste", "paste"),
+    PasteInternal => ("paste internal clipboard", "paste_internal"),
+    PasteSystem => ("paste system clipboard", "paste_system"),
+    SayClipboard => ("say clipboard", "say_clipboard"),
+    SayInternalClipboard => ("say internal clipboard", "say_internal_clipboard"),
+    SaySystemClipboard => ("say system clipboard", "say_system_clipboard"),
+    PreviousClipboard => ("previous clipboard", "previous_clipboard"),
+    NextClipboard => ("next clipboard", "next_clipboard"),
+
+    // Editing keys.
+    Backspace => ("backspace", "backspace"),
+    Delete => ("delete", "delete"),
+
+    // tmux.
     OpenTmuxConnectionChooser => (
         "open tmux connection chooser",
         "open_tmux_connection_chooser"
@@ -137,73 +190,34 @@ define_actions! {
     OpenTmuxCommandPrompt => ("open tmux command prompt", "open_tmux_command_prompt"),
     DetachTmuxConnection => ("gracefully detach the active tmux connection", "detach_tmux_connection"),
     ForceAbandonTmuxGateway => ("expose a stuck active tmux gateway as raw terminal input", "force_abandon_tmux_gateway"),
-    PassNextKey => ("forward next key press", "pass_next_key"),
-    PauseSpeaking => ("pause speaking", "pause_speaking"),
-    CancelSpeaking => ("cancel speaking", "cancel_speaking"),
-    ResumeSpeaking => ("resume speaking", "resume_speaking"),
-    ToggleSpeaking => ("pause or resume speaking", "toggle_speaking"),
-    RevLinePrev => ("previous line", "review_line_prev"),
-    RevLineNext => ("next line", "review_line_next"),
-    RevLinePrevNonBlank => ("previous non blank line", "review_line_prev_non_blank"),
-    RevLineNextNonBlank => ("next non blank line", "review_line_next_non_blank"),
-    RevLineRead => ("current line", "review_line_read"),
-    RevCharPrev => ("previous character", "review_char_prev"),
-    RevCharNext => ("next character", "review_char_next"),
-    RevCharRead => ("current character", "review_char_read"),
-    RevCharReadPhonetic => ("current character phonetically", "review_char_read_phonetic"),
-    RevWordPrev => ("previous word", "review_word_prev"),
-    RevWordNext => ("next word", "review_word_next"),
-    RevWordRead => ("current word", "review_word_read"),
-    RevTop => ("top", "review_top"),
-    RevBottom => ("bottom", "review_bottom"),
-    RevFirst => ("beginning of line", "review_first"),
-    RevLast => ("end of line", "review_last"),
-    RevReadAttributes => ("read attributes", "review_read_attributes"),
-    LeftClick => ("left click at review cursor", "left_click"),
-    RightClick => ("right click at review cursor", "right_click"),
-    Backspace => ("backspace", "backspace"),
-    Delete => ("delete", "delete"),
-    SayTime => ("say the time", "say_time"),
-    SetMark => ("set mark", "set_mark"),
-    Copy => ("copy", "copy"),
-    Paste => ("paste", "paste"),
-    PasteInternal => ("paste internal clipboard", "paste_internal"),
-    PasteSystem => ("paste system clipboard", "paste_system"),
-    SayClipboard => ("say clipboard", "say_clipboard"),
-    SayInternalClipboard => ("say internal clipboard", "say_internal_clipboard"),
-    SaySystemClipboard => ("say system clipboard", "say_system_clipboard"),
-    PreviousClipboard => ("previous clipboard", "previous_clipboard"),
-    NextClipboard => ("next clipboard", "next_clipboard"),
+
+    // Table navigation and setup.
     ToggleTableMode => ("toggle table mode", "toggle_table_mode"),
-    ToggleStopSpeechOnFocusLoss => (
-        "toggle stop speech on focus loss",
-        "toggle_stop_speech_on_focus_loss"
-    ),
-    StartTableSetupMode => ("start table setup mode", "start_table_setup_mode"),
-    CancelTableSetupMode => ("cancel table setup mode", "cancel_table_setup_mode"),
-    CommitTableSetupMode => ("commit table setup mode", "commit_table_setup_mode"),
-    ToggleTableSetupTabstop => (
-        "toggle tabstop at review cursor",
-        "toggle_table_setup_tabstop"
-    ),
     ExitTableMode => ("exit table mode", "exit_table_mode"),
     TableRowPrev => ("previous table row", "table_row_prev"),
+    TableCellRead => ("say current table cell", "table_cell_read"),
     TableRowNext => ("next table row", "table_row_next"),
-    TableRowTop => ("top table row", "table_row_top"),
-    TableRowBottom => ("bottom table row", "table_row_bottom"),
+    TableRowTop => ("first table row", "table_row_top"),
+    TableRowBottom => ("last table row", "table_row_bottom"),
     TableColPrev => ("previous table column", "table_col_prev"),
     TableColNext => ("next table column", "table_col_next"),
     TableColFirst => ("first table column", "table_col_first"),
     TableColLast => ("last table column", "table_col_last"),
-    TableCellRead => ("current table cell", "table_cell_read"),
-    TableHeaderRead => ("current table header", "table_header_read"),
+    TableHeaderRead => ("say current table header", "table_header_read"),
     ToggleTableHeaderRead => ("toggle table header reading", "toggle_table_header_read"),
     TableWordPrev => ("previous word in cell", "table_word_prev"),
+    TableWordRead => ("say current word in cell", "table_word_read"),
     TableWordNext => ("next word in cell", "table_word_next"),
-    TableWordRead => ("current word in cell", "table_word_read"),
     TableCharPrev => ("previous character in cell", "table_char_prev"),
+    TableCharRead => ("say current character in cell", "table_char_read"),
     TableCharNext => ("next character in cell", "table_char_next"),
-    TableCharRead => ("current character in cell", "table_char_read"),
+    StartTableSetupMode => ("start table setup", "start_table_setup_mode"),
+    ToggleTableSetupTabstop => (
+        "toggle tabstop at review cursor",
+        "toggle_table_setup_tabstop"
+    ),
+    CommitTableSetupMode => ("accept table setup", "commit_table_setup_mode"),
+    CancelTableSetupMode => ("cancel table setup", "cancel_table_setup_mode"),
 }
 
 pub enum CommandResult {

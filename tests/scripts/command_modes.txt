@@ -3,7 +3,7 @@ When stdin: \x1BOP
 And stdin: \x1Bi
 And stdin: \x1BOP
 Then expect-speak: entering help. Press this key again to exit
-And expect-speak: current line
+And expect-speak: say current line
 And expect-speak: exiting help
 
 Scenario: auto read toggle round trips

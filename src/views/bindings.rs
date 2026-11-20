@@ -63,12 +63,15 @@ fn entries(bindings: &KeyBindings) -> Vec<Entry> {
             id: format!("heading:{}", mode.as_str()),
             text: format!("{} bindings", mode.as_str()),
         });
-        let mut groups: Vec<(String, Entry)> = Vec::new();
-        for binding in bindings
+        let mut descriptions: Vec<_> = bindings
             .describe_effective(mode)
             .into_iter()
             .filter(|binding| !binding.inherited)
-        {
+            .collect();
+        // Keep the key order within an action and among custom bindings.
+        descriptions.sort_by_key(|binding| binding.action_order);
+        let mut groups: Vec<(String, Entry)> = Vec::new();
+        for binding in descriptions {
             if let Some((_, entry)) = groups.iter_mut().find(|(id, _)| *id == binding.action_id) {
                 entry.text.push_str(&format!(", {}", binding.key));
             } else {
@@ -414,6 +417,31 @@ mod tests {
     }
 
     #[test]
+    fn action_order_is_independent_of_remapped_keys() {
+        let mut bindings = KeyBindings::new();
+        bindings.clear_binding_for_mode(InputMode::Normal, "M-o");
+        bindings.set_builtin_binding_for_mode(InputMode::Normal, "!".into(), Action::RevLineNext);
+
+        let entries = entries(&bindings);
+        let previous = entries
+            .iter()
+            .position(|entry| entry.id == "normal:builtin:review_line_prev")
+            .unwrap();
+        let visible: Vec<_> = entries[previous..previous + 3]
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(
+            visible,
+            [
+                "previous line  M-u",
+                "say current line  M-i",
+                "next line  !"
+            ]
+        );
+    }
+
+    #[test]
     fn lua_aliases_group_by_callback_not_description() {
         let lua = Rc::new(mlua::Lua::new());
         let callback = lua.create_function(|_, ()| Ok(())).unwrap();
@@ -438,6 +466,11 @@ mod tests {
         assert_eq!(custom.len(), 2);
         assert_eq!(custom[0].text, "custom action  a, b");
         assert_eq!(custom[1].text, "custom action  c");
+        let table_heading = entries
+            .iter()
+            .position(|entry| entry.id == "heading:table")
+            .unwrap();
+        assert!(entries[table_heading - 2..table_heading].iter().eq(custom));
     }
 
     #[test]

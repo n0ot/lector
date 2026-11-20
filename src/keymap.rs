@@ -205,6 +205,7 @@ const TABLE_SETUP_BINDINGS: &[(&str, Action)] = &[
 pub(crate) struct BindingDescription {
     pub key: String,
     pub action_id: String,
+    pub action_order: usize,
     pub help: String,
     pub inherited: bool,
 }
@@ -261,18 +262,24 @@ impl KeyBindings {
             .filter_map(|key| {
                 let binding = self.binding_for_mode(mode, key)?;
                 let help = binding.help_text();
-                Some(BindingDescription {
-                    key: key.clone(),
-                    action_id: match binding {
-                        Binding::Builtin(action) => {
-                            format!("builtin:{}", crate::commands::builtin_action_name(*action))
-                        }
-                        Binding::Lua(binding) => binding
+                let (action_id, action_order) = match binding {
+                    Binding::Builtin(action) => (
+                        format!("builtin:{}", commands::builtin_action_name(*action)),
+                        *action as usize,
+                    ),
+                    Binding::Lua(binding) => (
+                        binding
                             .lua
                             .registry_value::<Function>(&binding.func)
                             .map(|func| format!("lua:{:p}", func.to_pointer()))
                             .unwrap_or_else(|_| format!("key:{key}")),
-                    },
+                        usize::MAX,
+                    ),
+                };
+                Some(BindingDescription {
+                    key: key.clone(),
+                    action_id,
+                    action_order,
                     help: if help.is_empty() {
                         "custom binding (no description)".to_owned()
                     } else {
@@ -446,7 +453,7 @@ mod tests {
             .find(|b| b.key == "custom")
             .unwrap();
         assert!(!own.inherited);
-        assert_eq!(own.help, "show current key bindings");
+        assert_eq!(own.help, "open bindings viewer");
         bindings.clear_binding_for_mode(InputMode::Table, "custom");
         assert!(
             bindings
