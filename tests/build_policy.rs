@@ -20,10 +20,11 @@ fn ghostty_dependency_and_source_revisions_are_exactly_pinned() {
 
     let manifest = include_str!("../Cargo.toml");
     assert!(!manifest.contains("ghostty-vt ="));
-    assert!(
-        manifest
-            .contains("lector-ghostty = { version = \"0.1.0\", path = \"crates/lector-ghostty\" }")
-    );
+    let dependency = manifest
+        .lines()
+        .find(|line| line.starts_with("lector-ghostty = {"))
+        .expect("Ghostty workspace dependency");
+    assert!(dependency.contains("path = \"crates/lector-ghostty\""));
     assert!(!manifest.contains("optional = true"));
     assert!(!include_str!("../build.rs").contains("CARGO_FEATURE_GHOSTTY_VT"));
     assert!(!manifest.contains("libghostty-vt ="));
@@ -37,9 +38,12 @@ fn ghostty_dependency_and_source_revisions_are_exactly_pinned() {
 #[test]
 fn tts_host_is_registry_publishable_and_matches_the_pinned_upstream() {
     let root_manifest = include_str!("../Cargo.toml");
-    assert!(root_manifest.contains(
-        "tts = { package = \"lector-tts\", version = \"0.1.0\", path = \"crates/lector-tts\" }"
-    ));
+    let dependency = root_manifest
+        .lines()
+        .find(|line| line.starts_with("tts = {"))
+        .expect("TTS workspace dependency");
+    assert!(dependency.contains("package = \"lector-tts\""));
+    assert!(dependency.contains("path = \"crates/lector-tts\""));
     assert!(!root_manifest.contains("lector-tts-backend"));
     assert!(!root_manifest.contains("git = \"https://github.com/ndarilek/tts-rs\""));
 
@@ -271,10 +275,6 @@ fn ghostty_is_the_only_production_terminal_engine() {
     let manifest = include_str!("../Cargo.toml");
     assert!(!manifest.lines().any(|line| line.starts_with("vt100 =")));
     assert!(!manifest.lines().any(|line| line.starts_with("vte =")));
-    assert!(
-        manifest
-            .contains("lector-ghostty = { version = \"0.1.0\", path = \"crates/lector-ghostty\" }")
-    );
 
     let terminal = include_str!("../src/terminal.rs");
     let view = include_str!("../src/view.rs");

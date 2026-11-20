@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       build: ${{ steps.changes.outputs.build }}
+      stable_version: ${{ steps.release.outputs.stable_version }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -32,6 +33,12 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: python3 .github/scripts/ci_policy.py changes
+      - name: Check stable release versions
+        id: release
+        if: steps.changes.outputs.build == 'true' && ((github.event_name == 'push' && github.ref == 'refs/heads/master') || (github.event_name == 'pull_request' && github.base_ref == 'master'))
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: python3 .github/scripts/publish_crates.py check
 
   ci:
     name: CI
@@ -513,3 +520,29 @@ jobs:
           BASE_SHA: ${{ github.event.before }}
           GH_TOKEN: ${{ github.token }}
         run: python3 .github/scripts/publish_release.py
+
+  publish-crates:
+    name: Publish crates.io packages
+    needs: [changes, publish]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && needs.changes.outputs.stable_version != '' && needs.publish.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install repository Rust toolchain
+        run: >-
+          rustup toolchain install "$(scripts/check-rust-toolchain --channel)"
+          --profile minimal --component clippy,llvm-tools,rustfmt
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: Publish release packages
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          RELEASE_VERSION: ${{ needs.changes.outputs.stable_version }}
+        run: python3 .github/scripts/publish_crates.py publish

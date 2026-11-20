@@ -126,23 +126,6 @@ passed to nextest. Set `LECTOR_REAL_TMUX_PLATFORM`, for example to
 See [testing tmux support](docs/internals/tmux/testing.md) for what each
 level covers.
 
-### Publishing binaries
-
-When a push to `master` runs the build matrix and passes the required
-`CI` job, the workflow publishes the macOS and Linux archives with
-`SHA256SUMS` on GitHub Releases. Markdown-only pushes skip builds and
-publishing.
-
-- For a stable release, bump the root package version in `Cargo.toml`
-  and the matching `lector` entry in `Cargo.lock` in a PR. The workflow
-  publishes `v<version>` from the merged commit.
-- With the same package version, the workflow publishes a prerelease
-  tagged `build-<commit-sha>`. The executable reports the Cargo version.
-
-If publishing fails, rerun the failed workflow jobs on the same push.
-The publish job can resume a draft and checks that any existing tag
-points to the commit being released.
-
 ### Native speech tests
 
 Ordinary test runs are silent. They never start real speech and do not need
@@ -192,6 +175,44 @@ Pull requests that change only Markdown files skip compilation in CI.
 
 If you rename or add CI jobs, keep the `CI` gate job and the repository's
 branch protection in step, so that every required job stays enforced.
+
+## Cutting a release
+
+Merge a version-bump PR into `master`. After CI passes, Actions creates
+the `v<version>` tag and publishes the GitHub release with macOS and Linux
+archives and `SHA256SUMS`. It then publishes to crates.io and checks that
+each package builds with Cargo's standard publish verification.
+
+1. Use the same new version in the `lector`, `lector-ghostty`, and
+   `lector-tts` manifests. Choose a version newer than the published
+   versions of all three crates.
+2. Set both internal dependency requirements in the root manifest to
+   `=<version>`, keeping their existing paths. Run
+   `cargo update --workspace` and include `Cargo.lock` in the PR.
+3. Merge the PR after the required checks pass. Follow **Publish binaries**
+   and **Publish crates.io packages** on the resulting `master` run. The
+   registry job publishes the two dependencies first, then `lector`.
+
+Builds with an unchanged package version publish a GitHub-only prerelease
+tagged `build-<commit-sha>`. Markdown-only pushes skip publishing.
+
+If publishing fails, rerun the failed jobs from the same push. The GitHub
+job can resume a draft. The registry job can resume when the versions that
+are already on crates.io came from the same release commit.
+
+### One-time crates.io setup
+
+Use the `crates-io` GitHub Actions environment with deployments restricted
+to the `master` branch. In the crates.io settings for each of `lector`,
+`lector-ghostty`, and `lector-tts`, a crate owner adds a GitHub Actions
+[trusted publisher](https://crates.io/docs/trusted-publishing) with these values.
+
+| Setting | Value |
+| --- | --- |
+| Repository owner | `n0ot` |
+| Repository name | `lector` |
+| Workflow filename | `ghostty-build.yml` |
+| Environment | `crates-io` |
 
 ## Documentation
 
