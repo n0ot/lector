@@ -199,6 +199,10 @@ fi
 mkdir -p "$prefix"
 (
     cd "$source_dir"
+    # The release archive has no Git metadata. Keep Zig's Git discovery inside it.
+    unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR
+    export GIT_CEILING_DIRECTORIES
+    GIT_CEILING_DIRECTORIES=$(cd .. && pwd -P)
     # LIB_VERSION selects the standalone library build; dependencies are offline.
     ZIG_GLOBAL_CACHE_DIR="$global_cache_dir" "$zig_bin" build \
         -Demit-lib-vt=true \
