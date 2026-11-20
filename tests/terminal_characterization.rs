@@ -88,7 +88,12 @@ fn compositor_presentation_preserves_terminal_protocols_effects_and_bells() {
                 b"\x1B]9;4;1;50\x07\x1B[c\x1B[18t\x1B[?996n\x1B[>q",
             ],
             expected_application_reply: Some(
-                b"\x1B[?64;22;28c\x1B[8;4;40t\x1B[?997;1n\x1BP>|Lector 0.4.1\x1B\\",
+                concat!(
+                    "\x1B[?64;22;28c\x1B[8;4;40t\x1B[?997;1n\x1BP>|Lector ",
+                    env!("CARGO_PKG_VERSION"),
+                    "\x1B\\",
+                )
+                .as_bytes(),
             ),
             forbidden_physical_sequences: &[
                 b"\x1B]52;c;aGVsbG8=\x1B\\",
