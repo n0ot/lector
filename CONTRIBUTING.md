@@ -211,7 +211,7 @@ to the `master` branch. In the crates.io settings for each of `lector`,
 | --- | --- |
 | Repository owner | `n0ot` |
 | Repository name | `lector` |
-| Workflow filename | `ghostty-build.yml` |
+| Workflow filename | `ci.yml` |
 | Environment | `crates-io` |
 
 ## Documentation

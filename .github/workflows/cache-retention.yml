@@ -2,7 +2,7 @@ name: Cache retention
 
 "on":
   workflow_run:
-    workflows: [Ghostty build matrix]
+    workflows: [Lector CI]
     types: [completed]
   schedule:
     - cron: '41 7 * * *'

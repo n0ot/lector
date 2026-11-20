@@ -45,7 +45,7 @@ class CargoCacheKeyTests(unittest.TestCase):
         original = self.key()
         for name in ("src/main.rs", "crates/lector-tts/src/lib.rs",
                      "crates/lector-ghostty/src/lib.rs", "xtask/src/main.rs",
-                     ".github/workflows/ghostty-build.yml", "docs/building.md"):
+                     ".github/workflows/ci.yml", "docs/building.md"):
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("first revision")

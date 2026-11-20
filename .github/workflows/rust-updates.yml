@@ -5,7 +5,7 @@ name: Tested Rust updates
     - cron: '19 8 * * 1'
   workflow_dispatch:
   workflow_run:
-    workflows: [Ghostty build matrix]
+    workflows: [Lector CI]
     types: [completed]
 
 permissions:

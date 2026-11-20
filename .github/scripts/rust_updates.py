@@ -90,7 +90,7 @@ def propose(repo, manifest):
 
 
 def check_run(repo, head):
-    runs = api(f"repos/{repo}/actions/workflows/ghostty-build.yml/runs?head_sha={head}&event=workflow_dispatch")
+    runs = api(f"repos/{repo}/actions/workflows/ci.yml/runs?head_sha={head}&event=workflow_dispatch")
     return runs["workflow_runs"][0] if runs["workflow_runs"] else None
 
 
@@ -98,7 +98,7 @@ def dispatch(repo, head):
     check = check_run(repo, head)
     if check is None:
         # Explicit dispatch works with GITHUB_TOKEN; no PR creation permission needed.
-        api(f"repos/{repo}/actions/workflows/ghostty-build.yml/dispatches", ref=BRANCH)
+        api(f"repos/{repo}/actions/workflows/ci.yml/dispatches", ref=BRANCH)
         return "Full CI dispatched. The active agent-queue session will create the review PR/card after validation."
     if check["status"] == "completed" and check["conclusion"] != "success":
         return f"Validation failed: {check['html_url']}. Master retains its tested pin. Inspect and rerun that workflow after resolving the failure."
