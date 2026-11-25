@@ -9,8 +9,11 @@ server.
 Lector plays short cues at review cursor boundaries and when inspecting a
 blank character. It identifies an OSC 8 hyperlink when its text starts, or
 when you start reading within the link. Set `lector.o.tones = false` to use
-spoken labels for boundaries, blank characters, and links. Hosts without
-sound cue support also use spoken labels.
+spoken labels for boundaries, blank characters, and links.
+
+The bundled AVFoundation speech host plays cues on macOS 13 or later, including
+when Lector connects to that host remotely. Other bundled speech hosts use
+spoken labels.
 
 ## Controlling speech
 

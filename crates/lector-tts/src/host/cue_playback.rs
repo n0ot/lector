@@ -112,24 +112,36 @@ impl RenderedAudio {
         let channels = usize::from(spec.channels);
         let frames = self.samples.len() / channels;
         let bytes_per_frame = channels * usize::from(spec.bits_per_sample / 8);
-        let mut words: Vec<_> = self
-            .words
-            .drain(..)
-            .filter_map(|word| {
-                // AVFoundation reports a byte position in the rendered PCM stream.
-                // Check it describes a complete frame that actually exists.
-                let frame = word.byte_sample / bytes_per_frame;
-                (word.byte_sample.is_multiple_of(bytes_per_frame) && frame < frames).then_some(
-                    WordOnset {
-                        frame,
-                        start: word.start,
-                        end: word.end,
-                    },
-                )
-            })
-            .collect();
-        words.sort_by_key(|word| (word.frame, word.start));
-        words.dedup_by_key(|word| (word.frame, word.start, word.end));
+        let mut words = Vec::<WordOnset>::with_capacity(self.words.len());
+        for word in self.words {
+            let frame = word.byte_sample / bytes_per_frame;
+            if !word.byte_sample.is_multiple_of(bytes_per_frame)
+                || frame >= frames
+                || word.start >= word.end
+                || text.get(word.start..word.end).is_none()
+            {
+                return Err(Error::OperationFailed("validate rendered speech marker"));
+            }
+            let onset = WordOnset {
+                frame,
+                start: word.start,
+                end: word.end,
+            };
+            if let Some(previous) = words.last() {
+                if *previous == onset {
+                    continue;
+                }
+                // The shared PCM timeline requires stream positions in
+                // callback order. Sorting would conceal offset resets,
+                // competing onsets, or reversed or overlapping text ranges.
+                if onset.frame <= previous.frame || onset.start < previous.end {
+                    return Err(Error::OperationFailed(
+                        "validate rendered speech marker order",
+                    ));
+                }
+            }
+            words.push(onset);
+        }
 
         if words.is_empty() {
             return Err(Error::OperationFailed("render speech word markers"));
@@ -159,7 +171,7 @@ impl RenderedAudio {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 struct WordOnset {
     frame: usize,
     start: usize,
@@ -607,6 +619,49 @@ mod tests {
             #[allow(clippy::cast_possible_truncation)]
             let expected = ((0.125 + sample) * f32::from(i16::MAX)).round() as i16;
             assert_eq!(*channels, [expected, expected]);
+        }
+    }
+
+    #[test]
+    fn ambiguous_marker_timelines_require_spoken_fallback() {
+        let wave = WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        for (sample, start, end) in [
+            (0, 4, 7),  // reset position for a later word
+            (40, 4, 7), // different words share one frame
+            (80, 0, 2), // text position reverses
+            (80, 2, 7), // text ranges overlap
+        ] {
+            let mut pcm = RenderedAudio::default();
+            pcm.append(wave, std::iter::repeat_n(0.0, 64)).unwrap();
+            pcm.words = vec![
+                Word {
+                    byte_sample: 40,
+                    start: 0,
+                    end: 3,
+                },
+                Word {
+                    byte_sample: sample,
+                    start,
+                    end,
+                },
+            ];
+            assert!(matches!(
+                pcm.finish(
+                    "one two",
+                    &[SoundCueAt {
+                        cue: SoundCue::Link,
+                        offset: 0
+                    }]
+                ),
+                Err(Error::OperationFailed(
+                    "validate rendered speech marker order"
+                ))
+            ));
         }
     }
 

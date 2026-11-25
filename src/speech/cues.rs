@@ -43,7 +43,7 @@ impl SpeechCues {
 
     pub(super) fn queue_bytes(&self) -> usize {
         match self {
-            Self::Links { links, .. } => size_of::<SpeechLink>().saturating_mul(links.len()),
+            Self::Links { links, .. } => size_of::<SpeechLink>().saturating_mul(links.capacity()),
             _ => 0,
         }
     }
@@ -56,6 +56,7 @@ impl SpeechCues {
                 rendered_bytes.saturating_add(links.len().saturating_mul(MAX_MARKER_BYTES));
         }
         if rendered_bytes <= limit {
+            self.compact_links();
             return text.to_owned();
         }
 
@@ -80,9 +81,18 @@ impl SpeechCues {
             end -= 1;
         }
         if let Self::Links { links, .. } = self {
-            links.retain(|link| link.offset < end);
+            links.truncate(links.partition_point(|link| link.offset < end));
         }
+        self.compact_links();
         format!("{}{TRUNCATION_SUFFIX}", &text[..end])
+    }
+
+    fn compact_links(&mut self) {
+        if let Self::Links { links, .. } = self
+            && links.capacity() != links.len()
+        {
+            *links = std::mem::take(links).into_boxed_slice().into_vec();
+        }
     }
 
     pub(super) fn render<'a>(&self, text: &'a str, supported: bool) -> RenderedCues<'a> {
@@ -161,6 +171,50 @@ mod tests {
     use super::*;
     use crate::speech::protocol::MAX_UTTERANCE_TEXT_BYTES;
     use tts::server::MAX_RPC_FRAME_BYTES;
+
+    #[test]
+    fn dense_cue_truncation_releases_excess_queue_storage() {
+        let text = "a".repeat(MAX_UTTERANCE_TEXT_BYTES);
+        let mut cues = SpeechCues::Links {
+            links: (0..text.len())
+                .map(|offset| SpeechLink {
+                    offset,
+                    audible: true,
+                })
+                .collect(),
+            tones: true,
+        };
+        assert_eq!(cues.queue_bytes(), text.len() * size_of::<SpeechLink>());
+        let bounded = cues.bound_text(&text, MAX_UTTERANCE_TEXT_BYTES);
+        let SpeechCues::Links { links, .. } = &cues else {
+            unreachable!("bounded link announcements must retain their metadata");
+        };
+        assert!(!links.is_empty());
+        assert!(links.len() < text.len());
+        assert_eq!(links.capacity(), links.len());
+        assert_eq!(
+            cues.queue_bytes(),
+            links.capacity() * size_of::<SpeechLink>()
+        );
+        assert!(bounded.len() + cues.queue_bytes() < 256 * 1024);
+    }
+
+    #[test]
+    fn queue_bytes_counts_spare_capacity_before_compaction() {
+        let mut links = Vec::with_capacity(1024);
+        links.push(SpeechLink {
+            offset: 0,
+            audible: true,
+        });
+        let original_capacity = links.capacity();
+        let mut cues = SpeechCues::Links { links, tones: true };
+        assert_eq!(
+            cues.queue_bytes(),
+            original_capacity * size_of::<SpeechLink>()
+        );
+        assert_eq!(cues.bound_text("text", MAX_UTTERANCE_TEXT_BYTES), "text");
+        assert_eq!(cues.queue_bytes(), size_of::<SpeechLink>());
+    }
 
     #[test]
     fn dense_cues_leave_room_for_a_pcm_host_or_spoken_fallback() {
