@@ -779,13 +779,28 @@ impl Host for ProcDriver {
     }
 
     fn speak(&mut self, id: &UtteranceId, text: &str, legacy_interrupt: bool) -> DriverResult<()> {
+        self.speak_with_cues(id, text, legacy_interrupt, &[])
+    }
+
+    fn speak_with_cues(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        legacy_interrupt: bool,
+        cues: &[super::protocol::SoundCueAt],
+    ) -> DriverResult<()> {
         let (method, params) = if self.legacy_protocol {
             (
                 "speak",
                 json!({ "text": text, "interrupt": legacy_interrupt }),
             )
-        } else {
+        } else if cues.is_empty() {
             ("speech.speak", json!({ "utteranceId": id, "text": text }))
+        } else {
+            (
+                "speech.speak",
+                json!({ "utteranceId": id, "text": text, "cues": cues }),
+            )
         };
         let result = self.call(method, Some(params))?;
         if self.legacy_protocol {

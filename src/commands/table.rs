@@ -1,4 +1,5 @@
 use super::{CommandResult, Result, review};
+use crate::speech::protocol::SoundCue;
 use crate::{
     keymap::InputMode,
     screen_reader::ScreenReader,
@@ -151,19 +152,25 @@ pub(super) fn row_move(
     let state = sr.table_session().navigation().unwrap().clone();
     let current_row = view.review_cursor_position().0;
     let (new_row, boundary) = match movement {
-        RowMove::Previous => (state.model().prev_data_row(view, current_row), "top"),
-        RowMove::Next => (state.model().next_data_row(view, current_row), "bottom"),
+        RowMove::Previous => (
+            state.model().prev_data_row(view, current_row),
+            SoundCue::Top,
+        ),
+        RowMove::Next => (
+            state.model().next_data_row(view, current_row),
+            SoundCue::Bottom,
+        ),
         RowMove::First => (
             state.model().nearest_data_row(view, state.model().top()),
-            "top",
+            SoundCue::Top,
         ),
         RowMove::Last => (
             state.model().nearest_data_row(view, state.model().bottom()),
-            "bottom",
+            SoundCue::Bottom,
         ),
     };
     let Some(new_row) = new_row else {
-        sr.speak(boundary, false)?;
+        sr.speak_review_cue(boundary)?;
         return Ok(CommandResult::Handled);
     };
 
@@ -196,16 +203,19 @@ pub(super) fn column_move(
     let current_col = state.current_col();
     let last_column = state.model().column_count().saturating_sub(1);
     let (target, boundary) = match movement {
-        ColumnMove::Previous => (current_col.checked_sub(1), "left"),
+        ColumnMove::Previous => (current_col.checked_sub(1), SoundCue::Left),
         ColumnMove::Next => (
             (current_col < last_column).then_some(current_col + 1),
-            "right",
+            SoundCue::Right,
         ),
-        ColumnMove::First => ((current_col != 0).then_some(0), "left"),
-        ColumnMove::Last => ((current_col != last_column).then_some(last_column), "right"),
+        ColumnMove::First => ((current_col != 0).then_some(0), SoundCue::Left),
+        ColumnMove::Last => (
+            (current_col != last_column).then_some(last_column),
+            SoundCue::Right,
+        ),
     };
     let Some(target) = target else {
-        sr.speak(boundary, false)?;
+        sr.speak_review_cue(boundary)?;
         return Ok(CommandResult::Handled);
     };
 
@@ -238,8 +248,11 @@ pub(super) fn header_read(sr: &mut ScreenReader, view: &mut View) -> Result<Comm
         return Ok(CommandResult::Handled);
     }
     let state = sr.table_session().navigation().unwrap().clone();
-    if let Some(text) = state.model().header_text(view, state.current_col()) {
-        sr.speak(&text, false)?;
+    if let Some((text, links)) = state
+        .model()
+        .header_text_with_links(view, state.current_col())
+    {
+        sr.speak_with_links(&text, &links, false)?;
     } else {
         sr.speak("no header", false)?;
     }
@@ -267,7 +280,7 @@ pub(super) fn word_previous(sr: &mut ScreenReader, view: &mut View) -> Result<Co
     let old_position = view.review_cursor_position();
     let (row, col) = old_position;
     if col <= start {
-        sr.speak("left", false)?;
+        sr.speak_review_cue(SoundCue::Left)?;
         word_read(sr, view)?;
         return Ok(CommandResult::Handled);
     }
@@ -306,7 +319,7 @@ pub(super) fn word_next(sr: &mut ScreenReader, view: &mut View) -> Result<Comman
         index += 1;
     }
     if index > end || old_word_end.is_some_and(|word_end| index <= word_end) {
-        sr.speak("right", false)?;
+        sr.speak_review_cue(SoundCue::Right)?;
         word_read(sr, view)?;
         return Ok(CommandResult::Handled);
     }
@@ -328,12 +341,12 @@ pub(super) fn word_read(sr: &mut ScreenReader, view: &mut View) -> Result<Comman
     let Some((word_start, word_end)) = word_bounds_at(view, row, col, start, end) else {
         return Ok(CommandResult::Handled);
     };
-    let text = view
+    let (text, mut links) = view
         .screen()
-        .contents_between(row, word_start, row, word_end + 1);
-    let spoken = text.trim();
-    if !spoken.is_empty() {
-        sr.speak(spoken, false)?;
+        .contents_with_links(row, word_start, row, word_end + 1);
+    let spoken = crate::terminal::trim_linked_text(&text, &mut links);
+    if !spoken.is_empty() || !links.is_empty() {
+        sr.speak_with_links(spoken, &links, false)?;
     }
     Ok(CommandResult::Handled)
 }
@@ -394,7 +407,7 @@ pub(super) fn character_previous(sr: &mut ScreenReader, view: &mut View) -> Resu
     };
     let old_position = view.review_cursor_position();
     if old_position.1 <= start {
-        sr.speak("left", false)?;
+        sr.speak_review_cue(SoundCue::Left)?;
         character_read(sr, view)?;
         return Ok(CommandResult::Handled);
     }
@@ -414,7 +427,7 @@ pub(super) fn character_next(sr: &mut ScreenReader, view: &mut View) -> Result<C
     };
     let old_position = view.review_cursor_position();
     if old_position.1 >= end {
-        sr.speak("right", false)?;
+        sr.speak_review_cue(SoundCue::Right)?;
         character_read(sr, view)?;
         return Ok(CommandResult::Handled);
     }
@@ -429,14 +442,20 @@ pub(super) fn character_read(sr: &mut ScreenReader, view: &mut View) -> Result<C
         sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     }
-    let Some((start, end)) = current_cell_text_bounds(sr, view) else {
+    let Some((start, end)) = current_cell_text_bounds(sr, view).or_else(|| {
+        let column = sr.table_session().navigation()?.current_column()?;
+        Some((column.start(), column.end()))
+    }) else {
         return Ok(CommandResult::Handled);
     };
     let (row, col) = view.review_cursor_position();
     let col = col.clamp(start, end);
-    let character = view.screen().contents_between(row, col, row, col + 1);
-    if !character.trim().is_empty() {
-        sr.speak(&character, false)?;
+    let (character, links) = view.character_with_links(row, col);
+    if !character.trim().is_empty() || !links.is_empty() {
+        sr.speak_with_links(&character, &links, false)?;
+    }
+    if character.trim().is_empty() {
+        sr.speak_review_cue(SoundCue::Blank)?;
     }
     Ok(CommandResult::Handled)
 }
@@ -520,13 +539,17 @@ fn speak_cell(
     if include_header
         && let Some(header_row) = state.model().header_row()
         && header_row != row
-        && let Some(text) = state.model().header_text(view, state.current_col())
+        && let Some((text, links)) = state
+            .model()
+            .header_text_with_links(view, state.current_col())
     {
-        sr.speak(&text, false)?;
+        sr.speak_with_links(&text, &links, false)?;
     }
-    let text = state.model().cell_text(view, row, state.current_col());
-    if !text.trim().is_empty() {
-        sr.speak(&text, false)?;
+    let (text, links) = state
+        .model()
+        .cell_text_with_links(view, row, state.current_col());
+    if !text.trim().is_empty() || !links.is_empty() {
+        sr.speak_with_links(&text, &links, false)?;
     }
     Ok(())
 }
@@ -632,12 +655,13 @@ mod tests {
                 "d",
                 "a",
                 "a",
+                "blank",
             ]
         );
     }
 
     #[test]
-    fn blank_table_cells_are_silent_for_navigation_and_explicit_reads() {
+    fn blank_table_cell_feedback_is_limited_to_character_inspection() {
         let (mut sr, output) = screen_reader();
         let mut view = View::new(3, 20);
         view.process_changes(b"A   VALUE   END\r\nx   data    yes\r\ny           no");
@@ -647,9 +671,10 @@ mod tests {
 
         row_move(&mut sr, &mut view, RowMove::Next).unwrap();
         word_read(&mut sr, &mut view).unwrap();
+        assert!(output.borrow().is_empty());
         character_read(&mut sr, &mut view).unwrap();
 
         assert_eq!(view.review_cursor_position().0, 2);
-        assert!(output.borrow().is_empty());
+        assert_eq!(output.borrow().as_slice(), ["blank"]);
     }
 }

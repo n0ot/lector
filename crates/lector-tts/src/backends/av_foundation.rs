@@ -317,7 +317,7 @@ fn run_synthesizer(callbacks: Arc<Mutex<Callbacks>>, span: Span, commands: Recei
     }
 }
 
-fn build_utterance(
+pub(crate) fn build_utterance(
     text: &str,
     rate: f32,
     volume: f32,
@@ -360,7 +360,7 @@ fn speak_utterance(
 }
 
 /// One buffer's worth of synthesized audio, in the engine's native sample type.
-enum Chunk {
+pub(crate) enum Chunk {
     F32(WavSpec, Vec<f32>),
     I16(WavSpec, Vec<i16>),
     /// The zero-length buffer that ends a write.
@@ -390,7 +390,7 @@ unsafe fn gather<T: Copy>(
 
 // Sample rates are small positive integers reported as f64.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn extract_chunk(buffer: &AVAudioBuffer) -> Chunk {
+pub(crate) fn extract_chunk(buffer: &AVAudioBuffer) -> Chunk {
     let Some(pcm) = buffer.downcast_ref::<AVAudioPCMBuffer>() else {
         return Chunk::Unsupported;
     };

@@ -8,6 +8,7 @@ use mlua::{Table, Value, thread::ThreadStatus};
 use std::{
     collections::{HashMap, VecDeque},
     hash::{Hash, Hasher},
+    ops::Range,
     sync::Arc,
 };
 
@@ -67,6 +68,8 @@ struct LuaCoordinate {
     row: u16,
     col: u16,
 }
+
+type MappedLuaText = (String, Vec<(usize, LuaCoordinate)>, Vec<Range<usize>>);
 
 struct ActiveRead {
     context: LuaViewKey,
@@ -378,7 +381,7 @@ impl App {
                     self.require_current_lua_view(view)?;
                     let first = lua_coordinate(request.get("first")?)?;
                     let last = lua_coordinate(request.get("last")?)?;
-                    let (text, offsets) = self.mapped_lua_text(view, first, last)?;
+                    let (text, offsets, links) = self.mapped_lua_text(view, first, last)?;
                     if text.is_empty() {
                         response = Value::Table(read_result(
                             &task.invocation.lua,
@@ -388,7 +391,7 @@ impl App {
                         )?);
                         continue;
                     }
-                    let submission = sr.speak_for_reader(&text)?;
+                    let submission = sr.speak_for_reader(&text, &links)?;
                     task.wait = LuaWait::Reading(ActiveRead {
                         context: view,
                         submission,
@@ -670,50 +673,24 @@ impl App {
         view_key: LuaViewKey,
         first: LuaCoordinate,
         last: LuaCoordinate,
-    ) -> Result<(String, Vec<(usize, LuaCoordinate)>)> {
+    ) -> Result<MappedLuaText> {
         validate_range(view_key, first, last)?;
         let view = self.presented_accessibility_model_mut();
-        let screen = view.screen();
-        let text = screen.contents_between(first.row, first.col, last.row, last.col);
         let mut offsets = Vec::new();
-        let mut absolute = 0usize;
-        for row in first.row..=last.row {
-            let start = if row == first.row { first.col } else { 0 };
-            let end = if row == last.row {
-                last.col
-            } else {
-                view_key.cols
-            };
-            let segment = screen.contents_between(row, start, row, end);
-            let mut segment_bytes = 0usize;
-            for col in start..end {
-                let contents = screen.cell(row, col).map_or("", |cell| cell.contents());
-                if contents.is_empty() || segment_bytes >= segment.len() {
-                    continue;
+        let mut links = crate::terminal::LinkSpans::default();
+        let text = view.screen().contents_between_with_cells(
+            first.row,
+            first.col,
+            last.row,
+            last.col,
+            |offset, row, col, cell| {
+                record_coordinate_offset(&mut offsets, offset, LuaCoordinate { row, col });
+                if let Some(cell) = cell {
+                    links.visit(offset, cell.contents(), cell.hyperlink.as_deref());
                 }
-                record_coordinate_offset(
-                    &mut offsets,
-                    absolute.saturating_add(segment_bytes),
-                    LuaCoordinate { row, col },
-                );
-                segment_bytes = segment_bytes
-                    .saturating_add(contents.len())
-                    .min(segment.len());
-            }
-            absolute = absolute.saturating_add(segment.len());
-            if row != last.row && !screen.row_wrapped(row) {
-                absolute = absolute.saturating_add(1);
-                record_coordinate_offset(
-                    &mut offsets,
-                    absolute,
-                    LuaCoordinate {
-                        row: row + 1,
-                        col: 0,
-                    },
-                );
-            }
-        }
-        Ok((text, offsets))
+            },
+        );
+        Ok((text, offsets, links.spans))
     }
 
     fn move_reader_review_cursor(

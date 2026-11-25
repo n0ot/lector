@@ -678,10 +678,10 @@ impl ReviewView {
             sr.speak("outside table", false)?;
             return Ok(ViewAction::None);
         };
-        let label = table.label(address).to_owned();
         if table.toggle_row_header(address.column) {
+            let (label, links) = table.label_with_links(address);
             sr.speak("row headers from", false)?;
-            sr.speak(&label, false)?;
+            sr.speak_with_links(label, links, false)?;
         } else {
             sr.speak("row headers off", false)?;
         }
@@ -736,9 +736,10 @@ impl ReviewView {
         if include_row {
             Self::speak_row_identity(sr, table, address)?;
         }
-        sr.speak(table.label(address), false)?;
-        let text = table.text(address).trim();
-        sr.speak(if text.is_empty() { "blank" } else { text }, false)?;
+        let (label, links) = table.label_with_links(address);
+        sr.speak_with_links(label, links, false)?;
+        let (text, links) = table.text_with_links(address);
+        sr.speak_with_links(if text.is_empty() { "blank" } else { text }, links, false)?;
         Ok(())
     }
 
@@ -757,10 +758,9 @@ impl ReviewView {
         if table
             .row_header_column()
             .is_some_and(|column| column != address.column)
-            && let Some(text) = table.row_header_text(address)
+            && let Some((text, links)) = table.row_header_with_links(address)
         {
-            let text = text.trim();
-            sr.speak(if text.is_empty() { "blank" } else { text }, false)?;
+            sr.speak_with_links(if text.is_empty() { "blank" } else { text }, links, false)?;
         }
         Ok(())
     }
@@ -793,7 +793,7 @@ impl ReviewView {
         self.view.queue_internal_speech(
             crate::application_accessibility::ApplicationAccessibilitySpeech {
                 text: text.into(),
-                indentation: None,
+                ..Default::default()
             },
         );
     }
@@ -881,7 +881,8 @@ impl ReviewView {
             (None, Some(address)) => {
                 sr.speak("table", false)?;
                 Self::speak_row_identity(sr, table, address)?;
-                sr.speak(table.label(address), false)?;
+                let (label, links) = table.label_with_links(address);
+                sr.speak_with_links(label, links, false)?;
             }
             (Some(_), None) => {
                 sr.speak(
@@ -898,7 +899,8 @@ impl ReviewView {
                     Self::speak_row_identity(sr, table, address)?;
                 }
                 if previous.column != address.column {
-                    sr.speak(table.label(address), false)?;
+                    let (label, links) = table.label_with_links(address);
+                    sr.speak_with_links(label, links, false)?;
                 }
             }
             _ => {}

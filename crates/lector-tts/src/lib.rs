@@ -29,6 +29,7 @@ mod backends;
 pub mod host;
 pub mod protocol;
 pub mod server;
+pub mod speech_fallback;
 
 /// Android-specific configuration with no counterpart on the other platforms.
 #[cfg(target_os = "android")]

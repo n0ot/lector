@@ -1007,6 +1007,10 @@ mod tests {
             r#"
                 assert(lector.o.suppress_key_echo == false)
                 assert(lector.o.report_indentation == true)
+                assert(lector.o.tones == true)
+                lector.o.tones = false
+                assert(lector.o.tones == false)
+                assert(not pcall(function() lector.o.tones = 'off' end))
                 assert(lector.o.tmux_bells == "audible")
                 assert(lector.o.clipboard.default_register == '"')
                 assert(lector.o.clipboard.system_provider == "native")

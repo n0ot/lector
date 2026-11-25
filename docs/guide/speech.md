@@ -4,6 +4,14 @@ Lector speaks through your system's text-to-speech out of the box. This page
 covers how to control speech, tune the voice, and use a different speech
 server.
 
+## Sound cues
+
+Lector plays short cues at review cursor boundaries and when inspecting a
+blank character. It identifies an OSC 8 hyperlink when its text starts, or
+when you start reading within the link. Set `lector.o.tones = false` to use
+spoken labels for boundaries, blank characters, and links. Hosts without
+sound cue support also use spoken labels.
+
 ## Controlling speech
 
 - `M-x` pauses or resumes speech. Typing pauses it too.

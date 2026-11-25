@@ -1,7 +1,11 @@
 //! Terminal state and Lector's Ghostty terminal adapter.
 
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, ops::RangeInclusive, sync::Arc};
+use std::{
+    collections::VecDeque,
+    ops::{Range, RangeInclusive},
+    sync::Arc,
+};
 
 pub use lector_ghostty::{
     CellSnapshot as Cell, ClipboardContentSnapshot as ClipboardContent,
@@ -130,6 +134,26 @@ pub struct PrintedRun {
     pub text: String,
     /// Applied before this run's text, even when the text is nonempty.
     pub boundary: PrintBoundary,
+    /// Hyperlink spans in this run’s UTF-8 text.
+    pub links: Vec<PrintedLink>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrintedLink {
+    pub start: usize,
+    pub end: usize,
+    /// Identity of the OSC 8 opening in this terminal stream.
+    pub id: u64,
+}
+
+impl PrintedRun {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.text.len().saturating_add(
+            self.links
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PrintedLink>()),
+        )
+    }
 }
 
 /// A print-observer suffix which began after the newest structural or
@@ -334,6 +358,14 @@ impl UpdateSummary {
         printed_runs_text_into(&self.printed_runs, text);
     }
 
+    pub(crate) fn printed_text_with_links_into(
+        &self,
+        text: &mut String,
+        links: &mut Vec<PrintedLink>,
+    ) {
+        printed_runs_with_links_into(&self.printed_runs, text, Some(links));
+    }
+
     pub(crate) fn cell_write_boundary(&self) -> CellWriteBoundary {
         CellWriteBoundary {
             run_count: self.cell_writes.len(),
@@ -397,6 +429,16 @@ impl UpdateSummary {
     ) -> Option<&LinearOutputReport> {
         let report = self.readable_linear_output_report()?;
         printed_runs_text_into(&report.printed_runs, text);
+        Some(report)
+    }
+
+    pub(crate) fn readable_linear_output_text_with_links_into(
+        &self,
+        text: &mut String,
+        links: &mut Vec<PrintedLink>,
+    ) -> Option<&LinearOutputReport> {
+        let report = self.readable_linear_output_report()?;
+        printed_runs_with_links_into(&report.printed_runs, text, Some(links));
         Some(report)
     }
 
@@ -511,7 +553,18 @@ impl LinearOutputReport {
 }
 
 fn printed_runs_text_into(runs: &[PrintedRun], text: &mut String) {
+    printed_runs_with_links_into(runs, text, None);
+}
+
+fn printed_runs_with_links_into(
+    runs: &[PrintedRun],
+    text: &mut String,
+    mut links: Option<&mut Vec<PrintedLink>>,
+) {
     text.clear();
+    if let Some(links) = links.as_deref_mut() {
+        links.clear();
+    }
     for run in runs {
         match run.boundary {
             PrintBoundary::Continue => {}
@@ -523,9 +576,34 @@ fn printed_runs_text_into(runs: &[PrintedRun], text: &mut String) {
             PrintBoundary::CarriageReturn => {
                 let line_start = text.rfind('\n').map_or(0, |index| index + 1);
                 text.truncate(line_start);
+                if let Some(links) = links.as_deref_mut() {
+                    links.truncate(links.partition_point(|link| link.start < line_start));
+                }
             }
         }
+        if let Some(links) = links.as_deref_mut() {
+            extend_printed_links(links, run.links.iter().copied(), text.len());
+        }
         text.push_str(&run.text);
+    }
+}
+
+fn extend_printed_links(
+    links: &mut Vec<PrintedLink>,
+    source: impl IntoIterator<Item = PrintedLink>,
+    offset: usize,
+) {
+    for mut link in source {
+        link.start += offset;
+        link.end += offset;
+        if let Some(last) = links.last_mut()
+            && last.id == link.id
+            && last.end == link.start
+        {
+            last.end = link.end;
+        } else {
+            links.push(link);
+        }
     }
 }
 
@@ -536,12 +614,19 @@ fn coalesce_printed_run(previous: &mut PrintedRun, run: &mut PrintedRun) -> bool
     {
         previous.boundary = PrintBoundary::LineFeed;
         previous.text = std::mem::take(&mut run.text);
+        previous.links = std::mem::take(&mut run.links);
         return true;
     }
     if run.boundary == PrintBoundary::Continue {
         if previous.text.is_empty() {
+            previous.links = std::mem::take(&mut run.links);
             previous.text = std::mem::take(&mut run.text);
         } else {
+            extend_printed_links(
+                &mut previous.links,
+                run.links.iter().copied(),
+                previous.text.len(),
+            );
             previous.text.push_str(&run.text);
         }
         return true;
@@ -895,11 +980,30 @@ impl TerminalSnapshot {
     }
 
     pub fn contents(&self) -> String {
+        self.contents_with_cell_visitor(|_, _| {})
+    }
+
+    pub(crate) fn linked_contents(&self) -> (String, Vec<Range<usize>>) {
+        let mut links = LinkSpans::default();
+        let text = self.contents_with_cell_visitor(|offset, cell| {
+            links.visit(offset, cell.contents(), cell.hyperlink.as_deref());
+        });
+        (text, links.spans)
+    }
+
+    fn contents_with_cell_visitor<'a>(&'a self, mut visit: impl FnMut(usize, &'a Cell)) -> String {
         let mut contents = String::new();
         let mut wrapping = false;
         for row in self.rows.iter() {
             let row_start = contents.len();
-            row.append_contents_to(&mut contents);
+            row.append_contents_range_with_cells(
+                &mut contents,
+                0,
+                row.cells.len(),
+                |offset, _, cell| {
+                    visit(offset, cell);
+                },
+            );
             if contents.len() == row_start && wrapping {
                 contents.push('\n');
             }
@@ -927,42 +1031,60 @@ impl TerminalSnapshot {
         end_row: u16,
         end_col: u16,
     ) -> String {
-        match start_row.cmp(&end_row) {
-            std::cmp::Ordering::Less => {
-                let (_, cols) = self.size();
-                let mut contents = String::new();
-                for row_index in start_row..=end_row {
-                    let Some(row) = self.rows.get(usize::from(row_index)) else {
-                        break;
-                    };
-                    if row_index == start_row {
-                        append_row_contents(
-                            row,
-                            start_col,
-                            cols.saturating_sub(start_col),
-                            &mut contents,
-                        );
-                    } else if row_index == end_row {
-                        append_row_contents(row, 0, end_col, &mut contents);
-                    } else {
-                        append_row_contents(row, 0, cols, &mut contents);
-                    }
-                    if row_index != end_row && !row.wrapped {
-                        contents.push('\n');
-                    }
-                }
-                contents
+        self.contents_between_with_cells(start_row, start_col, end_row, end_col, |_, _, _, _| {})
+    }
+
+    /// Visits each emitted grapheme, plus the position after a hard newline.
+    pub(crate) fn contents_between_with_cells<'a>(
+        &'a self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+        mut visit: impl FnMut(usize, u16, u16, Option<&'a Cell>),
+    ) -> String {
+        let (_, cols) = self.size();
+        let mut contents = String::new();
+        for row_index in start_row..=end_row {
+            let Some(row) = self.rows.get(usize::from(row_index)) else {
+                break;
+            };
+            let start = if row_index == start_row { start_col } else { 0 };
+            let end = if row_index == end_row { end_col } else { cols };
+            row.append_contents_range_with_cells(
+                &mut contents,
+                usize::from(start),
+                usize::from(end.saturating_sub(start)),
+                |offset, col, cell| visit(offset, row_index, col as u16, Some(cell)),
+            );
+            if row_index != end_row && !row.wrapped {
+                contents.push('\n');
+                visit(contents.len(), row_index + 1, 0, None);
             }
-            std::cmp::Ordering::Equal if start_col < end_col => self
-                .rows
-                .get(usize::from(start_row))
-                .map_or_else(String::new, |row| {
-                    let mut contents = String::new();
-                    append_row_contents(row, start_col, end_col - start_col, &mut contents);
-                    contents
-                }),
-            _ => String::new(),
         }
+        contents
+    }
+
+    pub(crate) fn contents_with_links(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+    ) -> (String, Vec<Range<usize>>) {
+        let mut links = LinkSpans::default();
+        let text = self.contents_between_with_cells(
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            |offset, _, _, cell| {
+                if let Some(cell) = cell {
+                    links.visit(offset, cell.contents(), cell.hyperlink.as_deref());
+                }
+            },
+        );
+        (text, links.spans)
     }
 
     pub fn contents_full(&self) -> String {
@@ -993,6 +1115,53 @@ impl TerminalSnapshot {
         }
     }
 
+    /// Normalized physical rows with link ranges in the same byte coordinates
+    /// as the visible or history-inclusive accessibility text cache.
+    pub(crate) fn physical_contents_with_links_into(
+        &self,
+        history: bool,
+        out: &mut String,
+        spans: &mut Vec<Range<usize>>,
+    ) {
+        out.clear();
+        spans.clear();
+        let mut links = LinkSpans {
+            previous: None,
+            spans: std::mem::take(spans),
+        };
+        let (_, cols) = self.size();
+        let history = self.scrollback.iter().filter(|_| history);
+        for row in history.chain(self.rows.iter()) {
+            let row_start = out.len();
+            let first_link = links.spans.len();
+            row.append_contents_range_with_cells(out, 0, usize::from(cols), |offset, _, cell| {
+                let hyperlink = cell.hyperlink.as_deref();
+                if offset == row_start
+                    && hyperlink.is_some()
+                    && links.previous == hyperlink
+                    && let Some(last) = links.spans.last_mut()
+                    && last.end + 1 == row_start
+                {
+                    // Preserve the link across the inserted separator on a
+                    // soft wrap, without treating unrelated rows as one.
+                    last.end = row_start;
+                }
+                links.visit(offset, cell.contents(), hyperlink);
+            });
+            let row_end = row_start + out[row_start..].trim_end().len();
+            out.truncate(row_end);
+            for span in &mut links.spans[first_link.saturating_sub(1)..] {
+                span.start = span.start.min(row_end);
+                span.end = span.end.min(row_end);
+            }
+            if !row.wrapped || row_start == row_end {
+                links.previous = None;
+            }
+            out.push('\n');
+        }
+        *spans = links.spans;
+    }
+
     /// Returns whether any visible cell contains a non-whitespace character.
     ///
     /// This is equivalent to `!self.contents().trim().is_empty()` without
@@ -1016,6 +1185,40 @@ fn append_full_row(row: &Row, cols: u16, out: &mut String) {
     let trimmed_row_len = out[row_start..].trim_end().len();
     out.truncate(row_start + trimmed_row_len);
     out.push('\n');
+}
+
+/// Collects half-open UTF-8 byte ranges of contiguous OSC 8 cells.
+#[derive(Default)]
+pub(crate) struct LinkSpans<'a> {
+    previous: Option<&'a str>,
+    pub(crate) spans: Vec<Range<usize>>,
+}
+
+impl<'a> LinkSpans<'a> {
+    pub(crate) fn visit(&mut self, start: usize, text: &str, hyperlink: Option<&'a str>) {
+        let end = start + text.len();
+        if hyperlink.is_some() && end > start {
+            if self.previous == hyperlink
+                && let Some(last) = self.spans.last_mut()
+                && last.end == start
+            {
+                last.end = end;
+            } else {
+                self.spans.push(start..end);
+            }
+        }
+        self.previous = hyperlink;
+    }
+}
+
+pub(crate) fn trim_linked_text<'a>(text: &'a str, links: &mut [Range<usize>]) -> &'a str {
+    let start = text.len() - text.trim_start().len();
+    let trimmed = text.trim();
+    let end = start + trimmed.len();
+    for link in links {
+        *link = link.start.clamp(start, end) - start..link.end.clamp(start, end) - start;
+    }
+    trimmed
 }
 
 fn row_contents(row: &Row, start: u16, width: u16) -> String {
@@ -1574,6 +1777,13 @@ fn normalize_ghostty_printed_runs(
     let mut normalized: Vec<_> = runs
         .into_iter()
         .map(|run| PrintedRun {
+            links: run.hyperlink.map_or_else(Vec::new, |id| {
+                vec![PrintedLink {
+                    start: 0,
+                    end: run.text.len(),
+                    id,
+                }]
+            }),
             text: run.text,
             boundary: match run.boundary {
                 GhosttyPrintBoundary::Continue => PrintBoundary::Continue,
@@ -1691,6 +1901,40 @@ fn ghostty_screen_identity(alternate: bool) -> ScreenIdentity {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn link_spans_follow_visible_bytes_across_wide_cells_and_soft_wraps() {
+        let mut engine = GhosttyEngine::new(3, 6).unwrap();
+        engine
+            .advance(b"a\x1b]8;;https://example.invalid\x1b\\  ")
+            .unwrap();
+        engine.advance("界e\u{301}f".as_bytes()).unwrap();
+        engine.advance(b"\x1b]8;;\x1b\\ !").unwrap();
+        let snapshot = engine.snapshot();
+        let (text, spans) = snapshot.contents_with_links(0, 0, 1, 6);
+        assert_eq!(text, "a  界e\u{301}f !");
+        assert_eq!(spans, std::slice::from_ref(&(1..10)));
+        let (text, spans) = snapshot.contents_with_links(0, 3, 1, 1);
+        assert_eq!(text, "界e\u{301}f");
+        assert_eq!(spans, std::slice::from_ref(&(0..7)));
+    }
+
+    #[test]
+    fn printed_link_spans_survive_chunks_and_discard_overwritten_text() {
+        let mut engine = GhosttyEngine::new(3, 20).unwrap();
+        let mut report = engine
+            .advance(b"\x1b]8;;https://example.invalid\x1b\\old")
+            .unwrap();
+        report.merge(engine.advance(b" text\rnew").unwrap());
+        report.merge(engine.advance("界".as_bytes()).unwrap());
+        report.merge(engine.advance(b"\x1b]8;;\x1b\\!").unwrap());
+        let mut text = String::new();
+        let mut links = Vec::new();
+        report.printed_text_with_links_into(&mut text, &mut links);
+        assert_eq!(text, "new界!");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].start..links[0].end, 0..6);
+    }
+
     #[test]
     fn cell_write_spill_preserves_revision_and_deletion_boundaries() {
         let mut engine = GhosttyEngine::new(2, 12).expect("create engine");

@@ -9,6 +9,7 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     fmt,
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     str::FromStr,
@@ -863,12 +864,42 @@ impl ScreenReader {
         result.map(Some).map_err(Into::into)
     }
 
+    pub(crate) fn speak_review_cue(&mut self, cue: speech::protocol::SoundCue) -> Result<()> {
+        if !self.terminal_focused {
+            return Ok(());
+        }
+        let label = cue.spoken_label();
+        self.call_hook_on_speech_start(label, false)?;
+        let result = self.speech.speak_cue(cue, label, false);
+        self.call_hook_on_speech_end(label, false, result.is_ok())?;
+        result.map(|_| ()).map_err(Into::into)
+    }
+
+    pub(crate) fn speak_with_links(
+        &mut self,
+        text: &str,
+        links: &[Range<usize>],
+        interrupt: bool,
+    ) -> Result<Option<crate::speech::protocol::UtteranceId>> {
+        if links.is_empty() {
+            return self.speak(text, interrupt);
+        }
+        if !self.terminal_focused {
+            return Ok(None);
+        }
+        self.call_hook_on_speech_start(text, interrupt)?;
+        let result = self.speech.speak_with_links(text, links, interrupt);
+        self.call_hook_on_speech_end(text, interrupt, result.is_ok())?;
+        result.map(Some).map_err(Into::into)
+    }
+
     pub(crate) fn speak_for_reader(
         &mut self,
         text: &str,
+        links: &[Range<usize>],
     ) -> Result<crate::speech::ReaderSubmission> {
         self.call_hook_on_speech_start(text, true)?;
-        let result = self.speech.speak_for_reader(text);
+        let result = self.speech.speak_for_reader_with_links(text, links);
         let ok = result.is_ok();
         self.call_hook_on_speech_end(text, true, ok)?;
         result.map_err(Into::into)

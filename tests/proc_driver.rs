@@ -371,6 +371,76 @@ mod native_speech {
 
     #[test]
     #[ignore = "requires native audio; run scripts/test-native-speech"]
+    fn synchronized_sound_cues_complete_and_stop_with_speech() {
+        let directory = tempfile::tempdir().expect("speech test directory");
+        let event_log = directory.path().join("events.jsonl");
+        let mut host = NativeTestHost::spawn(
+            Command::new(env!("CARGO_BIN_EXE_lector"))
+                .arg("tts")
+                .env("LECTOR_SPEECH_TEST_MUTE", "1")
+                .env("LECTOR_SPEECH_EVENT_LOG", &event_log),
+        );
+        let initialized = host.rpc(
+            1,
+            "initialize",
+            serde_json::json!({
+                "protocol": {"major": 2, "minimumMinor": 3, "maximumMinor": 3},
+                "client": {"name": "lector-test", "version": "1"},
+                "clientCapabilities": {"speechEvents": true, "progressModes": ["utf8ByteOffset"]}
+            }),
+        );
+        assert_eq!(initialized["result"]["capabilities"]["soundCues"], true);
+
+        let accepted = host.rpc(
+            2,
+            "speech.speak",
+            serde_json::json!({
+                "utteranceId": "linked",
+                "text": "One sample sentence ends here.",
+                "cues": [{"cue": "link", "offset": 4}]
+            }),
+        );
+        assert_eq!(accepted["result"]["accepted"], true);
+        host.frames
+            .as_mut()
+            .unwrap()
+            .wait_for(NATIVE_TEST_DEADLINE, "linked word playback", |frame| {
+                frame["params"]["utteranceId"] == "linked"
+                    && frame["params"]["event"]["type"] == "progress"
+                    && frame["params"]["event"]["position"]["offset"] == 4
+            })
+            .unwrap();
+        let stopped = host.rpc(
+            3,
+            "speech.stop",
+            serde_json::json!({"utteranceId": "linked"}),
+        );
+        assert_eq!(stopped["result"]["accepted"], true);
+        let ended = host
+            .frames
+            .as_mut()
+            .unwrap()
+            .wait_for(NATIVE_TEST_DEADLINE, "linked cancellation", |frame| {
+                frame["params"]["utteranceId"] == "linked"
+                    && frame["params"]["event"]["type"] == "ended"
+            })
+            .unwrap();
+        assert_eq!(ended["params"]["event"]["reason"], "cancelled");
+
+        let accepted = host.rpc(
+            4, "speech.speak",
+            serde_json::json!({"utteranceId": "boundary", "text": "", "cues": [{"cue": "right", "offset": 0}]}),
+        );
+        assert_eq!(accepted["result"]["accepted"], true);
+        host.wait_for_completion("boundary");
+        // The ordinary native speech callback logs begin. If the combined
+        // request fell back to ordinary speech, this file would be nonempty.
+        assert_eq!(fs::metadata(event_log).unwrap().len(), 0);
+        host.finish();
+    }
+
+    #[test]
+    #[ignore = "requires native audio; run scripts/test-native-speech"]
     fn lector_tts_host_advances_past_its_first_utterance() {
         let directory = tempfile::tempdir().expect("speech test directory");
         let event_log = directory.path().join("events.jsonl");

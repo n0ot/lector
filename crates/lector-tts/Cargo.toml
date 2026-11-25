@@ -81,12 +81,15 @@ objc2-avf-audio = { version = "0.3", default-features = false, features = [
     "block2",
     "AVAudioBuffer",
     "AVAudioFormat",
+    "AVAudioPlayer",
     "AVAudioTypes",
     "AVSpeechSynthesis",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSArray",
+    "NSData",
+    "NSError",
     "NSEnumerator",
     "NSRange",
     "NSString",

@@ -4,7 +4,9 @@
 //! is an external side effect and must never be allowed to stall that owner.
 
 use super::protocol::{UtteranceId, rate_is_normalized};
-use super::{CapabilityStatus, Driver, OptionState, SetOptionOutcome, UtteranceBoundary};
+use super::{
+    CapabilityStatus, Driver, OptionState, SetOptionOutcome, SpeechCues, UtteranceBoundary,
+};
 use anyhow::{Result as DriverResult, anyhow};
 use std::{
     collections::VecDeque,
@@ -21,7 +23,6 @@ use super::SpeechServerSpec;
 
 const MAX_PENDING_SPEECH_BYTES: usize = 256 * 1024;
 const MAX_SPEECH_ITEM_BYTES: usize = 64 * 1024;
-const TRUNCATION_SUFFIX: &str = " … speech truncated";
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -31,6 +32,7 @@ enum Request {
         text: String,
         interrupt: bool,
         boundary: UtteranceBoundary,
+        cues: SpeechCues,
     },
     Cancel,
     Pause,
@@ -47,9 +49,10 @@ enum Request {
 impl Request {
     fn speech_bytes(&self) -> usize {
         match self {
-            Self::Speak { id, text, .. } => std::mem::size_of::<Self>()
+            Self::Speak { id, text, cues, .. } => std::mem::size_of::<Self>()
                 .saturating_add(id.as_str().len())
-                .saturating_add(text.len()),
+                .saturating_add(text.len())
+                .saturating_add(cues.queue_bytes()),
             Self::Cancel
             | Self::Pause
             | Self::Resume
@@ -123,22 +126,31 @@ impl Mailbox {
     }
 
     fn enqueue_speech(&self, id: &UtteranceId, text: &str, interrupt: bool) -> DriverResult<()> {
-        self.enqueue_speech_with_boundary(id, text, interrupt, UtteranceBoundary::Immediate)
+        self.enqueue_speech_with_cues(
+            id,
+            text,
+            interrupt,
+            UtteranceBoundary::Immediate,
+            SpeechCues::None,
+        )
     }
 
-    fn enqueue_speech_with_boundary(
+    fn enqueue_speech_with_cues(
         &self,
         id: &UtteranceId,
         text: &str,
         interrupt: bool,
         boundary: UtteranceBoundary,
+        mut cues: SpeechCues,
     ) -> DriverResult<()> {
-        let text = bounded_text(text, MAX_SPEECH_ITEM_BYTES);
+        anyhow::ensure!(cues.valid_for(text), "invalid speech cue offsets");
+        let text = cues.bound_text(text, MAX_SPEECH_ITEM_BYTES);
         let request = Request::Speak {
             id: id.clone(),
             text,
             interrupt,
             boundary,
+            cues,
         };
         let speech_bytes = request.speech_bytes();
         let mut state = self.lock()?;
@@ -490,8 +502,19 @@ impl Driver for BoundedAsyncDriver {
         interrupt: bool,
         boundary: UtteranceBoundary,
     ) -> DriverResult<()> {
+        self.speak_utterance_with_cues(id, text, interrupt, boundary, SpeechCues::None)
+    }
+
+    fn speak_utterance_with_cues(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+        boundary: UtteranceBoundary,
+        cues: SpeechCues,
+    ) -> DriverResult<()> {
         self.mailbox
-            .enqueue_speech_with_boundary(id, text, interrupt, boundary)
+            .enqueue_speech_with_cues(id, text, interrupt, boundary, cues)
     }
 
     fn stop(&mut self) -> DriverResult<()> {
@@ -680,7 +703,8 @@ fn run_worker(
                 text,
                 interrupt,
                 boundary,
-            }) => driver.speak_utterance_with_boundary(&id, &text, interrupt, boundary),
+                cues,
+            }) => driver.speak_utterance_with_cues(&id, &text, interrupt, boundary, cues),
             NextRequest::Request(Request::Cancel) => driver.stop(),
             NextRequest::Request(Request::Pause) => driver.pause(),
             NextRequest::Request(Request::Resume) => driver.resume(),
@@ -727,21 +751,6 @@ fn run_worker(
             }
         }
     }
-}
-
-fn bounded_text(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    let prefix_limit = limit.saturating_sub(TRUNCATION_SUFFIX.len());
-    let mut end = prefix_limit.min(text.len());
-    while !text.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    let mut bounded = String::with_capacity(limit);
-    bounded.push_str(&text[..end]);
-    bounded.push_str(TRUNCATION_SUFFIX);
-    bounded
 }
 
 #[cfg(test)]

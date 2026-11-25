@@ -132,7 +132,14 @@ fn consume_application_accessibility(
             }
             // `speak` applies the outer-terminal focus policy. Unfocused
             // messages are consumed here and are never replayed later.
-            sr.speak(&message.text, false)?;
+            if let Some(cue) = message.cue {
+                if !message.links.is_empty() {
+                    sr.speak_with_links("", &message.links, false)?;
+                }
+                sr.speak_review_cue(cue)?;
+            } else {
+                sr.speak_with_links(&message.text, &message.links, false)?;
+            }
         }
     }
     Ok(policy)

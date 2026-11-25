@@ -1,9 +1,13 @@
 use crate::{keymap::InputMode, terminal::TerminalSnapshot, view::View};
+use std::ops::Range;
 
 mod detection;
 
 pub(crate) use detection::{detect, detect_manual_from_header};
-use detection::{is_separator_row, pipe_delimited_cell_text, row_has_fixed_width_columns};
+use detection::{
+    is_separator_row, pipe_delimited_cell_slice, pipe_delimited_cell_text,
+    row_has_fixed_width_columns,
+};
 
 pub(crate) trait TerminalSurface {
     fn screen(&self) -> &TerminalSnapshot;
@@ -254,30 +258,62 @@ impl TableModel {
         row: u16,
         col_idx: usize,
     ) -> String {
-        if self.delimiter == Some('|')
-            && let Some(text) = pipe_delimited_cell_text(&view.line(row), col_idx)
-        {
-            return text.to_string();
+        self.cell_text_with_links(view, row, col_idx).0
+    }
+
+    pub(crate) fn cell_text_with_links<V: TerminalSurface + ?Sized>(
+        &self,
+        view: &V,
+        row: u16,
+        col_idx: usize,
+    ) -> (String, Vec<Range<usize>>) {
+        let screen = view.screen();
+        if self.delimiter == Some('|') {
+            let (line, links) = screen.contents_with_links(row, 0, row, view.size().1);
+            if let Some(text) = pipe_delimited_cell_slice(&line, col_idx) {
+                if text.is_empty() {
+                    return (String::new(), Vec::new());
+                }
+                // The parser returns a slice of the original line.
+                let start = text.as_ptr() as usize - line.as_ptr() as usize;
+                let end = start + text.len();
+                let mut links = links
+                    .into_iter()
+                    .filter(|link| link.start < end && start < link.end)
+                    .map(|link| link.start.max(start) - start..link.end.min(end) - start)
+                    .collect::<Vec<_>>();
+                let text = crate::terminal::trim_linked_text(text, &mut links);
+                return (text.to_owned(), links);
+            }
         }
 
         let Some(column) = self.columns.get(col_idx) else {
-            return String::new();
+            return (String::new(), Vec::new());
         };
         let end = column.end.min(view.size().1.saturating_sub(1));
-        let text = view
-            .screen()
-            .contents_between(row, column.start, row, end + 1);
-        text.trim().to_string()
+        let (text, mut links) = screen.contents_with_links(row, column.start, row, end + 1);
+        let trimmed = crate::terminal::trim_linked_text(&text, &mut links);
+        (trimmed.to_owned(), links)
     }
 
+    #[cfg(test)]
     pub fn header_text<V: TerminalSurface + ?Sized>(
         &self,
         view: &V,
         col_idx: usize,
     ) -> Option<String> {
+        self.header_text_with_links(view, col_idx)
+            .map(|(text, _)| text)
+    }
+
+    pub(crate) fn header_text_with_links<V: TerminalSurface + ?Sized>(
+        &self,
+        view: &V,
+        col_idx: usize,
+    ) -> Option<(String, Vec<Range<usize>>)> {
         let header_row = self.header_row?;
-        let text = self.cell_text(view, header_row, col_idx);
-        if text.is_empty() { None } else { Some(text) }
+        let (text, links) = self.cell_text_with_links(view, header_row, col_idx);
+        (!text.is_empty() || !links.is_empty()).then_some((text, links))
     }
 
     pub fn prev_data_row<V: TerminalSurface + ?Sized>(&self, view: &V, row: u16) -> Option<u16> {

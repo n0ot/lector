@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MIN_MINOR: u16 = 0;
-pub const PROTOCOL_MAX_MINOR: u16 = 2;
+pub const PROTOCOL_MAX_MINOR: u16 = 3;
+pub const SOUND_CUES_PROTOCOL_MINOR: u16 = 3;
 /// First protocol minor whose rate domain is independent of the native backend.
 pub const NORMALIZED_RATE_PROTOCOL_MINOR: u16 = 2;
 pub const MIN_RATE: f32 = 0.0;
@@ -309,6 +310,53 @@ pub struct VoiceCapabilities {
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SoundCue {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Blank,
+    Link,
+}
+
+impl SoundCue {
+    /// The spoken label used when the cue cannot be played.
+    #[must_use]
+    pub const fn spoken_label(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Blank => "blank",
+            Self::Link => "link",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SoundCueAt {
+    pub cue: SoundCue,
+    /// Byte offset in the UTF-8 text.
+    pub offset: usize,
+}
+
+impl SoundCueAt {
+    #[must_use]
+    pub fn valid_for(text: &str, cues: &[Self]) -> bool {
+        if text.is_empty() {
+            return matches!(cues, [cue] if cue.offset == 0 && cue.cue != SoundCue::Link);
+        }
+        cues.iter().all(|cue| {
+            cue.cue == SoundCue::Link
+                && cue.offset < text.len()
+                && text.is_char_boundary(cue.offset)
+        }) && cues.windows(2).all(|pair| pair[0].offset < pair[1].offset)
+    }
+}
+
 /// Host guarantees negotiated for one process generation. Missing or unknown
 /// members are unsupported. New optional members can therefore be added
 /// without changing the protocol major version.
@@ -324,6 +372,9 @@ pub struct SpeechCapabilities {
     pub settings: SettingCapabilities,
     #[serde(default)]
     pub voices: VoiceCapabilities,
+    /// Supports standalone cues and synchronized link overlays.
+    #[serde(default, rename = "soundCues")]
+    pub sound_cues: bool,
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
@@ -397,6 +448,9 @@ impl SpeechCapabilities {
             self.settings.pitch = SettingSupport::Unsupported;
             self.settings.volume = SettingSupport::Unsupported;
         }
+        if version.minor < SOUND_CUES_PROTOCOL_MINOR {
+            self.sound_cues = false;
+        }
         self
     }
 
@@ -412,6 +466,8 @@ impl SpeechCapabilities {
 pub struct SpeakParams {
     pub utterance_id: UtteranceId,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cues: Vec<SoundCueAt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -546,7 +602,7 @@ mod tests {
                 minimum_minor: 0,
                 maximum_minor: 9,
             }),
-            Some(ProtocolVersion { major: 2, minor: 2 })
+            Some(ProtocolVersion::current())
         );
         assert_eq!(
             current.highest_mutual(ProtocolRange {

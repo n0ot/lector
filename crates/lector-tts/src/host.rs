@@ -4,6 +4,16 @@
 //! this boundary. The host accepts one Lector utterance at a time and emits
 //! correlated lifecycle events; Lector owns all queueing.
 
+#[cfg(target_vendor = "apple")]
+mod cue_playback;
+
+#[cfg(target_vendor = "apple")]
+use crate::speech_fallback::{
+    InsertedLink, MAX_LINK_ANNOUNCEMENT_BYTES, append_link_announcement, canonical_offset,
+};
+#[cfg(target_vendor = "apple")]
+use cue_playback::CuePlayback;
+
 use crate::{
     Backends, Error as TtsError, Features, Gender, Tts, UtteranceId as NativeUtteranceId, Voice,
     protocol::{
@@ -11,7 +21,7 @@ use crate::{
         EventCapability, LifecycleCapabilities, MAX_UTTERANCE_TEXT_BYTES, NORMAL_RATE,
         NORMALIZED_RATE_PROTOCOL_MINOR, PauseResult, PauseResumeSupport, PitchResult,
         ProgressCapabilities, ProgressMode, ProtocolVersion, RateResult, SetVoiceParams,
-        SettingCapabilities, SettingSupport, SpeakParams, SpeechCapabilities,
+        SettingCapabilities, SettingSupport, SoundCueAt, SpeakParams, SpeechCapabilities,
         SpeechEventNotification, SpeechEventPayload, StopSupport, TerminalCapability, TextPosition,
         UtteranceId, UtteranceParams, VoiceCapabilities, VoiceInfo, VoiceListResult, VolumeResult,
         rate_is_normalized,
@@ -76,6 +86,7 @@ enum NativeEvent {
     Range {
         id: NativeUtteranceId,
         start: usize,
+        length: usize,
     },
 }
 
@@ -83,6 +94,10 @@ struct ActiveUtterance {
     logical_id: UtteranceId,
     native_id: Option<NativeUtteranceId>,
     text: String,
+    #[cfg(target_vendor = "apple")]
+    cues: Vec<SoundCueAt>,
+    #[cfg(target_vendor = "apple")]
+    fallback: Option<SpokenFallback>,
     /// UTF-8 offset represented by byte zero of the current native utterance.
     native_base: usize,
     current_word: usize,
@@ -91,8 +106,71 @@ struct ActiveUtterance {
     paused: bool,
 }
 
+#[cfg(target_vendor = "apple")]
+impl ActiveUtterance {
+    fn cues_from(&self, base: usize) -> Vec<SoundCueAt> {
+        self.cues
+            .iter()
+            .filter_map(|cue| {
+                Some(SoundCueAt {
+                    cue: cue.cue,
+                    offset: cue.offset.checked_sub(base)?,
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+struct SpokenFallback {
+    text: String,
+    announcements: Vec<InsertedLink>,
+    playback_base: usize,
+    word: usize,
+}
+
+#[cfg(target_vendor = "apple")]
+impl SpokenFallback {
+    fn new(text: &str, cues: &[SoundCueAt]) -> Self {
+        let mut announcements = Vec::with_capacity(cues.len());
+        let spoken_text = if let [cue] = cues
+            && text.is_empty()
+        {
+            cue.cue.spoken_label().to_owned()
+        } else {
+            let mut spoken_text =
+                String::with_capacity(text.len() + cues.len() * MAX_LINK_ANNOUNCEMENT_BYTES);
+            let mut previous = 0;
+            for cue in cues {
+                spoken_text.push_str(&text[previous..cue.offset]);
+                announcements.push(append_link_announcement(&mut spoken_text, text, cue.offset));
+                previous = cue.offset;
+            }
+            spoken_text.push_str(&text[previous..]);
+            spoken_text
+        };
+        Self {
+            text: spoken_text,
+            announcements,
+            playback_base: 0,
+            word: 0,
+        }
+    }
+
+    fn report_word(&mut self, start: usize) -> Option<usize> {
+        let absolute = self.playback_base.checked_add(start)?;
+        if !self.text.is_char_boundary(absolute) {
+            return None;
+        }
+        self.word = absolute;
+        Some(canonical_offset(absolute, &self.announcements))
+    }
+}
+
 struct State {
     tts: Tts,
+    #[cfg(target_vendor = "apple")]
+    cue_playback: Option<CuePlayback>,
     backend: Backends,
     backend_info: BackendInfo,
     rate: Option<RateState>,
@@ -320,7 +398,10 @@ impl State {
         let selected_voice = voice_id
             .map(|voice_id| select_voice(&tts, voice_id).map(|voice| voice.id))
             .transpose()?;
-        let capabilities = native_capabilities(features);
+        let mut capabilities = native_capabilities(features);
+        if supports_sound_cues(backend) {
+            capabilities.sound_cues = true;
+        }
         let (native_event_tx, native_events) = mpsc::channel();
         install_native_callbacks(
             &tts,
@@ -334,6 +415,8 @@ impl State {
             .transpose()?;
         Ok(Self {
             tts,
+            #[cfg(target_vendor = "apple")]
+            cue_playback: None,
             backend,
             backend_info: BackendInfo {
                 id: backend.id().to_owned(),
@@ -354,44 +437,124 @@ impl State {
         })
     }
 
-    fn speak(&mut self, id: UtteranceId, text: String) -> Result<(), RpcError> {
+    fn speak(&mut self, params: SpeakParams) -> Result<(), RpcError> {
+        let SpeakParams {
+            utterance_id: id,
+            text,
+            cues,
+        } = params;
         self.advance();
         if self.active.is_some() {
             return Err(RpcError::invalid_request(
                 "speech.speak received while another utterance is active",
             ));
         }
-        if !id.is_valid() || text.is_empty() || text.len() > MAX_UTTERANCE_TEXT_BYTES {
+        if !id.is_valid()
+            || text.len() > MAX_UTTERANCE_TEXT_BYTES
+            || !SoundCueAt::valid_for(&text, &cues)
+        {
             return Err(RpcError::invalid_params(
-                "utteranceId must be valid and text must contain at most 65536 UTF-8 bytes",
+                "utteranceId, text, or sound cues are invalid",
             ));
         }
-        let native_id = match classify_backend_attempt(self.tts.speak(&text, false))? {
-            BackendAttempt::Completed(native_id) => native_id,
-            BackendAttempt::Unavailable(message) => {
-                // The selected backend remains authoritative while its external
-                // service is absent. Drop this utterance instead of changing
-                // engines or killing the protocol host, and provide correlated
-                // terminal evidence so the client does not retain phantom work.
-                self.emit(id, 0, "ended", None, Some("failed"), Some(message));
-                return Ok(());
-            }
-        };
-        self.active = Some(ActiveUtterance {
+        if !cues.is_empty() && !self.capabilities.sound_cues {
+            return Err(RpcError::invalid_params(
+                "sound cues are unavailable for this session",
+            ));
+        }
+        let mut active = ActiveUtterance {
             logical_id: id,
-            native_id,
+            native_id: None,
             text,
+            #[cfg(target_vendor = "apple")]
+            cues,
+            #[cfg(target_vendor = "apple")]
+            fallback: None,
             native_base: 0,
             current_word: 0,
             next_sequence: 0,
             started: false,
             paused: false,
-        });
+        };
+        active.native_id = match self.start_native(&mut active, 0)? {
+            BackendAttempt::Completed(native_id) => native_id,
+            BackendAttempt::Unavailable(message) => {
+                // The selected backend remains authoritative while its external
+                // service is absent. Provide correlated terminal evidence.
+                self.emit_for(&active, "ended", None, Some("failed"), Some(message));
+                return Ok(());
+            }
+        };
+        self.active = Some(active);
         Ok(())
     }
 
+    fn start_native(
+        &mut self,
+        active: &mut ActiveUtterance,
+        base: usize,
+    ) -> Result<BackendAttempt<Option<NativeUtteranceId>>, RpcError> {
+        let text = resumable_suffix(&active.text, base).ok_or_else(|| {
+            RpcError::internal_error("native word position is not a UTF-8 boundary")
+        })?;
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(fallback) = &mut active.fallback {
+                let result = classify_backend_attempt(
+                    self.tts.speak(&fallback.text[fallback.word..], false),
+                )?;
+                if matches!(result, BackendAttempt::Completed(_)) {
+                    fallback.playback_base = fallback.word;
+                }
+                return Ok(result);
+            }
+            let cues = active.cues_from(base);
+            if !cues.is_empty() {
+                match CuePlayback::new(
+                    &self.tts,
+                    text,
+                    cues.clone(),
+                    self.selected_voice.as_deref(),
+                ) {
+                    Ok(playback) => {
+                        let id = playback.id();
+                        self.cue_playback = Some(playback);
+                        active.native_base = base;
+                        return Ok(BackendAttempt::Completed(Some(id)));
+                    }
+                    Err(error) => {
+                        eprintln!("lector-tts: {error}; speaking cue labels");
+                        return self.start_spoken_fallback(active, base, &cues);
+                    }
+                }
+            }
+        }
+        let result = classify_backend_attempt(self.tts.speak(text, false))?;
+        if matches!(result, BackendAttempt::Completed(_)) {
+            active.native_base = base;
+        }
+        Ok(result)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn start_spoken_fallback(
+        &self,
+        active: &mut ActiveUtterance,
+        base: usize,
+        cues: &[SoundCueAt],
+    ) -> Result<BackendAttempt<Option<NativeUtteranceId>>, RpcError> {
+        let fallback = SpokenFallback::new(&active.text[base..], cues);
+        let result = classify_backend_attempt(self.tts.speak(&fallback.text, false))?;
+        if matches!(result, BackendAttempt::Completed(_)) {
+            active.native_base = base;
+            active.fallback = Some(fallback);
+            active.cues.clear();
+        }
+        Ok(result)
+    }
+
     fn stop(&mut self, id: &UtteranceId) -> Result<(), RpcError> {
-        self.advance();
+        self.advance_for_control();
         let Some(active) = self.active.take() else {
             return Ok(());
         };
@@ -401,7 +564,11 @@ impl State {
                 "utteranceId does not identify the active utterance",
             ));
         }
-        if !active.paused
+        #[cfg(target_vendor = "apple")]
+        let suspended_cue = active.text.is_empty() && self.cue_playback.is_some();
+        #[cfg(not(target_vendor = "apple"))]
+        let suspended_cue = false;
+        if (!active.paused || suspended_cue)
             && let Err(error) = self.stop_native(active.native_id)
         {
             self.active = Some(active);
@@ -412,7 +579,7 @@ impl State {
     }
 
     fn pause(&mut self, id: &UtteranceId) -> Result<PauseResult, RpcError> {
-        self.advance();
+        self.advance_for_control();
         if !self.capabilities.supports_resumable_pause() {
             return Err(RpcError::method_not_found("speech.pause"));
         }
@@ -440,7 +607,8 @@ impl State {
         }
         let position = active.current_word;
         active.paused = true;
-        if let Err(error) = self.stop_native(active.native_id) {
+        let pause = self.pause_native(&active);
+        if let Err(error) = pause {
             active.paused = false;
             self.active = Some(active);
             return Err(error);
@@ -458,12 +626,32 @@ impl State {
         })
     }
 
+    fn pause_native(&mut self, active: &ActiveUtterance) -> Result<(), RpcError> {
+        #[cfg(target_vendor = "apple")]
+        if active.text.is_empty()
+            && let Some(playback) = &mut self.cue_playback
+        {
+            playback.pause();
+            return Ok(());
+        }
+        self.stop_native(active.native_id)
+    }
+
     /// Stop the native utterance and make the backend ready for another one.
     /// `AVFoundation` has historically returned from `stop` without always
     /// issuing its cancellation callback. In that state it may silently drop
     /// the next utterance, so lack of terminal evidence causes a conservative
     /// synthesizer replacement.
     fn stop_native(&mut self, stopping: Option<NativeUtteranceId>) -> Result<(), RpcError> {
+        #[cfg(target_vendor = "apple")]
+        if self
+            .cue_playback
+            .as_ref()
+            .is_some_and(|playback| Some(playback.id()) == stopping)
+        {
+            self.cue_playback.take();
+            return Ok(());
+        }
         match classify_backend_attempt(self.tts.stop())? {
             BackendAttempt::Completed(()) => {}
             BackendAttempt::Unavailable(_) => return Ok(()),
@@ -528,25 +716,19 @@ impl State {
 
     fn resume(&mut self, id: &UtteranceId) -> Result<(), RpcError> {
         self.advance();
-        let Some(active) = self.active.as_mut() else {
+        let Some(mut active) = self.active.take() else {
             return Err(RpcError::invalid_request("there is no paused utterance"));
         };
         if active.logical_id != *id || !active.paused {
+            self.active = Some(active);
             return Err(RpcError::invalid_params(
                 "utteranceId does not identify a paused utterance",
             ));
         }
+        let result = self.resume_native(&mut active);
         let start = active.current_word;
-        let suffix = resumable_suffix(&active.text, start).ok_or_else(|| {
-            RpcError::internal_error("native word position is not a UTF-8 boundary")
-        })?;
-        let native_id = self
-            .tts
-            .speak(suffix, false)
-            .map_err(|error| RpcError::internal_error(error.to_string()))?;
-        active.native_id = native_id;
-        active.native_base = start;
-        active.paused = false;
+        self.active = Some(active);
+        result?;
         self.emit_active(
             "resumed",
             Some(TextPosition::Utf8ByteOffset { offset: start }),
@@ -556,9 +738,73 @@ impl State {
         Ok(())
     }
 
+    fn resume_native(&mut self, active: &mut ActiveUtterance) -> Result<(), RpcError> {
+        #[cfg(target_vendor = "apple")]
+        if active.text.is_empty()
+            && let Some(playback) = &mut self.cue_playback
+        {
+            playback
+                .resume()
+                .map_err(|error| RpcError::internal_error(error.to_string()))?;
+            active.paused = false;
+            return Ok(());
+        }
+        let start = active.current_word;
+        active.native_id = match self.start_native(active, start)? {
+            BackendAttempt::Completed(id) => id,
+            BackendAttempt::Unavailable(message) => return Err(RpcError::internal_error(message)),
+        };
+        active.paused = false;
+        Ok(())
+    }
+
     fn advance(&mut self) {
+        #[cfg(target_vendor = "apple")]
+        self.advance_cue_playback(true);
+        self.drain_native_events();
+    }
+
+    fn advance_for_control(&mut self) {
+        // Keep progress current, but a stop or pause that arrived during
+        // rendering must not start a player even if rendering just finished.
+        #[cfg(target_vendor = "apple")]
+        self.advance_cue_playback(false);
+        self.drain_native_events();
+    }
+
+    fn drain_native_events(&mut self) {
         while let Ok(event) = self.native_events.try_recv() {
             self.handle_native_event(event);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn advance_cue_playback(&mut self, allow_start: bool) {
+        let Some(mut playback) = self.cue_playback.take() else {
+            return;
+        };
+        match playback.advance(allow_start, |event| self.handle_native_event(event)) {
+            Ok(false) => self.cue_playback = Some(playback),
+            Ok(true) => {}
+            Err(error) => {
+                let Some(mut active) = self.active.take() else {
+                    return;
+                };
+                drop(playback);
+                let base = active.native_base;
+                let cues = active.cues_from(base);
+                eprintln!("lector-tts: {error}; speaking cue labels");
+                let failure = match self.start_spoken_fallback(&mut active, base, &cues) {
+                    Ok(BackendAttempt::Completed(id)) => {
+                        active.native_id = id;
+                        self.active = Some(active);
+                        return;
+                    }
+                    Ok(BackendAttempt::Unavailable(message)) => message,
+                    Err(error) => error.message,
+                };
+                self.emit_for(&active, "ended", None, Some("failed"), Some(failure));
+            }
         }
     }
 
@@ -780,10 +1026,25 @@ impl State {
                 self.emit_active("started", None, None, None);
             }
             #[cfg(target_vendor = "apple")]
-            NativeEvent::Range { start, .. } => {
+            NativeEvent::Range { start, length, .. } => {
+                let start = if let Some(fallback) = &mut active.fallback {
+                    let Some(position) = fallback.report_word(start) else {
+                        return;
+                    };
+                    position
+                } else {
+                    start
+                };
+                if active.text.is_empty() {
+                    return;
+                }
                 let position = active.native_base.saturating_add(start);
                 if position <= active.text.len() && active.text.is_char_boundary(position) {
                     active.current_word = position;
+                    // Mixed playback has reached this word, so its cues have fired.
+                    active
+                        .cues
+                        .retain(|cue| cue.offset >= position.saturating_add(length));
                     self.emit_active(
                         "progress",
                         Some(TextPosition::Utf8ByteOffset { offset: position }),
@@ -872,6 +1133,18 @@ impl State {
 
 fn resumable_suffix(text: &str, offset: usize) -> Option<&str> {
     (offset <= text.len() && text.is_char_boundary(offset)).then(|| &text[offset..])
+}
+
+fn supports_sound_cues(backend: Backends) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        backend == Backends::AvFoundation && cue_playback::supported()
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = backend;
+        false
+    }
 }
 
 fn native_capabilities(features: Features) -> SpeechCapabilities {
@@ -1021,8 +1294,8 @@ fn install_native_callbacks(
     #[cfg(target_vendor = "apple")]
     {
         let ranges = events.clone();
-        tts.on_utterance_range(move |id, start, _length| {
-            let _ = ranges.send(NativeEvent::Range { id, start });
+        tts.on_utterance_range(move |id, start, length| {
+            let _ = ranges.send(NativeEvent::Range { id, start, length });
         })?;
     }
     Ok(())
@@ -1061,7 +1334,7 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
     match request.method.as_str() {
         "speech.speak" => {
             let params: SpeakParams = params(request.params)?;
-            state.speak(params.utterance_id, params.text)?;
+            state.speak(params)?;
             value(AcceptedResult { accepted: true })
         }
         "speech.stop" => {
@@ -1218,6 +1491,46 @@ mod tests {
         BackendAttempt, RateScale, classify_backend_attempt, native_capabilities, resumable_suffix,
     };
     use crate::{Error, Features, protocol::SettingSupport};
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn spoken_cues_map_native_offsets_across_pause_and_resume() {
+        use super::SpokenFallback;
+        use crate::protocol::{SoundCue, SoundCueAt};
+        let mut fallback = SpokenFallback::new(
+            "éclair and apple",
+            &[
+                SoundCueAt {
+                    cue: SoundCue::Link,
+                    offset: 0,
+                },
+                SoundCueAt {
+                    cue: SoundCue::Link,
+                    offset: 12,
+                },
+            ],
+        );
+        assert_eq!(fallback.text, "link éclair and link apple");
+        assert_eq!(fallback.report_word(0), Some(0));
+        assert_eq!(fallback.report_word(5), Some(0));
+        assert_eq!(fallback.report_word(6), None);
+        assert_eq!(fallback.report_word(13), Some(8));
+
+        fallback.playback_base = fallback.word;
+        assert_eq!(&fallback.text[fallback.word..], "and link apple");
+        assert_eq!(fallback.report_word(0), Some(8));
+        assert_eq!(fallback.report_word(4), Some(12));
+        assert_eq!(fallback.report_word(9), Some(12));
+
+        let blank = SpokenFallback::new(
+            "",
+            &[SoundCueAt {
+                cue: SoundCue::Blank,
+                offset: 0,
+            }],
+        );
+        assert_eq!(blank.text, "blank");
+    }
 
     #[test]
     fn resume_suffix_starts_at_the_reported_utf8_word_boundary() {

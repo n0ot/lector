@@ -4,6 +4,7 @@
 //! Lector's automatic presentation heuristics and provide a semantic spoken
 //! replacement without Lector needing application-specific knowledge.
 
+use std::ops::Range;
 const PREFIX: &[u8] = b"Lector;A11y;1;";
 pub(crate) const MAX_SPEECH_BYTES: usize = 2_000;
 
@@ -20,13 +21,25 @@ pub(crate) enum ApplicationAccessibilityCommand {
     End,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ApplicationAccessibilitySpeech {
     pub(crate) text: String,
+    pub(crate) links: Vec<Range<usize>>,
+    pub(crate) cue: Option<crate::speech::protocol::SoundCue>,
     /// Application-provided indentation for semantic line content. Lector
     /// applies the user's indentation-reporting preference and tracks changes;
     /// the application does not decide whether it is spoken.
     pub(crate) indentation: Option<u16>,
+}
+
+impl ApplicationAccessibilitySpeech {
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.text.len().saturating_add(
+            self.links
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Range<usize>>()),
+        )
+    }
 }
 
 /// Parses one complete APC body. Unknown messages remain ordinary unknown
@@ -48,6 +61,7 @@ pub(crate) fn parse(content: &[u8], truncated: bool) -> Option<ApplicationAccess
             ApplicationAccessibilityCommand::Speak(ApplicationAccessibilitySpeech {
                 text,
                 indentation: None,
+                ..Default::default()
             })
         });
     }
@@ -63,6 +77,7 @@ pub(crate) fn parse(content: &[u8], truncated: bool) -> Option<ApplicationAccess
         ApplicationAccessibilityCommand::Speak(ApplicationAccessibilitySpeech {
             text,
             indentation: Some(indentation),
+            ..Default::default()
         })
     })
 }
@@ -135,6 +150,7 @@ mod tests {
                 ApplicationAccessibilitySpeech {
                     text: "h\u{e9}llo".into(),
                     indentation: None,
+                    ..Default::default()
                 }
             ))
         );
@@ -144,6 +160,7 @@ mod tests {
                 ApplicationAccessibilitySpeech {
                     text: "indented".into(),
                     indentation: Some(12),
+                    ..Default::default()
                 }
             ))
         );

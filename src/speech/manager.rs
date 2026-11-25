@@ -6,10 +6,13 @@
 
 use super::protocol::{
     BackendInfo, CurrentVoiceResult, KnownEventKind, MAX_JSON_SAFE_INTEGER,
-    MAX_UTTERANCE_TEXT_BYTES, PauseResult, SpeechCapabilities, SpeechEventNotification,
+    MAX_UTTERANCE_TEXT_BYTES, PauseResult, SoundCueAt, SpeechCapabilities, SpeechEventNotification,
     TextPosition, UtteranceId, VoiceInfo,
 };
-use super::{ReaderSpeechEvent, ReaderSpeechEventKind, UtteranceBoundary};
+use super::{
+    ReaderSpeechEvent, ReaderSpeechEventKind, SpeechCues, UtteranceBoundary,
+    cues::{InsertedLink, canonical_position},
+};
 use anyhow::{Result, anyhow};
 use std::{collections::VecDeque, time::Instant};
 
@@ -30,6 +33,17 @@ pub trait Host {
     }
 
     fn speak(&mut self, id: &UtteranceId, text: &str, legacy_interrupt: bool) -> Result<()>;
+    fn speak_with_cues(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        legacy_interrupt: bool,
+        cues: &[SoundCueAt],
+    ) -> Result<()> {
+        anyhow::ensure!(cues.is_empty(), "speech host cannot play sound cues");
+        self.speak(id, text, legacy_interrupt)
+    }
+
     fn stop(&mut self, id: &UtteranceId) -> Result<()>;
     fn pause(&mut self, id: &UtteranceId) -> Result<PauseResult>;
     fn resume(&mut self, id: &UtteranceId) -> Result<()>;
@@ -68,17 +82,15 @@ struct Utterance {
     id: UtteranceId,
     text: String,
     boundary: UtteranceBoundary,
+    cues: SpeechCues,
 }
 
 impl Utterance {
-    fn new(id: UtteranceId, text: String, boundary: UtteranceBoundary) -> Self {
-        Self { id, text, boundary }
-    }
-
     fn queue_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.id.as_str().len())
             .saturating_add(self.text.len())
+            .saturating_add(self.cues.queue_bytes())
     }
 }
 
@@ -104,6 +116,17 @@ struct ActiveUtterance {
     state: PlaybackState,
     last_sequence: Option<u64>,
     last_position: Option<TextPosition>,
+    wire_text: Option<String>,
+    inserted_links: Vec<InsertedLink>,
+}
+
+impl ActiveUtterance {
+    fn canonical_position(&self, position: TextPosition) -> Option<TextPosition> {
+        let text = self.wire_text.as_deref().unwrap_or(&self.utterance.text);
+        position
+            .valid_for(text)
+            .then(|| canonical_position(position, &self.inserted_links))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +145,10 @@ pub struct SpeechManager {
     deferred_start: Option<DeferredStart>,
     next_restart_id: u64,
     reader_events: VecDeque<ReaderSpeechEvent>,
+}
+
+fn supports_sound_cues(host: &dyn Host) -> bool {
+    host.capabilities().sound_cues && !host.has_legacy_queue()
 }
 
 impl SpeechManager {
@@ -149,13 +176,47 @@ impl SpeechManager {
         interrupt: bool,
         boundary: UtteranceBoundary,
     ) -> Result<()> {
+        self.submit_with_cues(host, id, text, interrupt, boundary, SpeechCues::None)
+    }
+
+    pub fn submit_with_cues(
+        &mut self,
+        host: &mut dyn Host,
+        id: UtteranceId,
+        text: String,
+        interrupt: bool,
+        boundary: UtteranceBoundary,
+        cues: SpeechCues,
+    ) -> Result<()> {
         self.drain_events(host)?;
-        if !id.is_valid() || text.is_empty() || text.len() > MAX_UTTERANCE_TEXT_BYTES {
+        let standalone = matches!(cues, SpeechCues::Standalone(_));
+        if !id.is_valid()
+            || (cues == SpeechCues::None && text.is_empty())
+            || text.len() > MAX_UTTERANCE_TEXT_BYTES
+        {
             return Err(anyhow!(
-                "speech utterance must have a valid ID and 1 through {MAX_UTTERANCE_TEXT_BYTES} UTF-8 bytes"
+                "speech utterance must have a valid ID and 1 through {MAX_UTTERANCE_TEXT_BYTES} UTF-8 bytes or a standalone cue"
             ));
         }
-        let utterance = Utterance::new(id, text, boundary);
+        anyhow::ensure!(cues.valid_for(&text), "invalid speech cue offsets");
+        if standalone && text.is_empty() && !supports_sound_cues(host) {
+            return Ok(());
+        }
+        let (text, cues) = if matches!(cues, SpeechCues::Links { .. }) {
+            // Direct callers may bypass the worker. Leave enough room for
+            // fallback speech even when a later host must play this item.
+            let mut cues = cues;
+            let bounded = cues.bound_text(&text, MAX_UTTERANCE_TEXT_BYTES);
+            (bounded, cues)
+        } else {
+            (text, cues)
+        };
+        let utterance = Utterance {
+            id,
+            text,
+            boundary,
+            cues,
+        };
 
         if interrupt {
             return self.replace_with(host, utterance);
@@ -180,8 +241,8 @@ impl SpeechManager {
             return self.start(host, utterance, false);
         }
         if host.has_legacy_queue() {
-            host.speak(&utterance.id, &utterance.text, false)?;
-            return Ok(());
+            let rendered = utterance.cues.render(&utterance.text, false);
+            return host.speak(&utterance.id, &rendered.text, false);
         }
         if !self.can_sequence(host) {
             return Err(anyhow!(
@@ -287,7 +348,7 @@ impl SpeechManager {
         if !paused {
             return self.stop_for(host, active, AfterStop::SuspendCurrent);
         }
-        let Some(position) = position.filter(|position| position.valid_for(&active.utterance.text))
+        let Some(position) = position.and_then(|position| active.canonical_position(position))
         else {
             let error = anyhow!("speech host paused without a valid UTF-8 resume position");
             return match self.stop_for(host, active, AfterStop::SuspendCurrent) {
@@ -408,13 +469,18 @@ impl SpeechManager {
             return Ok(());
         };
 
+        let canonical = event
+            .event
+            .position
+            .clone()
+            .and_then(|position| active.canonical_position(position));
         match kind {
             KnownEventKind::Progress => record_reader_event(
                 &mut self.reader_events,
                 ReaderSpeechEvent {
                     utterance_id: event.utterance_id.clone(),
                     kind: ReaderSpeechEventKind::Progress,
-                    position: event.event.position.clone(),
+                    position: canonical.clone(),
                     reason: None,
                 },
             ),
@@ -423,11 +489,7 @@ impl SpeechManager {
                 ReaderSpeechEvent {
                     utterance_id: event.utterance_id.clone(),
                     kind: ReaderSpeechEventKind::Ended,
-                    position: event
-                        .event
-                        .position
-                        .clone()
-                        .or_else(|| active.last_position.clone()),
+                    position: canonical.clone().or_else(|| active.last_position.clone()),
                     reason: event.event.reason.clone(),
                 },
             ),
@@ -436,11 +498,7 @@ impl SpeechManager {
 
         match kind {
             KnownEventKind::Progress | KnownEventKind::Paused => {
-                if let Some(position) = event
-                    .event
-                    .position
-                    .filter(|position| position.valid_for(&active.utterance.text))
-                {
+                if let Some(position) = canonical {
                     active.last_position = Some(position);
                 }
             }
@@ -472,12 +530,31 @@ impl SpeechManager {
         utterance: Utterance,
         legacy_interrupt: bool,
     ) -> Result<()> {
-        host.speak(&utterance.id, &utterance.text, legacy_interrupt)?;
+        let rendered = utterance
+            .cues
+            .render(&utterance.text, supports_sound_cues(host));
+        if rendered.text.is_empty() && rendered.cues.is_empty() {
+            return self.start_due(host, Instant::now());
+        }
+        host.speak_with_cues(
+            &utterance.id,
+            &rendered.text,
+            legacy_interrupt,
+            &rendered.cues,
+        )?;
+        let inserted_links = rendered.inserted_links;
+        let wire_text = match rendered.text {
+            std::borrow::Cow::Owned(text) => Some(text),
+            std::borrow::Cow::Borrowed("") => Some(String::new()),
+            std::borrow::Cow::Borrowed(_) => None,
+        };
         self.active = Some(ActiveUtterance {
             utterance,
             state: PlaybackState::Speaking,
             last_sequence: None,
             last_position: None,
+            wire_text,
+            inserted_links,
         });
         Ok(())
     }
@@ -688,10 +765,11 @@ fn record_reader_event(events: &mut VecDeque<ReaderSpeechEvent>, event: ReaderSp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::speech::SpeechLink;
     use crate::speech::protocol::{
         ControlCapabilities, DeliveryGuarantee, EventCapability, LifecycleCapabilities,
-        PauseResumeSupport, ProgressCapabilities, ProgressMode, SpeechEventPayload, StopSupport,
-        TerminalCapability,
+        PauseResumeSupport, ProgressCapabilities, ProgressMode, SoundCue, SpeechEventPayload,
+        StopSupport, TerminalCapability,
     };
     use std::{collections::BTreeMap, time::Duration};
 
@@ -700,6 +778,7 @@ mod tests {
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum Call {
         Speak(UtteranceId, String),
+        SpeakWithCues(UtteranceId, String, Vec<SoundCueAt>),
         Stop(UtteranceId),
         Pause(UtteranceId),
         Resume(UtteranceId),
@@ -791,6 +870,24 @@ mod tests {
             Ok(())
         }
 
+        fn speak_with_cues(
+            &mut self,
+            id: &UtteranceId,
+            text: &str,
+            interrupt: bool,
+            cues: &[SoundCueAt],
+        ) -> Result<()> {
+            if cues.is_empty() {
+                return self.speak(id, text, interrupt);
+            }
+            self.calls.push(Call::SpeakWithCues(
+                id.clone(),
+                text.to_owned(),
+                cues.to_vec(),
+            ));
+            Ok(())
+        }
+
         fn stop(&mut self, id: &UtteranceId) -> Result<()> {
             self.calls.push(Call::Stop(id.clone()));
             Ok(())
@@ -820,6 +917,107 @@ mod tests {
 
         fn take_events(&mut self) -> Result<Vec<SpeechEventNotification>> {
             Ok(std::mem::take(&mut self.events))
+        }
+    }
+
+    #[test]
+    fn native_cues_follow_speech_interruption_and_leave_link_text_intact() {
+        let mut manager = SpeechManager::default();
+        let mut host = FakeHost::full();
+        host.capabilities.sound_cues = true;
+        let cue_id = UtteranceId::new("cue");
+        let link_id = UtteranceId::new("linked");
+        manager
+            .submit_with_cues(
+                &mut host,
+                cue_id.clone(),
+                "top".to_owned(),
+                false,
+                UtteranceBoundary::Immediate,
+                SpeechCues::Standalone(SoundCue::Top),
+            )
+            .unwrap();
+        manager
+            .submit_with_cues(
+                &mut host,
+                link_id.clone(),
+                "See café".to_owned(),
+                true,
+                UtteranceBoundary::Immediate,
+                SpeechCues::Links {
+                    links: vec![SpeechLink {
+                        offset: 4,
+                        audible: true,
+                    }],
+                    tones: true,
+                },
+            )
+            .unwrap();
+        manager.cancel(&mut host).unwrap();
+
+        assert_eq!(
+            host.calls,
+            [
+                Call::SpeakWithCues(
+                    cue_id.clone(),
+                    "".to_owned(),
+                    vec![SoundCueAt {
+                        cue: SoundCue::Top,
+                        offset: 0
+                    }]
+                ),
+                Call::Stop(cue_id),
+                Call::SpeakWithCues(
+                    link_id.clone(),
+                    "See café".to_owned(),
+                    vec![SoundCueAt {
+                        cue: SoundCue::Link,
+                        offset: 4
+                    }]
+                ),
+                Call::Stop(link_id),
+            ]
+        );
+    }
+
+    #[test]
+    fn spoken_link_labels_preserve_canonical_reader_progress() {
+        for support in [false, true] {
+            let mut manager = SpeechManager::default();
+            let mut host = FakeHost::full();
+            host.capabilities.sound_cues = support;
+            let id = UtteranceId::new("linked");
+            manager
+                .submit_with_cues(
+                    &mut host,
+                    id.clone(),
+                    "See café now".to_owned(),
+                    false,
+                    UtteranceBoundary::Immediate,
+                    SpeechCues::Links {
+                        links: vec![SpeechLink {
+                            offset: 4,
+                            audible: true,
+                        }],
+                        tones: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                host.calls[0],
+                Call::Speak(id.clone(), "See link café now".to_owned())
+            );
+
+            let mut progress = FakeHost::ended(&id, 1);
+            progress.event.kind = "progress".to_owned();
+            progress.event.reason = None;
+            progress.event.position = Some(TextPosition::Utf8ByteOffset { offset: 15 });
+            host.events.push(progress);
+            manager.poll(&mut host).unwrap();
+            assert_eq!(
+                manager.take_reader_events()[0].position,
+                Some(TextPosition::Utf8ByteOffset { offset: 10 })
+            );
         }
     }
 

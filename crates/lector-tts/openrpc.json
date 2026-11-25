@@ -2,12 +2,12 @@
   "openrpc": "1.4.0",
   "info": {
     "title": "Lector speech-host protocol",
-    "description": "Version 2.2 of the bidirectional JSON-RPC interface between Lector and a speech host. Messages are UTF-8 NDJSON over stdio. See docs/protocols/speech-host.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
+    "description": "Version 2.3 of the bidirectional JSON-RPC interface between Lector and a speech host. Messages are UTF-8 NDJSON over stdio. See docs/protocols/speech-host.md for normative transport, capability, state-machine, timeout, and recovery semantics.",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/license/mit"
     },
-    "version": "2.2.0"
+    "version": "2.3.0"
   },
   "externalDocs": {
     "description": "Normative RFC-style protocol specification",
@@ -90,8 +90,18 @@
           "required": true,
           "schema": {
             "type": "string",
-            "minLength": 1,
-            "x-lector-maximumUtf8Bytes": 65536
+            "x-lector-maximumUtf8Bytes": 65536,
+            "description": "May be empty only for one standalone sound cue at offset zero."
+          }
+        },
+        {
+          "name": "cues",
+          "required": false,
+          "schema": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SoundCueAt"
+            }
           }
         }
       ],
@@ -570,10 +580,30 @@
           },
           "voices": {
             "$ref": "#/components/schemas/VoiceCapabilities"
+          },
+          "soundCues": {
+            "type": "boolean",
+            "default": false,
+            "description": "Supports both standalone sound cues and synchronized overlays."
           }
         },
         "additionalProperties": true,
         "description": "Missing and unknown capabilities are unsupported."
+      },
+      "SoundCueAt": {
+        "type": "object",
+        "required": ["cue", "offset"],
+        "properties": {
+          "cue": {
+            "type": "string",
+            "enum": ["top", "bottom", "left", "right", "blank", "link"]
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "description": "An offset in UTF-8 bytes. In nonempty text, link offsets must increase strictly and be at character boundaries before the end of the text."
       },
       "DeliveryGuarantee": {
         "type": "string",
@@ -971,7 +1001,7 @@
   },
   "x-lector-protocol": {
     "major": 2,
-    "minor": 2,
+    "minor": 3,
     "unknownMembers": "ignore",
     "unknownCapabilities": "unsupported",
     "unknownNotifications": "ignore",

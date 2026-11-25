@@ -74,6 +74,7 @@ Options live under `lector.o`.
 | `auto_read` | `true` | Speak new output as it appears. |
 | `symbol_level` | | How much punctuation to speak: `"none"`, `"some"`, `"most"`, `"all"`, or `"character"`. |
 | `report_indentation` | `true` | Announce changes in indentation. |
+| `tones` | `true` | Play cues for review cursor boundaries, blank characters, and OSC 8 links when supported by the speech host. |
 | `suppress_key_echo` | `false` | Do not speak output that just echoes what you typed. |
 | `stop_speech_on_focus_loss` | | Stop speaking when the terminal loses focus. |
 | `tmux_bells` | `"audible"` | How [tmux bells](tmux.md#bells) are reported: `"audible"`, `"spoken"`, or `"off"`. |

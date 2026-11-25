@@ -116,6 +116,7 @@ impl IntoLua for OptionValue {
 fn get_option(sr: &ScreenReader, option: &str) -> anyhow::Result<OptionValue> {
     use OptionValue::*;
     Ok(match option {
+        "tones" => Boolean(sr.speech().tones()),
         "speech.server" => Server(sr.speech_server_spec().clone()),
         "speech.rate" => Number(sr.speech().rate()),
         "speech.pitch" => Number(sr.speech().pitch()),
@@ -134,6 +135,13 @@ fn get_option(sr: &ScreenReader, option: &str) -> anyhow::Result<OptionValue> {
 
 fn set_option(sr: &mut ScreenReader, option: &str, value: mlua::Value) -> anyhow::Result<()> {
     use mlua::Value::*;
+    if option == "tones" {
+        let Boolean(value) = value else {
+            return Err(anyhow!("set option: tones: value must be a boolean"));
+        };
+        sr.speech_mut().set_tones(value);
+        return Ok(());
+    }
     if option == "legacy_escape_timeout_ms" {
         let Integer(value) = value else {
             return Err(anyhow!(
