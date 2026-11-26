@@ -245,7 +245,7 @@ impl DirectionalBatch {
     }
 }
 
-struct State {
+struct State<'a> {
     tts: Tts,
     #[cfg(target_vendor = "apple")]
     cue_playback: Option<CuePlayback>,
@@ -271,7 +271,7 @@ struct State {
     rpc_log: Option<File>,
     active: Option<ActiveUtterance>,
     native_events: mpsc::Receiver<NativeEvent>,
-    wake: Wake,
+    waiter: &'a Waiter,
     notifications: VecDeque<ServerNotification>,
 }
 
@@ -423,11 +423,7 @@ pub fn run_with_options(options: &Options) -> Result<()> {
         return Ok(());
     }
     let waiter = Waiter::new()?;
-    let state = RefCell::new(State::new(
-        backend,
-        options.voice.as_deref(),
-        waiter.wake(),
-    )?);
+    let state = RefCell::new(State::new(backend, options.voice.as_deref(), &waiter)?);
     run_server_with_wake(
         &waiter,
         |request| handle_request(request, &mut state.borrow_mut()),
@@ -460,8 +456,8 @@ fn select_backend(value: &str) -> Result<Backends> {
     Backends::from_str(value).map_err(Into::into)
 }
 
-impl State {
-    fn new(backend: Backends, voice_id: Option<&str>, wake: Wake) -> Result<Self> {
+impl<'a> State<'a> {
+    fn new(backend: Backends, voice_id: Option<&str>, waiter: &'a Waiter) -> Result<Self> {
         let tts = Tts::new(backend).map_err(|error| anyhow::anyhow!(error))?;
         let features = tts.supported_features();
         let test_event_log = configure_test_observation(&tts)?;
@@ -519,7 +515,7 @@ impl State {
         install_native_callbacks(
             &tts,
             &native_event_tx,
-            &wake,
+            &waiter.wake(),
             features.utterance_callbacks,
             test_event_log,
         )
@@ -557,7 +553,7 @@ impl State {
             rpc_log,
             active: None,
             native_events,
-            wake,
+            waiter,
             notifications: VecDeque::new(),
         })
     }
@@ -888,10 +884,9 @@ impl State {
             return Ok(());
         };
         let deadline = Instant::now() + Duration::from_millis(30);
-        let mut confirmed = false;
-        while Instant::now() < deadline {
-            settle_platform_runloop();
-            while let Ok(event) = self.native_events.try_recv() {
+        loop {
+            let mut confirmed = false;
+            for event in self.native_events.try_iter() {
                 confirmed |= matches!(
                     event,
                     NativeEvent::Completed(id) | NativeEvent::Cancelled(id) if id == stopping
@@ -900,9 +895,12 @@ impl State {
             if confirmed {
                 break;
             }
-        }
-        if !confirmed {
-            self.replace_synthesizer()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.replace_synthesizer()?;
+                break;
+            }
+            self.waiter.wait(Some(remaining));
         }
         Ok(())
     }
@@ -933,7 +931,7 @@ impl State {
         install_native_callbacks(
             &tts,
             &native_event_tx,
-            &self.wake,
+            &self.waiter.wake(),
             features.utterance_callbacks,
             test_event_log,
         )
@@ -1733,7 +1731,7 @@ fn install_native_callbacks(
     Ok(())
 }
 
-fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError> {
+fn handle_request(request: Request, state: &mut State<'_>) -> Result<Value, RpcError> {
     log_request(&request, state)?;
     if request.method == "initialize" && state.initialized {
         return Err(RpcError::invalid_request(
@@ -1820,7 +1818,7 @@ fn value<T: serde::Serialize>(value: T) -> Result<Value, RpcError> {
     serde_json::to_value(value).map_err(|error| RpcError::internal_error(error.to_string()))
 }
 
-fn log_request(request: &Request, state: &mut State) -> Result<(), RpcError> {
+fn log_request(request: &Request, state: &mut State<'_>) -> Result<(), RpcError> {
     let Some(log) = &mut state.rpc_log else {
         return Ok(());
     };
@@ -1856,17 +1854,6 @@ fn start_parent_watchdog(expected_parent_pid: u32) -> Result<()> {
 fn start_parent_watchdog(_expected_parent_pid: u32) -> Result<()> {
     Ok(())
 }
-
-#[cfg(target_vendor = "apple")]
-fn settle_platform_runloop() {
-    use core_foundation::runloop;
-    unsafe {
-        let _ = runloop::CFRunLoopRunInMode(runloop::kCFRunLoopDefaultMode, 0.01, 0);
-    }
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn settle_platform_runloop() {}
 
 fn configure_test_observation(tts: &Tts) -> Result<Option<SpeechEventLog>> {
     if std::env::var_os("LECTOR_SPEECH_TEST_MUTE").is_some() && tts.supported_features().volume {

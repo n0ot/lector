@@ -185,7 +185,7 @@ impl Waiter {
         self.0.wake()
     }
 
-    pub(super) fn wait(&self, timeout: Option<Duration>) -> bool {
+    pub(crate) fn wait(&self, timeout: Option<Duration>) -> bool {
         self.0.wait(timeout)
     }
 }
