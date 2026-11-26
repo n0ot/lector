@@ -476,6 +476,10 @@ impl Speech {
         self.tones && self.driver.option_state().sound_cues
     }
 
+    pub(crate) fn can_sequence_tones(&self) -> bool {
+        self.tones() && self.driver.supports_ordered_utterances()
+    }
+
     pub fn set_tones(&mut self, enabled: bool) {
         self.tones = enabled;
     }

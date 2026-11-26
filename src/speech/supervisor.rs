@@ -1887,6 +1887,30 @@ mod tests {
     }
 
     #[test]
+    fn linked_blank_reaches_an_unordered_host_in_one_utterance() {
+        let harness = Harness::new();
+        let host = fake_state();
+        host.lock().unwrap().legacy = false;
+        harness.push_driver(host.clone());
+        let mut speech = crate::speech::Speech::new(Box::new(harness.supervisor));
+        speech.start().unwrap();
+        let mut reader = crate::screen_reader::ScreenReader::new(speech);
+        let anchor = 0..0;
+        reader
+            .speak_linked_review_cue(
+                crate::speech::protocol::SoundCue::Blank,
+                std::slice::from_ref(&anchor),
+            )
+            .unwrap();
+        assert!(
+            host.lock()
+                .unwrap()
+                .calls
+                .contains(&Call::Speak("link blank".into(), false))
+        );
+    }
+
+    #[test]
     fn tone_availability_follows_the_active_host() {
         let harness = Harness::new();
         let host = fake_state();

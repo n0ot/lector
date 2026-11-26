@@ -881,6 +881,10 @@ impl ScreenReader {
         links: &[Range<usize>],
     ) -> Result<()> {
         if !links.is_empty() {
+            if !self.speech.can_sequence_tones() {
+                self.speak_with_links(cue.spoken_label(), links, false)?;
+                return Ok(());
+            }
             self.speak_with_links("", links, false)?;
         }
         self.speak_review_cue(cue)
@@ -894,6 +898,9 @@ impl ScreenReader {
     ) -> Result<()> {
         use speech::protocol::SoundCue;
         let blank = character.trim().is_empty();
+        if blank && direction.is_none() {
+            return self.speak_linked_review_cue(SoundCue::Blank, links);
+        }
         if blank
             && links.is_empty()
             && let Some(direction @ (SoundCue::Left | SoundCue::Right)) = direction

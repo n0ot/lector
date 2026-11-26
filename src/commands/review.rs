@@ -516,7 +516,7 @@ mod tests {
         view.process_changes(b"\r\n   \x1b]8;;https://example.invalid\x1b\\ \x1b]8;;\x1b\\");
         view.set_review_cursor_position((0, 0));
         line_next(&mut sr, &mut view, false).unwrap();
-        assert_eq!(output.borrow().as_slice(), ["link", "blank"]);
+        assert_eq!(output.borrow().as_slice(), ["link blank"]);
     }
 
     #[test]
