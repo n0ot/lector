@@ -226,13 +226,29 @@ fn application_capability_query_and_cue_fallback_use_the_pty() {
     app.flush_application_replies(&mut replies).unwrap();
     assert_eq!(
         replies,
-        application_accessibility("capabilities;42;cue=blank;link=1")
+        application_accessibility("capabilities;42;cue=blank;link=1;inline=link")
     );
     clock.advance_ms(u128::from(DIFF_DELAY) + 1);
     app.maybe_finalize_changes(&mut sr).unwrap();
     assert_eq!(
         recorder.inner.borrow().speaks,
         [("blank".into(), false), ("link see".into(), false)]
+    );
+}
+
+#[test]
+fn application_line_reads_links_at_their_offsets_with_spoken_fallback() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut output = application_accessibility("set;auto=0;cursor=0");
+    output.extend(application_accessibility(
+        "line;indent=0;links=4-8,13-16;736565206865726520616e6420616c6c",
+    ));
+    app.handle_pty(&mut sr, &output, &mut Vec::new()).unwrap();
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr).unwrap();
+    assert_eq!(
+        recorder.inner.borrow().speaks,
+        [("see link here and link all".into(), false)]
     );
 }
 

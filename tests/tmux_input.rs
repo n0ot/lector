@@ -340,7 +340,7 @@ fn accessibility_capabilities_reply_targets_the_querying_tmux_pane() {
     assert_eq!(commands.len(), 1);
     assert_eq!(
         decode_send_keys(&commands, PaneId(20)),
-        b"\x1b_Lector;A11y;1;capabilities;7;cue=blank;link=1\x1b\\"
+        b"\x1b_Lector;A11y;1;capabilities;7;cue=blank;link=1;inline=link\x1b\\"
     );
 }
 
@@ -740,7 +740,7 @@ fn real_tmux_byte_echo_paste_mouse_resize_and_output_flood_harness() {
     );
 
     send_real_input(&mut app, &mut sr, writer.as_mut(), &mut physical, b"^");
-    let expected = b"\x1b_Lector;A11y;1;capabilities;13;cue=blank;link=1\x1b\\"
+    let expected = b"\x1b_Lector;A11y;1;capabilities;13;cue=blank;link=1;inline=link\x1b\\"
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();

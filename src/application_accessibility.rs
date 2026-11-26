@@ -7,9 +7,10 @@
 use std::ops::Range;
 const CAPABILITIES_PREFIX: &[u8] = b"\x1b_Lector;A11y;1;capabilities;";
 const ST: &[u8] = b"\x1b\\";
-const CAPABILITIES: &[u8] = b";cue=blank;link=1";
+const CAPABILITIES: &[u8] = b";cue=blank;link=1;inline=link";
 const PREFIX: &[u8] = b"Lector;A11y;1;";
 pub(crate) const MAX_SPEECH_BYTES: usize = 2_000;
+const MAX_LINKS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ApplicationAccessibilityPolicy {
@@ -101,34 +102,63 @@ pub(crate) fn parse(content: &[u8], truncated: bool) -> Option<ApplicationAccess
         ));
     }
     if let Some(encoded) = body.strip_prefix(b"say;") {
-        return decode_speech(encoded).map(|text| {
-            ApplicationAccessibilityCommand::Speak(ApplicationAccessibilitySpeech {
-                text,
-                indentation: None,
-                ..Default::default()
-            })
-        });
+        return parse_annotated_speech(encoded, None);
     }
     let (indentation, encoded) = parse_line(body.strip_prefix(b"line;indent=")?)?;
-    decode_speech(encoded).map(|text| {
-        ApplicationAccessibilityCommand::Speak(ApplicationAccessibilitySpeech {
+    parse_annotated_speech(encoded, Some(indentation))
+}
+
+fn parse_annotated_speech(
+    payload: &[u8],
+    indentation: Option<u16>,
+) -> Option<ApplicationAccessibilityCommand> {
+    let (ranges, encoded) = if let Some(marked) = payload.strip_prefix(b"links=") {
+        let (ranges, encoded) = marked.split_at(marked.iter().position(|byte| *byte == b';')?);
+        (Some(ranges), &encoded[1..])
+    } else {
+        (None, payload)
+    };
+    let text = decode_speech(encoded)?;
+    let mut links = Vec::new();
+    if let Some(ranges) = ranges {
+        for range in ranges.split(|byte| *byte == b',') {
+            let (start, end) = std::str::from_utf8(range).ok()?.split_once('-')?;
+            let start = parse_decimal(start.as_bytes())?;
+            let end = parse_decimal(end.as_bytes())?;
+            if links.len() == MAX_LINKS
+                || start >= end
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+                || links
+                    .last()
+                    .is_some_and(|previous: &Range<usize>| previous.end > start)
+            {
+                return None;
+            }
+            links.push(start..end);
+        }
+    }
+    Some(ApplicationAccessibilityCommand::Speak(
+        ApplicationAccessibilitySpeech {
             text,
-            indentation: Some(indentation),
+            indentation,
+            links,
             ..Default::default()
-        })
-    })
+        },
+    ))
+}
+
+fn parse_decimal<T: std::str::FromStr>(bytes: &[u8]) -> Option<T> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 fn parse_line(body: &[u8]) -> Option<(u16, &[u8])> {
     let separator = body.iter().position(|byte| *byte == b';')?;
     let (indentation, encoded) = body.split_at(separator);
-    if indentation.is_empty() || !indentation.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    Some((
-        std::str::from_utf8(indentation).ok()?.parse().ok()?,
-        &encoded[1..],
-    ))
+    Some((parse_decimal(indentation)?, &encoded[1..]))
 }
 
 fn valid_query_id(id: &[u8]) -> bool {
@@ -210,6 +240,27 @@ mod tests {
         ApplicationAccessibilityCommand, ApplicationAccessibilityPolicy,
         ApplicationAccessibilitySpeech, MAX_SPEECH_BYTES, parse,
     };
+
+    #[test]
+    fn accepts_ordered_utf8_link_ranges_in_say_and_line_messages() {
+        for (header, indentation) in [("say;", None), ("line;indent=3;", Some(3))] {
+            let message = format!("Lector;A11y;1;{header}links=2-4,5-8;6120c3a920656e64");
+            let expected = ApplicationAccessibilitySpeech {
+                text: "a é end".into(),
+                links: vec![2..4, 5..8],
+                indentation,
+                ..Default::default()
+            };
+            assert_eq!(
+                parse(message.as_bytes(), false),
+                Some(ApplicationAccessibilityCommand::Speak(expected))
+            );
+        }
+        for ranges in ["", "3-4", "2-9", "4-4", "2-5,4-6", "5-8,2-4", "2-4,"] {
+            let message = format!("Lector;A11y;1;say;links={ranges};6120c3a920656e64");
+            assert_eq!(parse(message.as_bytes(), false), None, "{ranges}");
+        }
+    }
 
     #[test]
     fn parses_policy_speech_and_end() {
