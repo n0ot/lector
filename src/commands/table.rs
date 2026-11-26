@@ -281,7 +281,7 @@ pub(super) fn word_previous(sr: &mut ScreenReader, view: &mut View) -> Result<Co
     let (row, col) = old_position;
     if col <= start {
         let cue = Some(SoundCue::Left);
-        word_read_with_cue(sr, view, cue)?;
+        word_read_with_cue(sr, view, cue, Some(old_position))?;
         return Ok(CommandResult::Handled);
     }
 
@@ -294,7 +294,7 @@ pub(super) fn word_previous(sr: &mut ScreenReader, view: &mut View) -> Result<Co
     }
     view.set_review_cursor_col(index);
     review::report_move(sr, view, old_position)?;
-    word_read(sr, view)?;
+    word_read_with_cue(sr, view, None, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
@@ -320,23 +320,24 @@ pub(super) fn word_next(sr: &mut ScreenReader, view: &mut View) -> Result<Comman
     }
     if index > end || old_word_end.is_some_and(|word_end| index <= word_end) {
         let cue = Some(SoundCue::Right);
-        word_read_with_cue(sr, view, cue)?;
+        word_read_with_cue(sr, view, cue, Some(old_position))?;
         return Ok(CommandResult::Handled);
     }
     view.set_review_cursor_col(index);
     review::report_move(sr, view, old_position)?;
-    word_read(sr, view)?;
+    word_read_with_cue(sr, view, None, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn word_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    word_read_with_cue(sr, view, None)
+    word_read_with_cue(sr, view, None, None)
 }
 
 fn word_read_with_cue(
     sr: &mut ScreenReader,
     view: &mut View,
     cue: Option<SoundCue>,
+    previous: Option<(u16, u16)>,
 ) -> Result<CommandResult> {
     if !ensure_state(sr, view) {
         sr.speak_review_readback("", &[], cue)?;
@@ -352,9 +353,9 @@ fn word_read_with_cue(
         sr.speak_review_readback("", &[], cue)?;
         return Ok(CommandResult::Handled);
     };
-    let (text, mut links) = view
-        .screen()
-        .contents_with_links(row, word_start, row, word_end + 1);
+    let (text, mut links) =
+        view.screen()
+            .review_contents_with_links(previous, (row, col), word_start..word_end + 1);
     let spoken = crate::terminal::trim_linked_text(&text, &mut links);
     sr.speak_review_readback(spoken, &links, cue)?;
     Ok(CommandResult::Handled)
@@ -417,12 +418,12 @@ pub(super) fn character_previous(sr: &mut ScreenReader, view: &mut View) -> Resu
     let old_position = view.review_cursor_position();
     if old_position.1 <= start {
         let cue = Some(SoundCue::Left);
-        character_read_with_cue(sr, view, cue)?;
+        character_read_with_cue(sr, view, cue, Some(old_position))?;
         return Ok(CommandResult::Handled);
     }
     view.set_review_cursor_col(old_position.1.saturating_sub(1));
     review::report_move(sr, view, old_position)?;
-    character_read(sr, view)?;
+    character_read_with_cue(sr, view, None, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
@@ -437,23 +438,24 @@ pub(super) fn character_next(sr: &mut ScreenReader, view: &mut View) -> Result<C
     let old_position = view.review_cursor_position();
     if old_position.1 >= end {
         let cue = Some(SoundCue::Right);
-        character_read_with_cue(sr, view, cue)?;
+        character_read_with_cue(sr, view, cue, Some(old_position))?;
         return Ok(CommandResult::Handled);
     }
     view.set_review_cursor_col(old_position.1 + 1);
     review::report_move(sr, view, old_position)?;
-    character_read(sr, view)?;
+    character_read_with_cue(sr, view, None, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn character_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    character_read_with_cue(sr, view, None)
+    character_read_with_cue(sr, view, None, None)
 }
 
 fn character_read_with_cue(
     sr: &mut ScreenReader,
     view: &mut View,
     cue: Option<SoundCue>,
+    previous: Option<(u16, u16)>,
 ) -> Result<CommandResult> {
     if !ensure_state(sr, view) {
         sr.speak_review_readback("", &[], cue)?;
@@ -469,7 +471,9 @@ fn character_read_with_cue(
     };
     let (row, col) = view.review_cursor_position();
     let col = col.clamp(start, end);
-    let (character, links) = view.character_with_links(row, col);
+    let (character, links) =
+        view.screen()
+            .review_contents_with_links(previous, (row, col), col..col + 1);
     sr.speak_review_character(&character, &links, cue)?;
     Ok(CommandResult::Handled)
 }

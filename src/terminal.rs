@@ -1072,15 +1072,60 @@ impl TerminalSnapshot {
         end_row: u16,
         end_col: u16,
     ) -> (String, Vec<Range<usize>>) {
+        self.contents_excluding_link(start_row, start_col, end_row, end_col, 0..0)
+    }
+
+    pub(crate) fn review_contents_with_links(
+        &self,
+        previous: Option<(u16, u16)>,
+        current: (u16, u16),
+        read: Range<u16>,
+    ) -> (String, Vec<Range<usize>>) {
+        let position = |(row, col)| HistoryPosition {
+            row: usize::from(row),
+            col,
+        };
+        let continued = continued_link(
+            previous.map(position),
+            position(current),
+            read.clone(),
+            self.size().1,
+            |row, col| {
+                let row = row as u16;
+                let cell = self.cell(row, col)?;
+                let lead = if cell.is_wide_continuation() {
+                    self.cell(row, col.checked_sub(1)?)?
+                } else {
+                    cell
+                };
+                lead.hyperlink.as_deref()
+            },
+            |row| self.row_wrapped(row as u16),
+        );
+        self.contents_excluding_link(current.0, read.start, current.0, read.end, continued)
+    }
+
+    fn contents_excluding_link(
+        &self,
+        start_row: u16,
+        start_col: u16,
+        end_row: u16,
+        end_col: u16,
+        continued: Range<u16>,
+    ) -> (String, Vec<Range<usize>>) {
         let mut links = LinkSpans::default();
         let text = self.contents_between_with_cells(
             start_row,
             start_col,
             end_row,
             end_col,
-            |offset, _, _, cell| {
+            |offset, _, col, cell| {
                 if let Some(cell) = cell {
-                    links.visit(offset, cell.contents(), cell.hyperlink.as_deref());
+                    let uri = cell
+                        .hyperlink
+                        .as_deref()
+                        .filter(|_| !continued.contains(&col));
+                    links.visit(offset, cell.contents(), uri);
                 }
             },
         );
@@ -1185,6 +1230,44 @@ fn append_full_row(row: &Row, cols: u16, out: &mut String) {
     let trimmed_row_len = out[row_start..].trim_end().len();
     out.truncate(row_start + trimmed_row_len);
     out.push('\n');
+}
+
+/// Columns in this readback that belong to the OSC 8 run the cursor stayed in.
+/// A hard row break or an intervening unlinked cell separates equal URLs.
+pub(crate) fn continued_link<'a>(
+    previous: Option<HistoryPosition>,
+    current: HistoryPosition,
+    read: Range<u16>,
+    width: u16,
+    link_at: impl Fn(usize, u16) -> Option<&'a str>,
+    wrapped: impl Fn(usize) -> bool,
+) -> Range<u16> {
+    let Some(previous) = previous else {
+        return 0..0;
+    };
+    let Some(uri) = link_at(current.row, current.col) else {
+        return 0..0;
+    };
+    let (first, last) = (previous.min(current), previous.max(current));
+    for row in first.row..=last.row {
+        if row < last.row && !wrapped(row) {
+            return 0..0;
+        }
+        let start = if row == first.row { first.col } else { 0 };
+        let end = if row == last.row { last.col + 1 } else { width };
+        if (start..end).any(|col| link_at(row, col) != Some(uri)) {
+            return 0..0;
+        }
+    }
+    let mut start = current.col;
+    let mut end = current.col + 1;
+    while start > read.start && link_at(current.row, start - 1) == Some(uri) {
+        start -= 1;
+    }
+    while end < read.end && link_at(current.row, end) == Some(uri) {
+        end += 1;
+    }
+    start..end
 }
 
 /// Collects half-open UTF-8 byte ranges of contiguous OSC 8 cells.
