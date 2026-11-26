@@ -151,11 +151,15 @@ fn apply_rate_adjustment(
     let applied = driver.set_session_rate(rate);
     if let Some(id) = announcement.filter(|id| is_current(id)) {
         let text = match &applied {
-            Ok(Some(rate)) => format!("{} percent", rate.to_string().replace('.', " point ")),
+            Ok(Some(rate)) => {
+                let rounded = format!("{rate:.2}");
+                let percentage = rounded.trim_end_matches('0').trim_end_matches('.');
+                format!("{} percent", percentage.replace('.', " point "))
+            }
             Ok(None) => "the current voice cannot change speech rate".to_owned(),
             Err(_) => "could not change speech rate".to_owned(),
         };
-        driver.speak_utterance(id, &text, true)?;
+        driver.speak_rate_feedback(id, &text)?;
     }
     applied?;
     stopped
@@ -255,6 +259,11 @@ pub trait Driver {
     fn set_rate_option(&mut self, rate: f32) -> DriverResult<SetOptionOutcome> {
         self.set_rate(rate)?;
         Ok(SetOptionOutcome::Accepted)
+    }
+
+    /// Speak a rate command's feedback as an interrupting utterance.
+    fn speak_rate_feedback(&mut self, id: &UtteranceId, text: &str) -> DriverResult<()> {
+        self.speak_utterance(id, text, true)
     }
 
     /// Apply an interactive rate change and return the effective rate. None

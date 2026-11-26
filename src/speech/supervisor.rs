@@ -370,6 +370,7 @@ pub struct Supervisor {
     effective_rate: Option<f32>,
     configured_rate: Option<f32>,
     session_rate: Option<f32>,
+    rate_feedback: Option<UtteranceId>,
     pending_rate: Option<f32>,
     desired_pitch: Option<f32>,
     pending_pitch: Option<f32>,
@@ -423,6 +424,7 @@ impl Supervisor {
             effective_rate: None,
             configured_rate: None,
             session_rate: None,
+            rate_feedback: None,
             pending_rate: None,
             desired_pitch: None,
             pending_pitch: None,
@@ -1130,12 +1132,22 @@ impl Driver for Supervisor {
             self.pending_rate = Some(rate);
             return Ok(SetOptionOutcome::Accepted);
         }
+        if let Some(id) = self.rate_feedback.take() {
+            self.manager.discard_waiting_utterance(&id);
+        }
         let Some(actual) = self.apply_rate(rate)? else {
             return Ok(SetOptionOutcome::Unsupported);
         };
         self.configured_rate = Some(actual);
         self.session_rate = None;
         Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn speak_rate_feedback(&mut self, id: &UtteranceId, text: &str) -> DriverResult<()> {
+        self.ensure_available()?;
+        self.speak_utterance(id, text, true)?;
+        self.rate_feedback = Some(id.clone());
+        Ok(())
     }
 
     fn set_session_rate(&mut self, rate: f32) -> DriverResult<Option<f32>> {
@@ -1667,6 +1679,8 @@ mod tests {
 
     #[test]
     fn interactive_rate_confirms_applied_value_and_keeps_it_after_rejection() {
+        let actual_with_rounding_noise = 78.000_01_f32;
+        let next_requested_rate = (actual_with_rounding_noise + 5.0).to_bits();
         let mut harness = Harness::new();
         let host = fake_state();
         {
@@ -1674,9 +1688,11 @@ mod tests {
             state.legacy = false;
             state.capabilities.settings.rate = SettingSupport::ReadWrite;
             state.rate = 73.25;
-            state
-                .rate_results
-                .extend([Ok(78.0), Err(anyhow!("rate rejected")), Ok(83.0)]);
+            state.rate_results.extend([
+                Ok(actual_with_rounding_noise),
+                Err(anyhow!("rate rejected")),
+                Ok(83.0),
+            ]);
         }
         harness.push_driver(Arc::clone(&host));
         let supervisor = &mut harness.supervisor;
@@ -1690,7 +1706,10 @@ mod tests {
                 .adjust_rate_and_announce(true, Some(UtteranceId::new("rejected")))
                 .is_err()
         );
-        assert_eq!(supervisor.option_state().rate, Some(78.0));
+        assert_eq!(
+            supervisor.option_state().rate,
+            Some(actual_with_rounding_noise)
+        );
         supervisor
             .adjust_rate_and_announce(true, Some(UtteranceId::new("next")))
             .unwrap();
@@ -1705,9 +1724,9 @@ mod tests {
             [
                 Call::SetRate(78.25f32.to_bits()),
                 Call::Speak("78 percent".to_owned(), false),
-                Call::SetRate(83.0f32.to_bits()),
+                Call::SetRate(next_requested_rate),
                 Call::Speak("could not change speech rate".to_owned(), false),
-                Call::SetRate(83.0f32.to_bits()),
+                Call::SetRate(next_requested_rate),
                 Call::Speak("83 percent".to_owned(), false),
             ]
         );
@@ -1764,6 +1783,66 @@ mod tests {
                 Call::Speak("60 percent".to_owned(), false),
             ]
         );
+    }
+
+    #[test]
+    fn absolute_rate_discards_only_waiting_keyboard_feedback() {
+        use crate::speech::protocol::{
+            DeliveryGuarantee, SpeechEventNotification, SpeechEventPayload, StopSupport,
+        };
+
+        for unrelated in [None, Some("unrelated text")] {
+            let mut harness = Harness::new();
+            let host = fake_state();
+            {
+                let mut state = host.lock().unwrap();
+                state.legacy = false;
+                state.capabilities.settings.rate = SettingSupport::ReadWrite;
+                state.capabilities.controls.stop = StopSupport::BestEffort;
+                state.capabilities.lifecycle.terminal.delivery = DeliveryGuarantee::Reliable;
+            }
+            harness.push_driver(Arc::clone(&host));
+            let supervisor = &mut harness.supervisor;
+            supervisor.start().unwrap();
+            let current = UtteranceId::new("current");
+            supervisor
+                .speak_utterance(&current, "current text", false)
+                .unwrap();
+            supervisor
+                .adjust_rate_and_announce(true, Some(UtteranceId::new("rate-feedback")))
+                .unwrap();
+            if let Some(text) = unrelated {
+                supervisor
+                    .speak_utterance(&UtteranceId::new("ordinary"), text, true)
+                    .unwrap();
+            }
+            supervisor.set_rate(65.0).unwrap();
+
+            host.lock().unwrap().events.push(SpeechEventNotification {
+                utterance_id: current,
+                sequence: 1,
+                event: SpeechEventPayload {
+                    kind: "ended".to_owned(),
+                    position: None,
+                    reason: Some("cancelled".to_owned()),
+                    message: None,
+                    extensions: Default::default(),
+                },
+            });
+            supervisor.poll().unwrap();
+
+            let mut expected = vec![
+                Call::GetRate,
+                Call::Speak("current text".to_owned(), false),
+                Call::Stop,
+                Call::SetRate(55.0f32.to_bits()),
+                Call::SetRate(65.0f32.to_bits()),
+            ];
+            if let Some(text) = unrelated {
+                expected.push(Call::Speak(text.to_owned(), false));
+            }
+            assert_eq!(host.lock().unwrap().calls, expected);
+        }
     }
 
     #[test]

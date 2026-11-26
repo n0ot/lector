@@ -126,8 +126,9 @@ end
 | `on_speech_start(text, meta)` | When Lector queues text to speak | `meta`: `{ interrupt }` |
 | `on_speech_end(text, meta)` | When queuing finishes | `meta`: `{ interrupt, ok }` |
 
-These tell you what Lector sent to be spoken. They do not tell you when the
-sound actually starts or stops.
+These hooks report when Lector queues speech. The speech worker announces
+keyboard rate changes directly after the host confirms the result, so those
+announcements bypass these hooks.
 
 ### Keys, modes, and clipboard
 
