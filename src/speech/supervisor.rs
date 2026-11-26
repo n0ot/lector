@@ -891,9 +891,16 @@ impl Supervisor {
         Err(error)
     }
 
+    fn discard_rate_feedback(&mut self) {
+        if let Some(id) = self.rate_feedback.take() {
+            self.manager.discard_waiting_utterance(&id);
+        }
+    }
+
     fn recover_after_transport_failure(&mut self, failure: String) -> DriverResult<()> {
         let now = (self.now)();
         let may_restart = restart_allowed(self.last_crash, now);
+        self.discard_rate_feedback();
         self.manager.host_lost();
         let failed = self.clear_active();
         drop(failed);
@@ -951,6 +958,9 @@ impl Supervisor {
                 // untouched. Active speech is never replayed; only work that
                 // had not yet reached the old host may cross generations.
                 let mut candidate_manager = self.manager.clone();
+                if let Some(id) = &self.rate_feedback {
+                    candidate_manager.discard_waiting_utterance(id);
+                }
                 candidate_manager.host_lost();
                 if let Err(error) = candidate_manager.host_ready(candidate.host.as_mut()) {
                     let message = format!(
@@ -962,6 +972,7 @@ impl Supervisor {
                 }
                 let old = self.install_active((candidate, rate));
                 self.manager = candidate_manager;
+                self.rate_feedback = None;
                 self.spec = spec.clone();
                 self.refresh_option_state();
                 // An intentional replacement is not itself a crash. Preserve
@@ -1132,9 +1143,7 @@ impl Driver for Supervisor {
             self.pending_rate = Some(rate);
             return Ok(SetOptionOutcome::Accepted);
         }
-        if let Some(id) = self.rate_feedback.take() {
-            self.manager.discard_waiting_utterance(&id);
-        }
+        self.discard_rate_feedback();
         let Some(actual) = self.apply_rate(rate)? else {
             return Ok(SetOptionOutcome::Unsupported);
         };
@@ -1842,6 +1851,62 @@ mod tests {
                 expected.push(Call::Speak(text.to_owned(), false));
             }
             assert_eq!(host.lock().unwrap().calls, expected);
+        }
+    }
+
+    #[test]
+    fn host_generation_change_retires_waiting_rate_feedback_only() {
+        use crate::speech::protocol::{DeliveryGuarantee, StopSupport};
+
+        for crash in [false, true] {
+            for ordinary in [false, true] {
+                let harness = Harness::new();
+                let old = fake_state();
+                {
+                    let mut state = old.lock().unwrap();
+                    state.legacy = false;
+                    state.capabilities.settings.rate = SettingSupport::ReadWrite;
+                    state.capabilities.controls.stop = StopSupport::BestEffort;
+                    state.capabilities.lifecycle.terminal.delivery = DeliveryGuarantee::Reliable;
+                }
+                let replacement = fake_state();
+                replacement.lock().unwrap().legacy = false;
+                harness.push_driver(old);
+                harness.push_driver(Arc::clone(&replacement));
+                let mut supervisor = harness.supervisor;
+                supervisor.start().unwrap();
+                supervisor
+                    .speak_utterance(&UtteranceId::new("current"), "current text", false)
+                    .unwrap();
+                supervisor
+                    .adjust_rate_and_announce(true, Some(UtteranceId::new("rate-feedback")))
+                    .unwrap();
+                if ordinary {
+                    supervisor
+                        .speak_utterance(&UtteranceId::new("ordinary"), "ordinary text", true)
+                        .unwrap();
+                }
+
+                if crash {
+                    supervisor
+                        .recover_after_transport_failure("fixture loss".into())
+                        .unwrap();
+                } else {
+                    supervisor
+                        .configure_server(SpeechServerSpec::Process {
+                            program: "fixture".into(),
+                            args: vec![],
+                        })
+                        .unwrap();
+                }
+                let expected = if ordinary {
+                    vec![Call::Speak("ordinary text".into(), false)]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(replacement.lock().unwrap().calls, expected);
+                assert_eq!(supervisor.rate_feedback, None);
+            }
         }
     }
 
