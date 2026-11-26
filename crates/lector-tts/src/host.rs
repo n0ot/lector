@@ -195,6 +195,10 @@ impl DirectionPlayback {
     fn needs_label(self, naturally_completed: bool) -> bool {
         naturally_completed && self != Self::Played
     }
+
+    fn shows_missing_word_ranges(self, saw_range: bool) -> bool {
+        self == Self::Pending && !saw_range
+    }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -1394,10 +1398,14 @@ impl State {
         if !direction.playback.needs_label(allow_cue && !active.paused) {
             return Ok(false);
         }
-        // A missed onset establishes that this voice/text path cannot reliably
-        // start a live cue. Future requests can use prepared PCM if available
-        // or speak the label with the original text.
-        self.directional_word_ranges = false;
+        // Only missing word ranges establish that this voice cannot supply a
+        // live onset. Delayed delivery or a player failure affects this cue.
+        if direction
+            .playback
+            .shows_missing_word_ranges(direction.saw_range)
+        {
+            self.directional_word_ranges = false;
+        }
         if direction.saw_range
             && let Some(key) = direction.cache_key
         {
@@ -1861,6 +1869,13 @@ mod tests {
         assert!(!DirectionPlayback::Played.needs_label(true));
         assert!(!DirectionPlayback::Pending.needs_label(false));
         assert!(!DirectionPlayback::Failed.needs_label(false));
+
+        // A coalesced range or failed audio output on A does not disable
+        // its voice's live route when B reports a usable range.
+        for playback in [DirectionPlayback::Pending, DirectionPlayback::Failed] {
+            assert!(!playback.shows_missing_word_ranges(coalesced.saw_range));
+        }
+        assert!(DirectionPlayback::Pending.shows_missing_word_ranges(absent.saw_range));
     }
 
     #[cfg(target_vendor = "apple")]
