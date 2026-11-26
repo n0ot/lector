@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MIN_MINOR: u16 = 0;
-pub const PROTOCOL_MAX_MINOR: u16 = 3;
+pub const PROTOCOL_MAX_MINOR: u16 = 4;
+pub const DIRECTIONAL_OVERLAY_PROTOCOL_MINOR: u16 = 4;
 pub const SOUND_CUES_PROTOCOL_MINOR: u16 = 3;
 /// First protocol minor whose rate domain is independent of the native backend.
 pub const NORMALIZED_RATE_PROTOCOL_MINOR: u16 = 2;
@@ -322,6 +323,11 @@ pub enum SoundCue {
 }
 
 impl SoundCue {
+    #[must_use]
+    pub const fn is_direction(self) -> bool {
+        matches!(self, Self::Top | Self::Bottom | Self::Left | Self::Right)
+    }
+
     /// The spoken label used when the cue cannot be played.
     #[must_use]
     pub const fn spoken_label(self) -> &'static str {
@@ -346,9 +352,29 @@ pub struct SoundCueAt {
 impl SoundCueAt {
     #[must_use]
     pub fn valid_for(text: &str, cues: &[Self]) -> bool {
+        Self::valid_for_protocol(text, cues, ProtocolVersion::current())
+    }
+
+    #[must_use]
+    pub fn valid_for_protocol(text: &str, cues: &[Self], version: ProtocolVersion) -> bool {
+        if !cues.is_empty()
+            && (version.major != PROTOCOL_MAJOR || version.minor < SOUND_CUES_PROTOCOL_MINOR)
+        {
+            return false;
+        }
         if text.is_empty() {
             return matches!(cues, [cue] if cue.offset == 0 && cue.cue != SoundCue::Link);
         }
+        let cues = match cues {
+            [first, rest @ ..]
+                if first.cue.is_direction()
+                    && first.offset == 0
+                    && version.minor >= DIRECTIONAL_OVERLAY_PROTOCOL_MINOR =>
+            {
+                rest
+            }
+            _ => cues,
+        };
         cues.iter().all(|cue| {
             cue.cue == SoundCue::Link
                 && cue.offset < text.len()
@@ -584,6 +610,55 @@ impl SpeechEventPayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn directional_overlay_requires_protocol_two_four() {
+        let direction = SoundCueAt {
+            cue: SoundCue::Right,
+            offset: 0,
+        };
+        let link = SoundCueAt {
+            cue: SoundCue::Link,
+            offset: 0,
+        };
+        let old = ProtocolVersion { major: 2, minor: 3 };
+        let current = ProtocolVersion::current();
+        assert!(!SoundCueAt::valid_for_protocol(
+            "text",
+            &[direction, link],
+            old
+        ));
+        assert!(SoundCueAt::valid_for_protocol("", &[direction], old));
+        assert!(SoundCueAt::valid_for_protocol("text", &[link], old));
+        assert!(SoundCueAt::valid_for_protocol(
+            "text",
+            &[direction, link],
+            current
+        ));
+        assert!(!SoundCueAt::valid_for_protocol(
+            "text",
+            &[link, direction],
+            current
+        ));
+        assert!(!SoundCueAt::valid_for_protocol(
+            "text",
+            &[direction, direction],
+            current
+        ));
+        assert!(!SoundCueAt::valid_for_protocol(
+            "text",
+            &[SoundCueAt {
+                offset: 1,
+                ..direction
+            }],
+            current
+        ));
+        assert!(!SoundCueAt::valid_for_protocol(
+            "é",
+            &[direction, SoundCueAt { offset: 1, ..link }],
+            current
+        ));
+    }
 
     #[test]
     fn version_ranges_choose_the_highest_mutual_minor() {

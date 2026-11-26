@@ -1,7 +1,7 @@
 // This is an original Lector implementation over ReviewDocument. Keep this
 // module free of copied or translated GPL-licensed table-plugin code.
 use super::document::ReviewDocument;
-use crate::terminal::HistoryPosition;
+use crate::{speech::protocol::SoundCue, terminal::HistoryPosition};
 use std::{collections::BTreeMap, ops::Range};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -547,18 +547,10 @@ impl ReviewTable {
                 .is_some_and(Option::is_none)
     }
 
-    pub(crate) fn boundary_announcement(
-        &self,
-        movement: CellMove,
-        address: CellAddress,
-    ) -> (&'static str, Option<usize>) {
-        (self.edge_announcement(movement), self.row_number(address))
-    }
-
-    pub(crate) fn edge_announcement(&self, movement: CellMove) -> &'static str {
+    pub(crate) fn edge_announcement(&self, movement: CellMove) -> (SoundCue, &'static str) {
         match movement {
-            CellMove::Previous | CellMove::Up => "top of table",
-            CellMove::Next | CellMove::Down => "bottom of table",
+            CellMove::Previous | CellMove::Up => (SoundCue::Top, "top of table"),
+            CellMove::Next | CellMove::Down => (SoundCue::Bottom, "bottom of table"),
         }
     }
 }

@@ -371,6 +371,99 @@ mod native_speech {
 
     #[test]
     #[ignore = "requires native audio; run scripts/test-native-speech"]
+    fn directional_cue_reuses_prepared_readback_and_stops() {
+        let directory = tempfile::tempdir().expect("speech test directory");
+        let event_log = directory.path().join("events.jsonl");
+        let mut host = NativeTestHost::spawn(
+            Command::new(env!("CARGO_BIN_EXE_lector"))
+                .arg("tts")
+                .env("LECTOR_SPEECH_TEST_MUTE", "1")
+                .env("LECTOR_SPEECH_EVENT_LOG", &event_log),
+        );
+        let initialized = host.rpc(
+            1,
+            "initialize",
+            serde_json::json!({
+                "protocol": {"major": 2, "minimumMinor": 4, "maximumMinor": 4},
+                "client": {"name": "lector-test", "version": "1"},
+                "clientCapabilities": {"speechEvents": true, "progressModes": ["utf8ByteOffset"]}
+            }),
+        );
+        assert_eq!(initialized["result"]["capabilities"]["soundCues"], true);
+
+        for (request, utterance) in [(2, "first"), (4, "again"), (6, "handoff")] {
+            let accepted = host.rpc(
+                request,
+                "speech.speak",
+                serde_json::json!({
+                    "utteranceId": utterance,
+                    "text": "One sample sentence ends here.",
+                    "cues": [{"cue": "right", "offset": 0}]
+                }),
+            );
+            assert_eq!(accepted["result"]["accepted"], true);
+            host.frames
+                .as_mut()
+                .unwrap()
+                .wait_for(NATIVE_TEST_DEADLINE, "first directional word", |frame| {
+                    frame["params"]["utteranceId"] == utterance
+                        && frame["params"]["event"]["type"] == "progress"
+                        && frame["params"]["event"]["position"]["offset"] == 0
+                })
+                .unwrap();
+            let deadline = Instant::now() + NATIVE_TEST_DEADLINE;
+            loop {
+                let events = fs::read_to_string(&event_log).unwrap();
+                let count = events
+                    .lines()
+                    .filter(|line| {
+                        serde_json::from_str::<Value>(line)
+                            .is_ok_and(|entry| entry["event"] == "directional-cue-playing")
+                    })
+                    .count() as u64;
+                if count == request / 2 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cue playback clock did not advance"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            let stopped = host.rpc(
+                request + 1,
+                "speech.stop",
+                serde_json::json!({"utteranceId": utterance}),
+            );
+            assert_eq!(stopped["result"]["accepted"], true);
+            let ended = host
+                .frames
+                .as_mut()
+                .unwrap()
+                .wait_for(NATIVE_TEST_DEADLINE, "directional cancellation", |frame| {
+                    frame["params"]["utteranceId"] == utterance
+                        && frame["params"]["event"]["type"] == "ended"
+                })
+                .unwrap();
+            assert_eq!(ended["params"]["event"]["reason"], "cancelled");
+            if request == 2 {
+                let deadline = Instant::now() + NATIVE_TEST_DEADLINE;
+                while !fs::read_to_string(&event_log)
+                    .unwrap()
+                    .contains("directional-cue-cache-ready")
+                {
+                    assert!(Instant::now() < deadline, "short readback did not prepare");
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        let events = fs::read_to_string(&event_log).unwrap();
+        assert_eq!(events.matches("directional-cue-cache-hit").count(), 2);
+        host.finish();
+    }
+
+    #[test]
+    #[ignore = "requires native audio; run scripts/test-native-speech"]
     fn synchronized_sound_cues_complete_and_stop_with_speech() {
         let directory = tempfile::tempdir().expect("speech test directory");
         let event_log = directory.path().join("events.jsonl");

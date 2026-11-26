@@ -700,17 +700,18 @@ impl ReviewView {
         };
         let (target, include_row) = if let Some(current) = table.cell_at(self.cursor) {
             let Some(target) = table.move_cell(current, movement, count) else {
-                let (edge, row) = table.boundary_announcement(movement, current);
-                sr.speak(edge, false)?;
-                if let Some(row) = row {
-                    sr.speak(&format!("row {row}"), false)?;
-                }
+                let (cue, edge) = table.edge_announcement(movement);
+                let readback = table
+                    .row_number(current)
+                    .map_or_else(String::new, |row| format!("row {row}"));
+                sr.speak_review_boundary_readback(&readback, &[], cue, edge)?;
                 return Ok(ViewAction::None);
             };
             (target, current.row != target.row)
         } else {
             let Some(entry) = table.reentry_cell(self.cursor, movement) else {
-                sr.speak(table.edge_announcement(movement), false)?;
+                let (cue, edge) = table.edge_announcement(movement);
+                sr.speak_review_boundary_readback("", &[], cue, edge)?;
                 return Ok(ViewAction::None);
             };
             let target = count
@@ -2232,7 +2233,7 @@ mod tests {
 
         spoken.borrow_mut().clear();
         assert!(matches!(input(&mut view, &mut sr, b"}|"), ViewAction::None));
-        assert_eq!(spoken.borrow().as_slice(), ["bottom of table", "row 2"]);
+        assert_eq!(spoken.borrow().as_slice(), ["bottom of table row 2"]);
 
         spoken.borrow_mut().clear();
         assert!(matches!(

@@ -1,4 +1,4 @@
-//! Spoken link insertion and the corresponding UTF-8 progress mapping.
+//! Spoken cue insertion and the corresponding UTF-8 progress mapping.
 
 use crate::protocol::SoundCue;
 
@@ -14,11 +14,31 @@ pub struct InsertedLink {
 /// Insert the spoken label at an original text boundary. The caller has
 /// appended the original text up to that boundary.
 pub fn append_link_announcement(result: &mut String, text: &str, offset: usize) -> InsertedLink {
+    append_cue_announcement(result, text, offset, SoundCue::Link)
+}
+
+/// Insert a cue's spoken label at a boundary of the original text.
+pub(crate) fn append_cue_announcement(
+    result: &mut String,
+    text: &str,
+    offset: usize,
+    cue: SoundCue,
+) -> InsertedLink {
+    append_spoken_announcement(result, text, offset, cue.spoken_label())
+}
+
+/// Insert a custom spoken cue label at a UTF-8 character boundary.
+pub fn append_spoken_announcement(
+    result: &mut String,
+    text: &str,
+    offset: usize,
+    label: &str,
+) -> InsertedLink {
     let start = result.len();
     if result.ends_with(|character: char| !character.is_whitespace()) {
         result.push(' ');
     }
-    result.push_str(SoundCue::Link.spoken_label());
+    result.push_str(label);
     if text[offset..].starts_with(|character: char| !character.is_whitespace()) {
         result.push(' ');
     }

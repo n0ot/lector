@@ -7,7 +7,8 @@ server.
 ## Sound cues
 
 Lector plays short cues at review cursor boundaries and when inspecting a
-blank character. It identifies an OSC 8 hyperlink when its text starts, or
+blank character. Direction cues play over the spoken readback when the command
+also reads text. It identifies an OSC 8 hyperlink when its text starts, or
 when you start reading within the link. Set `lector.o.tones = false` to use
 spoken labels for boundaries, blank characters, and links.
 

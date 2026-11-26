@@ -5,7 +5,8 @@ use std::borrow::Cow;
 
 pub(super) use tts::speech_fallback::InsertedLink;
 use tts::speech_fallback::{
-    MAX_LINK_ANNOUNCEMENT_BYTES as MAX_MARKER_BYTES, append_link_announcement, canonical_offset,
+    MAX_LINK_ANNOUNCEMENT_BYTES as MAX_MARKER_BYTES, append_link_announcement,
+    append_spoken_announcement, canonical_offset,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -21,7 +22,8 @@ pub enum SpeechCues {
     #[default]
     None,
     Standalone(SoundCue),
-    Links {
+    Inline {
+        direction: Option<(SoundCue, &'static str)>,
         links: Vec<SpeechLink>,
         tones: bool,
     },
@@ -32,26 +34,37 @@ impl SpeechCues {
         match self {
             Self::None => true,
             Self::Standalone(cue) => *cue != SoundCue::Link,
-            Self::Links { links, .. } => {
-                links.iter().all(|link| {
-                    (!link.audible || link.offset < text.len())
-                        && text.is_char_boundary(link.offset)
-                }) && links.windows(2).all(|pair| pair[0] < pair[1])
+            Self::Inline {
+                direction, links, ..
+            } => {
+                direction.is_none_or(|(cue, _)| cue.is_direction())
+                    && links.iter().all(|link| {
+                        (!link.audible || link.offset < text.len())
+                            && text.is_char_boundary(link.offset)
+                    })
+                    && links.windows(2).all(|pair| pair[0] < pair[1])
             }
         }
     }
 
     pub(super) fn queue_bytes(&self) -> usize {
         match self {
-            Self::Links { links, .. } => size_of::<SpeechLink>().saturating_mul(links.capacity()),
+            Self::Inline { links, .. } => size_of::<SpeechLink>().saturating_mul(links.capacity()),
             _ => 0,
         }
     }
 
     pub(super) fn bound_text(&mut self, text: &str, limit: usize) -> String {
         const TRUNCATION_SUFFIX: &str = " … speech truncated";
-        let mut rendered_bytes = text.len();
-        if let Self::Links { links, .. } = self {
+        let direction_bytes = match self {
+            Self::Inline {
+                direction: Some((_, fallback)),
+                ..
+            } => fallback.len() + 1,
+            _ => 0,
+        };
+        let mut rendered_bytes = text.len().saturating_add(direction_bytes);
+        if let Self::Inline { links, .. } = self {
             rendered_bytes =
                 rendered_bytes.saturating_add(links.len().saturating_mul(MAX_MARKER_BYTES));
         }
@@ -60,9 +73,9 @@ impl SpeechCues {
             return text.to_owned();
         }
 
-        let budget = limit.saturating_sub(TRUNCATION_SUFFIX.len());
+        let budget = limit.saturating_sub(TRUNCATION_SUFFIX.len() + direction_bytes);
         let mut end = budget.min(text.len());
-        if let Self::Links { links, .. } = self {
+        if let Self::Inline { links, .. } = self {
             // Each retained link needs room for its spoken fallback even if
             // the current host can overlay the tone.
             for (index, link) in links.iter().enumerate() {
@@ -80,7 +93,7 @@ impl SpeechCues {
         while !text.is_char_boundary(end) {
             end -= 1;
         }
-        if let Self::Links { links, .. } = self {
+        if let Self::Inline { links, .. } = self {
             links.truncate(links.partition_point(|link| link.offset < end));
         }
         self.compact_links();
@@ -88,14 +101,19 @@ impl SpeechCues {
     }
 
     fn compact_links(&mut self) {
-        if let Self::Links { links, .. } = self
+        if let Self::Inline { links, .. } = self
             && links.capacity() != links.len()
         {
             *links = std::mem::take(links).into_boxed_slice().into_vec();
         }
     }
 
-    pub(super) fn render<'a>(&self, text: &'a str, supported: bool) -> RenderedCues<'a> {
+    pub(super) fn render<'a>(
+        &self,
+        text: &'a str,
+        supported: bool,
+        directional_overlay: bool,
+    ) -> RenderedCues<'a> {
         let mut rendered = RenderedCues {
             text: Cow::Borrowed(text),
             cues: Vec::new(),
@@ -111,9 +129,28 @@ impl SpeechCues {
                 });
             }
             Self::Standalone(_) => {}
-            Self::Links { links, tones } => {
+            Self::Inline {
+                direction,
+                links,
+                tones,
+            } => {
                 let overlay = supported && *tones;
                 let mut inserted = 0;
+                if let Some((cue, fallback)) = direction {
+                    if overlay && directional_overlay {
+                        rendered.cues.push(SoundCueAt {
+                            cue: *cue,
+                            offset: 0,
+                        });
+                    } else {
+                        let mut result = String::new();
+                        let announcement =
+                            append_spoken_announcement(&mut result, text, 0, fallback);
+                        inserted = announcement.inserted_bytes();
+                        rendered.inserted_links.push(announcement);
+                        rendered.text = Cow::Owned(result);
+                    }
+                }
                 let mut previous = 0;
                 for link in links {
                     let offset = link.offset;
@@ -173,9 +210,66 @@ mod tests {
     use tts::server::MAX_RPC_FRAME_BYTES;
 
     #[test]
+    fn direction_and_link_can_share_the_readback_onset() {
+        let mut cues = SpeechCues::Inline {
+            direction: Some((SoundCue::Bottom, "bottom of table")),
+            links: vec![SpeechLink {
+                offset: 0,
+                audible: true,
+            }],
+            tones: true,
+        };
+
+        let render = cues.render("café", true, true);
+        assert_eq!(render.text, "café");
+        assert_eq!(
+            render.cues,
+            [
+                SoundCueAt {
+                    cue: SoundCue::Bottom,
+                    offset: 0
+                },
+                SoundCueAt {
+                    cue: SoundCue::Link,
+                    offset: 0
+                },
+            ]
+        );
+        assert!(SoundCueAt::valid_for(&render.text, &render.cues));
+
+        let render = cues.render("café", true, false);
+        assert_eq!(render.text, "bottom of table café");
+        assert_eq!(
+            render.cues,
+            [SoundCueAt {
+                cue: SoundCue::Link,
+                offset: 16
+            }]
+        );
+        assert!(SoundCueAt::valid_for_protocol(
+            &render.text,
+            &render.cues,
+            super::super::protocol::ProtocolVersion { major: 2, minor: 3 },
+        ));
+        assert_eq!(canonical_offset(16, &render.inserted_links), 0);
+        assert_eq!(canonical_offset(21, &render.inserted_links), 5);
+
+        let SpeechCues::Inline { tones, .. } = &mut cues else {
+            unreachable!()
+        };
+        *tones = false;
+        let render = cues.render("café", true, true);
+        assert_eq!(render.text, "bottom of table link café");
+        assert!(render.cues.is_empty());
+        assert_eq!(canonical_offset(21, &render.inserted_links), 0);
+        assert_eq!(canonical_offset(26, &render.inserted_links), 5);
+    }
+
+    #[test]
     fn dense_cue_truncation_releases_excess_queue_storage() {
         let text = "a".repeat(MAX_UTTERANCE_TEXT_BYTES);
-        let mut cues = SpeechCues::Links {
+        let mut cues = SpeechCues::Inline {
+            direction: None,
             links: (0..text.len())
                 .map(|offset| SpeechLink {
                     offset,
@@ -186,7 +280,7 @@ mod tests {
         };
         assert_eq!(cues.queue_bytes(), text.len() * size_of::<SpeechLink>());
         let bounded = cues.bound_text(&text, MAX_UTTERANCE_TEXT_BYTES);
-        let SpeechCues::Links { links, .. } = &cues else {
+        let SpeechCues::Inline { links, .. } = &cues else {
             unreachable!("bounded link announcements must retain their metadata");
         };
         assert!(!links.is_empty());
@@ -207,7 +301,11 @@ mod tests {
             audible: true,
         });
         let original_capacity = links.capacity();
-        let mut cues = SpeechCues::Links { links, tones: true };
+        let mut cues = SpeechCues::Inline {
+            direction: None,
+            links,
+            tones: true,
+        };
         assert_eq!(
             cues.queue_bytes(),
             original_capacity * size_of::<SpeechLink>()
@@ -221,7 +319,8 @@ mod tests {
         // A control byte has the maximum JSON escape expansion, and every
         // byte starts a distinct link.
         let text = "\0".repeat(MAX_UTTERANCE_TEXT_BYTES);
-        let mut cues = SpeechCues::Links {
+        let mut cues = SpeechCues::Inline {
+            direction: None,
             links: (0..text.len())
                 .map(|offset| SpeechLink {
                     offset,
@@ -232,8 +331,8 @@ mod tests {
         };
         let bounded = cues.bound_text(&text, MAX_UTTERANCE_TEXT_BYTES);
         assert!(cues.valid_for(&bounded));
-        assert!(cues.render(&bounded, false).text.len() <= MAX_UTTERANCE_TEXT_BYTES);
-        let rendered = cues.render(&bounded, true);
+        assert!(cues.render(&bounded, false, false).text.len() <= MAX_UTTERANCE_TEXT_BYTES);
+        let rendered = cues.render(&bounded, true, true);
         let wire = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,

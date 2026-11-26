@@ -643,14 +643,18 @@ impl ScreenReader {
     }
 
     pub fn report_review_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
-        if !self.indentation_reporting_enabled() {
-            return Ok(());
-        }
-        let (indent_level, changed) = view.review_cursor_indentation_level();
-        if changed {
-            self.speak(&format!("indent {indent_level}"), false)?;
+        if let Some(level) = self.review_cursor_indentation_change(view) {
+            self.speak(&format!("indent {level}"), false)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn review_cursor_indentation_change(&self, view: &mut View) -> Option<u16> {
+        if !self.indentation_reporting_enabled() {
+            return None;
+        }
+        let (indent_level, changed) = view.review_cursor_indentation_level();
+        changed.then_some(indent_level)
     }
 }
 

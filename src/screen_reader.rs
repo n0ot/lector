@@ -875,6 +875,37 @@ impl ScreenReader {
         result.map(|_| ()).map_err(Into::into)
     }
 
+    pub(crate) fn speak_review_readback(
+        &mut self,
+        text: &str,
+        links: &[Range<usize>],
+        cue: Option<speech::protocol::SoundCue>,
+    ) -> Result<()> {
+        if let Some(cue) = cue {
+            return self.speak_review_boundary_readback(text, links, cue, cue.spoken_label());
+        }
+        self.speak_with_links(text, links, false).map(|_| ())
+    }
+
+    pub(crate) fn speak_review_boundary_readback(
+        &mut self,
+        text: &str,
+        links: &[Range<usize>],
+        cue: speech::protocol::SoundCue,
+        label: &'static str,
+    ) -> Result<()> {
+        if !self.terminal_focused {
+            return Ok(());
+        }
+        let hook_text = if text.is_empty() { label } else { text };
+        self.call_hook_on_speech_start(hook_text, false)?;
+        let result = self
+            .speech
+            .speak_with_links_and_cue(text, links, Some((cue, label)), false);
+        self.call_hook_on_speech_end(hook_text, false, result.is_ok())?;
+        result.map(|_| ()).map_err(Into::into)
+    }
+
     pub(crate) fn speak_with_links(
         &mut self,
         text: &str,

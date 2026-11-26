@@ -1,6 +1,8 @@
 //! `AVFoundation` rendering and sound cues share a single PCM playback clock.
 
 use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
     io::Cursor,
     ptr::NonNull,
     sync::{
@@ -31,11 +33,20 @@ use crate::{
 // Limit extra startup latency and memory before falling back to native speech.
 // Each queued callback holds only one buffer from AVFoundation; it must never
 // block the main run loop waiting for the host to receive it.
+mod engine;
+use engine::{Clip, CueEngine, NodePlayback};
+
 const RENDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(4);
 const RENDER_IDLE_TIMEOUT: Duration = Duration::from_millis(750);
 const RENDER_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RENDER_SAMPLES: usize = 1_048_576;
 const MAX_QUEUED_EVENTS: usize = 1024;
+const MAX_CACHED_READBACKS: usize = 4;
+const MAX_CACHED_TEXT_BYTES: usize = 256;
+// 10 seconds at 48 kHz, with lower-rate voices constrained by the
+// duration limit as well. Four entries cap retained PCM at ~7 MB after conversion.
+const MAX_CACHED_SAMPLES: usize = 480_000;
+const MAX_CACHED_SECONDS: usize = 10;
 
 fn cue_wav(cue: SoundCue) -> &'static [u8] {
     match cue {
@@ -57,6 +68,146 @@ fn new_player(wav: &[u8], volume: f32) -> Result<Retained<AVAudioPlayer>, Error>
         })?;
     unsafe { player.setVolume(volume) };
     Ok(player)
+}
+
+struct CuePlayer {
+    cue: SoundCue,
+    audio: Retained<AVAudioPlayer>,
+    prepared: Cell<bool>,
+}
+
+#[derive(Default)]
+pub(super) struct PreparedCues {
+    players: Vec<CuePlayer>,
+    engine: RefCell<Option<CueEngine>>,
+    failed_engine: Cell<Option<Instant>>,
+    clips: RefCell<Vec<(SoundCue, Clip)>>,
+}
+
+impl PreparedCues {
+    pub(super) fn new(volume: f32) -> Self {
+        let players = [
+            SoundCue::Top,
+            SoundCue::Bottom,
+            SoundCue::Left,
+            SoundCue::Right,
+            SoundCue::Blank,
+        ]
+        .into_iter()
+        .filter_map(|cue| {
+            let player = new_player(cue_wav(cue), volume).ok()?;
+            // Loading the clip does not activate an output device.
+            let prepared = Cell::new(false);
+            Some(CuePlayer {
+                cue,
+                audio: player,
+                prepared,
+            })
+        })
+        .collect();
+        Self {
+            players,
+            ..Self::default()
+        }
+    }
+
+    fn with_engine<T>(
+        &self,
+        action: impl FnOnce(&CueEngine) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let mut engine = self.engine.borrow_mut();
+        if engine.is_none() {
+            if self
+                .failed_engine
+                .get()
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+            {
+                return Err(Error::OperationFailed("start cue output engine"));
+            }
+            match CueEngine::new() {
+                Ok(open) => *engine = Some(open),
+                Err(error) => {
+                    self.failed_engine.set(Some(Instant::now()));
+                    return Err(error);
+                }
+            }
+        }
+        action(engine.as_ref().expect("cue output engine initialized"))
+    }
+
+    pub(super) fn idle(&self) {
+        if let Some(engine) = self.engine.borrow().as_ref() {
+            engine.idle();
+        }
+    }
+
+    fn standalone(&self, cue: SoundCue, volume: f32) -> Result<Playing, Error> {
+        let engine_play = self.with_engine(|engine| {
+            let mut clips = self.clips.borrow_mut();
+            let index = if let Some(index) = clips.iter().position(|(kind, _)| *kind == cue) {
+                index
+            } else {
+                clips.push((cue, engine.clip(cue_wav(cue))?));
+                clips.len() - 1
+            };
+            engine.play(&clips[index].1, volume)
+        });
+        if let Ok(node) = engine_play {
+            return Ok(Playing::new(AudioOutput::Engine(node), Vec::new(), 1));
+        }
+        self.prepare(cue, volume)?;
+        let player = self.player(cue)?;
+        unsafe { player.audio.setCurrentTime(0.0) };
+        Playing::start(player.audio.clone(), Vec::new(), 1)
+    }
+
+    fn player(&self, cue: SoundCue) -> Result<&CuePlayer, Error> {
+        self.players
+            .iter()
+            .find(|player| player.cue == cue)
+            .ok_or(Error::OperationFailed("load sound cue"))
+    }
+
+    pub(super) fn prepare(&self, cue: SoundCue, volume: f32) -> Result<(), Error> {
+        let player = self.player(cue)?;
+        unsafe {
+            player.audio.setVolume(volume);
+            if !player.prepared.get() {
+                let prepared = player.audio.prepareToPlay();
+                player.prepared.set(prepared);
+                if !prepared {
+                    return Err(Error::OperationFailed("prepare sound cue"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn play(&self, cue: SoundCue) -> Result<(), Error> {
+        let player = self.player(cue)?;
+        unsafe {
+            player.audio.setCurrentTime(0.0);
+            if !player.audio.play() {
+                player.prepared.set(false);
+                return Err(Error::OperationFailed("play sound cue"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn clock_is_advancing(&self, cue: SoundCue) -> bool {
+        self.player(cue).is_ok_and(|player| unsafe {
+            player.audio.isPlaying() && player.audio.currentTime() > 0.0
+        })
+    }
+
+    pub(super) fn stop(&self, cue: SoundCue) {
+        if let Ok(player) = self.player(cue)
+            && unsafe { player.audio.isPlaying() }
+        {
+            unsafe { player.audio.pause() };
+        }
+    }
 }
 
 pub(super) fn supported() -> bool {
@@ -146,8 +297,38 @@ impl RenderedAudio {
         if words.is_empty() {
             return Err(Error::OperationFailed("render speech word markers"));
         }
-        let cue = link_samples(spec.sample_rate)?;
-        if !mix_link_cues(&mut self.samples, channels, text, &words, cues, &cue) {
+        let (direction, links) = match cues {
+            [direction, links @ ..] if direction.cue != SoundCue::Link => (Some(direction), links),
+            _ => (None, cues),
+        };
+        if let Some(direction) = direction {
+            // The cached short-readback route can start at the first word.
+            // Remove preroll only when every omitted sample is silent.
+            let preroll_samples = words[0].frame * channels;
+            if links.is_empty()
+                && self.samples[..preroll_samples]
+                    .iter()
+                    .all(|sample| *sample == 0.0)
+            {
+                self.samples.drain(..preroll_samples);
+                let preroll_frames = words[0].frame;
+                for word in &mut words {
+                    word.frame -= preroll_frames;
+                }
+            }
+            let samples = cue_samples(direction.cue, spec.sample_rate)?;
+            mix_at(&mut self.samples, channels, words[0].frame, &samples);
+        }
+        if !links.is_empty()
+            && !mix_link_cues(
+                &mut self.samples,
+                channels,
+                text,
+                &words,
+                links,
+                &cue_samples(SoundCue::Link, spec.sample_rate)?,
+            )
+        {
             return Err(Error::OperationFailed(
                 "locate the linked text in rendered speech",
             ));
@@ -171,7 +352,7 @@ impl RenderedAudio {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct WordOnset {
     frame: usize,
     start: usize,
@@ -203,24 +384,28 @@ fn mix_link_cues(
         {
             return false;
         }
-        let needed_samples = (word.frame + cue.len()) * channels;
-        if speech.len() < needed_samples {
-            speech.resize(needed_samples, 0.0);
-        }
-        for (frame, &sample) in speech[word.frame * channels..]
-            .chunks_exact_mut(channels)
-            .zip(cue)
-        {
-            for channel in frame {
-                *channel += sample;
-            }
-        }
+        mix_at(speech, channels, word.frame, cue);
     }
     cues.next().is_none()
 }
 
-fn link_samples(sample_rate: u32) -> Result<Vec<f32>, Error> {
-    let mut reader = WavReader::new(Cursor::new(cue_wav(SoundCue::Link)))?;
+fn mix_at(speech: &mut Vec<f32>, channels: usize, frame: usize, cue: &[f32]) {
+    let needed_samples = (frame + cue.len()) * channels;
+    if speech.len() < needed_samples {
+        speech.resize(needed_samples, 0.0);
+    }
+    for (frame, &sample) in speech[frame * channels..]
+        .chunks_exact_mut(channels)
+        .zip(cue)
+    {
+        for channel in frame {
+            *channel += sample;
+        }
+    }
+}
+
+fn cue_samples(cue: SoundCue, sample_rate: u32) -> Result<Vec<f32>, Error> {
+    let mut reader = WavReader::new(Cursor::new(cue_wav(cue)))?;
     let source_rate = reader.spec().sample_rate as usize;
     let target_rate = sample_rate as usize;
     let samples = reader
@@ -266,6 +451,7 @@ struct Rendering {
     text: String,
     cues: Vec<SoundCueAt>,
     volume: f32,
+    sample_limit: usize,
 }
 
 impl Rendering {
@@ -275,6 +461,7 @@ impl Rendering {
         text: String,
         cues: Vec<SoundCueAt>,
         volume: f32,
+        sample_limit: usize,
     ) -> Self {
         let requested = Instant::now();
         let (send, events) = sync_channel(MAX_QUEUED_EVENTS);
@@ -342,10 +529,11 @@ impl Rendering {
             text,
             cues,
             volume,
+            sample_limit,
         }
     }
 
-    fn advance(&mut self) -> Result<Option<Playing>, Error> {
+    fn advance(&mut self) -> Result<Option<RenderedPlayback>, Error> {
         if self.overflowed.load(Ordering::Relaxed) {
             return Err(Error::OperationFailed(
                 "render speech within the callback queue budget",
@@ -354,6 +542,25 @@ impl Rendering {
         let mut finished = false;
         let before = self.data.samples.len();
         for event in self.events.try_iter() {
+            let (spec, sample_count) = match &event {
+                RenderEvent::Audio(Chunk::F32(spec, samples)) => (Some(spec), samples.len()),
+                RenderEvent::Audio(Chunk::I16(spec, samples)) => (Some(spec), samples.len()),
+                _ => (None, 0),
+            };
+            let limit = if self.sample_limit == MAX_CACHED_SAMPLES
+                && let Some(spec) = spec
+            {
+                self.sample_limit.min(
+                    MAX_CACHED_SECONDS * spec.sample_rate as usize * usize::from(spec.channels),
+                )
+            } else {
+                self.sample_limit
+            };
+            if self.data.samples.len().saturating_add(sample_count) > limit {
+                return Err(Error::OperationFailed(
+                    "render speech within the PCM budget",
+                ));
+            }
             match event {
                 RenderEvent::Audio(Chunk::Done) => finished = true,
                 RenderEvent::Audio(Chunk::F32(spec, samples)) => {
@@ -385,7 +592,11 @@ impl Rendering {
         if finished {
             let sample_rate = self.data.spec.map_or(1, |spec| spec.sample_rate);
             let (wav, words) = std::mem::take(&mut self.data).finish(&self.text, &self.cues)?;
-            return Playing::new(&wav, self.volume, words, sample_rate).map(Some);
+            return Ok(Some(RenderedPlayback {
+                wav,
+                words,
+                sample_rate,
+            }));
         }
         let now = Instant::now();
         if self.data.samples.len() > before {
@@ -398,49 +609,123 @@ impl Rendering {
     }
 }
 
+struct RenderedPlayback {
+    wav: Vec<u8>,
+    words: Vec<WordOnset>,
+    sample_rate: u32,
+}
+
+impl RenderedPlayback {
+    fn play(&self, volume: f32) -> Result<Playing, Error> {
+        let audio = new_player(&self.wav, volume)?;
+        Playing::start(audio, self.words.clone(), self.sample_rate)
+    }
+}
+
+enum AudioOutput {
+    Player(Retained<AVAudioPlayer>),
+    Engine(NodePlayback),
+}
+
+impl AudioOutput {
+    fn time(&self) -> f64 {
+        match self {
+            Self::Player(player) => unsafe { player.currentTime() },
+            Self::Engine(node) => node.time(),
+        }
+    }
+
+    fn duration(&self) -> f64 {
+        match self {
+            Self::Player(player) => unsafe { player.duration() },
+            Self::Engine(node) => node.duration(),
+        }
+    }
+
+    fn playing(&self) -> bool {
+        match self {
+            Self::Player(player) => unsafe { player.isPlaying() },
+            Self::Engine(node) => node.playing(),
+        }
+    }
+
+    fn interrupted(&self) -> bool {
+        matches!(self, Self::Engine(node) if node.interrupted())
+    }
+
+    fn pause(&self) {
+        match self {
+            Self::Player(player) => unsafe { player.pause() },
+            Self::Engine(node) => node.pause(),
+        }
+    }
+
+    fn resume(&self) -> bool {
+        match self {
+            Self::Player(player) => unsafe { player.play() },
+            Self::Engine(node) => node.resume(),
+        }
+    }
+}
+
 struct Playing {
-    audio: Retained<AVAudioPlayer>,
+    audio: AudioOutput,
     words: std::vec::IntoIter<WordOnset>,
     sample_rate: u32,
     paused: bool,
     announced: bool,
+    first_word_frame: f64,
 }
 
 impl Playing {
-    fn new(
-        wav: &[u8],
-        volume: f32,
+    fn start(
+        audio: Retained<AVAudioPlayer>,
         words: Vec<WordOnset>,
         sample_rate: u32,
     ) -> Result<Self, Error> {
-        let audio = new_player(wav, volume)?;
         if !unsafe { audio.play() } {
             return Err(Error::OperationFailed("play synchronized audio"));
         }
-        Ok(Self {
+        Ok(Self::new(AudioOutput::Player(audio), words, sample_rate))
+    }
+
+    fn new(audio: AudioOutput, words: Vec<WordOnset>, sample_rate: u32) -> Self {
+        #[allow(clippy::cast_precision_loss)]
+        let first_word_frame = words.first().map_or(0.0, |word| word.frame as f64);
+        Self {
             audio,
             words: words.into_iter(),
             sample_rate,
             paused: false,
             announced: false,
-        })
+            first_word_frame,
+        }
     }
 
     fn advance(&mut self, id: NativeUtteranceId, mut emit: impl FnMut(NativeEvent)) -> bool {
-        if !self.announced {
-            emit(NativeEvent::Started(id));
-            self.announced = true;
+        if self.audio.interrupted() {
+            emit(NativeEvent::Cancelled(id));
+            return true;
         }
         if self.paused {
             return false;
         }
-        let playing = unsafe { self.audio.isPlaying() };
+        let playing = self.audio.playing();
         let time = if playing {
-            unsafe { self.audio.currentTime() }
+            self.audio.time()
         } else {
             // AVAudioPlayer resets currentTime when it finishes.
-            unsafe { self.audio.duration() }
+            self.audio.duration()
         };
+        // Before the native cursor advances, a zero frame can mean queued
+        // output. Do not report a word at frame zero until playback begins.
+        if playing && time <= 0.0 {
+            return false;
+        }
+        if !self.announced {
+            emit(NativeEvent::Started(id));
+            self.announced = true;
+        }
         let frame = time * f64::from(self.sample_rate);
         #[allow(clippy::cast_precision_loss)]
         while self
@@ -471,6 +756,7 @@ enum Playback {
 pub(super) struct CuePlayback {
     token: Retained<AVSpeechUtterance>,
     playback: Playback,
+    cached_clock_pending: bool,
 }
 
 impl CuePlayback {
@@ -479,6 +765,7 @@ impl CuePlayback {
         text: &str,
         cues: Vec<SoundCueAt>,
         voice_id: Option<&str>,
+        prepared: &PreparedCues,
     ) -> Result<Self, Error> {
         let volume = tts.get_volume()?;
         // The player applies volume once, to both the rendered speech and the
@@ -487,12 +774,35 @@ impl CuePlayback {
         let playback = if let [cue] = cues.as_slice()
             && text.is_empty()
         {
-            Playback::Playing(Playing::new(cue_wav(cue.cue), volume, Vec::new(), 1)?)
+            Playback::Playing(prepared.standalone(cue.cue, volume)?)
         } else {
             let synth = unsafe { AVSpeechSynthesizer::new() };
-            Playback::Rendering(Rendering::new(synth, &token, text.to_owned(), cues, volume))
+            Playback::Rendering(Rendering::new(
+                synth,
+                &token,
+                text.to_owned(),
+                cues,
+                volume,
+                MAX_RENDER_SAMPLES,
+            ))
         };
-        Ok(Self { token, playback })
+        Ok(Self {
+            token,
+            playback,
+            cached_clock_pending: false,
+        })
+    }
+
+    pub(super) fn observe_cached_clock(&mut self) -> bool {
+        if self.cached_clock_pending
+            && let Playback::Playing(play) = &self.playback
+            && play.audio.playing()
+            && play.audio.time() * f64::from(play.sample_rate) > play.first_word_frame
+        {
+            self.cached_clock_pending = false;
+            return true;
+        }
+        false
     }
 
     pub(super) fn id(&self) -> NativeUtteranceId {
@@ -508,20 +818,24 @@ impl CuePlayback {
                         .stopSpeakingAtBoundary(AVSpeechBoundary::Immediate)
                 };
             }
-            Playback::Playing(play) => unsafe { play.audio.stop() },
+            Playback::Playing(play) => {
+                if let AudioOutput::Player(player) = &play.audio {
+                    unsafe { player.pause() };
+                }
+            }
         }
     }
 
     pub(super) fn pause(&mut self) {
         if let Playback::Playing(play) = &mut self.playback {
-            unsafe { play.audio.pause() };
+            play.audio.pause();
             play.paused = true;
         }
     }
 
     pub(super) fn resume(&mut self) -> Result<(), Error> {
         if let Playback::Playing(play) = &mut self.playback {
-            if !unsafe { play.audio.play() } {
+            if !play.audio.resume() {
                 return Err(Error::OperationFailed("resume sound cue"));
             }
             play.paused = false;
@@ -537,8 +851,8 @@ impl CuePlayback {
         let id = self.id();
         match &mut self.playback {
             Playback::Rendering(rendering) => {
-                if allow_start && let Some(play) = rendering.advance()? {
-                    self.playback = Playback::Playing(play);
+                if allow_start && let Some(ready) = rendering.advance()? {
+                    self.playback = Playback::Playing(ready.play(rendering.volume)?);
                 }
                 Ok(false)
             }
@@ -550,6 +864,154 @@ impl CuePlayback {
 impl Drop for CuePlayback {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct ReadbackKey {
+    text: String,
+    cue: SoundCue,
+    voice: Option<String>,
+    rate: u32,
+    pitch: u32,
+}
+
+impl ReadbackKey {
+    pub(super) fn new(tts: &Tts, text: &str, cue: SoundCue, voice: Option<&str>) -> Option<Self> {
+        if text.len() > MAX_CACHED_TEXT_BYTES {
+            return None;
+        }
+        Some(Self {
+            text: text.to_owned(),
+            cue,
+            voice: voice.map(str::to_owned),
+            rate: tts.get_rate().ok()?.to_bits(),
+            pitch: tts.get_pitch().ok()?.to_bits(),
+        })
+    }
+}
+
+struct PreparedReadback {
+    clip: Clip,
+    words: Vec<WordOnset>,
+}
+
+/// Process-local cache of short directional readbacks. No text or audio is
+/// written to disk, and a single bounded render can be in flight.
+#[derive(Default)]
+pub(super) struct ReadbackCache {
+    ready: VecDeque<(ReadbackKey, PreparedReadback)>,
+    requested: Option<ReadbackKey>,
+    rendering: Option<(ReadbackKey, Retained<AVSpeechUtterance>, Rendering)>,
+}
+
+impl ReadbackCache {
+    pub(super) fn retain_request(&mut self, key: Option<&ReadbackKey>) {
+        if self.requested.as_ref() != key {
+            self.requested = None;
+        }
+        if self
+            .rendering
+            .as_ref()
+            .is_some_and(|(in_flight, _, _)| Some(in_flight) != key)
+            && let Some((_, _, render)) = self.rendering.take()
+        {
+            unsafe {
+                render
+                    .synth
+                    .stopSpeakingAtBoundary(AVSpeechBoundary::Immediate)
+            };
+        }
+    }
+
+    pub(super) fn request(&mut self, key: ReadbackKey) {
+        if !self.ready.iter().any(|(cached, _)| cached == &key)
+            && !self
+                .rendering
+                .as_ref()
+                .is_some_and(|(pending, _, _)| pending == &key)
+        {
+            self.requested = Some(key);
+        }
+    }
+
+    pub(super) fn play(
+        &mut self,
+        key: &ReadbackKey,
+        volume: f32,
+        prepared: &PreparedCues,
+    ) -> Option<CuePlayback> {
+        let index = self.ready.iter().position(|(cached, _)| cached == key)?;
+        let (key, ready) = self.ready.remove(index)?;
+        let token = build_utterance("", 0.5, 1.0, 1.0, None).ok()?;
+        let playback = Playback::Playing(Playing::new(
+            AudioOutput::Engine(
+                prepared
+                    .with_engine(|engine| engine.play(&ready.clip, volume))
+                    .ok()?,
+            ),
+            ready.words.clone(),
+            ready.clip.source_rate(),
+        ));
+        self.ready.push_front((key, ready));
+        Some(CuePlayback {
+            token,
+            playback,
+            cached_clock_pending: true,
+        })
+    }
+
+    pub(super) fn advance(&mut self, prepared: &PreparedCues) -> bool {
+        if self.rendering.is_none()
+            && let Some(key) = self.requested.take()
+        {
+            let Ok(token) = build_utterance(
+                &key.text,
+                f32::from_bits(key.rate),
+                1.0,
+                f32::from_bits(key.pitch),
+                key.voice.as_deref(),
+            ) else {
+                return false;
+            };
+            let synth = unsafe { AVSpeechSynthesizer::new() };
+            let render = Rendering::new(
+                synth,
+                &token,
+                key.text.clone(),
+                vec![SoundCueAt {
+                    cue: key.cue,
+                    offset: 0,
+                }],
+                0.0,
+                MAX_CACHED_SAMPLES,
+            );
+            self.rendering = Some((key, token, render));
+        }
+        let Some((_, _, render)) = &mut self.rendering else {
+            return false;
+        };
+        match render.advance() {
+            Ok(Some(ready)) => {
+                let (key, _, _) = self.rendering.take().expect("render just advanced");
+                if let Ok(clip) = prepared.with_engine(|engine| engine.clip(&ready.wav)) {
+                    if self.ready.len() == MAX_CACHED_READBACKS {
+                        self.ready.pop_back();
+                    }
+                    self.ready.push_front((
+                        key,
+                        PreparedReadback {
+                            clip,
+                            words: ready.words,
+                        },
+                    ));
+                    return true;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => self.retain_request(None),
+        }
+        false
     }
 }
 
@@ -614,11 +1076,54 @@ mod tests {
             .unwrap();
         let dry = samples[0];
         assert!(samples[..400].iter().all(|sample| *sample == dry));
-        let cue = link_samples(44_100).unwrap();
+        let cue = cue_samples(SoundCue::Link, 44_100).unwrap();
         for (channels, sample) in samples[400..].as_chunks::<2>().0.iter().zip(cue) {
             #[allow(clippy::cast_possible_truncation)]
             let expected = ((0.125 + sample) * f32::from(i16::MAX)).round() as i16;
             assert_eq!(*channels, [expected, expected]);
+        }
+    }
+
+    #[test]
+    fn direction_and_link_can_share_the_first_native_word_frame() {
+        let wave = WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut pcm = RenderedAudio::default();
+        pcm.append(wave, std::iter::repeat_n(0.0, 6380)).unwrap();
+        let start = 32;
+        pcm.words.push(Word {
+            byte_sample: start * 4,
+            start: 0,
+            end: 3,
+        });
+        let cues = [
+            SoundCueAt {
+                cue: SoundCue::Right,
+                offset: 0,
+            },
+            SoundCueAt {
+                cue: SoundCue::Link,
+                offset: 0,
+            },
+        ];
+        let (audio, _) = pcm.finish("one", &cues).unwrap();
+        let mut reader = WavReader::new(Cursor::new(audio)).unwrap();
+        let samples = reader
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(samples[..start].iter().all(|sample| *sample == 0));
+        let direction = cue_samples(SoundCue::Right, wave.sample_rate).unwrap();
+        let link = cue_samples(SoundCue::Link, wave.sample_rate).unwrap();
+        for (index, (&actual, direction)) in samples[start..].iter().zip(direction).enumerate() {
+            let mixed = direction + link.get(index).copied().unwrap_or(0.0);
+            #[allow(clippy::cast_possible_truncation)]
+            let expected = (mixed.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+            assert_eq!(actual, expected);
         }
     }
 

@@ -1279,7 +1279,7 @@ fn review_previous_line_stops_at_visible_top_when_scrollback_exists() {
         .iter()
         .map(|(text, _)| text.clone())
         .collect::<Vec<_>>();
-    assert_eq!(spoken, ["top", "history-06"]);
+    assert_eq!(spoken, ["top history-06"]);
     assert!(pty_out.is_empty());
 }
 

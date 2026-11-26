@@ -22,6 +22,10 @@ const MAX_READER_EVENTS: usize = 256;
 pub trait Host {
     fn capabilities(&self) -> &SpeechCapabilities;
 
+    fn supports_directional_overlay(&self) -> bool {
+        false
+    }
+
     fn backend_info(&self) -> Option<&BackendInfo> {
         None
     }
@@ -202,7 +206,7 @@ impl SpeechManager {
         if standalone && text.is_empty() && !supports_sound_cues(host) {
             return Ok(());
         }
-        let (text, cues) = if matches!(cues, SpeechCues::Links { .. }) {
+        let (text, cues) = if matches!(cues, SpeechCues::Inline { .. }) {
             // Direct callers may bypass the worker. Leave enough room for
             // fallback speech even when a later host must play this item.
             let mut cues = cues;
@@ -241,7 +245,7 @@ impl SpeechManager {
             return self.start(host, utterance, false);
         }
         if host.has_legacy_queue() {
-            let rendered = utterance.cues.render(&utterance.text, false);
+            let rendered = utterance.cues.render(&utterance.text, false, false);
             return host.speak(&utterance.id, &rendered.text, false);
         }
         if !self.can_sequence(host) {
@@ -530,9 +534,11 @@ impl SpeechManager {
         utterance: Utterance,
         legacy_interrupt: bool,
     ) -> Result<()> {
-        let rendered = utterance
-            .cues
-            .render(&utterance.text, supports_sound_cues(host));
+        let rendered = utterance.cues.render(
+            &utterance.text,
+            supports_sound_cues(host),
+            host.supports_directional_overlay(),
+        );
         if rendered.text.is_empty() && rendered.cues.is_empty() {
             return self.start_due(host, Instant::now());
         }
@@ -944,7 +950,8 @@ mod tests {
                 "See café".to_owned(),
                 true,
                 UtteranceBoundary::Immediate,
-                SpeechCues::Links {
+                SpeechCues::Inline {
+                    direction: None,
                     links: vec![SpeechLink {
                         offset: 4,
                         audible: true,
@@ -994,7 +1001,8 @@ mod tests {
                     "See café now".to_owned(),
                     false,
                     UtteranceBoundary::Immediate,
-                    SpeechCues::Links {
+                    SpeechCues::Inline {
+                        direction: None,
                         links: vec![SpeechLink {
                             offset: 4,
                             audible: true,

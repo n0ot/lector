@@ -280,8 +280,8 @@ pub(super) fn word_previous(sr: &mut ScreenReader, view: &mut View) -> Result<Co
     let old_position = view.review_cursor_position();
     let (row, col) = old_position;
     if col <= start {
-        sr.speak_review_cue(SoundCue::Left)?;
-        word_read(sr, view)?;
+        let cue = Some(SoundCue::Left);
+        word_read_with_cue(sr, view, cue)?;
         return Ok(CommandResult::Handled);
     }
 
@@ -319,8 +319,8 @@ pub(super) fn word_next(sr: &mut ScreenReader, view: &mut View) -> Result<Comman
         index += 1;
     }
     if index > end || old_word_end.is_some_and(|word_end| index <= word_end) {
-        sr.speak_review_cue(SoundCue::Right)?;
-        word_read(sr, view)?;
+        let cue = Some(SoundCue::Right);
+        word_read_with_cue(sr, view, cue)?;
         return Ok(CommandResult::Handled);
     }
     view.set_review_cursor_col(index);
@@ -330,24 +330,33 @@ pub(super) fn word_next(sr: &mut ScreenReader, view: &mut View) -> Result<Comman
 }
 
 pub(super) fn word_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    word_read_with_cue(sr, view, None)
+}
+
+fn word_read_with_cue(
+    sr: &mut ScreenReader,
+    view: &mut View,
+    cue: Option<SoundCue>,
+) -> Result<CommandResult> {
     if !ensure_state(sr, view) {
+        sr.speak_review_readback("", &[], cue)?;
         sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     }
     let Some((start, end)) = current_cell_text_bounds(sr, view) else {
+        sr.speak_review_readback("", &[], cue)?;
         return Ok(CommandResult::Handled);
     };
     let (row, col) = view.review_cursor_position();
     let Some((word_start, word_end)) = word_bounds_at(view, row, col, start, end) else {
+        sr.speak_review_readback("", &[], cue)?;
         return Ok(CommandResult::Handled);
     };
     let (text, mut links) = view
         .screen()
         .contents_with_links(row, word_start, row, word_end + 1);
     let spoken = crate::terminal::trim_linked_text(&text, &mut links);
-    if !spoken.is_empty() || !links.is_empty() {
-        sr.speak_with_links(spoken, &links, false)?;
-    }
+    sr.speak_review_readback(spoken, &links, cue)?;
     Ok(CommandResult::Handled)
 }
 
@@ -407,8 +416,8 @@ pub(super) fn character_previous(sr: &mut ScreenReader, view: &mut View) -> Resu
     };
     let old_position = view.review_cursor_position();
     if old_position.1 <= start {
-        sr.speak_review_cue(SoundCue::Left)?;
-        character_read(sr, view)?;
+        let cue = Some(SoundCue::Left);
+        character_read_with_cue(sr, view, cue)?;
         return Ok(CommandResult::Handled);
     }
     view.set_review_cursor_col(old_position.1.saturating_sub(1));
@@ -427,8 +436,8 @@ pub(super) fn character_next(sr: &mut ScreenReader, view: &mut View) -> Result<C
     };
     let old_position = view.review_cursor_position();
     if old_position.1 >= end {
-        sr.speak_review_cue(SoundCue::Right)?;
-        character_read(sr, view)?;
+        let cue = Some(SoundCue::Right);
+        character_read_with_cue(sr, view, cue)?;
         return Ok(CommandResult::Handled);
     }
     view.set_review_cursor_col(old_position.1 + 1);
@@ -438,7 +447,16 @@ pub(super) fn character_next(sr: &mut ScreenReader, view: &mut View) -> Result<C
 }
 
 pub(super) fn character_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
+    character_read_with_cue(sr, view, None)
+}
+
+fn character_read_with_cue(
+    sr: &mut ScreenReader,
+    view: &mut View,
+    cue: Option<SoundCue>,
+) -> Result<CommandResult> {
     if !ensure_state(sr, view) {
+        sr.speak_review_readback("", &[], cue)?;
         sr.speak("no table found", false)?;
         return Ok(CommandResult::Handled);
     }
@@ -446,15 +464,20 @@ pub(super) fn character_read(sr: &mut ScreenReader, view: &mut View) -> Result<C
         let column = sr.table_session().navigation()?.current_column()?;
         Some((column.start(), column.end()))
     }) else {
+        sr.speak_review_readback("", &[], cue)?;
         return Ok(CommandResult::Handled);
     };
     let (row, col) = view.review_cursor_position();
     let col = col.clamp(start, end);
     let (character, links) = view.character_with_links(row, col);
-    if !character.trim().is_empty() || !links.is_empty() {
-        sr.speak_with_links(&character, &links, false)?;
-    }
-    if character.trim().is_empty() {
+    let blank = character.trim().is_empty();
+    let spoken = if !blank || !links.is_empty() {
+        &character
+    } else {
+        ""
+    };
+    sr.speak_review_readback(spoken, &links, cue)?;
+    if blank {
         sr.speak_review_cue(SoundCue::Blank)?;
     }
     Ok(CommandResult::Handled)
@@ -644,15 +667,12 @@ mod tests {
             [
                 "table mode on",
                 "data baz",
-                "left",
-                "data",
+                "left data",
                 "baz",
-                "right",
-                "baz",
+                "right baz",
                 "data",
                 "data",
-                "left",
-                "d",
+                "left d",
                 "a",
                 "a",
                 "blank",

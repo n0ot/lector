@@ -164,7 +164,7 @@ pub trait Driver {
         cues: SpeechCues,
     ) -> DriverResult<()> {
         anyhow::ensure!(cues.valid_for(text), "invalid speech cue offsets");
-        let rendered = cues.render(text, false);
+        let rendered = cues.render(text, false, false);
         if rendered.text.is_empty() {
             return Ok(());
         }
@@ -517,6 +517,22 @@ impl Speech {
         link_spans: &[Range<usize>],
         interrupt: bool,
     ) -> Result<UtteranceId> {
+        self.speak_with_links_and_cue(text, link_spans, None, interrupt)
+    }
+
+    pub fn speak_with_links_and_cue(
+        &mut self,
+        text: &str,
+        link_spans: &[Range<usize>],
+        direction: Option<(SoundCue, &'static str)>,
+        interrupt: bool,
+    ) -> Result<UtteranceId> {
+        if let Some((cue, fallback)) = direction
+            && text.trim().is_empty()
+            && link_spans.is_empty()
+        {
+            return self.speak_cue(cue, fallback, interrupt);
+        }
         let id = self.allocate_utterance_id();
         if text.is_empty() && link_spans.is_empty() {
             return Ok(id);
@@ -546,7 +562,9 @@ impl Speech {
                 let expanded_end = EXPAND_END_CAPS.replace_all(&expanded_start, "$1 $2");
                 split_paragraphs_with_links(&expanded_end, &[])
             };
-            if chunks.len() > 1 && !self.driver.supports_ordered_utterances() {
+            if chunks.len() > 1
+                && (direction.is_some() || !self.driver.supports_ordered_utterances())
+            {
                 let (mut joined, mut links) = chunks.remove(0);
                 for (chunk, chunk_links) in chunks.drain(..) {
                     joined.push(' ');
@@ -571,7 +589,7 @@ impl Speech {
                 } else {
                     UtteranceBoundary::Paragraph(self.paragraph_pause)
                 };
-                let cues = self.link_cues(links);
+                let cues = self.inline_cues(links, direction);
                 if let Err(error) = self.driver.speak_utterance_with_cues(
                     &chunk_id,
                     &chunk,
@@ -618,7 +636,7 @@ impl Speech {
         .expect("reader speech requests an offset map");
         let (processed, source_offsets) = expand_case_with_offsets(processed, source_offsets);
         let links = map_spoken_links(text, link_spans, &processed, &source_offsets);
-        let cues = self.link_cues(links);
+        let cues = self.inline_cues(links, None);
         let result = if processed.is_empty() && cues == SpeechCues::None {
             Ok(())
         } else {
@@ -641,11 +659,16 @@ impl Speech {
         })
     }
 
-    fn link_cues(&self, links: Vec<SpeechLink>) -> SpeechCues {
-        if links.is_empty() {
+    fn inline_cues(
+        &self,
+        links: Vec<SpeechLink>,
+        direction: Option<(SoundCue, &'static str)>,
+    ) -> SpeechCues {
+        if links.is_empty() && direction.is_none() {
             SpeechCues::None
         } else {
-            SpeechCues::Links {
+            SpeechCues::Inline {
+                direction,
                 links,
                 tones: self.tones,
             }

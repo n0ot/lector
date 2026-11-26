@@ -12,7 +12,7 @@ use crate::protocol::{
     SpeechCapabilities,
 };
 
-pub const SPEECH_PROTOCOL_VERSION: &str = "2.0 through 2.3";
+pub const SPEECH_PROTOCOL_VERSION: &str = "2.0 through 2.4";
 pub const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -545,7 +545,7 @@ mod tests {
             },
             ..crate::protocol::SpeechCapabilities::default()
         };
-        for (maximum_minor, selected_minor) in [(0, 0), (1, 1), (2, 2), (9, 3)] {
+        for (maximum_minor, selected_minor) in [(0, 0), (1, 1), (2, 2), (3, 3), (9, 4)] {
             let request = parse_request(&format!(
                 r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocol":{{"major":2,"minimumMinor":0,"maximumMinor":{maximum_minor}}},"client":{{"name":"client","version":"1"}}}}}}"#
             ))
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn discovery_document_covers_version_two_methods_events_and_transport() {
         let document = openrpc_document("test-host", "1");
-        assert_eq!(document["info"]["version"], "2.3.0");
+        assert_eq!(document["info"]["version"], "2.4.0");
         let methods = document["methods"].as_array().unwrap();
         for required in [
             "initialize",

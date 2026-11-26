@@ -148,6 +148,7 @@ pub struct ProcDriver {
     rate: f32,
     timeouts: RpcTimeouts,
     legacy_protocol: bool,
+    supports_directional_overlay: bool,
     backend: Option<BackendInfo>,
     capabilities: SpeechCapabilities,
     event_inbox: EventInbox,
@@ -381,6 +382,7 @@ impl ProcDriver {
             rate: NORMAL_RATE,
             timeouts,
             legacy_protocol: false,
+            supports_directional_overlay: false,
             backend: None,
             capabilities: SpeechCapabilities::default(),
             event_inbox: EventInbox::default(),
@@ -483,6 +485,8 @@ impl ProcDriver {
         if !initialized.capabilities.controls.stop.is_supported() {
             return Err(Error::MissingCapability("controls.stop"));
         }
+        self.supports_directional_overlay =
+            initialized.protocol.minor >= super::protocol::DIRECTIONAL_OVERLAY_PROTOCOL_MINOR;
         self.backend = initialized.backend;
         self.capabilities = initialized
             .capabilities
@@ -768,6 +772,10 @@ impl ProcDriver {
 impl Host for ProcDriver {
     fn capabilities(&self) -> &SpeechCapabilities {
         &self.capabilities
+    }
+
+    fn supports_directional_overlay(&self) -> bool {
+        self.supports_directional_overlay
     }
 
     fn backend_info(&self) -> Option<&BackendInfo> {

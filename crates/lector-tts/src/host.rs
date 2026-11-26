@@ -8,11 +8,13 @@
 mod cue_playback;
 
 #[cfg(target_vendor = "apple")]
+use crate::protocol::SoundCue;
+#[cfg(target_vendor = "apple")]
 use crate::speech_fallback::{
-    InsertedLink, MAX_LINK_ANNOUNCEMENT_BYTES, append_link_announcement, canonical_offset,
+    InsertedLink, MAX_LINK_ANNOUNCEMENT_BYTES, append_cue_announcement, canonical_offset,
 };
 #[cfg(target_vendor = "apple")]
-use cue_playback::CuePlayback;
+use cue_playback::{CuePlayback, PreparedCues, ReadbackCache, ReadbackKey};
 
 use crate::{
     Backends, Error as TtsError, Features, Gender, Tts, UtteranceId as NativeUtteranceId, Voice,
@@ -143,7 +145,12 @@ impl SpokenFallback {
             let mut previous = 0;
             for cue in cues {
                 spoken_text.push_str(&text[previous..cue.offset]);
-                announcements.push(append_link_announcement(&mut spoken_text, text, cue.offset));
+                announcements.push(append_cue_announcement(
+                    &mut spoken_text,
+                    text,
+                    cue.offset,
+                    cue.cue,
+                ));
                 previous = cue.offset;
             }
             spoken_text.push_str(&text[previous..]);
@@ -167,10 +174,30 @@ impl SpokenFallback {
     }
 }
 
+#[cfg(target_vendor = "apple")]
+struct LiveDirection {
+    native_id: NativeUtteranceId,
+    cue: SoundCue,
+    played: bool,
+    clock_logged: bool,
+    saw_range: bool,
+    cache_key: Option<ReadbackKey>,
+}
+
 struct State {
     tts: Tts,
     #[cfg(target_vendor = "apple")]
     cue_playback: Option<CuePlayback>,
+    #[cfg(target_vendor = "apple")]
+    prepared_cues: PreparedCues,
+    #[cfg(target_vendor = "apple")]
+    readback_cache: ReadbackCache,
+    #[cfg(target_vendor = "apple")]
+    live_direction: Option<LiveDirection>,
+    #[cfg(target_vendor = "apple")]
+    directional_word_ranges: bool,
+    #[cfg(target_vendor = "apple")]
+    cue_event_log: Option<SpeechEventLog>,
     backend: Backends,
     backend_info: BackendInfo,
     rate: Option<RateState>,
@@ -337,7 +364,16 @@ pub fn run_with_options(options: &Options) -> Result<()> {
     run_server_with_tick(
         |request| handle_request(request, &mut state.borrow_mut()),
         || {
-            let mut state = state.borrow_mut();
+            let mut borrowed = state.borrow_mut();
+            let state = &mut *borrowed;
+            #[cfg(target_vendor = "apple")]
+            if state.readback_cache.advance(&state.prepared_cues)
+                && let Some(log) = &state.cue_event_log
+            {
+                write_speech_event(log, "directional-cue-cache-ready");
+            }
+            #[cfg(target_vendor = "apple")]
+            state.prepared_cues.idle();
             state.advance();
             state.notifications.drain(..).collect()
         },
@@ -402,6 +438,14 @@ impl State {
         if supports_sound_cues(backend) {
             capabilities.sound_cues = true;
         }
+        #[cfg(target_vendor = "apple")]
+        let prepared_cues = if capabilities.sound_cues {
+            PreparedCues::new(tts.get_volume()?)
+        } else {
+            PreparedCues::default()
+        };
+        #[cfg(target_vendor = "apple")]
+        let cue_event_log = test_event_log.clone();
         let (native_event_tx, native_events) = mpsc::channel();
         install_native_callbacks(
             &tts,
@@ -417,6 +461,16 @@ impl State {
             tts,
             #[cfg(target_vendor = "apple")]
             cue_playback: None,
+            #[cfg(target_vendor = "apple")]
+            prepared_cues,
+            #[cfg(target_vendor = "apple")]
+            readback_cache: ReadbackCache::default(),
+            #[cfg(target_vendor = "apple")]
+            live_direction: None,
+            #[cfg(target_vendor = "apple")]
+            directional_word_ranges: true,
+            #[cfg(target_vendor = "apple")]
+            cue_event_log,
             backend,
             backend_info: BackendInfo {
                 id: backend.id().to_owned(),
@@ -451,7 +505,9 @@ impl State {
         }
         if !id.is_valid()
             || text.len() > MAX_UTTERANCE_TEXT_BYTES
-            || !SoundCueAt::valid_for(&text, &cues)
+            || !self
+                .protocol
+                .is_some_and(|version| SoundCueAt::valid_for_protocol(&text, &cues, version))
         {
             return Err(RpcError::invalid_params(
                 "utteranceId, text, or sound cues are invalid",
@@ -462,6 +518,8 @@ impl State {
                 "sound cues are unavailable for this session",
             ));
         }
+        #[cfg(target_vendor = "apple")]
+        self.stop_live_direction();
         let mut active = ActiveUtterance {
             logical_id: id,
             native_id: None,
@@ -500,6 +558,7 @@ impl State {
         #[cfg(target_vendor = "apple")]
         {
             if let Some(fallback) = &mut active.fallback {
+                self.readback_cache.retain_request(None);
                 let result = classify_backend_attempt(
                     self.tts.speak(&fallback.text[fallback.word..], false),
                 )?;
@@ -509,12 +568,62 @@ impl State {
                 return Ok(result);
             }
             let cues = active.cues_from(base);
+            if let [cue] = cues.as_slice()
+                && !text.is_empty()
+                && cue.cue != SoundCue::Link
+            {
+                // Use labels when there is no evidence that this text and
+                // voice will provide a word onset for live playback.
+                if !self.directional_word_ranges || !text.chars().any(char::is_alphanumeric) {
+                    self.readback_cache.retain_request(None);
+                    return self.start_spoken_fallback(active, base, &cues);
+                }
+                let cache_key =
+                    ReadbackKey::new(&self.tts, text, cue.cue, self.selected_voice.as_deref());
+                self.readback_cache.retain_request(cache_key.as_ref());
+                let volume = self
+                    .tts
+                    .get_volume()
+                    .map_err(|error| RpcError::internal_error(error.to_string()))?;
+                if let Some(key) = &cache_key
+                    && let Some(playback) =
+                        self.readback_cache.play(key, volume, &self.prepared_cues)
+                {
+                    if let Some(log) = &self.cue_event_log {
+                        write_speech_event(log, "directional-cue-cache-hit");
+                        write_speech_event(log, "directional-cue-begin");
+                    }
+                    let id = playback.id();
+                    self.cue_playback = Some(playback);
+                    active.native_base = base;
+                    return Ok(BackendAttempt::Completed(Some(id)));
+                }
+                if let Err(error) = self.prepared_cues.prepare(cue.cue, volume) {
+                    eprintln!("lector-tts: {error}; speaking cue label");
+                    return self.start_spoken_fallback(active, base, &cues);
+                }
+                let result = classify_backend_attempt(self.tts.speak(text, false))?;
+                if let BackendAttempt::Completed(Some(native_id)) = result {
+                    self.live_direction = Some(LiveDirection {
+                        native_id,
+                        cue: cue.cue,
+                        played: false,
+                        clock_logged: false,
+                        saw_range: false,
+                        cache_key,
+                    });
+                    active.native_base = base;
+                }
+                return Ok(result);
+            }
+            self.readback_cache.retain_request(None);
             if !cues.is_empty() {
                 match CuePlayback::new(
                     &self.tts,
                     text,
                     cues.clone(),
                     self.selected_voice.as_deref(),
+                    &self.prepared_cues,
                 ) {
                     Ok(playback) => {
                         let id = playback.id();
@@ -556,6 +665,8 @@ impl State {
     fn stop(&mut self, id: &UtteranceId) -> Result<(), RpcError> {
         self.advance_for_control();
         let Some(active) = self.active.take() else {
+            #[cfg(target_vendor = "apple")]
+            self.stop_live_direction();
             return Ok(());
         };
         if active.logical_id != *id {
@@ -643,6 +754,8 @@ impl State {
     /// the next utterance, so lack of terminal evidence causes a conservative
     /// synthesizer replacement.
     fn stop_native(&mut self, stopping: Option<NativeUtteranceId>) -> Result<(), RpcError> {
+        #[cfg(target_vendor = "apple")]
+        self.stop_live_direction();
         #[cfg(target_vendor = "apple")]
         if self
             .cue_playback
@@ -761,7 +874,16 @@ impl State {
     fn advance(&mut self) {
         #[cfg(target_vendor = "apple")]
         self.advance_cue_playback(true);
-        self.drain_native_events();
+        self.drain_native_events(true);
+        #[cfg(target_vendor = "apple")]
+        if let (Some(log), Some(direction)) = (&self.cue_event_log, &mut self.live_direction)
+            && direction.played
+            && !direction.clock_logged
+            && self.prepared_cues.clock_is_advancing(direction.cue)
+        {
+            direction.clock_logged = true;
+            write_speech_event(log, "directional-cue-playing");
+        }
     }
 
     fn advance_for_control(&mut self) {
@@ -769,12 +891,82 @@ impl State {
         // rendering must not start a player even if rendering just finished.
         #[cfg(target_vendor = "apple")]
         self.advance_cue_playback(false);
-        self.drain_native_events();
+        self.drain_native_events(false);
     }
 
-    fn drain_native_events(&mut self) {
+    fn drain_native_events(&mut self, allow_cue: bool) {
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = allow_cue;
+        #[cfg(target_vendor = "apple")]
+        if allow_cue
+            && let Some(direction) = &self.live_direction
+            && !direction.played
+        {
+            self.drain_directional_events(direction.native_id);
+            return;
+        }
         while let Ok(event) = self.native_events.try_recv() {
             self.handle_native_event(event);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn drain_directional_events(&mut self, id: NativeUtteranceId) {
+        let events: Vec<_> = self.native_events.try_iter().collect();
+        // A short utterance can report a word and completion between ticks.
+        // Never start a directional sound once speech has ended.
+        let ended = events.iter().any(|event| {
+            matches!(
+                event, NativeEvent::Completed(native_id) | NativeEvent::Cancelled(native_id)
+                if *native_id == id
+            )
+        });
+        for event in events {
+            if let NativeEvent::Range { id: native_id, .. } = event
+                && native_id == id
+            {
+                if let Some(direction) = &mut self.live_direction {
+                    direction.saw_range = true;
+                }
+                if !ended {
+                    self.play_live_direction(id);
+                }
+            }
+            self.handle_native_event(event);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn stop_live_direction(&mut self) {
+        if let Some(direction) = self.live_direction.take()
+            && direction.played
+        {
+            self.prepared_cues.stop(direction.cue);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn play_live_direction(&mut self, id: NativeUtteranceId) {
+        if let Some(direction) = &mut self.live_direction
+            && direction.native_id == id
+            && !direction.played
+            && self.tts.is_speaking().unwrap_or(false)
+        {
+            direction.played = true;
+            match self.prepared_cues.play(direction.cue) {
+                Ok(()) => {
+                    if let Some(key) = direction.cache_key.take() {
+                        self.readback_cache.request(key);
+                    }
+                    if let Some(log) = &self.cue_event_log {
+                        write_speech_event(log, "directional-cue-begin");
+                    }
+                }
+                Err(error) => eprintln!("lector-tts: {error}"),
+            }
+            if let Some(active) = &mut self.active {
+                active.cues.retain(|cue| cue.cue == SoundCue::Link);
+            }
         }
     }
 
@@ -783,6 +975,11 @@ impl State {
         let Some(mut playback) = self.cue_playback.take() else {
             return;
         };
+        if let Some(log) = &self.cue_event_log
+            && playback.observe_cached_clock()
+        {
+            write_speech_event(log, "directional-cue-playing");
+        }
         match playback.advance(allow_start, |event| self.handle_native_event(event)) {
             Ok(false) => self.cue_playback = Some(playback),
             Ok(true) => {}
@@ -999,6 +1196,10 @@ impl State {
         let voice = select_voice(&self.tts, voice_id)
             .map_err(|error| RpcError::invalid_params(error.to_string()))?;
         self.selected_voice = Some(voice.id.clone());
+        #[cfg(target_vendor = "apple")]
+        {
+            self.directional_word_ranges = true;
+        }
         Ok(CurrentVoiceResult { voice: Some(voice) })
     }
 
@@ -1042,9 +1243,14 @@ impl State {
                 if position <= active.text.len() && active.text.is_char_boundary(position) {
                     active.current_word = position;
                     // Mixed playback has reached this word, so its cues have fired.
-                    active
-                        .cues
-                        .retain(|cue| cue.offset >= position.saturating_add(length));
+                    let direction_pending = self
+                        .live_direction
+                        .as_ref()
+                        .is_some_and(|direction| !direction.played);
+                    active.cues.retain(|cue| {
+                        (direction_pending && cue.cue != SoundCue::Link)
+                            || cue.offset >= position.saturating_add(length)
+                    });
                     self.emit_active(
                         "progress",
                         Some(TextPosition::Utf8ByteOffset { offset: position }),
@@ -1054,6 +1260,15 @@ impl State {
                 }
             }
             NativeEvent::Completed(_) => {
+                #[cfg(target_vendor = "apple")]
+                if let Some(direction) = &self.live_direction
+                    && !direction.played
+                {
+                    // A voice that completed an ordinary word-bearing
+                    // utterance without a range cannot support this route.
+                    self.directional_word_ranges = direction.saw_range;
+                    self.live_direction = None;
+                }
                 let active = self.active.take().expect("active checked");
                 self.emit_for(&active, "ended", None, Some("completed"), None);
             }
@@ -1061,6 +1276,8 @@ impl State {
                 if active.paused {
                     return;
                 }
+                #[cfg(target_vendor = "apple")]
+                self.stop_live_direction();
                 let active = self.active.take().expect("active checked");
                 self.emit_for(&active, "ended", None, Some("cancelled"), None);
             }

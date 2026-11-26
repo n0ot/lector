@@ -4,7 +4,7 @@ This is the protocol between Lector and a speech server, called a *host*
 here. Implement it to make Lector speak through any speech engine, on any
 machine.
 
-- **Version:** 2.3. Hosts stay backward compatible with 2.0 through 2.2.
+- **Version:** 2.4. Hosts stay backward compatible with 2.0 through 2.3.
 - **Schema:** [`crates/lector-tts/openrpc.json`](../../crates/lector-tts/openrpc.json)
   defines the JSON shape of every method and message.
 - **This document** defines transport, capabilities, and behavior. If the two
@@ -107,13 +107,13 @@ are ignored. They are not failures.
 `initialize`, called exactly once:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":2,"maximumMinor":3},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":2,"maximumMinor":4},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
 ```
 
 The host picks a minor version in the offered range and describes itself:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":3},"server":{"name":"lector-tts","version":"0.1.0"},"backend":{"id":"av-foundation","name":"AVFoundation"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite","pitch":"readWrite","volume":"readWrite"},"voices":{"list":true,"current":true,"select":true}}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":4},"server":{"name":"lector-tts","version":"0.1.0"},"backend":{"id":"av-foundation","name":"AVFoundation"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite","pitch":"readWrite","volume":"readWrite"},"voices":{"list":true,"current":true,"select":true}}}}
 ```
 
 Rules:
@@ -236,8 +236,9 @@ lifecycle. A link cue plays alongside the speech at the audible onset of the
 marked text. It MUST NOT defer, pause, restart, or split the spoken text.
 Stopping or interrupting speech MUST stop its active cues and discard any
 of its unplayed cues. A host only offers this capability when it can meet all
-of these requirements. Earlier versions and other capability values use spoken
-fallbacks.
+of these requirements. Starting in 2.4, the same capability also guarantees
+that a directional cue can overlay the start of readback. Earlier versions
+and other capability values use spoken fallbacks for the cues they cannot play.
 
 ## 6. Data types
 
@@ -287,8 +288,10 @@ after initialization.
 - Clients MAY include a nonempty `cues` array only in 2.3 or later when the
   host advertises `soundCues: true`. Each entry contains a `cue` name
   and a UTF-8 byte `offset` in `text`.
-- For nonempty text, only `link` cues are valid. Their offsets MUST be strictly
-  increasing UTF-8 character boundaries before the end of the text.
+- For nonempty text, `link` cue offsets MUST be strictly increasing UTF-8
+  character boundaries before the end of the text. In 2.4 or later a
+  `top`, `bottom`, `left`, or `right` cue MAY also appear once as the first
+  cue at offset zero. A link cue may share this offset.
 - For empty text, supply exactly one of `top`, `bottom`, `left`, `right`, or
   `blank` at offset zero.
 - The host MUST NOT queue utterances itself. Lector sends the next one only
