@@ -22,6 +22,10 @@ const MAX_READER_EVENTS: usize = 256;
 pub trait Host {
     fn capabilities(&self) -> &SpeechCapabilities;
 
+    fn supports_sound_cues(&self) -> bool {
+        self.capabilities().sound_cues && !self.has_legacy_queue()
+    }
+
     fn supports_directional_overlay(&self) -> bool {
         false
     }
@@ -155,10 +159,6 @@ pub struct SpeechManager {
     reader_events: VecDeque<ReaderSpeechEvent>,
 }
 
-fn supports_sound_cues(host: &dyn Host) -> bool {
-    host.capabilities().sound_cues && !host.has_legacy_queue()
-}
-
 impl SpeechManager {
     /// Drain the bounded foreground observation stream. Only events which
     /// matched the active utterance and passed sequence validation enter it.
@@ -212,7 +212,7 @@ impl SpeechManager {
         anyhow::ensure!(cues.valid_for(&text), "invalid speech cue offsets");
         if standalone
             && text.is_empty()
-            && (!supports_sound_cues(host)
+            && (!host.supports_sound_cues()
                 || matches!(cues, SpeechCues::StandaloneDirectionAndBlank(_))
                     && !host.supports_standalone_pair())
         {
@@ -548,7 +548,7 @@ impl SpeechManager {
     ) -> Result<()> {
         let rendered = utterance.cues.render(
             &utterance.text,
-            supports_sound_cues(host),
+            host.supports_sound_cues(),
             host.supports_directional_overlay(),
             host.supports_standalone_pair(),
         );

@@ -55,6 +55,7 @@ pub enum CapabilityStatus {
 /// drivers publish this from their worker; Lua never performs host I/O.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OptionState {
+    pub sound_cues: bool,
     pub rate: Option<f32>,
     pub rate_status: CapabilityStatus,
     pub pitch: Option<f32>,
@@ -472,7 +473,7 @@ impl Speech {
     }
 
     pub fn tones(&self) -> bool {
-        self.tones
+        self.tones && self.driver.option_state().sound_cues
     }
 
     pub fn set_tones(&mut self, enabled: bool) {

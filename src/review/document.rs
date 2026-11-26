@@ -408,8 +408,9 @@ impl ReviewDocument {
         use crate::application_accessibility::ApplicationAccessibilitySpeech;
         if previous.is_none_or(|previous| previous.row != current.row) {
             let (line, mut links) = self.read_range(current.row, 0, self.line_end(current.row));
+            let blank = line.trim().is_empty();
             return ApplicationAccessibilitySpeech {
-                text: if line.trim().is_empty() {
+                text: if blank {
                     crate::terminal::trim_linked_text(&line, &mut links);
                     "blank".into()
                 } else {
@@ -417,7 +418,7 @@ impl ReviewDocument {
                 },
                 indentation: Some(self.line_first_nonblank(current.row)),
                 links,
-                cue: None,
+                cue: blank.then_some(crate::speech::protocol::SoundCue::Blank),
             };
         }
         let previous = previous.unwrap();
@@ -1467,7 +1468,10 @@ mod tests {
         assert_eq!(line.indentation, Some(2));
         let blank_line = document.cursor_feedback(Some(pos(1, 2)), pos(2, 0));
         assert_eq!(blank_line.text, "blank");
-        assert_eq!(blank_line.cue, None);
+        assert_eq!(
+            blank_line.cue,
+            Some(crate::speech::protocol::SoundCue::Blank)
+        );
         let blank_character = document.cursor_feedback(Some(pos(2, 1)), pos(2, 0));
         assert_eq!(blank_character.text, "blank");
         assert_eq!(

@@ -875,6 +875,17 @@ impl ScreenReader {
         result.map(|_| ()).map_err(Into::into)
     }
 
+    pub(crate) fn speak_linked_review_cue(
+        &mut self,
+        cue: speech::protocol::SoundCue,
+        links: &[Range<usize>],
+    ) -> Result<()> {
+        if !links.is_empty() {
+            self.speak_with_links("", links, false)?;
+        }
+        self.speak_review_cue(cue)
+    }
+
     pub(crate) fn speak_review_character(
         &mut self,
         character: &str,

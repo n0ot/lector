@@ -58,16 +58,14 @@ fn line_read_with_cue(
         sr.speak_review_readback(&format!("indent {level}"), &[], cue.take())?;
     }
     let (line, mut links) = view.line_with_links(row);
-    let text = if !line.trim().is_empty() || (at_boundary && !links.is_empty()) {
-        line.as_str()
-    } else if at_boundary {
-        ""
-    } else {
-        // Whitespace links still mark the destination, even on an empty row.
+    let blank = line.trim().is_empty();
+    if !at_boundary && blank {
         crate::terminal::trim_linked_text(&line, &mut links);
-        "blank"
-    };
-    sr.speak_review_readback(text, &links, cue)?;
+        sr.speak_linked_review_cue(SoundCue::Blank, &links)?;
+    } else {
+        let readable = !blank || !links.is_empty();
+        sr.speak_review_readback(if readable { &line } else { "" }, &links, cue)?;
+    }
     Ok(CommandResult::Handled)
 }
 
@@ -369,7 +367,7 @@ mod tests {
         assert_eq!(
             cues.borrow().as_slice(),
             [
-                ("blank".into(), SpeechCues::None),
+                ("blank".into(), SpeechCues::Standalone(SoundCue::Blank)),
                 ("top".into(), SpeechCues::Standalone(SoundCue::Top)),
                 ("bottom".into(), SpeechCues::Standalone(SoundCue::Bottom)),
                 (
@@ -420,7 +418,7 @@ mod tests {
         line_next(&mut sr, &mut view, false).unwrap();
         assert_eq!(
             submissions.borrow().as_slice(),
-            [("blank".into(), SpeechCues::None)]
+            [("blank".into(), SpeechCues::Standalone(SoundCue::Blank))]
         );
         submissions.borrow_mut().clear();
 
@@ -518,7 +516,7 @@ mod tests {
         view.process_changes(b"\r\n   \x1b]8;;https://example.invalid\x1b\\ \x1b]8;;\x1b\\");
         view.set_review_cursor_position((0, 0));
         line_next(&mut sr, &mut view, false).unwrap();
-        assert_eq!(output.borrow().as_slice(), ["link blank"]);
+        assert_eq!(output.borrow().as_slice(), ["link", "blank"]);
     }
 
     #[test]

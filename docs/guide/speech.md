@@ -7,14 +7,14 @@ server.
 ## Sound cues
 
 Lector plays short cues at review cursor boundaries and when inspecting a
-blank character. Moving the review cursor onto a blank line says “blank.”
-With spoken feedback, character navigation also says “blank” on an empty cell.
+blank character or blank line. With spoken feedback, Lector says “blank” in both cases.
 Direction cues play over the spoken readback when the command
 also reads text. At a left or right boundary on a blank character, a compatible
 host plays the boundary and blank cues together. Lector identifies an OSC 8
 hyperlink at the start of its text or when you start reading within it.
 Set `lector.o.tones = false` to use
-spoken labels for boundaries, blank characters, and links.
+spoken labels for boundaries, blanks, and links. Reading `lector.o.tones` returns
+true only when tones are enabled and the active speech host supports them.
 
 The bundled speech host plays cues through AVFoundation on macOS 13 or later.
 On Windows, use NVDA 2024.1 or later with a version 2 or newer NVDA Controller

@@ -614,6 +614,7 @@ impl Supervisor {
         let pitch_supported = capabilities.settings.pitch.can_write();
         let volume_supported = capabilities.settings.volume.can_write();
         let mut state = OptionState {
+            sound_cues: process.host.supports_sound_cues(),
             rate: (legacy || self.desired_rate_configured).then_some(self.desired_rate),
             rate_status: if rate_supported {
                 CapabilityStatus::Supported
@@ -1883,6 +1884,34 @@ mod tests {
                 Call::Speak("replacement".to_owned(), false),
             ]
         );
+    }
+
+    #[test]
+    fn tone_availability_follows_the_active_host() {
+        let harness = Harness::new();
+        let host = fake_state();
+        {
+            let mut state = host.lock().unwrap();
+            state.legacy = false;
+            state.capabilities.sound_cues = true;
+        }
+        harness.push_driver(host.clone());
+        harness.push_driver(fake_state());
+        harness.push_driver(host);
+        let mut speech = crate::speech::Speech::new(Box::new(harness.supervisor));
+        speech.set_tones(true);
+        assert!(!speech.tones());
+        speech.start().unwrap();
+        assert!(speech.tones());
+        speech
+            .configure_server(SpeechServerSpec::Process {
+                program: "fixture".into(),
+                args: vec![],
+            })
+            .unwrap();
+        assert!(!speech.tones());
+        speech.configure_server(SpeechServerSpec::Native).unwrap();
+        assert!(speech.tones());
     }
 
     #[test]

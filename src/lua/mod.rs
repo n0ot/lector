@@ -721,6 +721,7 @@ mod tests {
         let current = voice("voice-a", "Voice A");
         let driver = SpeechOptionsDriver {
             state: OptionState {
+                sound_cues: true,
                 rate: Some(65.0),
                 rate_status: CapabilityStatus::Supported,
                 pitch: Some(0.75),
@@ -745,6 +746,11 @@ mod tests {
         super::enter(&lua, &mut screen_reader, || {
             lua.load(
                 r#"
+                assert(lector.o.tones == true)
+                lector.o.tones = false
+                assert(lector.o.tones == false)
+                lector.o.tones = true
+                assert(lector.o.tones == true)
                 assert(lector.o.speech.rate == 65)
                 assert(lector.o.speech.pitch == 0.75)
                 assert(lector.o.speech.volume == 0.5)
@@ -1007,7 +1013,8 @@ mod tests {
             r#"
                 assert(lector.o.suppress_key_echo == false)
                 assert(lector.o.report_indentation == true)
-                assert(lector.o.tones == true)
+                lector.o.tones = true
+                assert(lector.o.tones == false)
                 lector.o.tones = false
                 assert(lector.o.tones == false)
                 assert(not pcall(function() lector.o.tones = 'off' end))
