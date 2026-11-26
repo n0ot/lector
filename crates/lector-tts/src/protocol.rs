@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MIN_MINOR: u16 = 0;
-pub const PROTOCOL_MAX_MINOR: u16 = 5;
+pub const PROTOCOL_MAX_MINOR: u16 = 6;
+pub const LINK_EXIT_PROTOCOL_MINOR: u16 = 6;
 pub const STANDALONE_CUE_PAIR_PROTOCOL_MINOR: u16 = 5;
 pub const DIRECTIONAL_OVERLAY_PROTOCOL_MINOR: u16 = 4;
 pub const SOUND_CUES_PROTOCOL_MINOR: u16 = 3;
@@ -321,6 +322,7 @@ pub enum SoundCue {
     Right,
     Blank,
     Link,
+    LinkExit,
 }
 
 impl SoundCue {
@@ -332,6 +334,7 @@ impl SoundCue {
             Self::Left => include_bytes!("../assets/left.wav"),
             Self::Right => include_bytes!("../assets/right.wav"),
             Self::Blank => include_bytes!("../assets/blank.wav"),
+            Self::LinkExit => include_bytes!("../assets/link-exit.wav"),
             Self::Link => include_bytes!("../assets/link.wav"),
         }
     }
@@ -351,6 +354,7 @@ impl SoundCue {
             Self::Right => "right",
             Self::Blank => "blank",
             Self::Link => "link",
+            Self::LinkExit => "out of link",
         }
     }
 }
@@ -375,12 +379,17 @@ impl SoundCueAt {
         {
             return false;
         }
+        if version.minor < LINK_EXIT_PROTOCOL_MINOR
+            && cues.iter().any(|cue| cue.cue == SoundCue::LinkExit)
+        {
+            return false;
+        }
         if text.is_empty() {
             return match cues {
                 [cue] => cue.offset == 0 && cue.cue != SoundCue::Link,
                 [direction, blank] => {
                     version.minor >= STANDALONE_CUE_PAIR_PROTOCOL_MINOR
-                        && direction.cue.is_direction()
+                        && (direction.cue.is_direction() || direction.cue == SoundCue::LinkExit)
                         && blank.cue == SoundCue::Blank
                         && direction.offset == 0
                         && blank.offset == 0
@@ -390,7 +399,8 @@ impl SoundCueAt {
         }
         let cues = match cues {
             [first, rest @ ..]
-                if first.cue.is_direction()
+                if (first.cue.is_direction()
+                    || (first.cue == SoundCue::LinkExit && rest.is_empty()))
                     && first.offset == 0
                     && version.minor >= DIRECTIONAL_OVERLAY_PROTOCOL_MINOR =>
             {
@@ -633,6 +643,27 @@ impl SpeechEventPayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn link_exit_requires_two_six_and_a_character_onset() {
+        let exit = SoundCueAt {
+            cue: SoundCue::LinkExit,
+            offset: 0,
+        };
+        let blank = SoundCueAt {
+            cue: SoundCue::Blank,
+            offset: 0,
+        };
+        let previous = ProtocolVersion { major: 2, minor: 5 };
+        for (text, cues) in [("next", vec![exit]), ("", vec![exit, blank])] {
+            assert!(SoundCueAt::valid_for(text, &cues));
+            assert!(!SoundCueAt::valid_for_protocol(text, &cues, previous));
+        }
+        assert!(!SoundCueAt::valid_for(
+            "next",
+            &[SoundCueAt { offset: 1, ..exit }]
+        ));
+    }
 
     #[test]
     fn simultaneous_direction_and_blank_require_protocol_two_five() {

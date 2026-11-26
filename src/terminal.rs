@@ -1075,6 +1075,24 @@ impl TerminalSnapshot {
         self.contents_excluding_link(start_row, start_col, end_row, end_col, 0..0)
     }
 
+    fn review_link(&self, (row, col): (u16, u16)) -> Option<&str> {
+        let cell = self.cell(row, col)?;
+        let lead = if cell.is_wide_continuation() {
+            self.cell(row, col.checked_sub(1)?)?
+        } else {
+            cell
+        };
+        lead.hyperlink.as_deref()
+    }
+
+    pub(crate) fn left_review_link(
+        &self,
+        previous: Option<(u16, u16)>,
+        current: (u16, u16),
+    ) -> bool {
+        previous.and_then(|p| self.review_link(p)).is_some() && self.review_link(current).is_none()
+    }
+
     pub(crate) fn review_contents_with_links(
         &self,
         previous: Option<(u16, u16)>,
@@ -1090,16 +1108,7 @@ impl TerminalSnapshot {
             position(current),
             read.clone(),
             self.size().1,
-            |row, col| {
-                let row = row as u16;
-                let cell = self.cell(row, col)?;
-                let lead = if cell.is_wide_continuation() {
-                    self.cell(row, col.checked_sub(1)?)?
-                } else {
-                    cell
-                };
-                lead.hyperlink.as_deref()
-            },
+            |row, col| self.review_link((row as u16, col)),
             |row| self.row_wrapped(row as u16),
         );
         self.contents_excluding_link(current.0, read.start, current.0, read.end, continued)

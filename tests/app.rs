@@ -1778,6 +1778,45 @@ fn review_overlay_reads_horizontal_destinations() {
 }
 
 #[test]
+fn review_speaks_link_exit_only_for_character_navigation() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(
+        &mut sr,
+        b"x\x1b]8;;https://example.invalid\x1b\\ab\x1b]8;;\x1b\\y\r\nrow\x1b[H",
+        &mut term_out,
+    )
+    .unwrap();
+    app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+        .unwrap();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"lllhhhllj", &mut pty_out, &mut term_out)
+        .unwrap();
+    let spoken: Vec<_> = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(s, _)| s.clone())
+        .collect();
+    assert_eq!(
+        spoken,
+        [
+            "link a",
+            "b",
+            "out of link y",
+            "link b",
+            "a",
+            "out of link x",
+            "link a",
+            "b",
+            "row"
+        ]
+    );
+}
+
+#[test]
 fn kitty_meta_r_opens_review_without_toggling_or_leaking() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();

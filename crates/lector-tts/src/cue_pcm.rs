@@ -8,11 +8,12 @@ use crate::{Error, protocol::SoundCue};
 
 pub(crate) const SAMPLE_RATE: u32 = 44_100;
 
-const DIRECTIONS: [SoundCue; 4] = [
+const ONSET_CUES: [SoundCue; 5] = [
     SoundCue::Top,
     SoundCue::Bottom,
     SoundCue::Left,
     SoundCue::Right,
+    SoundCue::LinkExit,
 ];
 
 fn decode(cue: SoundCue) -> Result<Arc<[i16]>, Error> {
@@ -73,13 +74,14 @@ impl Clips {
             SoundCue::Right,
             SoundCue::Blank,
             SoundCue::Link,
+            SoundCue::LinkExit,
         ]
         .into_iter()
         .map(|cue| Ok((cue, decode(cue)?)))
         .collect::<Result<Vec<_>, Error>>()?;
         let pairs = |other| {
             let other = Self::find(&single, other)?;
-            DIRECTIONS
+            ONSET_CUES
                 .into_iter()
                 .map(|direction| Ok((direction, mix(&Self::find(&single, direction)?, &other))))
                 .collect::<Result<Vec<_>, Error>>()
@@ -104,7 +106,9 @@ impl Clips {
     pub(crate) fn select(&self, cues: &[SoundCue]) -> Result<Arc<[i16]>, Error> {
         match cues {
             [cue] => Self::find(&self.single, *cue),
-            [direction, SoundCue::Blank] if direction.is_direction() => {
+            [direction, SoundCue::Blank]
+                if direction.is_direction() || *direction == SoundCue::LinkExit =>
+            {
                 Self::find(&self.direction_and_blank, *direction)
             }
             [direction, SoundCue::Link] if direction.is_direction() => {
@@ -140,7 +144,7 @@ mod tests {
     fn approved_assets_prepare_without_audio_device() {
         let clips = Clips::new().unwrap();
         let blank = clips.select(&[SoundCue::Blank]).unwrap();
-        for direction in DIRECTIONS {
+        for direction in ONSET_CUES {
             let bumper = clips.select(&[direction]).unwrap();
             let pair = clips.select(&[direction, SoundCue::Blank]).unwrap();
             assert_eq!(pair.len(), bumper.len().max(blank.len()));

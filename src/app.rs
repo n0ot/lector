@@ -132,7 +132,9 @@ fn consume_application_accessibility(
             }
             // `speak` applies the outer-terminal focus policy. Unfocused
             // messages are consumed here and are never replayed later.
-            if let Some(cue) = message.cue {
+            if message.cue == Some(crate::speech::protocol::SoundCue::LinkExit) {
+                sr.speak_review_character(&message.text, &message.links, message.cue)?;
+            } else if let Some(cue) = message.cue {
                 sr.speak_linked_review_cue(cue, !message.links.is_empty())?;
             } else {
                 sr.speak_with_links(&message.text, &message.links, false)?;

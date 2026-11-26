@@ -14,7 +14,9 @@ use std::{
 };
 
 use block2::RcBlock;
-use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+#[cfg(test)]
+use hound::SampleFormat;
+use hound::{WavReader, WavSpec};
 use objc2::{AllocAnyThread, MainThreadMarker, rc::Retained, sel};
 use objc2_avf_audio::{
     AVAudioBuffer, AVAudioPlayer, AVSpeechBoundary, AVSpeechSynthesisMarker,
@@ -50,12 +52,14 @@ const MAX_CACHED_TEXT_BYTES: usize = 256;
 // two channels, bounding retained PCM to ~15 MiB across four entries.
 const MAX_CACHED_SAMPLES: usize = 480_000;
 const MAX_CACHED_SECONDS: usize = 10;
-const STANDALONE_CUES: [SoundCue; 5] = [
+const STANDALONE_CUES: [SoundCue; 7] = [
     SoundCue::Top,
     SoundCue::Bottom,
     SoundCue::Left,
     SoundCue::Right,
     SoundCue::Blank,
+    SoundCue::Link,
+    SoundCue::LinkExit,
 ];
 
 fn playback_id() -> NativeUtteranceId {
@@ -112,7 +116,7 @@ impl PreparedCues {
             blank_pairs.extend(
                 clips
                     .iter()
-                    .filter(|(cue, _)| cue.is_direction())
+                    .filter(|(cue, _)| cue.is_direction() || *cue == SoundCue::LinkExit)
                     .filter_map(|(cue, clip)| clip.mix_at_start(blank).ok().map(|mix| (*cue, mix))),
             );
         }
@@ -370,9 +374,10 @@ fn peak(samples: &[f32]) -> f32 {
         .fold(0.0, |peak, sample| peak.max(sample.abs()))
 }
 
+#[cfg(test)]
 fn write_pcm16(spec: WavSpec, samples: &[f32]) -> Result<Vec<u8>, Error> {
     let mut wav = Cursor::new(Vec::new());
-    let mut writer = WavWriter::new(
+    let mut writer = hound::WavWriter::new(
         &mut wav,
         WavSpec {
             bits_per_sample: 16,
@@ -655,10 +660,14 @@ struct RenderedPlayback {
 }
 
 impl RenderedPlayback {
-    fn play(&self, volume: f32) -> Result<Playing, Error> {
-        let wav = write_pcm16(self.spec, &self.samples)?;
-        let audio = new_player(&wav, volume)?;
-        Playing::start(audio, self.words.clone(), self.spec.sample_rate)
+    fn play(self, volume: f32, prepared: &PreparedCues) -> Result<Playing, Error> {
+        let mut clip = Clip::from_pcm(self.spec.sample_rate, self.spec.channels, &self.samples)?;
+        let node = prepared.with_engine(|engine| engine.play_readback(&mut clip, volume))?;
+        Ok(Playing::new(
+            AudioOutput::Engine(node),
+            self.words,
+            self.spec.sample_rate,
+        ))
     }
 }
 
@@ -894,13 +903,14 @@ impl CuePlayback {
     pub(super) fn advance(
         &mut self,
         allow_start: bool,
+        prepared: &PreparedCues,
         emit: impl FnMut(NativeEvent),
     ) -> Result<bool, Error> {
         let id = self.id();
         match &mut self.playback {
             Playback::Rendering(rendering) => {
                 if allow_start && let Some(ready) = rendering.advance()? {
-                    self.playback = Playback::Playing(ready.play(rendering.volume)?);
+                    self.playback = Playback::Playing(ready.play(rendering.volume, prepared)?);
                 }
                 Ok(false)
             }

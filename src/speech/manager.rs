@@ -26,6 +26,10 @@ pub trait Host {
         self.capabilities().sound_cues && !self.has_legacy_queue()
     }
 
+    fn supports_link_exit(&self) -> bool {
+        false
+    }
+
     fn supports_directional_overlay(&self) -> bool {
         false
     }
@@ -548,7 +552,8 @@ impl SpeechManager {
     ) -> Result<()> {
         let rendered = utterance.cues.render(
             &utterance.text,
-            host.supports_sound_cues(),
+            host.supports_sound_cues()
+                && (!utterance.cues.uses_link_exit() || host.supports_link_exit()),
             host.supports_directional_overlay(),
             host.supports_standalone_pair(),
         );

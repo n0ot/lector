@@ -138,6 +138,11 @@ fn character_read_with_cue(
     let (character, links) =
         view.screen()
             .review_contents_with_links(previous, (row, col), col..col + 1);
+    let cue = cue.or_else(|| {
+        view.screen()
+            .left_review_link(previous, (row, col))
+            .then_some(SoundCue::LinkExit)
+    });
     sr.speak_review_character(&character, &links, cue)?;
     Ok(CommandResult::Handled)
 }
@@ -536,7 +541,15 @@ mod tests {
         character_previous(&mut sr, &mut view).unwrap();
         assert_eq!(
             output.borrow().as_slice(),
-            ["link a", "b", "blank", "cd!", "d", " bang ", "link d"]
+            [
+                "link a",
+                "b",
+                "blank",
+                "cd!",
+                "d",
+                "out of link bang ",
+                "link d"
+            ]
         );
     }
 

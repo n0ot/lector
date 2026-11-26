@@ -368,7 +368,7 @@ impl ReviewView {
                     target.col = self.document.line_first_nonblank(target.row);
                 }
                 self.record_jump_to(target);
-                self.move_with_table_context(sr, target)
+                self.move_with_table_context(sr, target, false)
             }
             Command::TravelJump { forward, count } => {
                 let target = self.navigation.borrow_mut().travel_jump(
@@ -388,7 +388,7 @@ impl ReviewView {
                     )?;
                     return Ok(ViewAction::Bell);
                 };
-                self.move_with_table_context(sr, target)
+                self.move_with_table_context(sr, target, false)
             }
             Command::StartVisual(kind) => {
                 self.visual_anchor.get_or_insert(self.cursor);
@@ -412,7 +412,11 @@ impl ReviewView {
                 ) {
                     self.record_jump_to(target);
                 }
-                self.move_with_table_context(sr, target)
+                self.move_with_table_context(
+                    sr,
+                    target,
+                    matches!(motion, Motion::Left | Motion::Right),
+                )
             }
             Command::ScrollPage { forward, count } => {
                 let old = self.current_table_cell();
@@ -770,20 +774,38 @@ impl ReviewView {
         &mut self,
         sr: &mut ScreenReader,
         target: HistoryPosition,
+        character_motion: bool,
     ) -> Result<ViewAction> {
         let old = self.current_table_cell();
         let previous = self.cursor;
         let action = self.move_to(target);
         self.announce_table_transition(sr, old)?;
-        self.queue_cursor_feedback(Some(previous));
+        self.queue_navigation_feedback(Some(previous), character_motion);
         Ok(action)
     }
 
     fn queue_cursor_feedback(&mut self, previous: Option<HistoryPosition>) {
+        self.queue_navigation_feedback(previous, false);
+    }
+
+    fn queue_navigation_feedback(
+        &mut self,
+        previous: Option<HistoryPosition>,
+        character_motion: bool,
+    ) {
         if self.kind != ViewKind::Review || previous == Some(self.cursor) {
             return;
         }
-        let speech = self.document.cursor_feedback(previous, self.cursor);
+        let mut speech = self.document.cursor_feedback(previous, self.cursor);
+        if character_motion
+            && speech.indentation.is_none()
+            && previous.is_some_and(|p| self.document.left_review_link(p, self.cursor))
+        {
+            if speech.cue == Some(crate::speech::protocol::SoundCue::Blank) {
+                speech.text.clear();
+            }
+            speech.cue = Some(crate::speech::protocol::SoundCue::LinkExit);
+        }
         self.view.queue_internal_speech(speech);
     }
 

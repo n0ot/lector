@@ -410,6 +410,24 @@ impl ReviewDocument {
             .map_or("", |cell| cell.text.as_str())
     }
 
+    fn review_link(&self, position: HistoryPosition) -> Option<&str> {
+        let cell = self.cell(position.row, position.col)?;
+        let lead = if cell.wide_continuation {
+            self.cell(position.row, position.col.checked_sub(1)?)?
+        } else {
+            cell
+        };
+        lead.hyperlink.as_deref()
+    }
+
+    pub(crate) fn left_review_link(
+        &self,
+        previous: HistoryPosition,
+        current: HistoryPosition,
+    ) -> bool {
+        self.review_link(previous).is_some() && self.review_link(current).is_none()
+    }
+
     fn continued_link(
         &self,
         previous: Option<HistoryPosition>,
@@ -421,15 +439,7 @@ impl ReviewDocument {
             current,
             read,
             self.capture_cols,
-            |row, col| {
-                let cell = self.cell(row, col)?;
-                let lead = if cell.wide_continuation {
-                    self.cell(row, col.checked_sub(1)?)?
-                } else {
-                    cell
-                };
-                lead.hyperlink.as_deref()
-            },
+            |row, col| self.review_link(HistoryPosition { row, col }),
             |row| self.is_wrapped_row(row),
         )
     }

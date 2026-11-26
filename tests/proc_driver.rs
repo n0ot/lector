@@ -500,7 +500,7 @@ mod native_speech {
             1,
             "initialize",
             serde_json::json!({
-                "protocol": {"major": 2, "minimumMinor": 5, "maximumMinor": 5},
+                "protocol": {"major": 2, "minimumMinor": 6, "maximumMinor": 6},
                 "client": {"name": "lector-test", "version": "1"},
                 "clientCapabilities": {"speechEvents": true, "progressModes": ["utf8ByteOffset"]}
             }),
@@ -543,6 +543,12 @@ mod native_speech {
             .unwrap();
         assert_eq!(ended["params"]["event"]["reason"], "cancelled");
 
+        assert!(
+            fs::read_to_string(&event_log)
+                .unwrap()
+                .contains("link-cue-begin")
+        );
+        let log_after_link = fs::read_to_string(&event_log).unwrap();
         let accepted = host.rpc(
             4, "speech.speak",
             serde_json::json!({"utteranceId": "boundary", "text": "", "cues": [{"cue": "right", "offset": 0}]}),
@@ -560,9 +566,24 @@ mod native_speech {
         );
         assert_eq!(accepted["result"]["accepted"], true);
         host.wait_for_completion("blank-boundary");
-        // The ordinary native speech callback logs begin. If the combined
-        // request fell back to ordinary speech, this file would be nonempty.
-        assert_eq!(fs::metadata(event_log).unwrap().len(), 0);
+        // The standalone pairs must not produce another speech callback.
+        assert_eq!(fs::read_to_string(&event_log).unwrap(), log_after_link);
+        let accepted = host.rpc(
+            6,
+            "speech.speak",
+            serde_json::json!({
+                "utteranceId":"exit", "text":"Next sample.", "cues":[{"cue":"linkExit","offset":0}]
+            }),
+        );
+        assert_eq!(accepted["result"]["accepted"], true);
+        host.wait_for_completion("exit");
+        assert_eq!(
+            fs::read_to_string(&event_log)
+                .unwrap()
+                .matches("link-cue-begin")
+                .count(),
+            2
+        );
         host.finish();
     }
 

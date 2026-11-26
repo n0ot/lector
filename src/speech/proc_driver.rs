@@ -777,6 +777,10 @@ impl Host for ProcDriver {
         self.selected_minor >= super::protocol::DIRECTIONAL_OVERLAY_PROTOCOL_MINOR
     }
 
+    fn supports_link_exit(&self) -> bool {
+        self.selected_minor >= super::protocol::LINK_EXIT_PROTOCOL_MINOR
+    }
+
     fn supports_standalone_pair(&self) -> bool {
         self.selected_minor >= super::protocol::STANDALONE_CUE_PAIR_PROTOCOL_MINOR
     }

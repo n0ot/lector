@@ -32,15 +32,29 @@ pub enum SpeechCues {
 }
 
 impl SpeechCues {
+    pub(super) fn uses_link_exit(&self) -> bool {
+        matches!(
+            self,
+            Self::Standalone(SoundCue::LinkExit)
+                | Self::StandaloneDirectionAndBlank(SoundCue::LinkExit)
+                | Self::Inline {
+                    direction: Some((SoundCue::LinkExit, _)),
+                    ..
+                }
+        )
+    }
+
     pub(super) fn valid_for(&self, text: &str) -> bool {
         match self {
             Self::None => true,
             Self::Standalone(cue) => *cue != SoundCue::Link,
-            Self::StandaloneDirectionAndBlank(cue) => cue.is_direction(),
+            Self::StandaloneDirectionAndBlank(cue) => {
+                cue.is_direction() || *cue == SoundCue::LinkExit
+            }
             Self::Inline {
                 direction, links, ..
             } => {
-                direction.is_none_or(|(cue, _)| cue.is_direction())
+                direction.is_none_or(|(cue, _)| cue.is_direction() || cue == SoundCue::LinkExit)
                     && links.iter().all(|link| {
                         (!link.audible || link.offset < text.len())
                             && text.is_char_boundary(link.offset)

@@ -82,6 +82,7 @@ zbus = { version = "6.3.0", default-features = false, features = ["default-rt", 
 zbus = { version = "6.3.0", default-features = false, features = ["default-rt", "proxy", "service", "p2p"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
+unicode-segmentation = "1.13.3"
 block2 = "0.6"
 core-foundation = "0.10"
 objc2 = "0.6"
