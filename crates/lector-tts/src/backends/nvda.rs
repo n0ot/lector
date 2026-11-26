@@ -182,12 +182,15 @@ impl Backend for Nvda {
 
     #[instrument(level = "debug", skip(self), err)]
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<Option<UtteranceId>, Error> {
+        if let Some(marked) = &self.marked {
+            if interrupt {
+                marked.cancel();
+            }
+            return marked.submit(text, &[]).map(Some);
+        }
         self.ensure_running()?;
         if interrupt {
             self.stop()?;
-        }
-        if let Some(marked) = &self.marked {
-            return marked.submit(text, &[]).map(Some);
         }
         let text = HSTRING::from(text);
         self.check_operation(unsafe { (self.controller.speak_text)(text.as_ptr()) })?;
@@ -204,9 +207,6 @@ impl Backend for Nvda {
             .as_ref()
             .filter(|marked| marked.supports_cues())
             .ok_or(Error::UnsupportedFeature)?;
-        if !text.is_empty() {
-            self.ensure_running()?;
-        }
         marked.submit(text, cues).map(Some)
     }
 

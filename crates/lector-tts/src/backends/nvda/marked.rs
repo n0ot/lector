@@ -5,21 +5,21 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
-        mpsc::{Receiver, SyncSender, sync_channel},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
     },
     thread,
     time::{Duration, Instant},
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use windows::core::HSTRING;
 
 use super::{Controller, audio::Audio};
 use crate::{
     Callbacks, Error, UtteranceId,
     nvda_schedule::{Job, Schedule},
-    nvda_ssml::{MarkProgress, make_ssml, parse_mark, spoken_text},
+    nvda_ssml::{MarkProgress, make_ssml, parse_mark},
     protocol::{SoundCue, SoundCueAt},
 };
 
@@ -40,6 +40,9 @@ const CANCEL_DEADLINE: Duration = Duration::from_secs(2);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static CALL: Mutex<()> = Mutex::new(());
+// A timed-out cancellation could still reach NVDA later. Even another TTS
+// instance in this process may not safely start a new controller request.
+static CANCEL_UNCERTAIN: AtomicBool = AtomicBool::new(false);
 static SESSION: Mutex<Option<MarkerSession>> = Mutex::new(None);
 
 #[derive(Debug)]
@@ -53,12 +56,12 @@ pub(super) struct Marked {
 #[derive(Debug)]
 struct Shared {
     playback: Mutex<Playback>,
+    cancel_finished: Condvar,
     callbacks: Arc<Mutex<Callbacks>>,
 }
 
 struct Playback {
     schedule: Schedule,
-    legacy_speech: bool,
     audio: Option<Audio>,
 }
 
@@ -97,9 +100,9 @@ impl Marked {
         let shared = Arc::new(Shared {
             playback: Mutex::new(Playback {
                 schedule: Schedule::default(),
-                legacy_speech: false,
                 audio,
             }),
+            cancel_finished: Condvar::new(),
             callbacks,
         });
         let (jobs, pending) = sync_channel(1);
@@ -108,11 +111,20 @@ impl Marked {
         thread::Builder::new()
             .name("lector-nvda-speech".to_owned())
             .spawn(move || run_worker(&rpc, &worker, &pending))?;
+        let (cancel_rpc, rpc_requests) = sync_channel::<Sender<()>>(1);
+        thread::Builder::new()
+            .name("lector-nvda-cancel-rpc".to_owned())
+            .spawn(move || {
+                while let Ok(reply) = rpc_requests.recv() {
+                    unsafe { (controller.cancel_speech)() };
+                    let _ = reply.send(());
+                }
+            })?;
         let (cancellations, cancel_requests) = sync_channel(1);
         let worker = Arc::clone(&shared);
         thread::Builder::new()
             .name("lector-nvda-cancel".to_owned())
-            .spawn(move || cancel_worker(&controller, &worker, &cancel_requests))?;
+            .spawn(move || cancel_worker(&worker, &cancel_requests, &cancel_rpc))?;
         Ok(Self {
             shared,
             jobs,
@@ -126,6 +138,11 @@ impl Marked {
     }
 
     pub(super) fn submit(&self, text: &str, cues: &[SoundCueAt]) -> Result<UtteranceId, Error> {
+        if CANCEL_UNCERTAIN.load(Ordering::Acquire) {
+            return Err(Error::BackendUnavailable(
+                "an NVDA cancellation is still unconfirmed",
+            ));
+        }
         if !SoundCueAt::valid_for(text, cues) {
             return Err(Error::OutOfRange);
         }
@@ -149,7 +166,7 @@ impl Marked {
             if let Some(audio) = &mut playback.audio {
                 audio.stop();
             }
-            if playback.schedule.cancelled_native().is_some() || playback.legacy_speech {
+            if playback.schedule.cancelled_native().is_some() {
                 let _ = self.cancellations.try_send(());
             }
             discarded
@@ -180,6 +197,10 @@ fn run_job(controller: &Controller, shared: &Arc<Shared>, job: &Job) {
     // The controller DLL exposes one callback pointer per process. Hold this
     // across the call and cleanup, even for multiple TTS instances.
     let _call = CALL.lock();
+    if CANCEL_UNCERTAIN.load(Ordering::Acquire) {
+        notify(shared, job.id, Completion::Failed);
+        return;
+    }
     if !shared.playback.lock().schedule.start(job) {
         notify(shared, job.id, Completion::Cancelled);
         return;
@@ -197,35 +218,48 @@ fn run_job(controller: &Controller, shared: &Arc<Shared>, job: &Job) {
             },
         );
     }
+    // Retain the process-wide speech gate until the cancellation call has
+    // returned or the coordinator has failed closed. The predicate, rather
+    // than an RPC lock, orders replacement against a late cancel.
+    let mut playback = shared.playback.lock();
+    while playback.schedule.cancel_in_flight() {
+        shared.cancel_finished.wait(&mut playback);
+    }
 }
 
-fn cancel_worker(controller: &Controller, shared: &Shared, requests: &Receiver<()>) {
+fn cancel_worker(shared: &Shared, requests: &Receiver<()>, rpc: &SyncSender<Sender<()>>) {
     while requests.recv().is_ok() {
         let deadline = Instant::now() + CANCEL_DEADLINE;
         loop {
-            let mut playback = shared.playback.lock();
-            if playback.legacy_speech {
-                unsafe { (controller.cancel_speech)() };
-                playback.legacy_speech = false;
-            }
-            let Some(id) = playback.schedule.cancelled_native() else {
+            let Some(id) = shared.playback.lock().schedule.reserve_cancel() else {
                 break;
             };
-            if Instant::now() >= deadline {
-                // Some old controller servers can lose a cancellation near
-                // submission. Fail closed while callbacks from the old call
-                // can still arrive, and release every accepted successor.
+            let (completion, done) = channel();
+            let completed = Instant::now() < deadline
+                && rpc.try_send(completion).is_ok()
+                && done
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .is_ok();
+
+            let mut playback = shared.playback.lock();
+            if !completed {
+                // If a cancel was dispatched but did not return, a late
+                // cancellation could still affect a later native utterance.
+                CANCEL_UNCERTAIN.store(true, Ordering::Release);
+                let active = playback.schedule.complete(id).is_some();
                 let pending = playback.schedule.poison();
+                shared.cancel_finished.notify_all();
                 drop(playback);
-                notify(shared, id, Completion::Cancelled);
+                if active {
+                    notify(shared, id, Completion::Failed);
+                }
                 for job in pending {
                     notify(shared, job.id, Completion::Failed);
                 }
                 break;
             }
-            // Keep replacement registration serialized with cancellation so
-            // a retry cannot stop the next job.
-            unsafe { (controller.cancel_speech)() };
+            playback.schedule.finish_cancel();
+            shared.cancel_finished.notify_all();
             drop(playback);
             thread::sleep(CANCEL_INTERVAL);
         }
@@ -249,15 +283,18 @@ fn perform(controller: &Controller, shared: &Arc<Shared>, job: &Job) -> Completi
             return Completion::Cancelled;
         }
         let cues: Vec<_> = job.cues.iter().map(|cue| cue.cue).collect();
-        if let Some(audio) = &mut playback.audio
-            && audio.play(&cues).is_ok()
-        {
-            drop(playback);
-            shared
-                .callbacks
-                .lock()
-                .utterance_begin(UtteranceId::Nvda(job.id));
-            return drain(shared, job.id);
+        if let Some(audio) = &mut playback.audio {
+            if audio.play(&cues).is_ok() {
+                drop(playback);
+                shared
+                    .callbacks
+                    .lock()
+                    .utterance_begin(UtteranceId::Nvda(job.id));
+                return drain(shared, job.id);
+            }
+            // Spoken fallback owns the lifecycle after a failure to submit
+            // standalone audio. Discard any failed or partial audio state.
+            audio.stop();
         }
         drop(playback);
         return speak_ssml(controller, shared, job, true);
@@ -272,12 +309,6 @@ fn speak_ssml(
     spoken: bool,
 ) -> Completion {
     let (status, delivered) = call_marked(controller, shared, job, spoken, true);
-    if status == RPC_S_UNKNOWN_IF {
-        // A different NVDA version may have started after the v2 probe.
-        // Preserve feedback via plain speech and report that synchronized
-        // completion was unavailable for this request.
-        return speak_legacy_fallback(controller, shared, job);
-    }
     if status != 0 {
         return stopped_or_failed(shared, status);
     }
@@ -371,19 +402,6 @@ fn stopped_or_failed(shared: &Shared, status: u32) -> Completion {
     }
 }
 
-fn speak_legacy_fallback(controller: &Controller, shared: &Shared, job: &Job) -> Completion {
-    let text = HSTRING::from(spoken_text(&job.text, &job.cues));
-    let mut playback = shared.playback.lock();
-    if !playback.schedule.is_current(job.id) {
-        return Completion::Cancelled;
-    }
-    if let Some(audio) = &mut playback.audio {
-        audio.stop();
-    }
-    playback.legacy_speech = unsafe { (controller.speak_text)(text.as_ptr()) } == 0;
-    Completion::Failed
-}
-
 fn drain(shared: &Shared, id: u64) -> Completion {
     let deadline = Instant::now() + DRAIN_DEADLINE;
     loop {
@@ -395,12 +413,13 @@ fn drain(shared: &Shared, id: u64) -> Completion {
             let Some(audio) = &mut playback.audio else {
                 return Completion::Ended;
             };
-            if !audio.is_playing() {
-                return Completion::Ended;
-            }
-            if Instant::now() >= deadline {
-                audio.stop();
-                return Completion::Failed;
+            match audio.is_playing() {
+                Ok(false) => return Completion::Ended,
+                Ok(true) if Instant::now() < deadline => {}
+                Ok(true) | Err(_) => {
+                    audio.stop();
+                    return Completion::Failed;
+                }
             }
         }
         thread::sleep(DRAIN_INTERVAL);

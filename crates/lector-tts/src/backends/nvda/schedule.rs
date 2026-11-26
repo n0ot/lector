@@ -42,6 +42,7 @@ pub(super) struct Schedule {
     queue: VecDeque<Job>,
     active: Option<Active>,
     unavailable: bool,
+    cancel_in_flight: bool,
 }
 
 #[derive(Debug)]
@@ -75,11 +76,14 @@ impl Schedule {
     }
 
     pub(super) fn next(&mut self) -> Option<Job> {
+        if self.cancel_in_flight {
+            return None;
+        }
         self.queue.pop_front()
     }
 
     pub(super) fn start(&mut self, job: &Job) -> bool {
-        if self.unavailable || self.generation != job.generation {
+        if self.unavailable || self.cancel_in_flight || self.generation != job.generation {
             return false;
         }
         self.active = Some(Active {
@@ -139,8 +143,26 @@ impl Schedule {
             .map(|active| active.id)
     }
 
+    pub(super) fn reserve_cancel(&mut self) -> Option<u64> {
+        if self.cancel_in_flight {
+            return None;
+        }
+        let id = self.cancelled_native()?;
+        self.cancel_in_flight = true;
+        Some(id)
+    }
+
+    pub(super) fn cancel_in_flight(&self) -> bool {
+        self.cancel_in_flight
+    }
+
+    pub(super) fn finish_cancel(&mut self) {
+        self.cancel_in_flight = false;
+    }
+
     pub(super) fn poison(&mut self) -> VecDeque<Job> {
         self.unavailable = true;
+        self.finish_cancel();
         self.active = None;
         std::mem::take(&mut self.queue)
     }
@@ -215,6 +237,41 @@ mod tests {
     }
 
     #[test]
+    fn replacement_waits_for_cancellation_reply_even_after_speech_returns() {
+        let mut schedule = Schedule::default();
+        schedule.submit(1, "speaking", &[]).unwrap();
+        let active = schedule.next().unwrap();
+        assert!(schedule.start(&active));
+        assert!(schedule.begin_native(active.id));
+        schedule.cancel();
+        assert_eq!(schedule.reserve_cancel(), Some(active.id));
+        assert!(schedule.cancel_in_flight());
+        assert_eq!(schedule.complete(active.id), Some(false));
+        schedule.submit(2, "next", &[]).unwrap();
+        assert!(schedule.next().is_none());
+        schedule.finish_cancel();
+        assert_eq!(schedule.next().unwrap().id, 2);
+    }
+
+    #[test]
+    fn cancellation_timeout_still_fails_replacement_if_old_speech_already_ended() {
+        let mut schedule = Schedule::default();
+        schedule.submit(1, "speaking", &[]).unwrap();
+        let active = schedule.next().unwrap();
+        assert!(schedule.start(&active));
+        assert!(schedule.begin_native(active.id));
+        schedule.cancel();
+        assert_eq!(schedule.reserve_cancel(), Some(active.id));
+        assert_eq!(schedule.complete(active.id), Some(false));
+        schedule.submit(2, "replacement", &[]).unwrap();
+        assert!(schedule.next().is_none());
+        assert_eq!(schedule.poison().front().unwrap().id, 2);
+        assert!(!schedule.cancel_in_flight());
+        assert_eq!(schedule.complete(active.id), None);
+        assert!(schedule.submit(3, "future", &[]).is_err());
+    }
+
+    #[test]
     fn poisoned_rpc_rejects_new_work_and_releases_queued_replacement() {
         let mut schedule = Schedule::default();
         schedule.submit(1, "blocked", &[]).unwrap();
@@ -222,7 +279,9 @@ mod tests {
         assert!(schedule.start(&blocked));
         assert!(schedule.begin_native(blocked.id));
         schedule.cancel();
+        assert_eq!(schedule.reserve_cancel(), Some(blocked.id));
         schedule.submit(2, "replacement", &[]).unwrap();
+        assert!(schedule.next().is_none());
         assert_eq!(schedule.poison().front().unwrap().id, 2);
         assert!(schedule.submit(3, "future", &[]).is_err());
         assert_eq!(schedule.complete(blocked.id), None);

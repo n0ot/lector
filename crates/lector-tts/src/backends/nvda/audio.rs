@@ -50,7 +50,7 @@ static FORMAT: WAVEFORMATEX = WAVEFORMATEX {
 };
 enum Command {
     Play(Arc<[i16]>, Sender<Result<(), Error>>),
-    Playing(Sender<bool>),
+    Playing(Sender<Result<bool, Error>>),
     Stop(Sender<()>),
 }
 
@@ -77,8 +77,8 @@ impl Audio {
         self.request(|reply| Command::Play(clip, reply))?
     }
 
-    pub(super) fn is_playing(&self) -> bool {
-        self.request(Command::Playing).unwrap_or(false)
+    pub(super) fn is_playing(&self) -> Result<bool, Error> {
+        self.request(Command::Playing)?
     }
 
     pub(super) fn stop(&mut self) {
@@ -149,10 +149,31 @@ fn run_audio(commands: Receiver<Command>, ready: &Sender<Result<(), Error>>) {
     drop(apartment);
 }
 
+#[derive(Default)]
+struct PlaybackFailure(Option<&'static str>);
+
+impl PlaybackFailure {
+    fn remember(&mut self, operation: &'static str) -> Error {
+        Error::OperationFailed(self.0.get_or_insert(operation))
+    }
+
+    fn check(&self) -> Result<(), Error> {
+        match self.0 {
+            Some(operation) => Err(Error::OperationFailed(operation)),
+            None => Ok(()),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0 = None;
+    }
+}
+
 struct Device {
     endpoints: IMMDeviceEnumerator,
     id: String,
     streams: Vec<Stream>,
+    failure: PlaybackFailure,
 }
 
 impl Device {
@@ -166,19 +187,13 @@ impl Device {
             endpoints,
             id,
             streams,
+            failure: PlaybackFailure::default(),
         })
     }
 
     fn play(&mut self, samples: &[i16]) -> Result<(), Error> {
-        // Recheck the default so headset changes do not keep sending audio
-        // to the previously selected endpoint.
-        let endpoint = unsafe { self.endpoints.GetDefaultAudioEndpoint(eRender, eConsole)? };
-        let id = endpoint_id(&endpoint)?;
-        if self.id != id {
-            self.streams.clear();
-            self.id = id;
-        }
-        self.update_playback();
+        self.update_playback()?;
+        let endpoint = self.current_endpoint()?;
         let index = match self
             .streams
             .iter()
@@ -186,39 +201,91 @@ impl Device {
         {
             Some(index) => index,
             None if self.streams.len() < MAX_OVERLAPPING_CUES => {
-                self.streams.push(Stream::new(&endpoint)?);
+                let stream = Stream::new(&endpoint).map_err(|error| self.fail_if_active(error))?;
+                self.streams.push(stream);
                 self.streams.len() - 1
             }
             None => return Err(Error::OperationFailed("overlap additional Windows cues")),
         };
         // A second nearby marker can start while the first cue decays.
         // Reuse the prepared streams and let WASAPI mix their output.
-        let result = self.streams[index].play(samples);
-        if result.is_err() {
+        if let Err(error) = self.streams[index].play(samples) {
             // Device invalidation and incomplete submission must not leave
             // queued cue audio attached to the next utterance.
             self.streams.remove(index);
+            return Err(self.fail_if_active(error));
         }
-        result
+        Ok(())
     }
 
-    fn update_playback(&mut self) {
-        self.streams
-            .retain_mut(|stream| match stream.update_playback() {
-                Ok(()) => true,
-                Err(error) => {
-                    warn!(%error, "Windows cue playback ended unexpectedly");
-                    false
-                }
-            });
-    }
-
-    fn is_playing(&mut self) -> bool {
-        self.update_playback();
+    fn has_active_stream(&self) -> bool {
         self.streams.iter().any(|stream| stream.active.is_some())
     }
 
+    fn fail(&mut self, cause: &Error) -> Error {
+        let operation = match cause {
+            Error::OperationFailed(operation) => *operation,
+            _ => "continue Windows cue playback",
+        };
+        // One missing region is a failure for the entire cue sequence. Stop
+        // its other streams and keep the failure until explicit cancellation
+        // or the start of a new utterance calls stop().
+        let failure = self.failure.remember(operation);
+        self.streams.clear();
+        warn!(%cause, "Windows cue playback ended unexpectedly");
+        failure
+    }
+
+    fn fail_if_active(&mut self, cause: Error) -> Error {
+        if self.has_active_stream() {
+            self.fail(&cause)
+        } else {
+            cause
+        }
+    }
+
+    fn current_endpoint(&mut self) -> Result<IMMDevice, Error> {
+        let result = (|| -> Result<_, Error> {
+            let endpoint = unsafe { self.endpoints.GetDefaultAudioEndpoint(eRender, eConsole)? };
+            let id = endpoint_id(&endpoint)?;
+            Ok((endpoint, id))
+        })();
+        let (endpoint, id) = result.map_err(|error| self.fail_if_active(error))?;
+        if self.id != id {
+            if self.has_active_stream() {
+                return Err(self.fail(&Error::OperationFailed(
+                    "keep the Windows cue output endpoint",
+                )));
+            }
+            self.streams.clear();
+            self.id = id;
+        }
+        Ok(endpoint)
+    }
+
+    fn update_playback(&mut self) -> Result<(), Error> {
+        self.failure.check()?;
+        for stream in &mut self.streams {
+            if let Err(error) = stream.update_playback() {
+                return Err(self.fail(&error));
+            }
+        }
+        Ok(())
+    }
+
+    fn is_playing(&mut self) -> Result<bool, Error> {
+        self.update_playback()?;
+        if self.has_active_stream() {
+            // Detect a reroute even when no further cue is appended.
+            self.current_endpoint()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn stop(&mut self) {
+        self.failure.clear();
         self.streams.retain_mut(|stream| match stream.stop() {
             Ok(()) => true,
             Err(error) => {
@@ -332,5 +399,53 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnected_worker_reports_failure_after_successful_play() {
+        let (requests, commands) = channel();
+        let mut audio = Audio {
+            clips: Clips::new().unwrap(),
+            requests,
+        };
+        let worker = thread::spawn(move || {
+            let Command::Play(_, reply) = commands.recv().unwrap() else {
+                panic!("expected a play request");
+            };
+            reply.send(Ok(())).unwrap();
+        });
+        audio.play(&[SoundCue::Top]).unwrap();
+        worker.join().unwrap();
+        assert!(matches!(
+            audio.is_playing(),
+            Err(Error::BackendUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn post_start_failure_survives_more_reports_until_stop() {
+        let mut failure = PlaybackFailure::default();
+        assert!(failure.check().is_ok());
+        assert!(matches!(
+            failure.remember("advance Windows cue playback clock"),
+            Error::OperationFailed("advance Windows cue playback clock")
+        ));
+        assert!(matches!(
+            failure.remember("switch Windows cue device during an overlap"),
+            Error::OperationFailed("advance Windows cue playback clock")
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                failure.check(),
+                Err(Error::OperationFailed("advance Windows cue playback clock"))
+            ));
+        }
+        failure.clear();
+        assert!(failure.check().is_ok());
     }
 }

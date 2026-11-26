@@ -122,8 +122,18 @@ struct ActiveUtterance {
     native_base: usize,
     current_word: usize,
     next_sequence: u64,
+    awaiting_stop: bool,
     started: bool,
     paused: bool,
+}
+
+impl ActiveUtterance {
+    fn completion_reason(&self) -> &'static str {
+        if self.awaiting_stop {
+            return "cancelled";
+        }
+        "completed"
+    }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -612,6 +622,7 @@ impl<'a> State<'a> {
             native_base: 0,
             current_word: 0,
             next_sequence: 0,
+            awaiting_stop: false,
             started: false,
             paused: false,
         };
@@ -793,6 +804,21 @@ impl<'a> State<'a> {
 
     fn stop(&mut self, id: &UtteranceId) -> Result<(), RpcError> {
         self.advance_for_control(id);
+        #[cfg(windows)]
+        if let Some(active) = &mut self.active
+            && active.logical_id == *id
+            && matches!(active.native_id, Some(NativeUtteranceId::Nvda(_)))
+        {
+            // NVDA accepts cancellation before its synchronous speech call returns.
+            // Keep the logical ID until the worker reports its terminal outcome.
+            if !active.awaiting_stop {
+                self.tts
+                    .stop()
+                    .map_err(|e| RpcError::internal_error(e.to_string()))?;
+                active.awaiting_stop = true;
+            }
+            return Ok(());
+        }
         let Some(active) = self.active.take() else {
             #[cfg(target_vendor = "apple")]
             self.stop_live_direction();
@@ -897,12 +923,6 @@ impl<'a> State<'a> {
         match classify_backend_attempt(self.tts.stop())? {
             BackendAttempt::Completed(()) => {}
             BackendAttempt::Unavailable(_) => return Ok(()),
-        }
-        // The NVDA worker owns cancellation and serializes subsequent requests.
-        // Replacing its controller would race its process-wide mark callback.
-        #[cfg(windows)]
-        if self.backend == Backends::Nvda {
-            return Ok(());
         }
         let Some(stopping) = stopping else {
             return Ok(());
@@ -1453,7 +1473,8 @@ impl<'a> State<'a> {
                         return;
                     }
                 }
-                self.emit_for(&active, "ended", None, Some("completed"), None);
+                let reason = active.completion_reason();
+                self.emit_for(&active, "ended", None, Some(reason), None);
             }
             #[cfg(windows)]
             NativeEvent::Failed(_) => {
@@ -1588,42 +1609,47 @@ fn resumable_suffix(text: &str, offset: usize) -> Option<&str> {
     (offset <= text.len() && text.is_char_boundary(offset)).then(|| &text[offset..])
 }
 
+fn native_lifecycle(callbacks: bool, controller_markers: bool) -> LifecycleCapabilities {
+    if !callbacks {
+        return LifecycleCapabilities::default();
+    }
+    let mut reasons = vec!["completed".to_owned(), "cancelled".to_owned()];
+    let started = if controller_markers {
+        reasons.push("failed".to_owned());
+        DeliveryGuarantee::BestEffort
+    } else {
+        DeliveryGuarantee::Reliable
+    };
+    LifecycleCapabilities {
+        started: EventCapability {
+            delivery: started,
+            ..Default::default()
+        },
+        terminal: TerminalCapability {
+            delivery: DeliveryGuarantee::Reliable,
+            distinguishes: reasons,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 fn native_capabilities(backend: Backends, features: Features) -> SpeechCapabilities {
     #[cfg(target_vendor = "apple")]
-    let sound_cues = backend == Backends::AvFoundation && cue_playback::supported();
+    let (sound_cues, controller_markers) = (
+        backend == Backends::AvFoundation && cue_playback::supported(),
+        false,
+    );
     #[cfg(windows)]
-    let sound_cues = features.sound_cues;
+    let (sound_cues, controller_markers) = (features.sound_cues, backend == Backends::Nvda);
     #[cfg(not(any(target_vendor = "apple", windows)))]
-    let sound_cues = {
+    let (sound_cues, controller_markers) = {
         let _ = backend;
-        false
-    };
-    let lifecycle = if features.utterance_callbacks {
-        DeliveryGuarantee::Reliable
-    } else {
-        DeliveryGuarantee::Unsupported
+        (false, false)
     };
     SpeechCapabilities {
         sound_cues,
-        lifecycle: LifecycleCapabilities {
-            started: EventCapability {
-                delivery: lifecycle,
-                ..Default::default()
-            },
-            terminal: TerminalCapability {
-                delivery: lifecycle,
-                distinguishes: if features.utterance_callbacks {
-                    let reasons = ["completed", "cancelled"].into_iter();
-                    #[cfg(windows)]
-                    let reasons = reasons.chain((backend == Backends::Nvda).then_some("failed"));
-                    reasons.map(str::to_owned).collect()
-                } else {
-                    Vec::new()
-                },
-                ..Default::default()
-            },
-            ..Default::default()
-        },
+        lifecycle: native_lifecycle(features.utterance_callbacks, controller_markers),
         progress: ProgressCapabilities {
             modes: if cfg!(target_vendor = "apple") && features.utterance_callbacks {
                 vec![ProgressMode {
@@ -2015,6 +2041,27 @@ mod tests {
         assert!((endpoint_normal.to_native(100.0) - 2.0).abs() < f32::EPSILON);
         assert!(RateScale::new(0.0, 1.0, f32::INFINITY).is_none());
         assert!(RateScale::new(2.0, 1.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn controller_starts_need_a_marker_but_terminal_events_do_not() {
+        let lifecycle = super::native_lifecycle(true, true);
+        assert_eq!(
+            lifecycle.started.delivery,
+            super::DeliveryGuarantee::BestEffort
+        );
+        assert!(lifecycle.terminal.delivery.is_reliable());
+        assert!(
+            lifecycle
+                .terminal
+                .distinguishes
+                .iter()
+                .any(|reason| reason == "failed")
+        );
+        assert_eq!(
+            super::native_lifecycle(false, true),
+            super::LifecycleCapabilities::default()
+        );
     }
 
     #[test]
