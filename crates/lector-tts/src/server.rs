@@ -7,12 +7,15 @@ use std::{
     time::Duration,
 };
 
+mod wake;
+pub(crate) use wake::{Waiter, Wake};
+
 use crate::protocol::{
     BackendInfo, ClientCapabilities, MAX_JSON_SAFE_INTEGER, ProtocolRange, ProtocolVersion,
     SpeechCapabilities,
 };
 
-pub const SPEECH_PROTOCOL_VERSION: &str = "2.0 through 2.2";
+pub const SPEECH_PROTOCOL_VERSION: &str = "2.0 through 2.6";
 pub const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -211,7 +214,11 @@ pub fn run_server<F>(mut handler: F) -> Result<()>
 where
     F: FnMut(Request) -> std::result::Result<Value, RpcError>,
 {
-    run_server_with_tick(&mut handler, Vec::new)
+    run_server_with_wake(
+        &Waiter::new().map_err(io_error("create speech host wake"))?,
+        &mut handler,
+        || (Vec::new(), None),
+    )
 }
 
 /// Serve protocol requests and emit notifications returned by `tick`.
@@ -225,7 +232,20 @@ where
     F: FnMut(Request) -> std::result::Result<Value, RpcError>,
     T: FnMut() -> Vec<ServerNotification>,
 {
-    run_server_threaded(&mut handler, &mut tick)
+    // Compatibility for embedders whose tick callback provides no schedule.
+    run_server_with_wake(
+        &Waiter::new().map_err(io_error("create speech host wake"))?,
+        &mut handler,
+        || (tick(), Some(Duration::from_millis(10))),
+    )
+}
+
+pub(crate) fn run_server_with_wake<F, T>(waiter: &Waiter, mut handler: F, mut tick: T) -> Result<()>
+where
+    F: FnMut(Request) -> std::result::Result<Value, RpcError>,
+    T: FnMut() -> (Vec<ServerNotification>, Option<Duration>),
+{
+    run_server_threaded(waiter, &mut handler, &mut tick)
 }
 
 #[derive(Clone, Debug)]
@@ -253,12 +273,13 @@ enum Input {
 /// Keep blocking stdin away from the host event loop. This gives callback-
 /// driven backends a chance to emit notifications while the client is idle
 /// and works the same way on Unix and Windows.
-fn run_server_threaded<F, T>(handler: &mut F, tick: &mut T) -> Result<()>
+fn run_server_threaded<F, T>(waiter: &Waiter, handler: &mut F, tick: &mut T) -> Result<()>
 where
     F: FnMut(Request) -> std::result::Result<Value, RpcError>,
-    T: FnMut() -> Vec<ServerNotification>,
+    T: FnMut() -> (Vec<ServerNotification>, Option<Duration>),
 {
-    let (input_tx, input_rx) = mpsc::channel();
+    let (input_tx, input_rx) = mpsc::sync_channel(8);
+    let wake = waiter.wake();
     thread::Builder::new()
         .name("lector-tts-stdin".to_owned())
         .spawn(move || {
@@ -266,22 +287,20 @@ where
             let mut stdin = stdin.lock();
             loop {
                 let mut chunk = vec![0u8; 4096];
-                match stdin.read(&mut chunk) {
-                    Ok(0) => {
-                        let _ = input_tx.send(Input::Eof);
-                        break;
-                    }
+                let input = match stdin.read(&mut chunk) {
+                    Ok(0) => Input::Eof,
                     Ok(read) => {
                         chunk.truncate(read);
-                        if input_tx.send(Input::Bytes(chunk)).is_err() {
-                            break;
-                        }
+                        Input::Bytes(chunk)
                     }
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(error) => {
-                        let _ = input_tx.send(Input::Error(error));
-                        break;
-                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) => Input::Error(error),
+                };
+                let terminal = !matches!(input, Input::Bytes(_));
+                let sent = input_tx.send(input).is_ok();
+                wake.notify();
+                if terminal || !sent {
+                    break;
                 }
             }
         })
@@ -290,32 +309,33 @@ where
     let mut stdout = io::stdout().lock();
     let mut frames = FrameBuffer::new();
     loop {
-        match input_rx.recv_timeout(Duration::from_millis(10)) {
-            Ok(Input::Bytes(chunk)) => frames.push(&chunk, |frame| {
-                handle_frame(frame, handler, &mut stdout)?;
-                tick_platform_runloop();
-                write_notifications(&mut stdout, tick())?;
-                Ok(())
-            })?,
-            Ok(Input::Eof) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            Ok(Input::Error(error)) => return Err(io_error("read stdin")(error)),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        // Bound the number of input chunks before giving the native run loop
+        // a turn. A client that keeps stdin readable cannot starve callbacks.
+        const INPUT_CHUNKS_PER_TURN: usize = 4;
+        let mut exhausted_input_budget = true;
+        for _ in 0..INPUT_CHUNKS_PER_TURN {
+            match input_rx.try_recv() {
+                Ok(Input::Bytes(chunk)) => frames.push(&chunk, |frame| {
+                    handle_frame(frame, handler, &mut stdout)?;
+                    write_notifications(&mut stdout, tick().0)
+                })?,
+                Ok(Input::Eof) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                Ok(Input::Error(error)) => return Err(io_error("read stdin")(error)),
+                Err(mpsc::TryRecvError::Empty) => {
+                    exhausted_input_budget = false;
+                    break;
+                }
+            }
         }
-        tick_platform_runloop();
-        write_notifications(&mut stdout, tick())?;
+        let (notifications, timeout) = tick();
+        write_notifications(&mut stdout, notifications)?;
+        waiter.wait(if exhausted_input_budget {
+            Some(Duration::ZERO)
+        } else {
+            timeout
+        });
     }
 }
-
-#[cfg(target_vendor = "apple")]
-fn tick_platform_runloop() {
-    use core_foundation::runloop;
-    unsafe {
-        let _ = runloop::CFRunLoopRunInMode(runloop::kCFRunLoopDefaultMode, 0.0, 1);
-    }
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn tick_platform_runloop() {}
 
 #[derive(Clone, Copy)]
 enum Frame<'a> {
@@ -536,6 +556,7 @@ mod tests {
     #[test]
     fn initialize_selects_the_highest_mutual_protocol_minor() {
         let capabilities = crate::protocol::SpeechCapabilities {
+            sound_cues: true,
             settings: crate::protocol::SettingCapabilities {
                 rate: crate::protocol::SettingSupport::ReadWrite,
                 pitch: crate::protocol::SettingSupport::ReadWrite,
@@ -544,7 +565,9 @@ mod tests {
             },
             ..crate::protocol::SpeechCapabilities::default()
         };
-        for (maximum_minor, selected_minor) in [(0, 0), (1, 1), (9, 2)] {
+        for (maximum_minor, selected_minor) in
+            [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (9, 6)]
+        {
             let request = parse_request(&format!(
                 r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocol":{{"major":2,"minimumMinor":0,"maximumMinor":{maximum_minor}}},"client":{{"name":"client","version":"1"}}}}}}"#
             ))
@@ -553,6 +576,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(result["protocol"]["minor"], selected_minor);
+            assert_eq!(result["capabilities"]["soundCues"], selected_minor >= 3);
             assert_eq!(
                 result["capabilities"]["settings"]["rate"],
                 if selected_minor == 0 {
@@ -575,7 +599,7 @@ mod tests {
     #[test]
     fn discovery_document_covers_version_two_methods_events_and_transport() {
         let document = openrpc_document("test-host", "1");
-        assert_eq!(document["info"]["version"], "2.2.0");
+        assert_eq!(document["info"]["version"], "2.6.0");
         let methods = document["methods"].as_array().unwrap();
         for required in [
             "initialize",

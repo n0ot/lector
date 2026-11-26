@@ -368,7 +368,7 @@ impl ReviewView {
                     target.col = self.document.line_first_nonblank(target.row);
                 }
                 self.record_jump_to(target);
-                self.move_with_table_context(sr, target)
+                self.move_with_table_context(sr, target, None)
             }
             Command::TravelJump { forward, count } => {
                 let target = self.navigation.borrow_mut().travel_jump(
@@ -388,7 +388,7 @@ impl ReviewView {
                     )?;
                     return Ok(ViewAction::Bell);
                 };
-                self.move_with_table_context(sr, target)
+                self.move_with_table_context(sr, target, None)
             }
             Command::StartVisual(kind) => {
                 self.visual_anchor.get_or_insert(self.cursor);
@@ -412,7 +412,7 @@ impl ReviewView {
                 ) {
                     self.record_jump_to(target);
                 }
-                self.move_with_table_context(sr, target)
+                self.move_with_table_context(sr, target, Some(motion))
             }
             Command::ScrollPage { forward, count } => {
                 let old = self.current_table_cell();
@@ -678,10 +678,10 @@ impl ReviewView {
             sr.speak("outside table", false)?;
             return Ok(ViewAction::None);
         };
-        let label = table.label(address).to_owned();
         if table.toggle_row_header(address.column) {
+            let (label, links) = table.label_with_links(address);
             sr.speak("row headers from", false)?;
-            sr.speak(&label, false)?;
+            sr.speak_with_links(label, links, false)?;
         } else {
             sr.speak("row headers off", false)?;
         }
@@ -700,17 +700,18 @@ impl ReviewView {
         };
         let (target, include_row) = if let Some(current) = table.cell_at(self.cursor) {
             let Some(target) = table.move_cell(current, movement, count) else {
-                let (edge, row) = table.boundary_announcement(movement, current);
-                sr.speak(edge, false)?;
-                if let Some(row) = row {
-                    sr.speak(&format!("row {row}"), false)?;
-                }
+                let (cue, edge) = table.edge_announcement(movement);
+                let readback = table
+                    .row_number(current)
+                    .map_or_else(String::new, |row| format!("row {row}"));
+                sr.speak_review_boundary_readback(&readback, &[], cue, edge)?;
                 return Ok(ViewAction::None);
             };
             (target, current.row != target.row)
         } else {
             let Some(entry) = table.reentry_cell(self.cursor, movement) else {
-                sr.speak(table.edge_announcement(movement), false)?;
+                let (cue, edge) = table.edge_announcement(movement);
+                sr.speak_review_boundary_readback("", &[], cue, edge)?;
                 return Ok(ViewAction::None);
             };
             let target = count
@@ -736,9 +737,10 @@ impl ReviewView {
         if include_row {
             Self::speak_row_identity(sr, table, address)?;
         }
-        sr.speak(table.label(address), false)?;
-        let text = table.text(address).trim();
-        sr.speak(if text.is_empty() { "blank" } else { text }, false)?;
+        let (label, links) = table.label_with_links(address);
+        sr.speak_with_links(label, links, false)?;
+        let (text, links) = table.text_with_links(address);
+        sr.speak_with_links(if text.is_empty() { "blank" } else { text }, links, false)?;
         Ok(())
     }
 
@@ -757,10 +759,9 @@ impl ReviewView {
         if table
             .row_header_column()
             .is_some_and(|column| column != address.column)
-            && let Some(text) = table.row_header_text(address)
+            && let Some((text, links)) = table.row_header_with_links(address)
         {
-            let text = text.trim();
-            sr.speak(if text.is_empty() { "blank" } else { text }, false)?;
+            sr.speak_with_links(if text.is_empty() { "blank" } else { text }, links, false)?;
         }
         Ok(())
     }
@@ -769,20 +770,46 @@ impl ReviewView {
         &mut self,
         sr: &mut ScreenReader,
         target: HistoryPosition,
+        motion: Option<Motion>,
     ) -> Result<ViewAction> {
         let old = self.current_table_cell();
         let previous = self.cursor;
         let action = self.move_to(target);
         self.announce_table_transition(sr, old)?;
-        self.queue_cursor_feedback(Some(previous));
+        self.queue_navigation_feedback(Some(previous), motion);
         Ok(action)
     }
 
     fn queue_cursor_feedback(&mut self, previous: Option<HistoryPosition>) {
+        self.queue_navigation_feedback(previous, None);
+    }
+
+    fn queue_navigation_feedback(
+        &mut self,
+        previous: Option<HistoryPosition>,
+        motion: Option<Motion>,
+    ) {
         if self.kind != ViewKind::Review || previous == Some(self.cursor) {
             return;
         }
-        let speech = self.document.cursor_feedback(previous, self.cursor);
+        let exit_motion = motion
+            .filter(|motion| matches!(motion, Motion::Left | Motion::Right | Motion::Word(..)));
+        let speech = if let (Some(motion), Some(previous)) = (exit_motion, previous)
+            && self.document.left_review_link(previous, self.cursor)
+        {
+            let (text, links) = match motion {
+                Motion::Word(_, style) => self.document.link_exit_word_readback(self.cursor, style),
+                _ => (self.document.cell_text(self.cursor).into(), Vec::new()),
+            };
+            crate::application_accessibility::ApplicationAccessibilitySpeech {
+                text,
+                links,
+                cue: Some(crate::speech::protocol::SoundCue::LinkExit),
+                ..Default::default()
+            }
+        } else {
+            self.document.cursor_feedback(previous, self.cursor)
+        };
         self.view.queue_internal_speech(speech);
     }
 
@@ -793,7 +820,7 @@ impl ReviewView {
         self.view.queue_internal_speech(
             crate::application_accessibility::ApplicationAccessibilitySpeech {
                 text: text.into(),
-                indentation: None,
+                ..Default::default()
             },
         );
     }
@@ -881,7 +908,8 @@ impl ReviewView {
             (None, Some(address)) => {
                 sr.speak("table", false)?;
                 Self::speak_row_identity(sr, table, address)?;
-                sr.speak(table.label(address), false)?;
+                let (label, links) = table.label_with_links(address);
+                sr.speak_with_links(label, links, false)?;
             }
             (Some(_), None) => {
                 sr.speak(
@@ -898,7 +926,8 @@ impl ReviewView {
                     Self::speak_row_identity(sr, table, address)?;
                 }
                 if previous.column != address.column {
-                    sr.speak(table.label(address), false)?;
+                    let (label, links) = table.label_with_links(address);
+                    sr.speak_with_links(label, links, false)?;
                 }
             }
             _ => {}
@@ -2230,7 +2259,7 @@ mod tests {
 
         spoken.borrow_mut().clear();
         assert!(matches!(input(&mut view, &mut sr, b"}|"), ViewAction::None));
-        assert_eq!(spoken.borrow().as_slice(), ["bottom of table", "row 2"]);
+        assert_eq!(spoken.borrow().as_slice(), ["bottom of table row 2"]);
 
         spoken.borrow_mut().clear();
         assert!(matches!(

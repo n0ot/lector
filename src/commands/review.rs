@@ -3,6 +3,7 @@ use crate::{
     attributes,
     ext::{CellExt, ScreenExt},
     screen_reader::ScreenReader,
+    speech::protocol::SoundCue,
     view::View,
 };
 
@@ -24,11 +25,9 @@ pub(super) fn line_previous(
     skip_blank_lines: bool,
 ) -> Result<CommandResult> {
     let old_position = view.review_cursor_position();
-    if !view.review_cursor_up(skip_blank_lines) {
-        sr.speak("top", false)?;
-    }
+    let cue = (!view.review_cursor_up(skip_blank_lines)).then_some(SoundCue::Top);
     report_move(sr, view, old_position)?;
-    line_read(sr, view)?;
+    line_read_with_cue(sr, view, cue, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
@@ -38,84 +37,132 @@ pub(super) fn line_next(
     skip_blank_lines: bool,
 ) -> Result<CommandResult> {
     let old_position = view.review_cursor_position();
-    if !view.review_cursor_down(skip_blank_lines) {
-        sr.speak("bottom", false)?;
-    }
+    let cue = (!view.review_cursor_down(skip_blank_lines)).then_some(SoundCue::Bottom);
     report_move(sr, view, old_position)?;
-    line_read(sr, view)?;
+    line_read_with_cue(sr, view, cue, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn line_read(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
-    let row = view.review_cursor_position().0;
-    sr.report_review_cursor_indentation_changes(view)?;
-    let line = view.line(row);
-    if !line.trim().is_empty() {
-        sr.speak(&line, false)?;
+    line_read_with_cue(sr, view, None, None)
+}
+
+fn line_read_with_cue(
+    sr: &mut ScreenReader,
+    view: &mut View,
+    mut cue: Option<SoundCue>,
+    previous: Option<(u16, u16)>,
+) -> Result<CommandResult> {
+    let current = view.review_cursor_position();
+    let (line, links) =
+        view.screen()
+            .review_contents_with_links(previous, current, 0..view.size().1);
+    let blank = line.trim().is_empty();
+    if let Some(level) = sr.review_cursor_indentation_change(view) {
+        let indent_cue = if blank { None } else { cue.take() };
+        sr.speak_review_readback(&format!("indent {level}"), &[], indent_cue)?;
+    }
+    if blank {
+        sr.speak_review_blank(!links.is_empty(), cue)?;
+    } else {
+        sr.speak_review_readback(&line, &links, cue)?;
     }
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn word_previous(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     let old_position = view.review_cursor_position();
-    if !view.review_cursor_prev_word() {
-        sr.speak("left", false)?;
-    }
+    let cue = (!view.review_cursor_prev_word()).then_some(SoundCue::Left);
     report_move(sr, view, old_position)?;
-    word_read(sr, view)?;
+    word_read_with_cue(sr, view, cue, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn word_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     let old_position = view.review_cursor_position();
-    if !view.review_cursor_next_word() {
-        sr.speak("right", false)?;
-    }
+    let cue = (!view.review_cursor_next_word()).then_some(SoundCue::Right);
     report_move(sr, view, old_position)?;
-    word_read(sr, view)?;
+    word_read_with_cue(sr, view, cue, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn word_read(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> {
+    word_read_with_cue(sr, view, None, None)
+}
+
+fn word_read_with_cue(
+    sr: &mut ScreenReader,
+    view: &View,
+    cue: Option<SoundCue>,
+    previous: Option<(u16, u16)>,
+) -> Result<CommandResult> {
     let (row, col) = view.review_cursor_position();
-    sr.speak(&view.word(row, col), false)?;
+    let screen = view.screen();
+    let range = screen.find_word_start(row, col)..screen.find_word_end(row, col) + 1;
+    let (word, links) = screen.review_contents_with_links(previous, (row, col), range);
+    let cue = cue.or_else(|| {
+        screen
+            .left_review_link(previous, (row, col))
+            .then_some(SoundCue::LinkExit)
+    });
+    if cue.is_some() && word.trim().is_empty() {
+        sr.speak_review_blank(!links.is_empty(), cue)?;
+    } else {
+        sr.speak_review_readback(&word, &links, cue)?;
+    }
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn character_previous(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     let old_position = view.review_cursor_position();
-    if !view.review_cursor_left() {
-        sr.speak("left", false)?;
-    }
+    let cue = (!view.review_cursor_left()).then_some(SoundCue::Left);
     report_move(sr, view, old_position)?;
-    character_read(sr, view)?;
+    character_read_with_cue(sr, view, cue, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn character_next(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
     let old_position = view.review_cursor_position();
-    if !view.review_cursor_right() {
-        sr.speak("right", false)?;
-    }
+    let cue = (!view.review_cursor_right()).then_some(SoundCue::Right);
     report_move(sr, view, old_position)?;
-    character_read(sr, view)?;
+    character_read_with_cue(sr, view, cue, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn character_read(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> {
+    character_read_with_cue(sr, view, None, None)
+}
+
+fn character_read_with_cue(
+    sr: &mut ScreenReader,
+    view: &View,
+    cue: Option<SoundCue>,
+    previous: Option<(u16, u16)>,
+) -> Result<CommandResult> {
     let (row, col) = view.review_cursor_position();
-    let character = view.character(row, col);
-    if !character.trim().is_empty() {
-        sr.speak(&character, false)?;
-    }
+    let (character, links) =
+        view.screen()
+            .review_contents_with_links(previous, (row, col), col..col + 1);
+    let cue = cue.or_else(|| {
+        view.screen()
+            .left_review_link(previous, (row, col))
+            .then_some(SoundCue::LinkExit)
+    });
+    sr.speak_review_character(&character, &links, cue)?;
     Ok(CommandResult::Handled)
 }
 
 pub(super) fn character_read_phonetic(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> {
     let (row, col) = view.review_cursor_position();
-    let character = view.character(row, col);
-    if !character.trim().is_empty() {
-        sr.speak(phonetic_name(&character).unwrap_or(&character), false)?;
+    let (character, links) = view.character_with_links(row, col);
+    if let Some(phonetic) = phonetic_name(&character) {
+        if links.is_empty() {
+            sr.speak(phonetic, false)?;
+        } else {
+            sr.speak_with_links(phonetic, std::slice::from_ref(&(0..phonetic.len())), false)?;
+        }
+    } else {
+        character_read(sr, view)?;
     }
     Ok(CommandResult::Handled)
 }
@@ -166,7 +213,7 @@ pub(super) fn top(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResul
     };
     view.set_review_cursor_row(target_row);
     report_move(sr, view, old_position)?;
-    line_read(sr, view)?;
+    line_read_with_cue(sr, view, None, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
@@ -184,7 +231,7 @@ pub(super) fn bottom(sr: &mut ScreenReader, view: &mut View) -> Result<CommandRe
     };
     view.set_review_cursor_row(target_row);
     report_move(sr, view, old_position)?;
-    line_read(sr, view)?;
+    line_read_with_cue(sr, view, None, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
@@ -201,7 +248,7 @@ pub(super) fn first(sr: &mut ScreenReader, view: &mut View) -> Result<CommandRes
     };
     view.set_review_cursor_col(target_col);
     report_move(sr, view, old_position)?;
-    character_read(sr, view)?;
+    character_read_with_cue(sr, view, None, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
@@ -218,7 +265,7 @@ pub(super) fn last(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResu
     };
     view.set_review_cursor_col(target_col);
     report_move(sr, view, old_position)?;
-    character_read(sr, view)?;
+    character_read_with_cue(sr, view, None, Some(old_position))?;
     Ok(CommandResult::Handled)
 }
 
@@ -289,6 +336,196 @@ mod tests {
         }
     }
 
+    type CueSubmissions = Rc<RefCell<Vec<(String, speech::SpeechCues)>>>;
+
+    struct CueRecordingDriver(CueSubmissions);
+
+    impl speech::Driver for CueRecordingDriver {
+        fn option_state(&self) -> speech::OptionState {
+            speech::OptionState {
+                sound_cues: true,
+                ..Default::default()
+            }
+        }
+        fn supports_ordered_utterances(&self) -> bool {
+            true
+        }
+
+        fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn speak_utterance_with_cues(
+            &mut self,
+            _id: &speech::protocol::UtteranceId,
+            text: &str,
+            _interrupt: bool,
+            _boundary: speech::UtteranceBoundary,
+            cues: speech::SpeechCues,
+        ) -> anyhow::Result<()> {
+            self.0.borrow_mut().push((text.into(), cues));
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn get_rate(&self) -> f32 {
+            1.0
+        }
+
+        fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn all_four_boundaries_pair_the_direction_with_blank_readback() {
+        use super::SoundCue;
+        use speech::SpeechCues;
+        let cues = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
+            Rc::clone(&cues),
+        ))));
+        let mut view = View::new(1, 4);
+        line_read(&mut sr, &mut view).unwrap();
+        line_previous(&mut sr, &mut view, false).unwrap();
+        line_next(&mut sr, &mut view, false).unwrap();
+        character_previous(&mut sr, &mut view).unwrap();
+        view.set_review_cursor_col(3);
+        character_next(&mut sr, &mut view).unwrap();
+        assert_eq!(
+            cues.borrow().as_slice(),
+            [
+                ("blank".into(), SpeechCues::Standalone(SoundCue::Blank)),
+                (
+                    "top blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Top)
+                ),
+                (
+                    "bottom blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Bottom)
+                ),
+                (
+                    "left blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Left)
+                ),
+                (
+                    "right blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Right)
+                ),
+            ],
+        );
+
+        let (mut sr, spoken) = screen_reader();
+        character_next(&mut sr, &mut view).unwrap();
+        sr.speech_mut().set_tones(false);
+        view.set_review_cursor_col(0);
+        character_previous(&mut sr, &mut view).unwrap();
+        assert_eq!(spoken.borrow().as_slice(), ["right blank", "left blank"]);
+    }
+
+    #[test]
+    fn character_review_preserves_the_link_on_a_blank_cell() {
+        let cues = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
+            cues.clone(),
+        ))));
+        let mut view = View::new(1, 4);
+        view.process_changes(b"\x1b]8;;https://example.invalid\x1b\\ \x1b]8;;\x1b\\");
+        character_read(&mut sr, &view).unwrap();
+        let cues = cues.borrow();
+        assert!(matches!(cues.as_slice(), [
+            (_, speech::SpeechCues::Inline { links, tones: true, .. }),
+            (_, speech::SpeechCues::Standalone(super::SoundCue::Blank)),
+        ] if links.len() == 1 && links[0].offset == 0));
+    }
+
+    #[test]
+    fn blocked_movement_inside_linked_whitespace_keeps_the_blank_label() {
+        let (mut sr, output) = screen_reader();
+        let mut view = View::new(1, 4);
+        view.process_changes(b"\x1b]8;;https://example.invalid\x1b\\ \x1b]8;;\x1b\\");
+        character_previous(&mut sr, &mut view).unwrap();
+        assert_eq!(
+            output
+                .borrow()
+                .iter()
+                .map(|text| text.trim())
+                .collect::<Vec<_>>(),
+            ["left blank"],
+        );
+    }
+
+    #[test]
+    fn blank_bottom_and_character_inspection_each_submit_one_request() {
+        use super::SoundCue;
+        use speech::SpeechCues;
+        let submissions = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
+            Rc::clone(&submissions),
+        ))));
+        let mut view = View::new(2, 12);
+        view.process_changes(b"entry");
+        line_next(&mut sr, &mut view, false).unwrap();
+        assert_eq!(
+            submissions.borrow().as_slice(),
+            [("blank".into(), SpeechCues::Standalone(SoundCue::Blank))]
+        );
+        submissions.borrow_mut().clear();
+
+        line_next(&mut sr, &mut view, false).unwrap();
+        character_read(&mut sr, &view).unwrap();
+        assert_eq!(
+            submissions.borrow().as_slice(),
+            [
+                (
+                    "bottom blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Bottom)
+                ),
+                ("blank".into(), SpeechCues::Standalone(SoundCue::Blank)),
+            ],
+        );
+
+        let (mut sr, spoken) = screen_reader();
+        line_next(&mut sr, &mut view, false).unwrap();
+        character_read(&mut sr, &view).unwrap();
+        assert_eq!(spoken.borrow().as_slice(), ["bottom blank", "blank"]);
+    }
+
+    #[test]
+    fn boundary_is_submitted_with_its_readback_and_does_not_leak() {
+        use super::SoundCue;
+        use speech::SpeechCues;
+        let submissions = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
+            Rc::clone(&submissions),
+        ))));
+        let mut view = View::new(1, 8);
+        view.process_changes(b"label");
+
+        line_previous(&mut sr, &mut view, false).unwrap();
+        sr.set_terminal_focused(false).unwrap();
+        line_next(&mut sr, &mut view, false).unwrap();
+        sr.set_terminal_focused(true).unwrap();
+        line_read(&mut sr, &mut view).unwrap();
+        assert_eq!(
+            submissions.borrow().as_slice(),
+            [
+                (
+                    "label".into(),
+                    SpeechCues::Inline {
+                        direction: Some((SoundCue::Top, "top")),
+                        links: Vec::new(),
+                        tones: true,
+                    }
+                ),
+                ("label".into(), SpeechCues::None),
+            ]
+        );
+    }
+
     fn screen_reader() -> (ScreenReader, Rc<RefCell<Vec<String>>>) {
         let output = Rc::new(RefCell::new(Vec::new()));
         let speech = speech::Speech::new(Box::new(RecordingDriver(Rc::clone(&output))));
@@ -296,14 +533,117 @@ mod tests {
     }
 
     #[test]
-    fn line_read_preserves_renderer_padding_as_silence() {
+    fn moving_through_a_multiword_link_only_announces_entry() {
+        let (mut sr, output) = screen_reader();
+        let mut view = View::new(2, 32);
+        view.process_changes(b".\x1b]8;;https://example.invalid\x1b\\ab cd\x1b]8;;\x1b\\!");
+        character_next(&mut sr, &mut view).unwrap();
+        character_next(&mut sr, &mut view).unwrap();
+        character_next(&mut sr, &mut view).unwrap();
+        word_next(&mut sr, &mut view).unwrap();
+        character_next(&mut sr, &mut view).unwrap();
+        character_next(&mut sr, &mut view).unwrap();
+        character_previous(&mut sr, &mut view).unwrap();
+        assert_eq!(
+            output.borrow().as_slice(),
+            [
+                "link a",
+                "b",
+                "blank",
+                "cd!",
+                "d",
+                "out of link bang ",
+                "link d"
+            ]
+        );
+    }
+
+    #[test]
+    fn word_navigation_submits_exit_tone_with_destination_word() {
+        let cues = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
+            cues.clone(),
+        ))));
+        let mut view = View::new(2, 24);
+        view.process_changes(b"\x1b]8;;https://example.invalid\x1b\\some link\x1b]8;;\x1b\\ next");
+        word_next(&mut sr, &mut view).unwrap();
+        word_next(&mut sr, &mut view).unwrap();
+        assert_eq!(
+            cues.borrow().last(),
+            Some(&(
+                "next".into(),
+                speech::SpeechCues::Inline {
+                    direction: Some((super::SoundCue::LinkExit, "out of link")),
+                    links: Vec::new(),
+                    tones: true,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn explicit_line_read_announces_link_entry_and_partial_character_read() {
+        let (mut sr, output) = screen_reader();
+        let mut view = View::new(2, 20);
+        view.process_changes(b"go \x1b]8;;https://example.invalid\x1b\\here\x1b]8;;\x1b\\ now");
+        line_read(&mut sr, &mut view).unwrap();
+        view.set_review_cursor_position((0, 4));
+        character_read(&mut sr, &view).unwrap();
+        assert_eq!(output.borrow().as_slice(), ["go link here now", "link e"]);
+    }
+
+    #[test]
+    fn blank_character_is_spoken_when_tones_are_disabled_or_unsupported() {
+        let (mut sr, output) = screen_reader();
+        let view = View::new(1, 4);
+        character_read(&mut sr, &view).unwrap();
+        sr.speech_mut().set_tones(false);
+        character_read_phonetic(&mut sr, &view).unwrap();
+        assert_eq!(output.borrow().as_slice(), ["blank", "blank"]);
+    }
+
+    #[test]
+    fn line_read_announces_whitespace_only_rows() {
         let (mut sr, output) = screen_reader();
         let mut view = View::new(1, 8);
         view.process_changes(b"        ");
 
         line_read(&mut sr, &mut view).unwrap();
 
-        assert!(output.borrow().is_empty());
+        assert_eq!(output.borrow().as_slice(), ["blank"]);
+    }
+
+    #[test]
+    fn blank_line_keeps_its_whitespace_link_announcement() {
+        let (mut sr, output) = screen_reader();
+        sr.speech_mut().set_tones(false);
+        let mut view = View::new(2, 8);
+        view.process_changes(b"\r\n   \x1b]8;;https://example.invalid\x1b\\ \x1b]8;;\x1b\\");
+        view.set_review_cursor_position((0, 0));
+        line_next(&mut sr, &mut view, false).unwrap();
+        assert_eq!(output.borrow().as_slice(), ["link blank"]);
+    }
+
+    #[test]
+    fn only_review_navigation_announces_blank_destinations() {
+        for tones in [true, false] {
+            let (mut sr, output) = screen_reader();
+            sr.speech_mut().set_tones(tones);
+            let mut view = View::new(3, 8);
+            view.process_changes(b"row");
+            view.finalize_changes(0);
+            view.process_changes(b"\x1b[2;1H");
+            sr.track_cursor(&mut view).unwrap();
+            view.finalize_changes(1);
+            view.process_changes(b"\x1b[C");
+            sr.track_cursor(&mut view).unwrap();
+            assert!(output.borrow().is_empty());
+
+            view.set_review_cursor_position((0, 0));
+            line_next(&mut sr, &mut view, false).unwrap();
+            character_next(&mut sr, &mut view).unwrap();
+            assert_eq!(output.borrow().as_slice(), ["blank", "blank"]);
+        }
     }
 
     #[test]
@@ -330,14 +670,14 @@ mod tests {
 
         assert_eq!(
             output.borrow().as_slice(),
-            ["top", "top", "bottom", "bottom", "bottom"]
+            ["top top", "bottom", "bottom bottom"]
         );
 
         output.borrow_mut().clear();
         view.set_review_cursor_position((0, 0));
         line_next(&mut sr, &mut view, false).unwrap();
         assert_eq!(view.review_cursor_position(), (1, 0));
-        assert!(output.borrow().is_empty());
+        assert_eq!(output.borrow().as_slice(), ["blank"]);
     }
 
     #[test]
@@ -355,7 +695,7 @@ mod tests {
         assert_eq!(view.review_cursor_position(), (0, 0));
         assert_eq!(view.scrollback(), 0);
         assert_eq!(view.line(0), "three");
-        assert_eq!(output.borrow().as_slice(), ["top", "three"]);
+        assert_eq!(output.borrow().as_slice(), ["top three"]);
     }
 
     #[test]
@@ -377,7 +717,15 @@ mod tests {
         assert_eq!(view.review_cursor_position(), (0, 9));
         assert_eq!(
             output.borrow().as_slice(),
-            ["left", "a", "beta", "right", "beta", "left", "a"]
+            [
+                "left a",
+                "beta",
+                "right beta",
+                "left a",
+                "blank",
+                "blank",
+                "blank"
+            ]
         );
     }
 

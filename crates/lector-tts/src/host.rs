@@ -4,6 +4,20 @@
 //! this boundary. The host accepts one Lector utterance at a time and emits
 //! correlated lifecycle events; Lector owns all queueing.
 
+#[cfg(target_vendor = "apple")]
+mod cue_playback;
+#[cfg(unix)]
+mod parent_watchdog;
+
+#[cfg(target_vendor = "apple")]
+use crate::protocol::SoundCue;
+#[cfg(target_vendor = "apple")]
+use crate::speech_fallback::{
+    InsertedLink, MAX_LINK_ANNOUNCEMENT_BYTES, append_cue_announcement, canonical_offset,
+};
+#[cfg(target_vendor = "apple")]
+use cue_playback::{CuePlayback, PreparedCues, ReadbackCache, ReadbackKey};
+
 use crate::{
     Backends, Error as TtsError, Features, Gender, Tts, UtteranceId as NativeUtteranceId, Voice,
     protocol::{
@@ -11,15 +25,15 @@ use crate::{
         EventCapability, LifecycleCapabilities, MAX_UTTERANCE_TEXT_BYTES, NORMAL_RATE,
         NORMALIZED_RATE_PROTOCOL_MINOR, PauseResult, PauseResumeSupport, PitchResult,
         ProgressCapabilities, ProgressMode, ProtocolVersion, RateResult, SetVoiceParams,
-        SettingCapabilities, SettingSupport, SpeakParams, SpeechCapabilities,
+        SettingCapabilities, SettingSupport, SoundCueAt, SpeakParams, SpeechCapabilities,
         SpeechEventNotification, SpeechEventPayload, StopSupport, TerminalCapability, TextPosition,
         UtteranceId, UtteranceParams, VoiceCapabilities, VoiceInfo, VoiceListResult, VolumeResult,
         rate_is_normalized,
     },
-    server::{InitializeResult, Request, RpcError, ServerNotification, run_server_with_tick},
+    server::{
+        InitializeResult, Request, RpcError, ServerNotification, Waiter, Wake, run_server_with_wake,
+    },
 };
-#[cfg(unix)]
-use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use serde::de::DeserializeOwned;
@@ -72,27 +86,225 @@ enum NativeEvent {
     Started(NativeUtteranceId),
     Completed(NativeUtteranceId),
     Cancelled(NativeUtteranceId),
+    #[cfg(windows)]
+    Failed(NativeUtteranceId),
     #[cfg(target_vendor = "apple")]
     Range {
         id: NativeUtteranceId,
         start: usize,
+        length: usize,
     },
+}
+
+impl NativeEvent {
+    fn id(self) -> NativeUtteranceId {
+        match self {
+            Self::Started(id) | Self::Completed(id) | Self::Cancelled(id) => id,
+            #[cfg(windows)]
+            Self::Failed(id) => id,
+            #[cfg(target_vendor = "apple")]
+            Self::Range { id, .. } => id,
+        }
+    }
 }
 
 struct ActiveUtterance {
     logical_id: UtteranceId,
     native_id: Option<NativeUtteranceId>,
     text: String,
+    #[cfg(any(target_vendor = "apple", windows))]
+    cues: Vec<SoundCueAt>,
+    #[cfg(target_vendor = "apple")]
+    fallback: Option<SpokenFallback>,
+    #[cfg(target_vendor = "apple")]
+    direction_label: Option<SoundCue>,
+    #[cfg(target_vendor = "apple")]
+    deferred_label: Option<SoundCue>,
     /// UTF-8 offset represented by byte zero of the current native utterance.
     native_base: usize,
     current_word: usize,
     next_sequence: u64,
+    awaiting_stop: bool,
     started: bool,
     paused: bool,
 }
 
-struct State {
+impl ActiveUtterance {
+    fn completion_reason(&self) -> &'static str {
+        if self.awaiting_stop {
+            return "cancelled";
+        }
+        "completed"
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl ActiveUtterance {
+    fn remember_missed_link(&mut self, live: Option<&LiveCue>) {
+        if live.is_some_and(|cue| {
+            Some(cue.native_id) == self.native_id
+                && cue.cue == SoundCue::Link
+                && cue.playback != DirectionPlayback::Played
+                && self.native_base + cue.offset < self.current_word
+        }) {
+            self.deferred_label = Some(SoundCue::Link);
+        }
+    }
+
+    fn cues_from(&self, base: usize) -> Vec<SoundCueAt> {
+        self.cues
+            .iter()
+            .filter_map(|cue| {
+                Some(SoundCueAt {
+                    cue: cue.cue,
+                    offset: if cue.cue == SoundCue::Link {
+                        cue.offset.checked_sub(base)?
+                    } else {
+                        // A retained direction has not announced yet. Its
+                        // onset moves to the beginning of the resumed suffix.
+                        0
+                    },
+                })
+            })
+            .collect()
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+struct SpokenFallback {
+    text: String,
+    announcements: Vec<InsertedLink>,
+    playback_base: usize,
+    word: usize,
+}
+
+#[cfg(target_vendor = "apple")]
+impl SpokenFallback {
+    fn new(text: &str, cues: &[SoundCueAt]) -> Self {
+        let mut announcements = Vec::with_capacity(cues.len());
+        let spoken_text = if let [cue] = cues
+            && text.is_empty()
+        {
+            cue.cue.spoken_label().to_owned()
+        } else {
+            let mut spoken_text =
+                String::with_capacity(text.len() + cues.len() * MAX_LINK_ANNOUNCEMENT_BYTES);
+            let mut previous = 0;
+            for cue in cues {
+                spoken_text.push_str(&text[previous..cue.offset]);
+                announcements.push(append_cue_announcement(
+                    &mut spoken_text,
+                    text,
+                    cue.offset,
+                    cue.cue,
+                ));
+                previous = cue.offset;
+            }
+            spoken_text.push_str(&text[previous..]);
+            spoken_text
+        };
+        Self {
+            text: spoken_text,
+            announcements,
+            playback_base: 0,
+            word: 0,
+        }
+    }
+
+    fn report_word(&mut self, start: usize) -> Option<usize> {
+        let absolute = self.playback_base.checked_add(start)?;
+        if !self.text.is_char_boundary(absolute) {
+            return None;
+        }
+        self.word = absolute;
+        Some(canonical_offset(absolute, &self.announcements))
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectionPlayback {
+    Pending,
+    Played,
+    Failed,
+}
+
+#[cfg(target_vendor = "apple")]
+impl DirectionPlayback {
+    fn needs_label(self, naturally_completed: bool) -> bool {
+        naturally_completed && self != Self::Played
+    }
+
+    fn shows_missing_word_ranges(self, saw_range: bool) -> bool {
+        self == Self::Pending && !saw_range
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn is_link_word_onset(text: &str, offset: usize) -> bool {
+    use unicode_segmentation::UnicodeSegmentation;
+    text.unicode_word_indices()
+        .take_while(|(start, _)| *start <= offset)
+        .any(|(start, _)| start == offset)
+}
+
+#[cfg(target_vendor = "apple")]
+struct LiveCue {
+    offset: usize,
+    native_id: NativeUtteranceId,
+    cue: SoundCue,
+    playback: DirectionPlayback,
+    clock_logged: bool,
+    saw_range: bool,
+    cache_key: Option<ReadbackKey>,
+}
+
+#[cfg(target_vendor = "apple")]
+#[derive(Default)]
+struct DirectionalBatch {
+    last_range: Option<usize>,
+    ended: bool,
+}
+
+#[cfg(target_vendor = "apple")]
+impl DirectionalBatch {
+    fn inspect(events: &[NativeEvent], id: NativeUtteranceId) -> Self {
+        let mut batch = Self::default();
+        for event in events {
+            match *event {
+                NativeEvent::Range {
+                    id: native_id,
+                    length,
+                    start,
+                } if native_id == id && length != 0 => {
+                    batch.last_range = Some(start);
+                }
+                NativeEvent::Completed(native_id) | NativeEvent::Cancelled(native_id)
+                    if native_id == id =>
+                {
+                    batch.ended = true;
+                }
+                _ => {}
+            }
+        }
+        batch
+    }
+}
+
+struct State<'a> {
     tts: Tts,
+    #[cfg(target_vendor = "apple")]
+    cue_playback: Option<CuePlayback>,
+    #[cfg(target_vendor = "apple")]
+    prepared_cues: PreparedCues,
+    #[cfg(target_vendor = "apple")]
+    readback_cache: ReadbackCache,
+    #[cfg(target_vendor = "apple")]
+    live_cue: Option<LiveCue>,
+    #[cfg(target_vendor = "apple")]
+    live_word_ranges: bool,
+    #[cfg(target_vendor = "apple")]
+    cue_event_log: Option<SpeechEventLog>,
     backend: Backends,
     backend_info: BackendInfo,
     rate: Option<RateState>,
@@ -105,6 +317,7 @@ struct State {
     rpc_log: Option<File>,
     active: Option<ActiveUtterance>,
     native_events: mpsc::Receiver<NativeEvent>,
+    waiter: &'a Waiter,
     notifications: VecDeque<ServerNotification>,
 }
 
@@ -237,8 +450,9 @@ pub fn run_with_options(options: &Options) -> Result<()> {
         }
         return Ok(());
     }
+    #[cfg(unix)]
     if let Some(expected_parent_pid) = options.parent_pid {
-        start_parent_watchdog(expected_parent_pid)?;
+        parent_watchdog::start(expected_parent_pid)?;
     }
     let backend = select_backend(&options.backend)?;
     if options.list_voices {
@@ -255,13 +469,25 @@ pub fn run_with_options(options: &Options) -> Result<()> {
         }
         return Ok(());
     }
-    let state = RefCell::new(State::new(backend, options.voice.as_deref())?);
-    run_server_with_tick(
+    let waiter = Waiter::new()?;
+    let state = RefCell::new(State::new(backend, options.voice.as_deref(), &waiter)?);
+    run_server_with_wake(
+        &waiter,
         |request| handle_request(request, &mut state.borrow_mut()),
         || {
-            let mut state = state.borrow_mut();
+            let mut borrowed = state.borrow_mut();
+            let state = &mut *borrowed;
+            #[cfg(target_vendor = "apple")]
+            if state.readback_cache.advance()
+                && let Some(log) = &state.cue_event_log
+            {
+                write_speech_event(log, "directional-cue-cache-ready");
+            }
+            #[cfg(target_vendor = "apple")]
+            state.prepared_cues.idle();
             state.advance();
-            state.notifications.drain(..).collect()
+            let timeout = state.next_tick();
+            (state.notifications.drain(..).collect(), timeout)
         },
     )?;
     Ok(())
@@ -277,8 +503,8 @@ fn select_backend(value: &str) -> Result<Backends> {
     Backends::from_str(value).map_err(Into::into)
 }
 
-impl State {
-    fn new(backend: Backends, voice_id: Option<&str>) -> Result<Self> {
+impl<'a> State<'a> {
+    fn new(backend: Backends, voice_id: Option<&str>, waiter: &'a Waiter) -> Result<Self> {
         let tts = Tts::new(backend).map_err(|error| anyhow::anyhow!(error))?;
         let features = tts.supported_features();
         let test_event_log = configure_test_observation(&tts)?;
@@ -320,11 +546,20 @@ impl State {
         let selected_voice = voice_id
             .map(|voice_id| select_voice(&tts, voice_id).map(|voice| voice.id))
             .transpose()?;
-        let capabilities = native_capabilities(features);
+        let capabilities = native_capabilities(backend, features);
+        #[cfg(target_vendor = "apple")]
+        let prepared_cues = if capabilities.sound_cues {
+            PreparedCues::new(tts.get_volume()?)
+        } else {
+            PreparedCues::default()
+        };
+        #[cfg(target_vendor = "apple")]
+        let cue_event_log = test_event_log.clone();
         let (native_event_tx, native_events) = mpsc::channel();
         install_native_callbacks(
             &tts,
             &native_event_tx,
+            &waiter.wake(),
             features.utterance_callbacks,
             test_event_log,
         )
@@ -334,6 +569,18 @@ impl State {
             .transpose()?;
         Ok(Self {
             tts,
+            #[cfg(target_vendor = "apple")]
+            cue_playback: None,
+            #[cfg(target_vendor = "apple")]
+            prepared_cues,
+            #[cfg(target_vendor = "apple")]
+            readback_cache: ReadbackCache::default(),
+            #[cfg(target_vendor = "apple")]
+            live_cue: None,
+            #[cfg(target_vendor = "apple")]
+            live_word_ranges: true,
+            #[cfg(target_vendor = "apple")]
+            cue_event_log,
             backend,
             backend_info: BackendInfo {
                 id: backend.id().to_owned(),
@@ -350,49 +597,265 @@ impl State {
             rpc_log,
             active: None,
             native_events,
+            waiter,
             notifications: VecDeque::new(),
         })
     }
 
-    fn speak(&mut self, id: UtteranceId, text: String) -> Result<(), RpcError> {
+    fn speak(&mut self, params: SpeakParams) -> Result<(), RpcError> {
+        let SpeakParams {
+            utterance_id: id,
+            text,
+            cues,
+        } = params;
         self.advance();
         if self.active.is_some() {
             return Err(RpcError::invalid_request(
                 "speech.speak received while another utterance is active",
             ));
         }
-        if !id.is_valid() || text.is_empty() || text.len() > MAX_UTTERANCE_TEXT_BYTES {
+        if !id.is_valid()
+            || text.len() > MAX_UTTERANCE_TEXT_BYTES
+            || !self
+                .protocol
+                .is_some_and(|version| SoundCueAt::valid_for_protocol(&text, &cues, version))
+        {
             return Err(RpcError::invalid_params(
-                "utteranceId must be valid and text must contain at most 65536 UTF-8 bytes",
+                "utteranceId, text, or sound cues are invalid",
             ));
         }
-        let native_id = match classify_backend_attempt(self.tts.speak(&text, false))? {
-            BackendAttempt::Completed(native_id) => native_id,
-            BackendAttempt::Unavailable(message) => {
-                // The selected backend remains authoritative while its external
-                // service is absent. Drop this utterance instead of changing
-                // engines or killing the protocol host, and provide correlated
-                // terminal evidence so the client does not retain phantom work.
-                self.emit(id, 0, "ended", None, Some("failed"), Some(message));
-                return Ok(());
-            }
-        };
-        self.active = Some(ActiveUtterance {
+        if !cues.is_empty() && !self.capabilities.sound_cues {
+            return Err(RpcError::invalid_params(
+                "sound cues are unavailable for this session",
+            ));
+        }
+        #[cfg(target_vendor = "apple")]
+        self.stop_live_cue();
+        let mut active = ActiveUtterance {
             logical_id: id,
-            native_id,
+            native_id: None,
             text,
+            #[cfg(any(target_vendor = "apple", windows))]
+            cues,
+            #[cfg(target_vendor = "apple")]
+            fallback: None,
+            #[cfg(target_vendor = "apple")]
+            direction_label: None,
+            #[cfg(target_vendor = "apple")]
+            deferred_label: None,
             native_base: 0,
             current_word: 0,
             next_sequence: 0,
+            awaiting_stop: false,
             started: false,
             paused: false,
-        });
+        };
+        active.native_id = match self.start_native(&mut active, 0)? {
+            BackendAttempt::Completed(native_id) => native_id,
+            BackendAttempt::Unavailable(message) => {
+                // The selected backend remains authoritative while its external
+                // service is absent. Provide correlated terminal evidence.
+                self.emit_for(&active, "ended", None, Some("failed"), Some(message));
+                return Ok(());
+            }
+        };
+        self.active = Some(active);
         Ok(())
     }
 
+    fn start_native(
+        &mut self,
+        active: &mut ActiveUtterance,
+        base: usize,
+    ) -> Result<BackendAttempt<Option<NativeUtteranceId>>, RpcError> {
+        let text = resumable_suffix(&active.text, base).ok_or_else(|| {
+            RpcError::internal_error("native word position is not a UTF-8 boundary")
+        })?;
+        #[cfg(target_vendor = "apple")]
+        {
+            if let Some(cue) = active.direction_label {
+                return classify_backend_attempt(self.tts.speak(cue.spoken_label(), false));
+            }
+            if let Some(fallback) = &mut active.fallback {
+                self.readback_cache.retain_request(None);
+                let result = classify_backend_attempt(
+                    self.tts.speak(&fallback.text[fallback.word..], false),
+                )?;
+                if matches!(result, BackendAttempt::Completed(_)) {
+                    fallback.playback_base = fallback.word;
+                }
+                return Ok(result);
+            }
+            let cues = active.cues_from(base);
+            if text.is_empty() && !cues.is_empty() {
+                return self.start_standalone_cue(active, base, &cues);
+            }
+            // Multiple overlays share a PCM clock so overlapping cue tails survive.
+            if let [cue] = cues.as_slice()
+                && !text.is_empty()
+                && (cue.cue != SoundCue::Link
+                    || (self.live_word_ranges && is_link_word_onset(text, cue.offset)))
+            {
+                return self.start_live_cue(active, base, cue);
+            }
+            self.readback_cache.retain_request(None);
+            if !cues.is_empty() {
+                match CuePlayback::new(
+                    &self.tts,
+                    text,
+                    cues.clone(),
+                    self.selected_voice.as_deref(),
+                ) {
+                    Ok(playback) => {
+                        let id = playback.id();
+                        self.cue_playback = Some(playback);
+                        active.native_base = base;
+                        return Ok(BackendAttempt::Completed(Some(id)));
+                    }
+                    Err(error) => {
+                        eprintln!("lector-tts: {error}; speaking cue labels");
+                        return self.start_spoken_fallback(active, base, &cues);
+                    }
+                }
+            }
+        }
+        #[cfg(windows)]
+        if !active.cues.is_empty() {
+            // NVDA restarts at the beginning. Its markers use offsets in the original text.
+            debug_assert_eq!(base, 0);
+            return classify_backend_attempt(self.tts.speak_with_cues(text, &active.cues));
+        }
+        let result = classify_backend_attempt(self.tts.speak(text, false))?;
+        if matches!(result, BackendAttempt::Completed(_)) {
+            active.native_base = base;
+        }
+        Ok(result)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn start_live_cue(
+        &mut self,
+        active: &mut ActiveUtterance,
+        base: usize,
+        cue: &SoundCueAt,
+    ) -> Result<BackendAttempt<Option<NativeUtteranceId>>, RpcError> {
+        let text = &active.text[base..];
+        // Use labels when there is no evidence that this text and
+        // voice will provide a word onset for live playback.
+        if !text.chars().any(char::is_alphanumeric) {
+            self.readback_cache.retain_request(None);
+            return self.start_spoken_fallback(active, base, &active.cues_from(base));
+        }
+        let cache_key = cue
+            .cue
+            .is_direction()
+            .then(|| ReadbackKey::new(&self.tts, text, cue.cue, self.selected_voice.as_deref()))
+            .flatten();
+        self.readback_cache.retain_request(cache_key.as_ref());
+        let volume = self
+            .tts
+            .get_volume()
+            .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        if let Some(key) = &cache_key
+            && let Some(playback) = self.readback_cache.play(key, volume, &self.prepared_cues)
+        {
+            if let Some(log) = &self.cue_event_log {
+                write_speech_event(log, "directional-cue-cache-hit");
+                write_speech_event(log, "directional-cue-begin");
+            }
+            let id = playback.id();
+            self.cue_playback = Some(playback);
+            active.native_base = base;
+            return Ok(BackendAttempt::Completed(Some(id)));
+        }
+        if !self.live_word_ranges {
+            return self.start_spoken_fallback(active, base, &active.cues_from(base));
+        }
+        if let Err(error) = self.prepared_cues.prepare(cue.cue, volume) {
+            eprintln!("lector-tts: {error}; speaking cue label");
+            return self.start_spoken_fallback(active, base, &active.cues_from(base));
+        }
+        // The system mixes these live sources at their normal levels. The
+        // host can inspect and limit peaks only on the rendered PCM route.
+        let result = classify_backend_attempt(self.tts.speak(text, false))?;
+        if let BackendAttempt::Completed(Some(native_id)) = result {
+            if cue.cue == SoundCue::Link {
+                active.cues.retain(|cue| cue.offset >= base);
+            }
+            self.live_cue = Some(LiveCue {
+                offset: cue.offset,
+                native_id,
+                cue: cue.cue,
+                playback: DirectionPlayback::Pending,
+                clock_logged: false,
+                saw_range: false,
+                cache_key,
+            });
+            active.native_base = base;
+        }
+        Ok(result)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn start_standalone_cue(
+        &mut self,
+        active: &mut ActiveUtterance,
+        base: usize,
+        cues: &[SoundCueAt],
+    ) -> Result<BackendAttempt<Option<NativeUtteranceId>>, RpcError> {
+        self.readback_cache.retain_request(None);
+        let volume = self.volume.as_ref().map_or(1.0, |volume| volume.current);
+        match CuePlayback::standalone(cues, volume, &self.prepared_cues) {
+            Ok(playback) => {
+                let id = playback.id();
+                self.cue_playback = Some(playback);
+                active.native_base = base;
+                Ok(BackendAttempt::Completed(Some(id)))
+            }
+            Err(error) => {
+                eprintln!("lector-tts: {error}; speaking cue labels");
+                self.start_spoken_fallback(active, base, cues)
+            }
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn start_spoken_fallback(
+        &self,
+        active: &mut ActiveUtterance,
+        base: usize,
+        cues: &[SoundCueAt],
+    ) -> Result<BackendAttempt<Option<NativeUtteranceId>>, RpcError> {
+        let fallback = SpokenFallback::new(&active.text[base..], cues);
+        let result = classify_backend_attempt(self.tts.speak(&fallback.text, false))?;
+        if matches!(result, BackendAttempt::Completed(_)) {
+            active.native_base = base;
+            active.fallback = Some(fallback);
+            active.cues.clear();
+        }
+        Ok(result)
+    }
+
     fn stop(&mut self, id: &UtteranceId) -> Result<(), RpcError> {
-        self.advance();
+        self.advance_for_control(id);
+        #[cfg(windows)]
+        if let Some(active) = &mut self.active
+            && active.logical_id == *id
+            && matches!(active.native_id, Some(NativeUtteranceId::Nvda(_)))
+        {
+            // NVDA accepts cancellation before its synchronous speech call returns.
+            // Keep the logical ID until the worker reports its terminal outcome.
+            if !active.awaiting_stop {
+                self.tts
+                    .stop()
+                    .map_err(|e| RpcError::internal_error(e.to_string()))?;
+                active.awaiting_stop = true;
+            }
+            return Ok(());
+        }
         let Some(active) = self.active.take() else {
+            #[cfg(target_vendor = "apple")]
+            self.stop_live_cue();
             return Ok(());
         };
         if active.logical_id != *id {
@@ -401,7 +864,11 @@ impl State {
                 "utteranceId does not identify the active utterance",
             ));
         }
-        if !active.paused
+        #[cfg(target_vendor = "apple")]
+        let suspended_cue = active.text.is_empty() && self.cue_playback.is_some();
+        #[cfg(not(target_vendor = "apple"))]
+        let suspended_cue = false;
+        if (!active.paused || suspended_cue)
             && let Err(error) = self.stop_native(active.native_id)
         {
             self.active = Some(active);
@@ -412,7 +879,7 @@ impl State {
     }
 
     fn pause(&mut self, id: &UtteranceId) -> Result<PauseResult, RpcError> {
-        self.advance();
+        self.advance_for_control(id);
         if !self.capabilities.supports_resumable_pause() {
             return Err(RpcError::method_not_found("speech.pause"));
         }
@@ -440,7 +907,10 @@ impl State {
         }
         let position = active.current_word;
         active.paused = true;
-        if let Err(error) = self.stop_native(active.native_id) {
+        #[cfg(target_vendor = "apple")]
+        active.remember_missed_link(self.live_cue.as_ref());
+        let pause = self.pause_native(&active);
+        if let Err(error) = pause {
             active.paused = false;
             self.active = Some(active);
             return Err(error);
@@ -458,12 +928,34 @@ impl State {
         })
     }
 
+    fn pause_native(&mut self, active: &ActiveUtterance) -> Result<(), RpcError> {
+        #[cfg(target_vendor = "apple")]
+        if active.text.is_empty()
+            && let Some(playback) = &mut self.cue_playback
+        {
+            playback.pause();
+            return Ok(());
+        }
+        self.stop_native(active.native_id)
+    }
+
     /// Stop the native utterance and make the backend ready for another one.
     /// `AVFoundation` has historically returned from `stop` without always
     /// issuing its cancellation callback. In that state it may silently drop
     /// the next utterance, so lack of terminal evidence causes a conservative
     /// synthesizer replacement.
     fn stop_native(&mut self, stopping: Option<NativeUtteranceId>) -> Result<(), RpcError> {
+        #[cfg(target_vendor = "apple")]
+        self.stop_live_cue();
+        #[cfg(target_vendor = "apple")]
+        if self
+            .cue_playback
+            .as_ref()
+            .is_some_and(|playback| Some(playback.id()) == stopping)
+        {
+            self.cue_playback.take();
+            return Ok(());
+        }
         match classify_backend_attempt(self.tts.stop())? {
             BackendAttempt::Completed(()) => {}
             BackendAttempt::Unavailable(_) => return Ok(()),
@@ -472,10 +964,9 @@ impl State {
             return Ok(());
         };
         let deadline = Instant::now() + Duration::from_millis(30);
-        let mut confirmed = false;
-        while Instant::now() < deadline {
-            settle_platform_runloop();
-            while let Ok(event) = self.native_events.try_recv() {
+        loop {
+            let mut confirmed = false;
+            for event in self.native_events.try_iter() {
                 confirmed |= matches!(
                     event,
                     NativeEvent::Completed(id) | NativeEvent::Cancelled(id) if id == stopping
@@ -484,9 +975,12 @@ impl State {
             if confirmed {
                 break;
             }
-        }
-        if !confirmed {
-            self.replace_synthesizer()?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.replace_synthesizer()?;
+                break;
+            }
+            self.waiter.wait(Some(remaining));
         }
         Ok(())
     }
@@ -517,6 +1011,7 @@ impl State {
         install_native_callbacks(
             &tts,
             &native_event_tx,
+            &self.waiter.wake(),
             features.utterance_callbacks,
             test_event_log,
         )
@@ -528,25 +1023,19 @@ impl State {
 
     fn resume(&mut self, id: &UtteranceId) -> Result<(), RpcError> {
         self.advance();
-        let Some(active) = self.active.as_mut() else {
+        let Some(mut active) = self.active.take() else {
             return Err(RpcError::invalid_request("there is no paused utterance"));
         };
         if active.logical_id != *id || !active.paused {
+            self.active = Some(active);
             return Err(RpcError::invalid_params(
                 "utteranceId does not identify a paused utterance",
             ));
         }
+        let result = self.resume_native(&mut active);
         let start = active.current_word;
-        let suffix = resumable_suffix(&active.text, start).ok_or_else(|| {
-            RpcError::internal_error("native word position is not a UTF-8 boundary")
-        })?;
-        let native_id = self
-            .tts
-            .speak(suffix, false)
-            .map_err(|error| RpcError::internal_error(error.to_string()))?;
-        active.native_id = native_id;
-        active.native_base = start;
-        active.paused = false;
+        self.active = Some(active);
+        result?;
         self.emit_active(
             "resumed",
             Some(TextPosition::Utf8ByteOffset { offset: start }),
@@ -556,9 +1045,211 @@ impl State {
         Ok(())
     }
 
+    fn resume_native(&mut self, active: &mut ActiveUtterance) -> Result<(), RpcError> {
+        #[cfg(target_vendor = "apple")]
+        if active.text.is_empty()
+            && let Some(playback) = &mut self.cue_playback
+        {
+            playback
+                .resume()
+                .map_err(|error| RpcError::internal_error(error.to_string()))?;
+            active.paused = false;
+            return Ok(());
+        }
+        let start = active.current_word;
+        active.native_id = match self.start_native(active, start)? {
+            BackendAttempt::Completed(id) => id,
+            BackendAttempt::Unavailable(message) => return Err(RpcError::internal_error(message)),
+        };
+        active.paused = false;
+        Ok(())
+    }
+
+    #[cfg_attr(not(target_vendor = "apple"), allow(clippy::unused_self))]
+    fn next_tick(&self) -> Option<Duration> {
+        #[cfg(target_vendor = "apple")]
+        {
+            // Sample-clock playback and render deadlines still need a timed
+            // check while active. Native speech itself wakes through callbacks.
+            let playback_active = self.cue_playback.is_some()
+                && self.active.as_ref().is_some_and(|active| !active.paused);
+            let observing_live_cue = self.cue_event_log.is_some()
+                && self.active.is_some()
+                && self.live_cue.as_ref().is_some_and(|direction| {
+                    direction.playback == DirectionPlayback::Played && !direction.clock_logged
+                });
+            if playback_active || observing_live_cue || self.readback_cache.needs_poll() {
+                return Some(Duration::from_millis(10));
+            }
+            self.prepared_cues.idle_timeout()
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            None
+        }
+    }
+
     fn advance(&mut self) {
+        #[cfg(target_vendor = "apple")]
+        self.advance_cue_playback(true);
+        self.drain_native_events(true);
+        #[cfg(target_vendor = "apple")]
+        if let (Some(log), Some(direction)) = (&self.cue_event_log, &mut self.live_cue)
+            && direction.playback == DirectionPlayback::Played
+            && !direction.clock_logged
+            && self.prepared_cues.clock_is_advancing(direction.cue)
+        {
+            direction.clock_logged = true;
+            write_speech_event(log, "directional-cue-playing");
+        }
+    }
+
+    fn advance_for_control(&mut self, id: &UtteranceId) {
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|active| &active.logical_id != id)
+        {
+            self.advance();
+            return;
+        }
+        // Keep progress current, but a stop or pause that arrived during
+        // rendering must not start a player even if rendering just finished.
+        #[cfg(target_vendor = "apple")]
+        self.advance_cue_playback(false);
+        self.drain_native_events(false);
+    }
+
+    fn drain_native_events(&mut self, allow_cue: bool) {
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = allow_cue;
+        #[cfg(target_vendor = "apple")]
+        if allow_cue
+            && let Some(direction) = &self.live_cue
+            && direction.playback == DirectionPlayback::Pending
+        {
+            self.drain_live_cue_events(direction.native_id);
+            return;
+        }
         while let Ok(event) = self.native_events.try_recv() {
-            self.handle_native_event(event);
+            self.handle_native_event(event, allow_cue);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn drain_live_cue_events(&mut self, id: NativeUtteranceId) {
+        let events: Vec<_> = self.native_events.try_iter().collect();
+        // A short utterance can report a word and completion between ticks.
+        // Never start a directional sound once speech has ended.
+        let batch = DirectionalBatch::inspect(&events, id);
+        if let Some(direction) = &mut self.live_cue {
+            direction.saw_range |= batch.last_range.is_some();
+        }
+        for event in events {
+            if !batch.ended
+                && let NativeEvent::Range {
+                    id: native_id,
+                    length,
+                    start,
+                } = event
+                && native_id == id
+                && length != 0
+            {
+                if batch.last_range == Some(start) {
+                    self.play_live_cue(id, start);
+                } else if let Some(cue) = &mut self.live_cue
+                    && cue.playback == DirectionPlayback::Pending
+                    && (cue.cue != SoundCue::Link || cue.offset == start)
+                {
+                    // The matching word has already passed. Keep the spoken fallback.
+                    cue.playback = DirectionPlayback::Failed;
+                }
+            }
+            self.handle_native_event(event, true);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn stop_live_cue(&mut self) {
+        if let Some(direction) = self.live_cue.take() {
+            self.prepared_cues.stop(direction.cue);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn play_live_cue(&mut self, id: NativeUtteranceId, word_start: usize) {
+        if let Some(direction) = &mut self.live_cue
+            && direction.native_id == id
+            && direction.playback == DirectionPlayback::Pending
+            && (direction.cue != SoundCue::Link || direction.offset == word_start)
+            && self.tts.is_speaking().unwrap_or(false)
+        {
+            match self.prepared_cues.play(direction.cue) {
+                Ok(()) => {
+                    direction.playback = DirectionPlayback::Played;
+                    if let Some(active) = &mut self.active {
+                        active.cues.clear();
+                    }
+                    if let Some(key) = direction.cache_key.take() {
+                        self.readback_cache.request(key);
+                    }
+                    if let Some(log) = &self.cue_event_log {
+                        write_speech_event(
+                            log,
+                            if direction.cue.is_direction() {
+                                "directional-cue-begin"
+                            } else {
+                                "link-cue-begin"
+                            },
+                        );
+                    }
+                }
+                Err(error) => {
+                    direction.playback = DirectionPlayback::Failed;
+                    eprintln!("lector-tts: {error}");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn advance_cue_playback(&mut self, allow_start: bool) {
+        let Some(mut playback) = self.cue_playback.take() else {
+            return;
+        };
+        if let Some(log) = &self.cue_event_log
+            && playback.observe_cached_clock()
+        {
+            write_speech_event(log, "directional-cue-playing");
+        }
+        let mut events = Vec::new();
+        let advanced =
+            playback.advance(allow_start, &self.prepared_cues, |event| events.push(event));
+        for event in events {
+            self.handle_native_event(event, allow_start);
+        }
+        match advanced {
+            Ok(false) => self.cue_playback = Some(playback),
+            Ok(true) => {}
+            Err(error) => {
+                let Some(mut active) = self.active.take() else {
+                    return;
+                };
+                drop(playback);
+                let base = active.native_base;
+                let cues = active.cues_from(base);
+                eprintln!("lector-tts: {error}; speaking cue labels");
+                let failure = match self.start_spoken_fallback(&mut active, base, &cues) {
+                    Ok(BackendAttempt::Completed(id)) => {
+                        active.native_id = id;
+                        self.active = Some(active);
+                        return;
+                    }
+                    Ok(BackendAttempt::Unavailable(message)) => message,
+                    Err(error) => error.message,
+                };
+                self.emit_for(&active, "ended", None, Some("failed"), Some(failure));
+            }
         }
     }
 
@@ -753,21 +1444,20 @@ impl State {
         let voice = select_voice(&self.tts, voice_id)
             .map_err(|error| RpcError::invalid_params(error.to_string()))?;
         self.selected_voice = Some(voice.id.clone());
+        #[cfg(target_vendor = "apple")]
+        {
+            self.live_word_ranges = true;
+        }
         Ok(CurrentVoiceResult { voice: Some(voice) })
     }
 
-    fn handle_native_event(&mut self, event: NativeEvent) {
+    fn handle_native_event(&mut self, event: NativeEvent, allow_cue: bool) {
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = allow_cue;
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        let event_id = match event {
-            NativeEvent::Started(id) | NativeEvent::Completed(id) | NativeEvent::Cancelled(id) => {
-                id
-            }
-            #[cfg(target_vendor = "apple")]
-            NativeEvent::Range { id, .. } => id,
-        };
-        if active.native_id != Some(event_id) {
+        if active.native_id != Some(event.id()) {
             return;
         }
 
@@ -780,10 +1470,32 @@ impl State {
                 self.emit_active("started", None, None, None);
             }
             #[cfg(target_vendor = "apple")]
-            NativeEvent::Range { start, .. } => {
+            NativeEvent::Range { start, length, .. } => {
+                if active.direction_label.is_some() {
+                    return;
+                }
+                let start = if let Some(fallback) = &mut active.fallback {
+                    let Some(position) = fallback.report_word(start) else {
+                        return;
+                    };
+                    position
+                } else {
+                    start
+                };
+                if active.text.is_empty() {
+                    return;
+                }
                 let position = active.native_base.saturating_add(start);
                 if position <= active.text.len() && active.text.is_char_boundary(position) {
                     active.current_word = position;
+                    // Mixed playback has reached this word, so its cues have fired.
+                    let direction_pending = self
+                        .live_cue
+                        .as_ref()
+                        .is_some_and(|direction| direction.playback != DirectionPlayback::Played);
+                    active.cues.retain(|cue| {
+                        direction_pending || cue.offset >= position.saturating_add(length)
+                    });
                     self.emit_active(
                         "progress",
                         Some(TextPosition::Utf8ByteOffset { offset: position }),
@@ -794,16 +1506,104 @@ impl State {
             }
             NativeEvent::Completed(_) => {
                 let active = self.active.take().expect("active checked");
-                self.emit_for(&active, "ended", None, Some("completed"), None);
+                #[cfg(target_vendor = "apple")]
+                let mut active = active;
+                #[cfg(target_vendor = "apple")]
+                match self.complete_live_cue(&mut active, allow_cue) {
+                    Ok(true) => {
+                        self.active = Some(active);
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.emit_for(
+                            &active,
+                            "ended",
+                            None,
+                            Some("failed"),
+                            Some(error.to_string()),
+                        );
+                        return;
+                    }
+                }
+                let reason = active.completion_reason();
+                self.emit_for(&active, "ended", None, Some(reason), None);
+            }
+            #[cfg(windows)]
+            NativeEvent::Failed(_) => {
+                let active = self.active.take().expect("active checked");
+                self.emit_for(
+                    &active,
+                    "ended",
+                    None,
+                    Some("failed"),
+                    Some("Native speech failed".to_owned()),
+                );
             }
             NativeEvent::Cancelled(_) => {
                 if active.paused {
                     return;
                 }
+                #[cfg(target_vendor = "apple")]
+                self.stop_live_cue();
                 let active = self.active.take().expect("active checked");
                 self.emit_for(&active, "ended", None, Some("cancelled"), None);
             }
         }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn complete_live_cue(
+        &mut self,
+        active: &mut ActiveUtterance,
+        allow_cue: bool,
+    ) -> Result<bool, TtsError> {
+        if allow_cue
+            && !active.paused
+            && let Some(cue) = active.deferred_label.take()
+        {
+            return self.speak_completion_label(active, cue);
+        }
+        if !self.live_cue.as_ref().is_some_and(|direction| {
+            direction.playback != DirectionPlayback::Played
+                && Some(direction.native_id) == active.native_id
+        }) {
+            return Ok(false);
+        }
+        let direction = self.live_cue.take().expect("unfinished direction checked");
+        if !direction.playback.needs_label(allow_cue && !active.paused) {
+            return Ok(false);
+        }
+        // Only missing word ranges establish that this voice cannot supply a
+        // live onset. Delayed delivery or a player failure affects this cue.
+        if direction
+            .playback
+            .shows_missing_word_ranges(direction.saw_range)
+        {
+            self.live_word_ranges = false;
+        }
+        if direction.saw_range
+            && let Some(key) = direction.cache_key
+        {
+            self.readback_cache.request(key);
+        }
+        self.speak_completion_label(active, direction.cue)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn speak_completion_label(
+        &mut self,
+        active: &mut ActiveUtterance,
+        cue: SoundCue,
+    ) -> Result<bool, TtsError> {
+        let id = self
+            .tts
+            .speak(cue.spoken_label(), false)?
+            .ok_or(TtsError::OperationFailed("identify spoken directional cue"))?;
+        active.native_id = Some(id);
+        active.direction_label = Some(cue);
+        active.cues.clear();
+        Ok(true)
     }
 
     fn emit_for(
@@ -874,29 +1674,47 @@ fn resumable_suffix(text: &str, offset: usize) -> Option<&str> {
     (offset <= text.len() && text.is_char_boundary(offset)).then(|| &text[offset..])
 }
 
-fn native_capabilities(features: Features) -> SpeechCapabilities {
-    let lifecycle = if features.utterance_callbacks {
-        DeliveryGuarantee::Reliable
+fn native_lifecycle(callbacks: bool, controller_markers: bool) -> LifecycleCapabilities {
+    if !callbacks {
+        return LifecycleCapabilities::default();
+    }
+    let mut reasons = vec!["completed".to_owned(), "cancelled".to_owned()];
+    let started = if controller_markers {
+        reasons.push("failed".to_owned());
+        DeliveryGuarantee::BestEffort
     } else {
-        DeliveryGuarantee::Unsupported
+        DeliveryGuarantee::Reliable
     };
-    SpeechCapabilities {
-        lifecycle: LifecycleCapabilities {
-            started: EventCapability {
-                delivery: lifecycle,
-                ..Default::default()
-            },
-            terminal: TerminalCapability {
-                delivery: lifecycle,
-                distinguishes: if features.utterance_callbacks {
-                    vec!["completed".to_owned(), "cancelled".to_owned()]
-                } else {
-                    Vec::new()
-                },
-                ..Default::default()
-            },
+    LifecycleCapabilities {
+        started: EventCapability {
+            delivery: started,
             ..Default::default()
         },
+        terminal: TerminalCapability {
+            delivery: DeliveryGuarantee::Reliable,
+            distinguishes: reasons,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn native_capabilities(backend: Backends, features: Features) -> SpeechCapabilities {
+    #[cfg(target_vendor = "apple")]
+    let (sound_cues, controller_markers) = (
+        backend == Backends::AvFoundation && cue_playback::supported(),
+        false,
+    );
+    #[cfg(windows)]
+    let (sound_cues, controller_markers) = (features.sound_cues, backend == Backends::Nvda);
+    #[cfg(not(any(target_vendor = "apple", windows)))]
+    let (sound_cues, controller_markers) = {
+        let _ = backend;
+        (false, false)
+    };
+    SpeechCapabilities {
+        sound_cues,
+        lifecycle: native_lifecycle(features.utterance_callbacks, controller_markers),
         progress: ProgressCapabilities {
             modes: if cfg!(target_vendor = "apple") && features.utterance_callbacks {
                 vec![ProgressMode {
@@ -997,38 +1815,45 @@ fn select_voice(tts: &Tts, voice_id: &str) -> Result<VoiceInfo> {
 fn install_native_callbacks(
     tts: &Tts,
     events: &mpsc::Sender<NativeEvent>,
+    wake: &Wake,
     supported: bool,
     event_log: Option<SpeechEventLog>,
 ) -> std::result::Result<(), TtsError> {
     if !supported {
         return Ok(());
     }
-    let started = events.clone();
+    let send = {
+        let events = events.clone();
+        let wake = wake.clone();
+        move |event| {
+            if events.send(event).is_ok() {
+                wake.notify();
+            }
+        }
+    };
+    let started = send.clone();
     tts.on_utterance_begin(move |id| {
         if let Some(log) = &event_log {
             write_speech_event(log, "begin");
         }
-        let _ = started.send(NativeEvent::Started(id));
+        started(NativeEvent::Started(id));
     })?;
-    let completed = events.clone();
-    tts.on_utterance_end(move |id| {
-        let _ = completed.send(NativeEvent::Completed(id));
-    })?;
-    let cancelled = events.clone();
-    tts.on_utterance_stop(move |id| {
-        let _ = cancelled.send(NativeEvent::Cancelled(id));
-    })?;
+    let completed = send.clone();
+    tts.on_utterance_end(move |id| completed(NativeEvent::Completed(id)))?;
+    let cancelled = send.clone();
+    tts.on_utterance_stop(move |id| cancelled(NativeEvent::Cancelled(id)))?;
+    #[cfg(windows)]
+    tts.on_utterance_failure(move |id| send(NativeEvent::Failed(id)))?;
     #[cfg(target_vendor = "apple")]
     {
-        let ranges = events.clone();
-        tts.on_utterance_range(move |id, start, _length| {
-            let _ = ranges.send(NativeEvent::Range { id, start });
+        tts.on_utterance_range(move |id, start, length| {
+            send(NativeEvent::Range { id, start, length });
         })?;
     }
     Ok(())
 }
 
-fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError> {
+fn handle_request(request: Request, state: &mut State<'_>) -> Result<Value, RpcError> {
     log_request(&request, state)?;
     if request.method == "initialize" && state.initialized {
         return Err(RpcError::invalid_request(
@@ -1061,7 +1886,7 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
     match request.method.as_str() {
         "speech.speak" => {
             let params: SpeakParams = params(request.params)?;
-            state.speak(params.utterance_id, params.text)?;
+            state.speak(params)?;
             value(AcceptedResult { accepted: true })
         }
         "speech.stop" => {
@@ -1115,7 +1940,7 @@ fn value<T: serde::Serialize>(value: T) -> Result<Value, RpcError> {
     serde_json::to_value(value).map_err(|error| RpcError::internal_error(error.to_string()))
 }
 
-fn log_request(request: &Request, state: &mut State) -> Result<(), RpcError> {
+fn log_request(request: &Request, state: &mut State<'_>) -> Result<(), RpcError> {
     let Some(log) = &mut state.rpc_log else {
         return Ok(());
     };
@@ -1142,41 +1967,6 @@ fn log_request(request: &Request, state: &mut State) -> Result<(), RpcError> {
 }
 
 /// Ensure a native speech host cannot survive an abruptly terminated Lector.
-#[cfg(unix)]
-fn start_parent_watchdog(expected_parent_pid: u32) -> Result<()> {
-    std::thread::Builder::new()
-        .name("lector-speech-parent-watchdog".to_owned())
-        .spawn(move || {
-            loop {
-                let actual_parent_pid = nix::unistd::getppid().as_raw().cast_unsigned();
-                if actual_parent_pid != expected_parent_pid {
-                    // SAFETY: the owning process is gone and arbitrary native
-                    // destructors must not keep this helper alive.
-                    unsafe { nix::libc::_exit(1) };
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        })
-        .map(|_| ())
-        .context("start native speech parent watchdog")
-}
-
-#[cfg(not(unix))]
-fn start_parent_watchdog(_expected_parent_pid: u32) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(target_vendor = "apple")]
-fn settle_platform_runloop() {
-    use core_foundation::runloop;
-    unsafe {
-        let _ = runloop::CFRunLoopRunInMode(runloop::kCFRunLoopDefaultMode, 0.01, 0);
-    }
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn settle_platform_runloop() {}
-
 fn configure_test_observation(tts: &Tts) -> Result<Option<SpeechEventLog>> {
     if std::env::var_os("LECTOR_SPEECH_TEST_MUTE").is_some() && tts.supported_features().volume {
         tts.set_volume(0.0)
@@ -1219,6 +2009,130 @@ mod tests {
     };
     use crate::{Error, Features, protocol::SettingSupport};
 
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn late_or_missing_native_ranges_keep_the_direction_pending_for_spoken_fallback() {
+        use super::{DirectionPlayback, DirectionalBatch, NativeEvent, NativeUtteranceId};
+        let id = NativeUtteranceId::AvFoundation(1);
+        let unrelated = NativeUtteranceId::AvFoundation(2);
+        let range = NativeEvent::Range {
+            id,
+            start: 0,
+            length: 3,
+        };
+
+        let live = DirectionalBatch::inspect(&[range, NativeEvent::Completed(unrelated)], id);
+        assert!(live.last_range.is_some() && !live.ended);
+        let later = NativeEvent::Range {
+            id,
+            start: 4,
+            length: 2,
+        };
+        let last = NativeEvent::Range {
+            id,
+            start: 7,
+            length: 3,
+        };
+        let queued = DirectionalBatch::inspect(&[range, later, last], id);
+        assert_eq!(queued.last_range, Some(7));
+        let coalesced = DirectionalBatch::inspect(&[range, NativeEvent::Completed(id)], id);
+        assert!(coalesced.last_range.is_some() && coalesced.ended);
+        let absent = DirectionalBatch::inspect(&[NativeEvent::Completed(id)], id);
+        assert!(absent.last_range.is_none() && absent.ended);
+        assert!(DirectionPlayback::Pending.needs_label(true));
+        assert!(DirectionPlayback::Failed.needs_label(true));
+        assert!(!DirectionPlayback::Played.needs_label(true));
+        assert!(!DirectionPlayback::Pending.needs_label(false));
+        assert!(!DirectionPlayback::Failed.needs_label(false));
+
+        // A coalesced range or failed audio output on A does not disable
+        // its voice's live route when B reports a usable range.
+        for playback in [DirectionPlayback::Pending, DirectionPlayback::Failed] {
+            assert!(!playback.shows_missing_word_ranges(coalesced.last_range.is_some()));
+        }
+        assert!(DirectionPlayback::Pending.shows_missing_word_ranges(absent.last_range.is_some()));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn resume_past_a_missed_link_preserves_one_completion_label() {
+        use super::{ActiveUtterance, DirectionPlayback, LiveCue, NativeUtteranceId};
+        use crate::protocol::{SoundCue, SoundCueAt, UtteranceId};
+        let id = NativeUtteranceId::AvFoundation(1);
+        let mut active = ActiveUtterance {
+            logical_id: UtteranceId::new("fixture"),
+            native_id: Some(id),
+            text: "one two".into(),
+            cues: vec![SoundCueAt {
+                cue: SoundCue::Link,
+                offset: 0,
+            }],
+            fallback: None,
+            direction_label: None,
+            deferred_label: None,
+            native_base: 0,
+            current_word: 4,
+            next_sequence: 0,
+            awaiting_stop: false,
+            started: true,
+            paused: true,
+        };
+        let live = LiveCue {
+            native_id: id,
+            offset: 0,
+            cue: SoundCue::Link,
+            playback: DirectionPlayback::Failed,
+            clock_logged: false,
+            saw_range: true,
+            cache_key: None,
+        };
+        active.remember_missed_link(Some(&live));
+        assert_eq!(active.cues_from(active.current_word), []);
+        active.remember_missed_link(None);
+        assert_eq!(active.deferred_label.take(), Some(SoundCue::Link));
+        assert_eq!(active.deferred_label.take(), None);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn spoken_cues_map_native_offsets_across_pause_and_resume() {
+        use super::SpokenFallback;
+        use crate::protocol::{SoundCue, SoundCueAt};
+        let mut fallback = SpokenFallback::new(
+            "éclair and apple",
+            &[
+                SoundCueAt {
+                    cue: SoundCue::Link,
+                    offset: 0,
+                },
+                SoundCueAt {
+                    cue: SoundCue::Link,
+                    offset: 12,
+                },
+            ],
+        );
+        assert_eq!(fallback.text, "link éclair and link apple");
+        assert_eq!(fallback.report_word(0), Some(0));
+        assert_eq!(fallback.report_word(5), Some(0));
+        assert_eq!(fallback.report_word(6), None);
+        assert_eq!(fallback.report_word(13), Some(8));
+
+        fallback.playback_base = fallback.word;
+        assert_eq!(&fallback.text[fallback.word..], "and link apple");
+        assert_eq!(fallback.report_word(0), Some(8));
+        assert_eq!(fallback.report_word(4), Some(12));
+        assert_eq!(fallback.report_word(9), Some(12));
+
+        let blank = SpokenFallback::new(
+            "",
+            &[SoundCueAt {
+                cue: SoundCue::Blank,
+                offset: 0,
+            }],
+        );
+        assert_eq!(blank.text, "blank");
+    }
+
     #[test]
     fn resume_suffix_starts_at_the_reported_utf8_word_boundary() {
         assert_eq!(resumable_suffix("héllo world", 7), Some("world"));
@@ -1247,8 +2161,30 @@ mod tests {
     }
 
     #[test]
+    fn controller_starts_need_a_marker_but_terminal_events_do_not() {
+        let lifecycle = super::native_lifecycle(true, true);
+        assert_eq!(
+            lifecycle.started.delivery,
+            super::DeliveryGuarantee::BestEffort
+        );
+        assert!(lifecycle.terminal.delivery.is_reliable());
+        assert!(
+            lifecycle
+                .terminal
+                .distinguishes
+                .iter()
+                .any(|reason| reason == "failed")
+        );
+        assert_eq!(
+            super::native_lifecycle(false, true),
+            super::LifecycleCapabilities::default()
+        );
+    }
+
+    #[test]
     fn native_capabilities_do_not_invent_settings_or_voice_controls() {
-        let unsupported = native_capabilities(Features::default());
+        let backend = crate::Backends::compiled()[0];
+        let unsupported = native_capabilities(backend, Features::default());
         assert_eq!(unsupported.settings.rate, SettingSupport::Unsupported);
         assert_eq!(unsupported.settings.pitch, SettingSupport::Unsupported);
         assert_eq!(unsupported.settings.volume, SettingSupport::Unsupported);
@@ -1256,22 +2192,28 @@ mod tests {
         assert!(!unsupported.voices.current);
         assert!(!unsupported.voices.select);
 
-        let independent_voice_operations = native_capabilities(Features {
-            voice: true,
-            get_voice: false,
-            ..Features::default()
-        });
+        let independent_voice_operations = native_capabilities(
+            backend,
+            Features {
+                voice: true,
+                get_voice: false,
+                ..Features::default()
+            },
+        );
         assert!(independent_voice_operations.voices.list);
         assert!(!independent_voice_operations.voices.current);
         assert!(independent_voice_operations.voices.select);
 
-        let configurable = native_capabilities(Features {
-            rate: true,
-            pitch: true,
-            volume: true,
-            get_voice: true,
-            ..Features::default()
-        });
+        let configurable = native_capabilities(
+            backend,
+            Features {
+                rate: true,
+                pitch: true,
+                volume: true,
+                get_voice: true,
+                ..Features::default()
+            },
+        );
         assert_eq!(configurable.settings.rate, SettingSupport::ReadWrite);
         assert_eq!(configurable.settings.pitch, SettingSupport::ReadWrite);
         assert_eq!(configurable.settings.volume, SettingSupport::ReadWrite);

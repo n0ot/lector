@@ -1,7 +1,7 @@
 use crate::{
     terminal::{
-        Color, HistoryPosition, SemanticKind as Osc133Kind, SemanticMark as Osc133Mark, Style,
-        TerminalSnapshot,
+        Color, HistoryPosition, LinkSpans, SemanticKind as Osc133Kind, SemanticMark as Osc133Mark,
+        Style, TerminalSnapshot,
     },
     view::View,
 };
@@ -330,21 +330,7 @@ impl ReviewDocument {
     }
 
     pub(crate) fn line_text(&self, row: usize) -> String {
-        let Some(row) = self.rows.get(row) else {
-            return String::new();
-        };
-        let mut text = String::new();
-        for cell in row.cells.iter().take(usize::from(row.end)) {
-            if cell.wide_continuation {
-                continue;
-            }
-            if cell.text.is_empty() {
-                text.push(' ');
-            } else {
-                text.push_str(&cell.text);
-            }
-        }
-        text
+        self.read_range(row, 0..self.line_end(row), 0..0).0
     }
 
     pub(crate) fn capture_cols(&self) -> u16 {
@@ -359,30 +345,53 @@ impl ReviewDocument {
         self.rows.get(row).is_some_and(|row| row.wrapped)
     }
 
-    pub(crate) fn text_between(&self, row: usize, start: u16, end: u16) -> String {
+    pub(crate) fn read_trimmed_range(
+        &self,
+        row: usize,
+        start: u16,
+        end: u16,
+    ) -> (String, Vec<Range<usize>>) {
+        let (text, mut links) = self.read_range(row, start..end, 0..0);
+        let trimmed = crate::terminal::trim_linked_text(&text, &mut links);
+        (trimmed.to_owned(), links)
+    }
+
+    fn read_range(
+        &self,
+        row: usize,
+        read: Range<u16>,
+        continued: Range<u16>,
+    ) -> (String, Vec<Range<usize>>) {
         let Some(source) = self.rows.get(row) else {
-            return String::new();
+            return (String::new(), Vec::new());
         };
         let mut text = String::new();
-        for cell in source
+        let mut links = LinkSpans::default();
+        for (col, cell) in source
             .cells
             .iter()
-            .skip(usize::from(start.min(self.capture_cols)))
-            .take(usize::from(
-                end.min(self.capture_cols)
-                    .saturating_sub(start.min(self.capture_cols)),
-            ))
+            .enumerate()
+            .take(usize::from(read.end))
+            .skip(usize::from(read.start))
         {
             if cell.wide_continuation {
                 continue;
             }
-            if cell.text.is_empty() {
-                text.push(' ');
+            let grapheme = if cell.text.is_empty() {
+                " "
             } else {
-                text.push_str(&cell.text);
-            }
+                &cell.text
+            };
+            links.visit(
+                text.len(),
+                grapheme,
+                cell.hyperlink
+                    .as_deref()
+                    .filter(|_| !continued.contains(&(col as u16))),
+            );
+            text.push_str(grapheme);
         }
-        text.trim().to_owned()
+        (text, links.spans)
     }
 
     pub(crate) fn first_text_col(&self, row: usize, start: u16, end: u16) -> Option<u16> {
@@ -401,6 +410,52 @@ impl ReviewDocument {
             .map_or("", |cell| cell.text.as_str())
     }
 
+    fn review_link(&self, position: HistoryPosition) -> Option<&str> {
+        let cell = self.cell(position.row, position.col)?;
+        let lead = if cell.wide_continuation {
+            self.cell(position.row, position.col.checked_sub(1)?)?
+        } else {
+            cell
+        };
+        lead.hyperlink.as_deref()
+    }
+
+    pub(crate) fn left_review_link(
+        &self,
+        previous: HistoryPosition,
+        current: HistoryPosition,
+    ) -> bool {
+        self.review_link(previous).is_some() && self.review_link(current).is_none()
+    }
+
+    fn continued_link(
+        &self,
+        previous: Option<HistoryPosition>,
+        current: HistoryPosition,
+        read: Range<u16>,
+    ) -> Range<u16> {
+        crate::terminal::continued_link(
+            previous,
+            current,
+            read,
+            self.capture_cols,
+            |row, col| self.review_link(HistoryPosition { row, col }),
+            |row| self.is_wrapped_row(row),
+        )
+    }
+
+    fn cursor_word_readback(
+        &self,
+        previous: HistoryPosition,
+        current: HistoryPosition,
+        range: Range<u16>,
+    ) -> (String, Vec<Range<usize>>) {
+        let continued = self.continued_link(Some(previous), current, range.clone());
+        let (text, mut links) = self.read_range(current.row, range, continued);
+        let trimmed = crate::terminal::trim_linked_text(&text, &mut links);
+        (trimmed.to_owned(), links)
+    }
+
     /// Describe the destination from document coordinates, independently of
     /// scrolling, clipping, or the physical width of a Unicode grapheme.
     pub(crate) fn cursor_feedback(
@@ -410,14 +465,20 @@ impl ReviewDocument {
     ) -> crate::application_accessibility::ApplicationAccessibilitySpeech {
         use crate::application_accessibility::ApplicationAccessibilitySpeech;
         if previous.is_none_or(|previous| previous.row != current.row) {
-            let line = self.line_text(current.row);
+            let range = 0..self.line_end(current.row);
+            let continued = self.continued_link(previous, current, range.clone());
+            let (line, mut links) = self.read_range(current.row, range, continued);
+            let blank = line.trim().is_empty();
             return ApplicationAccessibilitySpeech {
-                text: if line.trim().is_empty() {
+                text: if blank {
+                    crate::terminal::trim_linked_text(&line, &mut links);
                     "blank".into()
                 } else {
                     line
                 },
                 indentation: Some(self.line_first_nonblank(current.row)),
+                links,
+                cue: blank.then_some(crate::speech::protocol::SoundCue::Blank),
             };
         }
         let previous = previous.unwrap();
@@ -429,24 +490,44 @@ impl ReviewDocument {
                 .filter(|cell| !cell.wide_continuation)
                 .count()
         });
-        let word = self.keyword_bounds(current);
-        let text = if distance > 1
-            && let Some((start, end)) = word
+        let (text, links, cue) = if distance > 1
+            && let Some((start, end)) = self.keyword_bounds(current)
             && Some(start) != self.keyword_bounds(previous).map(|bounds| bounds.0)
         {
-            self.text_between(current.row, start, end)
+            let (text, links) = self.cursor_word_readback(previous, current, start..end);
+            (text, links, None)
         } else {
-            match self.cell_text(current) {
-                "" => "blank".into(),
-                " " => "space".into(),
-                "\t" => "tab".into(),
-                text if text.chars().all(char::is_whitespace) => "blank".into(),
-                text => text.into(),
+            use crate::speech::protocol::SoundCue;
+            let text = self.cell_text(current);
+            let (spoken, cue) = match text {
+                " " => ("space", None),
+                "\t" => ("tab", None),
+                text if text.chars().all(char::is_whitespace) => {
+                    (SoundCue::Blank.spoken_label(), Some(SoundCue::Blank))
+                }
+                text => (text, None),
+            };
+            let mut links = LinkSpans::default();
+            links.visit(
+                0,
+                text,
+                self.cell(current.row, current.col)
+                    .and_then(|cell| cell.hyperlink.as_deref())
+                    .filter(|_| {
+                        self.continued_link(Some(previous), current, current.col..current.col + 1)
+                            .is_empty()
+                    }),
+            );
+            if spoken != text {
+                crate::terminal::trim_linked_text(text, &mut links.spans);
             }
+            (spoken.into(), links.spans, cue)
         };
         ApplicationAccessibilitySpeech {
             text,
             indentation: None,
+            links,
+            cue,
         }
     }
 
@@ -456,13 +537,45 @@ impl ReviewDocument {
         current: HistoryPosition,
     ) -> crate::application_accessibility::ApplicationAccessibilitySpeech {
         if previous.row != current.row {
-            return self.cursor_feedback(None, current);
+            return self.cursor_feedback(Some(previous), current);
         }
-        let mut feedback = self.cursor_feedback(Some(current), current);
+        let mut feedback = self.cursor_feedback(Some(previous), current);
         if let Some((start, end)) = self.keyword_bounds(current) {
-            feedback.text = self.text_between(current.row, start, end);
+            (feedback.text, feedback.links) =
+                self.cursor_word_readback(previous, current, start..end);
+            feedback.cue = None;
         }
         feedback
+    }
+
+    pub(crate) fn link_exit_word_readback(
+        &self,
+        current: HistoryPosition,
+        style: WordStyle,
+    ) -> (String, Vec<Range<usize>>) {
+        let cells = &self.positions;
+        let Ok(index) = cells.binary_search(&current) else {
+            return (self.cell_text(current).into(), Vec::new());
+        };
+        if self.word_class(current, style) == 0 {
+            return (self.cell_text(current).into(), Vec::new());
+        }
+        let mut first = index;
+        let mut last = index;
+        while first > 0 && self.same_word(cells[first - 1], cells[first], style) {
+            first -= 1;
+        }
+        while last + 1 < cells.len() && self.same_word(cells[last], cells[last + 1], style) {
+            last += 1;
+        }
+        let mut text = String::new();
+        let mut links = LinkSpans::default();
+        for &position in &cells[first..=last] {
+            let grapheme = self.cell_text(position);
+            links.visit(text.len(), grapheme, self.review_link(position));
+            text.push_str(grapheme);
+        }
+        (text, links.spans)
     }
 
     fn keyword_bounds(&self, position: HistoryPosition) -> Option<(u16, u16)> {
@@ -1285,6 +1398,32 @@ mod tests {
     }
 
     #[test]
+    fn word_exit_readback_includes_the_linked_suffix_across_a_soft_wrap() {
+        let doc = ReviewDocument::from_text(3, 8, b"\x1b]8;;https://example.invalid\x1b\\link\x1b]8;;\x1b\\ abc\x1b]8;;https://example.invalid\x1b\\def\x1b]8;;\x1b\\ end");
+        let destination = pos(0, 5);
+        assert!(doc.left_review_link(pos(0, 0), destination));
+        let (text, links) = doc.link_exit_word_readback(destination, super::WordStyle::Word);
+        let suffix = 3..6;
+        assert_eq!(text, "abcdef");
+        assert_eq!(links, std::slice::from_ref(&suffix));
+    }
+
+    #[test]
+    fn cursor_links_follow_contiguous_runs_across_words_and_soft_wraps() {
+        let doc = ReviewDocument::from_text(4, 6, b".\x1b]8;;https://example.invalid\x1b\\ab cdef\x1b]8;;\x1b\\.\x1b]8;;https://example.invalid\x1b\\gh\x1b]8;;\x1b\\");
+        let spans = |from, to| doc.cursor_feedback(Some(from), to).links;
+        assert!(!spans(pos(0, 0), pos(0, 1)).is_empty());
+        assert!(spans(pos(0, 1), pos(0, 2)).is_empty());
+        assert!(spans(pos(0, 2), pos(0, 3)).is_empty());
+        assert!(spans(pos(0, 1), pos(0, 4)).is_empty());
+        // The wrapped readback still identifies the other link on this row.
+        let other = 3..5;
+        assert_eq!(spans(pos(0, 5), pos(1, 0)), std::slice::from_ref(&other));
+        assert!(!spans(pos(1, 0), pos(1, 3)).is_empty());
+        assert!(!spans(pos(1, 2), pos(1, 1)).is_empty());
+    }
+
+    #[test]
     fn word_search_selects_keyword_then_nonblank_fallback_on_logical_line() {
         let (document, _) =
             ReviewDocument::from_lines(&["  -- alpha.beta  [.*]".into(), "next".into()], 8);
@@ -1447,9 +1586,17 @@ mod tests {
         let line = document.cursor_feedback(Some(pos(0, 8)), pos(1, 2));
         assert_eq!(line.text, "  indented");
         assert_eq!(line.indentation, Some(2));
+        let blank_line = document.cursor_feedback(Some(pos(1, 2)), pos(2, 0));
+        assert_eq!(blank_line.text, "blank");
         assert_eq!(
-            document.cursor_feedback(Some(pos(1, 2)), pos(2, 0)).text,
-            "blank"
+            blank_line.cue,
+            Some(crate::speech::protocol::SoundCue::Blank)
+        );
+        let blank_character = document.cursor_feedback(Some(pos(2, 1)), pos(2, 0));
+        assert_eq!(blank_character.text, "blank");
+        assert_eq!(
+            blank_character.cue,
+            Some(crate::speech::protocol::SoundCue::Blank)
         );
     }
 

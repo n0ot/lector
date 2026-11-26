@@ -1346,11 +1346,9 @@ fn nested_lector_output_and_bells_are_visible_to_the_outer_lector() {
         lector.outer_speech()
     );
     lector.clear_speech_logs();
-    // Move the outer review cursor onto the blank row before the nested full
-    // repaint. Blank review lines are intentionally silent, so use a complete
-    // Kitty event and the nested READY output below as the synchronization
-    // barrier rather than waiting for obsolete "blank" speech.
+    // Confirm that review reached the blank row before starting the nested screen.
     lector.send(b"\x1b[111;3u");
+    assert!(lector.wait_for_outer_speech(Duration::from_secs(2), "blank"));
     lector.send(b"n");
     assert!(
         lector.wait_for(Duration::from_secs(2), |output| output

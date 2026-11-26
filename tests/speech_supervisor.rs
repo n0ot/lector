@@ -1,5 +1,6 @@
 use lector::speech::{
     Driver, SpeechServerSpec,
+    protocol::PROTOCOL_MAX_MINOR,
     supervisor::{Supervisor, SupervisorEvent},
 };
 use serde_json::Value;
@@ -141,7 +142,7 @@ fn real_process_startup_retries_once_after_the_first_generation_fails() {
             && record["method"] == "initialize"
             && record["identity"] == "retry"
             && record["params"]["protocol"]["minimumMinor"] == 2
-            && record["params"]["protocol"]["maximumMinor"] == 2
+            && record["params"]["protocol"]["maximumMinor"] == PROTOCOL_MAX_MINOR
     }));
     assert!(records.iter().any(|record| {
         record["generation"] == 2

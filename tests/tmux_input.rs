@@ -328,6 +328,23 @@ fn tick_commands(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>) -
 }
 
 #[test]
+fn accessibility_capabilities_reply_targets_the_querying_tmux_pane() {
+    let (mut app, mut sr, mut physical) = ready_split_app();
+    app.handle_pty(
+        &mut sr,
+        b"%output %20 \x5c033[6n\x5c033_Lector;A11y;1;query;7\x5c033\x5c134\n",
+        &mut physical,
+    )
+    .unwrap();
+    let commands = tick_commands(&mut app, &mut sr, &mut physical);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(
+        decode_send_keys(&commands, PaneId(20)),
+        b"\x1b_Lector;A11y;1;capabilities;7;cue=blank;link=1;inline=link\x1b\\"
+    );
+}
+
+#[test]
 fn application_harness_routes_keyboard_paste_focus_mouse_queries_and_latest_size() {
     let (mut app, mut sr, mut physical) = ready_split_app();
     let protocols: &[(&[u8], &[u8])] = &[
@@ -670,6 +687,7 @@ fn real_tmux_byte_echo_paste_mouse_resize_and_output_flood_harness() {
         "/usr/bin/perl -e '$|=1; system q(stty raw -echo); print q(READY); ",
         "$m=0; while (sysread(STDIN,$c,1)) { $n=ord($c); ",
         "if ($n==126 && !$m) { $m=1; print qq(\\e[?2004h\\e[?1004h\\e[?1000h\\e[?1006hMODES); } ",
+        "elsif ($n==94) { print qq(\\e_Lector;A11y;1;query;13\\e\\\\); } ",
         "elsif ($n==33) { print q(F) x 131072; } ",
         "else { printf qq(%02x), $n; } }'",
     );
@@ -719,6 +737,26 @@ fn real_tmux_byte_echo_paste_mouse_resize_and_output_flood_harness() {
         writer.as_mut(),
         &mut physical,
         |app| app.debug_active_view_contents().contains("READY"),
+    );
+
+    send_real_input(&mut app, &mut sr, writer.as_mut(), &mut physical, b"^");
+    let expected = b"\x1b_Lector;A11y;1;capabilities;13;cue=blank;link=1;inline=link\x1b\\"
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    drive_real_tmux_until(
+        "application accessibility capability round trip",
+        &mut app,
+        &mut sr,
+        &receiver,
+        writer.as_mut(),
+        &mut physical,
+        |app| {
+            app.debug_active_view_contents()
+                .split_whitespace()
+                .collect::<String>()
+                .contains(&expected)
+        },
     );
 
     send_real_input(&mut app, &mut sr, writer.as_mut(), &mut physical, b"~");

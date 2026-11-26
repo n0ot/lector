@@ -9,7 +9,11 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MIN_MINOR: u16 = 0;
-pub const PROTOCOL_MAX_MINOR: u16 = 2;
+pub const PROTOCOL_MAX_MINOR: u16 = 6;
+pub const LINK_EXIT_PROTOCOL_MINOR: u16 = 6;
+pub const STANDALONE_CUE_PAIR_PROTOCOL_MINOR: u16 = 5;
+pub const DIRECTIONAL_OVERLAY_PROTOCOL_MINOR: u16 = 4;
+pub const SOUND_CUES_PROTOCOL_MINOR: u16 = 3;
 /// First protocol minor whose rate domain is independent of the native backend.
 pub const NORMALIZED_RATE_PROTOCOL_MINOR: u16 = 2;
 pub const MIN_RATE: f32 = 0.0;
@@ -309,6 +313,109 @@ pub struct VoiceCapabilities {
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SoundCue {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Blank,
+    Link,
+    LinkExit,
+}
+
+impl SoundCue {
+    #[cfg(any(target_vendor = "apple", windows, test))]
+    pub(crate) const fn wav(self) -> &'static [u8] {
+        match self {
+            Self::Top => include_bytes!("../assets/top.wav"),
+            Self::Bottom => include_bytes!("../assets/bottom.wav"),
+            Self::Left => include_bytes!("../assets/left.wav"),
+            Self::Right => include_bytes!("../assets/right.wav"),
+            Self::Blank => include_bytes!("../assets/blank.wav"),
+            Self::LinkExit => include_bytes!("../assets/link-exit.wav"),
+            Self::Link => include_bytes!("../assets/link.wav"),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_direction(self) -> bool {
+        matches!(self, Self::Top | Self::Bottom | Self::Left | Self::Right)
+    }
+
+    /// The spoken label used when the cue cannot be played.
+    #[must_use]
+    pub const fn spoken_label(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Blank => "blank",
+            Self::Link => "link",
+            Self::LinkExit => "out of link",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SoundCueAt {
+    pub cue: SoundCue,
+    /// Byte offset in the UTF-8 text.
+    pub offset: usize,
+}
+
+impl SoundCueAt {
+    #[must_use]
+    pub fn valid_for(text: &str, cues: &[Self]) -> bool {
+        Self::valid_for_protocol(text, cues, ProtocolVersion::current())
+    }
+
+    #[must_use]
+    pub fn valid_for_protocol(text: &str, cues: &[Self], version: ProtocolVersion) -> bool {
+        if !cues.is_empty()
+            && (version.major != PROTOCOL_MAJOR || version.minor < SOUND_CUES_PROTOCOL_MINOR)
+        {
+            return false;
+        }
+        if version.minor < LINK_EXIT_PROTOCOL_MINOR
+            && cues.iter().any(|cue| cue.cue == SoundCue::LinkExit)
+        {
+            return false;
+        }
+        if text.is_empty() {
+            return match cues {
+                [cue] => cue.offset == 0 && cue.cue != SoundCue::Link,
+                [direction, blank] => {
+                    version.minor >= STANDALONE_CUE_PAIR_PROTOCOL_MINOR
+                        && (direction.cue.is_direction() || direction.cue == SoundCue::LinkExit)
+                        && blank.cue == SoundCue::Blank
+                        && direction.offset == 0
+                        && blank.offset == 0
+                }
+                _ => false,
+            };
+        }
+        let cues = match cues {
+            [first, rest @ ..]
+                if (first.cue.is_direction()
+                    || (first.cue == SoundCue::LinkExit && rest.is_empty()))
+                    && first.offset == 0
+                    && version.minor >= DIRECTIONAL_OVERLAY_PROTOCOL_MINOR =>
+            {
+                rest
+            }
+            _ => cues,
+        };
+        cues.iter().all(|cue| {
+            cue.cue == SoundCue::Link
+                && cue.offset < text.len()
+                && text.is_char_boundary(cue.offset)
+        }) && cues.windows(2).all(|pair| pair[0].offset < pair[1].offset)
+    }
+}
+
 /// Host guarantees negotiated for one process generation. Missing or unknown
 /// members are unsupported. New optional members can therefore be added
 /// without changing the protocol major version.
@@ -324,6 +431,9 @@ pub struct SpeechCapabilities {
     pub settings: SettingCapabilities,
     #[serde(default)]
     pub voices: VoiceCapabilities,
+    /// Supports standalone cues and synchronized link overlays.
+    #[serde(default, rename = "soundCues")]
+    pub sound_cues: bool,
     #[serde(default, flatten)]
     pub extensions: BTreeMap<String, serde_json::Value>,
 }
@@ -397,6 +507,9 @@ impl SpeechCapabilities {
             self.settings.pitch = SettingSupport::Unsupported;
             self.settings.volume = SettingSupport::Unsupported;
         }
+        if version.minor < SOUND_CUES_PROTOCOL_MINOR {
+            self.sound_cues = false;
+        }
         self
     }
 
@@ -412,6 +525,8 @@ impl SpeechCapabilities {
 pub struct SpeakParams {
     pub utterance_id: UtteranceId,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cues: Vec<SoundCueAt>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -530,6 +645,95 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn link_exit_requires_two_six_and_a_character_onset() {
+        let exit = SoundCueAt {
+            cue: SoundCue::LinkExit,
+            offset: 0,
+        };
+        let blank = SoundCueAt {
+            cue: SoundCue::Blank,
+            offset: 0,
+        };
+        let previous = ProtocolVersion { major: 2, minor: 5 };
+        for (text, cues) in [("next", vec![exit]), ("", vec![exit, blank])] {
+            assert!(SoundCueAt::valid_for(text, &cues));
+            assert!(!SoundCueAt::valid_for_protocol(text, &cues, previous));
+        }
+        assert!(!SoundCueAt::valid_for(
+            "next",
+            &[SoundCueAt { offset: 1, ..exit }]
+        ));
+    }
+
+    #[test]
+    fn simultaneous_direction_and_blank_require_protocol_two_five() {
+        let edge = SoundCueAt {
+            cue: SoundCue::Bottom,
+            offset: 0,
+        };
+        let blank = SoundCueAt {
+            cue: SoundCue::Blank,
+            offset: 0,
+        };
+        let old = ProtocolVersion { major: 2, minor: 4 };
+        assert!(SoundCueAt::valid_for_protocol("", &[edge], old));
+        assert!(!SoundCueAt::valid_for_protocol("", &[edge, blank], old));
+        assert!(SoundCueAt::valid_for("", &[edge, blank]));
+        assert!(!SoundCueAt::valid_for("", &[blank, edge]));
+        assert!(!SoundCueAt::valid_for("", &[edge, edge]));
+        assert!(!SoundCueAt::valid_for("row", &[edge, blank]));
+    }
+
+    #[test]
+    fn directional_overlay_requires_protocol_two_four() {
+        let direction = SoundCueAt {
+            cue: SoundCue::Right,
+            offset: 0,
+        };
+        let link = SoundCueAt {
+            cue: SoundCue::Link,
+            offset: 0,
+        };
+        let old = ProtocolVersion { major: 2, minor: 3 };
+        let current = ProtocolVersion::current();
+        assert!(!SoundCueAt::valid_for_protocol(
+            "text",
+            &[direction, link],
+            old
+        ));
+        assert!(SoundCueAt::valid_for_protocol("", &[direction], old));
+        assert!(SoundCueAt::valid_for_protocol("text", &[link], old));
+        assert!(SoundCueAt::valid_for_protocol(
+            "text",
+            &[direction, link],
+            current
+        ));
+        assert!(!SoundCueAt::valid_for_protocol(
+            "text",
+            &[link, direction],
+            current
+        ));
+        assert!(!SoundCueAt::valid_for_protocol(
+            "text",
+            &[direction, direction],
+            current
+        ));
+        assert!(!SoundCueAt::valid_for_protocol(
+            "text",
+            &[SoundCueAt {
+                offset: 1,
+                ..direction
+            }],
+            current
+        ));
+        assert!(!SoundCueAt::valid_for_protocol(
+            "é",
+            &[direction, SoundCueAt { offset: 1, ..link }],
+            current
+        ));
+    }
+
+    #[test]
     fn version_ranges_choose_the_highest_mutual_minor() {
         let current = ProtocolRange::current();
         assert_eq!(
@@ -546,7 +750,7 @@ mod tests {
                 minimum_minor: 0,
                 maximum_minor: 9,
             }),
-            Some(ProtocolVersion { major: 2, minor: 2 })
+            Some(ProtocolVersion::current())
         );
         assert_eq!(
             current.highest_mutual(ProtocolRange {

@@ -4,6 +4,34 @@ Lector speaks through your system's text-to-speech out of the box. This page
 covers how to control speech, tune the voice, and use a different speech
 server.
 
+## Sound cues
+
+Lector plays short cues at review cursor boundaries and when inspecting a
+blank character or blank line. With spoken feedback, Lector says “blank” in both cases.
+Direction cues play over the spoken readback when the command
+also reads text. At the top or bottom of a blank line, or the left or right edge on a blank
+character, a compatible host plays the boundary and blank cues together. Lector identifies an OSC 8
+hyperlink when review navigation enters it from either direction. Moving through
+characters, words, or a soft wrap within that link continues reading its text.
+Stepping out of a link by character or word plays a lower version of the link sound,
+or says “out of link” with spoken feedback. Whole-line reads announce link
+entries only. Explicitly reading linked text also identifies the link.
+Set `lector.o.tones = false` to use
+spoken labels for boundaries, blanks, and links. Reading `lector.o.tones` returns
+true only when tones are enabled and the active speech host supports them.
+
+The bundled speech host plays cues through AVFoundation on macOS 13 or later.
+On Windows, use NVDA 2024.1 or later with a version 2 or newer NVDA Controller
+Client DLL matching the architecture of `lector-tts.exe`. Put the DLL beside
+the executable and start NVDA before launching the host. Older controllers
+use spoken labels. If a link starts partway through a word, the NVDA backend
+finishes that word and says “link” to preserve its pronunciation.
+
+When you connect remotely, the cues play on the machine running the speech
+host. The NVDA backend plays cues through the Windows default
+audio output. If you selected another output device in NVDA, choose that same
+device as the Windows default to hear speech and cues together.
+
 ## Controlling speech
 
 - `M-x` pauses or resumes speech. Typing pauses it too.

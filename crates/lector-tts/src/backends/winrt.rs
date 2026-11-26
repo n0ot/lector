@@ -165,6 +165,7 @@ impl Backend for WinRt {
             get_voice: true,
             utterance_callbacks: true,
             synthesis: true,
+            sound_cues: false,
         }
     }
 

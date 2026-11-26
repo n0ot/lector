@@ -302,10 +302,21 @@ impl RowSnapshot {
     /// Appends the visible text in a range of physical cells without
     /// allocating an intermediate string. Trailing blank cells remain omitted.
     pub fn append_contents_range_to(&self, output: &mut String, start: usize, width: usize) {
+        self.append_contents_range_with_cells(output, start, width, |_, _, _| {});
+    }
+
+    /// Reports each emitted grapheme's byte offset and physical cell.
+    pub fn append_contents_range_with_cells<'a>(
+        &'a self,
+        output: &mut String,
+        start: usize,
+        width: usize,
+        mut visit: impl FnMut(usize, usize, &'a CellSnapshot),
+    ) {
         let end = start.saturating_add(width).min(self.cells.len());
         let start = start.min(end);
         let mut pending_spaces = 0;
-        for cell in &self.cells[start..end] {
+        for (offset, cell) in self.cells[start..end].iter().enumerate() {
             if cell.continuation {
                 continue;
             }
@@ -314,6 +325,7 @@ impl RowSnapshot {
             } else {
                 output.extend(std::iter::repeat_n(' ', pending_spaces));
                 pending_spaces = 0;
+                visit(output.len(), start + offset, cell);
                 output.push_str(&cell.grapheme);
             }
         }
@@ -482,6 +494,7 @@ pub enum PrintBoundarySnapshot {
 pub struct PrintedRunSnapshot {
     pub text: String,
     pub boundary: PrintBoundarySnapshot,
+    pub hyperlink: Option<u64>,
 }
 
 /// A non-authoritative operation hint observed in the same VT stream Ghostty
@@ -640,6 +653,7 @@ pub struct DiagnosticSnapshot {
     bytes: Vec<u8>,
     observer_continuation: Vec<u8>,
     active_hyperlink: Option<String>,
+    hyperlink_generation: u64,
     scrollback_capacity: usize,
     terminal_profile: TerminalProfile,
     primary_history_origin: usize,
@@ -1558,6 +1572,7 @@ struct StreamObserver {
     history_cleared: bool,
     history_changed: bool,
     active_hyperlink: Option<String>,
+    hyperlink_generation: u64,
     clipboard_read_queries: Vec<Vec<u8>>,
     default_color_queries: Vec<u8>,
     synchronized_output_boundary: Option<bool>,
@@ -1842,6 +1857,10 @@ impl StreamObserver {
         self.printed_runs.push(PrintedRunSnapshot {
             text: std::mem::take(&mut self.current_print),
             boundary: PrintBoundarySnapshot::Continue,
+            hyperlink: self
+                .active_hyperlink
+                .as_ref()
+                .map(|_| self.hyperlink_generation),
         });
     }
 
@@ -1861,6 +1880,7 @@ impl StreamObserver {
         self.printed_runs.push(PrintedRunSnapshot {
             text: String::new(),
             boundary,
+            hyperlink: None,
         });
     }
 
@@ -2035,6 +2055,7 @@ impl vte::Perform for StreamObserver {
                     uri
                 },
             );
+            self.hyperlink_generation = self.hyperlink_generation.wrapping_add(1);
             self.active_hyperlink = if uri.is_empty() {
                 None
             } else {
@@ -2375,6 +2396,7 @@ impl vte::Perform for StreamObserver {
             }
             b'c' => {
                 self.terminal_reset = true;
+                self.active_hyperlink = None;
                 self.scroll_region = None;
                 self.origin_mode = false;
                 self.left_right_margin_mode = false;
@@ -2869,6 +2891,7 @@ impl Terminal {
             bytes: snapshot_bytes(&self.terminal)?,
             observer_continuation: continuation_bytes(&self.terminal)?,
             active_hyperlink: self.stream_observer.active_hyperlink.clone(),
+            hyperlink_generation: self.stream_observer.hyperlink_generation,
             scrollback_capacity: self.scrollback_capacity,
             terminal_profile: self.effect_sink.terminal_profile.clone(),
             primary_history_origin: self.primary_history_origin,
@@ -2883,6 +2906,7 @@ impl Terminal {
             bytes,
             observer_continuation,
             active_hyperlink,
+            hyperlink_generation,
             scrollback_capacity,
             terminal_profile,
             primary_history_origin,
@@ -2916,6 +2940,7 @@ impl Terminal {
         stream_observer.begin_update(&TerminalSnapshot::default());
         let _ = stream_observer.take_update(&TerminalSnapshot::default());
         stream_observer.active_hyperlink = active_hyperlink;
+        stream_observer.hyperlink_generation = hyperlink_generation;
         let mut result = Self {
             row_cells,
             row_iterator,

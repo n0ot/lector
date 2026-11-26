@@ -7,7 +7,7 @@
 
 use super::{
     CapabilityStatus, Driver, OptionState, ReaderSpeechEvent, ReaderSupport, SetOptionOutcome,
-    SpeechServerSpec, UtteranceBoundary,
+    SpeechCues, SpeechServerSpec, UtteranceBoundary,
     manager::{Host, SpeechManager},
     proc_driver,
     protocol::{NORMAL_RATE, SettingSupport, UtteranceId, VoiceInfo, rate_is_normalized},
@@ -25,7 +25,6 @@ const CRASH_WINDOW: Duration = Duration::from_secs(30);
 const MAX_EVENTS: usize = 32;
 const MAX_PENDING_SPEECH_BYTES: usize = 256 * 1024;
 const MAX_PENDING_SPEECH_ITEM_BYTES: usize = 64 * 1024;
-const TRUNCATION_SUFFIX: &str = " … speech truncated";
 
 /// A lifecycle transition for the main event loop to consume.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -305,6 +304,7 @@ struct PendingSpeech {
     text: String,
     interrupt: bool,
     boundary: UtteranceBoundary,
+    cues: SpeechCues,
 }
 
 impl PendingSpeech {
@@ -312,6 +312,7 @@ impl PendingSpeech {
         std::mem::size_of::<Self>()
             .saturating_add(self.id.as_str().len())
             .saturating_add(self.text.len())
+            .saturating_add(self.cues.queue_bytes())
     }
 }
 
@@ -613,6 +614,7 @@ impl Supervisor {
         let pitch_supported = capabilities.settings.pitch.can_write();
         let volume_supported = capabilities.settings.volume.can_write();
         let mut state = OptionState {
+            sound_cues: process.host.supports_sound_cues(),
             rate: (legacy || self.desired_rate_configured).then_some(self.desired_rate),
             rate_status: if rate_supported {
                 CapabilityStatus::Supported
@@ -731,12 +733,13 @@ impl Supervisor {
                 .pending_speech_bytes
                 .saturating_sub(pending.queue_bytes());
             if let Err(error) = self.call_managed("speak", move |manager, host| {
-                manager.submit_with_boundary(
+                manager.submit_with_cues(
                     host,
                     pending.id,
                     pending.text,
                     pending.interrupt,
                     pending.boundary,
+                    pending.cues,
                 )
             }) {
                 if self.fatal_error.is_some() {
@@ -768,18 +771,20 @@ impl Supervisor {
         text: &str,
         interrupt: bool,
         boundary: UtteranceBoundary,
+        mut cues: SpeechCues,
     ) {
         if interrupt {
             self.pending_speech.clear();
             self.pending_speech_bytes = 0;
             self.pending_speech_paused = false;
         }
-        let text = bounded_text(text, MAX_PENDING_SPEECH_ITEM_BYTES);
+        let text = cues.bound_text(text, MAX_PENDING_SPEECH_ITEM_BYTES);
         let pending = PendingSpeech {
             id,
             text,
             interrupt,
             boundary,
+            cues,
         };
         let pending_bytes = pending.queue_bytes();
         while self.pending_speech_bytes.saturating_add(pending_bytes) > MAX_PENDING_SPEECH_BYTES {
@@ -970,7 +975,19 @@ impl Driver for Supervisor {
         interrupt: bool,
         boundary: UtteranceBoundary,
     ) -> DriverResult<()> {
-        if text.is_empty() {
+        self.speak_utterance_with_cues(id, text, interrupt, boundary, SpeechCues::None)
+    }
+
+    fn speak_utterance_with_cues(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+        boundary: UtteranceBoundary,
+        cues: SpeechCues,
+    ) -> DriverResult<()> {
+        anyhow::ensure!(cues.valid_for(text), "invalid speech cue offsets");
+        if text.is_empty() && cues == SpeechCues::None {
             return Ok(());
         }
         if !self.started {
@@ -982,7 +999,7 @@ impl Driver for Supervisor {
                 self.pending_speech_bytes = 0;
                 self.pending_speech_paused = false;
             }
-            self.buffer_speech(id.clone(), text, interrupt, boundary);
+            self.buffer_speech(id.clone(), text, interrupt, boundary, cues);
             return Ok(());
         }
         if self.pending_speech_paused {
@@ -991,7 +1008,7 @@ impl Driver for Supervisor {
             self.pending_speech_paused = false;
         }
         self.call_managed("speak", |manager, host| {
-            manager.submit_with_boundary(host, id.clone(), text.to_owned(), interrupt, boundary)
+            manager.submit_with_cues(host, id.clone(), text.to_owned(), interrupt, boundary, cues)
         })
     }
 
@@ -1215,21 +1232,6 @@ fn warn_option_failure(operation: &str, error: &anyhow::Error) {
         "warning",
         &format!("speech host failed while {operation}: {error:#}"),
     );
-}
-
-fn bounded_text(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_owned();
-    }
-    let prefix_limit = limit.saturating_sub(TRUNCATION_SUFFIX.len());
-    let mut end = prefix_limit.min(text.len());
-    while !text.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    let mut bounded = String::with_capacity(limit);
-    bounded.push_str(&text[..end]);
-    bounded.push_str(TRUNCATION_SUFFIX);
-    bounded
 }
 
 #[cfg(test)]
@@ -1882,6 +1884,54 @@ mod tests {
                 Call::Speak("replacement".to_owned(), false),
             ]
         );
+    }
+
+    #[test]
+    fn linked_blank_reaches_an_unordered_host_in_one_utterance() {
+        let harness = Harness::new();
+        let host = fake_state();
+        host.lock().unwrap().legacy = false;
+        harness.push_driver(host.clone());
+        let mut speech = crate::speech::Speech::new(Box::new(harness.supervisor));
+        speech.start().unwrap();
+        let mut reader = crate::screen_reader::ScreenReader::new(speech);
+        reader
+            .speak_linked_review_cue(crate::speech::protocol::SoundCue::Blank, true)
+            .unwrap();
+        assert!(
+            host.lock()
+                .unwrap()
+                .calls
+                .contains(&Call::Speak("link blank".into(), false))
+        );
+    }
+
+    #[test]
+    fn tone_availability_follows_the_active_host() {
+        let harness = Harness::new();
+        let host = fake_state();
+        {
+            let mut state = host.lock().unwrap();
+            state.legacy = false;
+            state.capabilities.sound_cues = true;
+        }
+        harness.push_driver(host.clone());
+        harness.push_driver(fake_state());
+        harness.push_driver(host);
+        let mut speech = crate::speech::Speech::new(Box::new(harness.supervisor));
+        speech.set_tones(true);
+        assert!(!speech.tones());
+        speech.start().unwrap();
+        assert!(speech.tones());
+        speech
+            .configure_server(SpeechServerSpec::Process {
+                program: "fixture".into(),
+                args: vec![],
+            })
+            .unwrap();
+        assert!(!speech.tones());
+        speech.configure_server(SpeechServerSpec::Native).unwrap();
+        assert!(speech.tones());
     }
 
     #[test]

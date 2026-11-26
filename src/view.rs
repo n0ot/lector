@@ -17,6 +17,7 @@ use super::{
 use std::{
     cmp::min,
     collections::VecDeque,
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -61,7 +62,13 @@ impl AccessibilityJournalEntry {
                 .printed_runs
                 .len()
                 .saturating_mul(std::mem::size_of::<crate::terminal::PrintedRun>())
-                .saturating_add(report.printed_runs.iter().map(|run| run.text.len()).sum()),
+                .saturating_add(
+                    report
+                        .printed_runs
+                        .iter()
+                        .map(crate::terminal::PrintedRun::heap_bytes)
+                        .sum(),
+                ),
             crate::terminal::LinearOutputEffect::Preserve
             | crate::terminal::LinearOutputEffect::Clear => 0,
         };
@@ -76,7 +83,7 @@ impl AccessibilityJournalEntry {
                 update
                     .printed_runs
                     .iter()
-                    .map(|run| run.text.len())
+                    .map(crate::terminal::PrintedRun::heap_bytes)
                     .sum::<usize>(),
             )
             .saturating_add(linear_output_bytes)
@@ -476,6 +483,7 @@ pub(crate) struct AccessibilityCellWriteBoundary {
 struct TextCache {
     text: String,
     row_hashes: Vec<u64>,
+    links: Vec<std::ops::Range<usize>>,
     valid: bool,
 }
 
@@ -483,13 +491,14 @@ impl TextCache {
     fn invalidate(&mut self) {
         self.valid = false;
         self.row_hashes.clear();
+        self.links.clear();
     }
 
-    fn refresh(&mut self, write: impl FnOnce(&mut String)) {
+    fn refresh(&mut self, write: impl FnOnce(&mut String, &mut Vec<std::ops::Range<usize>>)) {
         if self.valid {
             return;
         }
-        write(&mut self.text);
+        write(&mut self.text, &mut self.links);
         compute_row_hashes(&self.text, &mut self.row_hashes);
         self.valid = true;
     }
@@ -1572,7 +1581,7 @@ impl View {
                 .expect("front was present");
             self.pending_application_speech_bytes = self
                 .pending_application_speech_bytes
-                .saturating_sub(pending.speech.text.len());
+                .saturating_sub(pending.speech.heap_bytes());
             if pending.epoch_generation == epoch_generation {
                 speech.push(pending.speech);
             }
@@ -1606,6 +1615,12 @@ impl View {
                     self.push_application_speech(revision, speech);
                 }
                 ApplicationAccessibilityCommand::Speak(_) => {}
+                ApplicationAccessibilityCommand::Query(id) => {
+                    crate::application_accessibility::append_capabilities(
+                        &mut update.pty_replies,
+                        &id,
+                    );
+                }
                 ApplicationAccessibilityCommand::End => {
                     self.live_application_accessibility_policy =
                         ApplicationAccessibilityPolicy::default();
@@ -1622,7 +1637,7 @@ impl View {
     ) {
         self.pending_application_speech_bytes = self
             .pending_application_speech_bytes
-            .saturating_add(speech.text.len());
+            .saturating_add(speech.heap_bytes());
         self.pending_application_speech
             .push_back(PendingApplicationSpeech {
                 epoch_generation: self.live_accessibility_epoch.generation,
@@ -1637,7 +1652,7 @@ impl View {
             };
             self.pending_application_speech_bytes = self
                 .pending_application_speech_bytes
-                .saturating_sub(discarded.speech.text.len());
+                .saturating_sub(discarded.speech.heap_bytes());
         }
     }
 
@@ -3270,6 +3285,22 @@ impl View {
         self.screen().contents_between(row, col, row, col + 1)
     }
 
+    pub(crate) fn line_with_links(&self, row: u16) -> (String, Vec<Range<usize>>) {
+        self.screen()
+            .contents_with_links(row, 0, row, self.size().1)
+    }
+
+    pub(crate) fn word_with_links(&self, row: u16, col: u16) -> (String, Vec<Range<usize>>) {
+        let screen = self.screen();
+        let start = screen.find_word_start(row, col);
+        let end = screen.find_word_end(row, col);
+        screen.contents_with_links(row, start, row, end + 1)
+    }
+
+    pub(crate) fn character_with_links(&self, row: u16, col: u16) -> (String, Vec<Range<usize>>) {
+        self.screen().contents_with_links(row, col, row, col + 1)
+    }
+
     /// Returns the contents of the full screen, including blank lines.
     pub fn contents_full(&self) -> String {
         self.screen().contents_full()
@@ -3317,6 +3348,16 @@ impl View {
     #[cfg(test)]
     pub(crate) fn document_contents_cache_is_prepared_for_test(&self) -> bool {
         self.text_caches.document.current.valid || self.text_caches.document.previous.valid
+    }
+
+    pub(crate) fn current_contents_link_spans(&self, document: bool) -> &[std::ops::Range<usize>] {
+        let cache = if document {
+            &self.text_caches.document
+        } else {
+            &self.text_caches.full
+        };
+        debug_assert!(cache.current.valid);
+        &cache.current.links
     }
 
     /// Resolves document identity before automatic reading. Context switches,
@@ -3388,7 +3429,10 @@ impl View {
         // Move the retained buffers out while borrowing the accessible screen;
         // this does not clone the snapshot or allocate replacement buffers.
         let mut cache = std::mem::take(&mut self.text_caches.full.current);
-        cache.refresh(|out| self.screen().contents_full_into(out));
+        cache.refresh(|out, links| {
+            self.screen()
+                .physical_contents_with_links_into(false, out, links)
+        });
         self.text_caches.full.current = cache;
     }
 
@@ -3396,7 +3440,7 @@ impl View {
         self.text_caches
             .full
             .previous
-            .refresh(|out| self.prev_screen.contents_full_into(out));
+            .refresh(|out, _| self.prev_screen.contents_full_into(out));
     }
 
     fn ensure_cached_document(&mut self) {
@@ -3404,7 +3448,10 @@ impl View {
             return;
         }
         let mut cache = std::mem::take(&mut self.text_caches.document.current);
-        cache.refresh(|out| self.snapshot_with_history().document_contents_into(out));
+        cache.refresh(|out, links| {
+            self.snapshot_with_history()
+                .physical_contents_with_links_into(true, out, links);
+        });
         self.text_caches.document.current = cache;
     }
 
@@ -3412,7 +3459,7 @@ impl View {
         self.text_caches
             .document
             .previous
-            .refresh(|out| self.prev_screen.document_contents_into(out));
+            .refresh(|out, _| self.prev_screen.document_contents_into(out));
     }
 }
 

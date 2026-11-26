@@ -3,13 +3,14 @@ use regex::Regex;
 use std::{
     cell::RefCell,
     fmt::Write,
+    ops::Range,
     rc::Rc,
     sync::LazyLock,
     time::{Duration, Instant},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use protocol::{NORMAL_RATE, TextPosition, UtteranceId, VoiceInfo, rate_is_normalized};
+use protocol::{NORMAL_RATE, SoundCue, TextPosition, UtteranceId, VoiceInfo, rate_is_normalized};
 
 pub mod proc_driver;
 pub mod protocol;
@@ -19,6 +20,8 @@ pub mod tts;
 pub mod worker;
 
 mod config;
+mod cues;
+pub use cues::{SpeechCues, SpeechLink};
 pub mod manager;
 pub use config::SpeechServerSpec;
 
@@ -52,6 +55,7 @@ pub enum CapabilityStatus {
 /// drivers publish this from their worker; Lua never performs host I/O.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OptionState {
+    pub sound_cues: bool,
     pub rate: Option<f32>,
     pub rate_status: CapabilityStatus,
     pub pitch: Option<f32>,
@@ -151,6 +155,23 @@ pub trait Driver {
         self.speak_utterance(id, text, interrupt)
     }
 
+    /// Submit structured cues. Unmanaged drivers speak the fallback.
+    fn speak_utterance_with_cues(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        interrupt: bool,
+        boundary: UtteranceBoundary,
+        cues: SpeechCues,
+    ) -> DriverResult<()> {
+        anyhow::ensure!(cues.valid_for(text), "invalid speech cue offsets");
+        let rendered = cues.render(text, false, false, false);
+        if rendered.text.is_empty() {
+            return Ok(());
+        }
+        self.speak_utterance_with_boundary(id, &rendered.text, interrupt, boundary)
+    }
+
     fn stop(&mut self) -> DriverResult<()>;
 
     /// Suspend speech without discarding retained work. Compatibility drivers
@@ -243,6 +264,7 @@ pub struct Speech {
     run: String,
     next_utterance_id: u64,
     paragraph_pause: Duration,
+    tones: bool,
 }
 
 /// One reader submission plus the monotone relationship between byte offsets
@@ -398,6 +420,7 @@ impl Speech {
             run: String::new(),
             next_utterance_id: 1,
             paragraph_pause: Duration::from_millis(DEFAULT_PARAGRAPH_PAUSE_MS),
+            tones: true,
         }
     }
 
@@ -419,6 +442,7 @@ impl Speech {
         // defaults so deleting a customization from init.lua removes it.
         candidate.symbol_level = self.symbol_level;
         candidate.paragraph_pause = self.paragraph_pause;
+        candidate.tones = self.tones;
         (candidate, configured)
     }
 
@@ -445,39 +469,136 @@ impl Speech {
         self.symbol_level = candidate.symbol_level;
         self.symbols_map = std::mem::take(&mut candidate.symbols_map);
         self.paragraph_pause = candidate.paragraph_pause;
+        self.tones = candidate.tones;
+    }
+
+    pub fn tones(&self) -> bool {
+        self.tones && self.driver.option_state().sound_cues
+    }
+
+    pub(crate) fn can_sequence_tones(&self) -> bool {
+        self.tones() && self.driver.supports_ordered_utterances()
+    }
+
+    pub fn set_tones(&mut self, enabled: bool) {
+        self.tones = enabled;
+    }
+
+    pub fn speak_cue(
+        &mut self,
+        cue: SoundCue,
+        fallback: &str,
+        interrupt: bool,
+    ) -> Result<UtteranceId> {
+        self.speak_standalone_cues(SpeechCues::Standalone(cue), fallback, interrupt)
+    }
+
+    pub(crate) fn speak_direction_and_blank(
+        &mut self,
+        direction: SoundCue,
+        fallback: &str,
+    ) -> Result<UtteranceId> {
+        self.speak_standalone_cues(
+            SpeechCues::StandaloneDirectionAndBlank(direction),
+            fallback,
+            false,
+        )
+    }
+
+    fn speak_standalone_cues(
+        &mut self,
+        cues: SpeechCues,
+        fallback: &str,
+        interrupt: bool,
+    ) -> Result<UtteranceId> {
+        if !self.tones {
+            return self.speak(fallback, interrupt);
+        }
+        let id = self.allocate_utterance_id();
+        self.driver
+            .speak_utterance_with_cues(&id, fallback, interrupt, UtteranceBoundary::Immediate, cues)
+            .map_err(Error::Driver)?;
+        Ok(id)
+    }
+
+    fn allocate_utterance_id(&mut self) -> UtteranceId {
+        let id = UtteranceId::new(self.next_utterance_id.to_string());
+        self.next_utterance_id = self.next_utterance_id.wrapping_add(1);
+        id
     }
 
     pub fn speak(&mut self, text: &str, interrupt: bool) -> Result<UtteranceId> {
-        let id = UtteranceId::new(self.next_utterance_id.to_string());
-        self.next_utterance_id = self.next_utterance_id.wrapping_add(1);
-        if text.is_empty() {
+        self.speak_with_links(text, &[], interrupt)
+    }
+
+    pub fn speak_with_links(
+        &mut self,
+        text: &str,
+        link_spans: &[Range<usize>],
+        interrupt: bool,
+    ) -> Result<UtteranceId> {
+        self.speak_with_links_and_cue(text, link_spans, None, interrupt)
+    }
+
+    pub fn speak_with_links_and_cue(
+        &mut self,
+        text: &str,
+        link_spans: &[Range<usize>],
+        direction: Option<(SoundCue, &'static str)>,
+        interrupt: bool,
+    ) -> Result<UtteranceId> {
+        if let Some((cue, fallback)) = direction
+            && text.trim().is_empty()
+            && link_spans.is_empty()
+        {
+            return self.speak_cue(cue, fallback, interrupt);
+        }
+        let id = self.allocate_utterance_id();
+        if text.is_empty() && link_spans.is_empty() {
             return Ok(id);
         }
 
         let mut processed = std::mem::take(&mut self.processed);
         let mut run_string = std::mem::take(&mut self.run);
-        let _ = expand_speech_text(
+        let source_offsets = expand_speech_text(
             text,
             self.symbol_level,
             &self.symbols_map,
             &mut processed,
             &mut run_string,
-            false,
+            !link_spans.is_empty(),
+            link_spans,
         );
 
-        // Break up mixed-case words
         let result = {
-            let expanded_start = EXPAND_START_CAPS.replace_all(&processed, "$1 $2");
-            let expanded_end = EXPAND_END_CAPS.replace_all(&expanded_start, "$1 $2");
-            let chunks = if self.driver.supports_ordered_utterances() {
-                split_paragraphs(expanded_end.as_ref())
+            let mut chunks = if let Some(source_offsets) = source_offsets {
+                let (mapped_text, mapped_offsets) =
+                    expand_case_with_offsets(processed.clone(), source_offsets);
+                let spoken_links =
+                    map_spoken_links(text, link_spans, &mapped_text, &mapped_offsets);
+                split_paragraphs_with_links(&mapped_text, &spoken_links)
             } else {
-                let text = split_paragraphs(expanded_end.as_ref()).join(" ");
-                (!text.is_empty()).then_some(text).into_iter().collect()
+                let expanded_start = EXPAND_START_CAPS.replace_all(&processed, "$1 $2");
+                let expanded_end = EXPAND_END_CAPS.replace_all(&expanded_start, "$1 $2");
+                split_paragraphs_with_links(&expanded_end, &[])
             };
+            if chunks.len() > 1
+                && (direction.is_some() || !self.driver.supports_ordered_utterances())
+            {
+                let (mut joined, mut links) = chunks.remove(0);
+                for (chunk, chunk_links) in chunks.drain(..) {
+                    joined.push(' ');
+                    links.extend(chunk_links.into_iter().map(|mut link| {
+                        link.offset += joined.len();
+                        link
+                    }));
+                    joined.push_str(&chunk);
+                }
+                chunks.push((joined, links));
+            }
             let multiple = chunks.len() > 1;
             let mut result = Ok(());
-            for (index, chunk) in chunks.iter().enumerate() {
+            for (index, (chunk, links)) in chunks.into_iter().enumerate() {
                 let chunk_id = if multiple {
                     id.chunk(index)
                 } else {
@@ -488,11 +609,13 @@ impl Speech {
                 } else {
                     UtteranceBoundary::Paragraph(self.paragraph_pause)
                 };
-                if let Err(error) = self.driver.speak_utterance_with_boundary(
+                let cues = self.inline_cues(links, direction);
+                if let Err(error) = self.driver.speak_utterance_with_cues(
                     &chunk_id,
-                    chunk,
+                    &chunk,
                     interrupt && index == 0,
                     boundary,
+                    cues,
                 ) {
                     result = Err(Error::Driver(error));
                     break;
@@ -508,9 +631,17 @@ impl Speech {
     /// Normalize a coordinate-mapped utterance through the same symbol, emoji,
     /// and case pipeline as ordinary speech while retaining enough origin
     /// information to translate host progress back to the source view.
+    #[cfg(test)]
     pub(crate) fn speak_for_reader(&mut self, text: &str) -> Result<ReaderSubmission> {
-        let id = UtteranceId::new(self.next_utterance_id.to_string());
-        self.next_utterance_id = self.next_utterance_id.wrapping_add(1);
+        self.speak_for_reader_with_links(text, &[])
+    }
+
+    pub(crate) fn speak_for_reader_with_links(
+        &mut self,
+        text: &str,
+        link_spans: &[Range<usize>],
+    ) -> Result<ReaderSubmission> {
+        let id = self.allocate_utterance_id();
         let mut processed = std::mem::take(&mut self.processed);
         let mut run_string = std::mem::take(&mut self.run);
         let source_offsets = expand_speech_text(
@@ -520,17 +651,23 @@ impl Speech {
             &mut processed,
             &mut run_string,
             true,
+            link_spans,
         )
         .expect("reader speech requests an offset map");
-        let (processed, source_offsets) =
-            insert_case_boundaries(processed, source_offsets, &EXPAND_START_CAPS);
-        let (processed, source_offsets) =
-            insert_case_boundaries(processed, source_offsets, &EXPAND_END_CAPS);
-        let result = if processed.is_empty() {
+        let (processed, source_offsets) = expand_case_with_offsets(processed, source_offsets);
+        let links = map_spoken_links(text, link_spans, &processed, &source_offsets);
+        let cues = self.inline_cues(links, None);
+        let result = if processed.is_empty() && cues == SpeechCues::None {
             Ok(())
         } else {
             self.driver
-                .speak_utterance(&id, &processed, true)
+                .speak_utterance_with_cues(
+                    &id,
+                    &processed,
+                    true,
+                    UtteranceBoundary::Immediate,
+                    cues,
+                )
                 .map_err(Error::Driver)
         };
         self.processed = processed;
@@ -540,6 +677,22 @@ impl Speech {
             utterance_id: id,
             source_offsets,
         })
+    }
+
+    fn inline_cues(
+        &self,
+        links: Vec<SpeechLink>,
+        direction: Option<(SoundCue, &'static str)>,
+    ) -> SpeechCues {
+        if links.is_empty() && direction.is_none() {
+            SpeechCues::None
+        } else {
+            SpeechCues::Inline {
+                direction,
+                links,
+                tones: self.tones,
+            }
+        }
     }
 
     pub fn cancel(&mut self) -> Result<()> {
@@ -701,6 +854,7 @@ fn expand_speech_text(
     processed: &mut String,
     run_string: &mut String,
     map_offsets: bool,
+    link_spans: &[Range<usize>],
 ) -> Option<Vec<usize>> {
     processed.clear();
     processed.reserve(source.len());
@@ -722,6 +876,13 @@ fn expand_speech_text(
         offsets
     });
 
+    let mut link_boundaries = link_spans
+        .iter()
+        .flat_map(|link| [link.start, link.end])
+        .collect::<Vec<_>>();
+    link_boundaries.sort_unstable();
+    link_boundaries.dedup();
+
     let mut previous: Option<(usize, &str)> = None;
     let mut run_count = 0usize;
     for current in UnicodeSegmentation::grapheme_indices(text, true)
@@ -730,7 +891,12 @@ fn expand_speech_text(
     {
         let current_grapheme = current.map(|(_, grapheme)| grapheme);
         if previous.is_none()
-            || previous.is_some_and(|(_, grapheme)| Some(grapheme) == current_grapheme)
+            || (previous.is_some_and(|(_, grapheme)| Some(grapheme) == current_grapheme)
+                && current.is_some_and(|(offset, _)| {
+                    link_boundaries
+                        .binary_search(&(source_base + offset))
+                        .is_err()
+                }))
         {
             run_count = run_count.saturating_add(1);
             if previous.is_none() {
@@ -860,6 +1026,50 @@ fn map_generated_text(
     }
 }
 
+fn expand_case_with_offsets(text: String, source_offsets: Vec<usize>) -> (String, Vec<usize>) {
+    let (text, source_offsets) = insert_case_boundaries(text, source_offsets, &EXPAND_START_CAPS);
+    insert_case_boundaries(text, source_offsets, &EXPAND_END_CAPS)
+}
+
+fn map_spoken_links(
+    source: &str,
+    links: &[Range<usize>],
+    spoken: &str,
+    source_offsets: &[usize],
+) -> Vec<SpeechLink> {
+    let mut mapped = Vec::with_capacity(links.len());
+    for link in links {
+        if link.start > link.end
+            || !source.is_char_boundary(link.start)
+            || !source.is_char_boundary(link.end)
+        {
+            continue;
+        }
+        let mut start = source_offsets.partition_point(|source_offset| *source_offset < link.start);
+        while start < spoken.len() && !spoken.is_char_boundary(start) {
+            start += 1;
+        }
+        let mut end = source_offsets.partition_point(|source_offset| *source_offset < link.end);
+        while end < spoken.len() && !spoken.is_char_boundary(end) {
+            end += 1;
+        }
+        let audible_offset = spoken
+            .get(start..end.min(spoken.len()))
+            .and_then(|text| {
+                text.char_indices()
+                    .find(|(_, character)| !character.is_whitespace())
+            })
+            .map(|(relative, _)| start + relative);
+        mapped.push(SpeechLink {
+            offset: audible_offset.unwrap_or_else(|| start.min(spoken.len())),
+            audible: audible_offset.is_some(),
+        });
+    }
+    mapped.sort_unstable();
+    mapped.dedup();
+    mapped
+}
+
 fn insert_case_boundaries(
     text: String,
     source_offsets: Vec<usize>,
@@ -923,40 +1133,83 @@ fn ensure_normalized_rate(rate: f32) -> Result<()> {
 /// Collapse one physical line boundary to a space and split a logical
 /// paragraph boundary into independently sequenced utterances. CRLF is one
 /// boundary; lone CR is accepted for terminal-originated text.
-fn split_paragraphs(text: &str) -> Vec<String> {
-    if text.is_empty() {
+fn split_paragraphs_with_links(text: &str, links: &[SpeechLink]) -> Vec<(String, Vec<SpeechLink>)> {
+    if text.is_empty() && links.is_empty() {
         return Vec::new();
     }
     if !text.contains(['\r', '\n']) {
-        return vec![text.to_owned()];
+        return vec![(text.to_owned(), links.to_vec())];
     }
 
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut chunks = Vec::new();
-    let mut chunk = String::with_capacity(normalized.len());
+    let mut chunk = String::with_capacity(text.len());
+    let mut chunk_links = Vec::new();
+    let mut links = links.iter().copied().peekable();
     let mut newlines = 0usize;
-    for character in normalized.chars() {
-        if character == '\n' {
-            newlines = newlines.saturating_add(1);
+    let mut characters = text.char_indices().peekable();
+    while let Some((offset, character)) = characters.next() {
+        if matches!(character, '\r' | '\n') {
+            while links.next_if(|link| link.offset <= offset).is_some() {
+                chunk_links.push(SpeechLink {
+                    offset: chunk.len(),
+                    audible: false,
+                });
+            }
+            if character == '\r' && matches!(characters.peek(), Some((_, '\n'))) {
+                characters.next();
+            }
+            newlines += 1;
             continue;
         }
         if newlines == 1 {
             chunk.push(' ');
         } else if newlines >= 2 {
-            let paragraph = chunk.trim().to_owned();
-            if !paragraph.is_empty() {
-                chunks.push(paragraph);
-            }
-            chunk.clear();
+            push_paragraph(&mut chunks, &mut chunk, &mut chunk_links);
         }
         newlines = 0;
+        while let Some(link) = links.next_if(|link| link.offset <= offset) {
+            chunk_links.push(SpeechLink {
+                offset: chunk.len(),
+                audible: link.audible,
+            });
+        }
         chunk.push(character);
     }
-    let paragraph = chunk.trim().to_owned();
-    if !paragraph.is_empty() {
-        chunks.push(paragraph);
-    }
+    chunk_links.extend(links.map(|_| SpeechLink {
+        offset: chunk.len(),
+        audible: false,
+    }));
+    push_paragraph(&mut chunks, &mut chunk, &mut chunk_links);
     chunks
+}
+
+fn push_paragraph(
+    chunks: &mut Vec<(String, Vec<SpeechLink>)>,
+    chunk: &mut String,
+    links: &mut Vec<SpeechLink>,
+) {
+    let paragraph = chunk.trim();
+    if !paragraph.is_empty() || !links.is_empty() {
+        let trimmed_start = chunk.len() - chunk.trim_start().len();
+        for link in links.iter_mut() {
+            link.offset = link
+                .offset
+                .saturating_sub(trimmed_start)
+                .min(paragraph.len());
+        }
+        links.sort_unstable();
+        links.dedup();
+        chunks.push((paragraph.to_owned(), std::mem::take(links)));
+    }
+    chunk.clear();
+}
+
+#[cfg(test)]
+fn split_paragraphs(text: &str) -> Vec<String> {
+    split_paragraphs_with_links(text, &[])
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1041,6 +1294,37 @@ mod tests {
             source.find("Case").unwrap()
         );
         assert_eq!(submission.source_offset(spoken.len()), source.len());
+    }
+
+    #[test]
+    fn spoken_link_fallback_keeps_labels_at_their_source_position() {
+        let (mut speech, output) = recorder();
+        speech
+            .speak_with_links("Release notes", std::slice::from_ref(&(0..13)), false)
+            .unwrap();
+        speech
+            .speak_with_links("See Release notes", std::slice::from_ref(&(4..17)), false)
+            .unwrap();
+        speech
+            .speak_with_links(
+                "a \n\n café and news",
+                std::slice::from_ref(&(5..10)),
+                false,
+            )
+            .unwrap();
+        speech
+            .speak_with_links("Old new", std::slice::from_ref(&(3..4)), false)
+            .unwrap();
+        assert_eq!(
+            output.borrow().as_slice(),
+            [
+                "link Release notes",
+                "See link Release notes",
+                "a",
+                "link café and news",
+                "Old link new",
+            ]
+        );
     }
 
     #[test]

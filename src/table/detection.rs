@@ -3,14 +3,16 @@ use super::{Column, TableModel, TerminalSurface};
 type View = dyn TerminalSurface;
 
 pub(super) fn pipe_delimited_cell_text(line: &str, col_idx: usize) -> Option<&str> {
-    let trimmed = line.trim();
-    let (leading_delimiter, _) = pipe_cell_layout(trimmed)?;
+    pipe_delimited_cell_slice(line, col_idx).map(str::trim)
+}
 
-    let mut cells = trimmed.split('|');
-    if leading_delimiter == 1 {
-        cells.next();
-    }
-    Some(cells.nth(col_idx).unwrap_or_default().trim())
+pub(super) fn pipe_delimited_cell_slice(line: &str, col_idx: usize) -> Option<&str> {
+    let (leading_delimiter, _) = pipe_cell_layout(line.trim())?;
+    Some(
+        line.split('|')
+            .nth(col_idx.saturating_add(leading_delimiter))
+            .unwrap_or_default(),
+    )
 }
 
 fn pipe_cell_layout(line: &str) -> Option<(usize, usize)> {

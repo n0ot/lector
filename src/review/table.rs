@@ -1,8 +1,8 @@
 // This is an original Lector implementation over ReviewDocument. Keep this
 // module free of copied or translated GPL-licensed table-plugin code.
 use super::document::ReviewDocument;
-use crate::terminal::HistoryPosition;
-use std::collections::BTreeMap;
+use crate::{speech::protocol::SoundCue, terminal::HistoryPosition};
+use std::{collections::BTreeMap, ops::Range};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CellMove {
@@ -142,6 +142,7 @@ struct CellSpan {
     start: u16,
     end: u16,
     text: String,
+    links: Vec<Range<usize>>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -479,12 +480,29 @@ impl ReviewTable {
             .unwrap_or("column")
     }
 
+    pub(crate) fn label_with_links(&self, address: CellAddress) -> (&str, &[Range<usize>]) {
+        let label = self.label(address);
+        let links = self
+            .rows
+            .first()
+            .filter(|row| matches!(row.kind, RowKind::Header))
+            .and_then(|row| row.cells.get(address.column))
+            .map_or(&[][..], |cell| cell.links.as_slice());
+        (label, links)
+    }
+
+    #[cfg(test)]
     pub(crate) fn text(&self, address: CellAddress) -> &str {
+        self.text_with_links(address).0
+    }
+
+    pub(crate) fn text_with_links(&self, address: CellAddress) -> (&str, &[Range<usize>]) {
         self.rows[address.row]
             .cells
             .get(address.column)
-            .map(|cell| cell.text.as_str())
-            .unwrap_or("")
+            .map_or(("", &[]), |cell| {
+                (cell.text.as_str(), cell.links.as_slice())
+            })
     }
 
     pub(crate) fn toggle_row_header(&mut self, column: usize) -> bool {
@@ -501,12 +519,20 @@ impl ReviewTable {
         self.row_header
     }
 
+    #[cfg(test)]
     pub(crate) fn row_header_text(&self, address: CellAddress) -> Option<&str> {
+        self.row_header_with_links(address).map(|(text, _)| text)
+    }
+
+    pub(crate) fn row_header_with_links(
+        &self,
+        address: CellAddress,
+    ) -> Option<(&str, &[Range<usize>])> {
         let column = self.row_header?;
         self.rows[address.row]
             .cells
             .get(column)
-            .map(|cell| cell.text.as_str())
+            .map(|cell| (cell.text.as_str(), cell.links.as_slice()))
     }
 
     pub(crate) fn contains_row(&self, row: usize) -> bool {
@@ -521,18 +547,10 @@ impl ReviewTable {
                 .is_some_and(Option::is_none)
     }
 
-    pub(crate) fn boundary_announcement(
-        &self,
-        movement: CellMove,
-        address: CellAddress,
-    ) -> (&'static str, Option<usize>) {
-        (self.edge_announcement(movement), self.row_number(address))
-    }
-
-    pub(crate) fn edge_announcement(&self, movement: CellMove) -> &'static str {
+    pub(crate) fn edge_announcement(&self, movement: CellMove) -> (SoundCue, &'static str) {
         match movement {
-            CellMove::Previous | CellMove::Up => "top of table",
-            CellMove::Next | CellMove::Down => "bottom of table",
+            CellMove::Previous | CellMove::Up => (SoundCue::Top, "top of table"),
+            CellMove::Next | CellMove::Down => (SoundCue::Bottom, "bottom of table"),
         }
     }
 }
@@ -560,10 +578,12 @@ fn fixed_cells(document: &ReviewDocument, row: usize, starts: &[u16], right: u16
         .filter(|(_, start)| *start < right)
         .map(|(index, start)| {
             let end = starts.get(index + 1).copied().unwrap_or(right).min(right);
+            let (text, links) = document.read_trimmed_range(row, start, end);
             CellSpan {
                 start,
                 end,
-                text: document.text_between(row, start, end),
+                text,
+                links,
             }
         })
         .collect()
@@ -663,19 +683,23 @@ fn pipe_cells(document: &ReviewDocument, row: usize, delimiter: char) -> Option<
     let mut start = 0u16;
     for delimiter_col in positions {
         if delimiter_col > start {
+            let (text, links) = document.read_trimmed_range(row, start, delimiter_col);
             cells.push(CellSpan {
                 start,
                 end: delimiter_col,
-                text: document.text_between(row, start, delimiter_col),
+                text,
+                links,
             });
         }
         start = delimiter_col.saturating_add(1);
     }
     if start < end {
+        let (text, links) = document.read_trimmed_range(row, start, end);
         cells.push(CellSpan {
             start,
             end,
-            text: document.text_between(row, start, end),
+            text,
+            links,
         });
     }
     (cells.len() >= 2).then_some(cells)

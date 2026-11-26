@@ -1,6 +1,10 @@
 use super::{Result, ScreenReader};
-use crate::view::{AccessibleDocumentComparison, View};
+use crate::{
+    terminal::trim_linked_text,
+    view::{AccessibleDocumentComparison, View},
+};
 use similar::{Algorithm, ChangeTag, TextDiff};
+use std::ops::Range;
 
 #[derive(Default)]
 pub(super) struct AutoReadBuffers {
@@ -12,6 +16,7 @@ pub(super) struct AutoReadBuffers {
     interface_state: String,
     interface_state_candidate: String,
     interface_region: String,
+    interface_region_links: Vec<Range<usize>>,
     lcs: Vec<usize>,
 }
 
@@ -71,14 +76,15 @@ impl ScreenReader {
         }
 
         let mut live_text = std::mem::take(&mut self.auto_read_buffers.live_text);
+        let mut printed_links = Vec::new();
         let linear_output_metrics = view
             .accessibility_update_summary()
-            .readable_linear_output_text_into(&mut live_text)
+            .readable_linear_output_text_with_links_into(&mut live_text, &mut printed_links)
             .map(|report| (report.cursor_operations, report.scroll_operations > 0));
         let linear_output_report = linear_output_metrics.is_some();
         if !linear_output_report {
             view.accessibility_update_summary()
-                .printed_text_into(&mut live_text);
+                .printed_text_with_links_into(&mut live_text, &mut printed_links);
         }
         let linear_output_covers_printed_output = linear_output_report
             && view
@@ -131,6 +137,7 @@ impl ScreenReader {
         // recent Enter does not fall through to cursor tracking or a
         // whitespace-only screen diff.
         if completed_linear_record
+            && printed_links.is_empty()
             && (linear_output_covers_printed_output || linear_output_omits_only_submitted_input)
             && live_text.trim().is_empty()
         {
@@ -158,7 +165,8 @@ impl ScreenReader {
                     view.full_contents_cached();
                 previous_hashes == current_hashes && previous == current
             };
-            if presented_contents_unchanged {
+            if presented_contents_unchanged && !(readable_print_report && !printed_links.is_empty())
+            {
                 let suppressed_echo = self.should_suppress_key_echo(&live_text);
                 self.auto_read_buffers.live_text = live_text;
                 return Ok(suppressed_echo
@@ -168,7 +176,12 @@ impl ScreenReader {
 
         let mut live_read_result = None;
         {
-            let text = live_text.trim();
+            let mut links: Vec<_> = printed_links
+                .into_iter()
+                .map(|link| link.start..link.end)
+                .collect();
+            let text = trim_linked_text(&live_text, &mut links);
+            let has_linked_text = !text.is_empty() || !links.is_empty();
             if readable_print_report
                 && (completed_linear_record || print_cursor_moves == 0 || print_scrolled)
             {
@@ -178,19 +191,24 @@ impl ScreenReader {
                 // input acknowledgement queue at every word boundary.
                 let suppress_echo = self.should_suppress_key_echo(&live_text);
                 if !suppress_echo
-                    && !text.is_empty()
-                    && let Some(text) =
+                    && has_linked_text
+                    && let Some(filtered) =
                         self.hook_on_live_read(text, print_cursor_moves, print_scrolled)?
-                    && !text.is_empty()
+                    && (!filtered.is_empty() || (filtered == text && !links.is_empty()))
                 {
                     if crate::diagnostics::enabled() {
                         crate::diagnostics::event(
                             "screen-reader",
                             "auto-read-progress",
-                            &format!("speaking live text bytes={}", text.len()),
+                            &format!("speaking live text bytes={}", filtered.len()),
                         );
                     }
-                    self.speak(&text, false)?;
+                    let links = if filtered == text {
+                        links.as_slice()
+                    } else {
+                        &[]
+                    };
+                    self.speak_with_links(&filtered, links, false)?;
                     crate::diagnostics::event(
                         "screen-reader",
                         "auto-read-progress",
@@ -198,8 +216,8 @@ impl ScreenReader {
                     );
                     spoken = true;
                 }
-                if suppress_echo || !text.is_empty() {
-                    live_read_result = Some(suppress_echo || spoken || !text.is_empty());
+                if suppress_echo || has_linked_text {
+                    live_read_result = Some(suppress_echo || spoken || has_linked_text);
                 }
             }
         }
@@ -223,7 +241,11 @@ impl ScreenReader {
         let cursor_changed = cursor != prev_cursor;
         let new_interface_region = if structural_repaint {
             let mut region = std::mem::take(&mut self.auto_read_buffers.interface_region);
-            let has_region = collect_new_interface_region(view, &mut region);
+            let has_region = collect_new_interface_region(
+                view,
+                &mut region,
+                &mut self.auto_read_buffers.interface_region_links,
+            );
             self.auto_read_buffers.interface_region = region;
             has_region
         } else {
@@ -351,15 +373,17 @@ impl ScreenReader {
             let mut state = std::mem::take(&mut self.auto_read_buffers.interface_state);
             let mut candidate =
                 std::mem::take(&mut self.auto_read_buffers.interface_state_candidate);
+            let mut sources = TextSources::new();
             let has_state = collect_interface_state_changes(
                 old_text,
                 new_text,
-                prev_cursor_row,
-                cursor_row,
+                (prev_cursor_row, cursor_row),
                 &mut state,
                 &mut candidate,
                 &mut self.auto_read_buffers.lcs,
+                &mut sources,
             );
+            let state_links = project_screen_links(view, new_text, false, &sources);
             let state_to_speak = if has_state {
                 self.hook_on_live_read(&state, cursor_moves, scrolled)?
             } else {
@@ -380,7 +404,12 @@ impl ScreenReader {
                 if let Some(text) = state_to_speak
                     && !text.is_empty()
                 {
-                    self.speak(&text, false)?;
+                    let links = if text == self.auto_read_buffers.interface_state {
+                        state_links.as_slice()
+                    } else {
+                        &[]
+                    };
+                    self.speak_with_links(&text, links, false)?;
                 }
                 return Ok(true);
             }
@@ -425,12 +454,14 @@ impl ScreenReader {
             (old_text, new_text)
         };
 
+        let mut sources = TextSources::new();
         let diff_state = collect_auto_read_diff(
             diff_old_text,
             diff_new_text,
             &mut diff_text,
             &mut self.auto_read_buffers.graphemes,
             &mut self.auto_read_buffers.lcs,
+            &mut sources,
         );
 
         let cursor_crossed_changed_row = single_changed_row.is_some_and(|row| {
@@ -461,6 +492,7 @@ impl ScreenReader {
         };
         if suppress_echo {
             diff_text.clear();
+            sources.clear();
         }
         if input_echo_cursor_row && !suppress_echo {
             // A failed match provides no evidence of an inline edit. Restore
@@ -471,6 +503,7 @@ impl ScreenReader {
                 &mut diff_text,
                 &mut self.auto_read_buffers.graphemes,
                 &mut self.auto_read_buffers.lcs,
+                &mut sources,
             );
         } else if prefer_inline_cursor_row {
             // Exact echo evidence applies only to the edited row. Changes
@@ -485,11 +518,19 @@ impl ScreenReader {
                     continue;
                 }
                 other.clear();
-                collect_inserted_fields(old, new, &mut other, &mut self.auto_read_buffers.lcs);
+                let mut other_sources = TextSources::new();
+                collect_inserted_fields(
+                    old,
+                    new,
+                    &mut other,
+                    &mut self.auto_read_buffers.lcs,
+                    &mut other_sources,
+                );
                 if !other.is_empty() {
                     if !diff_text.is_empty() {
                         diff_text.push('\n');
                     }
+                    extend_sources(&mut sources, other_sources, diff_text.len());
                     diff_text.push_str(&other);
                 }
             }
@@ -500,7 +541,14 @@ impl ScreenReader {
         if let Some(text) = self.hook_on_live_read(&diff_text, cursor_moves, scrolled)?
             && !text.is_empty()
         {
-            self.speak(&text, false)?;
+            let document = compare_document && !prefer_inline_cursor_row;
+            let source = if document { diff_new_text } else { new_text };
+            let links = if text == diff_text {
+                project_screen_links(view, source, document, &sources)
+            } else {
+                Vec::new()
+            };
+            self.speak_with_links(&text, &links, false)?;
         }
         self.auto_read_buffers.diff_text = diff_text;
         Ok((original_nonempty || suppress_echo) && !track_destination)
@@ -524,10 +572,12 @@ impl ScreenReader {
 
     fn read_new_interface_region_repaint(&mut self) -> Result<()> {
         let region = std::mem::take(&mut self.auto_read_buffers.interface_region);
+        let links = std::mem::take(&mut self.auto_read_buffers.interface_region_links);
         if !self.should_suppress_key_echo(&region) {
-            self.speak(&region, false)?;
+            self.speak_with_links(&region, &links, false)?;
         }
         self.auto_read_buffers.interface_region = region;
+        self.auto_read_buffers.interface_region_links = links;
         Ok(())
     }
 
@@ -542,9 +592,10 @@ impl ScreenReader {
             return Ok(false);
         }
         let mut line = std::mem::take(&mut self.auto_read_buffers.cursor_line);
-        let has_logical_line = collect_application_cursor_logical_line(view, &mut line);
+        let mut links = crate::terminal::LinkSpans::default();
+        let has_logical_line = collect_application_cursor_logical_line(view, &mut line, &mut links);
         let handled = if has_logical_line {
-            self.speak(&line, false)?;
+            self.speak_with_links(&line, &links.spans, false)?;
             true
         } else {
             false
@@ -602,8 +653,13 @@ fn has_inserted_transcript_lines(old_text: &str, new_text: &str, cursor_row: usi
     matched > 0 && old_count.saturating_sub(matched) <= 1
 }
 
-fn collect_new_interface_region(view: &View, out: &mut String) -> bool {
+fn collect_new_interface_region(
+    view: &View,
+    out: &mut String,
+    links: &mut Vec<Range<usize>>,
+) -> bool {
     out.clear();
+    links.clear();
     let previous = view.prev_screen();
     let current = view.screen();
     if previous.screen != crate::terminal::ScreenIdentity::Primary
@@ -648,19 +704,14 @@ fn collect_new_interface_region(view: &View, out: &mut String) -> bool {
         return false;
     }
 
-    out.push_str(&current.contents_between(
+    let (text, mut spans) = current.contents_with_links(
         first_changed as u16,
         0,
         last_changed as u16,
         current.size().1,
-    ));
-    let trimmed = out.trim();
-    let leading = trimmed.as_ptr() as usize - out.as_ptr() as usize;
-    let trailing = leading.saturating_add(trimmed.len());
-    if leading > 0 {
-        out.drain(..leading);
-    }
-    out.truncate(trailing.saturating_sub(leading));
+    );
+    out.push_str(trim_linked_text(&text, &mut spans));
+    *links = spans;
     !out.is_empty()
 }
 
@@ -674,7 +725,11 @@ fn row_has_visible_non_whitespace(row: &crate::terminal::Row) -> bool {
     })
 }
 
-fn collect_application_cursor_logical_line(view: &View, out: &mut String) -> bool {
+fn collect_application_cursor_logical_line<'a>(
+    view: &'a View,
+    out: &mut String,
+    links: &mut crate::terminal::LinkSpans<'a>,
+) -> bool {
     out.clear();
     let previous = view.prev_screen();
     let current = view.screen();
@@ -727,9 +782,16 @@ fn collect_application_cursor_logical_line(view: &View, out: &mut String) -> boo
     }
 
     for row in span_start_row..=current_end - history_len {
-        current.rows[row].append_contents_to(out);
+        let row = &current.rows[row];
+        row.append_contents_range_with_cells(out, 0, row.cells.len(), |offset, _, cell| {
+            links.visit(offset, cell.contents(), cell.hyperlink.as_deref());
+        });
     }
-    out.truncate(out.trim_end().len());
+    let text_end = out.trim_end().len();
+    out.truncate(text_end);
+    for link in &mut links.spans {
+        *link = link.start.min(text_end)..link.end.min(text_end);
+    }
     !out.is_empty()
 }
 
@@ -770,27 +832,29 @@ fn rows_have_same_text(previous: &crate::terminal::Row, current: &crate::termina
             .all(|(old, new)| old.contents() == new.contents())
 }
 
-fn collect_interface_state_changes(
+fn collect_interface_state_changes<'a>(
     old_text: &str,
-    new_text: &str,
-    old_cursor_row: usize,
-    new_cursor_row: usize,
+    new_text: &'a str,
+    cursor_rows: (usize, usize),
     out: &mut String,
     candidate: &mut String,
     lcs: &mut Vec<usize>,
+    sources: &mut TextSources<'a>,
 ) -> bool {
     out.clear();
+    sources.clear();
     candidate.clear();
 
     let old_rows = old_text.split_terminator('\n');
     let new_rows = new_text.split_terminator('\n');
     for (row, (old_row, new_row)) in old_rows.zip(new_rows).enumerate() {
-        if old_row == new_row || row == old_cursor_row || row == new_cursor_row {
+        if old_row == new_row || row == cursor_rows.0 || row == cursor_rows.1 {
             continue;
         }
 
         candidate.clear();
-        if !collect_inserted_fields(old_row, new_row, candidate, lcs) {
+        let mut candidate_sources = TextSources::new();
+        if !collect_inserted_fields(old_row, new_row, candidate, lcs, &mut candidate_sources) {
             continue;
         }
         let compact = candidate.trim();
@@ -800,6 +864,9 @@ fn collect_interface_state_changes(
         if !out.is_empty() {
             out.push('\n');
         }
+        // Field synthesis emits no leading or trailing whitespace.
+        debug_assert_eq!(compact.len(), candidate.len());
+        extend_sources(sources, candidate_sources, out.len());
         out.push_str(compact);
     }
     !out.is_empty()
@@ -864,14 +931,87 @@ fn next_line_diff_state(state: DiffState, tag: ChangeTag) -> DiffState {
     }
 }
 
-fn collect_auto_read_diff(
+/// Byte-exact slices from the current snapshot and their offsets in the
+/// synthesized announcement. Separators inserted by the diff have no source.
+type TextSources<'a> = Vec<(usize, &'a str)>;
+
+fn append_source<'a>(out: &mut String, sources: &mut TextSources<'a>, text: &'a str) {
+    sources.push((out.len(), text));
+    out.push_str(text);
+}
+
+fn extend_sources<'a>(sources: &mut TextSources<'a>, part: TextSources<'a>, offset: usize) {
+    sources.extend(part.into_iter().map(|(start, text)| (start + offset, text)));
+}
+
+fn project_screen_links(
+    view: &View,
+    source: &str,
+    document: bool,
+    sources: &TextSources<'_>,
+) -> Vec<Range<usize>> {
+    let source_links = view.current_contents_link_spans(document);
+    if source_links.is_empty() {
+        return Vec::new();
+    }
+    let mut result = Vec::<Range<usize>>::new();
+    let mut last_source_link = None;
+    for (output, text) in sources {
+        let Some(selected) = source_range(source, text) else {
+            continue;
+        };
+        let first = source_links.partition_point(|link| link.end < selected.start);
+        for (link_index, link) in source_links.iter().enumerate().skip(first) {
+            if link.start >= selected.end {
+                break;
+            }
+            let start = link.start.max(selected.start);
+            let end = link.end.min(selected.end);
+            if start < end || (link.is_empty() && selected.contains(&start)) {
+                let mapped = output + start - selected.start..output + end - selected.start;
+                if let Some(last) = result.last_mut()
+                    && last_source_link == Some(link_index)
+                {
+                    last.end = mapped.end;
+                } else {
+                    result.push(mapped);
+                    last_source_link = Some(link_index);
+                }
+            }
+        }
+    }
+    result
+}
+
+fn source_range(source: &str, slice: &str) -> Option<Range<usize>> {
+    let start = (slice.as_ptr() as usize).checked_sub(source.as_ptr() as usize)?;
+    let end = start.checked_add(slice.len())?;
+    (end <= source.len()).then_some(start..end)
+}
+
+fn append_diff_source<'a>(
+    out: &mut String,
+    sources: &mut TextSources<'a>,
+    source: &'a str,
+    text: &str,
+) {
+    if let Some(range) = source_range(source, text) {
+        append_source(out, sources, &source[range]);
+    } else {
+        out.push_str(text);
+    }
+}
+
+fn collect_auto_read_diff<'a>(
     old_text: &str,
-    new_text: &str,
+    new_text: &'a str,
     diff_text: &mut String,
     graphemes: &mut String,
     lcs: &mut Vec<usize>,
+    sources: &mut TextSources<'a>,
 ) -> DiffState {
     diff_text.clear();
+    sources.clear();
     let line_changes = TextDiff::configure()
         .algorithm(Algorithm::Patience)
         .diff_lines(old_text, new_text);
@@ -882,7 +1022,7 @@ fn collect_auto_read_diff(
         if change.tag() == ChangeTag::Insert
             && let Some(change_str) = change.as_str()
         {
-            diff_text.push_str(change_str);
+            append_diff_source(diff_text, sources, new_text, change_str);
         }
     }
 
@@ -893,6 +1033,7 @@ fn collect_auto_read_diff(
     graphemes.clear();
     diff_state = DiffState::NoChanges;
     let mut previous_tag = None;
+    let mut grapheme_sources = TextSources::new();
     for change in TextDiff::configure()
         .algorithm(Algorithm::Patience)
         .diff_graphemes(old_text, new_text)
@@ -904,17 +1045,20 @@ fn collect_auto_read_diff(
             && change.tag() == ChangeTag::Insert
             && let Some(change_str) = change.as_str()
         {
-            graphemes.push_str(change_str);
+            append_diff_source(graphemes, &mut grapheme_sources, new_text, change_str);
         }
     }
 
     if diff_state == DiffState::Multi {
         graphemes.clear();
-        if collect_inserted_fields(old_text, new_text, graphemes, lcs) {
+        grapheme_sources.clear();
+        if collect_inserted_fields(old_text, new_text, graphemes, lcs, &mut grapheme_sources) {
             std::mem::swap(diff_text, graphemes);
+            *sources = grapheme_sources;
         }
     } else {
         std::mem::swap(diff_text, graphemes);
+        *sources = grapheme_sources;
     }
     diff_state
 }
@@ -949,11 +1093,12 @@ fn next_grapheme_diff_state(
     }
 }
 
-fn collect_inserted_fields(
+fn collect_inserted_fields<'a>(
     old_text: &str,
-    new_text: &str,
+    new_text: &'a str,
     out: &mut String,
     lcs: &mut Vec<usize>,
+    sources: &mut TextSources<'a>,
 ) -> bool {
     let old_fields: Vec<_> = old_text.split_whitespace().collect();
     let new_fields: Vec<_> = new_text.split_whitespace().collect();
@@ -991,6 +1136,7 @@ fn collect_inserted_fields(
                 out,
                 &mut last_spoken_hunk,
                 &mut spoke,
+                sources,
             );
             deleted_hunk.clear();
             inserted_hunk.clear();
@@ -1014,30 +1160,37 @@ fn collect_inserted_fields(
         out,
         &mut last_spoken_hunk,
         &mut spoke,
+        sources,
     );
 
     spoke
 }
 
-fn flush_inserted_field_hunk(
+fn flush_inserted_field_hunk<'a>(
     deleted: &[&str],
-    inserted: &[&str],
+    inserted: &[&'a str],
     out: &mut String,
     last_spoken_hunk: &mut String,
     spoke: &mut bool,
+    sources: &mut TextSources<'a>,
 ) {
     if inserted.is_empty() {
         return;
     }
 
     let mut hunk = String::new();
+    let mut hunk_sources = TextSources::new();
     if deleted.len() == inserted.len() {
         for (old_field, new_field) in deleted.iter().zip(inserted) {
-            append_inserted_field(field_replacement(old_field, new_field), &mut hunk);
+            append_inserted_field(
+                field_replacement(old_field, new_field),
+                &mut hunk,
+                &mut hunk_sources,
+            );
         }
     } else {
         for field in inserted {
-            append_inserted_field(field, &mut hunk);
+            append_inserted_field(field, &mut hunk, &mut hunk_sources);
         }
     }
 
@@ -1048,19 +1201,20 @@ fn flush_inserted_field_hunk(
     if *spoke {
         out.push(' ');
     }
+    extend_sources(sources, hunk_sources, out.len());
     out.push_str(&hunk);
     last_spoken_hunk.clone_from(&hunk);
     *spoke = true;
 }
 
-fn append_inserted_field(field: &str, out: &mut String) {
+fn append_inserted_field<'a>(field: &'a str, out: &mut String, sources: &mut TextSources<'a>) {
     if field.is_empty() {
         return;
     }
     if !out.is_empty() {
         out.push(' ');
     }
-    out.push_str(field);
+    append_source(out, sources, field);
 }
 
 fn field_replacement<'a>(old_field: &str, new_field: &'a str) -> &'a str {
@@ -1134,6 +1288,7 @@ mod tests {
             &mut output,
             &mut graphemes,
             &mut lcs,
+            &mut Vec::new(),
         );
 
         assert_eq!(state, DiffState::Multi);
@@ -1152,6 +1307,7 @@ mod tests {
             &mut output,
             &mut graphemes,
             &mut lcs,
+            &mut Vec::new(),
         );
 
         assert_eq!(output, "first\n\nsecond\n");
@@ -1175,6 +1331,7 @@ mod tests {
             "a first b second c",
             &mut output,
             &mut lcs,
+            &mut Vec::new(),
         ));
         assert_eq!(output, "first second");
     }
@@ -1188,6 +1345,7 @@ mod tests {
             "a new b new c",
             &mut output,
             &mut lcs,
+            &mut Vec::new(),
         ));
         assert_eq!(output, "new");
     }

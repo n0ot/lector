@@ -9,6 +9,7 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     fmt,
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     str::FromStr,
@@ -863,12 +864,137 @@ impl ScreenReader {
         result.map(Some).map_err(Into::into)
     }
 
+    pub(crate) fn speak_review_cue(&mut self, cue: speech::protocol::SoundCue) -> Result<()> {
+        self.speak_application_cue(cue, cue.spoken_label())
+    }
+
+    pub(crate) fn speak_application_cue(
+        &mut self,
+        cue: speech::protocol::SoundCue,
+        fallback: &str,
+    ) -> Result<()> {
+        if !self.terminal_focused {
+            return Ok(());
+        }
+        self.call_hook_on_speech_start(fallback, false)?;
+        let result = self.speech.speak_cue(cue, fallback, false);
+        self.call_hook_on_speech_end(fallback, false, result.is_ok())?;
+        result.map(|_| ()).map_err(Into::into)
+    }
+
+    pub(crate) fn speak_linked_review_cue(
+        &mut self,
+        cue: speech::protocol::SoundCue,
+        linked: bool,
+    ) -> Result<()> {
+        if linked {
+            // The reviewed text has collapsed to an empty destination.
+            let anchor = 0..0;
+            let links = std::slice::from_ref(&anchor);
+            if !self.speech.can_sequence_tones() {
+                self.speak_with_links(cue.spoken_label(), links, false)?;
+                return Ok(());
+            }
+            self.speak_with_links("", links, false)?;
+        }
+        self.speak_review_cue(cue)
+    }
+
+    pub(crate) fn speak_review_character(
+        &mut self,
+        character: &str,
+        links: &[Range<usize>],
+        direction: Option<speech::protocol::SoundCue>,
+    ) -> Result<()> {
+        if character.trim().is_empty() {
+            return self.speak_review_blank(!links.is_empty(), direction);
+        }
+        self.speak_review_readback(character, links, direction)
+    }
+
+    pub(crate) fn speak_review_blank(
+        &mut self,
+        linked: bool,
+        direction: Option<speech::protocol::SoundCue>,
+    ) -> Result<()> {
+        use speech::protocol::SoundCue;
+        let Some(direction) = direction else {
+            return self.speak_linked_review_cue(SoundCue::Blank, linked);
+        };
+        if !self.terminal_focused {
+            return Ok(());
+        }
+        if linked {
+            if !self.speech.can_sequence_tones() {
+                let label = format!("{} link blank", direction.spoken_label());
+                return self.speak(&label, false).map(|_| ());
+            }
+            let anchor = 0..0;
+            self.speak_with_links("", std::slice::from_ref(&anchor), false)?;
+        }
+        let label = format!("{} blank", direction.spoken_label());
+        self.call_hook_on_speech_start(&label, false)?;
+        let result = self.speech.speak_direction_and_blank(direction, &label);
+        self.call_hook_on_speech_end(&label, false, result.is_ok())?;
+        result.map(|_| ()).map_err(Into::into)
+    }
+
+    pub(crate) fn speak_review_readback(
+        &mut self,
+        text: &str,
+        links: &[Range<usize>],
+        cue: Option<speech::protocol::SoundCue>,
+    ) -> Result<()> {
+        if let Some(cue) = cue {
+            return self.speak_review_boundary_readback(text, links, cue, cue.spoken_label());
+        }
+        self.speak_with_links(text, links, false).map(|_| ())
+    }
+
+    pub(crate) fn speak_review_boundary_readback(
+        &mut self,
+        text: &str,
+        links: &[Range<usize>],
+        cue: speech::protocol::SoundCue,
+        label: &'static str,
+    ) -> Result<()> {
+        if !self.terminal_focused {
+            return Ok(());
+        }
+        let hook_text = if text.is_empty() { label } else { text };
+        self.call_hook_on_speech_start(hook_text, false)?;
+        let result = self
+            .speech
+            .speak_with_links_and_cue(text, links, Some((cue, label)), false);
+        self.call_hook_on_speech_end(hook_text, false, result.is_ok())?;
+        result.map(|_| ()).map_err(Into::into)
+    }
+
+    pub(crate) fn speak_with_links(
+        &mut self,
+        text: &str,
+        links: &[Range<usize>],
+        interrupt: bool,
+    ) -> Result<Option<crate::speech::protocol::UtteranceId>> {
+        if links.is_empty() {
+            return self.speak(text, interrupt);
+        }
+        if !self.terminal_focused {
+            return Ok(None);
+        }
+        self.call_hook_on_speech_start(text, interrupt)?;
+        let result = self.speech.speak_with_links(text, links, interrupt);
+        self.call_hook_on_speech_end(text, interrupt, result.is_ok())?;
+        result.map(Some).map_err(Into::into)
+    }
+
     pub(crate) fn speak_for_reader(
         &mut self,
         text: &str,
+        links: &[Range<usize>],
     ) -> Result<crate::speech::ReaderSubmission> {
         self.call_hook_on_speech_start(text, true)?;
-        let result = self.speech.speak_for_reader(text);
+        let result = self.speech.speak_for_reader_with_links(text, links);
         let ok = result.is_ok();
         self.call_hook_on_speech_end(text, true, ok)?;
         result.map_err(Into::into)

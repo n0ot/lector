@@ -182,3 +182,18 @@ Then expect-screen-contains: background
 And expect-speak: Terminal
 And expect-speak: background
 And expect-no-speak:
+
+Scenario: only the linked occurrence in a printed line is announced as a link
+When pty-stdout: index \x1b]8;;https://example.test/a\x1b\\index\x1b]8;;\x1b\\ index\r\n
+And settled:
+Then expect-speak: index link index index
+And expect-no-speak:
+
+Scenario: a cursor-addressed repaint marks links on the changed cells
+Given pty-stdout: \x1b[3;1Hitem delayed
+And settled:
+And clear-speech:
+When pty-stdout: \x1b[3;1H\x1b[Kitem \x1b]8;;https://example.test/b\x07available\x1b]8;;\x07\x1b[1;1H
+And settled:
+Then expect-speak: link available
+And expect-no-speak:

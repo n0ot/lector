@@ -137,21 +137,21 @@ impl ScreenReader {
             return Ok(false);
         }
 
-        let contents = view.screen().contents();
-        let contents = contents.trim();
-        if contents.is_empty() {
+        let (contents, mut links) = view.screen().linked_contents();
+        let contents = crate::terminal::trim_linked_text(&contents, &mut links);
+        if contents.is_empty() && links.is_empty() {
             return Ok(false);
         }
-        self.speak(contents, false)?;
+        self.speak_with_links(contents, &links, false)?;
         Ok(true)
     }
 
     pub(crate) fn speak_application_cursor_line(&mut self, view: &View) -> Result<bool> {
-        let line = view.line(view.screen().cursor_position().0);
-        if line.trim().is_empty() || self.should_suppress_key_echo(&line) {
+        let (line, links) = view.line_with_links(view.screen().cursor_position().0);
+        if (line.trim().is_empty() && links.is_empty()) || self.should_suppress_key_echo(&line) {
             return Ok(false);
         }
-        self.speak(&line, false)?;
+        self.speak_with_links(&line, &links, false)?;
         Ok(true)
     }
 
@@ -163,33 +163,29 @@ impl ScreenReader {
 
         let mut cursor_report = None;
         if cursor.0 != prev_cursor.0 {
-            let line = view.line(cursor.0);
-            cursor_report = Some(if line.trim().is_empty() {
-                String::new()
-            } else {
-                line
-            });
+            let reading = view.line_with_links(cursor.0);
+            if !reading.0.trim().is_empty() || !reading.1.is_empty() {
+                cursor_report = Some(reading);
+            }
         } else if cursor.1 != prev_cursor.1 {
             let distance_moved = (cursor.1 as i32 - prev_cursor.1 as i32).abs();
             let prev_word_start = view.screen().find_word_start(prev_cursor.0, prev_cursor.1);
             let word_start = view.screen().find_word_start(cursor.0, cursor.1);
             if word_start != prev_word_start && distance_moved > 1 {
-                cursor_report = Some(view.word(cursor.0, cursor.1));
+                cursor_report = Some(view.word_with_links(cursor.0, cursor.1));
             } else {
-                let character = view.character(cursor.0, cursor.1);
-                cursor_report = Some(if character.trim().is_empty() {
-                    String::new()
-                } else {
-                    character
-                });
+                let reading = view.character_with_links(cursor.0, cursor.1);
+                if !reading.0.trim().is_empty() || !reading.1.is_empty() {
+                    cursor_report = Some(reading);
+                }
             }
         }
 
         match self.cursor_tracking_mode {
             CursorTrackingMode::On => {
                 self.report_application_cursor_indentation_changes(view)?;
-                if let Some(text) = cursor_report {
-                    self.speak(&text, false)?;
+                if let Some((text, links)) = cursor_report {
+                    self.speak_with_links(&text, &links, false)?;
                 }
             }
             CursorTrackingMode::OffOnce => self.cursor_tracking_mode = CursorTrackingMode::On,
@@ -647,14 +643,18 @@ impl ScreenReader {
     }
 
     pub fn report_review_cursor_indentation_changes(&mut self, view: &mut View) -> Result<()> {
-        if !self.indentation_reporting_enabled() {
-            return Ok(());
-        }
-        let (indent_level, changed) = view.review_cursor_indentation_level();
-        if changed {
-            self.speak(&format!("indent {indent_level}"), false)?;
+        if let Some(level) = self.review_cursor_indentation_change(view) {
+            self.speak(&format!("indent {level}"), false)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn review_cursor_indentation_change(&self, view: &mut View) -> Option<u16> {
+        if !self.indentation_reporting_enabled() {
+            return None;
+        }
+        let (indent_level, changed) = view.review_cursor_indentation_level();
+        changed.then_some(indent_level)
     }
 }
 

@@ -65,7 +65,9 @@ Anything that might block runs on a bounded worker thread.
   cancellation and setting changes first. Results reach the event loop as
   events, not by polling. See the
   [speech-host protocol](../protocols/speech-host.md) for the queue and
-  failure rules.
+  failure rules. The built-in speech host sleeps until input, a native callback,
+  or a playback deadline needs attention. On macOS, active sample-timed
+  playback still checks the audio cursor.
 - **Opening links.** One worker launches the desktop URL opener for Review's
   `gx`, waits for it, and reaps it. A second request while one is running
   reports "busy". Shutdown does not wait for or kill a browser.

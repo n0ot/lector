@@ -405,6 +405,7 @@ fn update_summary_merges_print_boundaries_without_raw_byte_replay() {
         printed_runs: vec![PrintedRun {
             text: "partial".into(),
             boundary: PrintBoundary::Continue,
+            ..PrintedRun::default()
         }],
         batch_count: 1,
         ..UpdateSummary::default()
@@ -414,14 +415,17 @@ fn update_summary_merges_print_boundaries_without_raw_byte_replay() {
             PrintedRun {
                 text: " line".into(),
                 boundary: PrintBoundary::Continue,
+                ..PrintedRun::default()
             },
             PrintedRun {
                 text: "replacement".into(),
                 boundary: PrintBoundary::CarriageReturn,
+                ..PrintedRun::default()
             },
             PrintedRun {
                 text: "next".into(),
                 boundary: PrintBoundary::LineFeed,
+                ..PrintedRun::default()
             },
         ],
         batch_count: 1,
@@ -441,6 +445,7 @@ fn printed_run_coalescing_preserves_boundary_text_across_every_grouping() {
     let run = |boundary, text: &str| PrintedRun {
         boundary,
         text: text.into(),
+        ..PrintedRun::default()
     };
     let runs = [
         run(PrintBoundary::Continue, "prefix"),

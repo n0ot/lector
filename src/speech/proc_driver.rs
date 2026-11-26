@@ -148,6 +148,7 @@ pub struct ProcDriver {
     rate: f32,
     timeouts: RpcTimeouts,
     legacy_protocol: bool,
+    selected_minor: u16,
     backend: Option<BackendInfo>,
     capabilities: SpeechCapabilities,
     event_inbox: EventInbox,
@@ -381,6 +382,7 @@ impl ProcDriver {
             rate: NORMAL_RATE,
             timeouts,
             legacy_protocol: false,
+            selected_minor: 0,
             backend: None,
             capabilities: SpeechCapabilities::default(),
             event_inbox: EventInbox::default(),
@@ -483,6 +485,7 @@ impl ProcDriver {
         if !initialized.capabilities.controls.stop.is_supported() {
             return Err(Error::MissingCapability("controls.stop"));
         }
+        self.selected_minor = initialized.protocol.minor;
         self.backend = initialized.backend;
         self.capabilities = initialized
             .capabilities
@@ -770,6 +773,18 @@ impl Host for ProcDriver {
         &self.capabilities
     }
 
+    fn supports_directional_overlay(&self) -> bool {
+        self.selected_minor >= super::protocol::DIRECTIONAL_OVERLAY_PROTOCOL_MINOR
+    }
+
+    fn supports_link_exit(&self) -> bool {
+        self.selected_minor >= super::protocol::LINK_EXIT_PROTOCOL_MINOR
+    }
+
+    fn supports_standalone_pair(&self) -> bool {
+        self.selected_minor >= super::protocol::STANDALONE_CUE_PAIR_PROTOCOL_MINOR
+    }
+
     fn backend_info(&self) -> Option<&BackendInfo> {
         self.backend.as_ref()
     }
@@ -779,13 +794,28 @@ impl Host for ProcDriver {
     }
 
     fn speak(&mut self, id: &UtteranceId, text: &str, legacy_interrupt: bool) -> DriverResult<()> {
+        self.speak_with_cues(id, text, legacy_interrupt, &[])
+    }
+
+    fn speak_with_cues(
+        &mut self,
+        id: &UtteranceId,
+        text: &str,
+        legacy_interrupt: bool,
+        cues: &[super::protocol::SoundCueAt],
+    ) -> DriverResult<()> {
         let (method, params) = if self.legacy_protocol {
             (
                 "speak",
                 json!({ "text": text, "interrupt": legacy_interrupt }),
             )
-        } else {
+        } else if cues.is_empty() {
             ("speech.speak", json!({ "utteranceId": id, "text": text }))
+        } else {
+            (
+                "speech.speak",
+                json!({ "utteranceId": id, "text": text, "cues": cues }),
+            )
         };
         let result = self.call(method, Some(params))?;
         if self.legacy_protocol {

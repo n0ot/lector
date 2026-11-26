@@ -25,10 +25,20 @@ use ssip_client_async::ClientError as SpeechDispatcherError;
 use thiserror::Error;
 use tracing::instrument;
 
+#[cfg(any(windows, test))]
+#[path = "backends/nvda/schedule.rs"]
+mod nvda_schedule;
+#[cfg(any(windows, test))]
+#[path = "backends/nvda/ssml.rs"]
+mod nvda_ssml;
+
 mod backends;
+#[cfg(any(windows, test))]
+mod cue_pcm;
 pub mod host;
 pub mod protocol;
 pub mod server;
+pub mod speech_fallback;
 
 /// Android-specific configuration with no counterpart on the other platforms.
 #[cfg(target_os = "android")]
@@ -184,6 +194,10 @@ pub enum UtteranceId {
     Android(u64),
     #[cfg(target_vendor = "apple")]
     AvFoundation(usize),
+    #[cfg(windows)]
+    Nvda(u64),
+    #[cfg(target_vendor = "apple")]
+    SoundCue(usize),
     #[cfg(target_os = "linux")]
     SpeechDispatcher(u64),
     #[cfg(target_arch = "wasm32")]
@@ -201,6 +215,10 @@ impl fmt::Display for UtteranceId {
             UtteranceId::SpeechDispatcher(id) => write!(f, "SpeechDispatcher({id})"),
             #[cfg(target_vendor = "apple")]
             UtteranceId::AvFoundation(id) => write!(f, "AvFoundation({id})"),
+            #[cfg(windows)]
+            UtteranceId::Nvda(id) => write!(f, "NVDA({id})"),
+            #[cfg(target_vendor = "apple")]
+            UtteranceId::SoundCue(id) => write!(f, "SoundCue({id})"),
             #[cfg(target_arch = "wasm32")]
             UtteranceId::Web(id) => write!(f, "Web({id})"),
             #[cfg(windows)]
@@ -277,6 +295,9 @@ pub struct Features {
     pub stop: bool,
     pub synthesis: bool,
     pub utterance_callbacks: bool,
+    #[cfg(windows)]
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sound_cues: bool,
     pub voice: bool,
     pub get_voice: bool,
     pub volume: bool,
@@ -342,6 +363,15 @@ pub(crate) trait Backend: Clone {
     ///
     /// Returns an error if synthesis fails.
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<Option<UtteranceId>, Error>;
+    #[cfg(windows)]
+    fn speak_with_cues(
+        &mut self,
+        _text: &str,
+        _cues: &[protocol::SoundCueAt],
+    ) -> Result<Option<UtteranceId>, Error> {
+        Err(Error::UnsupportedFeature)
+    }
+
     /// # Errors
     ///
     /// Returns an error if the text cannot be synthesized to audio.
@@ -444,6 +474,8 @@ struct Callbacks {
     begin: Option<Box<dyn UtteranceCallback>>,
     end: Option<Box<dyn UtteranceCallback>>,
     stop: Option<Box<dyn UtteranceCallback>>,
+    #[cfg(windows)]
+    failure: Option<Box<dyn UtteranceCallback>>,
     pause: Option<Box<dyn UtteranceCallback>>,
     resume: Option<Box<dyn UtteranceCallback>>,
     #[cfg(target_vendor = "apple")]
@@ -471,6 +503,15 @@ impl Callbacks {
     fn utterance_stop(&mut self, utterance_id: UtteranceId) {
         if let Some(callback) = self.stop.as_mut() {
             callback(utterance_id);
+        }
+    }
+
+    #[cfg(windows)]
+    fn utterance_failure(&mut self, id: UtteranceId) {
+        if let Some(callback) = self.failure.as_mut() {
+            callback(id);
+        } else {
+            self.utterance_stop(id);
         }
     }
 
@@ -536,6 +577,8 @@ impl fmt::Debug for Callbacks {
             .field("resume", &self.resume.is_some());
         #[cfg(target_vendor = "apple")]
         debug.field("range", &self.range.is_some());
+        #[cfg(windows)]
+        debug.field("failure", &self.failure.is_some());
         debug
             .field("synthesis_begin", &self.synthesis_begin.is_some())
             .field("synthesis_complete", &self.synthesis_complete.is_some())
@@ -585,7 +628,7 @@ impl Tts {
             #[cfg(target_arch = "wasm32")]
             Backends::Web => Box::new(backends::Web::new(callbacks.clone())?),
             #[cfg(windows)]
-            Backends::Nvda => Box::new(backends::Nvda::new()?),
+            Backends::Nvda => Box::new(backends::Nvda::new(callbacks.clone())?),
             #[cfg(all(windows, feature = "tolk"))]
             Backends::Tolk => Box::new(
                 backends::Tolk::new().ok_or(Error::BackendUnavailable("Tolk failed to load"))?,
@@ -651,6 +694,18 @@ impl Tts {
     #[instrument(level = "debug", skip(self), err, ret)]
     pub fn speak(&self, text: &str, interrupt: bool) -> Result<Option<UtteranceId>, Error> {
         self.backend.write().speak(text, interrupt)
+    }
+
+    /// Submits speech with synchronized cues on a supporting Windows backend.
+    /// # Errors
+    /// Returns an error if the backend cannot play the supplied cues.
+    #[cfg(windows)]
+    pub fn speak_with_cues(
+        &self,
+        text: &str,
+        cues: &[protocol::SoundCueAt],
+    ) -> Result<Option<UtteranceId>, Error> {
+        self.backend.write().speak_with_cues(text, cues)
     }
 
     /// Synthesizes the specified text to audio, returned as a complete WAV file.
@@ -1165,6 +1220,18 @@ impl Tts {
         }
     }
 
+    /// Observes an asynchronous utterance failure.
+    /// # Errors
+    /// Returns an error if the backend cannot report utterance callbacks.
+    #[cfg(windows)]
+    pub fn on_utterance_failure(&self, callback: impl UtteranceCallback) -> Result<(), Error> {
+        if !self.supported_features().utterance_callbacks {
+            return Err(Error::UnsupportedFeature);
+        }
+        self.callbacks.lock().failure = Some(Box::new(callback));
+        Ok(())
+    }
+
     /// Called when this speech synthesizer pauses an utterance.
     ///
     /// # Errors
@@ -1227,6 +1294,10 @@ impl Tts {
         callbacks.begin = None;
         callbacks.end = None;
         callbacks.stop = None;
+        #[cfg(windows)]
+        {
+            callbacks.failure = None;
+        }
         callbacks.pause = None;
         callbacks.resume = None;
         #[cfg(target_vendor = "apple")]
@@ -1279,16 +1350,13 @@ impl Tts {
     #[instrument(level = "debug", ret)]
     #[must_use]
     pub fn screen_reader_available() -> bool {
-        #[cfg(windows)]
+        #[cfg(all(windows, feature = "tolk"))]
         {
-            if backends::Nvda::is_available() {
-                return true;
-            }
-            #[cfg(feature = "tolk")]
-            if backends::Tolk::is_available() {
-                return true;
-            }
-            false
+            backends::Nvda::is_available() || backends::Tolk::is_available()
+        }
+        #[cfg(all(windows, not(feature = "tolk")))]
+        {
+            backends::Nvda::is_available()
         }
         #[cfg(target_os = "linux")]
         {

@@ -213,6 +213,46 @@ fn application_semantic_speech_replaces_automatic_reading() {
 }
 
 #[test]
+fn application_capability_query_and_cue_fallback_use_the_pty() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut output = application_accessibility("query;42");
+    output.extend(application_accessibility("set;auto=0;cursor=0"));
+    output.extend(application_accessibility("cue;blank;indent=0;626c616e6b"));
+    output.extend(application_accessibility("cue;blank;"));
+    output.extend(application_accessibility("say-link;736565"));
+    let mut screen = Vec::new();
+    app.handle_pty(&mut sr, &output, &mut screen).unwrap();
+    let mut replies = Vec::new();
+    app.flush_application_replies(&mut replies).unwrap();
+    assert_eq!(
+        replies,
+        application_accessibility("capabilities;42;cue=blank;link=1;inline=link")
+    );
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr).unwrap();
+    assert_eq!(
+        recorder.inner.borrow().speaks,
+        [("blank".into(), false), ("link see".into(), false)]
+    );
+}
+
+#[test]
+fn application_line_reads_links_at_their_offsets_with_spoken_fallback() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    let mut output = application_accessibility("set;auto=0;cursor=0");
+    output.extend(application_accessibility(
+        "line;indent=0;links=4-8,13-16;736565206865726520616e6420616c6c",
+    ));
+    app.handle_pty(&mut sr, &output, &mut Vec::new()).unwrap();
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr).unwrap();
+    assert_eq!(
+        recorder.inner.borrow().speaks,
+        [("see link here and link all".into(), false)]
+    );
+}
+
+#[test]
 fn application_semantic_lines_report_only_changed_indentation_when_enabled() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut output = application_accessibility("set;auto=0;cursor=0");
@@ -1279,7 +1319,7 @@ fn review_previous_line_stops_at_visible_top_when_scrollback_exists() {
         .iter()
         .map(|(text, _)| text.clone())
         .collect::<Vec<_>>();
-    assert_eq!(spoken, ["top", "history-06"]);
+    assert_eq!(spoken, ["top history-06"]);
     assert!(pty_out.is_empty());
 }
 
@@ -1775,6 +1815,98 @@ fn review_overlay_reads_horizontal_destinations() {
         .collect::<Vec<_>>();
     assert_eq!(spoken, ["b", "c", "b"]);
     assert!(pty_out.is_empty());
+}
+
+#[test]
+fn review_speaks_link_exit_for_characters_and_skips_it_for_lines() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    app.handle_pty(
+        &mut sr,
+        b"x\x1b]8;;https://example.invalid\x1b\\ab\x1b]8;;\x1b\\y\r\nrow\x1b[H",
+        &mut term_out,
+    )
+    .unwrap();
+    app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+        .unwrap();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"lllhhhllj", &mut pty_out, &mut term_out)
+        .unwrap();
+    let spoken: Vec<_> = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(s, _)| s.clone())
+        .collect();
+    assert_eq!(
+        spoken,
+        [
+            "link a",
+            "b",
+            "out of link y",
+            "link b",
+            "a",
+            "out of link x",
+            "link a",
+            "b",
+            "row"
+        ]
+    );
+}
+
+#[test]
+fn review_word_navigation_announces_link_exits_in_both_directions() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty = Vec::new();
+    let mut screen = Vec::new();
+    app.handle_pty(
+        &mut sr,
+        b"before \x1b]8;;https://example.invalid\x1b\\linked words\x1b]8;;\x1b\\ after\x1b[H",
+        &mut screen,
+    )
+    .unwrap();
+    app.handle_stdin(&mut sr, b"\x1br", &mut pty, &mut screen)
+        .unwrap();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"wwwbbb", &mut pty, &mut screen)
+        .unwrap();
+    let spoken: Vec<_> = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(s, _)| s.clone())
+        .collect();
+    assert_eq!(
+        spoken,
+        [
+            "link linked",
+            "words",
+            "out of link after",
+            "link words",
+            "linked",
+            "out of link before"
+        ]
+    );
+}
+
+#[test]
+fn counted_character_exit_reads_only_its_destination() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty = Vec::new();
+    let mut screen = Vec::new();
+    app.handle_pty(&mut sr, b"\x1b]8;;https://example.invalid\x1b\\x\x1b]8;;\x1b\\ a\x1b]8;;https://example.invalid\x1b\\b\x1b]8;;\x1b\\\x1b[H", &mut screen).unwrap();
+    app.handle_stdin(&mut sr, b"\x1br", &mut pty, &mut screen)
+        .unwrap();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"2l", &mut pty, &mut screen)
+        .unwrap();
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("out of link a".into(), false)]
+    );
 }
 
 #[test]

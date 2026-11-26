@@ -904,7 +904,7 @@ impl App {
                 } else {
                     Vec::new()
                 };
-            self.queue_tmux_pane_report_replies(connection_id, pane_id, &bootstrap_replies);
+            self.queue_tmux_pane_report_replies(connection_id, pane_id, &bootstrap_replies)?;
             let pane_is_presented = self
                 .tmux_connections
                 .iter()
@@ -1673,10 +1673,10 @@ impl App {
             .flatten();
         // Current tmux asks a control client to supply default-colour reports.
         // Route only the OSC 10/11 replies through the dedicated report API;
-        // every other shadow reply remains tmux-owned and is discarded.
+        // Lector also returns its own accessibility replies to the originating pane.
         if let Some(outcome) = &mut outcome {
             let replies = std::mem::take(&mut outcome.update.pty_replies);
-            self.queue_tmux_pane_report_replies(connection_id, pane_id, &replies);
+            self.queue_tmux_pane_report_replies(connection_id, pane_id, &replies)?;
         }
         let bells = outcome.as_ref().map_or(0, |outcome| outcome.bells);
         let output_screen = outcome.as_ref().map(|outcome| {
@@ -1720,7 +1720,10 @@ impl App {
         connection_id: u64,
         pane_id: crate::tmux_model::PaneId,
         replies: &[u8],
-    ) {
+    ) -> Result<()> {
+        for reply in crate::application_accessibility::capability_replies(replies) {
+            self.queue_tmux_input(connection_id, pane_id, reply)?;
+        }
         for command in crate::tmux_input::refresh_client_report_commands(pane_id, replies) {
             self.pending_tmux_commands.push_back(PendingTmuxCommand {
                 connection_id,
@@ -1729,6 +1732,7 @@ impl App {
                 kind: PendingTmuxCommandKind::ColorReport(pane_id),
             });
         }
+        Ok(())
     }
 
     fn resolve_destroyed_tmux_gateways(

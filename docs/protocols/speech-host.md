@@ -4,7 +4,7 @@ This is the protocol between Lector and a speech server, called a *host*
 here. Implement it to make Lector speak through any speech engine, on any
 machine.
 
-- **Version:** 2.2. Hosts stay backward compatible with 2.0 and 2.1.
+- **Version:** 2.6. Hosts stay backward compatible with 2.0 through 2.5. Version 2.6 adds `linkExit` at offset zero for review navigation. It may accompany text or pair with `blank` on an empty utterance.
 - **Schema:** [`crates/lector-tts/openrpc.json`](../../crates/lector-tts/openrpc.json)
   defines the JSON shape of every method and message.
 - **This document** defines transport, capabilities, and behavior. If the two
@@ -107,13 +107,13 @@ are ignored. They are not failures.
 `initialize`, called exactly once:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":2,"maximumMinor":2},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":2,"maximumMinor":6},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
 ```
 
 The host picks a minor version in the offered range and describes itself:
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":2},"server":{"name":"lector-tts","version":"0.1.0"},"backend":{"id":"av-foundation","name":"AVFoundation"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite","pitch":"readWrite","volume":"readWrite"},"voices":{"list":true,"current":true,"select":true}}}}
+{"jsonrpc":"2.0","id":1,"result":{"protocol":{"major":2,"minor":5},"server":{"name":"lector-tts","version":"0.1.0"},"backend":{"id":"av-foundation","name":"AVFoundation"},"capabilities":{"lifecycle":{"started":{"delivery":"reliable"},"terminal":{"delivery":"reliable","distinguishes":["completed","cancelled","failed"]}},"progress":{"modes":[{"kind":"utf8ByteOffset","granularity":["word"]}]},"controls":{"stop":"confirmed","pauseResume":"restartFromWord"},"settings":{"rate":"readWrite","pitch":"readWrite","volume":"readWrite"},"voices":{"list":true,"current":true,"select":true}}}}
 ```
 
 Rules:
@@ -228,6 +228,40 @@ built-in NVDA adapter advertises all three as false.
 There is no "is speaking" capability or method. Playback state comes from
 lifecycle events, never from sampling the backend.
 
+### 5.6 Sound cues
+
+In 2.3, `soundCues: true` advertises one capability for both
+standalone cues and overlays. A standalone cue follows the normal utterance
+lifecycle. A cue with empty text can start as soon as the host accepts the
+request. It needs no speech synthesis or word callback. A link cue plays
+alongside the speech at the audible onset of the
+marked text. It MUST NOT defer, pause, restart, or split the spoken text.
+Stopping or interrupting speech MUST stop its active cues and discard any
+of its unplayed cues. A host only offers this capability when it can meet all
+of these requirements. Starting in 2.4, the same capability also guarantees
+that a directional cue can overlay the start of readback. Starting in 2.5,
+it also guarantees that a standalone direction and blank cue can play together
+from the same onset. Earlier versions and other capability values use spoken
+fallbacks for the cues they cannot play.
+
+On macOS, the first directional readback uses the native speech synthesizer
+at the configured volume. Its first word callback starts a separate cue
+player, and Core Audio mixes the two outputs. For a repeated short readback,
+the host can mix the cue into cached speech at the voice's original sample
+rate. On a stereo output, mono speech feeds both channels at the same
+level. Stereo speech keeps its original left and right samples. The host
+reduces this rendered mix only if its samples would exceed full scale.
+Core Audio handles conversion to the device sample rate. For a single word-aligned link,
+the macOS host uses live word callbacks to play the cue at the linked word.
+Multiple links share a rendered PCM timeline so their sounds can overlap.
+
+On Windows, the NVDA backend uses Controller Client v2 speech markers to
+trigger cues on the host machine. A worker waits for NVDA's synchronous
+speech call while the host remains available for stop requests. Standalone
+cues use the Windows audio output directly. The controller does not expose
+NVDA's selected audio device, so cue playback follows the Windows default
+audio output.
+
 ## 6. Data types
 
 **Utterance ID.** A nonempty opaque JSON string of at most 128 UTF-8 bytes,
@@ -273,6 +307,19 @@ after initialization.
 ```
 
 - The host MUST reject this call if another utterance is active.
+- Clients MAY include a nonempty `cues` array only in 2.3 or later when the
+  host advertises `soundCues: true`. Each entry contains a `cue` name
+  and a UTF-8 byte `offset` in `text`.
+- For nonempty text, `link` cue offsets MUST be strictly increasing UTF-8
+  character boundaries before the end of the text. In 2.4 or later a
+  `top`, `bottom`, `left`, or `right` cue MAY also appear once as the first
+  cue at offset zero. A link cue may share this offset. In 2.6, a sole
+  `linkExit` cue at zero can accompany the unlinked character or word.
+- For empty text, supply one of `top`, `bottom`, `left`, `right`, or
+  `blank` at offset zero. In 2.5 or later a directional cue MAY be followed
+  by `blank` at the same offset. The host MUST start both together, report one
+  utterance lifecycle, and stop both on cancellation. In 2.6, `linkExit` is
+  also valid at zero, alone or followed by `blank`.
 - The host MUST NOT queue utterances itself. Lector sends the next one only
   after reliable evidence that the current one ended.
 - A successful response means the host has taken responsibility for the
