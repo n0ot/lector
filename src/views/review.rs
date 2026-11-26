@@ -798,10 +798,7 @@ impl ReviewView {
             && self.document.left_review_link(previous, self.cursor)
         {
             let (text, links) = match motion {
-                Motion::Word(_, style) => {
-                    self.document
-                        .link_exit_word_readback(previous, self.cursor, style)
-                }
+                Motion::Word(_, style) => self.document.link_exit_word_readback(self.cursor, style),
                 _ => (self.document.cell_text(self.cursor).into(), Vec::new()),
             };
             crate::application_accessibility::ApplicationAccessibilitySpeech {

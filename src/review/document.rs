@@ -550,30 +550,36 @@ impl ReviewDocument {
 
     pub(crate) fn link_exit_word_readback(
         &self,
-        previous: HistoryPosition,
         current: HistoryPosition,
         style: WordStyle,
     ) -> (String, Vec<Range<usize>>) {
-        let class = self.word_class(current, style);
-        if class != 0
-            && let Some((start, end)) = self.word_bounds(current, style, class)
-        {
-            return self.cursor_word_readback(previous, current, start..end);
+        let cells = &self.positions;
+        let Ok(index) = cells.binary_search(&current) else {
+            return (self.cell_text(current).into(), Vec::new());
+        };
+        if self.word_class(current, style) == 0 {
+            return (self.cell_text(current).into(), Vec::new());
         }
-        (self.cell_text(current).into(), Vec::new())
+        let mut first = index;
+        let mut last = index;
+        while first > 0 && self.same_word(cells[first - 1], cells[first], style) {
+            first -= 1;
+        }
+        while last + 1 < cells.len() && self.same_word(cells[last], cells[last + 1], style) {
+            last += 1;
+        }
+        let mut text = String::new();
+        let mut links = LinkSpans::default();
+        for &position in &cells[first..=last] {
+            let grapheme = self.cell_text(position);
+            links.visit(text.len(), grapheme, self.review_link(position));
+            text.push_str(grapheme);
+        }
+        (text, links.spans)
     }
 
     fn keyword_bounds(&self, position: HistoryPosition) -> Option<(u16, u16)> {
-        self.word_bounds(position, WordStyle::Word, 1)
-    }
-
-    fn word_bounds(
-        &self,
-        position: HistoryPosition,
-        style: WordStyle,
-        class: u8,
-    ) -> Option<(u16, u16)> {
-        if self.word_class(position, style) != class {
+        if self.word_class(position, WordStyle::Word) != 1 {
             return None;
         }
         let row = self.rows.get(position.row)?;
@@ -586,8 +592,8 @@ impl ReviewDocument {
                         row: position.row,
                         col,
                     },
-                    style,
-                ) != class
+                    WordStyle::Word,
+                ) != 1
             {
                 break;
             }
@@ -601,8 +607,8 @@ impl ReviewDocument {
                         row: position.row,
                         col: end,
                     },
-                    style,
-                ) != class
+                    WordStyle::Word,
+                ) != 1
             {
                 break;
             }
@@ -1389,6 +1395,17 @@ mod tests {
 
     fn pos(row: usize, col: u16) -> HistoryPosition {
         HistoryPosition { row, col }
+    }
+
+    #[test]
+    fn word_exit_readback_includes_the_linked_suffix_across_a_soft_wrap() {
+        let doc = ReviewDocument::from_text(3, 8, b"\x1b]8;;https://example.invalid\x1b\\link\x1b]8;;\x1b\\ abc\x1b]8;;https://example.invalid\x1b\\def\x1b]8;;\x1b\\ end");
+        let destination = pos(0, 5);
+        assert!(doc.left_review_link(pos(0, 0), destination));
+        let (text, links) = doc.link_exit_word_readback(destination, super::WordStyle::Word);
+        let suffix = 3..6;
+        assert_eq!(text, "abcdef");
+        assert_eq!(links, std::slice::from_ref(&suffix));
     }
 
     #[test]
