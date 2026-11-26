@@ -1319,11 +1319,15 @@ fn speech_rate_keys_apply_before_confirmation_through_the_speech_host() {
 
     let rpc_log = fs::read_to_string(&lector.inner_speech_log).expect("read speech RPC log");
     let mut rate = None;
+    let mut requested_rates = Vec::new();
     let mut confirmed_rates = Vec::new();
     for record in rpc_log.split_terminator('\n') {
         let record: serde_json::Value = serde_json::from_str(record).expect("speech RPC record");
         match record["method"].as_str() {
-            Some("speech.setRate") => rate = record["params"]["rate"].as_f64(),
+            Some("speech.setRate") => {
+                rate = record["params"]["rate"].as_f64();
+                requested_rates.push(rate.expect("requested rate"));
+            }
             Some("speech.speak") => {
                 if let Some(value) = record["params"]["text"]
                     .as_str()
@@ -1337,6 +1341,13 @@ fn speech_rate_keys_apply_before_confirmation_through_the_speech_host() {
             _ => {}
         }
     }
+    assert_eq!(
+        requested_rates,
+        [
+            93.0, 88.0, 93.0, 98.0, 100.0, 100.0, 95.0, 90.0, 85.0, 80.0, 75.0, 70.0, 65.0, 60.0,
+            55.0, 50.0, 45.0, 40.0, 35.0, 30.0, 25.0, 20.0, 15.0, 10.0, 5.0, 0.0, 0.0,
+        ]
+    );
     assert!(confirmed_rates.starts_with(&[88.0, 93.0, 98.0, 100.0, 100.0]));
     assert!(confirmed_rates.contains(&85.0));
     assert!(confirmed_rates.ends_with(&[0.0, 0.0]));

@@ -366,6 +366,8 @@ impl App {
                             | commands::Action::CancelSpeaking
                             | commands::Action::ResumeSpeaking
                             | commands::Action::ToggleSpeaking
+                            | commands::Action::DecreaseSpeechRate
+                            | commands::Action::IncreaseSpeechRate
                     )
                 )
             });

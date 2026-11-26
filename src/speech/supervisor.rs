@@ -367,8 +367,9 @@ impl ConfiguredSpeechOptionError {
 pub struct Supervisor {
     spec: SpeechServerSpec,
     active: Option<ManagedProcess>,
-    desired_rate: f32,
-    desired_rate_configured: bool,
+    effective_rate: Option<f32>,
+    configured_rate: Option<f32>,
+    session_rate: Option<f32>,
     pending_rate: Option<f32>,
     desired_pitch: Option<f32>,
     pending_pitch: Option<f32>,
@@ -419,8 +420,9 @@ impl Supervisor {
         Self {
             spec,
             active: None,
-            desired_rate: NORMAL_RATE,
-            desired_rate_configured: false,
+            effective_rate: None,
+            configured_rate: None,
+            session_rate: None,
             pending_rate: None,
             desired_pitch: None,
             pending_pitch: None,
@@ -445,7 +447,10 @@ impl Supervisor {
         }
     }
 
-    fn spawn_ready(&mut self, spec: &SpeechServerSpec) -> DriverResult<ManagedProcess> {
+    fn spawn_ready(
+        &mut self,
+        spec: &SpeechServerSpec,
+    ) -> DriverResult<(ManagedProcess, Option<f32>)> {
         if self.handle.is_shutting_down() {
             return Err(anyhow!("speech supervisor is shutting down"));
         }
@@ -461,30 +466,40 @@ impl Supervisor {
             return Err(anyhow!("speech supervisor is shutting down"));
         }
         let legacy = candidate.host.has_legacy_queue();
-        let requested_rate = if legacy {
-            Some(self.pending_rate.unwrap_or(self.desired_rate))
-        } else {
-            self.pending_rate
-                .or(self.desired_rate_configured.then_some(self.desired_rate))
-        };
-        let applied_rate = if let Some(rate) = requested_rate {
-            if !legacy && !candidate.host.capabilities().settings.rate.can_write() {
-                return Err(ConfiguredSpeechOptionError::Unsupported {
-                    option: ConfiguredSpeechOption::Rate,
-                    operation: "setting rate",
-                }
-                .into());
+        let writable = legacy || candidate.host.capabilities().settings.rate.can_write();
+        let configured_rate = self.pending_rate.or(self.configured_rate);
+        if configured_rate.is_some() && !writable {
+            return Err(ConfiguredSpeechOptionError::Unsupported {
+                option: ConfiguredSpeechOption::Rate,
+                operation: "setting rate",
             }
-            Some(candidate.host.set_rate(rate).map_err(|source| {
-                anyhow::Error::new(ConfiguredSpeechOptionError::Rejected {
+            .into());
+        }
+
+        // A keyboard override can carry across hosts that accept it, but
+        // cannot veto a restart or replacement as a configured rate can.
+        let mut applied_rate = None;
+        let session_rate = self.session_rate.filter(|_| self.pending_rate.is_none());
+        if let Some(rate) = session_rate.filter(|_| writable) {
+            match candidate.host.set_rate(rate) {
+                Ok(actual) => applied_rate = Some(actual),
+                Err(error) if is_transport_failure(&error) => return Err(error),
+                Err(error) => warn_option_failure("restoring the session rate", &error),
+            }
+        }
+        if applied_rate.is_none()
+            && let Some(rate) = configured_rate.or_else(|| {
+                legacy.then(|| session_rate.map_or_else(|| self.get_rate(), |_| NORMAL_RATE))
+            })
+        {
+            applied_rate = Some(candidate.host.set_rate(rate).map_err(|source| {
+                ConfiguredSpeechOptionError::Rejected {
                     option: ConfiguredSpeechOption::Rate,
                     value: rate.to_string(),
                     source,
-                })
-            })?)
-        } else {
-            None
-        };
+                }
+            })?);
+        }
         let requested_pitch = self.pending_pitch.or(self.desired_pitch);
         let applied_pitch = if let Some(pitch) = requested_pitch {
             if candidate.host.capabilities().settings.pitch.can_write() {
@@ -546,11 +561,9 @@ impl Supervisor {
                 .into());
             }
         }
-        if let Some(applied_rate) = applied_rate {
-            self.desired_rate = applied_rate;
-        }
         if self.pending_rate.take().is_some() {
-            self.desired_rate_configured = true;
+            self.configured_rate = applied_rate;
+            self.session_rate = None;
         }
         if self.pending_pitch.take().is_some() || self.desired_pitch.is_some() {
             self.desired_pitch = applied_pitch;
@@ -561,10 +574,12 @@ impl Supervisor {
         if let Some(voice_id) = self.pending_voice.take() {
             self.desired_voice = Some(voice_id);
         }
-        Ok(candidate)
+        Ok((candidate, applied_rate))
     }
 
-    fn install_active(&mut self, process: ManagedProcess) -> Option<ManagedProcess> {
+    fn install_active(&mut self, process: (ManagedProcess, Option<f32>)) -> Option<ManagedProcess> {
+        let (process, rate) = process;
+        self.effective_rate = rate;
         self.active.replace(process)
     }
 
@@ -615,7 +630,7 @@ impl Supervisor {
         let volume_supported = capabilities.settings.volume.can_write();
         let mut state = OptionState {
             sound_cues: process.host.supports_sound_cues(),
-            rate: (legacy || self.desired_rate_configured).then_some(self.desired_rate),
+            rate: self.effective_rate,
             rate_status: if rate_supported {
                 CapabilityStatus::Supported
             } else {
@@ -648,7 +663,7 @@ impl Supervisor {
         if !legacy && capabilities.settings.rate == SettingSupport::ReadWrite {
             match process.host.get_rate() {
                 Ok(rate) => {
-                    self.desired_rate = rate;
+                    self.effective_rate = Some(rate);
                     state.rate = Some(rate);
                 }
                 Err(error) => warn_option_failure("reading rate", &error),
@@ -834,6 +849,24 @@ impl Supervisor {
         Err(error)
     }
 
+    fn apply_rate(&mut self, rate: f32) -> DriverResult<Option<f32>> {
+        self.ensure_available()?;
+        if self.active.as_ref().is_some_and(|process| {
+            !process.host.has_legacy_queue()
+                && !process.host.capabilities().settings.rate.can_write()
+        }) {
+            return Ok(None);
+        }
+        let mut actual = rate;
+        self.call_host("set_rate", |host| {
+            actual = host.set_rate(rate)?;
+            Ok(())
+        })?;
+        self.effective_rate = Some(actual);
+        self.option_state.rate = Some(actual);
+        Ok(Some(actual))
+    }
+
     fn call_managed(
         &mut self,
         operation: &'static str,
@@ -873,7 +906,7 @@ impl Supervisor {
 
         let spec = self.spec.clone();
         match self.spawn_ready(&spec) {
-            Ok(mut process) => {
+            Ok((mut process, rate)) => {
                 if let Err(error) = self.manager.host_ready(process.host.as_mut()) {
                     let message = format!(
                         "{failure}; resume pending speech on restarted server failed: {error:#}"
@@ -881,7 +914,7 @@ impl Supervisor {
                     self.enter_fatal(message.clone());
                     return Err(anyhow!(message));
                 }
-                let _ = self.install_active(process);
+                let _ = self.install_active((process, rate));
                 self.refresh_option_state();
                 Ok(())
             }
@@ -910,7 +943,7 @@ impl Supervisor {
         self.ensure_available()?;
 
         match self.spawn_ready(&spec) {
-            Ok(mut candidate) => {
+            Ok((mut candidate, rate)) => {
                 // Prepare the candidate from a clone so failure leaves both
                 // the old process and its evidence-backed manager state
                 // untouched. Active speech is never replayed; only work that
@@ -925,7 +958,7 @@ impl Supervisor {
                         .push_event(SupervisorEvent::ReconfigureFailed(message.clone()));
                     return Err(anyhow!(message));
                 }
-                let old = self.install_active(candidate);
+                let old = self.install_active((candidate, rate));
                 self.manager = candidate_manager;
                 self.spec = spec.clone();
                 self.refresh_option_state();
@@ -1077,7 +1110,7 @@ impl Driver for Supervisor {
     }
 
     fn get_rate(&self) -> f32 {
-        self.desired_rate
+        self.effective_rate.unwrap_or(NORMAL_RATE)
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
@@ -1097,21 +1130,23 @@ impl Driver for Supervisor {
             self.pending_rate = Some(rate);
             return Ok(SetOptionOutcome::Accepted);
         }
-        if self.active.as_ref().is_some_and(|process| {
-            !process.host.has_legacy_queue()
-                && !process.host.capabilities().settings.rate.can_write()
-        }) {
+        let Some(actual) = self.apply_rate(rate)? else {
             return Ok(SetOptionOutcome::Unsupported);
-        }
-        let mut actual = rate;
-        self.call_host("set_rate", |host| {
-            actual = host.set_rate(rate)?;
-            Ok(())
-        })?;
-        self.desired_rate = actual;
-        self.desired_rate_configured = true;
-        self.option_state.rate = Some(actual);
+        };
+        self.configured_rate = Some(actual);
+        self.session_rate = None;
         Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn set_session_rate(&mut self, rate: f32) -> DriverResult<Option<f32>> {
+        if !rate_is_normalized(rate) {
+            return Err(anyhow!("speech rate must be between 0 and 100 inclusive"));
+        }
+        let applied = self.apply_rate(rate)?;
+        if applied.is_some() {
+            self.session_rate = applied;
+        }
+        Ok(applied)
     }
 
     fn option_state(&self) -> OptionState {
@@ -1274,7 +1309,8 @@ mod tests {
         calls: Vec<Call>,
         speak_results: VecDeque<DriverResult<()>>,
         stop_results: VecDeque<DriverResult<()>>,
-        rate_results: VecDeque<DriverResult<()>>,
+        rate_results: VecDeque<DriverResult<f32>>,
+        events: Vec<crate::speech::protocol::SpeechEventNotification>,
         rate: f32,
         pitch: f32,
         volume: f32,
@@ -1291,6 +1327,7 @@ mod tests {
                 speak_results: VecDeque::new(),
                 stop_results: VecDeque::new(),
                 rate_results: VecDeque::new(),
+                events: Vec::new(),
                 rate: NORMAL_RATE,
                 pitch: 1.0,
                 volume: 1.0,
@@ -1351,11 +1388,9 @@ mod tests {
         fn set_rate(&mut self, rate: f32) -> DriverResult<f32> {
             let mut state = self.state.lock().unwrap();
             state.calls.push(Call::SetRate(rate.to_bits()));
-            let result = state.rate_results.pop_front().unwrap_or(Ok(()));
-            if result.is_ok() {
-                state.rate = rate;
-            }
-            result.map(|()| state.rate)
+            let actual = state.rate_results.pop_front().unwrap_or(Ok(rate))?;
+            state.rate = actual;
+            Ok(actual)
         }
 
         fn get_pitch(&mut self) -> DriverResult<f32> {
@@ -1417,7 +1452,7 @@ mod tests {
         fn take_events(
             &mut self,
         ) -> DriverResult<Vec<crate::speech::protocol::SpeechEventNotification>> {
-            Ok(Vec::new())
+            Ok(std::mem::take(&mut self.state.lock().unwrap().events))
         }
     }
 
@@ -1631,6 +1666,129 @@ mod tests {
     }
 
     #[test]
+    fn interactive_rate_confirms_applied_value_and_keeps_it_after_rejection() {
+        let mut harness = Harness::new();
+        let host = fake_state();
+        {
+            let mut state = host.lock().unwrap();
+            state.legacy = false;
+            state.capabilities.settings.rate = SettingSupport::ReadWrite;
+            state.rate = 73.25;
+            state
+                .rate_results
+                .extend([Ok(78.0), Err(anyhow!("rate rejected")), Ok(83.0)]);
+        }
+        harness.push_driver(Arc::clone(&host));
+        let supervisor = &mut harness.supervisor;
+        supervisor.start().unwrap();
+
+        supervisor
+            .adjust_rate_and_announce(true, Some(UtteranceId::new("first")))
+            .unwrap();
+        assert!(
+            supervisor
+                .adjust_rate_and_announce(true, Some(UtteranceId::new("rejected")))
+                .is_err()
+        );
+        assert_eq!(supervisor.option_state().rate, Some(78.0));
+        supervisor
+            .adjust_rate_and_announce(true, Some(UtteranceId::new("next")))
+            .unwrap();
+        let calls = &host.lock().unwrap().calls;
+        let rate_and_speech: Vec<_> = calls
+            .iter()
+            .filter(|call| matches!(call, Call::SetRate(_) | Call::Speak(..)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            rate_and_speech,
+            [
+                Call::SetRate(78.25f32.to_bits()),
+                Call::Speak("78 percent".to_owned(), false),
+                Call::SetRate(83.0f32.to_bits()),
+                Call::Speak("could not change speech rate".to_owned(), false),
+                Call::SetRate(83.0f32.to_bits()),
+                Call::Speak("83 percent".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn new_rate_discards_the_previous_confirmation_waiting_for_stop_evidence() {
+        use crate::speech::protocol::{
+            DeliveryGuarantee, SpeechEventNotification, SpeechEventPayload, StopSupport,
+        };
+
+        let mut harness = Harness::new();
+        let host = fake_state();
+        {
+            let mut state = host.lock().unwrap();
+            state.legacy = false;
+            state.capabilities.settings.rate = SettingSupport::ReadWrite;
+            state.capabilities.controls.stop = StopSupport::BestEffort;
+            state.capabilities.lifecycle.terminal.delivery = DeliveryGuarantee::Reliable;
+        }
+        harness.push_driver(Arc::clone(&host));
+        let supervisor = &mut harness.supervisor;
+        supervisor.start().unwrap();
+        let current = UtteranceId::new("current");
+        supervisor
+            .speak_utterance(&current, "current text", false)
+            .unwrap();
+        supervisor
+            .adjust_rate_and_announce(true, Some(UtteranceId::new("older")))
+            .unwrap();
+        host.lock().unwrap().events.push(SpeechEventNotification {
+            utterance_id: current,
+            sequence: 1,
+            event: SpeechEventPayload {
+                kind: "ended".to_owned(),
+                position: None,
+                reason: Some("cancelled".to_owned()),
+                message: None,
+                extensions: Default::default(),
+            },
+        });
+        supervisor
+            .adjust_rate_and_announce(true, Some(UtteranceId::new("latest")))
+            .unwrap();
+
+        assert_eq!(
+            host.lock().unwrap().calls,
+            [
+                Call::GetRate,
+                Call::Speak("current text".to_owned(), false),
+                Call::Stop,
+                Call::SetRate(55.0f32.to_bits()),
+                Call::SetRate(60.0f32.to_bits()),
+                Call::Speak("60 percent".to_owned(), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn keyboard_rate_does_not_require_rate_support_on_a_replacement_host() {
+        let mut harness = Harness::new();
+        let writable = fake_state();
+        let unsupported = fake_state();
+        unsupported.lock().unwrap().legacy = false;
+        harness.push_driver(writable);
+        harness.push_driver(Arc::clone(&unsupported));
+        let supervisor = &mut harness.supervisor;
+        supervisor.start().unwrap();
+        assert_eq!(supervisor.set_session_rate(67.0).unwrap(), Some(67.0));
+
+        let replacement = SpeechServerSpec::Process {
+            program: "replacement".to_owned(),
+            args: vec![],
+        };
+        supervisor.configure_server(replacement).unwrap();
+        assert_eq!(supervisor.option_state().rate, None);
+        assert_eq!(supervisor.set_session_rate(72.0).unwrap(), None);
+        assert!(unsupported.lock().unwrap().calls.is_empty());
+    }
+
+    #[test]
     fn configured_unsupported_rate_fails_startup_without_committing_the_value() {
         let mut harness = Harness::new();
         let active = fake_state();
@@ -1643,7 +1801,7 @@ mod tests {
         assert!(format!("{error:#}").contains("speech.rate is unavailable"));
         assert_eq!(harness.spawns.load(Ordering::SeqCst), 1);
         assert_eq!(active.lock().unwrap().calls, [Call::Terminate]);
-        assert_eq!(harness.supervisor.desired_rate, NORMAL_RATE);
+        assert_eq!(harness.supervisor.effective_rate, None);
         assert_eq!(harness.supervisor.pending_rate, None);
     }
 
@@ -1802,7 +1960,7 @@ mod tests {
             .unwrap();
         harness.supervisor.start().unwrap();
 
-        assert_eq!(harness.supervisor.desired_rate, 75.0);
+        assert_eq!(harness.supervisor.effective_rate, Some(75.0));
         assert_eq!(harness.supervisor.pending_rate, None);
         assert_eq!(
             accepted.lock().unwrap().calls,

@@ -10,7 +10,10 @@ use std::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use protocol::{NORMAL_RATE, SoundCue, TextPosition, UtteranceId, VoiceInfo, rate_is_normalized};
+use protocol::{
+    MAX_RATE, MIN_RATE, NORMAL_RATE, SoundCue, TextPosition, UtteranceId, VoiceInfo,
+    rate_is_normalized,
+};
 
 pub mod proc_driver;
 pub mod protocol;
@@ -128,6 +131,36 @@ pub enum UtteranceBoundary {
     Paragraph(Duration),
 }
 
+/// The driver owns both application and feedback so the utterance can use a
+/// confirmed rate without blocking the terminal thread.
+fn apply_rate_adjustment(
+    driver: &mut (impl Driver + ?Sized),
+    increase: bool,
+    announcement: Option<&UtteranceId>,
+    is_current: impl Fn(&UtteranceId) -> bool,
+) -> DriverResult<()> {
+    // Cancel first so the host cannot release an older deferred replacement
+    // at the new rate when submission drains terminal events.
+    let stopped = if announcement.is_some() {
+        driver.stop()
+    } else {
+        Ok(())
+    };
+    let step = if increase { 5.0 } else { -5.0 };
+    let rate = (driver.get_rate() + step).clamp(MIN_RATE, MAX_RATE);
+    let applied = driver.set_session_rate(rate);
+    if let Some(id) = announcement.filter(|id| is_current(id)) {
+        let text = match &applied {
+            Ok(Some(rate)) => format!("{} percent", rate.to_string().replace('.', " point ")),
+            Ok(None) => "the current voice cannot change speech rate".to_owned(),
+            Err(_) => "could not change speech rate".to_owned(),
+        };
+        driver.speak_utterance(id, &text, true)?;
+    }
+    applied?;
+    stopped
+}
+
 pub trait Driver {
     fn speak(&mut self, text: &str, interrupt: bool) -> DriverResult<()>;
 
@@ -222,6 +255,23 @@ pub trait Driver {
     fn set_rate_option(&mut self, rate: f32) -> DriverResult<SetOptionOutcome> {
         self.set_rate(rate)?;
         Ok(SetOptionOutcome::Accepted)
+    }
+
+    /// Apply an interactive rate change and return the effective rate. None
+    /// indicates that the active voice cannot change rate.
+    fn set_session_rate(&mut self, rate: f32) -> DriverResult<Option<f32>> {
+        match self.set_rate_option(rate)? {
+            SetOptionOutcome::Accepted => Ok(Some(self.get_rate())),
+            SetOptionOutcome::Unsupported => Ok(None),
+        }
+    }
+
+    fn adjust_rate_and_announce(
+        &mut self,
+        increase: bool,
+        announcement: Option<UtteranceId>,
+    ) -> DriverResult<()> {
+        apply_rate_adjustment(self, increase, announcement.as_ref(), |_| true)
     }
 
     fn set_pitch_option(&mut self, _pitch: f32) -> DriverResult<SetOptionOutcome> {
@@ -736,6 +786,13 @@ impl Speech {
     pub fn set_rate_option(&mut self, rate: f32) -> Result<SetOptionOutcome> {
         ensure_normalized_rate(rate)?;
         self.driver.set_rate_option(rate).map_err(Error::Driver)
+    }
+
+    pub(crate) fn adjust_rate(&mut self, increase: bool, announce: bool) -> Result<()> {
+        let announcement = announce.then(|| self.allocate_utterance_id());
+        self.driver
+            .adjust_rate_and_announce(increase, announcement)
+            .map_err(Error::Driver)
     }
 
     pub fn pitch(&self) -> Option<f32> {

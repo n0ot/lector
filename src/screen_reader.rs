@@ -419,6 +419,11 @@ impl ScreenReader {
         &mut self.speech
     }
 
+    pub(crate) fn adjust_speech_rate(&mut self, increase: bool) -> Result<()> {
+        self.speech.adjust_rate(increase, self.terminal_focused)?;
+        Ok(())
+    }
+
     pub fn cancel_speaking(&mut self) -> Result<()> {
         self.speech.cancel()?;
         Ok(())
