@@ -83,6 +83,7 @@ objc2-avf-audio = { version = "0.3", default-features = false, features = [
     "AVAudioBuffer",
     "AVAudioEngine",
     "AVAudioFormat",
+    "AVAudioIONode",
     "AVAudioMixerNode",
     "AVAudioMixing",
     "AVAudioNode",

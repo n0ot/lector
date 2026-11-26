@@ -36,15 +36,6 @@ use crate::{
 mod engine;
 use engine::{Clip, CueEngine, NodePlayback};
 
-// Directional sounds are less prominent during speech than when played alone.
-pub(super) const DIRECTIONAL_UNDERLAY_GAIN: f32 = 0.35;
-// The approved directional WAVs peak below this bound. Linear interpolation
-// and normal playback volume cannot increase that component's peak.
-const MAX_DIRECTIONAL_CUE_PEAK: f32 = 0.226;
-// Reserve room for the quiet cue even if the speech waveform reaches full
-// scale. Use the same small gain on both live and cached directional speech.
-pub(super) const DIRECTIONAL_SPEECH_GAIN: f32 =
-    0.99 - MAX_DIRECTIONAL_CUE_PEAK * DIRECTIONAL_UNDERLAY_GAIN;
 const MIX_PEAK_CEILING: f32 = 0.98;
 
 const RENDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(4);
@@ -55,7 +46,8 @@ const MAX_QUEUED_EVENTS: usize = 1024;
 const MAX_CACHED_READBACKS: usize = 4;
 const MAX_CACHED_TEXT_BYTES: usize = 256;
 // 10 seconds at 48 kHz, with lower-rate voices constrained by the
-// duration limit as well. Four entries cap retained PCM at ~7 MB after conversion.
+// duration limit as well. A mono entry routed to stereo still has at most
+// two channels, bounding retained PCM to ~15 MiB across four entries.
 const MAX_CACHED_SAMPLES: usize = 480_000;
 const MAX_CACHED_SECONDS: usize = 10;
 const STANDALONE_CUES: [SoundCue; 5] = [
@@ -103,7 +95,6 @@ struct CuePlayer {
 pub(super) struct PreparedCues {
     players: Vec<CuePlayer>,
     engine: RefCell<Option<CueEngine>>,
-    failed_engine: Cell<Option<Instant>>,
     clips: RefCell<Vec<(SoundCue, Clip)>>,
     blank_pairs: Vec<(SoundCue, Clip)>,
 }
@@ -148,24 +139,7 @@ impl PreparedCues {
         &self,
         action: impl FnOnce(&CueEngine) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let mut engine = self.engine.borrow_mut();
-        if engine.is_none() {
-            if self
-                .failed_engine
-                .get()
-                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
-            {
-                return Err(Error::OperationFailed("start cue output engine"));
-            }
-            match CueEngine::new() {
-                Ok(open) => *engine = Some(open),
-                Err(error) => {
-                    self.failed_engine.set(Some(Instant::now()));
-                    return Err(error);
-                }
-            }
-        }
-        action(engine.as_ref().expect("cue output engine initialized"))
+        action(self.engine.borrow_mut().get_or_insert_with(CueEngine::new))
     }
 
     pub(super) fn idle_timeout(&self) -> Option<Duration> {
@@ -309,7 +283,7 @@ impl RenderedAudio {
         mut self,
         text: &str,
         cues: &[SoundCueAt],
-    ) -> Result<(Vec<u8>, Vec<WordOnset>), Error> {
+    ) -> Result<(Vec<f32>, Vec<WordOnset>), Error> {
         let spec = self
             .spec
             .ok_or(Error::OperationFailed("render speech PCM"))?;
@@ -354,12 +328,6 @@ impl RenderedAudio {
             [direction, links @ ..] if direction.cue != SoundCue::Link => (Some(direction), links),
             _ => (None, cues),
         };
-        if direction.is_some() {
-            for sample in &mut self.samples {
-                *sample *= DIRECTIONAL_SPEECH_GAIN;
-            }
-        }
-        let dry_peak = peak(&self.samples);
         if let Some(direction) = direction {
             // The cached short-readback route can start at the first word.
             // Remove preroll only when every omitted sample is silent.
@@ -375,10 +343,7 @@ impl RenderedAudio {
                     word.frame -= preroll_frames;
                 }
             }
-            let mut samples = cue_samples(direction.cue, spec.sample_rate)?;
-            for sample in &mut samples {
-                *sample *= DIRECTIONAL_UNDERLAY_GAIN;
-            }
+            let samples = cue_samples(direction.cue, spec.sample_rate)?;
             mix_at(&mut self.samples, channels, words[0].frame, &samples);
         }
         if !links.is_empty()
@@ -400,17 +365,13 @@ impl RenderedAudio {
         // gain for the entire mix. A constant gain preserves the waveform
         // and avoids hard clipping or a gain change at the end of the cue.
         let mix_peak = peak(&self.samples);
-        let ceiling = if mix_peak > dry_peak {
-            MIX_PEAK_CEILING
-        } else {
-            1.0
-        };
-        let mix_gain = if mix_peak > ceiling {
-            ceiling / mix_peak
-        } else {
-            1.0
-        };
-        Ok((write_pcm16(spec, self.samples, mix_gain)?, words))
+        if mix_peak > 1.0 {
+            let gain = MIX_PEAK_CEILING / mix_peak;
+            for sample in &mut self.samples {
+                *sample *= gain;
+            }
+        }
+        Ok((self.samples, words))
     }
 }
 
@@ -420,7 +381,7 @@ fn peak(samples: &[f32]) -> f32 {
         .fold(0.0, |peak, sample| peak.max(sample.abs()))
 }
 
-fn write_pcm16(spec: WavSpec, samples: Vec<f32>, gain: f32) -> Result<Vec<u8>, Error> {
+fn write_pcm16(spec: WavSpec, samples: &[f32]) -> Result<Vec<u8>, Error> {
     let mut wav = Cursor::new(Vec::new());
     let mut writer = WavWriter::new(
         &mut wav,
@@ -432,7 +393,7 @@ fn write_pcm16(spec: WavSpec, samples: Vec<f32>, gain: f32) -> Result<Vec<u8>, E
     )?;
     for sample in samples {
         #[allow(clippy::cast_possible_truncation)]
-        writer.write_sample((sample * gain * f32::from(i16::MAX)).round() as i16)?;
+        writer.write_sample((sample * f32::from(i16::MAX)).round() as i16)?;
     }
     writer.finalize()?;
     Ok(wav.into_inner())
@@ -676,12 +637,15 @@ impl Rendering {
         }
 
         if finished {
-            let sample_rate = self.data.spec.map_or(1, |spec| spec.sample_rate);
-            let (wav, words) = std::mem::take(&mut self.data).finish(&self.text, &self.cues)?;
+            let spec = self
+                .data
+                .spec
+                .ok_or(Error::OperationFailed("render speech PCM"))?;
+            let (samples, words) = std::mem::take(&mut self.data).finish(&self.text, &self.cues)?;
             return Ok(Some(RenderedPlayback {
-                wav,
+                spec,
+                samples,
                 words,
-                sample_rate,
             }));
         }
         let now = Instant::now();
@@ -696,15 +660,16 @@ impl Rendering {
 }
 
 struct RenderedPlayback {
-    wav: Vec<u8>,
+    spec: WavSpec,
+    samples: Vec<f32>,
     words: Vec<WordOnset>,
-    sample_rate: u32,
 }
 
 impl RenderedPlayback {
     fn play(&self, volume: f32) -> Result<Playing, Error> {
-        let audio = new_player(&self.wav, volume)?;
-        Playing::start(audio, self.words.clone(), self.sample_rate)
+        let wav = write_pcm16(self.spec, &self.samples)?;
+        let audio = new_player(&wav, volume)?;
+        Playing::start(audio, self.words.clone(), self.spec.sample_rate)
     }
 }
 
@@ -1040,12 +1005,12 @@ impl ReadbackCache {
         prepared: &PreparedCues,
     ) -> Option<CuePlayback> {
         let index = self.ready.iter().position(|(cached, _)| cached == key)?;
-        let (key, ready) = self.ready.remove(index)?;
+        let (key, mut ready) = self.ready.remove(index)?;
 
         let playback = Playback::Playing(Playing::new(
             AudioOutput::Engine(
                 prepared
-                    .with_engine(|engine| engine.play(&ready.clip, volume))
+                    .with_engine(|engine| engine.play_readback(&mut ready.clip, volume))
                     .ok()?,
             ),
             ready.words.clone(),
@@ -1093,7 +1058,9 @@ impl ReadbackCache {
         match render.advance() {
             Ok(Some(ready)) => {
                 let (key, _, _) = self.rendering.take().expect("render just advanced");
-                if let Ok(clip) = Clip::from_wave(&ready.wav) {
+                if let Ok(clip) =
+                    Clip::from_pcm(ready.spec.sample_rate, ready.spec.channels, &ready.samples)
+                {
                     if self.ready.len() == MAX_CACHED_READBACKS {
                         self.ready.pop_back();
                     }
@@ -1119,24 +1086,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn directional_overlay_reserves_headroom_even_for_full_scale_speech() {
-        for cue in [
-            SoundCue::Top,
-            SoundCue::Bottom,
-            SoundCue::Left,
-            SoundCue::Right,
-        ] {
-            let samples = cue_samples(cue, 44_100).unwrap();
-            let cue_peak = peak(&samples);
-            assert!(
-                cue_peak <= MAX_DIRECTIONAL_CUE_PEAK,
-                "asset {cue:?} exceeds its peak budget"
-            );
-            assert!(DIRECTIONAL_SPEECH_GAIN + cue_peak * DIRECTIONAL_UNDERLAY_GAIN <= 0.99);
-        }
-    }
-
-    #[test]
     fn pcm_overload_guard_keeps_transients_instead_of_clipping_them() {
         let wave = WavSpec {
             channels: 1,
@@ -1160,7 +1109,7 @@ mod tests {
                 }],
             )
             .unwrap();
-        let mut wave = WavReader::new(Cursor::new(audio)).unwrap();
+        let mut wave = WavReader::new(Cursor::new(write_pcm16(wave, &audio).unwrap())).unwrap();
         let samples = wave
             .samples::<i16>()
             .collect::<Result<Vec<_>, _>>()
@@ -1200,14 +1149,15 @@ mod tests {
 
     #[test]
     fn link_is_mixed_into_speech_at_the_native_word_frame() {
-        let wave = WavSpec {
+        let wave_spec = WavSpec {
             channels: 2,
             sample_rate: 44_100,
             bits_per_sample: 32,
             sample_format: SampleFormat::Float,
         };
         let mut pcm = RenderedAudio::default();
-        pcm.append(wave, std::iter::repeat_n(0.125, 8192)).unwrap();
+        pcm.append(wave_spec, std::iter::repeat_n(0.125, 8192))
+            .unwrap();
         pcm.words.push(Word {
             byte_sample: 0,
             start: 0,
@@ -1228,7 +1178,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(words[1].frame, 200);
-        let mut reader = WavReader::new(Cursor::new(wave)).unwrap();
+        let mut reader =
+            WavReader::new(Cursor::new(write_pcm16(wave_spec, &wave).unwrap())).unwrap();
         let samples = reader
             .samples::<i16>()
             .collect::<Result<Vec<_>, _>>()
@@ -1270,7 +1221,7 @@ mod tests {
             },
         ];
         let (audio, _) = pcm.finish("one", &cues).unwrap();
-        let mut reader = WavReader::new(Cursor::new(audio)).unwrap();
+        let mut reader = WavReader::new(Cursor::new(write_pcm16(wave, &audio).unwrap())).unwrap();
         let samples = reader
             .samples::<i16>()
             .collect::<Result<Vec<_>, _>>()
@@ -1279,8 +1230,7 @@ mod tests {
         let direction = cue_samples(SoundCue::Right, wave.sample_rate).unwrap();
         let link = cue_samples(SoundCue::Link, wave.sample_rate).unwrap();
         for (index, (&actual, direction)) in samples[start..].iter().zip(direction).enumerate() {
-            let mixed =
-                direction * DIRECTIONAL_UNDERLAY_GAIN + link.get(index).copied().unwrap_or(0.0);
+            let mixed = direction + link.get(index).copied().unwrap_or(0.0);
             #[allow(clippy::cast_possible_truncation)]
             let expected = (mixed.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
             assert_eq!(actual, expected);

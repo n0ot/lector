@@ -185,37 +185,8 @@ fn utf16_range_to_utf8(text: &str, location: usize, length: usize) -> Option<(us
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{AvFoundation, Backend, Command, channel, thread, utf16_range_to_utf8};
-
-    #[test]
-    fn per_utterance_volume_leaves_later_speech_at_configured_volume() {
-        let (commands, receiver) = channel();
-        let mut backend = AvFoundation {
-            commands,
-            rate: 0.5,
-            pitch: 1.0,
-            volume: 0.75,
-            voice: None,
-        };
-        let synth = thread::spawn(move || {
-            let mut volumes = Vec::new();
-            for id in [1, 2] {
-                let Command::Speak { volume, reply, .. } = receiver.recv().unwrap() else {
-                    panic!("expected native speak command");
-                };
-                volumes.push(volume.to_bits());
-                reply.send(Ok(id)).unwrap();
-            }
-            volumes
-        });
-        backend.speak_at_volume("sample", false, 0.5).unwrap();
-        backend.speak("next", false).unwrap();
-        assert_eq!(
-            synth.join().unwrap(),
-            [0.5_f32.to_bits(), 0.75_f32.to_bits()]
-        );
-    }
+mod range_tests {
+    use super::utf16_range_to_utf8;
 
     #[test]
     fn converts_native_utf16_ranges_to_utf8_boundaries() {
@@ -630,20 +601,11 @@ impl Backend for AvFoundation {
         err
     )]
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<Option<UtteranceId>, Error> {
-        self.speak_at_volume(text, interrupt, self.volume)
-    }
-
-    fn speak_at_volume(
-        &mut self,
-        text: &str,
-        interrupt: bool,
-        volume: f32,
-    ) -> Result<Option<UtteranceId>, Error> {
         let address = self.request(|reply| Command::Speak {
             text: text.to_string(),
             interrupt,
             rate: self.rate,
-            volume,
+            volume: self.volume,
             pitch: self.pitch,
             voice_id: self.voice.as_ref().map(|v| v.id().to_string()),
             reply,

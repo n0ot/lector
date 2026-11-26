@@ -244,6 +244,15 @@ it also guarantees that a standalone direction and blank cue can play together
 from the same onset. Earlier versions and other capability values use spoken
 fallbacks for the cues they cannot play.
 
+On macOS, the first directional readback uses the native speech synthesizer
+at the configured volume. Its first word callback starts a separate cue
+player, and Core Audio mixes the two outputs. For a repeated short readback,
+the host can mix the cue into cached speech at the voice's original sample
+rate. On a stereo output, mono speech feeds both channels at the same
+level. Stereo speech keeps its original left and right samples. The host
+reduces this rendered mix only if its samples would exceed full scale.
+Core Audio handles conversion to the device sample rate.
+
 ## 6. Data types
 
 **Utterance ID.** A nonempty opaque JSON string of at most 128 UTF-8 bytes,

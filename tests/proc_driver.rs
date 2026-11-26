@@ -391,6 +391,18 @@ mod native_speech {
         );
         assert_eq!(initialized["result"]["capabilities"]["soundCues"], true);
 
+        let standalone = host.rpc(
+            8,
+            "speech.speak",
+            serde_json::json!({
+                "utteranceId": "standalone-first",
+                "text": "",
+                "cues": [{"cue": "right", "offset": 0}]
+            }),
+        );
+        assert_eq!(standalone["result"]["accepted"], true);
+        host.wait_for_completion("standalone-first");
+
         for (request, utterance) in [(2, "first"), (4, "again"), (6, "handoff")] {
             let accepted = host.rpc(
                 request,
@@ -459,6 +471,17 @@ mod native_speech {
         }
         let events = fs::read_to_string(&event_log).unwrap();
         assert_eq!(events.matches("directional-cue-cache-hit").count(), 2);
+        let standalone = host.rpc(
+            9,
+            "speech.speak",
+            serde_json::json!({
+                "utteranceId": "standalone-last",
+                "text": "",
+                "cues": [{"cue": "right", "offset": 0}]
+            }),
+        );
+        assert_eq!(standalone["result"]["accepted"], true);
+        host.wait_for_completion("standalone-last");
         host.finish();
     }
 

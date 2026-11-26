@@ -16,10 +16,7 @@ use crate::speech_fallback::{
     InsertedLink, MAX_LINK_ANNOUNCEMENT_BYTES, append_cue_announcement, canonical_offset,
 };
 #[cfg(target_vendor = "apple")]
-use cue_playback::{
-    CuePlayback, DIRECTIONAL_SPEECH_GAIN, DIRECTIONAL_UNDERLAY_GAIN, PreparedCues, ReadbackCache,
-    ReadbackKey,
-};
+use cue_playback::{CuePlayback, PreparedCues, ReadbackCache, ReadbackKey};
 
 use crate::{
     Backends, Error as TtsError, Features, Gender, Tts, UtteranceId as NativeUtteranceId, Voice,
@@ -719,17 +716,13 @@ impl State {
         if !self.directional_word_ranges {
             return self.start_spoken_fallback(active, base, std::slice::from_ref(cue));
         }
-        if let Err(error) = self
-            .prepared_cues
-            .prepare(cue.cue, volume * DIRECTIONAL_UNDERLAY_GAIN)
-        {
+        if let Err(error) = self.prepared_cues.prepare(cue.cue, volume) {
             eprintln!("lector-tts: {error}; speaking cue label");
             return self.start_spoken_fallback(active, base, std::slice::from_ref(cue));
         }
-        let result = classify_backend_attempt(
-            self.tts
-                .speak_at_volume(text, volume * DIRECTIONAL_SPEECH_GAIN),
-        )?;
+        // The system mixes these live sources at their normal levels. The
+        // host can inspect and limit peaks only on the rendered PCM route.
+        let result = classify_backend_attempt(self.tts.speak(text, false))?;
         if let BackendAttempt::Completed(Some(native_id)) = result {
             self.live_direction = Some(LiveDirection {
                 native_id,
