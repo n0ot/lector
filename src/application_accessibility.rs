@@ -5,6 +5,9 @@
 //! replacement without Lector needing application-specific knowledge.
 
 use std::ops::Range;
+const CAPABILITIES_PREFIX: &[u8] = b"\x1b_Lector;A11y;1;capabilities;";
+const ST: &[u8] = b"\x1b\\";
+const CAPABILITIES: &[u8] = b";cue=blank;link=1";
 const PREFIX: &[u8] = b"Lector;A11y;1;";
 pub(crate) const MAX_SPEECH_BYTES: usize = 2_000;
 
@@ -18,6 +21,7 @@ pub(crate) struct ApplicationAccessibilityPolicy {
 pub(crate) enum ApplicationAccessibilityCommand {
     Set(ApplicationAccessibilityPolicy),
     Speak(ApplicationAccessibilitySpeech),
+    Query(String),
     End,
 }
 
@@ -56,6 +60,46 @@ pub(crate) fn parse(content: &[u8], truncated: bool) -> Option<ApplicationAccess
     if let Some(settings) = body.strip_prefix(b"set;") {
         return parse_settings(settings).map(ApplicationAccessibilityCommand::Set);
     }
+    if let Some(id) = body.strip_prefix(b"query;") {
+        return valid_query_id(id).then(|| {
+            ApplicationAccessibilityCommand::Query(
+                std::str::from_utf8(id)
+                    .expect("query ID contains only ASCII digits")
+                    .into(),
+            )
+        });
+    }
+    if let Some(encoded) = body.strip_prefix(b"say-link;") {
+        return decode_speech(encoded).map(|text| {
+            let link = 0..text.len();
+            ApplicationAccessibilityCommand::Speak(ApplicationAccessibilitySpeech {
+                text,
+                links: std::iter::once(link).collect(),
+                ..Default::default()
+            })
+        });
+    }
+    if let Some(body) = body.strip_prefix(b"cue;blank;") {
+        let (indentation, encoded) = if let Some(line) = body.strip_prefix(b"indent=") {
+            let (indentation, encoded) = parse_line(line)?;
+            (Some(indentation), encoded)
+        } else {
+            (None, body)
+        };
+        let text = if encoded.is_empty() {
+            String::new()
+        } else {
+            decode_speech(encoded)?
+        };
+        return Some(ApplicationAccessibilityCommand::Speak(
+            ApplicationAccessibilitySpeech {
+                text,
+                indentation,
+                cue: Some(crate::speech::protocol::SoundCue::Blank),
+                ..Default::default()
+            },
+        ));
+    }
     if let Some(encoded) = body.strip_prefix(b"say;") {
         return decode_speech(encoded).map(|text| {
             ApplicationAccessibilityCommand::Speak(ApplicationAccessibilitySpeech {
@@ -65,14 +109,7 @@ pub(crate) fn parse(content: &[u8], truncated: bool) -> Option<ApplicationAccess
             })
         });
     }
-    let semantic_line = body.strip_prefix(b"line;indent=")?;
-    let separator = semantic_line.iter().position(|byte| *byte == b';')?;
-    let (indentation, encoded) = semantic_line.split_at(separator);
-    let encoded = encoded.get(1..)?;
-    if indentation.is_empty() || !indentation.iter().all(u8::is_ascii_digit) {
-        return None;
-    }
-    let indentation = std::str::from_utf8(indentation).ok()?.parse().ok()?;
+    let (indentation, encoded) = parse_line(body.strip_prefix(b"line;indent=")?)?;
     decode_speech(encoded).map(|text| {
         ApplicationAccessibilityCommand::Speak(ApplicationAccessibilitySpeech {
             text,
@@ -80,6 +117,47 @@ pub(crate) fn parse(content: &[u8], truncated: bool) -> Option<ApplicationAccess
             ..Default::default()
         })
     })
+}
+
+fn parse_line(body: &[u8]) -> Option<(u16, &[u8])> {
+    let separator = body.iter().position(|byte| *byte == b';')?;
+    let (indentation, encoded) = body.split_at(separator);
+    if indentation.is_empty() || !indentation.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some((
+        std::str::from_utf8(indentation).ok()?.parse().ok()?,
+        &encoded[1..],
+    ))
+}
+
+fn valid_query_id(id: &[u8]) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.iter().all(u8::is_ascii_digit)
+}
+
+pub(crate) fn append_capabilities(reply: &mut Vec<u8>, id: &str) {
+    reply.extend_from_slice(CAPABILITIES_PREFIX);
+    reply.extend_from_slice(id.as_bytes());
+    reply.extend_from_slice(CAPABILITIES);
+    reply.extend_from_slice(ST);
+}
+
+/// Extract our own replies from the pane's terminal replies. Tmux owns all
+/// other reports except the color replies handled by its dedicated API.
+pub(crate) fn capability_replies(replies: &[u8]) -> impl Iterator<Item = &[u8]> {
+    replies
+        .split_inclusive(|byte| *byte == b'\\')
+        .filter_map(|part| {
+            let start = part
+                .windows(CAPABILITIES_PREFIX.len())
+                .rposition(|window| window == CAPABILITIES_PREFIX)?;
+            let reply = &part[start..];
+            let id = reply
+                .strip_prefix(CAPABILITIES_PREFIX)?
+                .strip_suffix(ST)?
+                .strip_suffix(CAPABILITIES)?;
+            valid_query_id(id).then_some(reply)
+        })
 }
 
 fn parse_settings(settings: &[u8]) -> Option<ApplicationAccessibilityPolicy> {

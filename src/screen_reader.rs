@@ -865,13 +865,20 @@ impl ScreenReader {
     }
 
     pub(crate) fn speak_review_cue(&mut self, cue: speech::protocol::SoundCue) -> Result<()> {
+        self.speak_application_cue(cue, cue.spoken_label())
+    }
+
+    pub(crate) fn speak_application_cue(
+        &mut self,
+        cue: speech::protocol::SoundCue,
+        fallback: &str,
+    ) -> Result<()> {
         if !self.terminal_focused {
             return Ok(());
         }
-        let label = cue.spoken_label();
-        self.call_hook_on_speech_start(label, false)?;
-        let result = self.speech.speak_cue(cue, label, false);
-        self.call_hook_on_speech_end(label, false, result.is_ok())?;
+        self.call_hook_on_speech_start(fallback, false)?;
+        let result = self.speech.speak_cue(cue, fallback, false);
+        self.call_hook_on_speech_end(fallback, false, result.is_ok())?;
         result.map(|_| ()).map_err(Into::into)
     }
 

@@ -1615,6 +1615,12 @@ impl View {
                     self.push_application_speech(revision, speech);
                 }
                 ApplicationAccessibilityCommand::Speak(_) => {}
+                ApplicationAccessibilityCommand::Query(id) => {
+                    crate::application_accessibility::append_capabilities(
+                        &mut update.pty_replies,
+                        &id,
+                    );
+                }
                 ApplicationAccessibilityCommand::End => {
                     self.live_application_accessibility_policy =
                         ApplicationAccessibilityPolicy::default();

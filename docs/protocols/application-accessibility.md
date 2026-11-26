@@ -29,6 +29,19 @@ ESC _ Lector;A11y;1;<command> ESC \
 ```
 
 Lector understands the version 1 commands `set`, `say`, `line`, and `end`.
+An application can send `query;<id>` to discover optional commands. Lector
+returns `capabilities;<id>;cue=blank;link=1` in the same APC envelope to the
+querying PTY or tmux control-mode pane. The ID must be 1 to 32 ASCII digits.
+
+- `cue;blank;<hex>` plays the blank tone or speaks the decoded fallback.
+  An empty fallback makes the request silent when tones are unavailable.
+  To report indentation as part of a semantic line, send
+  `cue;blank;indent=<0..65535>;<hex>`.
+- `say-link;<hex>` reads the decoded text with a link indication at its
+  first spoken word. Lector uses spoken link feedback when applicable.
+
+Capabilities describe the commands the receiver accepts. Lector applies the
+user's tone preference and active speech host support at playback time.
 
 ### Limits
 
@@ -58,8 +71,8 @@ apply policy from the wrong moment.
 suppressed independently. Suppressing cursor tracking also suppresses pending
 Backspace and Delete announcements.
 
-**Requested speech is ordinary speech.** It goes through the same path as
-everything else Lector says, so the user's settings still apply.
+**Requested speech and cues share the same policy.** Lector applies the user's
+speech and tone settings to application feedback.
 
 ## The user stays in charge
 
