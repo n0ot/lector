@@ -100,6 +100,11 @@ fn word_read_with_cue(
     let screen = view.screen();
     let range = screen.find_word_start(row, col)..screen.find_word_end(row, col) + 1;
     let (word, links) = screen.review_contents_with_links(previous, (row, col), range);
+    let cue = cue.or_else(|| {
+        screen
+            .left_review_link(previous, (row, col))
+            .then_some(SoundCue::LinkExit)
+    });
     if cue.is_some() && word.trim().is_empty() {
         sr.speak_review_blank(!links.is_empty(), cue)?;
     } else {
@@ -550,6 +555,29 @@ mod tests {
                 "out of link bang ",
                 "link d"
             ]
+        );
+    }
+
+    #[test]
+    fn word_navigation_submits_exit_tone_with_destination_word() {
+        let cues = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
+            cues.clone(),
+        ))));
+        let mut view = View::new(2, 24);
+        view.process_changes(b"\x1b]8;;https://example.invalid\x1b\\some link\x1b]8;;\x1b\\ next");
+        word_next(&mut sr, &mut view).unwrap();
+        word_next(&mut sr, &mut view).unwrap();
+        assert_eq!(
+            cues.borrow().last(),
+            Some(&(
+                "next".into(),
+                speech::SpeechCues::Inline {
+                    direction: Some((super::SoundCue::LinkExit, "out of link")),
+                    links: Vec::new(),
+                    tones: true,
+                }
+            ))
         );
     }
 

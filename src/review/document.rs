@@ -548,8 +548,32 @@ impl ReviewDocument {
         feedback
     }
 
+    pub(crate) fn link_exit_word_readback(
+        &self,
+        previous: HistoryPosition,
+        current: HistoryPosition,
+        style: WordStyle,
+    ) -> (String, Vec<Range<usize>>) {
+        let class = self.word_class(current, style);
+        if class != 0
+            && let Some((start, end)) = self.word_bounds(current, style, class)
+        {
+            return self.cursor_word_readback(previous, current, start..end);
+        }
+        (self.cell_text(current).into(), Vec::new())
+    }
+
     fn keyword_bounds(&self, position: HistoryPosition) -> Option<(u16, u16)> {
-        if self.word_class(position, WordStyle::Word) != 1 {
+        self.word_bounds(position, WordStyle::Word, 1)
+    }
+
+    fn word_bounds(
+        &self,
+        position: HistoryPosition,
+        style: WordStyle,
+        class: u8,
+    ) -> Option<(u16, u16)> {
+        if self.word_class(position, style) != class {
             return None;
         }
         let row = self.rows.get(position.row)?;
@@ -562,8 +586,8 @@ impl ReviewDocument {
                         row: position.row,
                         col,
                     },
-                    WordStyle::Word,
-                ) != 1
+                    style,
+                ) != class
             {
                 break;
             }
@@ -577,8 +601,8 @@ impl ReviewDocument {
                         row: position.row,
                         col: end,
                     },
-                    WordStyle::Word,
-                ) != 1
+                    style,
+                ) != class
             {
                 break;
             }

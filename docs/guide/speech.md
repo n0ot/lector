@@ -13,7 +13,7 @@ also reads text. At the top or bottom of a blank line, or the left or right edge
 character, a compatible host plays the boundary and blank cues together. Lector identifies an OSC 8
 hyperlink when review navigation enters it from either direction. Moving through
 characters, words, or a soft wrap within that link continues reading its text.
-Stepping out of a link by character plays a lower version of the link sound,
+Stepping out of a link by character or word plays a lower version of the link sound,
 or says “out of link” with spoken feedback. Whole-line reads announce link
 entries only. Explicitly reading linked text also identifies the link.
 Set `lector.o.tones = false` to use

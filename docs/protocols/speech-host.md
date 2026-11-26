@@ -4,7 +4,7 @@ This is the protocol between Lector and a speech server, called a *host*
 here. Implement it to make Lector speak through any speech engine, on any
 machine.
 
-- **Version:** 2.6. Hosts stay backward compatible with 2.0 through 2.5. Version 2.6 adds `linkExit` at offset zero on character review. It may accompany text or pair with `blank` on an empty utterance.
+- **Version:** 2.6. Hosts stay backward compatible with 2.0 through 2.5. Version 2.6 adds `linkExit` at offset zero for review navigation. It may accompany text or pair with `blank` on an empty utterance.
 - **Schema:** [`crates/lector-tts/openrpc.json`](../../crates/lector-tts/openrpc.json)
   defines the JSON shape of every method and message.
 - **This document** defines transport, capabilities, and behavior. If the two
@@ -314,7 +314,7 @@ after initialization.
   character boundaries before the end of the text. In 2.4 or later a
   `top`, `bottom`, `left`, or `right` cue MAY also appear once as the first
   cue at offset zero. A link cue may share this offset. In 2.6, a sole
-  `linkExit` cue at zero can accompany the first unlinked character.
+  `linkExit` cue at zero can accompany the unlinked character or word.
 - For empty text, supply one of `top`, `bottom`, `left`, `right`, or
   `blank` at offset zero. In 2.5 or later a directional cue MAY be followed
   by `blank` at the same offset. The host MUST start both together, report one

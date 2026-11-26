@@ -349,8 +349,17 @@ fn word_read_with_cue(
         return Ok(CommandResult::Handled);
     };
     let (row, col) = view.review_cursor_position();
+    let cue = cue.or_else(|| {
+        view.screen()
+            .left_review_link(previous, (row, col))
+            .then_some(SoundCue::LinkExit)
+    });
     let Some((word_start, word_end)) = word_bounds_at(view, row, col, start, end) else {
-        sr.speak_review_readback("", &[], cue)?;
+        if cue == Some(SoundCue::LinkExit) {
+            sr.speak_review_blank(false, cue)?;
+        } else {
+            sr.speak_review_readback("", &[], cue)?;
+        }
         return Ok(CommandResult::Handled);
     };
     let (text, mut links) =

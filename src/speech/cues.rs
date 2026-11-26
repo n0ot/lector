@@ -166,6 +166,11 @@ impl SpeechCues {
                 tones,
             } => {
                 let overlay = supported && *tones;
+                // Protocol 2.6 allows an exit overlay by itself. If the word
+                // also contains a linked span, retain its spoken announcement.
+                let plays_exit = overlay
+                    && directional_overlay
+                    && direction.is_some_and(|(cue, _)| cue == SoundCue::LinkExit);
                 let mut inserted = 0;
                 if let Some((cue, fallback)) = direction {
                     if overlay && directional_overlay {
@@ -185,7 +190,7 @@ impl SpeechCues {
                 let mut previous = 0;
                 for link in links {
                     let offset = link.offset;
-                    if overlay && link.audible {
+                    if overlay && link.audible && !plays_exit {
                         rendered.cues.push(SoundCueAt {
                             cue: SoundCue::Link,
                             offset: offset + inserted,
@@ -239,6 +244,28 @@ mod tests {
     use super::*;
     use crate::speech::protocol::MAX_UTTERANCE_TEXT_BYTES;
     use tts::server::MAX_RPC_FRAME_BYTES;
+
+    #[test]
+    fn word_exit_keeps_a_valid_cue_when_the_word_contains_a_link() {
+        let cues = SpeechCues::Inline {
+            direction: Some((SoundCue::LinkExit, "out of link")),
+            links: vec![SpeechLink {
+                offset: 1,
+                audible: true,
+            }],
+            tones: true,
+        };
+        let rendered = cues.render("ab", true, true, true);
+        assert_eq!(rendered.text, "a link b");
+        assert_eq!(
+            rendered.cues,
+            [SoundCueAt {
+                cue: SoundCue::LinkExit,
+                offset: 0
+            }]
+        );
+        assert!(SoundCueAt::valid_for(&rendered.text, &rendered.cues));
+    }
 
     #[test]
     fn direction_and_link_can_share_the_readback_onset() {

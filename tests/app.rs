@@ -1778,7 +1778,7 @@ fn review_overlay_reads_horizontal_destinations() {
 }
 
 #[test]
-fn review_speaks_link_exit_only_for_character_navigation() {
+fn review_speaks_link_exit_for_characters_and_skips_it_for_lines() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
@@ -1812,6 +1812,42 @@ fn review_speaks_link_exit_only_for_character_navigation() {
             "link a",
             "b",
             "row"
+        ]
+    );
+}
+
+#[test]
+fn review_word_navigation_announces_link_exits_in_both_directions() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty = Vec::new();
+    let mut screen = Vec::new();
+    app.handle_pty(
+        &mut sr,
+        b"before \x1b]8;;https://example.invalid\x1b\\linked words\x1b]8;;\x1b\\ after\x1b[H",
+        &mut screen,
+    )
+    .unwrap();
+    app.handle_stdin(&mut sr, b"\x1br", &mut pty, &mut screen)
+        .unwrap();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"wwwbbb", &mut pty, &mut screen)
+        .unwrap();
+    let spoken: Vec<_> = recorder
+        .inner
+        .borrow()
+        .speaks
+        .iter()
+        .map(|(s, _)| s.clone())
+        .collect();
+    assert_eq!(
+        spoken,
+        [
+            "link linked",
+            "words",
+            "out of link after",
+            "link words",
+            "linked",
+            "out of link before"
         ]
     );
 }
