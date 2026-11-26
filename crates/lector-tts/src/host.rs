@@ -86,6 +86,8 @@ enum NativeEvent {
     Started(NativeUtteranceId),
     Completed(NativeUtteranceId),
     Cancelled(NativeUtteranceId),
+    #[cfg(windows)]
+    Failed(NativeUtteranceId),
     #[cfg(target_vendor = "apple")]
     Range {
         id: NativeUtteranceId,
@@ -94,11 +96,23 @@ enum NativeEvent {
     },
 }
 
+impl NativeEvent {
+    fn id(self) -> NativeUtteranceId {
+        match self {
+            Self::Started(id) | Self::Completed(id) | Self::Cancelled(id) => id,
+            #[cfg(windows)]
+            Self::Failed(id) => id,
+            #[cfg(target_vendor = "apple")]
+            Self::Range { id, .. } => id,
+        }
+    }
+}
+
 struct ActiveUtterance {
     logical_id: UtteranceId,
     native_id: Option<NativeUtteranceId>,
     text: String,
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(target_vendor = "apple", windows))]
     cues: Vec<SoundCueAt>,
     #[cfg(target_vendor = "apple")]
     fallback: Option<SpokenFallback>,
@@ -404,8 +418,9 @@ pub fn run_with_options(options: &Options) -> Result<()> {
         }
         return Ok(());
     }
+    #[cfg(unix)]
     if let Some(expected_parent_pid) = options.parent_pid {
-        start_parent_watchdog(expected_parent_pid)?;
+        parent_watchdog::start(expected_parent_pid)?;
     }
     let backend = select_backend(&options.backend)?;
     if options.list_voices {
@@ -499,10 +514,7 @@ impl<'a> State<'a> {
         let selected_voice = voice_id
             .map(|voice_id| select_voice(&tts, voice_id).map(|voice| voice.id))
             .transpose()?;
-        let mut capabilities = native_capabilities(features);
-        if supports_sound_cues(backend) {
-            capabilities.sound_cues = true;
-        }
+        let capabilities = native_capabilities(backend, features);
         #[cfg(target_vendor = "apple")]
         let prepared_cues = if capabilities.sound_cues {
             PreparedCues::new(tts.get_volume()?)
@@ -591,7 +603,7 @@ impl<'a> State<'a> {
             logical_id: id,
             native_id: None,
             text,
-            #[cfg(target_vendor = "apple")]
+            #[cfg(any(target_vendor = "apple", windows))]
             cues,
             #[cfg(target_vendor = "apple")]
             fallback: None,
@@ -669,6 +681,12 @@ impl<'a> State<'a> {
                     }
                 }
             }
+        }
+        #[cfg(windows)]
+        if !active.cues.is_empty() {
+            // NVDA restarts at the beginning. Its markers use offsets in the original text.
+            debug_assert_eq!(base, 0);
+            return classify_backend_attempt(self.tts.speak_with_cues(text, &active.cues));
         }
         let result = classify_backend_attempt(self.tts.speak(text, false))?;
         if matches!(result, BackendAttempt::Completed(_)) {
@@ -879,6 +897,12 @@ impl<'a> State<'a> {
         match classify_backend_attempt(self.tts.stop())? {
             BackendAttempt::Completed(()) => {}
             BackendAttempt::Unavailable(_) => return Ok(()),
+        }
+        // The NVDA worker owns cancellation and serializes subsequent requests.
+        // Replacing its controller would race its process-wide mark callback.
+        #[cfg(windows)]
+        if self.backend == Backends::Nvda {
+            return Ok(());
         }
         let Some(stopping) = stopping else {
             return Ok(());
@@ -1359,14 +1383,7 @@ impl<'a> State<'a> {
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        let event_id = match event {
-            NativeEvent::Started(id) | NativeEvent::Completed(id) | NativeEvent::Cancelled(id) => {
-                id
-            }
-            #[cfg(target_vendor = "apple")]
-            NativeEvent::Range { id, .. } => id,
-        };
-        if active.native_id != Some(event_id) {
+        if active.native_id != Some(event.id()) {
             return;
         }
 
@@ -1437,6 +1454,17 @@ impl<'a> State<'a> {
                     }
                 }
                 self.emit_for(&active, "ended", None, Some("completed"), None);
+            }
+            #[cfg(windows)]
+            NativeEvent::Failed(_) => {
+                let active = self.active.take().expect("active checked");
+                self.emit_for(
+                    &active,
+                    "ended",
+                    None,
+                    Some("failed"),
+                    Some("Native speech failed".to_owned()),
+                );
             }
             NativeEvent::Cancelled(_) => {
                 if active.paused {
@@ -1560,25 +1588,23 @@ fn resumable_suffix(text: &str, offset: usize) -> Option<&str> {
     (offset <= text.len() && text.is_char_boundary(offset)).then(|| &text[offset..])
 }
 
-fn supports_sound_cues(backend: Backends) -> bool {
+fn native_capabilities(backend: Backends, features: Features) -> SpeechCapabilities {
     #[cfg(target_vendor = "apple")]
-    {
-        backend == Backends::AvFoundation && cue_playback::supported()
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
+    let sound_cues = backend == Backends::AvFoundation && cue_playback::supported();
+    #[cfg(windows)]
+    let sound_cues = features.sound_cues;
+    #[cfg(not(any(target_vendor = "apple", windows)))]
+    let sound_cues = {
         let _ = backend;
         false
-    }
-}
-
-fn native_capabilities(features: Features) -> SpeechCapabilities {
+    };
     let lifecycle = if features.utterance_callbacks {
         DeliveryGuarantee::Reliable
     } else {
         DeliveryGuarantee::Unsupported
     };
     SpeechCapabilities {
+        sound_cues,
         lifecycle: LifecycleCapabilities {
             started: EventCapability {
                 delivery: lifecycle,
@@ -1587,7 +1613,10 @@ fn native_capabilities(features: Features) -> SpeechCapabilities {
             terminal: TerminalCapability {
                 delivery: lifecycle,
                 distinguishes: if features.utterance_callbacks {
-                    vec!["completed".to_owned(), "cancelled".to_owned()]
+                    let reasons = ["completed", "cancelled"].into_iter();
+                    #[cfg(windows)]
+                    let reasons = reasons.chain((backend == Backends::Nvda).then_some("failed"));
+                    reasons.map(str::to_owned).collect()
                 } else {
                     Vec::new()
                 },
@@ -1722,6 +1751,8 @@ fn install_native_callbacks(
     tts.on_utterance_end(move |id| completed(NativeEvent::Completed(id)))?;
     let cancelled = send.clone();
     tts.on_utterance_stop(move |id| cancelled(NativeEvent::Cancelled(id)))?;
+    #[cfg(windows)]
+    tts.on_utterance_failure(move |id| send(NativeEvent::Failed(id)))?;
     #[cfg(target_vendor = "apple")]
     {
         tts.on_utterance_range(move |id, start, length| {
@@ -1845,16 +1876,6 @@ fn log_request(request: &Request, state: &mut State<'_>) -> Result<(), RpcError>
 }
 
 /// Ensure a native speech host cannot survive an abruptly terminated Lector.
-#[cfg(unix)]
-fn start_parent_watchdog(expected_parent_pid: u32) -> Result<()> {
-    parent_watchdog::start(expected_parent_pid)
-}
-
-#[cfg(not(unix))]
-fn start_parent_watchdog(_expected_parent_pid: u32) -> Result<()> {
-    Ok(())
-}
-
 fn configure_test_observation(tts: &Tts) -> Result<Option<SpeechEventLog>> {
     if std::env::var_os("LECTOR_SPEECH_TEST_MUTE").is_some() && tts.supported_features().volume {
         tts.set_volume(0.0)
@@ -1998,7 +2019,8 @@ mod tests {
 
     #[test]
     fn native_capabilities_do_not_invent_settings_or_voice_controls() {
-        let unsupported = native_capabilities(Features::default());
+        let backend = crate::Backends::compiled()[0];
+        let unsupported = native_capabilities(backend, Features::default());
         assert_eq!(unsupported.settings.rate, SettingSupport::Unsupported);
         assert_eq!(unsupported.settings.pitch, SettingSupport::Unsupported);
         assert_eq!(unsupported.settings.volume, SettingSupport::Unsupported);
@@ -2006,22 +2028,28 @@ mod tests {
         assert!(!unsupported.voices.current);
         assert!(!unsupported.voices.select);
 
-        let independent_voice_operations = native_capabilities(Features {
-            voice: true,
-            get_voice: false,
-            ..Features::default()
-        });
+        let independent_voice_operations = native_capabilities(
+            backend,
+            Features {
+                voice: true,
+                get_voice: false,
+                ..Features::default()
+            },
+        );
         assert!(independent_voice_operations.voices.list);
         assert!(!independent_voice_operations.voices.current);
         assert!(independent_voice_operations.voices.select);
 
-        let configurable = native_capabilities(Features {
-            rate: true,
-            pitch: true,
-            volume: true,
-            get_voice: true,
-            ..Features::default()
-        });
+        let configurable = native_capabilities(
+            backend,
+            Features {
+                rate: true,
+                pitch: true,
+                volume: true,
+                get_voice: true,
+                ..Features::default()
+            },
+        );
         assert_eq!(configurable.settings.rate, SettingSupport::ReadWrite);
         assert_eq!(configurable.settings.pitch, SettingSupport::ReadWrite);
         assert_eq!(configurable.settings.volume, SettingSupport::ReadWrite);

@@ -253,6 +253,13 @@ level. Stereo speech keeps its original left and right samples. The host
 reduces this rendered mix only if its samples would exceed full scale.
 Core Audio handles conversion to the device sample rate.
 
+On Windows, the NVDA backend uses Controller Client v2 speech markers to
+trigger cues on the host machine. A worker waits for NVDA's synchronous
+speech call while the host remains available for stop requests. Standalone
+cues use the Windows audio output directly. The controller does not expose
+NVDA's selected audio device, so cue playback follows the Windows default
+audio output.
+
 ## 6. Data types
 
 **Utterance ID.** A nonempty opaque JSON string of at most 128 UTF-8 bytes,

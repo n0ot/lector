@@ -324,6 +324,18 @@ pub enum SoundCue {
 }
 
 impl SoundCue {
+    #[cfg(any(target_vendor = "apple", windows, test))]
+    pub(crate) const fn wav(self) -> &'static [u8] {
+        match self {
+            Self::Top => include_bytes!("../assets/top.wav"),
+            Self::Bottom => include_bytes!("../assets/bottom.wav"),
+            Self::Left => include_bytes!("../assets/left.wav"),
+            Self::Right => include_bytes!("../assets/right.wav"),
+            Self::Blank => include_bytes!("../assets/blank.wav"),
+            Self::Link => include_bytes!("../assets/link.wav"),
+        }
+    }
+
     #[must_use]
     pub const fn is_direction(self) -> bool {
         matches!(self, Self::Top | Self::Bottom | Self::Left | Self::Right)

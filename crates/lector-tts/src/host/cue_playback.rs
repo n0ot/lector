@@ -63,17 +63,6 @@ fn playback_id() -> NativeUtteranceId {
     NativeUtteranceId::SoundCue(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-fn cue_wav(cue: SoundCue) -> &'static [u8] {
-    match cue {
-        SoundCue::Top => include_bytes!("../../assets/top.wav"),
-        SoundCue::Bottom => include_bytes!("../../assets/bottom.wav"),
-        SoundCue::Left => include_bytes!("../../assets/left.wav"),
-        SoundCue::Right => include_bytes!("../../assets/right.wav"),
-        SoundCue::Blank => include_bytes!("../../assets/blank.wav"),
-        SoundCue::Link => include_bytes!("../../assets/link.wav"),
-    }
-}
-
 fn new_player(wav: &[u8], volume: f32) -> Result<Retained<AVAudioPlayer>, Error> {
     let data = NSData::with_bytes(wav);
     let player = unsafe { AVAudioPlayer::initWithData_error(AVAudioPlayer::alloc(), &data) }
@@ -104,7 +93,7 @@ impl PreparedCues {
         let players = STANDALONE_CUES
             .into_iter()
             .filter_map(|cue| {
-                let player = new_player(cue_wav(cue), volume).ok()?;
+                let player = new_player(cue.wav(), volume).ok()?;
                 Some(CuePlayer {
                     cue,
                     audio: player,
@@ -116,7 +105,7 @@ impl PreparedCues {
         // output graph is opened on the first actual playback request.
         let clips: Vec<_> = STANDALONE_CUES
             .into_iter()
-            .filter_map(|cue| Clip::from_wave(cue_wav(cue)).ok().map(|clip| (cue, clip)))
+            .filter_map(|cue| Clip::from_wave(cue.wav()).ok().map(|clip| (cue, clip)))
             .collect();
         let mut blank_pairs = Vec::new();
         if let Some((_, blank)) = clips.iter().find(|(cue, _)| *cue == SoundCue::Blank) {
@@ -174,7 +163,7 @@ impl PreparedCues {
             let index = if let Some(index) = clips.iter().position(|(kind, _)| *kind == cue) {
                 index
             } else {
-                clips.push((cue, Clip::from_wave(cue_wav(cue))?));
+                clips.push((cue, Clip::from_wave(cue.wav())?));
                 clips.len() - 1
             };
             engine.play(&clips[index].1, volume)
@@ -452,7 +441,7 @@ fn mix_at(speech: &mut Vec<f32>, channels: usize, frame: usize, cue: &[f32]) {
 }
 
 fn cue_samples(cue: SoundCue, sample_rate: u32) -> Result<Vec<f32>, Error> {
-    let mut reader = WavReader::new(Cursor::new(cue_wav(cue)))?;
+    let mut reader = WavReader::new(Cursor::new(cue.wav()))?;
     let source_rate = reader.spec().sample_rate as usize;
     let target_rate = sample_rate as usize;
     let samples = reader

@@ -1,10 +1,17 @@
 use std::sync::Arc;
 
 use libloading::{Library, os::windows::Symbol};
+use parking_lot::Mutex;
 use tracing::{debug, info, instrument, warn};
 use windows::{Win32::Foundation::WIN32_ERROR, core::HSTRING};
 
-use crate::{Backend, Error, Features, SynthesizedAudio, UtteranceId, Voice};
+use crate::{
+    Backend, Callbacks, Error, Features, SynthesizedAudio, UtteranceId, Voice, protocol::SoundCueAt,
+};
+
+mod audio;
+mod marked;
+use marked::{Marked, ProcessIdFn, SetMarkFn, SpeakSsmlFn};
 
 /// `error_status_t`: a Win32 error code, 0 on success.
 type StatusFn = unsafe extern "system" fn() -> u32;
@@ -16,6 +23,12 @@ fn check(status: u32) -> Result<(), Error> {
     Ok(WIN32_ERROR(status).ok()?)
 }
 
+#[derive(Debug)]
+struct MarkedController {
+    speak: Symbol<SpeakSsmlFn>,
+    set_mark: Symbol<SetMarkFn>,
+}
+
 /// Symbols resolved from `nvdaControllerClient.dll`.
 #[derive(Debug)]
 struct Controller {
@@ -24,6 +37,7 @@ struct Controller {
     cancel_speech: Symbol<StatusFn>,
     /// Introduced in v3.0 of the controller client (NVDA 2026.3); absent from older DLLs.
     is_speaking: Option<Symbol<IsSpeakingFn>>,
+    marked: Option<MarkedController>,
     // Declared last so the symbols above, which point into it, drop first.
     _library: Library,
 }
@@ -54,11 +68,32 @@ impl Controller {
                 .get::<IsSpeakingFn>(b"nvdaController_isSpeaking\0")
                 .ok()
                 .map(|symbol| symbol.into_raw());
+            // A v2 DLL can be installed alongside an older NVDA server.
+            // Probe the v2 endpoint without enqueuing audible speech.
+            let marked = library
+                .get::<ProcessIdFn>(b"nvdaController_getProcessId\0")
+                .ok()
+                .filter(|get_pid| {
+                    let mut pid = 0;
+                    get_pid(&raw mut pid) == 0 && pid != 0
+                })
+                .and_then(|_| {
+                    let speak = library
+                        .get::<SpeakSsmlFn>(b"nvdaController_speakSsml\0")
+                        .ok()?
+                        .into_raw();
+                    let set_mark = library
+                        .get::<SetMarkFn>(b"nvdaController_setOnSsmlMarkReachedCallback\0")
+                        .ok()?
+                        .into_raw();
+                    Some(MarkedController { speak, set_mark })
+                });
             Ok(Self {
                 test_if_running,
                 speak_text,
                 cancel_speech,
                 is_speaking,
+                marked,
                 _library: library,
             })
         }
@@ -66,7 +101,10 @@ impl Controller {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Nvda(Arc<Controller>);
+pub(crate) struct Nvda {
+    controller: Arc<Controller>,
+    marked: Option<Arc<Marked>>,
+}
 
 impl Nvda {
     pub(crate) const NAME: &str = "NVDA";
@@ -84,8 +122,8 @@ impl Nvda {
         }
     }
 
-    #[instrument(level = "info", err)]
-    pub(crate) fn new() -> Result<Self, Error> {
+    #[instrument(level = "info", skip(callbacks), err)]
+    pub(crate) fn new(callbacks: Arc<Mutex<Callbacks>>) -> Result<Self, Error> {
         let mut controller = Controller::load().map_err(|error| {
             warn!(%error, "loading the NVDA controller client failed");
             Error::BackendUnavailable("the NVDA controller client DLL failed to load")
@@ -100,11 +138,18 @@ impl Nvda {
             unsafe { is_speaking(&raw mut speaking) == 0 }
         });
         info!("Loaded the NVDA controller client");
-        Ok(Self(Arc::new(controller)))
+        let controller = Arc::new(controller);
+        let marked = controller.marked.as_ref().and_then(|_| {
+            Marked::new(Arc::clone(&controller), callbacks)
+                .map(Arc::new)
+                .inspect_err(|error| warn!(%error, "NVDA marked speech unavailable"))
+                .ok()
+        });
+        Ok(Self { controller, marked })
     }
 
     fn ensure_running(&self) -> Result<(), Error> {
-        if unsafe { (self.0.test_if_running)() } == 0 {
+        if unsafe { (self.controller.test_if_running)() } == 0 {
             Ok(())
         } else {
             Err(Error::BackendUnavailable("NVDA is not running"))
@@ -125,7 +170,12 @@ impl Backend for Nvda {
     fn supported_features(&self) -> Features {
         Features {
             stop: true,
-            is_speaking: self.0.is_speaking.is_some(),
+            is_speaking: self.controller.is_speaking.is_some(),
+            utterance_callbacks: self.marked.is_some(),
+            sound_cues: self
+                .marked
+                .as_ref()
+                .is_some_and(|marked| marked.supports_cues()),
             ..Default::default()
         }
     }
@@ -134,11 +184,30 @@ impl Backend for Nvda {
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<Option<UtteranceId>, Error> {
         self.ensure_running()?;
         if interrupt {
-            self.check_operation(unsafe { (self.0.cancel_speech)() })?;
+            self.stop()?;
+        }
+        if let Some(marked) = &self.marked {
+            return marked.submit(text, &[]).map(Some);
         }
         let text = HSTRING::from(text);
-        self.check_operation(unsafe { (self.0.speak_text)(text.as_ptr()) })?;
+        self.check_operation(unsafe { (self.controller.speak_text)(text.as_ptr()) })?;
         Ok(None)
+    }
+
+    fn speak_with_cues(
+        &mut self,
+        text: &str,
+        cues: &[SoundCueAt],
+    ) -> Result<Option<UtteranceId>, Error> {
+        let marked = self
+            .marked
+            .as_ref()
+            .filter(|marked| marked.supports_cues())
+            .ok_or(Error::UnsupportedFeature)?;
+        if !text.is_empty() {
+            self.ensure_running()?;
+        }
+        marked.submit(text, cues).map(Some)
     }
 
     #[instrument(level = "debug", skip(self, _text), err)]
@@ -148,8 +217,12 @@ impl Backend for Nvda {
 
     #[instrument(level = "debug", skip(self), err)]
     fn stop(&mut self) -> Result<(), Error> {
+        if let Some(marked) = &self.marked {
+            marked.cancel();
+            return Ok(());
+        }
         self.ensure_running()?;
-        self.check_operation(unsafe { (self.0.cancel_speech)() })
+        self.check_operation(unsafe { (self.controller.cancel_speech)() })
     }
 
     #[instrument(level = "debug", skip(self), err)]
@@ -244,7 +317,7 @@ impl Backend for Nvda {
 
     #[instrument(level = "trace", skip(self), err, ret)]
     fn is_speaking(&self) -> Result<bool, Error> {
-        let Some(is_speaking) = self.0.is_speaking.as_ref() else {
+        let Some(is_speaking) = self.controller.is_speaking.as_ref() else {
             unimplemented!()
         };
         let mut speaking = 0u8;

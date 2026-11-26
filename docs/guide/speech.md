@@ -14,9 +14,17 @@ hyperlink at the start of its text or when you start reading within it.
 Set `lector.o.tones = false` to use
 spoken labels for boundaries, blank characters, and links.
 
-The bundled AVFoundation speech host plays cues on macOS 13 or later, including
-when Lector connects to that host remotely. Other bundled speech hosts use
-spoken labels.
+The bundled speech host plays cues through AVFoundation on macOS 13 or later.
+On Windows, use NVDA 2024.1 or later with a version 2 or newer NVDA Controller
+Client DLL matching the architecture of `lector-tts.exe`. Put the DLL beside
+the executable and start NVDA before launching the host. Older controllers
+use spoken labels. If a link starts partway through a word, the NVDA backend
+finishes that word and says “link” to preserve its pronunciation.
+
+When you connect remotely, the cues play on the machine running the speech
+host. The NVDA backend plays cues through the Windows default
+audio output. If you selected another output device in NVDA, choose that same
+device as the Windows default to hear speech and cues together.
 
 ## Controlling speech
 
