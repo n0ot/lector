@@ -118,6 +118,8 @@ struct ActiveUtterance {
     fallback: Option<SpokenFallback>,
     #[cfg(target_vendor = "apple")]
     direction_label: Option<SoundCue>,
+    #[cfg(target_vendor = "apple")]
+    deferred_link_label: bool,
     /// UTF-8 offset represented by byte zero of the current native utterance.
     native_base: usize,
     current_word: usize,
@@ -138,6 +140,21 @@ impl ActiveUtterance {
 
 #[cfg(target_vendor = "apple")]
 impl ActiveUtterance {
+    fn remember_missed_link(&mut self, live: Option<&LiveCue>) {
+        if live.is_some_and(|cue| {
+            Some(cue.native_id) == self.native_id
+                && cue.cue == SoundCue::Link
+                && cue.playback != DirectionPlayback::Played
+                && self.native_base + cue.offset < self.current_word
+        }) {
+            self.deferred_link_label = true;
+        }
+    }
+
+    fn take_deferred_label(&mut self) -> Option<SoundCue> {
+        std::mem::take(&mut self.deferred_link_label).then_some(SoundCue::Link)
+    }
+
     fn cues_from(&self, base: usize) -> Vec<SoundCueAt> {
         self.cues
             .iter()
@@ -628,6 +645,8 @@ impl<'a> State<'a> {
             fallback: None,
             #[cfg(target_vendor = "apple")]
             direction_label: None,
+            #[cfg(target_vendor = "apple")]
+            deferred_link_label: false,
             native_base: 0,
             current_word: 0,
             next_sequence: 0,
@@ -892,6 +911,8 @@ impl<'a> State<'a> {
         }
         let position = active.current_word;
         active.paused = true;
+        #[cfg(target_vendor = "apple")]
+        active.remember_missed_link(self.live_cue.as_ref());
         let pause = self.pause_native(&active);
         if let Err(error) = pause {
             active.paused = false;
@@ -1541,6 +1562,12 @@ impl<'a> State<'a> {
         active: &mut ActiveUtterance,
         allow_cue: bool,
     ) -> Result<bool, TtsError> {
+        if allow_cue
+            && !active.paused
+            && let Some(cue) = active.take_deferred_label()
+        {
+            return self.speak_completion_label(active, cue);
+        }
         if !self.live_cue.as_ref().is_some_and(|direction| {
             direction.playback != DirectionPlayback::Played
                 && Some(direction.native_id) == active.native_id
@@ -1564,12 +1591,21 @@ impl<'a> State<'a> {
         {
             self.readback_cache.request(key);
         }
+        self.speak_completion_label(active, direction.cue)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn speak_completion_label(
+        &mut self,
+        active: &mut ActiveUtterance,
+        cue: SoundCue,
+    ) -> Result<bool, TtsError> {
         let id = self
             .tts
-            .speak(direction.cue.spoken_label(), false)?
+            .speak(cue.spoken_label(), false)?
             .ok_or(TtsError::OperationFailed("identify spoken directional cue"))?;
         active.native_id = Some(id);
-        active.direction_label = Some(direction.cue);
+        active.direction_label = Some(cue);
         active.cues.clear();
         Ok(true)
     }
@@ -2019,6 +2055,46 @@ mod tests {
             assert!(!playback.shows_missing_word_ranges(coalesced.last_range.is_some()));
         }
         assert!(DirectionPlayback::Pending.shows_missing_word_ranges(absent.last_range.is_some()));
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn resume_past_a_missed_link_preserves_one_completion_label() {
+        use super::{ActiveUtterance, DirectionPlayback, LiveCue, NativeUtteranceId};
+        use crate::protocol::{SoundCue, SoundCueAt, UtteranceId};
+        let id = NativeUtteranceId::AvFoundation(1);
+        let mut active = ActiveUtterance {
+            logical_id: UtteranceId::new("fixture"),
+            native_id: Some(id),
+            text: "one two".into(),
+            cues: vec![SoundCueAt {
+                cue: SoundCue::Link,
+                offset: 0,
+            }],
+            fallback: None,
+            direction_label: None,
+            deferred_link_label: false,
+            native_base: 0,
+            current_word: 4,
+            next_sequence: 0,
+            awaiting_stop: false,
+            started: true,
+            paused: true,
+        };
+        let live = LiveCue {
+            native_id: id,
+            offset: 0,
+            cue: SoundCue::Link,
+            playback: DirectionPlayback::Failed,
+            clock_logged: false,
+            saw_range: true,
+            cache_key: None,
+        };
+        active.remember_missed_link(Some(&live));
+        assert!(active.cues_from(active.current_word).is_empty());
+        active.remember_missed_link(None);
+        assert_eq!(active.take_deferred_label(), Some(SoundCue::Link));
+        assert_eq!(active.take_deferred_label(), None);
     }
 
     #[cfg(target_vendor = "apple")]
