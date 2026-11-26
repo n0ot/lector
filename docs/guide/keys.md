@@ -23,6 +23,8 @@ Two things help when you forget a key:
 | Key | Action |
 | --- | --- |
 | `M-x` | Toggle speech pause |
+| `M--` | Decrease speech rate by five percentage points |
+| `M-=` | Increase speech rate by five percentage points |
 | `M-'` | Toggle automatic reading of new output |
 | `M-s` | Cycle symbol level (how much punctuation is spoken) |
 | `M-g` | Toggle stopping speech when the terminal loses focus |

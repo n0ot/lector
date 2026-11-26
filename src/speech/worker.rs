@@ -6,6 +6,7 @@
 use super::protocol::{UtteranceId, rate_is_normalized};
 use super::{
     CapabilityStatus, Driver, OptionState, SetOptionOutcome, SpeechCues, UtteranceBoundary,
+    apply_rate_adjustment,
 };
 use anyhow::{Result as DriverResult, anyhow};
 use std::{
@@ -23,6 +24,7 @@ use super::SpeechServerSpec;
 
 const MAX_PENDING_SPEECH_BYTES: usize = 256 * 1024;
 const MAX_SPEECH_ITEM_BYTES: usize = 64 * 1024;
+const MAX_PENDING_RATE_ADJUSTMENTS: usize = 1024;
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -39,6 +41,10 @@ enum Request {
     Resume,
     Toggle,
     SetRate(f32),
+    AdjustRate {
+        increase: bool,
+        announcement: Option<UtteranceId>,
+    },
     SetPitch(f32),
     SetVolume(f32),
     SetVoice(String),
@@ -58,6 +64,7 @@ impl Request {
             | Self::Resume
             | Self::Toggle
             | Self::SetRate(_)
+            | Self::AdjustRate { .. }
             | Self::SetPitch(_)
             | Self::SetVolume(_)
             | Self::SetVoice(_)
@@ -74,6 +81,8 @@ impl Request {
 #[derive(Default)]
 struct MailboxState {
     requests: VecDeque<Request>,
+    rate_announcement: Option<UtteranceId>,
+    rate_adjustments: usize,
     speech_items: usize,
     speech_bytes: usize,
     dropped_speech_items: u64,
@@ -101,6 +110,9 @@ impl Mailbox {
 
     fn remove_request(state: &mut MailboxState, index: usize) -> Option<Request> {
         let request = state.requests.remove(index)?;
+        if matches!(request, Request::AdjustRate { .. }) {
+            state.rate_adjustments -= 1;
+        }
         if request.is_speech() {
             state.speech_items = state.speech_items.saturating_sub(1);
             state.speech_bytes = state.speech_bytes.saturating_sub(request.speech_bytes());
@@ -159,6 +171,7 @@ impl Mailbox {
         }
 
         if interrupt {
+            state.rate_announcement = None;
             let _ = Self::discard_speech(&mut state);
             state.requests.retain(|request| {
                 !matches!(
@@ -199,6 +212,7 @@ impl Mailbox {
         if state.shutdown {
             return Ok(());
         }
+        state.rate_announcement = None;
         let _ = Self::discard_speech(&mut state);
         state.requests.retain(|request| {
             !matches!(
@@ -217,6 +231,7 @@ impl Mailbox {
         if state.shutdown {
             return Ok(());
         }
+        state.rate_announcement = None;
         if state
             .requests
             .iter()
@@ -279,13 +294,68 @@ impl Mailbox {
         if state.shutdown {
             return Ok(());
         }
-        state
+        state.rate_announcement = None;
+        let request = Request::SetRate(rate);
+        if let Some(last_adjustment) = state
             .requests
-            .retain(|request| !matches!(request, Request::SetRate(_)));
-        state.requests.push_front(Request::SetRate(rate));
+            .iter()
+            .rposition(|request| matches!(request, Request::AdjustRate { .. }))
+        {
+            // Preserve the order of absolute and relative requests. Only an
+            // absolute value after the last adjustment can be replaced.
+            if let Some(last_set) = state
+                .requests
+                .iter()
+                .rposition(|request| matches!(request, Request::SetRate(_)))
+                .filter(|index| *index > last_adjustment)
+            {
+                state.requests.remove(last_set);
+            }
+            state.requests.push_back(request);
+        } else {
+            state
+                .requests
+                .retain(|request| !matches!(request, Request::SetRate(_)));
+            state.requests.push_front(request);
+        }
         drop(state);
         self.available.notify_one();
         Ok(())
+    }
+
+    fn enqueue_rate_adjustment(
+        &self,
+        increase: bool,
+        announcement: Option<UtteranceId>,
+    ) -> DriverResult<()> {
+        let mut state = self.lock()?;
+        if state.shutdown {
+            return Ok(());
+        }
+        if state.rate_adjustments == MAX_PENDING_RATE_ADJUSTMENTS {
+            // Keep terminal input responsive if a stalled backend is flooded.
+            return Ok(());
+        }
+        if announcement.is_some() {
+            let _ = Self::discard_speech(&mut state);
+            state.requests.retain(|request| {
+                !matches!(request, Request::Pause | Request::Resume | Request::Toggle)
+            });
+        }
+        state.rate_announcement = announcement.clone();
+        state.rate_adjustments += 1;
+        state.requests.push_back(Request::AdjustRate {
+            increase,
+            announcement,
+        });
+        drop(state);
+        self.available.notify_one();
+        Ok(())
+    }
+
+    fn is_current_rate_announcement(&self, id: &UtteranceId) -> bool {
+        self.lock()
+            .is_ok_and(|state| state.rate_announcement.as_ref() == Some(id))
     }
 
     fn enqueue_pitch(&self, pitch: f32) -> DriverResult<()> {
@@ -373,13 +443,9 @@ impl Mailbox {
         if state.shutdown {
             return NextRequest::Shutdown;
         }
-        let Some(request) = state.requests.pop_front() else {
+        let Some(request) = Self::remove_request(&mut state, 0) else {
             return NextRequest::Idle;
         };
-        if request.is_speech() {
-            state.speech_items = state.speech_items.saturating_sub(1);
-            state.speech_bytes = state.speech_bytes.saturating_sub(request.speech_bytes());
-        }
         NextRequest::Request(request)
     }
 
@@ -387,6 +453,8 @@ impl Mailbox {
         if let Ok(mut state) = self.state.lock() {
             state.shutdown = true;
             state.requests.clear();
+            state.rate_announcement = None;
+            state.rate_adjustments = 0;
             state.speech_items = 0;
             state.speech_bytes = 0;
         }
@@ -420,7 +488,8 @@ pub struct BoundedAsyncDriver {
     mailbox: Arc<Mailbox>,
     ordered_utterances: Arc<AtomicBool>,
     option_state: Arc<Mutex<OptionState>>,
-    rate: f32,
+    initial_rate: f32,
+    requested_rate: Option<f32>,
     worker: Option<thread::JoinHandle<()>>,
     shutdown_backend: Option<Box<dyn FnOnce() + Send>>,
     next_compatibility_id: u64,
@@ -449,7 +518,7 @@ impl BoundedAsyncDriver {
     where
         D: Driver + Send + 'static,
     {
-        let rate = driver.get_rate();
+        let initial_rate = driver.get_rate();
         let initial_option_state = driver.option_state();
         let ordered_utterances = Arc::new(AtomicBool::new(driver.supports_ordered_utterances()));
         let option_state = Arc::new(Mutex::new(initial_option_state));
@@ -471,7 +540,8 @@ impl BoundedAsyncDriver {
             mailbox,
             ordered_utterances,
             option_state,
-            rate,
+            initial_rate,
+            requested_rate: None,
             worker: Some(worker),
             shutdown_backend,
             next_compatibility_id: 1,
@@ -538,7 +608,11 @@ impl Driver for BoundedAsyncDriver {
     }
 
     fn get_rate(&self) -> f32 {
-        self.rate
+        // Preserve the foreground snapshot of an absolute assignment. Key
+        // adjustments are computed from the backend on the worker.
+        self.requested_rate
+            .or_else(|| self.option_state.lock().ok().and_then(|state| state.rate))
+            .unwrap_or(self.initial_rate)
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
@@ -546,7 +620,7 @@ impl Driver for BoundedAsyncDriver {
             return Err(anyhow!("speech rate must be between 0 and 100 inclusive"));
         }
         self.mailbox.enqueue_rate(rate)?;
-        self.rate = rate;
+        self.requested_rate = Some(rate);
         Ok(())
     }
 
@@ -570,13 +644,24 @@ impl Driver for BoundedAsyncDriver {
             return Ok(SetOptionOutcome::Unsupported);
         }
         self.mailbox.enqueue_rate(rate)?;
-        self.rate = rate;
+        self.requested_rate = Some(rate);
         if status == CapabilityStatus::Supported
             && let Ok(mut state) = self.option_state.lock()
         {
             state.rate = Some(rate);
         }
         Ok(SetOptionOutcome::Accepted)
+    }
+
+    fn adjust_rate_and_announce(
+        &mut self,
+        increase: bool,
+        announcement: Option<UtteranceId>,
+    ) -> DriverResult<()> {
+        self.mailbox
+            .enqueue_rate_adjustment(increase, announcement)?;
+        self.requested_rate = None;
+        Ok(())
     }
 
     fn set_pitch_option(&mut self, pitch: f32) -> DriverResult<SetOptionOutcome> {
@@ -710,6 +795,12 @@ fn run_worker(
             NextRequest::Request(Request::Resume) => driver.resume(),
             NextRequest::Request(Request::Toggle) => driver.toggle(),
             NextRequest::Request(Request::SetRate(rate)) => driver.set_rate(rate),
+            NextRequest::Request(Request::AdjustRate {
+                increase,
+                announcement,
+            }) => apply_rate_adjustment(&mut driver, increase, announcement.as_ref(), |id| {
+                mailbox.is_current_rate_announcement(id)
+            }),
             NextRequest::Request(Request::SetPitch(pitch)) => {
                 driver.set_pitch_option(pitch).map(|_| ())
             }
@@ -918,6 +1009,49 @@ mod tests {
         // Give the worker time to observe the queued controls before its owner
         // is dropped. This is not needed for correctness, only clean test exit.
         thread::sleep(Duration::from_millis(10));
+    }
+
+    #[test]
+    fn pending_rate_requests_keep_every_step_and_only_the_latest_confirmation() {
+        let mailbox = Mailbox::new();
+        let older = UtteranceId::new("older");
+        let latest = UtteranceId::new("latest");
+        mailbox.enqueue_rate(52.0).unwrap();
+        mailbox
+            .enqueue_rate_adjustment(true, Some(older.clone()))
+            .unwrap();
+        mailbox.enqueue_rate(64.0).unwrap();
+        mailbox.enqueue_rate(65.0).unwrap();
+        mailbox
+            .enqueue_rate_adjustment(false, Some(latest.clone()))
+            .unwrap();
+
+        assert!(!mailbox.is_current_rate_announcement(&older));
+        assert!(mailbox.is_current_rate_announcement(&latest));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::SetRate(52.0))
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::AdjustRate { increase: true, .. })
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::SetRate(65.0))
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::AdjustRate {
+                increase: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Idle
+        ));
+        assert_eq!(mailbox.lock().unwrap().rate_adjustments, 0);
     }
 
     #[test]

@@ -21,6 +21,11 @@ pub(super) fn toggle_speaking(sr: &mut ScreenReader) -> Result<CommandResult> {
     Ok(CommandResult::Handled)
 }
 
+pub(super) fn adjust_speech_rate(sr: &mut ScreenReader, increase: bool) -> Result<CommandResult> {
+    sr.adjust_speech_rate(increase)?;
+    Ok(CommandResult::Handled)
+}
+
 pub(super) fn toggle_auto_read(sr: &mut ScreenReader) -> Result<CommandResult> {
     let enabled = sr.toggle_auto_read();
     sr.speak(
@@ -119,14 +124,14 @@ pub(super) fn toggle_symbol_level(sr: &mut ScreenReader) -> Result<CommandResult
 #[cfg(test)]
 mod tests {
     use super::{
-        backspace, cancel, delete, pass_next_key, pause, resume, say_overlay, say_time,
-        toggle_auto_read, toggle_help, toggle_review_follows_screen_cursor, toggle_speaking,
-        toggle_stop_speech_on_focus_loss, toggle_symbol_level,
+        adjust_speech_rate, backspace, cancel, delete, pass_next_key, pause, resume, say_overlay,
+        say_time, toggle_auto_read, toggle_help, toggle_review_follows_screen_cursor,
+        toggle_speaking, toggle_stop_speech_on_focus_loss, toggle_symbol_level,
     };
     use crate::{
         commands::CommandResult,
         screen_reader::ScreenReader,
-        speech::{self, symbols::Level},
+        speech::{self, SetOptionOutcome, symbols::Level},
         view::View,
     };
     use std::{cell::RefCell, rc::Rc};
@@ -148,7 +153,11 @@ mod tests {
         }
 
         fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
-            Ok(())
+            anyhow::bail!("rate control is unavailable")
+        }
+
+        fn set_rate_option(&mut self, _rate: f32) -> anyhow::Result<SetOptionOutcome> {
+            Ok(SetOptionOutcome::Unsupported)
         }
     }
 
@@ -177,6 +186,20 @@ mod tests {
                 "entering help. Press this key again to exit",
                 "exiting help",
             ]
+        );
+    }
+
+    #[test]
+    fn speech_rate_adjustment_announces_unsupported_voice() {
+        let (mut sr, output) = screen_reader();
+
+        assert!(matches!(
+            adjust_speech_rate(&mut sr, true).unwrap(),
+            CommandResult::Handled
+        ));
+        assert_eq!(
+            output.borrow().as_slice(),
+            ["the current voice cannot change speech rate"]
         );
     }
 

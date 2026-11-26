@@ -284,12 +284,11 @@ impl Backend for WinRt {
         1.
     }
 
-    // WinRT reports f64, but this crate's API is f32.
-    #[allow(clippy::cast_possible_truncation)]
     #[instrument(level = "debug", skip(self), err, ret)]
     fn get_rate(&self) -> std::result::Result<f32, Error> {
-        let rate = self.synth.Options()?.SpeakingRate()?;
-        Ok(rate as f32)
+        // Synthesizer options belong to the utterance being synthesized.
+        // This value is captured when the next utterance is submitted.
+        Ok(self.rate)
     }
 
     #[instrument(level = "debug", skip(self), err)]

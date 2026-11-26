@@ -1255,6 +1255,105 @@ fn live_pty_drains_output_that_was_ready_before_poll_registration_and_delivers_b
 }
 
 #[test]
+fn speech_rate_keys_apply_before_confirmation_through_the_speech_host() {
+    let _serial = serialize_live_pty_test();
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let config = config_dir.path().join("init.lua");
+    fs::write(
+        &config,
+        r#"
+            lector.o.speech.server = {
+                program = assert(os.getenv("LECTOR_TEST_SPEECH_SERVER")),
+                args = {"speech", "--rpc-log", assert(os.getenv("LECTOR_TEST_STARTUP_ORDER_LOG"))},
+            }
+            lector.o.auto_read = false
+            lector.o.symbol_level = "none"
+            lector.o.speech.rate = 93
+            lector.bindings["M-z"] = "lector.increase_speech_rate"
+        "#,
+    )
+    .expect("write isolated speech settings");
+    let mut lector = LiveLector::spawn_with_config("latency", &config);
+    assert!(
+        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+            physical_screen_contains(terminal, LATENCY_READY)
+        })
+    );
+
+    for (input, text) in [
+        (b"\x1bOP".as_slice(), "entering help"),
+        (b"\x1b-", "decrease speech rate"),
+        (b"\x1b=", "increase speech rate"),
+        (b"\x1bOP", "exiting help"),
+    ] {
+        lector.send_now(input);
+        assert!(
+            lector.wait_for_outer_speech(Duration::from_secs(3), text),
+            "missing {text:?}: {:?}",
+            lector.outer_speech()
+        );
+    }
+
+    let slow_to_minimum = b"\x1b-".repeat(17);
+    for (input, text) in [
+        (b"\x1b-".as_slice(), "88 percent"),
+        (b"\x1b=", "93 percent"),
+        (b"\x1bz", "98 percent"),
+        (b"\x1b=", "100 percent"),
+        (b"\x1b=", "100 percent"),
+        (b"\x1b-\x1b-\x1b-", "85 percent"),
+        (slow_to_minimum.as_slice(), "0 percent"),
+        (b"\x1b-", "0 percent"),
+    ] {
+        fs::write(&lector.outer_speech_log, []).expect("clear speech log");
+        lector.send_now(input);
+        assert!(
+            lector.wait_for_exact_outer_speech(Duration::from_secs(3), text),
+            "missing {text:?}: {:?}",
+            lector.outer_speech()
+        );
+    }
+
+    lector.send(b"q");
+    assert!(lector.finish(Duration::from_secs(3)));
+
+    let rpc_log = fs::read_to_string(&lector.inner_speech_log).expect("read speech RPC log");
+    let mut rate = None;
+    let mut requested_rates = Vec::new();
+    let mut confirmed_rates = Vec::new();
+    for record in rpc_log.split_terminator('\n') {
+        let record: serde_json::Value = serde_json::from_str(record).expect("speech RPC record");
+        match record["method"].as_str() {
+            Some("speech.setRate") => {
+                rate = record["params"]["rate"].as_f64();
+                requested_rates.push(rate.expect("requested rate"));
+            }
+            Some("speech.speak") => {
+                if let Some(value) = record["params"]["text"]
+                    .as_str()
+                    .and_then(|text| text.strip_suffix(" percent"))
+                {
+                    let spoken = value.parse::<f64>().expect("spoken percentage");
+                    assert_eq!(Some(spoken), rate);
+                    confirmed_rates.push(spoken);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        requested_rates,
+        [
+            93.0, 88.0, 93.0, 98.0, 100.0, 100.0, 95.0, 90.0, 85.0, 80.0, 75.0, 70.0, 65.0, 60.0,
+            55.0, 50.0, 45.0, 40.0, 35.0, 30.0, 25.0, 20.0, 15.0, 10.0, 5.0, 0.0, 0.0,
+        ]
+    );
+    assert!(confirmed_rates.starts_with(&[88.0, 93.0, 98.0, 100.0, 100.0]));
+    assert!(confirmed_rates.contains(&85.0));
+    assert!(confirmed_rates.ends_with(&[0.0, 0.0]));
+}
+
+#[test]
 fn direct_output_flood_does_not_starve_auto_read_toggle() {
     let _serial = serialize_live_pty_test();
     let mut lector = LiveLector::spawn("flood", false);

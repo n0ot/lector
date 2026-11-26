@@ -291,6 +291,39 @@ impl SpeechManager {
         self.stop_for(host, active, AfterStop::Cancel)
     }
 
+    /// Discard a particular waiting utterance without stopping active audio.
+    pub(super) fn discard_waiting_utterance(&mut self, id: &UtteranceId) {
+        if let Some(index) = self.pending.iter().position(|item| item.id == *id) {
+            let removed = self.pending.remove(index).expect("waiting utterance index");
+            self.pending_bytes -= removed.queue_bytes();
+            if self.pending.is_empty() {
+                self.deferred_start = None;
+            }
+        }
+        if self
+            .paused_restart
+            .as_ref()
+            .is_some_and(|item| item.id == *id)
+        {
+            self.paused_restart = None;
+            self.deferred_start =
+                (!self.pending.is_empty()).then_some(DeferredStart::PausedBeforeNext);
+        }
+        if let Some(active) = &mut self.active
+            && let PlaybackState::Stopping(after) = &mut active.state
+        {
+            match after {
+                AfterStop::Replace(item) if item.id == *id => *after = AfterStop::Cancel,
+                AfterStop::SuspendReplacement(item) if item.id == *id => {
+                    *after = AfterStop::Cancel;
+                    self.deferred_start =
+                        (!self.pending.is_empty()).then_some(DeferredStart::PausedBeforeNext);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Suspend playback without discarding the active or queued speech.
     pub fn pause(&mut self, host: &mut dyn Host) -> Result<()> {
         self.drain_events(host)?;
