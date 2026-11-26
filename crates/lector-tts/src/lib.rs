@@ -185,6 +185,8 @@ pub enum UtteranceId {
     Android(u64),
     #[cfg(target_vendor = "apple")]
     AvFoundation(usize),
+    #[cfg(target_vendor = "apple")]
+    SoundCue(usize),
     #[cfg(target_os = "linux")]
     SpeechDispatcher(u64),
     #[cfg(target_arch = "wasm32")]
@@ -202,6 +204,8 @@ impl fmt::Display for UtteranceId {
             UtteranceId::SpeechDispatcher(id) => write!(f, "SpeechDispatcher({id})"),
             #[cfg(target_vendor = "apple")]
             UtteranceId::AvFoundation(id) => write!(f, "AvFoundation({id})"),
+            #[cfg(target_vendor = "apple")]
+            UtteranceId::SoundCue(id) => write!(f, "SoundCue({id})"),
             #[cfg(target_arch = "wasm32")]
             UtteranceId::Web(id) => write!(f, "Web({id})"),
             #[cfg(windows)]

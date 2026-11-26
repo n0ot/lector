@@ -927,6 +927,54 @@ mod tests {
     }
 
     #[test]
+    fn standalone_boundary_replaces_paused_speech_with_one_host_request() {
+        for sound_cues in [false, true] {
+            let mut manager = SpeechManager::default();
+            let mut host = FakeHost::full();
+            host.capabilities.sound_cues = sound_cues;
+            host.pause_result.position = Some(TextPosition::Utf8ByteOffset { offset: 0 });
+            let original = UtteranceId::new("original");
+            let boundary = UtteranceId::new("boundary");
+            manager
+                .submit(&mut host, original.clone(), "text".into(), false)
+                .unwrap();
+            manager.pause(&mut host).unwrap();
+            manager
+                .submit_with_cues(
+                    &mut host,
+                    boundary.clone(),
+                    "bottom".into(),
+                    false,
+                    UtteranceBoundary::Immediate,
+                    SpeechCues::Standalone(SoundCue::Bottom),
+                )
+                .unwrap();
+
+            let announcement = if sound_cues {
+                Call::SpeakWithCues(
+                    boundary,
+                    String::new(),
+                    vec![SoundCueAt {
+                        cue: SoundCue::Bottom,
+                        offset: 0,
+                    }],
+                )
+            } else {
+                Call::Speak(boundary, "bottom".into())
+            };
+            assert_eq!(
+                host.calls,
+                [
+                    Call::Speak(original.clone(), "text".into()),
+                    Call::Pause(original.clone()),
+                    Call::Stop(original),
+                    announcement,
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn native_cues_follow_speech_interruption_and_leave_link_text_intact() {
         let mut manager = SpeechManager::default();
         let mut host = FakeHost::full();

@@ -7,7 +7,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{Receiver, sync_channel},
     },
     time::{Duration, Instant},
@@ -47,6 +47,18 @@ const MAX_CACHED_TEXT_BYTES: usize = 256;
 // duration limit as well. Four entries cap retained PCM at ~7 MB after conversion.
 const MAX_CACHED_SAMPLES: usize = 480_000;
 const MAX_CACHED_SECONDS: usize = 10;
+const STANDALONE_CUES: [SoundCue; 5] = [
+    SoundCue::Top,
+    SoundCue::Bottom,
+    SoundCue::Left,
+    SoundCue::Right,
+    SoundCue::Blank,
+];
+
+fn playback_id() -> NativeUtteranceId {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    NativeUtteranceId::SoundCue(NEXT.fetch_add(1, Ordering::Relaxed))
+}
 
 fn cue_wav(cue: SoundCue) -> &'static [u8] {
     match cue {
@@ -86,27 +98,26 @@ pub(super) struct PreparedCues {
 
 impl PreparedCues {
     pub(super) fn new(volume: f32) -> Self {
-        let players = [
-            SoundCue::Top,
-            SoundCue::Bottom,
-            SoundCue::Left,
-            SoundCue::Right,
-            SoundCue::Blank,
-        ]
-        .into_iter()
-        .filter_map(|cue| {
-            let player = new_player(cue_wav(cue), volume).ok()?;
-            // Loading the clip does not activate an output device.
-            let prepared = Cell::new(false);
-            Some(CuePlayer {
-                cue,
-                audio: player,
-                prepared,
+        let players = STANDALONE_CUES
+            .into_iter()
+            .filter_map(|cue| {
+                let player = new_player(cue_wav(cue), volume).ok()?;
+                Some(CuePlayer {
+                    cue,
+                    audio: player,
+                    prepared: Cell::new(false),
+                })
             })
-        })
-        .collect();
+            .collect();
+        // Decode the embedded clips without touching an audio device. The
+        // output graph is opened on the first actual playback request.
+        let clips = STANDALONE_CUES
+            .into_iter()
+            .filter_map(|cue| Clip::from_wave(cue_wav(cue)).ok().map(|clip| (cue, clip)))
+            .collect();
         Self {
             players,
+            clips: RefCell::new(clips),
             ..Self::default()
         }
     }
@@ -135,6 +146,13 @@ impl PreparedCues {
         action(engine.as_ref().expect("cue output engine initialized"))
     }
 
+    pub(super) fn idle_timeout(&self) -> Option<Duration> {
+        self.engine
+            .borrow()
+            .as_ref()
+            .and_then(CueEngine::idle_timeout)
+    }
+
     pub(super) fn idle(&self) {
         if let Some(engine) = self.engine.borrow().as_ref() {
             engine.idle();
@@ -147,7 +165,7 @@ impl PreparedCues {
             let index = if let Some(index) = clips.iter().position(|(kind, _)| *kind == cue) {
                 index
             } else {
-                clips.push((cue, engine.clip(cue_wav(cue))?));
+                clips.push((cue, Clip::from_wave(cue_wav(cue))?));
                 clips.len() - 1
             };
             engine.play(&clips[index].1, volume)
@@ -754,7 +772,8 @@ enum Playback {
 }
 
 pub(super) struct CuePlayback {
-    token: Retained<AVSpeechUtterance>,
+    id: NativeUtteranceId,
+    _utterance: Option<Retained<AVSpeechUtterance>>,
     playback: Playback,
     cached_clock_pending: bool,
 }
@@ -765,30 +784,37 @@ impl CuePlayback {
         text: &str,
         cues: Vec<SoundCueAt>,
         voice_id: Option<&str>,
-        prepared: &PreparedCues,
     ) -> Result<Self, Error> {
         let volume = tts.get_volume()?;
         // The player applies volume once, to both the rendered speech and the
         // cue, including zero volume in the opt-in native integration tests.
         let token = build_utterance(text, tts.get_rate()?, 1.0, tts.get_pitch()?, voice_id)?;
-        let playback = if let [cue] = cues.as_slice()
-            && text.is_empty()
-        {
-            Playback::Playing(prepared.standalone(cue.cue, volume)?)
-        } else {
-            let synth = unsafe { AVSpeechSynthesizer::new() };
-            Playback::Rendering(Rendering::new(
-                synth,
-                &token,
-                text.to_owned(),
-                cues,
-                volume,
-                MAX_RENDER_SAMPLES,
-            ))
-        };
+        let synth = unsafe { AVSpeechSynthesizer::new() };
+        let playback = Playback::Rendering(Rendering::new(
+            synth,
+            &token,
+            text.to_owned(),
+            cues,
+            volume,
+            MAX_RENDER_SAMPLES,
+        ));
         Ok(Self {
-            token,
+            id: playback_id(),
+            _utterance: Some(token),
             playback,
+            cached_clock_pending: false,
+        })
+    }
+
+    pub(super) fn standalone(
+        cue: SoundCue,
+        volume: f32,
+        prepared: &PreparedCues,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            id: playback_id(),
+            _utterance: None,
+            playback: Playback::Playing(prepared.standalone(cue, volume)?),
             cached_clock_pending: false,
         })
     }
@@ -806,7 +832,7 @@ impl CuePlayback {
     }
 
     pub(super) fn id(&self) -> NativeUtteranceId {
-        NativeUtteranceId::AvFoundation(std::ptr::from_ref(&*self.token) as usize)
+        self.id
     }
 
     fn stop(&self) {
@@ -906,6 +932,10 @@ pub(super) struct ReadbackCache {
 }
 
 impl ReadbackCache {
+    pub(super) fn needs_poll(&self) -> bool {
+        self.requested.is_some() || self.rendering.is_some()
+    }
+
     pub(super) fn retain_request(&mut self, key: Option<&ReadbackKey>) {
         if self.requested.as_ref() != key {
             self.requested = None;
@@ -943,7 +973,7 @@ impl ReadbackCache {
     ) -> Option<CuePlayback> {
         let index = self.ready.iter().position(|(cached, _)| cached == key)?;
         let (key, ready) = self.ready.remove(index)?;
-        let token = build_utterance("", 0.5, 1.0, 1.0, None).ok()?;
+
         let playback = Playback::Playing(Playing::new(
             AudioOutput::Engine(
                 prepared
@@ -955,13 +985,14 @@ impl ReadbackCache {
         ));
         self.ready.push_front((key, ready));
         Some(CuePlayback {
-            token,
+            id: playback_id(),
+            _utterance: None,
             playback,
             cached_clock_pending: true,
         })
     }
 
-    pub(super) fn advance(&mut self, prepared: &PreparedCues) -> bool {
+    pub(super) fn advance(&mut self) -> bool {
         if self.rendering.is_none()
             && let Some(key) = self.requested.take()
         {
@@ -994,7 +1025,7 @@ impl ReadbackCache {
         match render.advance() {
             Ok(Some(ready)) => {
                 let (key, _, _) = self.rendering.take().expect("render just advanced");
-                if let Ok(clip) = prepared.with_engine(|engine| engine.clip(&ready.wav)) {
+                if let Ok(clip) = Clip::from_wave(&ready.wav) {
                     if self.ready.len() == MAX_CACHED_READBACKS {
                         self.ready.pop_back();
                     }

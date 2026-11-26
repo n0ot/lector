@@ -394,6 +394,35 @@ mod tests {
     }
 
     #[test]
+    fn blank_bottom_and_character_inspection_each_submit_one_request() {
+        use super::SoundCue;
+        use speech::SpeechCues;
+        let submissions = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
+            Rc::clone(&submissions),
+        ))));
+        let mut view = View::new(2, 12);
+        view.process_changes(b"entry");
+        line_next(&mut sr, &mut view, false).unwrap();
+        assert!(submissions.borrow().is_empty());
+
+        line_next(&mut sr, &mut view, false).unwrap();
+        character_read(&mut sr, &view).unwrap();
+        assert_eq!(
+            submissions.borrow().as_slice(),
+            [
+                ("bottom".into(), SpeechCues::Standalone(SoundCue::Bottom)),
+                ("blank".into(), SpeechCues::Standalone(SoundCue::Blank)),
+            ],
+        );
+
+        let (mut sr, spoken) = screen_reader();
+        line_next(&mut sr, &mut view, false).unwrap();
+        character_read(&mut sr, &view).unwrap();
+        assert_eq!(spoken.borrow().as_slice(), ["bottom", "blank"]);
+    }
+
+    #[test]
     fn boundary_is_submitted_with_its_readback_and_does_not_leak() {
         use super::SoundCue;
         use speech::SpeechCues;

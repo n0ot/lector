@@ -6,6 +6,8 @@
 
 #[cfg(target_vendor = "apple")]
 mod cue_playback;
+#[cfg(unix)]
+mod parent_watchdog;
 
 #[cfg(target_vendor = "apple")]
 use crate::protocol::SoundCue;
@@ -28,10 +30,10 @@ use crate::{
         UtteranceId, UtteranceParams, VoiceCapabilities, VoiceInfo, VoiceListResult, VolumeResult,
         rate_is_normalized,
     },
-    server::{InitializeResult, Request, RpcError, ServerNotification, run_server_with_tick},
+    server::{
+        InitializeResult, Request, RpcError, ServerNotification, Waiter, Wake, run_server_with_wake,
+    },
 };
-#[cfg(unix)]
-use anyhow::Context;
 use anyhow::Result;
 use clap::Args;
 use serde::de::DeserializeOwned;
@@ -269,6 +271,7 @@ struct State {
     rpc_log: Option<File>,
     active: Option<ActiveUtterance>,
     native_events: mpsc::Receiver<NativeEvent>,
+    wake: Wake,
     notifications: VecDeque<ServerNotification>,
 }
 
@@ -419,14 +422,20 @@ pub fn run_with_options(options: &Options) -> Result<()> {
         }
         return Ok(());
     }
-    let state = RefCell::new(State::new(backend, options.voice.as_deref())?);
-    run_server_with_tick(
+    let waiter = Waiter::new()?;
+    let state = RefCell::new(State::new(
+        backend,
+        options.voice.as_deref(),
+        waiter.wake(),
+    )?);
+    run_server_with_wake(
+        &waiter,
         |request| handle_request(request, &mut state.borrow_mut()),
         || {
             let mut borrowed = state.borrow_mut();
             let state = &mut *borrowed;
             #[cfg(target_vendor = "apple")]
-            if state.readback_cache.advance(&state.prepared_cues)
+            if state.readback_cache.advance()
                 && let Some(log) = &state.cue_event_log
             {
                 write_speech_event(log, "directional-cue-cache-ready");
@@ -434,7 +443,8 @@ pub fn run_with_options(options: &Options) -> Result<()> {
             #[cfg(target_vendor = "apple")]
             state.prepared_cues.idle();
             state.advance();
-            state.notifications.drain(..).collect()
+            let timeout = state.next_tick();
+            (state.notifications.drain(..).collect(), timeout)
         },
     )?;
     Ok(())
@@ -451,7 +461,7 @@ fn select_backend(value: &str) -> Result<Backends> {
 }
 
 impl State {
-    fn new(backend: Backends, voice_id: Option<&str>) -> Result<Self> {
+    fn new(backend: Backends, voice_id: Option<&str>, wake: Wake) -> Result<Self> {
         let tts = Tts::new(backend).map_err(|error| anyhow::anyhow!(error))?;
         let features = tts.supported_features();
         let test_event_log = configure_test_observation(&tts)?;
@@ -509,6 +519,7 @@ impl State {
         install_native_callbacks(
             &tts,
             &native_event_tx,
+            &wake,
             features.utterance_callbacks,
             test_event_log,
         )
@@ -546,6 +557,7 @@ impl State {
             rpc_log,
             active: None,
             native_events,
+            wake,
             notifications: VecDeque::new(),
         })
     }
@@ -632,6 +644,11 @@ impl State {
                 return Ok(result);
             }
             let cues = active.cues_from(base);
+            if text.is_empty()
+                && let [cue] = cues.as_slice()
+            {
+                return self.start_standalone_cue(active, base, cue);
+            }
             if let [cue] = cues.as_slice()
                 && !text.is_empty()
                 && cue.cue != SoundCue::Link
@@ -690,7 +707,6 @@ impl State {
                     text,
                     cues.clone(),
                     self.selected_voice.as_deref(),
-                    &self.prepared_cues,
                 ) {
                     Ok(playback) => {
                         let id = playback.id();
@@ -710,6 +726,29 @@ impl State {
             active.native_base = base;
         }
         Ok(result)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn start_standalone_cue(
+        &mut self,
+        active: &mut ActiveUtterance,
+        base: usize,
+        cue: &SoundCueAt,
+    ) -> Result<BackendAttempt<Option<NativeUtteranceId>>, RpcError> {
+        self.readback_cache.retain_request(None);
+        let volume = self.volume.as_ref().map_or(1.0, |volume| volume.current);
+        match CuePlayback::standalone(cue.cue, volume, &self.prepared_cues) {
+            Ok(playback) => {
+                let id = playback.id();
+                self.cue_playback = Some(playback);
+                active.native_base = base;
+                Ok(BackendAttempt::Completed(Some(id)))
+            }
+            Err(error) => {
+                eprintln!("lector-tts: {error}; speaking cue label");
+                self.start_spoken_fallback(active, base, std::slice::from_ref(cue))
+            }
+        }
     }
 
     #[cfg(target_vendor = "apple")]
@@ -885,6 +924,7 @@ impl State {
         install_native_callbacks(
             &tts,
             &native_event_tx,
+            &self.wake,
             features.utterance_callbacks,
             test_event_log,
         )
@@ -936,6 +976,30 @@ impl State {
         };
         active.paused = false;
         Ok(())
+    }
+
+    #[cfg_attr(not(target_vendor = "apple"), allow(clippy::unused_self))]
+    fn next_tick(&self) -> Option<Duration> {
+        #[cfg(target_vendor = "apple")]
+        {
+            // Sample-clock playback and render deadlines still need a timed
+            // check while active. Native speech itself wakes through callbacks.
+            let playback_active = self.cue_playback.is_some()
+                && self.active.as_ref().is_some_and(|active| !active.paused);
+            let observing_live_cue = self.cue_event_log.is_some()
+                && self.active.is_some()
+                && self.live_direction.as_ref().is_some_and(|direction| {
+                    direction.playback == DirectionPlayback::Played && !direction.clock_logged
+                });
+            if playback_active || observing_live_cue || self.readback_cache.needs_poll() {
+                return Some(Duration::from_millis(10));
+            }
+            self.prepared_cues.idle_timeout()
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            None
+        }
     }
 
     fn advance(&mut self) {
@@ -1624,32 +1688,37 @@ fn select_voice(tts: &Tts, voice_id: &str) -> Result<VoiceInfo> {
 fn install_native_callbacks(
     tts: &Tts,
     events: &mpsc::Sender<NativeEvent>,
+    wake: &Wake,
     supported: bool,
     event_log: Option<SpeechEventLog>,
 ) -> std::result::Result<(), TtsError> {
     if !supported {
         return Ok(());
     }
-    let started = events.clone();
+    let send = {
+        let events = events.clone();
+        let wake = wake.clone();
+        move |event| {
+            if events.send(event).is_ok() {
+                wake.notify();
+            }
+        }
+    };
+    let started = send.clone();
     tts.on_utterance_begin(move |id| {
         if let Some(log) = &event_log {
             write_speech_event(log, "begin");
         }
-        let _ = started.send(NativeEvent::Started(id));
+        started(NativeEvent::Started(id));
     })?;
-    let completed = events.clone();
-    tts.on_utterance_end(move |id| {
-        let _ = completed.send(NativeEvent::Completed(id));
-    })?;
-    let cancelled = events.clone();
-    tts.on_utterance_stop(move |id| {
-        let _ = cancelled.send(NativeEvent::Cancelled(id));
-    })?;
+    let completed = send.clone();
+    tts.on_utterance_end(move |id| completed(NativeEvent::Completed(id)))?;
+    let cancelled = send.clone();
+    tts.on_utterance_stop(move |id| cancelled(NativeEvent::Cancelled(id)))?;
     #[cfg(target_vendor = "apple")]
     {
-        let ranges = events.clone();
         tts.on_utterance_range(move |id, start, length| {
-            let _ = ranges.send(NativeEvent::Range { id, start, length });
+            send(NativeEvent::Range { id, start, length });
         })?;
     }
     Ok(())
@@ -1771,21 +1840,7 @@ fn log_request(request: &Request, state: &mut State) -> Result<(), RpcError> {
 /// Ensure a native speech host cannot survive an abruptly terminated Lector.
 #[cfg(unix)]
 fn start_parent_watchdog(expected_parent_pid: u32) -> Result<()> {
-    std::thread::Builder::new()
-        .name("lector-speech-parent-watchdog".to_owned())
-        .spawn(move || {
-            loop {
-                let actual_parent_pid = nix::unistd::getppid().as_raw().cast_unsigned();
-                if actual_parent_pid != expected_parent_pid {
-                    // SAFETY: the owning process is gone and arbitrary native
-                    // destructors must not keep this helper alive.
-                    unsafe { nix::libc::_exit(1) };
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        })
-        .map(|_| ())
-        .context("start native speech parent watchdog")
+    parent_watchdog::start(expected_parent_pid)
 }
 
 #[cfg(not(unix))]

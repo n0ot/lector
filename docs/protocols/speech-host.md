@@ -232,7 +232,9 @@ lifecycle events, never from sampling the backend.
 
 In 2.3, `soundCues: true` advertises one capability for both
 standalone cues and overlays. A standalone cue follows the normal utterance
-lifecycle. A link cue plays alongside the speech at the audible onset of the
+lifecycle. A cue with empty text can start as soon as the host accepts the
+request. It needs no speech synthesis or word callback. A link cue plays
+alongside the speech at the audible onset of the
 marked text. It MUST NOT defer, pause, restart, or split the spoken text.
 Stopping or interrupting speech MUST stop its active cues and discard any
 of its unplayed cues. A host only offers this capability when it can meet all

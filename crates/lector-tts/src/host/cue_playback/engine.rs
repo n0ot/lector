@@ -28,8 +28,8 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) struct CueEngine {
     engine: Retained<AVAudioEngine>,
     node: Retained<AVAudioPlayerNode>,
-    format: Retained<AVAudioFormat>,
     last_request: Cell<Instant>,
+    failed_start: Cell<Option<Instant>>,
     in_use: Rc<Cell<bool>>,
 }
 
@@ -42,100 +42,49 @@ impl CueEngine {
     pub(super) fn new() -> Result<Self, Error> {
         let engine = unsafe { AVAudioEngine::new() };
         let node = unsafe { AVAudioPlayerNode::init(AVAudioPlayerNode::alloc()) };
-        let format = unsafe {
-            AVAudioFormat::initStandardFormatWithSampleRate_channels(
-                AVAudioFormat::alloc(),
-                f64::from(RATE),
-                1,
-            )
-        }
-        .ok_or(Error::OperationFailed("create cue output format"))?;
+        let format = pcm_format()?;
         unsafe {
             engine.attachNode(&node);
             engine.connect_to_format(&node, &engine.mainMixerNode(), Some(&format));
-            engine.prepare();
         }
-        let output = Self {
+        Ok(Self {
             engine,
             node,
-            format,
             last_request: Cell::new(Instant::now()),
+            failed_start: Cell::new(None),
             in_use: Rc::new(Cell::new(false)),
-        };
-        output.start()?;
-        Ok(output)
+        })
     }
 
     fn start(&self) -> Result<(), Error> {
         self.last_request.set(Instant::now());
         if !unsafe { self.engine.isRunning() } {
-            unsafe { self.engine.startAndReturnError() }
-                .map_err(|_| Error::OperationFailed("start cue output engine"))?;
+            if self
+                .failed_start
+                .get()
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+            {
+                return Err(Error::OperationFailed("start cue output engine"));
+            }
+            if unsafe { self.engine.startAndReturnError() }.is_err() {
+                self.failed_start.set(Some(Instant::now()));
+                return Err(Error::OperationFailed("start cue output engine"));
+            }
+            self.failed_start.set(None);
         }
         Ok(())
     }
 
-    pub(super) fn idle(&self) {
-        if self.last_request.get().elapsed() >= IDLE_TIMEOUT
-            && !self.in_use.get()
-            && unsafe { self.engine.isRunning() }
-        {
-            unsafe { self.engine.stop() };
-        }
+    pub(super) fn idle_timeout(&self) -> Option<Duration> {
+        (!self.in_use.get() && unsafe { self.engine.isRunning() })
+            .then(|| IDLE_TIMEOUT.saturating_sub(self.last_request.get().elapsed()))
     }
 
-    pub(super) fn clip(&self, wave: &[u8]) -> Result<Clip, Error> {
-        let mut wave = WavReader::new(Cursor::new(wave))?;
-        let spec = wave.spec();
-        let source_rate = spec.sample_rate as usize;
-        let channels = usize::from(spec.channels);
-        if channels == 0 || source_rate == 0 {
-            return Err(Error::OperationFailed("read cue PCM format"));
+    pub(super) fn idle(&self) {
+        if self.idle_timeout().is_some_and(|timeout| timeout.is_zero()) {
+            // Pause releases the hardware but keeps the prepared graph.
+            unsafe { self.engine.pause() };
         }
-        let source = wave
-            .samples::<i16>()
-            .map(|sample| sample.map(|sample| f32::from(sample) / 32768.0))
-            .collect::<Result<Vec<_>, _>>()?;
-        let input: Vec<_> = source
-            .chunks_exact(channels)
-            .map(|frame| frame.iter().sum::<f32>() / f32::from(spec.channels))
-            .collect();
-        let rate = RATE as usize;
-        let frames = (input.len() * rate).div_ceil(source_rate);
-        if frames == 0 {
-            return Err(Error::OperationFailed("read empty cue PCM"));
-        }
-        let count =
-            u32::try_from(frames).map_err(|_| Error::OperationFailed("size cue PCM buffer"))?;
-        let buffer = unsafe {
-            AVAudioPCMBuffer::initWithPCMFormat_frameCapacity(
-                AVAudioPCMBuffer::alloc(),
-                &self.format,
-                count,
-            )
-        }
-        .ok_or(Error::OperationFailed("allocate cue PCM buffer"))?;
-        unsafe {
-            buffer.setFrameLength(count);
-            let data = buffer.floatChannelData();
-            if data.is_null() {
-                return Err(Error::OperationFailed("access cue PCM buffer"));
-            }
-            let out = std::slice::from_raw_parts_mut((*data).as_ptr(), frames);
-            for (frame, sample) in out.iter_mut().enumerate() {
-                let position = frame * source_rate;
-                let offset = position / rate;
-                #[allow(clippy::cast_precision_loss)]
-                let fraction = (position % rate) as f32 / rate as f32;
-                let current = input[offset];
-                let next = input.get(offset + 1).copied().unwrap_or(0.0);
-                *sample = current + (next - current) * fraction;
-            }
-        }
-        Ok(Clip {
-            buffer,
-            source_rate: spec.sample_rate,
-        })
     }
 
     pub(super) fn play(&self, clip: &Clip, volume: f32) -> Result<NodePlayback, Error> {
@@ -172,7 +121,72 @@ impl Drop for CueEngine {
     }
 }
 
+fn pcm_format() -> Result<Retained<AVAudioFormat>, Error> {
+    unsafe {
+        AVAudioFormat::initStandardFormatWithSampleRate_channels(
+            AVAudioFormat::alloc(),
+            f64::from(RATE),
+            1,
+        )
+    }
+    .ok_or(Error::OperationFailed("create cue PCM format"))
+}
+
 impl Clip {
+    pub(super) fn from_wave(wave: &[u8]) -> Result<Self, Error> {
+        let mut wave = WavReader::new(Cursor::new(wave))?;
+        let spec = wave.spec();
+        let source_rate = spec.sample_rate as usize;
+        let channels = usize::from(spec.channels);
+        if channels == 0 || source_rate == 0 {
+            return Err(Error::OperationFailed("read cue PCM format"));
+        }
+        let source = wave
+            .samples::<i16>()
+            .map(|sample| sample.map(|sample| f32::from(sample) / 32768.0))
+            .collect::<Result<Vec<_>, _>>()?;
+        let input: Vec<_> = source
+            .chunks_exact(channels)
+            .map(|frame| frame.iter().sum::<f32>() / f32::from(spec.channels))
+            .collect();
+        let rate = RATE as usize;
+        let frames = (input.len() * rate).div_ceil(source_rate);
+        if frames == 0 {
+            return Err(Error::OperationFailed("read empty cue PCM"));
+        }
+        let count =
+            u32::try_from(frames).map_err(|_| Error::OperationFailed("size cue PCM buffer"))?;
+        let format = pcm_format()?;
+        let buffer = unsafe {
+            AVAudioPCMBuffer::initWithPCMFormat_frameCapacity(
+                AVAudioPCMBuffer::alloc(),
+                &format,
+                count,
+            )
+        }
+        .ok_or(Error::OperationFailed("allocate cue PCM buffer"))?;
+        unsafe {
+            buffer.setFrameLength(count);
+            let data = buffer.floatChannelData();
+            if data.is_null() {
+                return Err(Error::OperationFailed("access cue PCM buffer"));
+            }
+            let out = std::slice::from_raw_parts_mut((*data).as_ptr(), frames);
+            for (frame, sample) in out.iter_mut().enumerate() {
+                let position = frame * source_rate;
+                let offset = position / rate;
+                #[allow(clippy::cast_precision_loss)]
+                let fraction = (position % rate) as f32 / rate as f32;
+                let current = input[offset];
+                let next = input.get(offset + 1).copied().unwrap_or(0.0);
+                *sample = current + (next - current) * fraction;
+            }
+        }
+        Ok(Self {
+            buffer,
+            source_rate: spec.sample_rate,
+        })
+    }
     pub(super) fn source_rate(&self) -> u32 {
         self.source_rate
     }
