@@ -21,6 +21,7 @@ class HomebrewPublicationTests(unittest.TestCase):
             self.assertIn(f'/download/v1.2.3/{name}"\n      sha256 "{digest}"', formula)
         self.assertNotIn("linux-gnu", formula)
         self.assertIn('branch: "master"', formula)
+        self.assertIn('    end\n    doc.install "LICENSE"\n  end', formula)
 
     def test_rejects_incomplete_or_ambiguous_checksums_and_prereleases(self):
         with self.assertRaisesRegex(ValueError, "Missing checksums"):

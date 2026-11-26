@@ -65,6 +65,7 @@ class Lector < Formula
     else
       bin.install "lector"
     end
+    doc.install "LICENSE"
   end
 
   test do
