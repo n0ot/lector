@@ -1817,6 +1817,23 @@ fn review_speaks_link_exit_only_for_character_navigation() {
 }
 
 #[test]
+fn counted_character_exit_reads_only_its_destination() {
+    let (mut app, mut sr, recorder, _clock) = make_app();
+    let mut pty = Vec::new();
+    let mut screen = Vec::new();
+    app.handle_pty(&mut sr, b"\x1b]8;;https://example.invalid\x1b\\x\x1b]8;;\x1b\\ a\x1b]8;;https://example.invalid\x1b\\b\x1b]8;;\x1b\\\x1b[H", &mut screen).unwrap();
+    app.handle_stdin(&mut sr, b"\x1br", &mut pty, &mut screen)
+        .unwrap();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"2l", &mut pty, &mut screen)
+        .unwrap();
+    assert_eq!(
+        recorder.inner.borrow().speaks.as_slice(),
+        [("out of link a".into(), false)]
+    );
+}
+
+#[test]
 fn kitty_meta_r_opens_review_without_toggling_or_leaking() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();

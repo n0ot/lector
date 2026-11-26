@@ -228,24 +228,16 @@ impl DirectionPlayback {
 }
 
 #[cfg(target_vendor = "apple")]
-fn live_link_offsets(text: &str, cues: &[SoundCueAt]) -> bool {
+fn is_link_word_onset(text: &str, offset: usize) -> bool {
     use unicode_segmentation::UnicodeSegmentation;
-    // Mid-word links require the rendered marker validation and spoken fallback.
-    let mut words = text
-        .unicode_word_indices()
-        .map(|(offset, _)| offset)
-        .peekable();
-    cues.iter().all(|cue| {
-        if cue.cue != SoundCue::Link {
-            return false;
-        }
-        while words.next_if(|offset| *offset < cue.offset).is_some() {}
-        words.next_if_eq(&cue.offset).is_some()
-    })
+    text.unicode_word_indices()
+        .take_while(|(start, _)| *start <= offset)
+        .any(|(start, _)| start == offset)
 }
 
 #[cfg(target_vendor = "apple")]
 struct LiveCue {
+    offset: usize,
     native_id: NativeUtteranceId,
     cue: SoundCue,
     playback: DirectionPlayback,
@@ -257,7 +249,7 @@ struct LiveCue {
 #[cfg(target_vendor = "apple")]
 #[derive(Default)]
 struct DirectionalBatch {
-    saw_range: bool,
+    last_range: Option<usize>,
     ended: bool,
 }
 
@@ -270,9 +262,9 @@ impl DirectionalBatch {
                 NativeEvent::Range {
                     id: native_id,
                     length,
-                    ..
+                    start,
                 } if native_id == id && length != 0 => {
-                    batch.saw_range = true;
+                    batch.last_range = Some(start);
                 }
                 NativeEvent::Completed(native_id) | NativeEvent::Cancelled(native_id)
                     if native_id == id =>
@@ -683,10 +675,11 @@ impl<'a> State<'a> {
             if text.is_empty() && !cues.is_empty() {
                 return self.start_standalone_cue(active, base, &cues);
             }
-            if let Some(cue) = cues.first()
+            // Multiple overlays share a PCM clock so overlapping cue tails survive.
+            if let [cue] = cues.as_slice()
                 && !text.is_empty()
-                && ((cues.len() == 1 && cue.cue != SoundCue::Link)
-                    || (self.live_word_ranges && live_link_offsets(text, &cues)))
+                && (cue.cue != SoundCue::Link
+                    || (self.live_word_ranges && is_link_word_onset(text, cue.offset)))
             {
                 return self.start_live_cue(active, base, cue);
             }
@@ -775,6 +768,7 @@ impl<'a> State<'a> {
                 active.cues.retain(|cue| cue.offset >= base);
             }
             self.live_cue = Some(LiveCue {
+                offset: cue.offset,
                 native_id,
                 cue: cue.cue,
                 playback: DirectionPlayback::Pending,
@@ -1132,7 +1126,7 @@ impl<'a> State<'a> {
         // Never start a directional sound once speech has ended.
         let batch = DirectionalBatch::inspect(&events, id);
         if let Some(direction) = &mut self.live_cue {
-            direction.saw_range |= batch.saw_range;
+            direction.saw_range |= batch.last_range.is_some();
         }
         for event in events {
             if !batch.ended
@@ -1144,7 +1138,15 @@ impl<'a> State<'a> {
                 && native_id == id
                 && length != 0
             {
-                self.play_live_cue(id, start);
+                if batch.last_range == Some(start) {
+                    self.play_live_cue(id, start);
+                } else if let Some(cue) = &mut self.live_cue
+                    && cue.playback == DirectionPlayback::Pending
+                    && (cue.cue != SoundCue::Link || cue.offset == start)
+                {
+                    // The matching word has already passed. Keep the spoken fallback.
+                    cue.playback = DirectionPlayback::Failed;
+                }
             }
             self.handle_native_event(event, true);
         }
@@ -1162,29 +1164,14 @@ impl<'a> State<'a> {
         if let Some(direction) = &mut self.live_cue
             && direction.native_id == id
             && direction.playback == DirectionPlayback::Pending
-            && (direction.cue != SoundCue::Link
-                || self.active.as_ref().is_some_and(|active| {
-                    let offset = active.native_base.saturating_add(word_start);
-                    active
-                        .cues
-                        .binary_search_by_key(&offset, |cue| cue.offset)
-                        .is_ok()
-                }))
+            && (direction.cue != SoundCue::Link || direction.offset == word_start)
             && self.tts.is_speaking().unwrap_or(false)
         {
             match self.prepared_cues.play(direction.cue) {
                 Ok(()) => {
                     direction.playback = DirectionPlayback::Played;
                     if let Some(active) = &mut self.active {
-                        if direction.cue == SoundCue::Link {
-                            let played = active.native_base + word_start;
-                            active.cues.retain(|cue| cue.offset != played);
-                            if !active.cues.is_empty() {
-                                direction.playback = DirectionPlayback::Pending;
-                            }
-                        } else {
-                            active.cues.retain(|cue| cue.cue == SoundCue::Link);
-                        }
+                        active.cues.clear();
                     }
                     if let Some(key) = direction.cache_key.take() {
                         self.readback_cache.request(key);
@@ -1577,16 +1564,9 @@ impl<'a> State<'a> {
         {
             self.readback_cache.request(key);
         }
-        let labels = if direction.cue == SoundCue::Link {
-            std::iter::repeat_n(direction.cue.spoken_label(), active.cues.len())
-                .collect::<Vec<_>>()
-                .join(" ")
-        } else {
-            direction.cue.spoken_label().to_owned()
-        };
         let id = self
             .tts
-            .speak(&labels, false)?
+            .speak(direction.cue.spoken_label(), false)?
             .ok_or(TtsError::OperationFailed("identify spoken directional cue"))?;
         active.native_id = Some(id);
         active.direction_label = Some(direction.cue);
@@ -2010,11 +1990,23 @@ mod tests {
         };
 
         let live = DirectionalBatch::inspect(&[range, NativeEvent::Completed(unrelated)], id);
-        assert!(live.saw_range && !live.ended);
+        assert!(live.last_range.is_some() && !live.ended);
+        let later = NativeEvent::Range {
+            id,
+            start: 4,
+            length: 2,
+        };
+        let last = NativeEvent::Range {
+            id,
+            start: 7,
+            length: 3,
+        };
+        let queued = DirectionalBatch::inspect(&[range, later, last], id);
+        assert_eq!(queued.last_range, Some(7));
         let coalesced = DirectionalBatch::inspect(&[range, NativeEvent::Completed(id)], id);
-        assert!(coalesced.saw_range && coalesced.ended);
+        assert!(coalesced.last_range.is_some() && coalesced.ended);
         let absent = DirectionalBatch::inspect(&[NativeEvent::Completed(id)], id);
-        assert!(!absent.saw_range && absent.ended);
+        assert!(!absent.last_range.is_some() && absent.ended);
         assert!(DirectionPlayback::Pending.needs_label(true));
         assert!(DirectionPlayback::Failed.needs_label(true));
         assert!(!DirectionPlayback::Played.needs_label(true));
@@ -2024,9 +2016,9 @@ mod tests {
         // A coalesced range or failed audio output on A does not disable
         // its voice's live route when B reports a usable range.
         for playback in [DirectionPlayback::Pending, DirectionPlayback::Failed] {
-            assert!(!playback.shows_missing_word_ranges(coalesced.saw_range));
+            assert!(!playback.shows_missing_word_ranges(coalesced.last_range.is_some()));
         }
-        assert!(DirectionPlayback::Pending.shows_missing_word_ranges(absent.saw_range));
+        assert!(DirectionPlayback::Pending.shows_missing_word_ranges(absent.last_range.is_some()));
     }
 
     #[cfg(target_vendor = "apple")]

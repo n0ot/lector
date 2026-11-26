@@ -796,16 +796,17 @@ impl ReviewView {
         if self.kind != ViewKind::Review || previous == Some(self.cursor) {
             return;
         }
-        let mut speech = self.document.cursor_feedback(previous, self.cursor);
-        if character_motion
-            && speech.indentation.is_none()
+        let speech = if character_motion
             && previous.is_some_and(|p| self.document.left_review_link(p, self.cursor))
         {
-            if speech.cue == Some(crate::speech::protocol::SoundCue::Blank) {
-                speech.text.clear();
+            crate::application_accessibility::ApplicationAccessibilitySpeech {
+                text: self.document.cell_text(self.cursor).into(),
+                cue: Some(crate::speech::protocol::SoundCue::LinkExit),
+                ..Default::default()
             }
-            speech.cue = Some(crate::speech::protocol::SoundCue::LinkExit);
-        }
+        } else {
+            self.document.cursor_feedback(previous, self.cursor)
+        };
         self.view.queue_internal_speech(speech);
     }
 
