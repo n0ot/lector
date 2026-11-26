@@ -52,13 +52,22 @@ fn line_read_with_cue(
     view: &mut View,
     mut cue: Option<SoundCue>,
 ) -> Result<CommandResult> {
+    let at_boundary = cue.is_some();
     let row = view.review_cursor_position().0;
     if let Some(level) = sr.review_cursor_indentation_change(view) {
         sr.speak_review_readback(&format!("indent {level}"), &[], cue.take())?;
     }
-    let (line, links) = view.line_with_links(row);
-    let readable = !line.trim().is_empty() || !links.is_empty();
-    sr.speak_review_readback(if readable { &line } else { "" }, &links, cue)?;
+    let (line, mut links) = view.line_with_links(row);
+    let text = if !line.trim().is_empty() || (at_boundary && !links.is_empty()) {
+        line.as_str()
+    } else if at_boundary {
+        ""
+    } else {
+        // Whitespace links still mark the destination, even on an empty row.
+        crate::terminal::trim_linked_text(&line, &mut links);
+        "blank"
+    };
+    sr.speak_review_readback(text, &links, cue)?;
     Ok(CommandResult::Handled)
 }
 
@@ -360,6 +369,7 @@ mod tests {
         assert_eq!(
             cues.borrow().as_slice(),
             [
+                ("blank".into(), SpeechCues::None),
                 ("top".into(), SpeechCues::Standalone(SoundCue::Top)),
                 ("bottom".into(), SpeechCues::Standalone(SoundCue::Bottom)),
                 (
@@ -408,7 +418,11 @@ mod tests {
         let mut view = View::new(2, 12);
         view.process_changes(b"entry");
         line_next(&mut sr, &mut view, false).unwrap();
-        assert!(submissions.borrow().is_empty());
+        assert_eq!(
+            submissions.borrow().as_slice(),
+            [("blank".into(), SpeechCues::None)]
+        );
+        submissions.borrow_mut().clear();
 
         line_next(&mut sr, &mut view, false).unwrap();
         character_read(&mut sr, &view).unwrap();
@@ -486,14 +500,47 @@ mod tests {
     }
 
     #[test]
-    fn line_read_preserves_renderer_padding_as_silence() {
+    fn line_read_announces_whitespace_only_rows() {
         let (mut sr, output) = screen_reader();
         let mut view = View::new(1, 8);
         view.process_changes(b"        ");
 
         line_read(&mut sr, &mut view).unwrap();
 
-        assert!(output.borrow().is_empty());
+        assert_eq!(output.borrow().as_slice(), ["blank"]);
+    }
+
+    #[test]
+    fn blank_line_keeps_its_whitespace_link_announcement() {
+        let (mut sr, output) = screen_reader();
+        sr.speech_mut().set_tones(false);
+        let mut view = View::new(2, 8);
+        view.process_changes(b"\r\n   \x1b]8;;https://example.invalid\x1b\\ \x1b]8;;\x1b\\");
+        view.set_review_cursor_position((0, 0));
+        line_next(&mut sr, &mut view, false).unwrap();
+        assert_eq!(output.borrow().as_slice(), ["link blank"]);
+    }
+
+    #[test]
+    fn only_review_navigation_announces_blank_destinations() {
+        for tones in [true, false] {
+            let (mut sr, output) = screen_reader();
+            sr.speech_mut().set_tones(tones);
+            let mut view = View::new(3, 8);
+            view.process_changes(b"row");
+            view.finalize_changes(0);
+            view.process_changes(b"\x1b[2;1H");
+            sr.track_cursor(&mut view).unwrap();
+            view.finalize_changes(1);
+            view.process_changes(b"\x1b[C");
+            sr.track_cursor(&mut view).unwrap();
+            assert!(output.borrow().is_empty());
+
+            view.set_review_cursor_position((0, 0));
+            line_next(&mut sr, &mut view, false).unwrap();
+            character_next(&mut sr, &mut view).unwrap();
+            assert_eq!(output.borrow().as_slice(), ["blank", "blank"]);
+        }
     }
 
     #[test]
@@ -527,7 +574,7 @@ mod tests {
         view.set_review_cursor_position((0, 0));
         line_next(&mut sr, &mut view, false).unwrap();
         assert_eq!(view.review_cursor_position(), (1, 0));
-        assert!(output.borrow().is_empty());
+        assert_eq!(output.borrow().as_slice(), ["blank"]);
     }
 
     #[test]

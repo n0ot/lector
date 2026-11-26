@@ -7,7 +7,9 @@ server.
 ## Sound cues
 
 Lector plays short cues at review cursor boundaries and when inspecting a
-blank character. Direction cues play over the spoken readback when the command
+blank character. Moving the review cursor onto a blank line says “blank.”
+With spoken feedback, character navigation also says “blank” on an empty cell.
+Direction cues play over the spoken readback when the command
 also reads text. At a left or right boundary on a blank character, a compatible
 host plays the boundary and blank cues together. Lector identifies an OSC 8
 hyperlink at the start of its text or when you start reading within it.
