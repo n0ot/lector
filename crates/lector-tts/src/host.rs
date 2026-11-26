@@ -2006,7 +2006,7 @@ mod tests {
         let coalesced = DirectionalBatch::inspect(&[range, NativeEvent::Completed(id)], id);
         assert!(coalesced.last_range.is_some() && coalesced.ended);
         let absent = DirectionalBatch::inspect(&[NativeEvent::Completed(id)], id);
-        assert!(!absent.last_range.is_some() && absent.ended);
+        assert!(absent.last_range.is_none() && absent.ended);
         assert!(DirectionPlayback::Pending.needs_label(true));
         assert!(DirectionPlayback::Failed.needs_label(true));
         assert!(!DirectionPlayback::Played.needs_label(true));
