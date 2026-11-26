@@ -119,7 +119,7 @@ struct ActiveUtterance {
     #[cfg(target_vendor = "apple")]
     direction_label: Option<SoundCue>,
     #[cfg(target_vendor = "apple")]
-    deferred_link_label: bool,
+    deferred_label: Option<SoundCue>,
     /// UTF-8 offset represented by byte zero of the current native utterance.
     native_base: usize,
     current_word: usize,
@@ -147,12 +147,8 @@ impl ActiveUtterance {
                 && cue.playback != DirectionPlayback::Played
                 && self.native_base + cue.offset < self.current_word
         }) {
-            self.deferred_link_label = true;
+            self.deferred_label = Some(SoundCue::Link);
         }
-    }
-
-    fn take_deferred_label(&mut self) -> Option<SoundCue> {
-        std::mem::take(&mut self.deferred_link_label).then_some(SoundCue::Link)
     }
 
     fn cues_from(&self, base: usize) -> Vec<SoundCueAt> {
@@ -646,7 +642,7 @@ impl<'a> State<'a> {
             #[cfg(target_vendor = "apple")]
             direction_label: None,
             #[cfg(target_vendor = "apple")]
-            deferred_link_label: false,
+            deferred_label: None,
             native_base: 0,
             current_word: 0,
             next_sequence: 0,
@@ -1564,7 +1560,7 @@ impl<'a> State<'a> {
     ) -> Result<bool, TtsError> {
         if allow_cue
             && !active.paused
-            && let Some(cue) = active.take_deferred_label()
+            && let Some(cue) = active.deferred_label.take()
         {
             return self.speak_completion_label(active, cue);
         }
@@ -2073,7 +2069,7 @@ mod tests {
             }],
             fallback: None,
             direction_label: None,
-            deferred_link_label: false,
+            deferred_label: None,
             native_base: 0,
             current_word: 4,
             next_sequence: 0,
@@ -2091,10 +2087,10 @@ mod tests {
             cache_key: None,
         };
         active.remember_missed_link(Some(&live));
-        assert!(active.cues_from(active.current_word).is_empty());
+        assert_eq!(active.cues_from(active.current_word), []);
         active.remember_missed_link(None);
-        assert_eq!(active.take_deferred_label(), Some(SoundCue::Link));
-        assert_eq!(active.take_deferred_label(), None);
+        assert_eq!(active.deferred_label.take(), Some(SoundCue::Link));
+        assert_eq!(active.deferred_label.take(), None);
     }
 
     #[cfg(target_vendor = "apple")]
