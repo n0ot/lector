@@ -726,7 +726,7 @@ impl State {
     }
 
     fn stop(&mut self, id: &UtteranceId) -> Result<(), RpcError> {
-        self.advance_for_control();
+        self.advance_for_control(id);
         let Some(active) = self.active.take() else {
             #[cfg(target_vendor = "apple")]
             self.stop_live_direction();
@@ -753,7 +753,7 @@ impl State {
     }
 
     fn pause(&mut self, id: &UtteranceId) -> Result<PauseResult, RpcError> {
-        self.advance_for_control();
+        self.advance_for_control(id);
         if !self.capabilities.supports_resumable_pause() {
             return Err(RpcError::method_not_found("speech.pause"));
         }
@@ -949,7 +949,15 @@ impl State {
         }
     }
 
-    fn advance_for_control(&mut self) {
+    fn advance_for_control(&mut self, id: &UtteranceId) {
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|active| &active.logical_id != id)
+        {
+            self.advance();
+            return;
+        }
         // Keep progress current, but a stop or pause that arrived during
         // rendering must not start a player even if rendering just finished.
         #[cfg(target_vendor = "apple")]
@@ -1336,9 +1344,22 @@ impl State {
                 #[cfg(target_vendor = "apple")]
                 let mut active = active;
                 #[cfg(target_vendor = "apple")]
-                if self.complete_live_direction(&mut active, allow_cue) {
-                    self.active = Some(active);
-                    return;
+                match self.complete_live_direction(&mut active, allow_cue) {
+                    Ok(true) => {
+                        self.active = Some(active);
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        self.emit_for(
+                            &active,
+                            "ended",
+                            None,
+                            Some("failed"),
+                            Some(error.to_string()),
+                        );
+                        return;
+                    }
                 }
                 self.emit_for(&active, "ended", None, Some("completed"), None);
             }
@@ -1355,42 +1376,41 @@ impl State {
     }
 
     #[cfg(target_vendor = "apple")]
-    fn complete_live_direction(&mut self, active: &mut ActiveUtterance, allow_cue: bool) -> bool {
+    fn complete_live_direction(
+        &mut self,
+        active: &mut ActiveUtterance,
+        allow_cue: bool,
+    ) -> Result<bool, TtsError> {
         if !self.live_direction.as_ref().is_some_and(|direction| {
             direction.playback != DirectionPlayback::Played
                 && Some(direction.native_id) == active.native_id
         }) {
-            return false;
+            return Ok(false);
         }
         let direction = self
             .live_direction
             .take()
             .expect("unfinished direction checked");
+        if !direction.playback.needs_label(allow_cue && !active.paused) {
+            return Ok(false);
+        }
         // A missed onset establishes that this voice/text path cannot reliably
         // start a live cue. Future requests can use prepared PCM if available
         // or speak the label with the original text.
         self.directional_word_ranges = false;
-        if !direction.playback.needs_label(allow_cue && !active.paused) {
-            return false;
-        }
         if direction.saw_range
             && let Some(key) = direction.cache_key
         {
             self.readback_cache.request(key);
         }
-        match self.tts.speak(direction.cue.spoken_label(), false) {
-            Ok(Some(id)) => {
-                active.native_id = Some(id);
-                active.direction_label = Some(direction.cue);
-                active.cues.clear();
-                true
-            }
-            Ok(None) => false,
-            Err(error) => {
-                eprintln!("lector-tts: {error}; unable to speak cue label");
-                false
-            }
-        }
+        let id = self
+            .tts
+            .speak(direction.cue.spoken_label(), false)?
+            .ok_or(TtsError::OperationFailed("identify spoken directional cue"))?;
+        active.native_id = Some(id);
+        active.direction_label = Some(direction.cue);
+        active.cues.clear();
+        Ok(true)
     }
 
     fn emit_for(
