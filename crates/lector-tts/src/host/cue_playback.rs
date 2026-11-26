@@ -52,6 +52,7 @@ const MAX_CACHED_TEXT_BYTES: usize = 256;
 // two channels, bounding retained PCM to ~15 MiB across four entries.
 const MAX_CACHED_SAMPLES: usize = 480_000;
 const MAX_CACHED_SECONDS: usize = 10;
+const MAX_LIVE_LINK_PLAYERS: usize = 4;
 const STANDALONE_CUES: [SoundCue; 7] = [
     SoundCue::Top,
     SoundCue::Bottom,
@@ -84,6 +85,33 @@ struct CuePlayer {
     prepared: Cell<bool>,
 }
 
+impl CuePlayer {
+    fn prepare(&self, volume: f32) -> Result<(), Error> {
+        unsafe {
+            self.audio.setVolume(volume);
+            if !self.prepared.get() {
+                let prepared = self.audio.prepareToPlay();
+                self.prepared.set(prepared);
+                if !prepared {
+                    return Err(Error::OperationFailed("prepare sound cue"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn play(&self) -> Result<(), Error> {
+        unsafe {
+            self.audio.setCurrentTime(0.0);
+            if !self.audio.play() {
+                self.prepared.set(false);
+                return Err(Error::OperationFailed("play sound cue"));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub(super) struct PreparedCues {
     players: Vec<CuePlayer>,
@@ -96,6 +124,10 @@ impl PreparedCues {
     pub(super) fn new(volume: f32) -> Self {
         let players = STANDALONE_CUES
             .into_iter()
+            .chain(std::iter::repeat_n(
+                SoundCue::Link,
+                MAX_LIVE_LINK_PLAYERS - 1,
+            ))
             .filter_map(|cue| {
                 let player = new_player(cue.wav(), volume).ok()?;
                 Some(CuePlayer {
@@ -189,30 +221,22 @@ impl PreparedCues {
     }
 
     pub(super) fn prepare(&self, cue: SoundCue, volume: f32) -> Result<(), Error> {
-        let player = self.player(cue)?;
-        unsafe {
-            player.audio.setVolume(volume);
-            if !player.prepared.get() {
-                let prepared = player.audio.prepareToPlay();
-                player.prepared.set(prepared);
-                if !prepared {
-                    return Err(Error::OperationFailed("prepare sound cue"));
-                }
-            }
-        }
-        Ok(())
+        self.player(cue)?.prepare(volume)
     }
 
     pub(super) fn play(&self, cue: SoundCue) -> Result<(), Error> {
-        let player = self.player(cue)?;
-        unsafe {
-            player.audio.setCurrentTime(0.0);
-            if !player.audio.play() {
-                player.prepared.set(false);
-                return Err(Error::OperationFailed("play sound cue"));
-            }
-        }
-        Ok(())
+        self.player(cue)?.play()
+    }
+
+    pub(super) fn play_link(&self, volume: f32) -> Result<(), Error> {
+        // Use a free player so a new onset cannot rewind an audible tail.
+        let player = self
+            .players
+            .iter()
+            .find(|player| player.cue == SoundCue::Link && !unsafe { player.audio.isPlaying() })
+            .ok_or(Error::OperationFailed("use occupied link cue players"))?;
+        player.prepare(volume)?;
+        player.play()
     }
 
     pub(super) fn clock_is_advancing(&self, cue: SoundCue) -> bool {
@@ -222,10 +246,10 @@ impl PreparedCues {
     }
 
     pub(super) fn stop(&self, cue: SoundCue) {
-        if let Ok(player) = self.player(cue)
-            && unsafe { player.audio.isPlaying() }
-        {
-            unsafe { player.audio.pause() };
+        for player in self.players.iter().filter(|player| player.cue == cue) {
+            if unsafe { player.audio.isPlaying() } {
+                unsafe { player.audio.pause() };
+            }
         }
     }
 }

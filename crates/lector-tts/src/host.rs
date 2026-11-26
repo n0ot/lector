@@ -117,9 +117,11 @@ struct ActiveUtterance {
     #[cfg(target_vendor = "apple")]
     fallback: Option<SpokenFallback>,
     #[cfg(target_vendor = "apple")]
-    direction_label: Option<SoundCue>,
+    completion_label: Option<String>,
     #[cfg(target_vendor = "apple")]
-    deferred_label: Option<SoundCue>,
+    live_links: Option<LiveLinks>,
+    #[cfg(target_vendor = "apple")]
+    missed_links: usize,
     /// UTF-8 offset represented by byte zero of the current native utterance.
     native_base: usize,
     current_word: usize,
@@ -140,14 +142,11 @@ impl ActiveUtterance {
 
 #[cfg(target_vendor = "apple")]
 impl ActiveUtterance {
-    fn remember_missed_link(&mut self, live: Option<&LiveCue>) {
-        if live.is_some_and(|cue| {
-            Some(cue.native_id) == self.native_id
-                && cue.cue == SoundCue::Link
-                && cue.playback != DirectionPlayback::Played
-                && self.native_base + cue.offset < self.current_word
-        }) {
-            self.deferred_label = Some(SoundCue::Link);
+    fn save_live_links(&mut self) {
+        if let Some(mut links) = self.live_links.take() {
+            links.skip_before(&self.cues, self.current_word);
+            self.missed_links += links.missed;
+            self.cues.drain(..links.next);
         }
     }
 
@@ -241,16 +240,50 @@ impl DirectionPlayback {
 }
 
 #[cfg(target_vendor = "apple")]
-fn is_link_word_onset(text: &str, offset: usize) -> bool {
+fn have_live_link_onsets(text: &str, cues: &[SoundCueAt]) -> bool {
     use unicode_segmentation::UnicodeSegmentation;
-    text.unicode_word_indices()
-        .take_while(|(start, _)| *start <= offset)
-        .any(|(start, _)| start == offset)
+    let mut words = text
+        .unicode_word_indices()
+        .map(|(offset, _)| offset)
+        .peekable();
+    !cues.is_empty()
+        && cues.iter().all(|cue| {
+            if cue.cue != SoundCue::Link {
+                return false;
+            }
+            while words.next_if(|offset| *offset < cue.offset).is_some() {}
+            words.next_if_eq(&cue.offset).is_some()
+        })
+}
+
+#[cfg(target_vendor = "apple")]
+#[derive(Default)]
+struct LiveLinks {
+    next: usize,
+    missed: usize,
+    saw_range: bool,
+}
+
+#[cfg(target_vendor = "apple")]
+impl LiveLinks {
+    fn skip_before(&mut self, cues: &[SoundCueAt], offset: usize) {
+        let skipped = cues[self.next..].partition_point(|cue| cue.offset < offset);
+        self.next += skipped;
+        self.missed += skipped;
+    }
+
+    fn take_onset(&mut self, cues: &[SoundCueAt], offset: usize, current: bool) -> bool {
+        self.skip_before(cues, offset);
+        if current && cues.get(self.next).is_some_and(|cue| cue.offset == offset) {
+            self.next += 1;
+            return true;
+        }
+        false
+    }
 }
 
 #[cfg(target_vendor = "apple")]
 struct LiveCue {
-    offset: usize,
     native_id: NativeUtteranceId,
     cue: SoundCue,
     playback: DirectionPlayback,
@@ -261,13 +294,13 @@ struct LiveCue {
 
 #[cfg(target_vendor = "apple")]
 #[derive(Default)]
-struct DirectionalBatch {
+struct NativeWordBatch {
     last_range: Option<usize>,
     ended: bool,
 }
 
 #[cfg(target_vendor = "apple")]
-impl DirectionalBatch {
+impl NativeWordBatch {
     fn inspect(events: &[NativeEvent], id: NativeUtteranceId) -> Self {
         let mut batch = Self::default();
         for event in events {
@@ -630,7 +663,7 @@ impl<'a> State<'a> {
             ));
         }
         #[cfg(target_vendor = "apple")]
-        self.stop_live_cue();
+        self.stop_live_cues();
         let mut active = ActiveUtterance {
             logical_id: id,
             native_id: None,
@@ -640,9 +673,11 @@ impl<'a> State<'a> {
             #[cfg(target_vendor = "apple")]
             fallback: None,
             #[cfg(target_vendor = "apple")]
-            direction_label: None,
+            completion_label: None,
             #[cfg(target_vendor = "apple")]
-            deferred_label: None,
+            live_links: None,
+            #[cfg(target_vendor = "apple")]
+            missed_links: 0,
             native_base: 0,
             current_word: 0,
             next_sequence: 0,
@@ -673,8 +708,8 @@ impl<'a> State<'a> {
         })?;
         #[cfg(target_vendor = "apple")]
         {
-            if let Some(cue) = active.direction_label {
-                return classify_backend_attempt(self.tts.speak(cue.spoken_label(), false));
+            if let Some(label) = &active.completion_label {
+                return classify_backend_attempt(self.tts.speak(label, false));
             }
             if let Some(fallback) = &mut active.fallback {
                 self.readback_cache.retain_request(None);
@@ -690,15 +725,29 @@ impl<'a> State<'a> {
             if text.is_empty() && !cues.is_empty() {
                 return self.start_standalone_cue(active, base, &cues);
             }
-            // Multiple overlays share a PCM clock so overlapping cue tails survive.
             if let [cue] = cues.as_slice()
-                && !text.is_empty()
-                && (cue.cue != SoundCue::Link
-                    || (self.live_word_ranges && is_link_word_onset(text, cue.offset)))
+                && cue.cue != SoundCue::Link
             {
                 return self.start_live_cue(active, base, cue);
             }
             self.readback_cache.retain_request(None);
+            if self.live_word_ranges && have_live_link_onsets(text, &cues) {
+                let volume = self
+                    .tts
+                    .get_volume()
+                    .map_err(|error| RpcError::internal_error(error.to_string()))?;
+                if let Err(error) = self.prepared_cues.prepare(SoundCue::Link, volume) {
+                    eprintln!("lector-tts: {error}; speaking cue labels");
+                    return self.start_spoken_fallback(active, base, &cues);
+                }
+                let result = classify_backend_attempt(self.tts.speak(text, false))?;
+                if matches!(result, BackendAttempt::Completed(Some(_))) {
+                    active.cues.retain(|cue| cue.offset >= base);
+                    active.live_links = Some(LiveLinks::default());
+                    active.native_base = base;
+                }
+                return Ok(result);
+            }
             if !cues.is_empty() {
                 match CuePlayback::new(
                     &self.tts,
@@ -779,11 +828,7 @@ impl<'a> State<'a> {
         // host can inspect and limit peaks only on the rendered PCM route.
         let result = classify_backend_attempt(self.tts.speak(text, false))?;
         if let BackendAttempt::Completed(Some(native_id)) = result {
-            if cue.cue == SoundCue::Link {
-                active.cues.retain(|cue| cue.offset >= base);
-            }
             self.live_cue = Some(LiveCue {
-                offset: cue.offset,
                 native_id,
                 cue: cue.cue,
                 playback: DirectionPlayback::Pending,
@@ -855,7 +900,7 @@ impl<'a> State<'a> {
         }
         let Some(active) = self.active.take() else {
             #[cfg(target_vendor = "apple")]
-            self.stop_live_cue();
+            self.stop_live_cues();
             return Ok(());
         };
         if active.logical_id != *id {
@@ -907,14 +952,14 @@ impl<'a> State<'a> {
         }
         let position = active.current_word;
         active.paused = true;
-        #[cfg(target_vendor = "apple")]
-        active.remember_missed_link(self.live_cue.as_ref());
         let pause = self.pause_native(&active);
         if let Err(error) = pause {
             active.paused = false;
             self.active = Some(active);
             return Err(error);
         }
+        #[cfg(target_vendor = "apple")]
+        active.save_live_links();
         self.active = Some(active);
         self.emit_active(
             "paused",
@@ -946,7 +991,7 @@ impl<'a> State<'a> {
     /// synthesizer replacement.
     fn stop_native(&mut self, stopping: Option<NativeUtteranceId>) -> Result<(), RpcError> {
         #[cfg(target_vendor = "apple")]
-        self.stop_live_cue();
+        self.stop_live_cues();
         #[cfg(target_vendor = "apple")]
         if self
             .cue_playback
@@ -1125,6 +1170,15 @@ impl<'a> State<'a> {
         let _ = allow_cue;
         #[cfg(target_vendor = "apple")]
         if allow_cue
+            && let Some(active) = &self.active
+            && active.live_links.is_some()
+            && let Some(id) = active.native_id
+        {
+            self.drain_live_link_events(id);
+            return;
+        }
+        #[cfg(target_vendor = "apple")]
+        if allow_cue
             && let Some(direction) = &self.live_cue
             && direction.playback == DirectionPlayback::Pending
         {
@@ -1137,11 +1191,39 @@ impl<'a> State<'a> {
     }
 
     #[cfg(target_vendor = "apple")]
+    fn drain_live_link_events(&mut self, id: NativeUtteranceId) {
+        let events: Vec<_> = self.native_events.try_iter().collect();
+        let batch = NativeWordBatch::inspect(&events, id);
+        if let Some(start) = batch.last_range
+            && let Some(active) = &mut self.active
+            && let Some(links) = &mut active.live_links
+            && active
+                .text
+                .is_char_boundary(active.native_base.saturating_add(start))
+            && links.take_onset(&active.cues, active.native_base + start, !batch.ended)
+        {
+            if self.tts.is_speaking().unwrap_or(false)
+                && let Ok(volume) = self.tts.get_volume()
+                && self.prepared_cues.play_link(volume).is_ok()
+            {
+                if let Some(log) = &self.cue_event_log {
+                    write_speech_event(log, "link-cue-begin");
+                }
+            } else {
+                links.missed += 1;
+            }
+        }
+        for event in events {
+            self.handle_native_event(event, true);
+        }
+    }
+
+    #[cfg(target_vendor = "apple")]
     fn drain_live_cue_events(&mut self, id: NativeUtteranceId) {
         let events: Vec<_> = self.native_events.try_iter().collect();
         // A short utterance can report a word and completion between ticks.
         // Never start a directional sound once speech has ended.
-        let batch = DirectionalBatch::inspect(&events, id);
+        let batch = NativeWordBatch::inspect(&events, id);
         if let Some(direction) = &mut self.live_cue {
             direction.saw_range |= batch.last_range.is_some();
         }
@@ -1156,10 +1238,9 @@ impl<'a> State<'a> {
                 && length != 0
             {
                 if batch.last_range == Some(start) {
-                    self.play_live_cue(id, start);
+                    self.play_live_cue(id);
                 } else if let Some(cue) = &mut self.live_cue
                     && cue.playback == DirectionPlayback::Pending
-                    && (cue.cue != SoundCue::Link || cue.offset == start)
                 {
                     // The matching word has already passed. Keep the spoken fallback.
                     cue.playback = DirectionPlayback::Failed;
@@ -1170,18 +1251,18 @@ impl<'a> State<'a> {
     }
 
     #[cfg(target_vendor = "apple")]
-    fn stop_live_cue(&mut self) {
+    fn stop_live_cues(&mut self) {
         if let Some(direction) = self.live_cue.take() {
             self.prepared_cues.stop(direction.cue);
         }
+        self.prepared_cues.stop(SoundCue::Link);
     }
 
     #[cfg(target_vendor = "apple")]
-    fn play_live_cue(&mut self, id: NativeUtteranceId, word_start: usize) {
+    fn play_live_cue(&mut self, id: NativeUtteranceId) {
         if let Some(direction) = &mut self.live_cue
             && direction.native_id == id
             && direction.playback == DirectionPlayback::Pending
-            && (direction.cue != SoundCue::Link || direction.offset == word_start)
             && self.tts.is_speaking().unwrap_or(false)
         {
             match self.prepared_cues.play(direction.cue) {
@@ -1471,7 +1552,7 @@ impl<'a> State<'a> {
             }
             #[cfg(target_vendor = "apple")]
             NativeEvent::Range { start, length, .. } => {
-                if active.direction_label.is_some() {
+                if active.completion_label.is_some() {
                     return;
                 }
                 let start = if let Some(fallback) = &mut active.fallback {
@@ -1493,9 +1574,13 @@ impl<'a> State<'a> {
                         .live_cue
                         .as_ref()
                         .is_some_and(|direction| direction.playback != DirectionPlayback::Played);
-                    active.cues.retain(|cue| {
-                        direction_pending || cue.offset >= position.saturating_add(length)
-                    });
+                    if let Some(links) = &mut active.live_links {
+                        links.saw_range |= length != 0;
+                    } else if !direction_pending {
+                        active
+                            .cues
+                            .retain(|cue| cue.offset >= position.saturating_add(length));
+                    }
                     self.emit_active(
                         "progress",
                         Some(TextPosition::Utf8ByteOffset { offset: position }),
@@ -1545,7 +1630,7 @@ impl<'a> State<'a> {
                     return;
                 }
                 #[cfg(target_vendor = "apple")]
-                self.stop_live_cue();
+                self.stop_live_cues();
                 let active = self.active.take().expect("active checked");
                 self.emit_for(&active, "ended", None, Some("cancelled"), None);
             }
@@ -1558,11 +1643,20 @@ impl<'a> State<'a> {
         active: &mut ActiveUtterance,
         allow_cue: bool,
     ) -> Result<bool, TtsError> {
-        if allow_cue
-            && !active.paused
-            && let Some(cue) = active.deferred_label.take()
-        {
-            return self.speak_completion_label(active, cue);
+        if let Some(links) = active.live_links.take() {
+            if allow_cue && !active.paused && !links.saw_range {
+                self.live_word_ranges = false;
+            }
+            active.missed_links += links.missed + active.cues.len() - links.next;
+        }
+        if allow_cue && !active.paused && active.missed_links > 0 {
+            let total = std::mem::take(&mut active.missed_links);
+            let label = if total == 1 {
+                "link".into()
+            } else {
+                format!("{total} links")
+            };
+            return self.speak_completion_label(active, label);
         }
         if !self.live_cue.as_ref().is_some_and(|direction| {
             direction.playback != DirectionPlayback::Played
@@ -1587,21 +1681,21 @@ impl<'a> State<'a> {
         {
             self.readback_cache.request(key);
         }
-        self.speak_completion_label(active, direction.cue)
+        self.speak_completion_label(active, direction.cue.spoken_label().into())
     }
 
     #[cfg(target_vendor = "apple")]
     fn speak_completion_label(
         &mut self,
         active: &mut ActiveUtterance,
-        cue: SoundCue,
+        label: String,
     ) -> Result<bool, TtsError> {
         let id = self
             .tts
-            .speak(cue.spoken_label(), false)?
-            .ok_or(TtsError::OperationFailed("identify spoken directional cue"))?;
+            .speak(&label, false)?
+            .ok_or(TtsError::OperationFailed("identify spoken cue fallback"))?;
         active.native_id = Some(id);
-        active.direction_label = Some(cue);
+        active.completion_label = Some(label);
         active.cues.clear();
         Ok(true)
     }
@@ -2012,7 +2106,7 @@ mod tests {
     #[cfg(target_vendor = "apple")]
     #[test]
     fn late_or_missing_native_ranges_keep_the_direction_pending_for_spoken_fallback() {
-        use super::{DirectionPlayback, DirectionalBatch, NativeEvent, NativeUtteranceId};
+        use super::{DirectionPlayback, NativeEvent, NativeUtteranceId, NativeWordBatch};
         let id = NativeUtteranceId::AvFoundation(1);
         let unrelated = NativeUtteranceId::AvFoundation(2);
         let range = NativeEvent::Range {
@@ -2021,7 +2115,7 @@ mod tests {
             length: 3,
         };
 
-        let live = DirectionalBatch::inspect(&[range, NativeEvent::Completed(unrelated)], id);
+        let live = NativeWordBatch::inspect(&[range, NativeEvent::Completed(unrelated)], id);
         assert!(live.last_range.is_some() && !live.ended);
         let later = NativeEvent::Range {
             id,
@@ -2033,11 +2127,11 @@ mod tests {
             start: 7,
             length: 3,
         };
-        let queued = DirectionalBatch::inspect(&[range, later, last], id);
+        let queued = NativeWordBatch::inspect(&[range, later, last], id);
         assert_eq!(queued.last_range, Some(7));
-        let coalesced = DirectionalBatch::inspect(&[range, NativeEvent::Completed(id)], id);
+        let coalesced = NativeWordBatch::inspect(&[range, NativeEvent::Completed(id)], id);
         assert!(coalesced.last_range.is_some() && coalesced.ended);
-        let absent = DirectionalBatch::inspect(&[NativeEvent::Completed(id)], id);
+        let absent = NativeWordBatch::inspect(&[NativeEvent::Completed(id)], id);
         assert!(absent.last_range.is_none() && absent.ended);
         assert!(DirectionPlayback::Pending.needs_label(true));
         assert!(DirectionPlayback::Failed.needs_label(true));
@@ -2055,42 +2149,57 @@ mod tests {
 
     #[cfg(target_vendor = "apple")]
     #[test]
-    fn resume_past_a_missed_link_preserves_one_completion_label() {
-        use super::{ActiveUtterance, DirectionPlayback, LiveCue, NativeUtteranceId};
+    fn live_links_skip_stale_onsets_and_keep_the_remaining_cue_on_pause() {
+        use super::{ActiveUtterance, LiveLinks, NativeUtteranceId, have_live_link_onsets};
         use crate::protocol::{SoundCue, SoundCueAt, UtteranceId};
-        let id = NativeUtteranceId::AvFoundation(1);
+        let text = "one two three four";
+        let cues = [0, 4, 8, 14].map(|offset| SoundCueAt {
+            cue: SoundCue::Link,
+            offset,
+        });
+        assert!(have_live_link_onsets(text, &cues));
+        assert!(!have_live_link_onsets(
+            text,
+            &[SoundCueAt {
+                cue: SoundCue::Link,
+                offset: 5
+            }]
+        ));
+        let mut links = LiveLinks::default();
+        // A batch with callbacks for "one" and then "two" can play only
+        // "two", and a repeated callback must not replay that cue.
+        assert!(links.take_onset(&cues, 4, true));
+        assert!(!links.take_onset(&cues, 4, true));
+        assert_eq!(links.missed, 1);
+        assert!(!links.take_onset(&cues, 8, false));
+
         let mut active = ActiveUtterance {
             logical_id: UtteranceId::new("fixture"),
-            native_id: Some(id),
-            text: "one two".into(),
-            cues: vec![SoundCueAt {
-                cue: SoundCue::Link,
-                offset: 0,
-            }],
+            native_id: Some(NativeUtteranceId::AvFoundation(1)),
+            text: text.into(),
+            cues: cues.to_vec(),
             fallback: None,
-            direction_label: None,
-            deferred_label: None,
+            completion_label: None,
+            live_links: Some(links),
+            missed_links: 0,
             native_base: 0,
-            current_word: 4,
+            current_word: 8,
             next_sequence: 0,
             awaiting_stop: false,
             started: true,
             paused: true,
         };
-        let live = LiveCue {
-            native_id: id,
-            offset: 0,
-            cue: SoundCue::Link,
-            playback: DirectionPlayback::Failed,
-            clock_logged: false,
-            saw_range: true,
-            cache_key: None,
-        };
-        active.remember_missed_link(Some(&live));
-        assert_eq!(active.cues_from(active.current_word), []);
-        active.remember_missed_link(None);
-        assert_eq!(active.deferred_label.take(), Some(SoundCue::Link));
-        assert_eq!(active.deferred_label.take(), None);
+        active.save_live_links();
+        active.save_live_links();
+        assert_eq!(active.missed_links, 1);
+        assert_eq!(
+            active
+                .cues_from(8)
+                .iter()
+                .map(|cue| cue.offset)
+                .collect::<Vec<_>>(),
+            [0, 6]
+        );
     }
 
     #[cfg(target_vendor = "apple")]

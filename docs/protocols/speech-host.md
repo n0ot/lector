@@ -251,9 +251,12 @@ the host can mix the cue into cached speech at the voice's original sample
 rate. On a stereo output, mono speech feeds both channels at the same
 level. Stereo speech keeps its original left and right samples. The host
 reduces this rendered mix only if its samples would exceed full scale.
-Core Audio handles conversion to the device sample rate. For a single word-aligned link,
-the macOS host uses live word callbacks to play the cue at the linked word.
-Multiple links share a rendered PCM timeline so their sounds can overlap.
+Core Audio handles conversion to the device sample rate. On an utterance
+with word-aligned links, macOS starts native speech directly and plays each
+cue at its word callback. A small pool of players allows cue tails to
+overlap. If a callback arrives after its word has passed or all cue players
+are busy, Lector reports the missed link after the readback. Other cue
+combinations use a rendered timeline with validated word positions.
 
 On Windows, the NVDA backend uses Controller Client v2 speech markers to
 trigger cues on the host machine. A worker waits for NVDA's synchronous

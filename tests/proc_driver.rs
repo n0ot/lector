@@ -584,6 +584,26 @@ mod native_speech {
                 .count(),
             2
         );
+        let accepted = host.rpc(
+            7,
+            "speech.speak",
+            serde_json::json!({
+                "utteranceId": "two-links",
+                "text": "Read these words and then those words.",
+                "cues": [{"cue":"link","offset":5}, {"cue":"link","offset":26}]
+            }),
+        );
+        assert_eq!(accepted["result"]["accepted"], true);
+        host.wait_for_completion("two-links");
+        // Only the live path logs these cue onsets. A rendered utterance
+        // would finish without either event.
+        assert_eq!(
+            fs::read_to_string(&event_log)
+                .unwrap()
+                .matches("link-cue-begin")
+                .count(),
+            4
+        );
         host.finish();
     }
 
