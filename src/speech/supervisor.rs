@@ -1081,20 +1081,27 @@ impl Driver for Supervisor {
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
+        match self.set_rate_option(rate)? {
+            SetOptionOutcome::Accepted => Ok(()),
+            SetOptionOutcome::Unsupported => Err(anyhow!(
+                "lector.o.speech.rate is unavailable: speech host does not support setting rate"
+            )),
+        }
+    }
+
+    fn set_rate_option(&mut self, rate: f32) -> DriverResult<SetOptionOutcome> {
         if !rate_is_normalized(rate) {
             return Err(anyhow!("speech rate must be between 0 and 100 inclusive"));
         }
         if !self.started {
             self.pending_rate = Some(rate);
-            return Ok(());
+            return Ok(SetOptionOutcome::Accepted);
         }
         if self.active.as_ref().is_some_and(|process| {
             !process.host.has_legacy_queue()
                 && !process.host.capabilities().settings.rate.can_write()
         }) {
-            return Err(anyhow!(
-                "lector.o.speech.rate is unavailable: speech host does not support setting rate"
-            ));
+            return Ok(SetOptionOutcome::Unsupported);
         }
         let mut actual = rate;
         self.call_host("set_rate", |host| {
@@ -1104,7 +1111,7 @@ impl Driver for Supervisor {
         self.desired_rate = actual;
         self.desired_rate_configured = true;
         self.option_state.rate = Some(actual);
-        Ok(())
+        Ok(SetOptionOutcome::Accepted)
     }
 
     fn option_state(&self) -> OptionState {

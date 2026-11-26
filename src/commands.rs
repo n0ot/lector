@@ -131,6 +131,8 @@ define_actions! {
     PauseSpeaking => ("pause speaking", "pause_speaking"),
     ResumeSpeaking => ("resume speaking", "resume_speaking"),
     CancelSpeaking => ("cancel speaking", "cancel_speaking"),
+    DecreaseSpeechRate => ("decrease speech rate", "decrease_speech_rate"),
+    IncreaseSpeechRate => ("increase speech rate", "increase_speech_rate"),
     ToggleAutoRead => ("toggle automatic reading", "toggle_auto_read"),
     ToggleSymbolLevel => ("cycle symbol level", "toggle_symbol_level"),
     ToggleStopSpeechOnFocusLoss => (
@@ -259,6 +261,8 @@ pub fn handle(
         Action::CancelSpeaking => system::cancel(sr),
         Action::ResumeSpeaking => system::resume(sr),
         Action::ToggleSpeaking => system::toggle_speaking(sr),
+        Action::DecreaseSpeechRate => system::adjust_speech_rate(sr, -system::SPEECH_RATE_STEP),
+        Action::IncreaseSpeechRate => system::adjust_speech_rate(sr, system::SPEECH_RATE_STEP),
         Action::RevLinePrev => review::line_previous(sr, view, false),
         Action::RevLineNext => review::line_next(sr, view, false),
         Action::RevLinePrevNonBlank => review::line_previous(sr, view, true),

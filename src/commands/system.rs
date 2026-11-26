@@ -1,5 +1,14 @@
 use super::{CommandResult, Result};
-use crate::{screen_reader::ScreenReader, view::View};
+use crate::{
+    screen_reader::ScreenReader,
+    speech::{
+        SetOptionOutcome,
+        protocol::{MAX_RATE, MIN_RATE},
+    },
+    view::View,
+};
+
+pub(super) const SPEECH_RATE_STEP: f32 = 5.0;
 
 pub(super) fn pause(sr: &mut ScreenReader) -> Result<CommandResult> {
     sr.pause_speaking()?;
@@ -18,6 +27,19 @@ pub(super) fn resume(sr: &mut ScreenReader) -> Result<CommandResult> {
 
 pub(super) fn toggle_speaking(sr: &mut ScreenReader) -> Result<CommandResult> {
     sr.toggle_speaking()?;
+    Ok(CommandResult::Handled)
+}
+
+pub(super) fn adjust_speech_rate(sr: &mut ScreenReader, adjustment: f32) -> Result<CommandResult> {
+    // Clear pending confirmations before the worker can apply the new rate.
+    sr.cancel_speaking()?;
+    let speech = sr.speech_mut();
+    let rate = (speech.get_rate() + adjustment).clamp(MIN_RATE, MAX_RATE);
+    let announcement = match speech.set_rate_option(rate)? {
+        SetOptionOutcome::Accepted => format!("{rate} percent"),
+        SetOptionOutcome::Unsupported => "the current voice cannot change speech rate".to_owned(),
+    };
+    sr.speak(&announcement, true)?;
     Ok(CommandResult::Handled)
 }
 
@@ -119,14 +141,15 @@ pub(super) fn toggle_symbol_level(sr: &mut ScreenReader) -> Result<CommandResult
 #[cfg(test)]
 mod tests {
     use super::{
-        backspace, cancel, delete, pass_next_key, pause, resume, say_overlay, say_time,
-        toggle_auto_read, toggle_help, toggle_review_follows_screen_cursor, toggle_speaking,
-        toggle_stop_speech_on_focus_loss, toggle_symbol_level,
+        SPEECH_RATE_STEP, adjust_speech_rate, backspace, cancel, delete, pass_next_key, pause,
+        resume, say_overlay, say_time, toggle_auto_read, toggle_help,
+        toggle_review_follows_screen_cursor, toggle_speaking, toggle_stop_speech_on_focus_loss,
+        toggle_symbol_level,
     };
     use crate::{
         commands::CommandResult,
         screen_reader::ScreenReader,
-        speech::{self, symbols::Level},
+        speech::{self, SetOptionOutcome, symbols::Level},
         view::View,
     };
     use std::{cell::RefCell, rc::Rc};
@@ -148,7 +171,11 @@ mod tests {
         }
 
         fn set_rate(&mut self, _rate: f32) -> anyhow::Result<()> {
-            Ok(())
+            anyhow::bail!("rate control is unavailable")
+        }
+
+        fn set_rate_option(&mut self, _rate: f32) -> anyhow::Result<SetOptionOutcome> {
+            Ok(SetOptionOutcome::Unsupported)
         }
     }
 
@@ -177,6 +204,20 @@ mod tests {
                 "entering help. Press this key again to exit",
                 "exiting help",
             ]
+        );
+    }
+
+    #[test]
+    fn speech_rate_adjustment_announces_unsupported_voice() {
+        let (mut sr, output) = screen_reader();
+
+        assert!(matches!(
+            adjust_speech_rate(&mut sr, SPEECH_RATE_STEP).unwrap(),
+            CommandResult::Handled
+        ));
+        assert_eq!(
+            output.borrow().as_slice(),
+            ["the current voice cannot change speech rate"]
         );
     }
 

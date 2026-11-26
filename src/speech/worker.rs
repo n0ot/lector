@@ -420,7 +420,8 @@ pub struct BoundedAsyncDriver {
     mailbox: Arc<Mailbox>,
     ordered_utterances: Arc<AtomicBool>,
     option_state: Arc<Mutex<OptionState>>,
-    rate: f32,
+    initial_rate: f32,
+    requested_rate: Option<f32>,
     worker: Option<thread::JoinHandle<()>>,
     shutdown_backend: Option<Box<dyn FnOnce() + Send>>,
     next_compatibility_id: u64,
@@ -449,7 +450,7 @@ impl BoundedAsyncDriver {
     where
         D: Driver + Send + 'static,
     {
-        let rate = driver.get_rate();
+        let initial_rate = driver.get_rate();
         let initial_option_state = driver.option_state();
         let ordered_utterances = Arc::new(AtomicBool::new(driver.supports_ordered_utterances()));
         let option_state = Arc::new(Mutex::new(initial_option_state));
@@ -471,7 +472,8 @@ impl BoundedAsyncDriver {
             mailbox,
             ordered_utterances,
             option_state,
-            rate,
+            initial_rate,
+            requested_rate: None,
             worker: Some(worker),
             shutdown_backend,
             next_compatibility_id: 1,
@@ -538,7 +540,12 @@ impl Driver for BoundedAsyncDriver {
     }
 
     fn get_rate(&self) -> f32 {
-        self.rate
+        // Use the active host's startup value until a caller requests a rate.
+        // Subsequent adjustments must see the latest request even when the
+        // worker has not applied it or published the updated snapshot yet.
+        self.requested_rate
+            .or_else(|| self.option_state.lock().ok().and_then(|state| state.rate))
+            .unwrap_or(self.initial_rate)
     }
 
     fn set_rate(&mut self, rate: f32) -> DriverResult<()> {
@@ -546,7 +553,7 @@ impl Driver for BoundedAsyncDriver {
             return Err(anyhow!("speech rate must be between 0 and 100 inclusive"));
         }
         self.mailbox.enqueue_rate(rate)?;
-        self.rate = rate;
+        self.requested_rate = Some(rate);
         Ok(())
     }
 
@@ -570,7 +577,7 @@ impl Driver for BoundedAsyncDriver {
             return Ok(SetOptionOutcome::Unsupported);
         }
         self.mailbox.enqueue_rate(rate)?;
-        self.rate = rate;
+        self.requested_rate = Some(rate);
         if status == CapabilityStatus::Supported
             && let Ok(mut state) = self.option_state.lock()
         {
@@ -918,6 +925,35 @@ mod tests {
         // Give the worker time to observe the queued controls before its owner
         // is dropped. This is not needed for correctness, only clean test exit.
         thread::sleep(Duration::from_millis(10));
+    }
+
+    #[test]
+    fn newer_rate_and_interrupt_replace_pending_rate_and_announcement() {
+        let mailbox = Mailbox::new();
+        mailbox.enqueue_rate(65.0).unwrap();
+        mailbox
+            .enqueue_speech(&UtteranceId::new("first"), "65 percent", true)
+            .unwrap();
+
+        mailbox.enqueue_cancel().unwrap();
+        mailbox.enqueue_rate(70.0).unwrap();
+        assert_eq!(mailbox.usage().0, 0);
+
+        mailbox
+            .enqueue_speech(&UtteranceId::new("second"), "70 percent", true)
+            .unwrap();
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::SetRate(70.0))
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Request(Request::Speak { text, interrupt: true, .. }) if text == "70 percent"
+        ));
+        assert!(matches!(
+            mailbox.next_request(Duration::ZERO),
+            NextRequest::Idle
+        ));
     }
 
     #[test]

@@ -47,6 +47,12 @@ device as the Windows default to hear speech and cues together.
 
 ## Rate, pitch, volume, and voice
 
+Press `M--` to slow speech down or `M-=` to speed it up. Each press changes
+the rate by five percentage points within 0–100 and speaks the resulting
+percentage at that speed. The change applies to the current session. To
+rebind these commands, use `lector.decrease_speech_rate` and
+`lector.increase_speech_rate` in [your key bindings](scripting.md#key-bindings).
+
 Set these in your [configuration file](configuration.md):
 
 ```lua
