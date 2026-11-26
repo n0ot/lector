@@ -347,6 +347,14 @@ pub(crate) trait Backend: Clone {
     ///
     /// Returns an error if synthesis fails.
     fn speak(&mut self, text: &str, interrupt: bool) -> Result<Option<UtteranceId>, Error>;
+    #[cfg(target_vendor = "apple")]
+    fn speak_at_volume(
+        &mut self,
+        text: &str,
+        interrupt: bool,
+        volume: f32,
+    ) -> Result<Option<UtteranceId>, Error>;
+
     /// # Errors
     ///
     /// Returns an error if the text cannot be synthesized to audio.
@@ -656,6 +664,15 @@ impl Tts {
     #[instrument(level = "debug", skip(self), err, ret)]
     pub fn speak(&self, text: &str, interrupt: bool) -> Result<Option<UtteranceId>, Error> {
         self.backend.write().speak(text, interrupt)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn speak_at_volume(
+        &self,
+        text: &str,
+        volume: f32,
+    ) -> Result<Option<UtteranceId>, Error> {
+        self.backend.write().speak_at_volume(text, false, volume)
     }
 
     /// Synthesizes the specified text to audio, returned as a complete WAV file.

@@ -470,16 +470,7 @@ fn character_read_with_cue(
     let (row, col) = view.review_cursor_position();
     let col = col.clamp(start, end);
     let (character, links) = view.character_with_links(row, col);
-    let blank = character.trim().is_empty();
-    let spoken = if !blank || !links.is_empty() {
-        &character
-    } else {
-        ""
-    };
-    sr.speak_review_readback(spoken, &links, cue)?;
-    if blank {
-        sr.speak_review_cue(SoundCue::Blank)?;
-    }
+    sr.speak_review_character(&character, &links, cue)?;
     Ok(CommandResult::Handled)
 }
 

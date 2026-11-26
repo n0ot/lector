@@ -151,6 +151,56 @@ impl Clip {
             .collect();
         let rate = RATE as usize;
         let frames = (input.len() * rate).div_ceil(source_rate);
+        Self::with_frames(frames, spec.sample_rate, |out| {
+            for (frame, sample) in out.iter_mut().enumerate() {
+                let position = frame * source_rate;
+                let offset = position / rate;
+                #[allow(clippy::cast_precision_loss)]
+                let fraction = (position % rate) as f32 / rate as f32;
+                let current = input[offset];
+                let next = input.get(offset + 1).copied().unwrap_or(0.0);
+                *sample = current + (next - current) * fraction;
+            }
+        })
+    }
+
+    pub(super) fn mix_at_start(&self, other: &Self) -> Result<Self, Error> {
+        let first = self.samples()?;
+        let second = other.samples()?;
+        Self::with_frames(first.len().max(second.len()), RATE, |out| {
+            let mut peak = 1.0_f32;
+            for (index, sample) in out.iter_mut().enumerate() {
+                *sample = first.get(index).copied().unwrap_or_default()
+                    + second.get(index).copied().unwrap_or_default();
+                peak = peak.max(sample.abs());
+            }
+            if peak > 1.0 {
+                // Preserve the cues' relative levels and their full tails.
+                for sample in out {
+                    *sample /= peak;
+                }
+            }
+        })
+    }
+
+    fn samples(&self) -> Result<&[f32], Error> {
+        unsafe {
+            let data = self.buffer.floatChannelData();
+            if data.is_null() {
+                return Err(Error::OperationFailed("access cue PCM buffer"));
+            }
+            Ok(std::slice::from_raw_parts(
+                (*data).as_ptr(),
+                self.buffer.frameLength() as usize,
+            ))
+        }
+    }
+
+    fn with_frames(
+        frames: usize,
+        source_rate: u32,
+        write: impl FnOnce(&mut [f32]),
+    ) -> Result<Self, Error> {
         if frames == 0 {
             return Err(Error::OperationFailed("read empty cue PCM"));
         }
@@ -171,22 +221,14 @@ impl Clip {
             if data.is_null() {
                 return Err(Error::OperationFailed("access cue PCM buffer"));
             }
-            let out = std::slice::from_raw_parts_mut((*data).as_ptr(), frames);
-            for (frame, sample) in out.iter_mut().enumerate() {
-                let position = frame * source_rate;
-                let offset = position / rate;
-                #[allow(clippy::cast_precision_loss)]
-                let fraction = (position % rate) as f32 / rate as f32;
-                let current = input[offset];
-                let next = input.get(offset + 1).copied().unwrap_or(0.0);
-                *sample = current + (next - current) * fraction;
-            }
+            write(std::slice::from_raw_parts_mut((*data).as_ptr(), frames));
         }
         Ok(Self {
             buffer,
-            source_rate: spec.sample_rate,
+            source_rate,
         })
     }
+
     pub(super) fn source_rate(&self) -> u32 {
         self.source_rate
     }
@@ -241,5 +283,19 @@ impl Drop for NodePlayback {
         // Clear this buffer and reset the node timeline while the graph runs.
         unsafe { self.node.stop() };
         self.in_use.set(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_mix_starts_both_cues_together_and_preserves_the_whole_tail() {
+        let first =
+            Clip::with_frames(3, RATE, |out| out.copy_from_slice(&[0.75, -0.5, 0.25])).unwrap();
+        let second = Clip::with_frames(2, RATE, |out| out.copy_from_slice(&[0.5, 0.0])).unwrap();
+        let mixed = first.mix_at_start(&second).unwrap();
+        assert_eq!(mixed.samples().unwrap(), &[1.0, -0.4, 0.2]);
     }
 }

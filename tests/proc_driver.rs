@@ -477,7 +477,7 @@ mod native_speech {
             1,
             "initialize",
             serde_json::json!({
-                "protocol": {"major": 2, "minimumMinor": 3, "maximumMinor": 3},
+                "protocol": {"major": 2, "minimumMinor": 5, "maximumMinor": 5},
                 "client": {"name": "lector-test", "version": "1"},
                 "clientCapabilities": {"speechEvents": true, "progressModes": ["utf8ByteOffset"]}
             }),
@@ -526,6 +526,17 @@ mod native_speech {
         );
         assert_eq!(accepted["result"]["accepted"], true);
         host.wait_for_completion("boundary");
+        let accepted = host.rpc(
+            5,
+            "speech.speak",
+            serde_json::json!({
+                "utteranceId": "blank-boundary",
+                "text": "",
+                "cues": [{"cue": "right", "offset": 0}, {"cue": "blank", "offset": 0}]
+            }),
+        );
+        assert_eq!(accepted["result"]["accepted"], true);
+        host.wait_for_completion("blank-boundary");
         // The ordinary native speech callback logs begin. If the combined
         // request fell back to ordinary speech, this file would be nonempty.
         assert_eq!(fs::metadata(event_log).unwrap().len(), 0);

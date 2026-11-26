@@ -164,7 +164,7 @@ pub trait Driver {
         cues: SpeechCues,
     ) -> DriverResult<()> {
         anyhow::ensure!(cues.valid_for(text), "invalid speech cue offsets");
-        let rendered = cues.render(text, false, false);
+        let rendered = cues.render(text, false, false, false);
         if rendered.text.is_empty() {
             return Ok(());
         }
@@ -485,18 +485,33 @@ impl Speech {
         fallback: &str,
         interrupt: bool,
     ) -> Result<UtteranceId> {
+        self.speak_standalone_cues(SpeechCues::Standalone(cue), fallback, interrupt)
+    }
+
+    pub(crate) fn speak_direction_and_blank(
+        &mut self,
+        direction: SoundCue,
+        fallback: &str,
+    ) -> Result<UtteranceId> {
+        self.speak_standalone_cues(
+            SpeechCues::StandaloneDirectionAndBlank(direction),
+            fallback,
+            false,
+        )
+    }
+
+    fn speak_standalone_cues(
+        &mut self,
+        cues: SpeechCues,
+        fallback: &str,
+        interrupt: bool,
+    ) -> Result<UtteranceId> {
         if !self.tones {
             return self.speak(fallback, interrupt);
         }
         let id = self.allocate_utterance_id();
         self.driver
-            .speak_utterance_with_cues(
-                &id,
-                fallback,
-                interrupt,
-                UtteranceBoundary::Immediate,
-                SpeechCues::Standalone(cue),
-            )
+            .speak_utterance_with_cues(&id, fallback, interrupt, UtteranceBoundary::Immediate, cues)
             .map_err(Error::Driver)?;
         Ok(id)
     }

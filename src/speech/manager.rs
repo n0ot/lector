@@ -26,6 +26,10 @@ pub trait Host {
         false
     }
 
+    fn supports_standalone_pair(&self) -> bool {
+        false
+    }
+
     fn backend_info(&self) -> Option<&BackendInfo> {
         None
     }
@@ -193,7 +197,10 @@ impl SpeechManager {
         cues: SpeechCues,
     ) -> Result<()> {
         self.drain_events(host)?;
-        let standalone = matches!(cues, SpeechCues::Standalone(_));
+        let standalone = matches!(
+            cues,
+            SpeechCues::Standalone(_) | SpeechCues::StandaloneDirectionAndBlank(_)
+        );
         if !id.is_valid()
             || (cues == SpeechCues::None && text.is_empty())
             || text.len() > MAX_UTTERANCE_TEXT_BYTES
@@ -203,7 +210,12 @@ impl SpeechManager {
             ));
         }
         anyhow::ensure!(cues.valid_for(&text), "invalid speech cue offsets");
-        if standalone && text.is_empty() && !supports_sound_cues(host) {
+        if standalone
+            && text.is_empty()
+            && (!supports_sound_cues(host)
+                || matches!(cues, SpeechCues::StandaloneDirectionAndBlank(_))
+                    && !host.supports_standalone_pair())
+        {
             return Ok(());
         }
         let (text, cues) = if matches!(cues, SpeechCues::Inline { .. }) {
@@ -245,7 +257,7 @@ impl SpeechManager {
             return self.start(host, utterance, false);
         }
         if host.has_legacy_queue() {
-            let rendered = utterance.cues.render(&utterance.text, false, false);
+            let rendered = utterance.cues.render(&utterance.text, false, false, false);
             return host.speak(&utterance.id, &rendered.text, false);
         }
         if !self.can_sequence(host) {
@@ -538,6 +550,7 @@ impl SpeechManager {
             &utterance.text,
             supports_sound_cues(host),
             host.supports_directional_overlay(),
+            host.supports_standalone_pair(),
         );
         if rendered.text.is_empty() && rendered.cues.is_empty() {
             return self.start_due(host, Instant::now());
@@ -798,6 +811,7 @@ mod tests {
         fail_pause: bool,
         fail_resume: bool,
         legacy: bool,
+        standalone_pair: bool,
     }
 
     impl FakeHost {
@@ -844,6 +858,7 @@ mod tests {
                 fail_pause: false,
                 fail_resume: false,
                 legacy: false,
+                standalone_pair: false,
             }
         }
 
@@ -865,6 +880,10 @@ mod tests {
     impl Host for FakeHost {
         fn capabilities(&self) -> &SpeechCapabilities {
             &self.capabilities
+        }
+
+        fn supports_standalone_pair(&self) -> bool {
+            self.standalone_pair
         }
 
         fn has_legacy_queue(&self) -> bool {
@@ -923,6 +942,47 @@ mod tests {
 
         fn take_events(&mut self) -> Result<Vec<SpeechEventNotification>> {
             Ok(std::mem::take(&mut self.events))
+        }
+    }
+
+    #[test]
+    fn blank_edge_pair_uses_one_host_request_with_or_without_pair_support() {
+        for (sound_cues, standalone_pair) in [(false, false), (true, false), (true, true)] {
+            let mut manager = SpeechManager::default();
+            let mut host = FakeHost::full();
+            host.capabilities.sound_cues = sound_cues;
+            host.standalone_pair = standalone_pair;
+            let id = UtteranceId::new("boundary");
+            manager
+                .submit_with_cues(
+                    &mut host,
+                    id.clone(),
+                    "left blank".into(),
+                    false,
+                    UtteranceBoundary::Immediate,
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Left),
+                )
+                .unwrap();
+
+            let announcement = if standalone_pair {
+                Call::SpeakWithCues(
+                    id,
+                    String::new(),
+                    vec![
+                        SoundCueAt {
+                            cue: SoundCue::Left,
+                            offset: 0,
+                        },
+                        SoundCueAt {
+                            cue: SoundCue::Blank,
+                            offset: 0,
+                        },
+                    ],
+                )
+            } else {
+                Call::Speak(id, "left blank".into())
+            };
+            assert_eq!(host.calls, [announcement]);
         }
     }
 

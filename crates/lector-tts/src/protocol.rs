@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MIN_MINOR: u16 = 0;
-pub const PROTOCOL_MAX_MINOR: u16 = 4;
+pub const PROTOCOL_MAX_MINOR: u16 = 5;
+pub const STANDALONE_CUE_PAIR_PROTOCOL_MINOR: u16 = 5;
 pub const DIRECTIONAL_OVERLAY_PROTOCOL_MINOR: u16 = 4;
 pub const SOUND_CUES_PROTOCOL_MINOR: u16 = 3;
 /// First protocol minor whose rate domain is independent of the native backend.
@@ -363,7 +364,17 @@ impl SoundCueAt {
             return false;
         }
         if text.is_empty() {
-            return matches!(cues, [cue] if cue.offset == 0 && cue.cue != SoundCue::Link);
+            return match cues {
+                [cue] => cue.offset == 0 && cue.cue != SoundCue::Link,
+                [direction, blank] => {
+                    version.minor >= STANDALONE_CUE_PAIR_PROTOCOL_MINOR
+                        && direction.cue.is_direction()
+                        && blank.cue == SoundCue::Blank
+                        && direction.offset == 0
+                        && blank.offset == 0
+                }
+                _ => false,
+            };
         }
         let cues = match cues {
             [first, rest @ ..]
@@ -610,6 +621,25 @@ impl SpeechEventPayload {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn simultaneous_direction_and_blank_require_protocol_two_five() {
+        let edge = SoundCueAt {
+            cue: SoundCue::Bottom,
+            offset: 0,
+        };
+        let blank = SoundCueAt {
+            cue: SoundCue::Blank,
+            offset: 0,
+        };
+        let old = ProtocolVersion { major: 2, minor: 4 };
+        assert!(SoundCueAt::valid_for_protocol("", &[edge], old));
+        assert!(!SoundCueAt::valid_for_protocol("", &[edge, blank], old));
+        assert!(SoundCueAt::valid_for("", &[edge, blank]));
+        assert!(!SoundCueAt::valid_for("", &[blank, edge]));
+        assert!(!SoundCueAt::valid_for("", &[edge, edge]));
+        assert!(!SoundCueAt::valid_for("row", &[edge, blank]));
+    }
 
     #[test]
     fn directional_overlay_requires_protocol_two_four() {

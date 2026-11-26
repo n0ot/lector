@@ -875,6 +875,43 @@ impl ScreenReader {
         result.map(|_| ()).map_err(Into::into)
     }
 
+    pub(crate) fn speak_review_character(
+        &mut self,
+        character: &str,
+        links: &[Range<usize>],
+        direction: Option<speech::protocol::SoundCue>,
+    ) -> Result<()> {
+        use speech::protocol::SoundCue;
+        let blank = character.trim().is_empty();
+        if blank
+            && links.is_empty()
+            && let Some(direction @ (SoundCue::Left | SoundCue::Right)) = direction
+        {
+            if self.terminal_focused {
+                let label = format!(
+                    "{} {}",
+                    direction.spoken_label(),
+                    SoundCue::Blank.spoken_label()
+                );
+                self.call_hook_on_speech_start(&label, false)?;
+                let result = self.speech.speak_direction_and_blank(direction, &label);
+                self.call_hook_on_speech_end(&label, false, result.is_ok())?;
+                result?;
+            }
+            return Ok(());
+        }
+        let spoken = if blank && links.is_empty() {
+            ""
+        } else {
+            character
+        };
+        self.speak_review_readback(spoken, links, direction)?;
+        if blank {
+            self.speak_review_cue(SoundCue::Blank)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn speak_review_readback(
         &mut self,
         text: &str,

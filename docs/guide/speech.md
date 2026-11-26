@@ -8,8 +8,10 @@ server.
 
 Lector plays short cues at review cursor boundaries and when inspecting a
 blank character. Direction cues play over the spoken readback when the command
-also reads text. It identifies an OSC 8 hyperlink when its text starts, or
-when you start reading within the link. Set `lector.o.tones = false` to use
+also reads text. At a left or right boundary on a blank character, a compatible
+host plays the boundary and blank cues together. Lector identifies an OSC 8
+hyperlink at the start of its text or when you start reading within it.
+Set `lector.o.tones = false` to use
 spoken labels for boundaries, blank characters, and links.
 
 The bundled AVFoundation speech host plays cues on macOS 13 or later, including

@@ -120,16 +120,7 @@ fn character_read_with_cue(
 ) -> Result<CommandResult> {
     let (row, col) = view.review_cursor_position();
     let (character, links) = view.character_with_links(row, col);
-    let blank = character.trim().is_empty();
-    let spoken = if !blank || !links.is_empty() {
-        &character
-    } else {
-        ""
-    };
-    sr.speak_review_readback(spoken, &links, cue)?;
-    if blank {
-        sr.speak_review_cue(SoundCue::Blank)?;
-    }
+    sr.speak_review_character(&character, &links, cue)?;
     Ok(CommandResult::Handled)
 }
 
@@ -352,8 +343,9 @@ mod tests {
     }
 
     #[test]
-    fn blank_cue_is_character_feedback_and_boundaries_keep_their_direction() {
+    fn horizontal_boundaries_submit_one_pair_for_blank_character_readback() {
         use super::SoundCue;
+        use speech::SpeechCues;
         let cues = Rc::new(RefCell::new(Vec::new()));
         let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
             Rc::clone(&cues),
@@ -366,30 +358,42 @@ mod tests {
         view.set_review_cursor_col(3);
         character_next(&mut sr, &mut view).unwrap();
         assert_eq!(
-            cues.borrow()
-                .iter()
-                .filter_map(|(_, cues)| match cues {
-                    speech::SpeechCues::Standalone(cue) => Some(*cue),
-                    _ => None,
-                })
-                .collect::<Vec<_>>(),
+            cues.borrow().as_slice(),
             [
-                SoundCue::Top,
-                SoundCue::Bottom,
-                SoundCue::Left,
-                SoundCue::Blank,
-                SoundCue::Right,
-                SoundCue::Blank
+                ("top".into(), SpeechCues::Standalone(SoundCue::Top)),
+                ("bottom".into(), SpeechCues::Standalone(SoundCue::Bottom)),
+                (
+                    "left blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Left)
+                ),
+                (
+                    "right blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Right)
+                ),
             ],
         );
+
+        let (mut sr, spoken) = screen_reader();
+        character_next(&mut sr, &mut view).unwrap();
         sr.speech_mut().set_tones(false);
-        character_read(&mut sr, &view).unwrap();
+        view.set_review_cursor_col(0);
+        character_previous(&mut sr, &mut view).unwrap();
+        assert_eq!(spoken.borrow().as_slice(), ["right blank", "left blank"]);
+    }
+
+    #[test]
+    fn linked_whitespace_boundary_preserves_the_link_and_blank_labels() {
+        let (mut sr, output) = screen_reader();
+        let mut view = View::new(1, 4);
+        view.process_changes(b"\x1b]8;;https://example.invalid\x1b\\ \x1b]8;;\x1b\\");
+        character_previous(&mut sr, &mut view).unwrap();
         assert_eq!(
-            cues.borrow()
+            output
+                .borrow()
                 .iter()
-                .filter(|(_, cues)| matches!(cues, speech::SpeechCues::Standalone(_)))
-                .count(),
-            6
+                .map(|text| text.trim())
+                .collect::<Vec<_>>(),
+            ["left link space", "blank"],
         );
     }
 

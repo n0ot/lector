@@ -22,6 +22,8 @@ pub enum SpeechCues {
     #[default]
     None,
     Standalone(SoundCue),
+    /// Two cues at one onset for a horizontal edge on an unlinked blank cell.
+    StandaloneDirectionAndBlank(SoundCue),
     Inline {
         direction: Option<(SoundCue, &'static str)>,
         links: Vec<SpeechLink>,
@@ -34,6 +36,9 @@ impl SpeechCues {
         match self {
             Self::None => true,
             Self::Standalone(cue) => *cue != SoundCue::Link,
+            Self::StandaloneDirectionAndBlank(cue) => {
+                matches!(cue, SoundCue::Left | SoundCue::Right)
+            }
             Self::Inline {
                 direction, links, ..
             } => {
@@ -113,6 +118,7 @@ impl SpeechCues {
         text: &'a str,
         supported: bool,
         directional_overlay: bool,
+        standalone_pair: bool,
     ) -> RenderedCues<'a> {
         let mut rendered = RenderedCues {
             text: Cow::Borrowed(text),
@@ -128,7 +134,20 @@ impl SpeechCues {
                     offset: 0,
                 });
             }
-            Self::Standalone(_) => {}
+            Self::StandaloneDirectionAndBlank(direction) if supported && standalone_pair => {
+                rendered.text = Cow::Borrowed("");
+                rendered.cues.extend([
+                    SoundCueAt {
+                        cue: *direction,
+                        offset: 0,
+                    },
+                    SoundCueAt {
+                        cue: SoundCue::Blank,
+                        offset: 0,
+                    },
+                ]);
+            }
+            Self::Standalone(_) | Self::StandaloneDirectionAndBlank(_) => {}
             Self::Inline {
                 direction,
                 links,
@@ -220,7 +239,7 @@ mod tests {
             tones: true,
         };
 
-        let render = cues.render("café", true, true);
+        let render = cues.render("café", true, true, true);
         assert_eq!(render.text, "café");
         assert_eq!(
             render.cues,
@@ -237,7 +256,7 @@ mod tests {
         );
         assert!(SoundCueAt::valid_for(&render.text, &render.cues));
 
-        let render = cues.render("café", true, false);
+        let render = cues.render("café", true, false, false);
         assert_eq!(render.text, "bottom of table café");
         assert_eq!(
             render.cues,
@@ -258,7 +277,7 @@ mod tests {
             unreachable!()
         };
         *tones = false;
-        let render = cues.render("café", true, true);
+        let render = cues.render("café", true, true, true);
         assert_eq!(render.text, "bottom of table link café");
         assert!(render.cues.is_empty());
         assert_eq!(canonical_offset(21, &render.inserted_links), 0);
@@ -331,8 +350,8 @@ mod tests {
         };
         let bounded = cues.bound_text(&text, MAX_UTTERANCE_TEXT_BYTES);
         assert!(cues.valid_for(&bounded));
-        assert!(cues.render(&bounded, false, false).text.len() <= MAX_UTTERANCE_TEXT_BYTES);
-        let rendered = cues.render(&bounded, true, true);
+        assert!(cues.render(&bounded, false, false, false).text.len() <= MAX_UTTERANCE_TEXT_BYTES);
+        let rendered = cues.render(&bounded, true, true, true);
         let wire = serde_json::to_vec(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 3,

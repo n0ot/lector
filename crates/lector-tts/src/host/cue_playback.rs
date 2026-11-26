@@ -36,6 +36,17 @@ use crate::{
 mod engine;
 use engine::{Clip, CueEngine, NodePlayback};
 
+// Directional sounds are less prominent during speech than when played alone.
+pub(super) const DIRECTIONAL_UNDERLAY_GAIN: f32 = 0.35;
+// The approved directional WAVs peak below this bound. Linear interpolation
+// and normal playback volume cannot increase that component's peak.
+const MAX_DIRECTIONAL_CUE_PEAK: f32 = 0.226;
+// Reserve room for the quiet cue even if the speech waveform reaches full
+// scale. Use the same small gain on both live and cached directional speech.
+pub(super) const DIRECTIONAL_SPEECH_GAIN: f32 =
+    0.99 - MAX_DIRECTIONAL_CUE_PEAK * DIRECTIONAL_UNDERLAY_GAIN;
+const MIX_PEAK_CEILING: f32 = 0.98;
+
 const RENDER_STARTUP_TIMEOUT: Duration = Duration::from_secs(4);
 const RENDER_IDLE_TIMEOUT: Duration = Duration::from_millis(750);
 const RENDER_TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -94,6 +105,7 @@ pub(super) struct PreparedCues {
     engine: RefCell<Option<CueEngine>>,
     failed_engine: Cell<Option<Instant>>,
     clips: RefCell<Vec<(SoundCue, Clip)>>,
+    blank_pairs: Vec<(SoundCue, Clip)>,
 }
 
 impl PreparedCues {
@@ -111,13 +123,23 @@ impl PreparedCues {
             .collect();
         // Decode the embedded clips without touching an audio device. The
         // output graph is opened on the first actual playback request.
-        let clips = STANDALONE_CUES
+        let clips: Vec<_> = STANDALONE_CUES
             .into_iter()
             .filter_map(|cue| Clip::from_wave(cue_wav(cue)).ok().map(|clip| (cue, clip)))
             .collect();
+        let mut blank_pairs = Vec::new();
+        if let Some((_, blank)) = clips.iter().find(|(cue, _)| *cue == SoundCue::Blank) {
+            blank_pairs.extend(
+                clips
+                    .iter()
+                    .filter(|(cue, _)| cue.is_direction())
+                    .filter_map(|(cue, clip)| clip.mix_at_start(blank).ok().map(|mix| (*cue, mix))),
+            );
+        }
         Self {
             players,
             clips: RefCell::new(clips),
+            blank_pairs,
             ..Self::default()
         }
     }
@@ -159,7 +181,20 @@ impl PreparedCues {
         }
     }
 
-    fn standalone(&self, cue: SoundCue, volume: f32) -> Result<Playing, Error> {
+    fn standalone(&self, cues: &[SoundCueAt], volume: f32) -> Result<Playing, Error> {
+        let cue = match cues {
+            [cue] => cue.cue,
+            [direction, _] => {
+                let (_, clip) = self
+                    .blank_pairs
+                    .iter()
+                    .find(|(cue, _)| *cue == direction.cue)
+                    .ok_or(Error::OperationFailed("load simultaneous sound cues"))?;
+                let node = self.with_engine(|engine| engine.play(clip, volume))?;
+                return Ok(Playing::new(AudioOutput::Engine(node), Vec::new(), 1));
+            }
+            _ => return Err(Error::OperationFailed("load standalone sound cue")),
+        };
         let engine_play = self.with_engine(|engine| {
             let mut clips = self.clips.borrow_mut();
             let index = if let Some(index) = clips.iter().position(|(kind, _)| *kind == cue) {
@@ -319,6 +354,12 @@ impl RenderedAudio {
             [direction, links @ ..] if direction.cue != SoundCue::Link => (Some(direction), links),
             _ => (None, cues),
         };
+        if direction.is_some() {
+            for sample in &mut self.samples {
+                *sample *= DIRECTIONAL_SPEECH_GAIN;
+            }
+        }
+        let dry_peak = peak(&self.samples);
         if let Some(direction) = direction {
             // The cached short-readback route can start at the first word.
             // Remove preroll only when every omitted sample is silent.
@@ -334,7 +375,10 @@ impl RenderedAudio {
                     word.frame -= preroll_frames;
                 }
             }
-            let samples = cue_samples(direction.cue, spec.sample_rate)?;
+            let mut samples = cue_samples(direction.cue, spec.sample_rate)?;
+            for sample in &mut samples {
+                *sample *= DIRECTIONAL_UNDERLAY_GAIN;
+            }
             mix_at(&mut self.samples, channels, words[0].frame, &samples);
         }
         if !links.is_empty()
@@ -352,22 +396,46 @@ impl RenderedAudio {
             ));
         }
 
-        let mut wav = Cursor::new(Vec::new());
-        let mut writer = WavWriter::new(
-            &mut wav,
-            WavSpec {
-                bits_per_sample: 16,
-                sample_format: SampleFormat::Int,
-                ..spec
-            },
-        )?;
-        for sample in self.samples {
-            #[allow(clippy::cast_possible_truncation)]
-            writer.write_sample((sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16)?;
-        }
-        writer.finalize()?;
-        Ok((wav.into_inner(), words))
+        // If the overlay causes an over, reserve headroom with one constant
+        // gain for the entire mix. A constant gain preserves the waveform
+        // and avoids hard clipping or a gain change at the end of the cue.
+        let mix_peak = peak(&self.samples);
+        let ceiling = if mix_peak > dry_peak {
+            MIX_PEAK_CEILING
+        } else {
+            1.0
+        };
+        let mix_gain = if mix_peak > ceiling {
+            ceiling / mix_peak
+        } else {
+            1.0
+        };
+        Ok((write_pcm16(spec, self.samples, mix_gain)?, words))
     }
+}
+
+fn peak(samples: &[f32]) -> f32 {
+    samples
+        .iter()
+        .fold(0.0, |peak, sample| peak.max(sample.abs()))
+}
+
+fn write_pcm16(spec: WavSpec, samples: Vec<f32>, gain: f32) -> Result<Vec<u8>, Error> {
+    let mut wav = Cursor::new(Vec::new());
+    let mut writer = WavWriter::new(
+        &mut wav,
+        WavSpec {
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+            ..spec
+        },
+    )?;
+    for sample in samples {
+        #[allow(clippy::cast_possible_truncation)]
+        writer.write_sample((sample * gain * f32::from(i16::MAX)).round() as i16)?;
+    }
+    writer.finalize()?;
+    Ok(wav.into_inner())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -807,14 +875,14 @@ impl CuePlayback {
     }
 
     pub(super) fn standalone(
-        cue: SoundCue,
+        cues: &[SoundCueAt],
         volume: f32,
         prepared: &PreparedCues,
     ) -> Result<Self, Error> {
         Ok(Self {
             id: playback_id(),
             _utterance: None,
-            playback: Playback::Playing(prepared.standalone(cue, volume)?),
+            playback: Playback::Playing(prepared.standalone(cues, volume)?),
             cached_clock_pending: false,
         })
     }
@@ -1051,6 +1119,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directional_overlay_reserves_headroom_even_for_full_scale_speech() {
+        for cue in [
+            SoundCue::Top,
+            SoundCue::Bottom,
+            SoundCue::Left,
+            SoundCue::Right,
+        ] {
+            let samples = cue_samples(cue, 44_100).unwrap();
+            let cue_peak = peak(&samples);
+            assert!(
+                cue_peak <= MAX_DIRECTIONAL_CUE_PEAK,
+                "asset {cue:?} exceeds its peak budget"
+            );
+            assert!(DIRECTIONAL_SPEECH_GAIN + cue_peak * DIRECTIONAL_UNDERLAY_GAIN <= 0.99);
+        }
+    }
+
+    #[test]
+    fn pcm_overload_guard_keeps_transients_instead_of_clipping_them() {
+        let wave = WavSpec {
+            channels: 1,
+            sample_rate: 44_100,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut pcm = RenderedAudio::default();
+        pcm.append(wave, std::iter::repeat_n(0.99, 3200)).unwrap();
+        pcm.words.push(Word {
+            byte_sample: 0,
+            start: 0,
+            end: 3,
+        });
+        let (audio, _) = pcm
+            .finish(
+                "one",
+                &[SoundCueAt {
+                    cue: SoundCue::Link,
+                    offset: 0,
+                }],
+            )
+            .unwrap();
+        let mut wave = WavReader::new(Cursor::new(audio)).unwrap();
+        let samples = wave
+            .samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let cue = cue_samples(SoundCue::Link, 44_100).unwrap();
+        let peak = samples.iter().copied().max().unwrap();
+        let normalized_peak = f32::from(peak) / f32::from(i16::MAX);
+        assert!((normalized_peak - MIX_PEAK_CEILING).abs() <= 0.0001);
+        let baseline = f32::from(samples[cue.len()]) / f32::from(i16::MAX);
+        let gain = baseline / 0.99;
+        for (&actual, cue) in samples.iter().zip(cue) {
+            let expected = gain * (0.99 + cue);
+            let actual = f32::from(actual) / f32::from(i16::MAX);
+            assert!((actual - expected).abs() <= 0.0001);
+        }
+    }
+
+    #[test]
     fn cold_start_and_pcm_stalls_have_separate_render_deadlines() {
         let requested = Instant::now();
         let mut deadline = RenderDeadline {
@@ -1151,7 +1279,8 @@ mod tests {
         let direction = cue_samples(SoundCue::Right, wave.sample_rate).unwrap();
         let link = cue_samples(SoundCue::Link, wave.sample_rate).unwrap();
         for (index, (&actual, direction)) in samples[start..].iter().zip(direction).enumerate() {
-            let mixed = direction + link.get(index).copied().unwrap_or(0.0);
+            let mixed =
+                direction * DIRECTIONAL_UNDERLAY_GAIN + link.get(index).copied().unwrap_or(0.0);
             #[allow(clippy::cast_possible_truncation)]
             let expected = (mixed.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
             assert_eq!(actual, expected);

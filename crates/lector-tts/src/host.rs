@@ -16,7 +16,10 @@ use crate::speech_fallback::{
     InsertedLink, MAX_LINK_ANNOUNCEMENT_BYTES, append_cue_announcement, canonical_offset,
 };
 #[cfg(target_vendor = "apple")]
-use cue_playback::{CuePlayback, PreparedCues, ReadbackCache, ReadbackKey};
+use cue_playback::{
+    CuePlayback, DIRECTIONAL_SPEECH_GAIN, DIRECTIONAL_UNDERLAY_GAIN, PreparedCues, ReadbackCache,
+    ReadbackKey,
+};
 
 use crate::{
     Backends, Error as TtsError, Features, Gender, Tts, UtteranceId as NativeUtteranceId, Voice,
@@ -644,61 +647,14 @@ impl State {
                 return Ok(result);
             }
             let cues = active.cues_from(base);
-            if text.is_empty()
-                && let [cue] = cues.as_slice()
-            {
-                return self.start_standalone_cue(active, base, cue);
+            if text.is_empty() && !cues.is_empty() {
+                return self.start_standalone_cue(active, base, &cues);
             }
             if let [cue] = cues.as_slice()
                 && !text.is_empty()
                 && cue.cue != SoundCue::Link
             {
-                // Use labels when there is no evidence that this text and
-                // voice will provide a word onset for live playback.
-                if !text.chars().any(char::is_alphanumeric) {
-                    self.readback_cache.retain_request(None);
-                    return self.start_spoken_fallback(active, base, &cues);
-                }
-                let cache_key =
-                    ReadbackKey::new(&self.tts, text, cue.cue, self.selected_voice.as_deref());
-                self.readback_cache.retain_request(cache_key.as_ref());
-                let volume = self
-                    .tts
-                    .get_volume()
-                    .map_err(|error| RpcError::internal_error(error.to_string()))?;
-                if let Some(key) = &cache_key
-                    && let Some(playback) =
-                        self.readback_cache.play(key, volume, &self.prepared_cues)
-                {
-                    if let Some(log) = &self.cue_event_log {
-                        write_speech_event(log, "directional-cue-cache-hit");
-                        write_speech_event(log, "directional-cue-begin");
-                    }
-                    let id = playback.id();
-                    self.cue_playback = Some(playback);
-                    active.native_base = base;
-                    return Ok(BackendAttempt::Completed(Some(id)));
-                }
-                if !self.directional_word_ranges {
-                    return self.start_spoken_fallback(active, base, &cues);
-                }
-                if let Err(error) = self.prepared_cues.prepare(cue.cue, volume) {
-                    eprintln!("lector-tts: {error}; speaking cue label");
-                    return self.start_spoken_fallback(active, base, &cues);
-                }
-                let result = classify_backend_attempt(self.tts.speak(text, false))?;
-                if let BackendAttempt::Completed(Some(native_id)) = result {
-                    self.live_direction = Some(LiveDirection {
-                        native_id,
-                        cue: cue.cue,
-                        playback: DirectionPlayback::Pending,
-                        clock_logged: false,
-                        saw_range: false,
-                        cache_key,
-                    });
-                    active.native_base = base;
-                }
-                return Ok(result);
+                return self.start_live_direction(active, base, cue);
             }
             self.readback_cache.retain_request(None);
             if !cues.is_empty() {
@@ -729,15 +685,75 @@ impl State {
     }
 
     #[cfg(target_vendor = "apple")]
-    fn start_standalone_cue(
+    fn start_live_direction(
         &mut self,
         active: &mut ActiveUtterance,
         base: usize,
         cue: &SoundCueAt,
     ) -> Result<BackendAttempt<Option<NativeUtteranceId>>, RpcError> {
+        let text = &active.text[base..];
+        // Use labels when there is no evidence that this text and
+        // voice will provide a word onset for live playback.
+        if !text.chars().any(char::is_alphanumeric) {
+            self.readback_cache.retain_request(None);
+            return self.start_spoken_fallback(active, base, std::slice::from_ref(cue));
+        }
+        let cache_key = ReadbackKey::new(&self.tts, text, cue.cue, self.selected_voice.as_deref());
+        self.readback_cache.retain_request(cache_key.as_ref());
+        let volume = self
+            .tts
+            .get_volume()
+            .map_err(|error| RpcError::internal_error(error.to_string()))?;
+        if let Some(key) = &cache_key
+            && let Some(playback) = self.readback_cache.play(key, volume, &self.prepared_cues)
+        {
+            if let Some(log) = &self.cue_event_log {
+                write_speech_event(log, "directional-cue-cache-hit");
+                write_speech_event(log, "directional-cue-begin");
+            }
+            let id = playback.id();
+            self.cue_playback = Some(playback);
+            active.native_base = base;
+            return Ok(BackendAttempt::Completed(Some(id)));
+        }
+        if !self.directional_word_ranges {
+            return self.start_spoken_fallback(active, base, std::slice::from_ref(cue));
+        }
+        if let Err(error) = self
+            .prepared_cues
+            .prepare(cue.cue, volume * DIRECTIONAL_UNDERLAY_GAIN)
+        {
+            eprintln!("lector-tts: {error}; speaking cue label");
+            return self.start_spoken_fallback(active, base, std::slice::from_ref(cue));
+        }
+        let result = classify_backend_attempt(
+            self.tts
+                .speak_at_volume(text, volume * DIRECTIONAL_SPEECH_GAIN),
+        )?;
+        if let BackendAttempt::Completed(Some(native_id)) = result {
+            self.live_direction = Some(LiveDirection {
+                native_id,
+                cue: cue.cue,
+                playback: DirectionPlayback::Pending,
+                clock_logged: false,
+                saw_range: false,
+                cache_key,
+            });
+            active.native_base = base;
+        }
+        Ok(result)
+    }
+
+    #[cfg(target_vendor = "apple")]
+    fn start_standalone_cue(
+        &mut self,
+        active: &mut ActiveUtterance,
+        base: usize,
+        cues: &[SoundCueAt],
+    ) -> Result<BackendAttempt<Option<NativeUtteranceId>>, RpcError> {
         self.readback_cache.retain_request(None);
         let volume = self.volume.as_ref().map_or(1.0, |volume| volume.current);
-        match CuePlayback::standalone(cue.cue, volume, &self.prepared_cues) {
+        match CuePlayback::standalone(cues, volume, &self.prepared_cues) {
             Ok(playback) => {
                 let id = playback.id();
                 self.cue_playback = Some(playback);
@@ -745,8 +761,8 @@ impl State {
                 Ok(BackendAttempt::Completed(Some(id)))
             }
             Err(error) => {
-                eprintln!("lector-tts: {error}; speaking cue label");
-                self.start_spoken_fallback(active, base, std::slice::from_ref(cue))
+                eprintln!("lector-tts: {error}; speaking cue labels");
+                self.start_spoken_fallback(active, base, cues)
             }
         }
     }
