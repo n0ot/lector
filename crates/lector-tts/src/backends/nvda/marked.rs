@@ -5,7 +5,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
     },
     thread,
@@ -18,7 +18,7 @@ use windows::core::HSTRING;
 use super::{Controller, audio::Audio};
 use crate::{
     Callbacks, Error, UtteranceId,
-    nvda_schedule::{Job, Schedule},
+    nvda_schedule::{AdmissionError, CallGate, Job, Schedule},
     nvda_ssml::{MarkProgress, make_ssml, parse_mark},
     protocol::{SoundCue, SoundCueAt},
 };
@@ -39,10 +39,7 @@ const CANCEL_INTERVAL: Duration = Duration::from_millis(20);
 const CANCEL_DEADLINE: Duration = Duration::from_secs(2);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static CALL: Mutex<()> = Mutex::new(());
-// A timed-out cancellation could still reach NVDA later. Even another TTS
-// instance in this process may not safely start a new controller request.
-static CANCEL_UNCERTAIN: AtomicBool = AtomicBool::new(false);
+static CALL: CallGate = CallGate::new();
 static SESSION: Mutex<Option<MarkerSession>> = Mutex::new(None);
 
 #[derive(Debug)]
@@ -138,7 +135,7 @@ impl Marked {
     }
 
     pub(super) fn submit(&self, text: &str, cues: &[SoundCueAt]) -> Result<UtteranceId, Error> {
-        if CANCEL_UNCERTAIN.load(Ordering::Acquire) {
+        if CALL.is_poisoned() {
             return Err(Error::BackendUnavailable(
                 "an NVDA cancellation is still unconfirmed",
             ));
@@ -171,6 +168,7 @@ impl Marked {
             }
             discarded
         };
+        CALL.notify_cancellation();
         for job in discarded {
             notify(&self.shared, job.id, Completion::Cancelled);
         }
@@ -196,11 +194,17 @@ fn run_worker(controller: &Controller, shared: &Arc<Shared>, requests: &Receiver
 fn run_job(controller: &Controller, shared: &Arc<Shared>, job: &Job) {
     // The controller DLL exposes one callback pointer per process. Hold this
     // across the call and cleanup, even for multiple TTS instances.
-    let _call = CALL.lock();
-    if CANCEL_UNCERTAIN.load(Ordering::Acquire) {
-        notify(shared, job.id, Completion::Failed);
-        return;
-    }
+    let _call = match CALL.acquire(|| shared.playback.lock().schedule.can_start(job)) {
+        Ok(guard) => guard,
+        Err(AdmissionError::Cancelled) => {
+            notify(shared, job.id, Completion::Cancelled);
+            return;
+        }
+        Err(AdmissionError::Poisoned) => {
+            notify(shared, job.id, Completion::Failed);
+            return;
+        }
+    };
     if !shared.playback.lock().schedule.start(job) {
         notify(shared, job.id, Completion::Cancelled);
         return;
@@ -241,11 +245,11 @@ fn cancel_worker(shared: &Shared, requests: &Receiver<()>, rpc: &SyncSender<Send
                     .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     .is_ok();
 
-            let mut playback = shared.playback.lock();
             if !completed {
-                // If a cancel was dispatched but did not return, a late
-                // cancellation could still affect a later native utterance.
-                CANCEL_UNCERTAIN.store(true, Ordering::Release);
+                // Poison before releasing native ownership. Never acquire
+                // the global gate monitor while holding the playback lock.
+                CALL.poison();
+                let mut playback = shared.playback.lock();
                 let active = playback.schedule.complete(id).is_some();
                 let pending = playback.schedule.poison();
                 shared.cancel_finished.notify_all();
@@ -258,9 +262,8 @@ fn cancel_worker(shared: &Shared, requests: &Receiver<()>, rpc: &SyncSender<Send
                 }
                 break;
             }
-            playback.schedule.finish_cancel();
+            shared.playback.lock().schedule.finish_cancel();
             shared.cancel_finished.notify_all();
-            drop(playback);
             thread::sleep(CANCEL_INTERVAL);
         }
     }
