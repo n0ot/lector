@@ -899,38 +899,37 @@ impl ScreenReader {
         links: &[Range<usize>],
         direction: Option<speech::protocol::SoundCue>,
     ) -> Result<()> {
-        use speech::protocol::SoundCue;
-        let blank = character.trim().is_empty();
-        if blank && direction.is_none() {
-            return self.speak_linked_review_cue(SoundCue::Blank, !links.is_empty());
+        if character.trim().is_empty() {
+            return self.speak_review_blank(!links.is_empty(), direction);
         }
-        if blank
-            && links.is_empty()
-            && let Some(direction @ (SoundCue::Left | SoundCue::Right)) = direction
-        {
-            if self.terminal_focused {
-                let label = format!(
-                    "{} {}",
-                    direction.spoken_label(),
-                    SoundCue::Blank.spoken_label()
-                );
-                self.call_hook_on_speech_start(&label, false)?;
-                let result = self.speech.speak_direction_and_blank(direction, &label);
-                self.call_hook_on_speech_end(&label, false, result.is_ok())?;
-                result?;
-            }
+        self.speak_review_readback(character, links, direction)
+    }
+
+    pub(crate) fn speak_review_blank(
+        &mut self,
+        linked: bool,
+        direction: Option<speech::protocol::SoundCue>,
+    ) -> Result<()> {
+        use speech::protocol::SoundCue;
+        let Some(direction) = direction else {
+            return self.speak_linked_review_cue(SoundCue::Blank, linked);
+        };
+        if !self.terminal_focused {
             return Ok(());
         }
-        let spoken = if blank && links.is_empty() {
-            ""
-        } else {
-            character
-        };
-        self.speak_review_readback(spoken, links, direction)?;
-        if blank {
-            self.speak_review_cue(SoundCue::Blank)?;
+        if linked {
+            if !self.speech.can_sequence_tones() {
+                let label = format!("{} link blank", direction.spoken_label());
+                return self.speak(&label, false).map(|_| ());
+            }
+            let anchor = 0..0;
+            self.speak_with_links("", std::slice::from_ref(&anchor), false)?;
         }
-        Ok(())
+        let label = format!("{} blank", direction.spoken_label());
+        self.call_hook_on_speech_start(&label, false)?;
+        let result = self.speech.speak_direction_and_blank(direction, &label);
+        self.call_hook_on_speech_end(&label, false, result.is_ok())?;
+        result.map(|_| ()).map_err(Into::into)
     }
 
     pub(crate) fn speak_review_readback(

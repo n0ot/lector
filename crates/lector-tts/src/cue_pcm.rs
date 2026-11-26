@@ -139,16 +139,19 @@ mod tests {
     #[test]
     fn approved_assets_prepare_without_audio_device() {
         let clips = Clips::new().unwrap();
-        let directions = clips.select(&[SoundCue::Left]).unwrap();
         let blank = clips.select(&[SoundCue::Blank]).unwrap();
-        let both = clips.select(&[SoundCue::Left, SoundCue::Blank]).unwrap();
-        assert_eq!(both.len(), directions.len());
-        assert!(
-            both.iter()
-                .zip(directions.iter().zip(&*blank))
-                .all(|(&combined, (&direction, &blank))| combined == direction + blank)
-        );
-        assert_eq!(both[blank.len()..], directions[blank.len()..]);
+        for direction in DIRECTIONS {
+            let bumper = clips.select(&[direction]).unwrap();
+            let pair = clips.select(&[direction, SoundCue::Blank]).unwrap();
+            assert_eq!(pair.len(), bumper.len().max(blank.len()));
+            for (index, sample) in pair.iter().enumerate() {
+                let sum = i32::from(bumper.get(index).copied().unwrap_or_default())
+                    + i32::from(blank.get(index).copied().unwrap_or_default());
+                assert_eq!(i32::from(*sample), sum);
+                assert!(sum.abs() < i32::from(i16::MAX));
+            }
+        }
+        let directions = clips.select(&[SoundCue::Left]).unwrap();
         let link = clips.select(&[SoundCue::Link]).unwrap();
         let linked = clips.select(&[SoundCue::Left, SoundCue::Link]).unwrap();
         assert!(

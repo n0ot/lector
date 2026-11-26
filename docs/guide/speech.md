@@ -9,8 +9,8 @@ server.
 Lector plays short cues at review cursor boundaries and when inspecting a
 blank character or blank line. With spoken feedback, Lector says “blank” in both cases.
 Direction cues play over the spoken readback when the command
-also reads text. At a left or right boundary on a blank character, a compatible
-host plays the boundary and blank cues together. Lector identifies an OSC 8
+also reads text. At the top or bottom of a blank line, or the left or right edge on a blank
+character, a compatible host plays the boundary and blank cues together. Lector identifies an OSC 8
 hyperlink at the start of its text or when you start reading within it.
 Set `lector.o.tones = false` to use
 spoken labels for boundaries, blanks, and links. Reading `lector.o.tones` returns

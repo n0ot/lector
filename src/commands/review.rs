@@ -52,18 +52,17 @@ fn line_read_with_cue(
     view: &mut View,
     mut cue: Option<SoundCue>,
 ) -> Result<CommandResult> {
-    let at_boundary = cue.is_some();
     let row = view.review_cursor_position().0;
-    if let Some(level) = sr.review_cursor_indentation_change(view) {
-        sr.speak_review_readback(&format!("indent {level}"), &[], cue.take())?;
-    }
     let (line, links) = view.line_with_links(row);
     let blank = line.trim().is_empty();
-    if !at_boundary && blank {
-        sr.speak_linked_review_cue(SoundCue::Blank, !links.is_empty())?;
+    if let Some(level) = sr.review_cursor_indentation_change(view) {
+        let indent_cue = if blank { None } else { cue.take() };
+        sr.speak_review_readback(&format!("indent {level}"), &[], indent_cue)?;
+    }
+    if blank {
+        sr.speak_review_blank(!links.is_empty(), cue)?;
     } else {
-        let readable = !blank || !links.is_empty();
-        sr.speak_review_readback(if readable { &line } else { "" }, &links, cue)?;
+        sr.speak_review_readback(&line, &links, cue)?;
     }
     Ok(CommandResult::Handled)
 }
@@ -95,7 +94,11 @@ fn word_read_with_cue(
 ) -> Result<CommandResult> {
     let (row, col) = view.review_cursor_position();
     let (word, links) = view.word_with_links(row, col);
-    sr.speak_review_readback(&word, &links, cue)?;
+    if cue.is_some() && word.trim().is_empty() {
+        sr.speak_review_blank(!links.is_empty(), cue)?;
+    } else {
+        sr.speak_review_readback(&word, &links, cue)?;
+    }
     Ok(CommandResult::Handled)
 }
 
@@ -359,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_boundaries_submit_one_pair_for_blank_character_readback() {
+    fn all_four_boundaries_pair_the_direction_with_blank_readback() {
         use super::SoundCue;
         use speech::SpeechCues;
         let cues = Rc::new(RefCell::new(Vec::new()));
@@ -377,8 +380,14 @@ mod tests {
             cues.borrow().as_slice(),
             [
                 ("blank".into(), SpeechCues::Standalone(SoundCue::Blank)),
-                ("top".into(), SpeechCues::Standalone(SoundCue::Top)),
-                ("bottom".into(), SpeechCues::Standalone(SoundCue::Bottom)),
+                (
+                    "top blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Top)
+                ),
+                (
+                    "bottom blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Bottom)
+                ),
                 (
                     "left blank".into(),
                     SpeechCues::StandaloneDirectionAndBlank(SoundCue::Left)
@@ -426,7 +435,7 @@ mod tests {
                 .iter()
                 .map(|text| text.trim())
                 .collect::<Vec<_>>(),
-            ["left link space", "blank"],
+            ["left link blank"],
         );
     }
 
@@ -452,7 +461,10 @@ mod tests {
         assert_eq!(
             submissions.borrow().as_slice(),
             [
-                ("bottom".into(), SpeechCues::Standalone(SoundCue::Bottom)),
+                (
+                    "bottom blank".into(),
+                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Bottom)
+                ),
                 ("blank".into(), SpeechCues::Standalone(SoundCue::Blank)),
             ],
         );
@@ -460,7 +472,7 @@ mod tests {
         let (mut sr, spoken) = screen_reader();
         line_next(&mut sr, &mut view, false).unwrap();
         character_read(&mut sr, &view).unwrap();
-        assert_eq!(spoken.borrow().as_slice(), ["bottom", "blank"]);
+        assert_eq!(spoken.borrow().as_slice(), ["bottom blank", "blank"]);
     }
 
     #[test]

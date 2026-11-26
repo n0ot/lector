@@ -22,7 +22,7 @@ pub enum SpeechCues {
     #[default]
     None,
     Standalone(SoundCue),
-    /// Two cues at one onset for a horizontal edge on an unlinked blank cell.
+    /// Two cues at one onset for a review boundary with blank readback.
     StandaloneDirectionAndBlank(SoundCue),
     Inline {
         direction: Option<(SoundCue, &'static str)>,
@@ -36,9 +36,7 @@ impl SpeechCues {
         match self {
             Self::None => true,
             Self::Standalone(cue) => *cue != SoundCue::Link,
-            Self::StandaloneDirectionAndBlank(cue) => {
-                matches!(cue, SoundCue::Left | SoundCue::Right)
-            }
+            Self::StandaloneDirectionAndBlank(cue) => cue.is_direction(),
             Self::Inline {
                 direction, links, ..
             } => {

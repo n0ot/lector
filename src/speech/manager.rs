@@ -947,42 +947,50 @@ mod tests {
 
     #[test]
     fn blank_edge_pair_uses_one_host_request_with_or_without_pair_support() {
-        for (sound_cues, standalone_pair) in [(false, false), (true, false), (true, true)] {
-            let mut manager = SpeechManager::default();
-            let mut host = FakeHost::full();
-            host.capabilities.sound_cues = sound_cues;
-            host.standalone_pair = standalone_pair;
-            let id = UtteranceId::new("boundary");
-            manager
-                .submit_with_cues(
-                    &mut host,
-                    id.clone(),
-                    "left blank".into(),
-                    false,
-                    UtteranceBoundary::Immediate,
-                    SpeechCues::StandaloneDirectionAndBlank(SoundCue::Left),
-                )
-                .unwrap();
+        for direction in [
+            SoundCue::Top,
+            SoundCue::Bottom,
+            SoundCue::Left,
+            SoundCue::Right,
+        ] {
+            let label = format!("{} blank", direction.spoken_label());
+            for (sound_cues, standalone_pair) in [(false, false), (true, false), (true, true)] {
+                let mut manager = SpeechManager::default();
+                let mut host = FakeHost::full();
+                host.capabilities.sound_cues = sound_cues;
+                host.standalone_pair = standalone_pair;
+                let id = UtteranceId::new("boundary");
+                manager
+                    .submit_with_cues(
+                        &mut host,
+                        id.clone(),
+                        label.clone(),
+                        false,
+                        UtteranceBoundary::Immediate,
+                        SpeechCues::StandaloneDirectionAndBlank(direction),
+                    )
+                    .unwrap();
 
-            let announcement = if standalone_pair {
-                Call::SpeakWithCues(
-                    id,
-                    String::new(),
-                    vec![
-                        SoundCueAt {
-                            cue: SoundCue::Left,
-                            offset: 0,
-                        },
-                        SoundCueAt {
-                            cue: SoundCue::Blank,
-                            offset: 0,
-                        },
-                    ],
-                )
-            } else {
-                Call::Speak(id, "left blank".into())
-            };
-            assert_eq!(host.calls, [announcement]);
+                let announcement = if standalone_pair {
+                    Call::SpeakWithCues(
+                        id,
+                        String::new(),
+                        vec![
+                            SoundCueAt {
+                                cue: direction,
+                                offset: 0,
+                            },
+                            SoundCueAt {
+                                cue: SoundCue::Blank,
+                                offset: 0,
+                            },
+                        ],
+                    )
+                } else {
+                    Call::Speak(id, label.clone())
+                };
+                assert_eq!(host.calls, [announcement]);
+            }
         }
     }
 
