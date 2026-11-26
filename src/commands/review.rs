@@ -57,11 +57,10 @@ fn line_read_with_cue(
     if let Some(level) = sr.review_cursor_indentation_change(view) {
         sr.speak_review_readback(&format!("indent {level}"), &[], cue.take())?;
     }
-    let (line, mut links) = view.line_with_links(row);
+    let (line, links) = view.line_with_links(row);
     let blank = line.trim().is_empty();
     if !at_boundary && blank {
-        crate::terminal::trim_linked_text(&line, &mut links);
-        sr.speak_linked_review_cue(SoundCue::Blank, &links)?;
+        sr.speak_linked_review_cue(SoundCue::Blank, !links.is_empty())?;
     } else {
         let readable = !blank || !links.is_empty();
         sr.speak_review_readback(if readable { &line } else { "" }, &links, cue)?;
@@ -320,6 +319,16 @@ mod tests {
     struct CueRecordingDriver(CueSubmissions);
 
     impl speech::Driver for CueRecordingDriver {
+        fn option_state(&self) -> speech::OptionState {
+            speech::OptionState {
+                sound_cues: true,
+                ..Default::default()
+            }
+        }
+        fn supports_ordered_utterances(&self) -> bool {
+            true
+        }
+
         fn speak(&mut self, _text: &str, _interrupt: bool) -> anyhow::Result<()> {
             Ok(())
         }
@@ -387,6 +396,22 @@ mod tests {
         view.set_review_cursor_col(0);
         character_previous(&mut sr, &mut view).unwrap();
         assert_eq!(spoken.borrow().as_slice(), ["right blank", "left blank"]);
+    }
+
+    #[test]
+    fn character_review_preserves_the_link_on_a_blank_cell() {
+        let cues = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
+            cues.clone(),
+        ))));
+        let mut view = View::new(1, 4);
+        view.process_changes(b"\x1b]8;;https://example.invalid\x1b\\ \x1b]8;;\x1b\\");
+        character_read(&mut sr, &view).unwrap();
+        let cues = cues.borrow();
+        assert!(matches!(cues.as_slice(), [
+            (_, speech::SpeechCues::Inline { links, tones: true, .. }),
+            (_, speech::SpeechCues::Standalone(super::SoundCue::Blank)),
+        ] if links.len() == 1 && links[0].offset == 0));
     }
 
     #[test]

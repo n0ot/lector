@@ -878,9 +878,12 @@ impl ScreenReader {
     pub(crate) fn speak_linked_review_cue(
         &mut self,
         cue: speech::protocol::SoundCue,
-        links: &[Range<usize>],
+        linked: bool,
     ) -> Result<()> {
-        if !links.is_empty() {
+        if linked {
+            // The reviewed text has collapsed to an empty destination.
+            let anchor = 0..0;
+            let links = std::slice::from_ref(&anchor);
             if !self.speech.can_sequence_tones() {
                 self.speak_with_links(cue.spoken_label(), links, false)?;
                 return Ok(());
@@ -899,7 +902,7 @@ impl ScreenReader {
         use speech::protocol::SoundCue;
         let blank = character.trim().is_empty();
         if blank && direction.is_none() {
-            return self.speak_linked_review_cue(SoundCue::Blank, links);
+            return self.speak_linked_review_cue(SoundCue::Blank, !links.is_empty());
         }
         if blank
             && links.is_empty()

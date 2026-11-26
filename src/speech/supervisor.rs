@@ -1895,12 +1895,8 @@ mod tests {
         let mut speech = crate::speech::Speech::new(Box::new(harness.supervisor));
         speech.start().unwrap();
         let mut reader = crate::screen_reader::ScreenReader::new(speech);
-        let anchor = 0..0;
         reader
-            .speak_linked_review_cue(
-                crate::speech::protocol::SoundCue::Blank,
-                std::slice::from_ref(&anchor),
-            )
+            .speak_linked_review_cue(crate::speech::protocol::SoundCue::Blank, true)
             .unwrap();
         assert!(
             host.lock()
