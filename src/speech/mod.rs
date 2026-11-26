@@ -540,6 +540,15 @@ impl Speech {
         self.speak_with_links_and_cue(text, link_spans, None, interrupt)
     }
 
+    /// Speak text whose symbols and pauses have already been prepared by the caller.
+    pub(crate) fn speak_prepared(&mut self, text: &str, links: Vec<SpeechLink>) -> Result<()> {
+        let id = self.allocate_utterance_id();
+        let cues = self.inline_cues(links, None);
+        self.driver
+            .speak_utterance_with_cues(&id, text, false, UtteranceBoundary::Immediate, cues)
+            .map_err(Error::Driver)
+    }
+
     pub fn speak_with_links_and_cue(
         &mut self,
         text: &str,

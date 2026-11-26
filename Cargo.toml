@@ -52,6 +52,7 @@ smallvec = "1.16.5"
 similar = { version = "3.2.1", default-features = false, features = ["std", "unicode"] }
 unicode-segmentation = "1.13.3"
 unicode-width = { version = "0.2.3", default-features = false }
+unicode_names2 = "4.0.0"
 mlua = { version = "0.12.2", features = ["luajit", "vendored", "error-send"] }
 tts = { package = "lector-tts", version = "=0.4.2", path = "crates/lector-tts" }
 terminput = "0.5.16"

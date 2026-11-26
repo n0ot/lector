@@ -1611,6 +1611,70 @@ fn phase_two_baseline_preserves_full_overlay_redraw_title_cursor_and_modes() {
 }
 
 #[test]
+fn current_word_phonetic_binding_works_on_the_live_screen_and_in_review() {
+    let (mut app, mut sr, recorder, clock) = make_app();
+    sr.set_auto_read_enabled(false);
+    let mut pty_out = Vec::new();
+    let mut term_out = Vec::new();
+    let config_dir = tempfile::tempdir().unwrap();
+    let config = config_dir.path().join("init.lua");
+    fs::write(
+        &config,
+        r#"lector.bindings["M-z"] = "lector.review_word_read_phonetic""#,
+    )
+    .unwrap();
+    lua::setup(config, true, &mut sr, |_| Ok(())).unwrap();
+
+    app.handle_pty(&mut sr, b"up down\r\n\x1b[H", &mut term_out)
+        .unwrap();
+    clock.advance_ms(u128::from(DIFF_DELAY) + 1);
+    app.maybe_finalize_changes(&mut sr).unwrap();
+
+    let application_cursor = app.presented_scene().cursor();
+    for (key, expected) in [
+        (b"\x1bk".as_slice(), "up"),
+        (b"\x1bK", "Uniform, Papa"),
+        (b"\x1bz", "Uniform, Papa"),
+    ] {
+        recorder.inner.borrow_mut().speaks.clear();
+        app.handle_stdin(&mut sr, key, &mut pty_out, &mut term_out)
+            .unwrap();
+        assert_eq!(recorder.inner.borrow().speaks, [(expected.into(), false)]);
+        assert_eq!(app.presented_scene().cursor(), application_cursor);
+    }
+
+    app.handle_stdin(&mut sr, b"\x1bOP", &mut pty_out, &mut term_out)
+        .unwrap();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bK", &mut pty_out, &mut term_out)
+        .unwrap();
+    assert_eq!(
+        recorder.inner.borrow().speaks,
+        [("spell current word phonetically".into(), false)]
+    );
+    app.handle_stdin(&mut sr, b"\x1bOP\x1brw", &mut pty_out, &mut term_out)
+        .unwrap();
+    assert!(app.has_overlay());
+    let review_cursor = app.presented_scene().cursor();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bK", &mut pty_out, &mut term_out)
+        .unwrap();
+    assert_eq!(
+        recorder.inner.borrow().speaks,
+        [("Delta, Oscar, Whiskey, November".into(), false)]
+    );
+    assert_eq!(app.presented_scene().cursor(), review_cursor);
+
+    app.handle_stdin(&mut sr, b"j", &mut pty_out, &mut term_out)
+        .unwrap();
+    recorder.inner.borrow_mut().speaks.clear();
+    app.handle_stdin(&mut sr, b"\x1bK", &mut pty_out, &mut term_out)
+        .unwrap();
+    assert_eq!(recorder.inner.borrow().speaks, [("No word".into(), false)]);
+    assert!(pty_out.is_empty());
+}
+
+#[test]
 fn review_modes_and_search_results_are_announced_with_auto_read_off() {
     for (scheduled, suppress_echo) in [(false, false), (false, true), (true, false), (true, true)] {
         let (mut app, mut sr, recorder, clock) = make_app();

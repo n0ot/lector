@@ -43,6 +43,7 @@ The review cursor reads the screen without moving the application's cursor.
 | `M-U` / `M-O` | Previous, next non-blank line |
 | `M-j` / `M-l` | Previous / next word |
 | `M-k` | Say current word |
+| `M-K` | Spell current word phonetically |
 | `M-m` / `M-.` | Previous / next character |
 | `M-,` | Say current character |
 | `M-<` | Say current character phonetically |
@@ -54,6 +55,10 @@ The review cursor reads the screen without moving the application's cursor.
 
 To read output that has scrolled off the screen, open [Review](review.md) with
 `M-r`.
+
+`M-K` also works in Review. It spells the word using the same phonetic alphabet
+as `M-<`, says “cap” for uppercase letters, and names digits and punctuation
+at every symbol level. To rebind it, use `lector.review_word_read_phonetic`.
 
 ## Clipboard
 
