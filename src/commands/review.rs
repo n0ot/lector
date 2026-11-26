@@ -3,9 +3,11 @@ use crate::{
     attributes,
     ext::{CellExt, ScreenExt},
     screen_reader::ScreenReader,
-    speech::protocol::SoundCue,
+    speech::{Speech, SpeechLink, protocol::SoundCue},
     view::View,
 };
+use std::{borrow::Cow, ops::Range};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub(super) fn report_move(
     sr: &mut ScreenReader,
@@ -98,8 +100,7 @@ fn word_read_with_cue(
 ) -> Result<CommandResult> {
     let (row, col) = view.review_cursor_position();
     let screen = view.screen();
-    let range = screen.find_word_start(row, col)..screen.find_word_end(row, col) + 1;
-    let (word, links) = screen.review_contents_with_links(previous, (row, col), range);
+    let (word, links) = word_with_links(view, previous);
     let cue = cue.or_else(|| {
         screen
             .left_review_link(previous, (row, col))
@@ -111,6 +112,77 @@ fn word_read_with_cue(
         sr.speak_review_readback(&word, &links, cue)?;
     }
     Ok(CommandResult::Handled)
+}
+
+fn word_with_links(view: &View, previous: Option<(u16, u16)>) -> (String, Vec<Range<usize>>) {
+    let (row, col) = view.review_cursor_position();
+    let screen = view.screen();
+    let range = screen.find_word_start(row, col)..screen.find_word_end(row, col) + 1;
+    screen.review_contents_with_links(previous, (row, col), range)
+}
+
+pub(super) fn word_read_phonetic(sr: &mut ScreenReader, view: &View) -> Result<CommandResult> {
+    let (word, links) = word_with_links(view, None);
+    if word.trim().is_empty() {
+        sr.speak("No word", false)?;
+        return Ok(CommandResult::Handled);
+    }
+
+    let mut spelling = String::new();
+    let mut spoken_links = Vec::new();
+    let mut links = links.into_iter().peekable();
+    // The ordinary word range includes its following blanks.
+    for (offset, grapheme) in word.trim_end().grapheme_indices(true) {
+        if !spelling.is_empty() {
+            spelling.push_str(", ");
+        }
+        while let Some(link) = links.next_if(|link| link.start < offset + grapheme.len()) {
+            if link.end > offset && !link.is_empty() {
+                spoken_links.push(SpeechLink {
+                    offset: spelling.len(),
+                    audible: true,
+                });
+            }
+        }
+        if grapheme.starts_with(char::is_uppercase) {
+            spelling.push_str("cap ");
+        }
+        spelling.push_str(&spelling_name(sr.speech(), grapheme));
+    }
+    spoken_links.dedup();
+    sr.speak_prepared(&spelling, spoken_links)?;
+    Ok(CommandResult::Handled)
+}
+
+fn spelling_name<'a>(speech: &'a Speech, grapheme: &'a str) -> Cow<'a, str> {
+    const DIGITS: [&str; 10] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    ];
+    if let Some(name) = phonetic_name(grapheme) {
+        return name.into();
+    }
+    if let [digit @ b'0'..=b'9'] = grapheme.as_bytes() {
+        return DIGITS[usize::from(*digit - b'0')].into();
+    }
+    if let Some(symbol) = speech.symbol(grapheme)
+        && !symbol.replacement.trim().is_empty()
+    {
+        return symbol.replacement.as_str().into();
+    }
+    if let Some(emoji) = emojis::get(grapheme) {
+        return emoji.name().into();
+    }
+    grapheme
+        .chars()
+        .map(|character| {
+            unicode_names2::name(character).map_or_else(
+                || character.to_string(),
+                |name| name.to_string().to_ascii_lowercase(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .into()
 }
 
 pub(super) fn character_previous(sr: &mut ScreenReader, view: &mut View) -> Result<CommandResult> {
@@ -305,7 +377,7 @@ mod tests {
     use super::{
         bottom, character_next, character_previous, character_read, character_read_phonetic, first,
         last, line_next, line_previous, line_read, phonetic_name, read_attributes, top, word_next,
-        word_previous,
+        word_previous, word_read_phonetic,
     };
     use crate::{
         commands::Error,
@@ -653,6 +725,33 @@ mod tests {
         assert_eq!(phonetic_name("z"), Some("Zulu"));
         assert_eq!(phonetic_name("?"), None);
         assert_eq!(phonetic_name("é"), None);
+    }
+
+    #[test]
+    fn phonetic_spelling_names_symbols_and_maps_the_link_to_its_character() {
+        let submissions = Rc::new(RefCell::new(Vec::new()));
+        let mut sr = ScreenReader::new(speech::Speech::new(Box::new(CueRecordingDriver(
+            submissions.clone(),
+        ))));
+        let mut view = View::new(1, 20);
+        view.process_changes(
+            "A\x1b]8;;https://example.invalid\x1b\\12?、\x1b]8;;\x1b\\ next".as_bytes(),
+        );
+        view.set_review_cursor_col(1);
+        let application = view.screen().cursor_position();
+        for level in [speech::symbols::Level::None, speech::symbols::Level::All] {
+            sr.speech_mut().set_symbol_level(level);
+            word_read_phonetic(&mut sr, &view).unwrap();
+        }
+        assert_eq!(view.review_cursor_position(), (0, 1));
+        assert_eq!(view.screen().cursor_position(), application);
+        let submissions = submissions.borrow();
+        assert_eq!(submissions.len(), 2);
+        for (text, cues) in submissions.iter() {
+            assert_eq!(text, "cap Alpha, one, two, question, ideographic comma");
+            assert!(matches!(cues, speech::SpeechCues::Inline { links, .. }
+                if links.as_slice() == [speech::SpeechLink { offset: "cap Alpha, ".len(), audible: true }]));
+        }
     }
 
     #[test]

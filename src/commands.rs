@@ -73,6 +73,7 @@ macro_rules! define_actions {
                         | Action::RevWordPrev
                         | Action::RevWordNext
                         | Action::RevWordRead
+                        | Action::RevWordReadPhonetic
                         | Action::RevTop
                         | Action::RevBottom
                         | Action::RevFirst
@@ -145,6 +146,7 @@ define_actions! {
     RevLineNextNonBlank => ("next non-blank line", "review_line_next_non_blank"),
     RevWordPrev => ("previous word", "review_word_prev"),
     RevWordRead => ("say current word", "review_word_read"),
+    RevWordReadPhonetic => ("spell current word phonetically", "review_word_read_phonetic"),
     RevWordNext => ("next word", "review_word_next"),
     RevCharPrev => ("previous character", "review_char_prev"),
     RevCharRead => ("say current character", "review_char_read"),
@@ -265,6 +267,7 @@ pub fn handle(
         Action::RevWordPrev => review::word_previous(sr, view),
         Action::RevWordNext => review::word_next(sr, view),
         Action::RevWordRead => review::word_read(sr, view),
+        Action::RevWordReadPhonetic => review::word_read_phonetic(sr, view),
         Action::RevCharPrev => review::character_previous(sr, view),
         Action::RevCharNext => review::character_next(sr, view),
         Action::RevCharRead => review::character_read(sr, view),

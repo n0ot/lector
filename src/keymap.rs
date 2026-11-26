@@ -142,6 +142,7 @@ const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("M-j", Action::RevWordPrev),
     ("M-l", Action::RevWordNext),
     ("M-k", Action::RevWordRead),
+    ("M-K", Action::RevWordReadPhonetic),
     ("M-y", Action::RevTop),
     ("M-p", Action::RevBottom),
     ("M-h", Action::RevFirst),

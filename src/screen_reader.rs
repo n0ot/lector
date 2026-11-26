@@ -988,6 +988,20 @@ impl ScreenReader {
         result.map(Some).map_err(Into::into)
     }
 
+    pub(crate) fn speak_prepared(
+        &mut self,
+        text: &str,
+        links: Vec<speech::SpeechLink>,
+    ) -> Result<()> {
+        if !self.terminal_focused {
+            return Ok(());
+        }
+        self.call_hook_on_speech_start(text, false)?;
+        let result = self.speech.speak_prepared(text, links);
+        self.call_hook_on_speech_end(text, false, result.is_ok())?;
+        result.map_err(Into::into)
+    }
+
     pub(crate) fn speak_for_reader(
         &mut self,
         text: &str,
