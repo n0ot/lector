@@ -1284,6 +1284,7 @@ pub struct App {
     tmux_hierarchy: ConnectionHierarchy,
     tmux_connections: Vec<TmuxConnectionState>,
     pending_tmux_commands: VecDeque<PendingTmuxCommand>,
+    waiting_tmux_bootstraps: VecDeque<PendingTmuxCommand>,
     tmux_carrier_leases: BTreeMap<
         (
             u64,
@@ -1415,6 +1416,21 @@ struct PendingTmuxPaneCapture {
     failed: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BootstrapCaptureStage {
+    ProgramStatus,
+    PendingEscape,
+    Screen,
+}
+
+#[derive(Clone)]
+struct PendingTmuxBootstrap {
+    pane_id: crate::tmux_model::PaneId,
+    line_flags: bool,
+    stage: BootstrapCaptureStage,
+    recovered: crate::tmux_panes::BootstrapTerminalState,
+}
+
 enum TmuxPaneResyncResult {
     Success(
         crate::tmux_model::PaneCaptureMetadata,
@@ -1475,12 +1491,11 @@ struct TmuxControlStep {
     sync_topology: bool,
     render_topology: bool,
     bootstrap_reply: Option<(
-        crate::tmux_model::PaneId,
+        PendingTmuxBootstrap,
         crate::tmux_control::CommandStatus,
         Vec<Vec<u8>>,
-        bool,
     )>,
-    bootstrap_retry: Option<(crate::tmux_model::PaneId, Vec<u8>)>,
+    bootstrap_retry: Option<(crate::tmux_model::PaneId, Vec<u8>, bool)>,
     pane_resync_probe: Option<crate::tmux_model::PaneCaptureMetadata>,
     pane_resync_request: Option<crate::tmux_model::PaneId>,
     pane_resume_request: Option<crate::tmux_model::PaneId>,
@@ -1645,22 +1660,52 @@ impl TmuxConnectionState {
                         connection.flow_control_verified =
                             Some(connection.flow_control_policy_accepted == Some(true) && retained);
                     }
-                    Some(ExpectedTmuxReply::Bootstrap {
-                        pane_id,
-                        line_flags,
-                    }) => {
-                        if line_flags
+                    Some(ExpectedTmuxReply::Bootstrap(mut capture)) => {
+                        use crate::tmux_control::CommandStatus;
+
+                        let pane_id = capture.pane_id;
+                        if status == CommandStatus::Success
+                            && capture.stage != BootstrapCaptureStage::Screen
+                        {
+                            match capture.stage {
+                                BootstrapCaptureStage::ProgramStatus => {
+                                    capture.recovered.program_status = match output.as_slice() {
+                                        [line] => crate::tmux_model::parse_pane_program_status(
+                                            line, pane_id,
+                                        ),
+                                        _ => None,
+                                    };
+                                    capture.stage = BootstrapCaptureStage::PendingEscape;
+                                }
+                                BootstrapCaptureStage::PendingEscape => {
+                                    capture.recovered.pending_escape =
+                                        join_tmux_command_output(&output);
+                                    capture.stage = BootstrapCaptureStage::Screen;
+                                }
+                                BootstrapCaptureStage::Screen => unreachable!(),
+                            }
+                            // This is still the same parsed command sequence.
+                            // Keep one bounded reply-queue slot until it ends.
+                            connection
+                                .expected_replies
+                                .push_front(ExpectedTmuxReply::Bootstrap(capture));
+                        } else if capture.line_flags
                             && Self::tmux_capture_line_flags_unsupported(status, &output)
                             && let Some(pane) = connection.topology.pane(pane_id)
                         {
                             connection.capture_line_flags_supported = Some(false);
-                            step.bootstrap_retry =
-                                Some((pane_id, crate::tmux_panes::portable_capture_command(pane)));
+                            step.bootstrap_retry = Some((
+                                pane_id,
+                                crate::tmux_panes::portable_capture_command(pane),
+                                connection.topology.bootstrap_samples_program_status(),
+                            ));
                         } else {
-                            if line_flags && status == crate::tmux_control::CommandStatus::Success {
+                            // tmux can reject the entire group with one error
+                            // reply. There are no later replies to correlate.
+                            if capture.line_flags && status == CommandStatus::Success {
                                 connection.capture_line_flags_supported = Some(true);
                             }
-                            step.bootstrap_reply = Some((pane_id, status, output, line_flags));
+                            step.bootstrap_reply = Some((capture, status, output));
                         }
                     }
                     Some(ExpectedTmuxReply::PaneResyncProbe(pane_id)) => {
@@ -2279,10 +2324,7 @@ enum ExpectedTmuxReply {
     Inventory,
     FlowControlPolicy,
     FlowControlVerification,
-    Bootstrap {
-        pane_id: crate::tmux_model::PaneId,
-        line_flags: bool,
-    },
+    Bootstrap(PendingTmuxBootstrap),
     PaneResyncProbe(crate::tmux_model::PaneId),
     PaneResyncCapture(crate::tmux_model::PaneId),
     PaneResyncPendingEscape(crate::tmux_model::PaneId),
@@ -2327,6 +2369,7 @@ enum ExpectedTmuxReply {
     },
 }
 
+#[derive(Clone)]
 struct PendingTmuxCommand {
     connection_id: u64,
     bytes: Vec<u8>,
@@ -2492,6 +2535,7 @@ impl App {
             tmux_hierarchy: ConnectionHierarchy::new(),
             tmux_connections: Vec::new(),
             pending_tmux_commands: VecDeque::new(),
+            waiting_tmux_bootstraps: VecDeque::new(),
             tmux_carrier_leases: BTreeMap::new(),
             pending_tmux_session_switches: BTreeMap::new(),
             rejected_tmux_carrier_indices: BTreeMap::new(),
@@ -2570,6 +2614,7 @@ impl App {
     pub fn debug_tmux_pending_command_bytes(&self) -> usize {
         self.pending_tmux_commands
             .iter()
+            .chain(&self.waiting_tmux_bootstraps)
             .map(|command| command.bytes.len())
             .sum()
     }

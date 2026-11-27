@@ -16,6 +16,7 @@ pub mod output_scheduler;
 pub mod platform;
 pub mod presentation;
 pub mod proc_server_common;
+mod program_status;
 pub mod pty;
 mod review;
 pub mod screen_reader;

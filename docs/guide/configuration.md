@@ -72,6 +72,7 @@ Options live under `lector.o`.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `auto_read` | `true` | Speak new output as it appears. |
+| `program_status_announcements` | `true` | Speak [program status updates](speech.md#program-status) and play their tone when enabled. |
 | `symbol_level` | | How much punctuation to speak: `"none"`, `"some"`, `"most"`, `"all"`, or `"character"`. |
 | `report_indentation` | `true` | Announce changes in indentation. |
 | `tones` | `true` | Play cues for review cursor boundaries, blank lines and characters, and OSC 8 links. Reads as `false` while the active host lacks cue support. |

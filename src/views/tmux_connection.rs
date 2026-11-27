@@ -33,6 +33,7 @@ pub struct TmuxConnectionView {
 pub(crate) struct PaneOutput {
     pub update: UpdateSummary,
     pub bells: usize,
+    pub program_announcements: Vec<String>,
 }
 
 /// Parsed, topology-validated data for the active tmux window. A topology sync
@@ -235,9 +236,17 @@ impl TmuxConnectionView {
             bytes,
             retain_for_accessibility,
         )?;
-        Ok(update.map(|update| PaneOutput {
-            bells: update.effects.bells,
-            update,
+        Ok(update.map(|mut update| {
+            let program_announcements = self
+                .panes
+                .pane_view_mut(pane_id)
+                .expect("only a known pane can produce an update")
+                .program_status_announcements(&mut update);
+            PaneOutput {
+                bells: update.effects.bells,
+                update,
+                program_announcements,
+            }
         }))
     }
 
@@ -264,10 +273,29 @@ impl TmuxConnectionView {
         line_flags: bool,
         now_ms: u128,
     ) -> std::result::Result<Vec<u8>, TmuxPaneError> {
+        self.apply_bootstrap_capture(
+            pane_id,
+            status,
+            output,
+            line_flags,
+            crate::tmux_panes::BootstrapTerminalState::default(),
+            now_ms,
+        )
+    }
+
+    pub(crate) fn apply_bootstrap_capture(
+        &mut self,
+        pane_id: PaneId,
+        status: CommandStatus,
+        output: &[Vec<u8>],
+        line_flags: bool,
+        recovered: crate::tmux_panes::BootstrapTerminalState,
+        now_ms: u128,
+    ) -> std::result::Result<Vec<u8>, TmuxPaneError> {
         let previous = self.active_document();
         let result = self
             .panes
-            .apply_bootstrap_with_line_flags(pane_id, status, output, line_flags, now_ms);
+            .apply_bootstrap_capture(pane_id, status, output, line_flags, recovered, now_ms);
         if result.is_ok() {
             self.finish_document_model_change(previous);
         }

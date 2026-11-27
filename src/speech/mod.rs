@@ -539,6 +539,11 @@ impl Speech {
         self.tones() && self.driver.supports_ordered_utterances()
     }
 
+    /// The user preference also controls cues produced by the terminal.
+    pub(crate) fn tones_requested(&self) -> bool {
+        self.tones
+    }
+
     pub fn set_tones(&mut self, enabled: bool) {
         self.tones = enabled;
     }

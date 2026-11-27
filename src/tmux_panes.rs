@@ -484,6 +484,12 @@ pub struct BootstrapRequest {
     pub command: Vec<u8>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct BootstrapTerminalState {
+    pub program_status: Option<crate::program_status::ProgramStatus>,
+    pub pending_escape: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum TmuxPaneError {
     #[error(transparent)]
@@ -765,11 +771,31 @@ impl TmuxPaneSet {
         line_flags: bool,
         now_ms: u128,
     ) -> Result<Vec<u8>, TmuxPaneError> {
+        self.apply_bootstrap_capture(
+            pane_id,
+            status,
+            output,
+            line_flags,
+            BootstrapTerminalState::default(),
+            now_ms,
+        )
+    }
+
+    pub(crate) fn apply_bootstrap_capture(
+        &mut self,
+        pane_id: PaneId,
+        status: CommandStatus,
+        output: &[Vec<u8>],
+        line_flags: bool,
+        recovered: BootstrapTerminalState,
+        now_ms: u128,
+    ) -> Result<Vec<u8>, TmuxPaneError> {
         let state = self
             .panes
             .get_mut(&pane_id)
             .ok_or(TmuxPaneError::UnknownPane(pane_id.0))?;
         if status == CommandStatus::Error {
+            state.view.restore_program_status(recovered.program_status);
             state.bootstrapped = true;
             state.bootstrap_requested = false;
             let buffered = std::mem::take(&mut state.prebootstrap_output);
@@ -815,10 +841,21 @@ impl TmuxPaneSet {
             },
         );
         view.process_changes(&bytes);
-        if !view.screen().has_visible_non_whitespace_content() && !buffered.is_empty() {
+        let replay_buffered =
+            !view.screen().has_visible_non_whitespace_content() && !buffered.is_empty();
+        if replay_buffered {
             view.process_changes(&buffered);
         }
+        // A capture of cells cannot recover an unfinished terminal sequence.
+        // Resume the parser unless empty-screen fallback already replayed
+        // this exact unfinished suffix.
+        if !recovered.pending_escape.is_empty()
+            && !(replay_buffered && buffered.ends_with(&recovered.pending_escape))
+        {
+            view.process_changes(&recovered.pending_escape);
+        }
         view.discard_shadow_pty_replies();
+        view.restore_program_status(recovered.program_status);
         // An authoritative capture establishes the pane's diff baseline; it is
         // not application output to announce. Finalize it while parsing is
         // still the publication boundary, then let physical receipts own every
@@ -893,6 +930,7 @@ impl TmuxPaneSet {
         );
         view.process_changes(&bytes);
         view.discard_shadow_pty_replies();
+        view.restore_program_status(metadata.program_status.clone());
         // Baseline the authoritative snapshot before presentation tracking
         // starts so capture text cannot taint the first later output receipt.
         view.finalize_changes(now_ms);
@@ -1607,6 +1645,7 @@ mod synchronization_tests {
             alternate_on: true,
             pane_in_mode: 0,
             history_size: 0,
+            program_status: None,
         };
         panes
             .apply_resync_capture(
@@ -1645,6 +1684,7 @@ mod synchronization_tests {
             alternate_on: false,
             pane_in_mode: 0,
             history_size: 12,
+            program_status: None,
         };
         assert_eq!(
             capture_command_for_metadata(&metadata),
@@ -1824,6 +1864,7 @@ mod synchronization_tests {
             alternate_on: true,
             pane_in_mode: 0,
             history_size: 0,
+            program_status: None,
         };
         panes
             .apply_resync_capture(&metadata, &[b"CAPTURE".to_vec()], &[], 20)

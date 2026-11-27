@@ -140,3 +140,28 @@ What they add over the modeled tests:
   terminal.
 - **Gateway.** A real tmux lifecycle, with abrupt transport loss injected.
 - **Bells.** A real server ringing a pane.
+
+
+### Program status preview
+
+The distro lane does not require OSC 7501 support. Run the program status
+integration separately with the pinned tmux preview:
+
+```sh
+LECTOR_REAL_TMUX_PROGRAM_STATUS=1 scripts/test-real-tmux-docker
+```
+
+The preview build uses upstream revision
+[`61aded53`](https://github.com/tmux/tmux/commit/61aded536b925f6eadfd37457dc765c85116f51a).
+The test uses a project-built pane fixture that waits for tmux's capability
+reply before reporting its status. It checks background speech and silent
+state recovery when Lector reattaches. The runner also accepts an immutable
+prebuilt preview image with `LECTOR_REAL_TMUX_PREBUILT_IMAGE` and an explicit
+`LECTOR_REAL_TMUX_PLATFORM`.
+
+Lector observes root records in live pane output and seeds their state and name
+from tmux capture metadata at attach and resynchronization. The same capture
+recovers unfinished terminal sequences, including an OSC split by the boundary.
+Recovered state is silent. Empty status fields mean the state is unknown.
+The reported message can contain arbitrary user-facing text and has no role
+in the transition or announcement.

@@ -79,10 +79,10 @@ fn inventory(connection_id: u64) -> Vec<Vec<Vec<u8>>> {
             format!("W\t$2\t@12\t1\t1\t{UNATTACHED}\t{UNATTACHED}\t*\tremote").into_bytes(),
         ],
         vec![
-            b"P\t@10\t%20\t1\t1\t0\t0\t40\t24\t0\t0\t0\t1\t0\t0\t0\t0\tactive".to_vec(),
-            b"P\t@10\t%23\t2\t0\t41\t0\t39\t24\t0\t0\t0\t1\t0\t0\t0\t0\tinactive".to_vec(),
-            b"P\t@11\t%21\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\thidden".to_vec(),
-            b"P\t@12\t%22\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tunattached".to_vec(),
+            b"P\tstatus\t@10\t%20\t1\t1\t0\t0\t40\t24\t0\t0\t0\t1\t0\t0\t0\t0\tactive".to_vec(),
+            b"P\tstatus\t@10\t%23\t2\t0\t41\t0\t39\t24\t0\t0\t0\t1\t0\t0\t0\t0\tinactive".to_vec(),
+            b"P\tstatus\t@11\t%21\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\thidden".to_vec(),
+            b"P\tstatus\t@12\t%22\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tunattached".to_vec(),
         ],
         vec![b"A\t$1".to_vec()],
         vec![b"O\tbase-index\t1".to_vec()],
@@ -123,6 +123,24 @@ fn add_ready_connection(
     sr: &mut ScreenReader,
     physical: &mut Vec<u8>,
     connection_id: u64,
+) -> TmuxGatewayRouter {
+    add_connection_with_bootstrap_sample(app, sr, physical, connection_id, &[], None)
+}
+
+struct BootstrapSample<'a> {
+    pane: u64,
+    state: &'a str,
+    name: &'a str,
+    pending_escape: &'a [u8],
+}
+
+fn add_connection_with_bootstrap_sample(
+    app: &mut App,
+    sr: &mut ScreenReader,
+    physical: &mut Vec<u8>,
+    connection_id: u64,
+    pending_reports: &[(u64, &str)],
+    captured_status: Option<BootstrapSample<'_>>,
 ) -> TmuxGatewayRouter {
     let mut router = TmuxGatewayRouter::with_first_connection_id(connection_id);
     feed(
@@ -172,12 +190,48 @@ fn add_ready_connection(
             String::from_utf8_lossy(&commands)
         );
     }
-    for (index, pane_id) in [20, 21, 22, 23].into_iter().enumerate() {
+    for &(pane, report) in pending_reports {
+        feed(app, sr, &mut router, &pane_output(pane, report), physical);
+    }
+    let commands = std::str::from_utf8(&commands).unwrap();
+    assert_eq!(
+        app.debug_tmux_expected_reply_count(connection_id),
+        Some(commands.lines().count()),
+        "each bootstrap sequence must occupy one bounded reply slot"
+    );
+    for (index, command) in commands.lines().enumerate() {
+        let (_, target) = command.rsplit_once("-t %").expect("capture target");
+        let pane_id: u64 = target.parse().unwrap();
+        let pending = captured_status
+            .as_ref()
+            .filter(|sample| sample.pane == pane_id);
+        let sample = pending.map_or_else(
+            || format!("T\t%{pane_id}\t\t"),
+            |sample| format!("T\t%{pane_id}\t{}\t{}", sample.state, sample.name),
+        );
         feed(
             app,
             sr,
             &mut router,
-            &reply(30 + index, &[format!("ready-{pane_id}").into_bytes()]),
+            &reply(30 + index * 3, &[sample.into_bytes()]),
+            physical,
+        );
+        let pending_escape = pending
+            .map(|sample| sample.pending_escape.to_vec())
+            .into_iter()
+            .collect::<Vec<_>>();
+        feed(
+            app,
+            sr,
+            &mut router,
+            &reply(31 + index * 3, &pending_escape),
+            physical,
+        );
+        feed(
+            app,
+            sr,
+            &mut router,
+            &reply(32 + index * 3, &[format!("ready-{pane_id}").into_bytes()]),
             physical,
         );
     }
@@ -744,65 +798,22 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
     std::fs::create_dir_all(&socket_dir).unwrap();
     let socket = socket_dir.join(format!("bells-{}-{unique}.sock", std::process::id()));
     let session = format!("lector_bells_{}_{unique}", std::process::id());
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .unwrap();
-    let mut command = CommandBuilder::new("tmux");
-    command.args([
-        "-S",
-        socket.to_str().unwrap(),
-        "-f",
-        "/dev/null",
-        "-CC",
-        "new-session",
-        "-s",
-        &session,
-        "/bin/sh -c 'printf ACTIVE_READY; exec /bin/sh'",
-    ]);
-    command.env("TERM", "xterm-256color");
-    command.env_remove("TMUX");
-    command.env_remove("TMUX_PANE");
-    let mut child = pair.slave.spawn_command(command).unwrap();
-    drop(pair.slave);
-    let mut reader = pair.master.try_clone_reader().unwrap();
-    let mut writer = pair.master.take_writer().unwrap();
-    let (sender, receiver) = mpsc::channel();
-    let read_thread = thread::spawn(move || {
-        let mut buffer = [0_u8; 4096];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(count) => {
-                    if sender.send(buffer[..count].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(error) if error.raw_os_error() == Some(5) => break,
-                Err(error) => panic!("read real tmux bell PTY: {error}"),
-            }
-        }
-    });
-
-    let recorder = Recorder::default();
-    let stack = views::ViewStack::new(Box::new(views::PtyView::new(24, 80)));
-    let mut app = App::new(stack).unwrap();
-    let mut sr = ScreenReader::new(speech::Speech::new(Box::new(recorder.clone())));
-    let mut physical = Vec::new();
-    drive_real_tmux(
-        "initial activity pane bootstrap",
-        &mut app,
-        &mut sr,
-        &receiver,
-        writer.as_mut(),
-        &mut physical,
-        |app| app.debug_active_view_contents().contains("ACTIVE_READY"),
+    let mut client = RealTmuxClient::start(
+        &socket,
+        &[
+            "-f",
+            "/dev/null",
+            "-CC",
+            "new-session",
+            "-s",
+            &session,
+            "/bin/sh -c 'printf ACTIVE_READY; exec /bin/sh'",
+        ],
     );
-    let topology = app.debug_tmux_topology(1).unwrap();
+    client.drive("initial activity pane bootstrap", |app| {
+        app.debug_active_view_contents().contains("ACTIVE_READY")
+    });
+    let topology = client.app.debug_tmux_topology(1).unwrap();
     let background_pane = pane_id_at_index(&topology, 0).expect("background pane id");
 
     super::run_real_tmux_fixture_command(
@@ -816,21 +827,13 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
             "/bin/sh -c 'printf FOREGROUND_READY; exec /bin/sh'",
         ],
     );
-    drive_real_tmux(
-        "foreground window bootstrap",
-        &mut app,
-        &mut sr,
-        &receiver,
-        writer.as_mut(),
-        &mut physical,
-        |app| {
-            app.debug_active_view_contents()
-                .contains("FOREGROUND_READY")
-        },
-    );
+    client.drive("foreground window bootstrap", |app| {
+        app.debug_active_view_contents()
+            .contains("FOREGROUND_READY")
+    });
 
-    sr.set_tmux_bell_mode(TmuxBellMode::Spoken);
-    recorder.clear();
+    client.sr.set_tmux_bell_mode(TmuxBellMode::Spoken);
+    client.recorder.clear();
     super::run_real_tmux_fixture_command(
         &socket,
         &[
@@ -841,24 +844,16 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
             "Enter",
         ],
     );
-    drive_real_tmux(
-        "background window activity",
-        &mut app,
-        &mut sr,
-        &receiver,
-        writer.as_mut(),
-        &mut physical,
-        |app| {
-            app.debug_tmux_pane_contents(1, background_pane)
-                .is_some_and(|contents| contents.contains("BACKGROUND_DONE"))
-        },
-    );
+    client.drive("background window activity", |app| {
+        app.debug_tmux_pane_contents(1, background_pane)
+            .is_some_and(|contents| contents.contains("BACKGROUND_DONE"))
+    });
     assert!(
-        recorder.messages().is_empty(),
+        client.recorder.messages().is_empty(),
         "ordinary background activity was announced: {:?}",
-        recorder.messages()
+        client.recorder.messages()
     );
-    assert!(app.last_tmux_bell_source().is_none());
+    assert!(client.app.last_tmux_bell_source().is_none());
 
     super::run_real_tmux_fixture_command(
         &socket,
@@ -870,16 +865,12 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
             "Enter",
         ],
     );
-    drive_real_tmux(
-        "background pane bell",
-        &mut app,
-        &mut sr,
-        &receiver,
-        writer.as_mut(),
-        &mut physical,
-        |_| !recorder.messages().is_empty(),
-    );
-    let source = app.last_tmux_bell_source().expect("real pane bell source");
+    let recorder = client.recorder.clone();
+    client.drive("background pane bell", |_| !recorder.messages().is_empty());
+    let source = client
+        .app
+        .last_tmux_bell_source()
+        .expect("real pane bell source");
     assert_eq!(source.connection_id, 1);
     assert_eq!(source.pane_id, PaneId(background_pane));
     assert_eq!(source.session_name, session);
@@ -895,7 +886,333 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
     );
 
     super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
-    let _ = child.wait().unwrap();
-    read_thread.join().unwrap();
+    drop(client);
     let _ = std::fs::remove_file(&socket);
+}
+
+#[test]
+fn tmux_program_status_observes_each_pane_and_respects_accessibility_settings() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
+    let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
+    recorder.clear();
+    physical.clear();
+    assert!(sr.program_status_announcements());
+    assert!(sr.auto_read_enabled());
+    let contents = app.debug_active_view_contents();
+
+    let blocked = "\\033]7501;state=blocked:app=Fixture:msg=c2FtcGxlIHJlYXNvbg==\\033\\134";
+    let working = "\\033]7501;state=working:app=Fixture\\033\\134";
+    let done = "\\033]7501;state=done:ignored=x;y:app=Fixture\\033\\134";
+
+    for (pane, report) in [(20, blocked), (21, blocked), (21, blocked)] {
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            &pane_output(pane, report),
+            &mut physical,
+        );
+    }
+    assert_eq!(recorder.messages(), ["Fixture needs attention"]);
+    assert_eq!(physical, b"\x07");
+
+    // Reports suppressed by auto-read were still observed. Toggling it
+    // off makes a new transition in the current pane eligible.
+    sr.set_auto_read_enabled(false);
+    let settings = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(settings.path(), "lector.o.tones = false").unwrap();
+    lector::lua::setup(settings.path().to_path_buf(), true, &mut sr, |_| Ok(())).unwrap();
+    for report in [blocked, done, done, working, done] {
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            &pane_output(20, report),
+            &mut physical,
+        );
+    }
+    assert_eq!(
+        recorder.messages(),
+        [
+            "Fixture needs attention",
+            "Fixture is done",
+            "Fixture is done"
+        ]
+    );
+    assert_eq!(physical, b"\x07");
+
+    std::fs::write(settings.path(), "lector.o.tones = true").unwrap();
+    lector::lua::setup(settings.path().to_path_buf(), true, &mut sr, |_| Ok(())).unwrap();
+    sr.set_program_status_announcements(false);
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(21, done),
+        &mut physical,
+    );
+    sr.set_program_status_announcements(true);
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(21, done),
+        &mut physical,
+    );
+    assert_eq!(recorder.messages().len(), 3);
+    assert_eq!(physical, b"\x07");
+    assert_eq!(app.debug_active_view_contents(), contents);
+    assert_eq!(app.active_tmux_connection(), Some(1));
+}
+
+#[test]
+fn tmux_bootstrap_uses_the_capture_time_status_after_buffered_transitions() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
+    let working = "\\033]7501;state=working:app=Fixture\\033\\134";
+    let blocked = "\\033]7501;state=blocked:app=Fixture\\033\\134";
+    let mut router = add_connection_with_bootstrap_sample(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &[(21, working), (21, blocked)],
+        Some(BootstrapSample {
+            pane: 21,
+            state: "blocked",
+            name: "Fixture",
+            pending_escape: &[],
+        }),
+    );
+    assert!(
+        !recorder
+            .messages()
+            .iter()
+            .any(|text| text == "Fixture needs attention")
+    );
+    recorder.clear();
+    for report in [blocked, working, blocked] {
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            &pane_output(21, report),
+            &mut physical,
+        );
+    }
+    assert_eq!(recorder.messages(), ["Fixture needs attention"]);
+}
+
+#[test]
+fn tmux_bootstrap_resumes_a_program_report_split_at_capture() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
+    let mut router = add_connection_with_bootstrap_sample(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &[(21, "\\033]7501;app=Fixture:state=bloc")],
+        Some(BootstrapSample {
+            pane: 21,
+            state: "working",
+            name: "Fixture",
+            pending_escape: b"\x1b]7501;app=Fixture:state=bloc",
+        }),
+    );
+    recorder.clear();
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(21, "ked\\033\\134"),
+        &mut physical,
+    );
+    assert_eq!(recorder.messages(), ["Fixture needs attention"]);
+    assert!(!app.debug_tmux_pane_contents(1, 21).unwrap().contains("ked"));
+}
+
+struct RealTmuxClient {
+    app: App,
+    sr: ScreenReader,
+    recorder: Recorder,
+    physical: Vec<u8>,
+    writer: Box<dyn Write + Send>,
+    receiver: mpsc::Receiver<Vec<u8>>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    reader: Option<thread::JoinHandle<()>>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+}
+
+impl RealTmuxClient {
+    fn start(socket: &std::path::Path, args: &[&str]) -> Self {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new("tmux");
+        command.args(["-S", socket.to_str().unwrap()]);
+        command.args(args);
+        command.env("TERM", "xterm-256color");
+        command.env_remove("TMUX");
+        command.env_remove("TMUX_PANE");
+        let child = pair.slave.spawn_command(command).unwrap();
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) if sender.send(buffer[..count].to_vec()).is_err() => break,
+                    Ok(_) => {}
+                    Err(error) if error.raw_os_error() == Some(5) => break,
+                    Err(error) => panic!("read control PTY: {error}"),
+                }
+            }
+        });
+        let recorder = Recorder::default();
+        let stack = views::ViewStack::new(Box::new(views::PtyView::new(24, 80)));
+        Self {
+            app: App::new(stack).unwrap(),
+            sr: ScreenReader::new(speech::Speech::new(Box::new(recorder.clone()))),
+            recorder,
+            physical: Vec::new(),
+            writer,
+            receiver,
+            child,
+            reader: Some(reader),
+            _master: pair.master,
+        }
+    }
+
+    fn attach(socket: &std::path::Path, session: &str) -> Self {
+        Self::start(socket, &["-CC", "attach", "-t", session])
+    }
+
+    fn drive(&mut self, case: &str, done: impl FnMut(&mut App) -> bool) {
+        drive_real_tmux(
+            case,
+            &mut self.app,
+            &mut self.sr,
+            &self.receiver,
+            self.writer.as_mut(),
+            &mut self.physical,
+            done,
+        );
+    }
+
+    fn wait_for(&mut self, pane: u64, text: &str) {
+        self.drive(text, |app| {
+            app.debug_active_view_contents().contains("STATUS READY")
+                && app
+                    .debug_tmux_pane_contents(1, pane)
+                    .is_some_and(|contents| contents.contains(text))
+        });
+    }
+}
+
+impl Drop for RealTmuxClient {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reader.take().unwrap().join().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "run through scripts/test-real-tmux-docker with the pinned OSC 7501 preview"]
+fn real_tmux_preview_announces_background_program_status_once_across_reattach() {
+    let _serial = super::serialize_real_tmux_test();
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tmux.sock");
+    let session = "program-status";
+    let fixture = env!("CARGO_BIN_EXE_lector-harness");
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "-e",
+            "LECTOR_TEST_PTY_MODE=program-status",
+            fixture,
+            "pty",
+        ],
+    );
+    let background = super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            session,
+            "-e",
+            "LECTOR_TEST_PTY_MODE=program-status",
+            fixture,
+            "pty",
+        ],
+    );
+    let target = background.trim();
+    let pane = target.strip_prefix('%').unwrap().parse().unwrap();
+    {
+        let mut client = RealTmuxClient::attach(&socket, session);
+        client.wait_for(pane, "STATUS READY");
+        client.recorder.clear();
+        super::run_real_tmux_fixture_command(&socket, &["send-keys", "-t", target, "p"]);
+        client.wait_for(pane, "PROBE ACCEPTED");
+        assert_eq!(client.recorder.messages(), ["Fixture needs attention"]);
+        assert!(
+            !client
+                .app
+                .debug_active_view_contents()
+                .contains("PROBE ACCEPTED")
+        );
+
+        assert_eq!(
+            super::run_real_tmux_fixture_command(
+                &socket,
+                &[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    target,
+                    "#{pane_program_state} #{pane_program_name}",
+                ],
+            )
+            .trim(),
+            "blocked Fixture"
+        );
+        super::run_real_tmux_fixture_command(&socket, &["detach-client", "-s", session]);
+    }
+    {
+        let mut client = RealTmuxClient::attach(&socket, session);
+        client.wait_for(pane, "PROBE ACCEPTED");
+        super::run_real_tmux_fixture_command(&socket, &["send-keys", "-t", target, "r"]);
+        client.wait_for(pane, "STATUS REPEATED");
+        assert!(
+            !client
+                .recorder
+                .messages()
+                .iter()
+                .any(|message| { message.contains("needs attention") })
+        );
+        assert!(
+            !client
+                .app
+                .debug_active_view_contents()
+                .contains("STATUS REPEATED")
+        );
+        super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
+    }
 }

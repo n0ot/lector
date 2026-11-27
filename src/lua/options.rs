@@ -69,6 +69,7 @@ reader_options! {
     booleans {
         "help_mode" => help_mode, set_help_mode;
         "auto_read" => auto_read_enabled, set_auto_read_enabled;
+        "program_status_announcements" => program_status_announcements, set_program_status_announcements;
         "suppress_key_echo" => suppress_key_echo, set_suppress_key_echo;
         "report_indentation" => indentation_reporting_enabled, set_indentation_reporting_enabled;
         "review_follows_screen_cursor" | "rev_follows" => review_follows_screen_cursor, set_review_follows_screen_cursor;

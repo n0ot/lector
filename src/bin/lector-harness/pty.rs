@@ -36,6 +36,7 @@ pub(super) fn run() -> Result<()> {
         Ok("latency") => latency(),
         Ok("nested-lector") => nested_lector(),
         Ok("parent") => parent(),
+        Ok("program-status") => program_status(),
         Ok("prompt") => prompt(),
         Ok(mode) => bail!("unknown PTY test fixture mode {mode:?}"),
         Err(_) => bail!("{MODE_ENV} is required"),
@@ -94,6 +95,32 @@ fn bell() -> Result<()> {
     while let Some(byte) = read_byte()? {
         match byte {
             0x7f => write_bytes(b"\x07")?,
+            b'q' => return Ok(()),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn program_status() -> Result<()> {
+    make_stdin_raw()?;
+    write_bytes(b"STATUS READY")?;
+    const BLOCKED: &[u8] = b"\x1b]7501;state=blocked:app=Fixture:msg=c2FtcGxlIHJlYXNvbg==\x1b\\";
+    while let Some(command) = read_byte()? {
+        match command {
+            b'p' => {
+                const REPLY: &[u8] = b"\x1b]7501;?\x1b\\";
+                write_bytes(b"\x1b]7501;?\x1b\\\x1b[c")?;
+                let mut reply = [0; REPLY.len()];
+                io::stdin().read_exact(&mut reply)?;
+                anyhow::ensure!(reply == REPLY, "program status probe received {reply:?}");
+                write_bytes(BLOCKED)?;
+                write_bytes(b"\r\nPROBE ACCEPTED")?;
+            }
+            b'r' => {
+                write_bytes(BLOCKED)?;
+                write_bytes(b"\r\nSTATUS REPEATED")?;
+            }
             b'q' => return Ok(()),
             _ => {}
         }

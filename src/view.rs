@@ -560,6 +560,7 @@ impl TextCaches {
 
 pub struct View {
     view_id: ViewId,
+    program_status: crate::program_status::ProgramStatusTracker,
     review_navigation: [crate::review::navigation::SharedNavigation; 2],
     presentation_tracking: bool,
     live_revision: ViewRevision,
@@ -649,6 +650,7 @@ impl View {
         let presented_history_basis = PresentedHistoryBasis::from_snapshot(&committed_snapshot);
         View {
             review_navigation: Default::default(),
+            program_status: Default::default(),
             view_id: ViewId(NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed)),
             presentation_tracking: false,
             live_revision: ViewRevision(0),
@@ -1587,6 +1589,23 @@ impl View {
             }
         }
         speech
+    }
+
+    pub(crate) fn program_status_announcements(
+        &mut self,
+        update: &mut UpdateSummary,
+    ) -> Vec<String> {
+        std::mem::take(&mut update.program_status_updates)
+            .into_iter()
+            .filter_map(|update| self.program_status.observe(update))
+            .collect()
+    }
+
+    pub(crate) fn restore_program_status(
+        &mut self,
+        status: Option<crate::program_status::ProgramStatus>,
+    ) {
+        self.program_status.restore(status);
     }
 
     fn consume_application_accessibility(

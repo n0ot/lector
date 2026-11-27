@@ -277,7 +277,7 @@ impl App {
             .model()
             .live_screen()
             .kitty_keyboard_flags();
-        let terminal_update = self
+        let mut terminal_update = self
             .view_stack
             .root_mut()
             .model()
@@ -343,6 +343,13 @@ impl App {
                 | crate::terminal_protocol::EffectDisposition::Drop => {}
             }
         }
+        let announcements = self
+            .view_stack
+            .root_mut()
+            .model()
+            .program_status_announcements(&mut terminal_update);
+        let current = self.view_stack.presented_tmux_connection_mut().is_none();
+        self.announce_program_status(sr, announcements, current, term_out)?;
         let output_screen = (
             terminal_update.screen_after,
             terminal_update.screen_before != terminal_update.screen_after,
@@ -365,6 +372,28 @@ impl App {
             output_screen.1,
             adaptive_quiet_trainable,
         );
+        Ok(())
+    }
+
+    fn announce_program_status(
+        &mut self,
+        sr: &mut ScreenReader,
+        announcements: Vec<String>,
+        current: bool,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        if !sr.program_status_announcements()
+            || !sr.terminal_focused()
+            || (current && sr.auto_read_enabled())
+        {
+            return Ok(());
+        }
+        for text in announcements {
+            if sr.speech().tones_requested() {
+                self.emit_physical_bells(term_out, 1)?;
+            }
+            sr.speak(&text, false)?;
+        }
         Ok(())
     }
 
@@ -507,6 +536,8 @@ impl App {
         }
         self.pending_tmux_commands
             .retain(|command| !removed_connections.contains(&command.connection_id));
+        self.waiting_tmux_bootstraps
+            .retain(|command| !removed_connections.contains(&command.connection_id));
         self.pending_tmux_session_switches
             .retain(|connection_id, _| !removed_connections.contains(connection_id));
         self.tmux_carrier_leases
@@ -590,6 +621,7 @@ impl App {
         else {
             return Ok(());
         };
+        let replies_before = connection.expected_replies.len();
         let Some(step) = connection.step_control(
             event,
             now_ms,
@@ -599,6 +631,12 @@ impl App {
         else {
             return Ok(());
         };
+        if connection.expected_replies.len() < replies_before {
+            // Bootstrap work is required for readiness. Retry only after a
+            // reply frees capacity so a silent peer cannot cause a tick loop.
+            self.pending_tmux_commands
+                .append(&mut self.waiting_tmux_bootstraps);
+        }
         let TmuxControlStep {
             pane_resync_result,
             carrier_reply,
@@ -755,16 +793,14 @@ impl App {
         let mut announce_tmux_location = location_changed;
 
         // 2. Queue commands with their replies before synchronizing views.
-        if let Some((pane_id, command)) = bootstrap_retry {
-            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+        if let Some((pane_id, command, sample_status)) = bootstrap_retry {
+            self.queue_tmux_bootstrap_capture(
                 connection_id,
-                bytes: command,
-                expected_replies: vec![ExpectedTmuxReply::Bootstrap {
-                    pane_id,
-                    line_flags: false,
-                }],
-                kind: PendingTmuxCommandKind::Ordinary,
-            });
+                pane_id,
+                command,
+                false,
+                sample_status,
+            );
         }
         if request_resync {
             self.queue_tmux_inventory(connection_id);
@@ -884,17 +920,19 @@ impl App {
             self.open_review(sr, false, term_out)?;
         }
         // 4. Applying captures may raise new render/announcement/resume work.
-        if let Some((pane_id, status, output, line_flags)) = bootstrap_reply {
+        if let Some((capture, status, output)) = bootstrap_reply {
+            let pane_id = capture.pane_id;
             self.pending_tmux_background_output
                 .remove((connection_id, pane_id));
             let bootstrap_replies =
                 if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
                     let was_ready = view.is_ready();
-                    let replies = view.apply_bootstrap_with_line_flags(
+                    let replies = view.apply_bootstrap_capture(
                         pane_id,
                         status,
                         &output,
-                        line_flags,
+                        capture.line_flags,
+                        capture.recovered,
                         self.clock.now_ms(),
                     )?;
                     let is_ready = view.is_ready() && !view.is_showing_portal();
@@ -1677,6 +1715,20 @@ impl App {
         if let Some(outcome) = &mut outcome {
             let replies = std::mem::take(&mut outcome.update.pty_replies);
             self.queue_tmux_pane_report_replies(connection_id, pane_id, &replies)?;
+            let current = self
+                .view_stack
+                .presented_tmux_connection_mut()
+                .is_some_and(|view| {
+                    view.connection_id() == connection_id
+                        && !view.is_showing_portal()
+                        && view.is_active_pane(pane_id)
+                });
+            self.announce_program_status(
+                sr,
+                std::mem::take(&mut outcome.program_announcements),
+                current,
+                term_out,
+            )?;
         }
         let bells = outcome.as_ref().map_or(0, |outcome| outcome.bells);
         let output_screen = outcome.as_ref().map(|outcome| {
@@ -1774,6 +1826,8 @@ impl App {
         self.tmux_connections
             .retain(|connection| !removed.contains(&connection.id));
         self.pending_tmux_commands
+            .retain(|command| !removed.contains(&command.connection_id));
+        self.waiting_tmux_bootstraps
             .retain(|command| !removed.contains(&command.connection_id));
         self.pending_direct_gateway_input
             .retain(|input| !removed.contains(&input.connection_id));
@@ -1981,15 +2035,13 @@ impl App {
             if !capture_line_flags && let Some(pane) = topology.pane(request.pane_id) {
                 request.command = crate::tmux_panes::portable_capture_command(pane);
             }
-            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+            self.queue_tmux_bootstrap_capture(
                 connection_id,
-                bytes: request.command,
-                expected_replies: vec![ExpectedTmuxReply::Bootstrap {
-                    pane_id: request.pane_id,
-                    line_flags: capture_line_flags,
-                }],
-                kind: PendingTmuxCommandKind::Ordinary,
-            });
+                request.pane_id,
+                request.command,
+                capture_line_flags,
+                topology.bootstrap_samples_program_status(),
+            );
         }
         for pane_id in pane_resync_requests {
             self.queue_tmux_pane_resync(connection_id, pane_id)?;
@@ -2001,6 +2053,39 @@ impl App {
             .map(|chooser| chooser.sync_topology(&topology))
             .is_some();
         Ok(chooser_updated)
+    }
+
+    fn queue_tmux_bootstrap_capture(
+        &mut self,
+        connection_id: u64,
+        pane_id: crate::tmux_model::PaneId,
+        command: Vec<u8>,
+        line_flags: bool,
+        sample_status: bool,
+    ) {
+        let (bytes, stage) = if sample_status {
+            (
+                join_tmux_command_sequence(&[
+                    crate::tmux_model::pane_program_status_command(pane_id),
+                    crate::tmux_panes::pending_escape_capture_command(pane_id),
+                    command,
+                ]),
+                BootstrapCaptureStage::ProgramStatus,
+            )
+        } else {
+            (command, BootstrapCaptureStage::Screen)
+        };
+        self.pending_tmux_commands.push_back(PendingTmuxCommand {
+            connection_id,
+            bytes,
+            expected_replies: vec![ExpectedTmuxReply::Bootstrap(PendingTmuxBootstrap {
+                pane_id,
+                line_flags,
+                stage,
+                recovered: Default::default(),
+            })],
+            kind: PendingTmuxCommandKind::Ordinary,
+        });
     }
 
     pub(super) fn queue_tmux_input(
@@ -2635,13 +2720,22 @@ impl App {
         &mut self,
         command: PendingTmuxCommand,
     ) -> Result<Option<(u64, Vec<Vec<u8>>)>> {
-        if !self
+        let Some(connection) = self
             .tmux_connections
             .iter()
-            .any(|connection| connection.id == command.connection_id)
-        {
+            .find(|connection| connection.id == command.connection_id)
+        else {
             return Ok(None);
-        }
+        };
+        let bootstrap_retry =
+            if let [ExpectedTmuxReply::Bootstrap(capture)] = command.expected_replies.as_slice() {
+                if connection.topology.pane(capture.pane_id).is_none() {
+                    return Ok(None);
+                }
+                Some(command.clone())
+            } else {
+                None
+            };
         let mut connection_id = command.connection_id;
         let mut encoded = match command.kind {
             PendingTmuxCommandKind::Input(pane_id) => {
@@ -2700,10 +2794,14 @@ impl App {
                             > TMUX_EXPECTED_REPLY_LIMIT
                     });
                     if reply_backlog_exceeded {
-                        self.log_event(&format!(
-                            "discarded tmux command because reply backlog is saturated connection={}",
-                            command.connection_id
-                        ));
+                        if let Some(bootstrap) = bootstrap_retry {
+                            self.waiting_tmux_bootstraps.push_back(bootstrap);
+                        } else {
+                            self.log_event(&format!(
+                                "discarded tmux command because reply backlog is saturated connection={}",
+                                command.connection_id
+                            ));
+                        }
                         return Ok(None);
                     }
                     for (index, expected_replies) in reply_additions {
@@ -3008,7 +3106,12 @@ fn join_tmux_command_sequence(commands: &[Vec<u8>]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{TmuxConnectionState, join_tmux_command_sequence};
+    use super::*;
+    use crate::{
+        speech::Speech,
+        tmux_control::{CommandStatus, ControlEvent},
+        tmux_model::PaneId,
+    };
 
     #[test]
     fn tmux_flow_retry_backoff_is_exponential_and_capped() {
@@ -3021,6 +3124,64 @@ mod tests {
         assert_eq!(
             TmuxConnectionState::tmux_flow_retry_delay_ms(u32::MAX),
             2_000
+        );
+    }
+
+    #[test]
+    fn tmux_bootstrap_waits_for_reply_capacity() {
+        let stack = views::ViewStack::new(Box::new(views::PtyView::new(4, 10)));
+        let mut app = App::new(stack).unwrap();
+        let mut sr = ScreenReader::new(Speech::silent());
+        let mut physical = Vec::new();
+        app.start_tmux_connection(&mut sr, 1, GatewayOrigin::Direct, &mut physical)
+            .unwrap();
+        app.pending_tmux_commands.clear();
+        let connection = &mut app.tmux_connections[0];
+        connection.initial_command_seen = true;
+        connection
+            .topology
+            .replace_inventory(&[
+                b"S\t$1\twork".to_vec(),
+                b"W\t$1\t@10\t1\t1\tb25f,10x4,0,0,20\tb25f,10x4,0,0,20\t*\tactive".to_vec(),
+                b"P\tstatus\t@10\t%20\t1\t1\t0\t0\t10\t4\t0\tactive".to_vec(),
+                b"A\t$1".to_vec(),
+            ])
+            .unwrap();
+        connection.expected_replies =
+            VecDeque::from(vec![ExpectedTmuxReply::Ignored; TMUX_EXPECTED_REPLY_LIMIT]);
+
+        app.queue_tmux_bootstrap_capture(
+            1,
+            PaneId(20),
+            b"capture-pane -p -t %20\n".to_vec(),
+            false,
+            true,
+        );
+        let mut wire = Vec::new();
+        app.drain_tmux_commands_for(1, &mut wire).unwrap();
+        assert!(wire.is_empty());
+        assert!(app.pending_tmux_commands.is_empty());
+        assert_eq!(app.waiting_tmux_bootstraps.len(), 1);
+
+        app.process_tmux_control(
+            &mut sr,
+            1,
+            ControlEvent::Command {
+                timestamp: 1,
+                number: 1,
+                flags: 0,
+                status: CommandStatus::Success,
+                output: Vec::new(),
+            },
+            &mut physical,
+        )
+        .unwrap();
+        assert!(app.waiting_tmux_bootstraps.is_empty());
+        app.drain_tmux_commands_for(1, &mut wire).unwrap();
+        assert!(wire.ends_with(b"capture-pane -p -t %20\n"));
+        assert_eq!(
+            app.debug_tmux_expected_reply_count(1),
+            Some(TMUX_EXPECTED_REPLY_LIMIT)
         );
     }
 
