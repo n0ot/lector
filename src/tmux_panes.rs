@@ -484,6 +484,12 @@ pub struct BootstrapRequest {
     pub command: Vec<u8>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct BootstrapTerminalState {
+    pub program_status: Option<crate::program_status::ProgramStatus>,
+    pub pending_escape: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum TmuxPaneError {
     #[error(transparent)]
@@ -508,7 +514,6 @@ struct PaneState {
     metadata: Pane,
     surface_id: SurfaceId,
     bootstrap_requested: bool,
-    bootstrap_program_status: Option<crate::program_status::ProgramStatus>,
     bootstrapped: bool,
     prebootstrap_output: Vec<u8>,
 }
@@ -624,7 +629,6 @@ impl TmuxPaneSet {
                     metadata: pane.clone(),
                     surface_id,
                     bootstrap_requested: false,
-                    bootstrap_program_status: None,
                     bootstrapped: false,
                     prebootstrap_output: self.orphan_output.remove(&pane.id).unwrap_or_default(),
                 }
@@ -749,18 +753,6 @@ impl TmuxPaneSet {
         Ok(Some(update))
     }
 
-    pub(crate) fn set_bootstrap_program_status(
-        &mut self,
-        pane_id: PaneId,
-        status: Option<crate::program_status::ProgramStatus>,
-    ) {
-        if let Some(pane) = self.panes.get_mut(&pane_id)
-            && !pane.bootstrapped
-        {
-            pane.bootstrap_program_status = status;
-        }
-    }
-
     pub fn apply_bootstrap(
         &mut self,
         pane_id: PaneId,
@@ -779,14 +771,31 @@ impl TmuxPaneSet {
         line_flags: bool,
         now_ms: u128,
     ) -> Result<Vec<u8>, TmuxPaneError> {
+        self.apply_bootstrap_capture(
+            pane_id,
+            status,
+            output,
+            line_flags,
+            BootstrapTerminalState::default(),
+            now_ms,
+        )
+    }
+
+    pub(crate) fn apply_bootstrap_capture(
+        &mut self,
+        pane_id: PaneId,
+        status: CommandStatus,
+        output: &[Vec<u8>],
+        line_flags: bool,
+        recovered: BootstrapTerminalState,
+        now_ms: u128,
+    ) -> Result<Vec<u8>, TmuxPaneError> {
         let state = self
             .panes
             .get_mut(&pane_id)
             .ok_or(TmuxPaneError::UnknownPane(pane_id.0))?;
         if status == CommandStatus::Error {
-            state
-                .view
-                .restore_program_status(state.bootstrap_program_status.take());
+            state.view.restore_program_status(recovered.program_status);
             state.bootstrapped = true;
             state.bootstrap_requested = false;
             let buffered = std::mem::take(&mut state.prebootstrap_output);
@@ -832,11 +841,21 @@ impl TmuxPaneSet {
             },
         );
         view.process_changes(&bytes);
-        if !view.screen().has_visible_non_whitespace_content() && !buffered.is_empty() {
+        let replay_buffered =
+            !view.screen().has_visible_non_whitespace_content() && !buffered.is_empty();
+        if replay_buffered {
             view.process_changes(&buffered);
         }
+        // A capture of cells cannot recover an unfinished terminal sequence.
+        // Resume the parser unless empty-screen fallback already replayed
+        // this exact unfinished suffix.
+        if !recovered.pending_escape.is_empty()
+            && !(replay_buffered && buffered.ends_with(&recovered.pending_escape))
+        {
+            view.process_changes(&recovered.pending_escape);
+        }
         view.discard_shadow_pty_replies();
-        view.restore_program_status(state.bootstrap_program_status.take());
+        view.restore_program_status(recovered.program_status);
         // An authoritative capture establishes the pane's diff baseline; it is
         // not application output to announce. Finalize it while parsing is
         // still the publication boundary, then let physical receipts own every
@@ -1580,7 +1599,6 @@ mod synchronization_tests {
                     },
                     surface_id,
                     bootstrap_requested: false,
-                    bootstrap_program_status: None,
                     bootstrapped: true,
                     prebootstrap_output: Vec::new(),
                 },

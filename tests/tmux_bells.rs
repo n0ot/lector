@@ -127,13 +127,20 @@ fn add_ready_connection(
     add_connection_with_bootstrap_sample(app, sr, physical, connection_id, &[], None)
 }
 
+struct BootstrapSample<'a> {
+    pane: u64,
+    state: &'a str,
+    name: &'a str,
+    pending_escape: &'a [u8],
+}
+
 fn add_connection_with_bootstrap_sample(
     app: &mut App,
     sr: &mut ScreenReader,
     physical: &mut Vec<u8>,
     connection_id: u64,
     pending_reports: &[(u64, &str)],
-    captured_status: Option<(u64, &str, &str)>,
+    captured_status: Option<BootstrapSample<'_>>,
 ) -> TmuxGatewayRouter {
     let mut router = TmuxGatewayRouter::with_first_connection_id(connection_id);
     feed(
@@ -186,27 +193,45 @@ fn add_connection_with_bootstrap_sample(
     for &(pane, report) in pending_reports {
         feed(app, sr, &mut router, &pane_output(pane, report), physical);
     }
-    for (index, command) in std::str::from_utf8(&commands).unwrap().lines().enumerate() {
+    let commands = std::str::from_utf8(&commands).unwrap();
+    assert_eq!(
+        app.debug_tmux_expected_reply_count(connection_id),
+        Some(commands.lines().count()),
+        "each bootstrap sequence must occupy one bounded reply slot"
+    );
+    for (index, command) in commands.lines().enumerate() {
         let (_, target) = command.rsplit_once("-t %").expect("capture target");
         let pane_id: u64 = target.parse().unwrap();
-        let sample = captured_status
-            .filter(|(sampled, _, _)| *sampled == pane_id)
-            .map_or_else(
-                || format!("T\t%{pane_id}\t\t"),
-                |(_, state, name)| format!("T\t%{pane_id}\t{state}\t{name}"),
-            );
+        let pending = captured_status
+            .as_ref()
+            .filter(|sample| sample.pane == pane_id);
+        let sample = pending.map_or_else(
+            || format!("T\t%{pane_id}\t\t"),
+            |sample| format!("T\t%{pane_id}\t{}\t{}", sample.state, sample.name),
+        );
         feed(
             app,
             sr,
             &mut router,
-            &reply(30 + index * 2, &[sample.into_bytes()]),
+            &reply(30 + index * 3, &[sample.into_bytes()]),
+            physical,
+        );
+        let pending_escape = pending
+            .map(|sample| sample.pending_escape.to_vec())
+            .into_iter()
+            .collect::<Vec<_>>();
+        feed(
+            app,
+            sr,
+            &mut router,
+            &reply(31 + index * 3, &pending_escape),
             physical,
         );
         feed(
             app,
             sr,
             &mut router,
-            &reply(31 + index * 2, &[format!("ready-{pane_id}").into_bytes()]),
+            &reply(32 + index * 3, &[format!("ready-{pane_id}").into_bytes()]),
             physical,
         );
     }
@@ -951,7 +976,12 @@ fn tmux_bootstrap_uses_the_capture_time_status_after_buffered_transitions() {
         &mut physical,
         1,
         &[(21, working), (21, blocked)],
-        Some((21, "blocked", "Fixture")),
+        Some(BootstrapSample {
+            pane: 21,
+            state: "blocked",
+            name: "Fixture",
+            pending_escape: &[],
+        }),
     );
     assert!(
         !recorder
@@ -970,6 +1000,34 @@ fn tmux_bootstrap_uses_the_capture_time_status_after_buffered_transitions() {
         );
     }
     assert_eq!(recorder.messages(), ["Fixture needs attention"]);
+}
+
+#[test]
+fn tmux_bootstrap_resumes_a_program_report_split_at_capture() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
+    let mut router = add_connection_with_bootstrap_sample(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &[(21, "\\033]7501;app=Fixture:state=bloc")],
+        Some(BootstrapSample {
+            pane: 21,
+            state: "working",
+            name: "Fixture",
+            pending_escape: b"\x1b]7501;app=Fixture:state=bloc",
+        }),
+    );
+    recorder.clear();
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(21, "ked\\033\\134"),
+        &mut physical,
+    );
+    assert_eq!(recorder.messages(), ["Fixture needs attention"]);
+    assert!(!app.debug_tmux_pane_contents(1, 21).unwrap().contains("ked"));
 }
 
 struct RealTmuxClient {

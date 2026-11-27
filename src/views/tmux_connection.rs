@@ -250,14 +250,6 @@ impl TmuxConnectionView {
         }))
     }
 
-    pub(crate) fn set_bootstrap_program_status(
-        &mut self,
-        pane_id: PaneId,
-        status: Option<crate::program_status::ProgramStatus>,
-    ) {
-        self.panes.set_bootstrap_program_status(pane_id, status);
-    }
-
     pub fn apply_bootstrap(
         &mut self,
         pane_id: PaneId,
@@ -281,10 +273,29 @@ impl TmuxConnectionView {
         line_flags: bool,
         now_ms: u128,
     ) -> std::result::Result<Vec<u8>, TmuxPaneError> {
+        self.apply_bootstrap_capture(
+            pane_id,
+            status,
+            output,
+            line_flags,
+            crate::tmux_panes::BootstrapTerminalState::default(),
+            now_ms,
+        )
+    }
+
+    pub(crate) fn apply_bootstrap_capture(
+        &mut self,
+        pane_id: PaneId,
+        status: CommandStatus,
+        output: &[Vec<u8>],
+        line_flags: bool,
+        recovered: crate::tmux_panes::BootstrapTerminalState,
+        now_ms: u128,
+    ) -> std::result::Result<Vec<u8>, TmuxPaneError> {
         let previous = self.active_document();
         let result = self
             .panes
-            .apply_bootstrap_with_line_flags(pane_id, status, output, line_flags, now_ms);
+            .apply_bootstrap_capture(pane_id, status, output, line_flags, recovered, now_ms);
         if result.is_ok() {
             self.finish_document_model_change(previous);
         }
