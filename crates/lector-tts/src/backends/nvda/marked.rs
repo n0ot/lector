@@ -315,13 +315,14 @@ fn speak_ssml(
     if status != 0 {
         return stopped_or_failed(shared, status);
     }
-    let missing = delivered.missed;
-    if !missing.is_empty() {
-        let labels = missing
-            .iter()
-            .map(|cue| cue.spoken_label())
-            .collect::<Vec<_>>()
-            .join(" ");
+    let labels = delivered
+        .missed
+        .iter()
+        .map(|cue| cue.spoken_label())
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !labels.is_empty() {
         let fallback = job.label_fallback(labels);
         let (status, _) = call_marked(
             controller,

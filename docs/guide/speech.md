@@ -180,5 +180,6 @@ is off. Background panes in a supported tmux session can announce them either
 way.
 
 Set `lector.o.program_status_announcements = false` to silence both the
-announcement and its accompanying terminal bell. Set `lector.o.tones = false`
-for speech alone.
+announcement and its tone. The tone plays through a compatible speech host.
+Set `lector.o.tones = false` for speech alone. Hosts without program status
+cue support still speak the same announcement.

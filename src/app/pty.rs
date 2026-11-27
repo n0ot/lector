@@ -349,7 +349,7 @@ impl App {
             .model()
             .program_status_announcements(&mut terminal_update);
         let current = self.view_stack.presented_tmux_connection_mut().is_none();
-        self.announce_program_status(sr, announcements, current, term_out)?;
+        Self::announce_program_status(sr, announcements, current)?;
         let output_screen = (
             terminal_update.screen_after,
             terminal_update.screen_before != terminal_update.screen_after,
@@ -376,11 +376,9 @@ impl App {
     }
 
     fn announce_program_status(
-        &mut self,
         sr: &mut ScreenReader,
         announcements: Vec<String>,
         current: bool,
-        term_out: &mut dyn Write,
     ) -> Result<()> {
         if !sr.program_status_announcements()
             || !sr.terminal_focused()
@@ -389,10 +387,7 @@ impl App {
             return Ok(());
         }
         for text in announcements {
-            if sr.speech().tones_requested() {
-                self.emit_physical_bells(term_out, 1)?;
-            }
-            sr.speak(&text, false)?;
+            sr.speak_program_status(&text)?;
         }
         Ok(())
     }
@@ -1723,11 +1718,10 @@ impl App {
                         && !view.is_showing_portal()
                         && view.is_active_pane(pane_id)
                 });
-            self.announce_program_status(
+            Self::announce_program_status(
                 sr,
                 std::mem::take(&mut outcome.program_announcements),
                 current,
-                term_out,
             )?;
         }
         let bells = outcome.as_ref().map_or(0, |outcome| outcome.bells);

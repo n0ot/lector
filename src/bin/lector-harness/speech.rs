@@ -27,6 +27,7 @@ struct State {
     rpc_log: Option<File>,
     stall_speech: bool,
     legacy_protocol: bool,
+    sound_cues: bool,
     generation: u64,
     identity: String,
     crash_speak: bool,
@@ -39,6 +40,7 @@ struct Options {
     adversary: Option<String>,
     pid_file: Option<PathBuf>,
     legacy_protocol: bool,
+    sound_cues: bool,
     speech_log: Option<PathBuf>,
     rpc_log: Option<PathBuf>,
     lifecycle_state: Option<PathBuf>,
@@ -52,6 +54,7 @@ pub(super) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--legacy" => options.legacy_protocol = true,
+            "--sound-cues" => options.sound_cues = true,
             "--adversary" => {
                 options.adversary = Some(required_arg(&mut args, "--adversary")?);
             }
@@ -133,6 +136,7 @@ pub(super) fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         rpc_log,
         stall_speech: std::env::var_os("LECTOR_PROC_STUB_STALL_SPEECH").is_some(),
         legacy_protocol: options.legacy_protocol,
+        sound_cues: options.sound_cues,
         generation,
         identity: options.identity,
         crash_speak: options.crash_speak_generations.contains(&generation),
@@ -215,7 +219,7 @@ fn handle_request(request: Request, state: &mut State) -> Result<Value, RpcError
             "lector-proc-stub",
             env!("CARGO_PKG_VERSION"),
             Some(&backend),
-            &stub_capabilities(),
+            &stub_capabilities(state.sound_cues),
         )
     {
         if request.method == "initialize" && result.is_ok() {
@@ -369,11 +373,12 @@ fn stub_voices() -> Vec<VoiceInfo> {
     .collect()
 }
 
-fn stub_capabilities() -> SpeechCapabilities {
+fn stub_capabilities(sound_cues: bool) -> SpeechCapabilities {
     use lector::speech::protocol::{
         DeliveryGuarantee, EventCapability, LifecycleCapabilities, TerminalCapability,
     };
     SpeechCapabilities {
+        sound_cues,
         lifecycle: LifecycleCapabilities {
             started: EventCapability {
                 delivery: DeliveryGuarantee::Reliable,

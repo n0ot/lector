@@ -53,7 +53,7 @@ const MAX_CACHED_TEXT_BYTES: usize = 256;
 const MAX_CACHED_SAMPLES: usize = 480_000;
 const MAX_CACHED_SECONDS: usize = 10;
 const MAX_LIVE_LINK_PLAYERS: usize = 4;
-const STANDALONE_CUES: [SoundCue; 7] = [
+const EMBEDDED_CUES: [SoundCue; 8] = [
     SoundCue::Top,
     SoundCue::Bottom,
     SoundCue::Left,
@@ -61,6 +61,7 @@ const STANDALONE_CUES: [SoundCue; 7] = [
     SoundCue::Blank,
     SoundCue::Link,
     SoundCue::LinkExit,
+    SoundCue::ProgramStatus,
 ];
 
 fn playback_id() -> NativeUtteranceId {
@@ -122,7 +123,7 @@ pub(super) struct PreparedCues {
 
 impl PreparedCues {
     pub(super) fn new(volume: f32) -> Self {
-        let players = STANDALONE_CUES
+        let players = EMBEDDED_CUES
             .into_iter()
             .chain(std::iter::repeat_n(
                 SoundCue::Link,
@@ -139,7 +140,7 @@ impl PreparedCues {
             .collect();
         // Decode the embedded clips without touching an audio device. The
         // output graph is opened on the first actual playback request.
-        let clips: Vec<_> = STANDALONE_CUES
+        let clips: Vec<_> = EMBEDDED_CUES
             .into_iter()
             .filter_map(|cue| Clip::from_wave(cue.wav()).ok().map(|clip| (cue, clip)))
             .collect();

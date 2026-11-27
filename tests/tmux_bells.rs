@@ -914,7 +914,7 @@ fn tmux_program_status_observes_each_pane_and_respects_accessibility_settings() 
         );
     }
     assert_eq!(recorder.messages(), ["Fixture needs attention"]);
-    assert_eq!(physical, b"\x07");
+    assert!(physical.is_empty());
 
     // Reports suppressed by auto-read were still observed. Toggling it
     // off makes a new transition in the current pane eligible.
@@ -939,7 +939,7 @@ fn tmux_program_status_observes_each_pane_and_respects_accessibility_settings() 
             "Fixture is done"
         ]
     );
-    assert_eq!(physical, b"\x07");
+    assert!(physical.is_empty());
 
     std::fs::write(settings.path(), "lector.o.tones = true").unwrap();
     lector::lua::setup(settings.path().to_path_buf(), true, &mut sr, |_| Ok(())).unwrap();
@@ -960,7 +960,7 @@ fn tmux_program_status_observes_each_pane_and_respects_accessibility_settings() 
         &mut physical,
     );
     assert_eq!(recorder.messages().len(), 3);
-    assert_eq!(physical, b"\x07");
+    assert!(physical.is_empty());
     assert_eq!(app.debug_active_view_contents(), contents);
     assert_eq!(app.active_tmux_connection(), Some(1));
 }

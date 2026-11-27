@@ -75,7 +75,7 @@ Options live under `lector.o`.
 | `program_status_announcements` | `true` | Speak [program status updates](speech.md#program-status) and play their tone when enabled. |
 | `symbol_level` | | How much punctuation to speak: `"none"`, `"some"`, `"most"`, `"all"`, or `"character"`. |
 | `report_indentation` | `true` | Announce changes in indentation. |
-| `tones` | `true` | Play cues for review cursor boundaries, blank lines and characters, and OSC 8 links. Reads as `false` while the active host lacks cue support. |
+| `tones` | `true` | Play cues for review cursor boundaries, blank lines and characters, OSC 8 links, and program status announcements. Reads as `false` while the active host lacks cue support. |
 | `suppress_key_echo` | `false` | Do not speak output that just echoes what you typed. |
 | `stop_speech_on_focus_loss` | | Stop speaking when the terminal loses focus. |
 | `tmux_bells` | `"audible"` | How [tmux bells](tmux.md#bells) are reported: `"audible"`, `"spoken"`, or `"off"`. |

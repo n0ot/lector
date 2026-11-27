@@ -539,11 +539,6 @@ impl Speech {
         self.tones() && self.driver.supports_ordered_utterances()
     }
 
-    /// The user preference also controls cues produced by the terminal.
-    pub(crate) fn tones_requested(&self) -> bool {
-        self.tones
-    }
-
     pub fn set_tones(&mut self, enabled: bool) {
         self.tones = enabled;
     }
@@ -613,12 +608,27 @@ impl Speech {
             .map_err(Error::Driver)
     }
 
+    pub(crate) fn speak_program_status(&mut self, text: &str) -> Result<UtteranceId> {
+        self.speak_with_cues(text, &[], None, false, self.tones)
+    }
+
     pub fn speak_with_links_and_cue(
         &mut self,
         text: &str,
         link_spans: &[Range<usize>],
         direction: Option<(SoundCue, &'static str)>,
         interrupt: bool,
+    ) -> Result<UtteranceId> {
+        self.speak_with_cues(text, link_spans, direction, interrupt, false)
+    }
+
+    fn speak_with_cues(
+        &mut self,
+        text: &str,
+        link_spans: &[Range<usize>],
+        direction: Option<(SoundCue, &'static str)>,
+        interrupt: bool,
+        program_status_cue: bool,
     ) -> Result<UtteranceId> {
         if let Some((cue, fallback)) = direction
             && text.trim().is_empty()
@@ -656,7 +666,9 @@ impl Speech {
                 split_paragraphs_with_links(&expanded_end, &[])
             };
             if chunks.len() > 1
-                && (direction.is_some() || !self.driver.supports_ordered_utterances())
+                && (direction.is_some()
+                    || program_status_cue
+                    || !self.driver.supports_ordered_utterances())
             {
                 let (mut joined, mut links) = chunks.remove(0);
                 for (chunk, chunk_links) in chunks.drain(..) {
@@ -682,7 +694,11 @@ impl Speech {
                 } else {
                     UtteranceBoundary::Paragraph(self.paragraph_pause)
                 };
-                let cues = self.inline_cues(links, direction);
+                let cues = if program_status_cue {
+                    SpeechCues::ProgramStatus
+                } else {
+                    self.inline_cues(links, direction)
+                };
                 if let Err(error) = self.driver.speak_utterance_with_cues(
                     &chunk_id,
                     &chunk,

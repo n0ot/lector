@@ -35,12 +35,14 @@ pub fn append_spoken_announcement(
     label: &str,
 ) -> InsertedLink {
     let start = result.len();
-    if result.ends_with(|character: char| !character.is_whitespace()) {
-        result.push(' ');
-    }
-    result.push_str(label);
-    if text[offset..].starts_with(|character: char| !character.is_whitespace()) {
-        result.push(' ');
+    if !label.is_empty() {
+        if result.ends_with(|character: char| !character.is_whitespace()) {
+            result.push(' ');
+        }
+        result.push_str(label);
+        if text[offset..].starts_with(|character: char| !character.is_whitespace()) {
+            result.push(' ');
+        }
     }
     InsertedLink {
         start,
@@ -65,4 +67,21 @@ pub fn canonical_offset(offset: usize, inserted_links: &[InsertedLink]) -> usize
         let link = &inserted_links[index];
         link.canonical + offset.saturating_sub(link.end)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn program_status_does_not_insert_words_or_spaces_in_fallback_speech() {
+        let text = "Fixture needs attention";
+        let mut spoken = String::new();
+        let marker = append_cue_announcement(&mut spoken, text, 0, SoundCue::ProgramStatus);
+        spoken.push_str(text);
+
+        assert_eq!(spoken, text);
+        assert_eq!(marker.inserted_bytes(), 0);
+        assert_eq!(canonical_offset(8, &[marker]), 8);
+    }
 }

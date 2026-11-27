@@ -26,6 +26,10 @@ pub trait Host {
         self.capabilities().sound_cues && !self.has_legacy_queue()
     }
 
+    fn supports_program_status_cue(&self) -> bool {
+        false
+    }
+
     fn supports_link_exit(&self) -> bool {
         false
     }
@@ -586,7 +590,9 @@ impl SpeechManager {
         let rendered = utterance.cues.render(
             &utterance.text,
             host.supports_sound_cues()
-                && (!utterance.cues.uses_link_exit() || host.supports_link_exit()),
+                && (!utterance.cues.uses_link_exit() || host.supports_link_exit())
+                && (utterance.cues != SpeechCues::ProgramStatus
+                    || host.supports_program_status_cue()),
             host.supports_directional_overlay(),
             host.supports_standalone_pair(),
         );
@@ -850,6 +856,7 @@ mod tests {
         fail_resume: bool,
         legacy: bool,
         standalone_pair: bool,
+        program_status_cue: bool,
     }
 
     impl FakeHost {
@@ -897,6 +904,7 @@ mod tests {
                 fail_resume: false,
                 legacy: false,
                 standalone_pair: false,
+                program_status_cue: false,
             }
         }
 
@@ -918,6 +926,10 @@ mod tests {
     impl Host for FakeHost {
         fn capabilities(&self) -> &SpeechCapabilities {
             &self.capabilities
+        }
+
+        fn supports_program_status_cue(&self) -> bool {
+            self.program_status_cue
         }
 
         fn supports_standalone_pair(&self) -> bool {
@@ -980,6 +992,42 @@ mod tests {
 
         fn take_events(&mut self) -> Result<Vec<SpeechEventNotification>> {
             Ok(std::mem::take(&mut self.events))
+        }
+    }
+
+    #[test]
+    fn program_status_keeps_the_same_words_on_older_cue_hosts() {
+        for supports_status in [true, false] {
+            let mut host = FakeHost::full();
+            host.capabilities.sound_cues = true;
+            host.program_status_cue = supports_status;
+            let mut manager = SpeechManager::default();
+            let id = UtteranceId::new("status");
+            let text = "Fixture is done".to_owned();
+            manager
+                .submit_with_cues(
+                    &mut host,
+                    id.clone(),
+                    text.clone(),
+                    false,
+                    UtteranceBoundary::Immediate,
+                    SpeechCues::ProgramStatus,
+                )
+                .unwrap();
+
+            let expected = if supports_status {
+                Call::SpeakWithCues(
+                    id,
+                    text,
+                    vec![SoundCueAt {
+                        cue: SoundCue::ProgramStatus,
+                        offset: 0,
+                    }],
+                )
+            } else {
+                Call::Speak(id, text)
+            };
+            assert_eq!(host.calls, [expected]);
         }
     }
 

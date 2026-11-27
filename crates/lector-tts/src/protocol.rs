@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 
 pub const PROTOCOL_MAJOR: u16 = 2;
 pub const PROTOCOL_MIN_MINOR: u16 = 0;
-pub const PROTOCOL_MAX_MINOR: u16 = 6;
+pub const PROTOCOL_MAX_MINOR: u16 = 7;
+pub const PROGRAM_STATUS_CUE_PROTOCOL_MINOR: u16 = 7;
 pub const LINK_EXIT_PROTOCOL_MINOR: u16 = 6;
 pub const STANDALONE_CUE_PAIR_PROTOCOL_MINOR: u16 = 5;
 pub const DIRECTIONAL_OVERLAY_PROTOCOL_MINOR: u16 = 4;
@@ -323,6 +324,7 @@ pub enum SoundCue {
     Blank,
     Link,
     LinkExit,
+    ProgramStatus,
 }
 
 impl SoundCue {
@@ -336,6 +338,7 @@ impl SoundCue {
             Self::Blank => include_bytes!("../assets/blank.wav"),
             Self::LinkExit => include_bytes!("../assets/link-exit.wav"),
             Self::Link => include_bytes!("../assets/link.wav"),
+            Self::ProgramStatus => include_bytes!("../assets/program-status.wav"),
         }
     }
 
@@ -344,7 +347,8 @@ impl SoundCue {
         matches!(self, Self::Top | Self::Bottom | Self::Left | Self::Right)
     }
 
-    /// The spoken label used when the cue cannot be played.
+    /// The spoken label used when the cue cannot be played. An empty label
+    /// leaves the utterance as is.
     #[must_use]
     pub const fn spoken_label(self) -> &'static str {
         match self {
@@ -355,6 +359,7 @@ impl SoundCue {
             Self::Blank => "blank",
             Self::Link => "link",
             Self::LinkExit => "out of link",
+            Self::ProgramStatus => "",
         }
     }
 }
@@ -383,6 +388,17 @@ impl SoundCueAt {
             && cues.iter().any(|cue| cue.cue == SoundCue::LinkExit)
         {
             return false;
+        }
+        if cues.iter().any(|cue| cue.cue == SoundCue::ProgramStatus) {
+            return !text.is_empty()
+                && version.minor >= PROGRAM_STATUS_CUE_PROTOCOL_MINOR
+                && matches!(
+                    cues,
+                    [Self {
+                        cue: SoundCue::ProgramStatus,
+                        offset: 0,
+                    }]
+                );
         }
         if text.is_empty() {
             return match cues {
@@ -641,6 +657,30 @@ impl SpeechEventPayload {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn program_status_requires_a_sole_onset_with_speech_and_a_new_host() {
+        let status = SoundCueAt {
+            cue: SoundCue::ProgramStatus,
+            offset: 0,
+        };
+        let text = "Fixture is done";
+        assert!(SoundCueAt::valid_for(text, &[status]));
+        assert!(!SoundCueAt::valid_for_protocol(
+            text,
+            &[status],
+            ProtocolVersion { major: 2, minor: 6 },
+        ));
+        assert!(!SoundCueAt::valid_for("", &[status]));
+        assert!(!SoundCueAt::valid_for(
+            text,
+            &[SoundCueAt {
+                offset: 1,
+                ..status
+            }]
+        ));
+        assert!(!SoundCueAt::valid_for(text, &[status, status]));
+    }
+
     use super::*;
     use serde_json::json;
 
