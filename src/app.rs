@@ -1480,7 +1480,11 @@ struct TmuxControlStep {
         Vec<Vec<u8>>,
         bool,
     )>,
-    bootstrap_retry: Option<(crate::tmux_model::PaneId, Vec<u8>)>,
+    bootstrap_program_status: Option<(
+        crate::tmux_model::PaneId,
+        Option<crate::program_status::ProgramStatus>,
+    )>,
+    bootstrap_retry: Option<(crate::tmux_model::PaneId, Vec<u8>, bool)>,
     pane_resync_probe: Option<crate::tmux_model::PaneCaptureMetadata>,
     pane_resync_request: Option<crate::tmux_model::PaneId>,
     pane_resume_request: Option<crate::tmux_model::PaneId>,
@@ -1645,6 +1649,17 @@ impl TmuxConnectionState {
                         connection.flow_control_verified =
                             Some(connection.flow_control_policy_accepted == Some(true) && retained);
                     }
+                    Some(ExpectedTmuxReply::BootstrapProgramStatus(pane_id)) => {
+                        let program_status = if status
+                            == crate::tmux_control::CommandStatus::Success
+                            && let [line] = output.as_slice()
+                        {
+                            crate::tmux_model::parse_pane_program_status(line, pane_id)
+                        } else {
+                            None
+                        };
+                        step.bootstrap_program_status = Some((pane_id, program_status));
+                    }
                     Some(ExpectedTmuxReply::Bootstrap {
                         pane_id,
                         line_flags,
@@ -1654,8 +1669,11 @@ impl TmuxConnectionState {
                             && let Some(pane) = connection.topology.pane(pane_id)
                         {
                             connection.capture_line_flags_supported = Some(false);
-                            step.bootstrap_retry =
-                                Some((pane_id, crate::tmux_panes::portable_capture_command(pane)));
+                            step.bootstrap_retry = Some((
+                                pane_id,
+                                crate::tmux_panes::portable_capture_command(pane),
+                                connection.topology.bootstrap_samples_program_status(),
+                            ));
                         } else {
                             if line_flags && status == crate::tmux_control::CommandStatus::Success {
                                 connection.capture_line_flags_supported = Some(true);
@@ -2279,6 +2297,7 @@ enum ExpectedTmuxReply {
     Inventory,
     FlowControlPolicy,
     FlowControlVerification,
+    BootstrapProgramStatus(crate::tmux_model::PaneId),
     Bootstrap {
         pane_id: crate::tmux_model::PaneId,
         line_flags: bool,

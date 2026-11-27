@@ -79,10 +79,10 @@ fn inventory(connection_id: u64) -> Vec<Vec<Vec<u8>>> {
             format!("W\t$2\t@12\t1\t1\t{UNATTACHED}\t{UNATTACHED}\t*\tremote").into_bytes(),
         ],
         vec![
-            b"P\t@10\t%20\t1\t1\t0\t0\t40\t24\t0\t0\t0\t1\t0\t0\t0\t0\tactive".to_vec(),
-            b"P\t@10\t%23\t2\t0\t41\t0\t39\t24\t0\t0\t0\t1\t0\t0\t0\t0\tinactive".to_vec(),
-            b"P\t@11\t%21\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\thidden".to_vec(),
-            b"P\t@12\t%22\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tunattached".to_vec(),
+            b"P\tstatus\t@10\t%20\t1\t1\t0\t0\t40\t24\t0\t0\t0\t1\t0\t0\t0\t0\tactive".to_vec(),
+            b"P\tstatus\t@10\t%23\t2\t0\t41\t0\t39\t24\t0\t0\t0\t1\t0\t0\t0\t0\tinactive".to_vec(),
+            b"P\tstatus\t@11\t%21\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\thidden".to_vec(),
+            b"P\tstatus\t@12\t%22\t1\t1\t0\t0\t80\t24\t0\t0\t0\t1\t0\t0\t0\t0\tunattached".to_vec(),
         ],
         vec![b"A\t$1".to_vec()],
         vec![b"O\tbase-index\t1".to_vec()],
@@ -123,6 +123,17 @@ fn add_ready_connection(
     sr: &mut ScreenReader,
     physical: &mut Vec<u8>,
     connection_id: u64,
+) -> TmuxGatewayRouter {
+    add_connection_with_bootstrap_sample(app, sr, physical, connection_id, &[], None)
+}
+
+fn add_connection_with_bootstrap_sample(
+    app: &mut App,
+    sr: &mut ScreenReader,
+    physical: &mut Vec<u8>,
+    connection_id: u64,
+    pending_reports: &[(u64, &str)],
+    captured_status: Option<(u64, &str, &str)>,
 ) -> TmuxGatewayRouter {
     let mut router = TmuxGatewayRouter::with_first_connection_id(connection_id);
     feed(
@@ -172,12 +183,30 @@ fn add_ready_connection(
             String::from_utf8_lossy(&commands)
         );
     }
-    for (index, pane_id) in [20, 21, 22, 23].into_iter().enumerate() {
+    for &(pane, report) in pending_reports {
+        feed(app, sr, &mut router, &pane_output(pane, report), physical);
+    }
+    for (index, command) in std::str::from_utf8(&commands).unwrap().lines().enumerate() {
+        let (_, target) = command.rsplit_once("-t %").expect("capture target");
+        let pane_id: u64 = target.parse().unwrap();
+        let sample = captured_status
+            .filter(|(sampled, _, _)| *sampled == pane_id)
+            .map_or_else(
+                || format!("T\t%{pane_id}\t\t"),
+                |(_, state, name)| format!("T\t%{pane_id}\t{state}\t{name}"),
+            );
         feed(
             app,
             sr,
             &mut router,
-            &reply(30 + index, &[format!("ready-{pane_id}").into_bytes()]),
+            &reply(30 + index * 2, &[sample.into_bytes()]),
+            physical,
+        );
+        feed(
+            app,
+            sr,
+            &mut router,
+            &reply(31 + index * 2, &[format!("ready-{pane_id}").into_bytes()]),
             physical,
         );
     }
@@ -848,7 +877,7 @@ fn tmux_program_status_observes_each_pane_and_respects_accessibility_settings() 
 
     let blocked = "\\033]7501;state=blocked:app=Fixture:msg=c2FtcGxlIHJlYXNvbg==\\033\\134";
     let working = "\\033]7501;state=working:app=Fixture\\033\\134";
-    let done = "\\033]7501;state=done:app=Fixture\\033\\134";
+    let done = "\\033]7501;state=done:ignored=x;y:app=Fixture\\033\\134";
 
     for (pane, report) in [(20, blocked), (21, blocked), (21, blocked)] {
         feed(
@@ -909,6 +938,38 @@ fn tmux_program_status_observes_each_pane_and_respects_accessibility_settings() 
     assert_eq!(physical, b"\x07");
     assert_eq!(app.debug_active_view_contents(), contents);
     assert_eq!(app.active_tmux_connection(), Some(1));
+}
+
+#[test]
+fn tmux_bootstrap_uses_the_capture_time_status_after_buffered_transitions() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
+    let working = "\\033]7501;state=working:app=Fixture\\033\\134";
+    let blocked = "\\033]7501;state=blocked:app=Fixture\\033\\134";
+    let mut router = add_connection_with_bootstrap_sample(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &[(21, working), (21, blocked)],
+        Some((21, "blocked", "Fixture")),
+    );
+    assert!(
+        !recorder
+            .messages()
+            .iter()
+            .any(|text| text == "Fixture needs attention")
+    );
+    recorder.clear();
+    for report in [blocked, working, blocked] {
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            &pane_output(21, report),
+            &mut physical,
+        );
+    }
+    assert_eq!(recorder.messages(), ["Fixture needs attention"]);
 }
 
 struct RealTmuxClient {

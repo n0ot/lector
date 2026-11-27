@@ -10,7 +10,7 @@ use thiserror::Error;
 pub const INVENTORY_COMMANDS: [&str; 12] = [
     "list-sessions -F 'S\t#{session_id}\t#{session_name}'\n",
     "list-windows -a -F 'W\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}'\n",
-    "list-panes -a -F 'P\tstatus\t#{pane_program_state}\t#{pane_program_name}\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
+    "list-panes -a -F 'P\tstatus\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
     "display-message -p -F 'A\t#{session_id}\t#{host}'\n",
     "display-message -p -F 'O\tbase-index\t#{base-index}'\n",
     "display-message -p -F 'O\tpane-base-index\t#{pane-base-index}'\n",
@@ -30,7 +30,7 @@ pub const INVENTORY_REPLY_COUNT: usize = INVENTORY_COMMANDS.len();
 pub const INVENTORY_COMMAND: &str = concat!(
     "list-sessions -F 'S\t#{session_id}\t#{session_name}'\n",
     "list-windows -a -F 'W\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}'\n",
-    "list-panes -a -F 'P\tstatus\t#{pane_program_state}\t#{pane_program_name}\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
+    "list-panes -a -F 'P\tstatus\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
     "display-message -p -F 'A\t#{session_id}\t#{host}'\n",
     "display-message -p -F 'O\tbase-index\t#{base-index}'\n",
     "display-message -p -F 'O\tpane-base-index\t#{pane-base-index}'\n",
@@ -95,7 +95,6 @@ pub struct Pane {
     pub pane_in_mode: u32,
     pub mode: String,
     pub history_size: u32,
-    pub program_status: Option<ProgramStatus>,
 }
 
 /// Pane-local state sampled immediately around an authoritative capture.
@@ -211,6 +210,9 @@ pub struct TmuxTopology {
     /// the attached session. They remain part of tmux's real topology, but
     /// are omitted from Lector's user-facing window chooser.
     internal_window_links: BTreeSet<(SessionId, u32, WindowId)>,
+    // The current inventory format correlates a status sample with each
+    // bootstrap capture. Legacy control recordings omit the format marker.
+    bootstrap_samples_program_status: bool,
     needs_resync: bool,
 }
 
@@ -230,8 +232,13 @@ impl TmuxTopology {
             bindings: BTreeMap::new(),
             key_tables: BTreeMap::new(),
             internal_window_links: BTreeSet::new(),
+            bootstrap_samples_program_status: false,
             needs_resync: false,
         }
+    }
+
+    pub(crate) fn bootstrap_samples_program_status(&self) -> bool {
+        self.bootstrap_samples_program_status
     }
 
     #[must_use]
@@ -745,12 +752,19 @@ impl TmuxTopology {
     }
 
     fn inventory_pane(&mut self, line: &[u8]) -> Result<(), TopologyError> {
-        let (line, program_status) = split_program_status_fields(line)?;
+        let canonical;
+        let line = if let Some(body) = line.strip_prefix(b"P\tstatus\t") {
+            self.bootstrap_samples_program_status = true;
+            canonical = [b"P\t", body].concat();
+            &canonical
+        } else {
+            line
+        };
         let tab_count = line.iter().filter(|byte| **byte == b'\t').count();
         let named_mode = tab_count >= 18;
         let extended = tab_count >= 17;
         let fields = split_inventory(
-            &line,
+            line,
             if named_mode {
                 19
             } else if extended {
@@ -810,7 +824,6 @@ impl TmuxTopology {
             } else {
                 0
             },
-            program_status,
             title: text(
                 fields[if named_mode {
                     18
@@ -1160,7 +1173,6 @@ fn empty_pane(id: PaneId, window_id: WindowId) -> Pane {
         pane_in_mode: 0,
         mode: String::new(),
         history_size: 0,
-        program_status: None,
     }
 }
 
@@ -1231,6 +1243,25 @@ fn boolean(bytes: &[u8], field: &'static str) -> Result<bool, TopologyError> {
 fn parse_cursor_shape(bytes: &[u8]) -> Result<String, TopologyError> {
     let shape = text(bytes, "cursor shape")?;
     Ok(if shape.is_empty() { "default" } else { shape }.to_owned())
+}
+
+pub(crate) fn pane_program_status_command(pane_id: PaneId) -> Vec<u8> {
+    format!(
+        "display-message -p -t %{} -F 'T\t#{{pane_id}}\t#{{pane_program_state}}\t#{{pane_program_name}}'\n",
+        pane_id.0
+    )
+    .into_bytes()
+}
+
+pub(crate) fn parse_pane_program_status(
+    line: &[u8],
+    expected_pane_id: PaneId,
+) -> Option<ProgramStatus> {
+    let fields = split_inventory(line, 4).ok()?;
+    if fields[0] != b"T" || parse_pane_id(fields[1]).ok()? != expected_pane_id {
+        return None;
+    }
+    ProgramStatus::from_fields(fields[2], fields[3])
 }
 
 #[must_use]

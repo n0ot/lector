@@ -1547,6 +1547,9 @@ struct CachedKittyImage {
     data_digest: u64,
 }
 
+// VTE reports at most 16 parameters, including the OSC number. At the cap
+// it can omit a tail, so use only strictly shorter parameter lists.
+const MAX_COMPLETE_OSC_PARTS: usize = 15;
 const UNBROKERED_MODE_URXVT_MOUSE: u8 = 1 << 0;
 const UNBROKERED_MODE_SGR_PIXEL_MOUSE: u8 = 1 << 1;
 const UNBROKERED_MODE_COLOR_SCHEME_UPDATES: u8 = 1 << 2;
@@ -2063,14 +2066,18 @@ impl vte::Perform for StreamObserver {
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         self.flush_print();
         if params.first() == Some(&b"7501".as_slice()) {
-            if let [_, body] = params
-                && body.len() <= 4096 - b"\x1b]7501;\x1b\\".len()
+            if let [_, parts @ ..] = params
+                && !parts.is_empty()
+                && parts.len() < MAX_COMPLETE_OSC_PARTS
+                && parts.iter().map(|part| part.len() + 1).sum::<usize>()
+                    <= 4096 - b"\x1b]7501;\x1b\\".len() + 1
             {
+                let body = parts.join(b";".as_slice());
                 if bell_terminated {
-                    self.complete_program_status(body.to_vec());
+                    self.complete_program_status(body);
                 } else {
                     // VTE dispatches on ESC. The next byte must complete ST.
-                    self.program_status_pending_st = Some(body.to_vec());
+                    self.program_status_pending_st = Some(body);
                 }
             }
             return;

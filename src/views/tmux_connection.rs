@@ -250,6 +250,14 @@ impl TmuxConnectionView {
         }))
     }
 
+    pub(crate) fn set_bootstrap_program_status(
+        &mut self,
+        pane_id: PaneId,
+        status: Option<crate::program_status::ProgramStatus>,
+    ) {
+        self.panes.set_bootstrap_program_status(pane_id, status);
+    }
+
     pub fn apply_bootstrap(
         &mut self,
         pane_id: PaneId,

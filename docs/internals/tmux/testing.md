@@ -160,7 +160,7 @@ prebuilt preview image with `LECTOR_REAL_TMUX_PREBUILT_IMAGE` and an explicit
 `LECTOR_REAL_TMUX_PLATFORM`.
 
 Lector observes root records in live pane output and seeds their state and name
-from tmux inventory at attach and from capture metadata at resynchronization.
+from tmux capture metadata at attach and resynchronization.
 Recovered state is silent. Empty status fields mean the state is unknown.
 The reported message can contain arbitrary user-facing text and has no role
 in the transition or announcement.

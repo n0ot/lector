@@ -508,6 +508,7 @@ struct PaneState {
     metadata: Pane,
     surface_id: SurfaceId,
     bootstrap_requested: bool,
+    bootstrap_program_status: Option<crate::program_status::ProgramStatus>,
     bootstrapped: bool,
     prebootstrap_output: Vec<u8>,
 }
@@ -623,6 +624,7 @@ impl TmuxPaneSet {
                     metadata: pane.clone(),
                     surface_id,
                     bootstrap_requested: false,
+                    bootstrap_program_status: None,
                     bootstrapped: false,
                     prebootstrap_output: self.orphan_output.remove(&pane.id).unwrap_or_default(),
                 }
@@ -747,6 +749,18 @@ impl TmuxPaneSet {
         Ok(Some(update))
     }
 
+    pub(crate) fn set_bootstrap_program_status(
+        &mut self,
+        pane_id: PaneId,
+        status: Option<crate::program_status::ProgramStatus>,
+    ) {
+        if let Some(pane) = self.panes.get_mut(&pane_id)
+            && !pane.bootstrapped
+        {
+            pane.bootstrap_program_status = status;
+        }
+    }
+
     pub fn apply_bootstrap(
         &mut self,
         pane_id: PaneId,
@@ -772,7 +786,7 @@ impl TmuxPaneSet {
         if status == CommandStatus::Error {
             state
                 .view
-                .restore_program_status(state.metadata.program_status.clone());
+                .restore_program_status(state.bootstrap_program_status.take());
             state.bootstrapped = true;
             state.bootstrap_requested = false;
             let buffered = std::mem::take(&mut state.prebootstrap_output);
@@ -822,7 +836,7 @@ impl TmuxPaneSet {
             view.process_changes(&buffered);
         }
         view.discard_shadow_pty_replies();
-        view.restore_program_status(state.metadata.program_status.clone());
+        view.restore_program_status(state.bootstrap_program_status.take());
         // An authoritative capture establishes the pane's diff baseline; it is
         // not application output to announce. Finalize it while parsing is
         // still the publication boundary, then let physical receipts own every
@@ -1563,10 +1577,10 @@ mod synchronization_tests {
                         pane_in_mode: 0,
                         mode: String::new(),
                         history_size: 0,
-                        program_status: None,
                     },
                     surface_id,
                     bootstrap_requested: false,
+                    bootstrap_program_status: None,
                     bootstrapped: true,
                     prebootstrap_output: Vec::new(),
                 },

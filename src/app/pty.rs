@@ -635,6 +635,7 @@ impl App {
             sync_topology,
             mut render_topology,
             bootstrap_reply,
+            bootstrap_program_status,
             bootstrap_retry,
             pane_resync_probe,
             pane_resync_request,
@@ -784,16 +785,14 @@ impl App {
         let mut announce_tmux_location = location_changed;
 
         // 2. Queue commands with their replies before synchronizing views.
-        if let Some((pane_id, command)) = bootstrap_retry {
-            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+        if let Some((pane_id, command, sample_status)) = bootstrap_retry {
+            self.queue_tmux_bootstrap_capture(
                 connection_id,
-                bytes: command,
-                expected_replies: vec![ExpectedTmuxReply::Bootstrap {
-                    pane_id,
-                    line_flags: false,
-                }],
-                kind: PendingTmuxCommandKind::Ordinary,
-            });
+                pane_id,
+                command,
+                false,
+                sample_status,
+            );
         }
         if request_resync {
             self.queue_tmux_inventory(connection_id);
@@ -913,6 +912,11 @@ impl App {
             self.open_review(sr, false, term_out)?;
         }
         // 4. Applying captures may raise new render/announcement/resume work.
+        if let Some((pane_id, status)) = bootstrap_program_status
+            && let Some(view) = self.view_stack.tmux_connection_mut(connection_id)
+        {
+            view.set_bootstrap_program_status(pane_id, status);
+        }
         if let Some((pane_id, status, output, line_flags)) = bootstrap_reply {
             self.pending_tmux_background_output
                 .remove((connection_id, pane_id));
@@ -2024,15 +2028,13 @@ impl App {
             if !capture_line_flags && let Some(pane) = topology.pane(request.pane_id) {
                 request.command = crate::tmux_panes::portable_capture_command(pane);
             }
-            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+            self.queue_tmux_bootstrap_capture(
                 connection_id,
-                bytes: request.command,
-                expected_replies: vec![ExpectedTmuxReply::Bootstrap {
-                    pane_id: request.pane_id,
-                    line_flags: capture_line_flags,
-                }],
-                kind: PendingTmuxCommandKind::Ordinary,
-            });
+                request.pane_id,
+                request.command,
+                capture_line_flags,
+                topology.bootstrap_samples_program_status(),
+            );
         }
         for pane_id in pane_resync_requests {
             self.queue_tmux_pane_resync(connection_id, pane_id)?;
@@ -2044,6 +2046,39 @@ impl App {
             .map(|chooser| chooser.sync_topology(&topology))
             .is_some();
         Ok(chooser_updated)
+    }
+
+    fn queue_tmux_bootstrap_capture(
+        &mut self,
+        connection_id: u64,
+        pane_id: crate::tmux_model::PaneId,
+        command: Vec<u8>,
+        line_flags: bool,
+        sample_status: bool,
+    ) {
+        let mut expected_replies = Vec::new();
+        let bytes = if sample_status {
+            expected_replies.push(ExpectedTmuxReply::BootstrapProgramStatus(pane_id));
+            // Sample status and screen in one tmux command sequence. The
+            // status display succeeds even when its target disappeared, and
+            // the parser checks its resolved pane ID before using the fields.
+            join_tmux_command_sequence(&[
+                crate::tmux_model::pane_program_status_command(pane_id),
+                command,
+            ])
+        } else {
+            command
+        };
+        expected_replies.push(ExpectedTmuxReply::Bootstrap {
+            pane_id,
+            line_flags,
+        });
+        self.pending_tmux_commands.push_back(PendingTmuxCommand {
+            connection_id,
+            bytes,
+            expected_replies,
+            kind: PendingTmuxCommandKind::Ordinary,
+        });
     }
 
     pub(super) fn queue_tmux_input(
