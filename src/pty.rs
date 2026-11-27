@@ -433,53 +433,12 @@ fn decoded_bundled_sync_terminfo() -> io::Result<&'static [u8]> {
     if let Some(entry) = DECODED_BUNDLED_SYNC_TERMINFO.get() {
         return Ok(entry);
     }
-    let decoded = decode_base64(BUNDLED_SYNC_TERMINFO)?;
+    let decoded = crate::base64::decode_unpadded(BUNDLED_SYNC_TERMINFO)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid bundled terminfo base64"))?;
     let _ = DECODED_BUNDLED_SYNC_TERMINFO.set(decoded);
     Ok(DECODED_BUNDLED_SYNC_TERMINFO
         .get()
         .expect("decoded bundled terminfo was initialized"))
-}
-
-fn decode_base64(encoded: &[u8]) -> io::Result<Vec<u8>> {
-    fn digit(byte: u8) -> Option<u8> {
-        match byte {
-            b'A'..=b'Z' => Some(byte - b'A'),
-            b'a'..=b'z' => Some(byte - b'a' + 26),
-            b'0'..=b'9' => Some(byte - b'0' + 52),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-
-    let digits = encoded
-        .iter()
-        .copied()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .map(|byte| {
-            digit(byte).ok_or_else(|| {
-                io::Error::new(ErrorKind::InvalidData, "invalid bundled terminfo base64")
-            })
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    if digits.len() % 4 == 1 {
-        return Err(io::Error::new(
-            ErrorKind::InvalidData,
-            "truncated bundled terminfo base64",
-        ));
-    }
-
-    let mut decoded = Vec::with_capacity(digits.len().saturating_mul(3) / 4);
-    for chunk in digits.chunks(4) {
-        decoded.push((chunk[0] << 2) | (chunk[1] >> 4));
-        if let Some(third) = chunk.get(2) {
-            decoded.push((chunk[1] << 4) | (third >> 2));
-            if let Some(fourth) = chunk.get(3) {
-                decoded.push((third << 6) | fourth);
-            }
-        }
-    }
-    Ok(decoded)
 }
 
 fn installed_terminfo_ready(terminfo: &Path) -> bool {

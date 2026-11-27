@@ -1255,6 +1255,48 @@ fn live_pty_drains_output_that_was_ready_before_poll_registration_and_delivers_b
 }
 
 #[test]
+fn standalone_program_status_probes_before_da_and_announces_with_auto_read_off() {
+    let _serial = serialize_live_pty_test();
+    let config_dir = tempfile::tempdir().expect("create isolated config directory");
+    let config = config_dir.path().join("init.lua");
+    fs::write(
+        &config,
+        r#"
+            lector.o.auto_read = false
+            lector.o.speech.server = {
+                program = assert(os.getenv("LECTOR_TEST_STARTUP_SPEECH_SERVER")),
+                args = {"speech", "--speech-log", assert(os.getenv("LECTOR_TEST_STARTUP_ORDER_LOG"))},
+            }
+        "#,
+    )
+    .expect("write isolated speech settings");
+    let mut lector = LiveLector::spawn_with_config("program-status", &config);
+
+    assert!(
+        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+            physical_screen_contains(terminal, "STATUS READY")
+        })
+    );
+    lector.send(b"p");
+    assert!(
+        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+            physical_screen_contains(terminal, "PROBE ACCEPTED")
+        })
+    );
+    assert!(lector.wait_for_speech(
+        Duration::from_secs(3),
+        |speech| speech.lines().any(|line| {
+            serde_json::from_str::<String>(line)
+                .is_ok_and(|entry| entry == "Fixture needs attention")
+        }),
+        &lector.inner_speech_log.clone(),
+    ));
+
+    lector.send(b"q");
+    assert!(lector.finish(Duration::from_secs(3)));
+}
+
+#[test]
 fn speech_rate_keys_apply_before_confirmation_through_the_speech_host() {
     let _serial = serialize_live_pty_test();
     let config_dir = tempfile::tempdir().expect("create isolated config directory");

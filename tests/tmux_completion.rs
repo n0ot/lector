@@ -2262,6 +2262,55 @@ fn pane_exit_while_resync_reply_is_in_flight_discards_the_stale_capture() {
 }
 
 #[test]
+fn recovered_program_status_sets_a_silent_baseline_for_the_pane() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app(false);
+    sr.set_auto_read_enabled(false);
+    recorder.0.borrow_mut().clear();
+
+    start_visible_lossy_capture(&mut app, &mut sr, &mut physical, 40, 20);
+    let metadata = pane_metadata_line(20);
+    let metadata = [
+        b"R\tstatus\tdone\tFixture\t".as_slice(),
+        metadata.strip_prefix(b"R\t").unwrap(),
+    ]
+    .concat();
+    for (serial, lines) in [
+        (42, vec![b"captured contents".to_vec()]),
+        (43, vec![]),
+        (44, vec![metadata]),
+    ] {
+        app.handle_pty(&mut sr, &reply(serial, &lines), &mut physical)
+            .unwrap();
+    }
+    assert_eq!(
+        app.debug_tmux_pane_flow_state(1, 20).unwrap().status,
+        TmuxFlowStatus::Running
+    );
+    let done = pane_output_record(20, b"\x1b]7501;state=done:app=Fixture\x1b\\");
+    app.handle_pty(&mut sr, &done, &mut physical).unwrap();
+    assert!(
+        !recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|text| text == "Fixture is done")
+    );
+
+    let working = pane_output_record(20, b"\x1b]7501;state=working:app=Fixture\x1b\\");
+    app.handle_pty(&mut sr, &working, &mut physical).unwrap();
+    app.handle_pty(&mut sr, &done, &mut physical).unwrap();
+    assert_eq!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .filter(|text| *text == "Fixture is done")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn pane_resync_explicitly_drops_unrecoverable_image_state() {
     let (mut app, mut sr, _recorder, mut physical) = ready_app(false);
     let mut record = b"%output %20 ".to_vec();

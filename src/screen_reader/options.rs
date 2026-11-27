@@ -5,6 +5,7 @@ use crate::clipboard::{ClipboardRegister, SystemClipboardProvider};
 pub(super) struct Options {
     help_mode: bool,
     auto_read: bool,
+    program_status_announcements: bool,
     suppress_key_echo: bool,
     report_indentation: bool,
     review_follows_screen_cursor: bool,
@@ -22,6 +23,7 @@ impl Default for Options {
         Self {
             help_mode: false,
             auto_read: true,
+            program_status_announcements: true,
             suppress_key_echo: false,
             report_indentation: true,
             review_follows_screen_cursor: true,
@@ -61,6 +63,14 @@ impl Options {
     pub(super) fn toggle_auto_read(&mut self) -> bool {
         self.auto_read.toggle();
         self.auto_read
+    }
+
+    pub(super) fn program_status_announcements(&self) -> bool {
+        self.program_status_announcements
+    }
+
+    pub(super) fn set_program_status_announcements(&mut self, value: bool) {
+        self.program_status_announcements = value;
     }
 
     pub(super) fn suppress_key_echo(&self) -> bool {

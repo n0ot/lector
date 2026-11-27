@@ -755,6 +755,14 @@ impl ScreenReader {
         !self.reader_auto_read_suppressed && self.options.auto_read()
     }
 
+    pub fn program_status_announcements(&self) -> bool {
+        self.options.program_status_announcements()
+    }
+
+    pub fn set_program_status_announcements(&mut self, enabled: bool) {
+        self.options.set_program_status_announcements(enabled);
+    }
+
     pub fn set_auto_read_enabled(&mut self, value: bool) {
         self.options.set_auto_read(value);
     }

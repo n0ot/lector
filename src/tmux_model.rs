@@ -1,5 +1,6 @@
 //! UI-independent tmux connection topology and notification reconciliation.
 
+use crate::program_status::ProgramStatus;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -9,7 +10,7 @@ use thiserror::Error;
 pub const INVENTORY_COMMANDS: [&str; 12] = [
     "list-sessions -F 'S\t#{session_id}\t#{session_name}'\n",
     "list-windows -a -F 'W\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}'\n",
-    "list-panes -a -F 'P\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
+    "list-panes -a -F 'P\tstatus\t#{pane_program_state}\t#{pane_program_name}\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
     "display-message -p -F 'A\t#{session_id}\t#{host}'\n",
     "display-message -p -F 'O\tbase-index\t#{base-index}'\n",
     "display-message -p -F 'O\tpane-base-index\t#{pane-base-index}'\n",
@@ -29,7 +30,7 @@ pub const INVENTORY_REPLY_COUNT: usize = INVENTORY_COMMANDS.len();
 pub const INVENTORY_COMMAND: &str = concat!(
     "list-sessions -F 'S\t#{session_id}\t#{session_name}'\n",
     "list-windows -a -F 'W\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_active}\t#{window_layout}\t#{window_visible_layout}\t#{window_flags}\t#{window_name}'\n",
-    "list-panes -a -F 'P\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
+    "list-panes -a -F 'P\tstatus\t#{pane_program_state}\t#{pane_program_name}\t#{window_id}\t#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_dead}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\t#{cursor_shape}\t#{alternate_on}\t#{pane_in_mode}\t#{pane_mode}\t#{history_size}\t#{pane_title}'\n",
     "display-message -p -F 'A\t#{session_id}\t#{host}'\n",
     "display-message -p -F 'O\tbase-index\t#{base-index}'\n",
     "display-message -p -F 'O\tpane-base-index\t#{pane-base-index}'\n",
@@ -94,6 +95,7 @@ pub struct Pane {
     pub pane_in_mode: u32,
     pub mode: String,
     pub history_size: u32,
+    pub program_status: Option<ProgramStatus>,
 }
 
 /// Pane-local state sampled immediately around an authoritative capture.
@@ -115,6 +117,7 @@ pub struct PaneCaptureMetadata {
     pub alternate_on: bool,
     pub pane_in_mode: u32,
     pub history_size: u32,
+    pub program_status: Option<ProgramStatus>,
 }
 
 impl PaneCaptureMetadata {
@@ -742,11 +745,12 @@ impl TmuxTopology {
     }
 
     fn inventory_pane(&mut self, line: &[u8]) -> Result<(), TopologyError> {
+        let (line, program_status) = split_program_status_fields(line)?;
         let tab_count = line.iter().filter(|byte| **byte == b'\t').count();
         let named_mode = tab_count >= 18;
         let extended = tab_count >= 17;
         let fields = split_inventory(
-            line,
+            &line,
             if named_mode {
                 19
             } else if extended {
@@ -806,6 +810,7 @@ impl TmuxTopology {
             } else {
                 0
             },
+            program_status,
             title: text(
                 fields[if named_mode {
                     18
@@ -1155,7 +1160,25 @@ fn empty_pane(id: PaneId, window_id: WindowId) -> Pane {
         pane_in_mode: 0,
         mode: String::new(),
         history_size: 0,
+        program_status: None,
     }
+}
+
+/// Keep the prefix unambiguous for legacy replies and leave the pane title
+/// at the end, where it can contain tabs without consuming status fields.
+fn split_program_status_fields(
+    line: &[u8],
+) -> Result<(std::borrow::Cow<'_, [u8]>, Option<ProgramStatus>), TopologyError> {
+    if line.get(1..9) != Some(b"\tstatus\t") {
+        return Ok((std::borrow::Cow::Borrowed(line), None));
+    }
+    let mut parts = line[9..].splitn(3, |byte| *byte == b'\t');
+    let state = parts.next().ok_or(TopologyError::MalformedInventory)?;
+    let name = parts.next().ok_or(TopologyError::MalformedInventory)?;
+    let fields = parts.next().ok_or(TopologyError::MalformedInventory)?;
+    let mut original = line[..2].to_vec();
+    original.extend_from_slice(fields);
+    Ok((original.into(), ProgramStatus::from_fields(state, name)))
 }
 
 fn split_inventory(line: &[u8], fields: usize) -> Result<Vec<&[u8]>, TopologyError> {
@@ -1213,7 +1236,7 @@ fn parse_cursor_shape(bytes: &[u8]) -> Result<String, TopologyError> {
 #[must_use]
 pub fn pane_capture_metadata_command(pane_id: PaneId) -> Vec<u8> {
     format!(
-        "display-message -p -t %{} -F 'R\t#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}\t#{{pane_width}}\t#{{pane_height}}\t#{{pane_dead}}\t#{{cursor_x}}\t#{{cursor_y}}\t#{{cursor_flag}}\t#{{cursor_shape}}\t#{{alternate_on}}\t#{{pane_in_mode}}\t#{{history_size}}'\n",
+        "display-message -p -t %{} -F 'R\tstatus\t#{{pane_program_state}}\t#{{pane_program_name}}\t#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}\t#{{pane_width}}\t#{{pane_height}}\t#{{pane_dead}}\t#{{cursor_x}}\t#{{cursor_y}}\t#{{cursor_flag}}\t#{{cursor_shape}}\t#{{alternate_on}}\t#{{pane_in_mode}}\t#{{history_size}}'\n",
         pane_id.0
     )
     .into_bytes()
@@ -1223,7 +1246,8 @@ pub fn parse_pane_capture_metadata(
     line: &[u8],
     expected_pane_id: PaneId,
 ) -> Result<PaneCaptureMetadata, TopologyError> {
-    let fields = split_inventory(line, 14)?;
+    let (line, program_status) = split_program_status_fields(line)?;
+    let fields = split_inventory(&line, 14)?;
     if fields[0] != b"R" {
         return Err(TopologyError::MalformedInventory);
     }
@@ -1247,6 +1271,7 @@ pub fn parse_pane_capture_metadata(
         alternate_on: boolean(fields[11], "alternate screen")?,
         pane_in_mode: number(fields[12], "pane mode")?,
         history_size: number(fields[13], "history size")?,
+        program_status,
     })
 }
 

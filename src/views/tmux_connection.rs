@@ -33,6 +33,7 @@ pub struct TmuxConnectionView {
 pub(crate) struct PaneOutput {
     pub update: UpdateSummary,
     pub bells: usize,
+    pub program_announcements: Vec<String>,
 }
 
 /// Parsed, topology-validated data for the active tmux window. A topology sync
@@ -235,9 +236,17 @@ impl TmuxConnectionView {
             bytes,
             retain_for_accessibility,
         )?;
-        Ok(update.map(|update| PaneOutput {
-            bells: update.effects.bells,
-            update,
+        Ok(update.map(|mut update| {
+            let program_announcements = self
+                .panes
+                .pane_view_mut(pane_id)
+                .expect("only a known pane can produce an update")
+                .program_status_announcements(&mut update);
+            PaneOutput {
+                bells: update.effects.bells,
+                update,
+                program_announcements,
+            }
         }))
     }
 

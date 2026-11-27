@@ -1352,6 +1352,7 @@ mod tests {
         super::enter(&lua, &mut reader, || lua.load(r#"
             local booleans = {
                 {'help_mode', false}, {'auto_read', true},
+                {'program_status_announcements', true},
                 {'suppress_key_echo', false}, {'report_indentation', true},
                 {'review_follows_screen_cursor', true}, {'rev_follows', true},
                 {'highlight_tracking', false}, {'stop_speech_on_focus_loss', true},

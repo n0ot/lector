@@ -211,6 +211,9 @@ pub struct UpdateSummary {
     pub effects: TerminalEffects,
     pub damage: TerminalDamage,
     pub pty_replies: Vec<u8>,
+    /// Immediate program-status observations. Cumulative summaries omit them.
+    #[doc(hidden)]
+    pub program_status_updates: Vec<lector_ghostty::ProgramStatusUpdate>,
     pub printed_runs: Vec<PrintedRun>,
     /// Independently composable safe suffix of `printed_runs`. Unlike
     /// `output_report_structural`, this is deliberately not sticky: ordinary
@@ -267,6 +270,7 @@ impl Default for UpdateSummary {
             effects: TerminalEffects::default(),
             damage: TerminalDamage::None,
             pty_replies: Vec::new(),
+            program_status_updates: Vec::new(),
             printed_runs: Vec::new(),
             linear_output_effect: LinearOutputEffect::Preserve,
             output_report_structural: false,
@@ -1956,6 +1960,7 @@ fn normalize_ghostty_update(update: GhosttyUpdate) -> UpdateSummary {
             events: effects,
         },
         pty_replies: update.pty_replies,
+        program_status_updates: update.program_status_updates,
         damage,
         printed_runs: normalize_ghostty_printed_runs(update.printed_runs),
         output_report_structural: update.output_report_structural,

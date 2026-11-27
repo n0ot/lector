@@ -770,6 +770,9 @@ impl TmuxPaneSet {
             .get_mut(&pane_id)
             .ok_or(TmuxPaneError::UnknownPane(pane_id.0))?;
         if status == CommandStatus::Error {
+            state
+                .view
+                .restore_program_status(state.metadata.program_status.clone());
             state.bootstrapped = true;
             state.bootstrap_requested = false;
             let buffered = std::mem::take(&mut state.prebootstrap_output);
@@ -819,6 +822,7 @@ impl TmuxPaneSet {
             view.process_changes(&buffered);
         }
         view.discard_shadow_pty_replies();
+        view.restore_program_status(state.metadata.program_status.clone());
         // An authoritative capture establishes the pane's diff baseline; it is
         // not application output to announce. Finalize it while parsing is
         // still the publication boundary, then let physical receipts own every
@@ -893,6 +897,7 @@ impl TmuxPaneSet {
         );
         view.process_changes(&bytes);
         view.discard_shadow_pty_replies();
+        view.restore_program_status(metadata.program_status.clone());
         // Baseline the authoritative snapshot before presentation tracking
         // starts so capture text cannot taint the first later output receipt.
         view.finalize_changes(now_ms);
@@ -1558,6 +1563,7 @@ mod synchronization_tests {
                         pane_in_mode: 0,
                         mode: String::new(),
                         history_size: 0,
+                        program_status: None,
                     },
                     surface_id,
                     bootstrap_requested: false,
@@ -1607,6 +1613,7 @@ mod synchronization_tests {
             alternate_on: true,
             pane_in_mode: 0,
             history_size: 0,
+            program_status: None,
         };
         panes
             .apply_resync_capture(
@@ -1645,6 +1652,7 @@ mod synchronization_tests {
             alternate_on: false,
             pane_in_mode: 0,
             history_size: 12,
+            program_status: None,
         };
         assert_eq!(
             capture_command_for_metadata(&metadata),
@@ -1824,6 +1832,7 @@ mod synchronization_tests {
             alternate_on: true,
             pane_in_mode: 0,
             history_size: 0,
+            program_status: None,
         };
         panes
             .apply_resync_capture(&metadata, &[b"CAPTURE".to_vec()], &[], 20)

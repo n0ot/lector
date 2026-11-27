@@ -414,6 +414,7 @@ pub enum QuerySnapshot {
     ColorScheme,
     DeviceAttributes,
     Clipboard,
+    ProgramStatus,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -546,11 +547,20 @@ impl RenderDamageSnapshot {
     }
 }
 
+/// Program status controls observed in terminal-stream order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgramStatusUpdate {
+    Report(Vec<u8>),
+    PromptStart,
+    Reset,
+}
+
 /// Operation and damage facts produced by the same write that mutated Ghostty.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpdateSnapshot {
     pub effects: Vec<EffectSnapshot>,
     pub pty_replies: Vec<u8>,
+    pub program_status_updates: Vec<ProgramStatusUpdate>,
     pub printed_runs: Vec<PrintedRunSnapshot>,
     /// Ordered effect of this update on an older safe linear-output suffix.
     /// Unlike `output_report_structural`, a structural operation can be
@@ -1575,6 +1585,9 @@ struct StreamObserver {
     hyperlink_generation: u64,
     clipboard_read_queries: Vec<Vec<u8>>,
     default_color_queries: Vec<u8>,
+    program_status_query: bool,
+    program_status_pending_st: Option<Vec<u8>>,
+    program_status_updates: Vec<ProgramStatusUpdate>,
     synchronized_output_boundary: Option<bool>,
     cursor_visibility_boundary: Option<bool>,
     semantic_input_boundary: bool,
@@ -1815,9 +1828,19 @@ impl StreamObserver {
         !self.events.is_empty()
             || !self.clipboard_read_queries.is_empty()
             || !self.default_color_queries.is_empty()
+            || self.program_status_query
             || self.synchronized_output_boundary.is_some()
             || self.cursor_visibility_boundary.is_some()
             || self.unbrokered_private_mode_boundary != 0
+    }
+
+    fn complete_program_status(&mut self, body: Vec<u8>) {
+        if body == b"?" {
+            self.program_status_query = true;
+        } else {
+            self.program_status_updates
+                .push(ProgramStatusUpdate::Report(body));
+        }
     }
 
     fn take_synchronized_output_boundary(&mut self) -> Option<bool> {
@@ -1978,7 +2001,7 @@ struct StreamUpdate {
 
 impl vte::Perform for StreamObserver {
     fn terminated(&self) -> bool {
-        self.has_boundary_events()
+        self.has_boundary_events() || self.program_status_pending_st.is_some()
     }
 
     fn print(&mut self, character: char) {
@@ -2024,6 +2047,10 @@ impl vte::Perform for StreamObserver {
             // controls may select character sets or mutate terminal state in
             // ways this observer does not model conservatively.
             b'\0' | b'\x07' => {}
+            b'\x18' | b'\x1a' => {
+                self.program_status_pending_st = None;
+                self.mark_structural_output();
+            }
             _ => {
                 self.mark_structural_output();
             }
@@ -2033,8 +2060,21 @@ impl vte::Perform for StreamObserver {
         self.flush_print();
         self.mark_structural_output();
     }
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         self.flush_print();
+        if params.first() == Some(&b"7501".as_slice()) {
+            if let [_, body] = params
+                && body.len() <= 4096 - b"\x1b]7501;\x1b\\".len()
+            {
+                if bell_terminated {
+                    self.complete_program_status(body.to_vec());
+                } else {
+                    // VTE dispatches on ESC. The next byte must complete ST.
+                    self.program_status_pending_st = Some(body.to_vec());
+                }
+            }
+            return;
+        }
         if let [b"52", location, b"?"] = params {
             self.clipboard_read_queries.push(location.to_vec());
             return;
@@ -2078,7 +2118,11 @@ impl vte::Perform for StreamObserver {
             return;
         };
         let kind = match *marker {
-            b"A" => SemanticKindSnapshot::PromptStart,
+            b"A" => {
+                self.program_status_updates
+                    .push(ProgramStatusUpdate::PromptStart);
+                SemanticKindSnapshot::PromptStart
+            }
             b"B" => SemanticKindSnapshot::InputStart,
             b"C" => SemanticKindSnapshot::CommandStart,
             b"D" => SemanticKindSnapshot::CommandFinished {
@@ -2370,6 +2414,12 @@ impl vte::Perform for StreamObserver {
         }
     }
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        if byte == b'\\'
+            && let Some(body) = self.program_status_pending_st.take()
+        {
+            self.complete_program_status(body);
+            return;
+        }
         self.flush_print();
         self.mark_structural_output();
         if !intermediates.is_empty() {
@@ -2395,6 +2445,7 @@ impl vte::Perform for StreamObserver {
                 }
             }
             b'c' => {
+                self.program_status_updates.push(ProgramStatusUpdate::Reset);
                 self.terminal_reset = true;
                 self.active_hyperlink = None;
                 self.scroll_region = None;
@@ -2606,7 +2657,13 @@ impl Terminal {
                 next_mark = None;
                 continue;
             }
+            let pending_program_status_st =
+                self.stream_observer.program_status_pending_st.is_some();
+            if pending_program_status_st && bytes[fed] != b'\\' {
+                self.stream_observer.program_status_pending_st = None;
+            }
             let consumed = if bytewise
+                || pending_program_status_st
                 || self.stream_observer.has_boundary_events()
                 || self.stream_parser_after_non_ascii
                 || !bytes[fed].is_ascii()
@@ -2644,6 +2701,7 @@ impl Terminal {
             }
             self.answer_clipboard_queries();
             self.answer_default_color_queries();
+            self.answer_program_status_query();
             render_damage.merge(self.refresh_snapshot()?);
             self.anchor_semantic_events(scrollback_extent_before)?;
             let synchronization_boundary = self.stream_observer.take_synchronized_output_boundary();
@@ -2703,6 +2761,7 @@ impl Terminal {
             }
             self.answer_clipboard_queries();
             self.answer_default_color_queries();
+            self.answer_program_status_query();
             render_damage.merge(self.refresh_snapshot()?);
         }
         self.recalibrate_new_semantic_marks(new_semantic_start)?;
@@ -2735,6 +2794,9 @@ impl Terminal {
         Ok(UpdateSnapshot {
             effects,
             pty_replies,
+            program_status_updates: std::mem::take(
+                &mut self.stream_observer.program_status_updates,
+            ),
             printed_runs: stream.printed_runs,
             linear_output_effect: stream.linear_output_effect,
             output_report_structural: stream.output_report_structural,
@@ -2759,6 +2821,17 @@ impl Terminal {
                 && cursor_visibility_restore_end == Some(bytes.len()),
             synchronized_output_open_snapshot,
         })
+    }
+
+    fn answer_program_status_query(&mut self) {
+        if std::mem::take(&mut self.stream_observer.program_status_query) {
+            self.effect_sink
+                .events
+                .push(EffectSnapshot::Query(QuerySnapshot::ProgramStatus));
+            self.effect_sink
+                .pty_replies
+                .extend_from_slice(b"\x1b]7501;?\x1b\\");
+        }
     }
 
     fn answer_clipboard_queries(&mut self) {
@@ -4916,6 +4989,26 @@ mod tests {
         CellSnapshot, LinearOutputEffectSnapshot, OperationSnapshot, RenderDamageSnapshot,
         RowSnapshot, StreamObserver, Terminal,
     };
+
+    #[test]
+    fn program_status_observes_complete_osc_sequences_across_fragment_boundaries() {
+        use super::ProgramStatusUpdate;
+
+        let wire = b"\x1b]7501;?\x1b\\\x1b]7501;state=blocked\x07\x1b]7501;state=working\x18\x1b]7501;state=clear\x1b[0m";
+        for split in 0..=wire.len() {
+            let mut terminal = Terminal::new(4, 40).expect("create terminal");
+            let a = terminal.advance(&wire[..split]).expect("first fragment");
+            let b = terminal.advance(&wire[split..]).expect("second fragment");
+            assert_eq!(
+                [a.pty_replies, b.pty_replies].concat(),
+                b"\x1b]7501;?\x1b\\"
+            );
+            assert_eq!(
+                [a.program_status_updates, b.program_status_updates].concat(),
+                [ProgramStatusUpdate::Report(b"state=blocked".to_vec())],
+            );
+        }
+    }
 
     #[test]
     fn observer_retains_safe_output_after_the_latest_structural_boundary() {

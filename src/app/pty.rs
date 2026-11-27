@@ -277,7 +277,7 @@ impl App {
             .model()
             .live_screen()
             .kitty_keyboard_flags();
-        let terminal_update = self
+        let mut terminal_update = self
             .view_stack
             .root_mut()
             .model()
@@ -343,6 +343,13 @@ impl App {
                 | crate::terminal_protocol::EffectDisposition::Drop => {}
             }
         }
+        let announcements = self
+            .view_stack
+            .root_mut()
+            .model()
+            .program_status_announcements(&mut terminal_update);
+        let current = self.view_stack.presented_tmux_connection_mut().is_none();
+        self.announce_program_status(sr, announcements, current, term_out)?;
         let output_screen = (
             terminal_update.screen_after,
             terminal_update.screen_before != terminal_update.screen_after,
@@ -365,6 +372,28 @@ impl App {
             output_screen.1,
             adaptive_quiet_trainable,
         );
+        Ok(())
+    }
+
+    fn announce_program_status(
+        &mut self,
+        sr: &mut ScreenReader,
+        announcements: Vec<String>,
+        current: bool,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        if !sr.program_status_announcements()
+            || !sr.terminal_focused()
+            || (current && sr.auto_read_enabled())
+        {
+            return Ok(());
+        }
+        for text in announcements {
+            if sr.speech().tones_requested() {
+                self.emit_physical_bells(term_out, 1)?;
+            }
+            sr.speak(&text, false)?;
+        }
         Ok(())
     }
 
@@ -1677,6 +1706,20 @@ impl App {
         if let Some(outcome) = &mut outcome {
             let replies = std::mem::take(&mut outcome.update.pty_replies);
             self.queue_tmux_pane_report_replies(connection_id, pane_id, &replies)?;
+            let current = self
+                .view_stack
+                .presented_tmux_connection_mut()
+                .is_some_and(|view| {
+                    view.connection_id() == connection_id
+                        && !view.is_showing_portal()
+                        && view.is_active_pane(pane_id)
+                });
+            self.announce_program_status(
+                sr,
+                std::mem::take(&mut outcome.program_announcements),
+                current,
+                term_out,
+            )?;
         }
         let bells = outcome.as_ref().map_or(0, |outcome| outcome.bells);
         let output_screen = outcome.as_ref().map(|outcome| {

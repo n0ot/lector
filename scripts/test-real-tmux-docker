@@ -3,11 +3,16 @@ set -euo pipefail
 
 repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 dockerfile="$repo_dir/tests/docker/real-tmux.Dockerfile"
+program_status=${LECTOR_REAL_TMUX_PROGRAM_STATUS:-0}
 image=${LECTOR_REAL_TMUX_IMAGE:-lector-real-tmux:ubuntu-24.04}
 platform=${LECTOR_REAL_TMUX_PLATFORM:-}
 prebuilt_image=${LECTOR_REAL_TMUX_PREBUILT_IMAGE:-}
 cache_dir=${LECTOR_REAL_TMUX_CACHE_DIR:-}
-test_filter='binary(tmux) & test(/(^|::)(real_|two_real_)/)'
+test_filter='binary(tmux) & test(/(^|::)(real_|two_real_)/) & not test(/(^|::)real_tmux_preview_/)'
+if [[ "$program_status" == 1 ]]; then
+    image=${LECTOR_REAL_TMUX_IMAGE:-lector-real-tmux:program-status-preview}
+    test_filter='binary(tmux) & test(/(^|::)real_tmux_preview_/)'
+fi
 # Default integrations exercise native dynamic glibc. Static compatibility is opt-in.
 cargo_command=(cargo)
 if [[ "${LECTOR_TEST_STATIC:-0}" == 1 ]]; then
@@ -47,6 +52,10 @@ else
         --volume lector-real-tmux-target:/work/target
     )
 fi
+if [[ "$program_status" == 1 ]]; then
+    build_args+=(--target program-status-preview)
+fi
+
 if [[ -n "$platform" ]]; then
     build_args+=(--platform "$platform")
     run_args+=(--platform "$platform")

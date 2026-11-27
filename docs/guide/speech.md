@@ -41,8 +41,7 @@ device as the Windows default to hear speech and cues together.
 - Cancelling throws away the current speech and everything queued behind it.
   It has no default key. Bind `lector.cancel_speaking` if you want one (see
   [Scripting](scripting.md#key-bindings)).
-- `M-'` turns automatic reading off or on. With it off, Lector speaks only
-  when you ask.
+- `M-'` turns automatic reading of new terminal output off or on.
 - `M-g` chooses whether speech stops when the terminal loses focus.
 
 ## Rate, pitch, volume, and voice
@@ -170,3 +169,16 @@ Any program that speaks the
 ## If speech stops working
 
 See [Troubleshooting](troubleshooting.md#nothing-is-spoken).
+
+
+## Program status
+
+Apps that report their status using OSC 7501 can announce when they need
+attention or finish. Lector uses short messages such as “Codex needs attention”
+and “Codex is done.” The current pane gets these announcements when auto-read
+is off. Background panes in a supported tmux session can announce them either
+way.
+
+Set `lector.o.program_status_announcements = false` to silence both the
+announcement and its accompanying terminal bell. Set `lector.o.tones = false`
+for speech alone.
