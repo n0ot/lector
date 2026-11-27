@@ -22,6 +22,8 @@ pub enum SpeechCues {
     #[default]
     None,
     Standalone(SoundCue),
+    /// Optional onset during the same spoken announcement.
+    ProgramStatus,
     /// Two cues at one onset for a review boundary with blank readback.
     StandaloneDirectionAndBlank(SoundCue),
     Inline {
@@ -47,7 +49,8 @@ impl SpeechCues {
     pub(super) fn valid_for(&self, text: &str) -> bool {
         match self {
             Self::None => true,
-            Self::Standalone(cue) => *cue != SoundCue::Link,
+            Self::Standalone(cue) => !matches!(cue, SoundCue::Link | SoundCue::ProgramStatus),
+            Self::ProgramStatus => !text.is_empty(),
             Self::StandaloneDirectionAndBlank(cue) => {
                 cue.is_direction() || *cue == SoundCue::LinkExit
             }
@@ -139,6 +142,14 @@ impl SpeechCues {
         };
         match self {
             Self::None => {}
+            Self::ProgramStatus => {
+                if supported {
+                    rendered.cues.push(SoundCueAt {
+                        cue: SoundCue::ProgramStatus,
+                        offset: 0,
+                    });
+                }
+            }
             Self::Standalone(cue) if supported => {
                 rendered.text = Cow::Borrowed("");
                 rendered.cues.push(SoundCueAt {

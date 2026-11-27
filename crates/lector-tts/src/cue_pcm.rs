@@ -75,6 +75,7 @@ impl Clips {
             SoundCue::Blank,
             SoundCue::Link,
             SoundCue::LinkExit,
+            SoundCue::ProgramStatus,
         ]
         .into_iter()
         .map(|cue| Ok((cue, decode(cue)?)))

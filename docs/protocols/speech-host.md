@@ -4,7 +4,7 @@ This is the protocol between Lector and a speech server, called a *host*
 here. Implement it to make Lector speak through any speech engine, on any
 machine.
 
-- **Version:** 2.6. Hosts stay backward compatible with 2.0 through 2.5. Version 2.6 adds `linkExit` at offset zero for review navigation. It may accompany text or pair with `blank` on an empty utterance.
+- **Version** 2.7 adds the `programStatus` speech overlay. Hosts stay backward compatible with 2.0 through 2.6.
 - **Schema:** [`crates/lector-tts/openrpc.json`](../../crates/lector-tts/openrpc.json)
   defines the JSON shape of every method and message.
 - **This document** defines transport, capabilities, and behavior. If the two
@@ -107,7 +107,7 @@ are ignored. They are not failures.
 `initialize`, called exactly once:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":2,"maximumMinor":6},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocol":{"major":2,"minimumMinor":2,"maximumMinor":7},"client":{"name":"lector","version":"0.4.1"},"clientCapabilities":{"speechEvents":true,"progressModes":["marker","utf8ByteOffset"]}}}
 ```
 
 The host picks a minor version in the offered range and describes itself:
@@ -242,7 +242,10 @@ of these requirements. Starting in 2.4, the same capability also guarantees
 that a directional cue can overlay the start of readback. Starting in 2.5,
 it also guarantees that a standalone direction and blank cue can play together
 from the same onset. Earlier versions and other capability values use spoken
-fallbacks for the cues they cannot play.
+fallbacks for review cues they cannot play. Starting in 2.7, the same
+capability guarantees a `programStatus` cue at the onset of a spoken
+program status announcement. If this cue cannot play, use the original
+utterance without adding any words.
 
 On macOS, the first directional readback uses the native speech synthesizer
 at the configured volume. Its first word callback starts a separate cue
@@ -318,6 +321,7 @@ after initialization.
   `top`, `bottom`, `left`, or `right` cue MAY also appear once as the first
   cue at offset zero. A link cue may share this offset. In 2.6, a sole
   `linkExit` cue at zero can accompany the unlinked character or word.
+  In 2.7, a sole `programStatus` cue at zero can accompany a nonempty announcement.
 - For empty text, supply one of `top`, `bottom`, `left`, `right`, or
   `blank` at offset zero. In 2.5 or later a directional cue MAY be followed
   by `blank` at the same offset. The host MUST start both together, report one

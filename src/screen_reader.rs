@@ -867,11 +867,25 @@ impl ScreenReader {
         text: &str,
         interrupt: bool,
     ) -> Result<Option<crate::speech::protocol::UtteranceId>> {
+        self.speak_with(text, interrupt, |speech| speech.speak(text, interrupt))
+    }
+
+    pub(crate) fn speak_program_status(&mut self, text: &str) -> Result<()> {
+        self.speak_with(text, false, |speech| speech.speak_program_status(text))
+            .map(|_| ())
+    }
+
+    fn speak_with(
+        &mut self,
+        text: &str,
+        interrupt: bool,
+        submit: impl FnOnce(&mut Speech) -> speech::Result<speech::protocol::UtteranceId>,
+    ) -> Result<Option<speech::protocol::UtteranceId>> {
         if text.is_empty() || !self.terminal_focused {
             return Ok(None);
         }
         self.call_hook_on_speech_start(text, interrupt)?;
-        let result = self.speech.speak(text, interrupt);
+        let result = submit(&mut self.speech);
         let ok = result.is_ok();
         self.call_hook_on_speech_end(text, interrupt, ok)?;
         result.map(Some).map_err(Into::into)

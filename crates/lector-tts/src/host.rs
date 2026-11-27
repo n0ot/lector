@@ -821,7 +821,7 @@ impl<'a> State<'a> {
             return self.start_spoken_fallback(active, base, &active.cues_from(base));
         }
         if let Err(error) = self.prepared_cues.prepare(cue.cue, volume) {
-            eprintln!("lector-tts: {error}; speaking cue label");
+            eprintln!("lector-tts: {error}; falling back to speech");
             return self.start_spoken_fallback(active, base, &active.cues_from(base));
         }
         // The system mixes these live sources at their normal levels. The
@@ -1145,7 +1145,12 @@ impl<'a> State<'a> {
             && self.prepared_cues.clock_is_advancing(direction.cue)
         {
             direction.clock_logged = true;
-            write_speech_event(log, "directional-cue-playing");
+            let event = if direction.cue == SoundCue::ProgramStatus {
+                "program-status-cue-playing"
+            } else {
+                "directional-cue-playing"
+            };
+            write_speech_event(log, event);
         }
     }
 
@@ -1277,10 +1282,10 @@ impl<'a> State<'a> {
                     if let Some(log) = &self.cue_event_log {
                         write_speech_event(
                             log,
-                            if direction.cue.is_direction() {
-                                "directional-cue-begin"
-                            } else {
-                                "link-cue-begin"
+                            match direction.cue {
+                                SoundCue::ProgramStatus => "program-status-cue-begin",
+                                SoundCue::LinkExit => "link-cue-begin",
+                                _ => "directional-cue-begin",
                             },
                         );
                     }
@@ -1681,7 +1686,11 @@ impl<'a> State<'a> {
         {
             self.readback_cache.request(key);
         }
-        self.speak_completion_label(active, direction.cue.spoken_label().into())
+        let label = direction.cue.spoken_label();
+        if label.is_empty() {
+            return Ok(false);
+        }
+        self.speak_completion_label(active, label.into())
     }
 
     #[cfg(target_vendor = "apple")]

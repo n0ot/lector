@@ -487,6 +487,44 @@ mod native_speech {
 
     #[test]
     #[ignore = "requires native audio; run scripts/test-native-speech"]
+    fn program_status_overlay_plays_with_the_announcement() {
+        let directory = tempfile::tempdir().expect("speech test directory");
+        let event_log = directory.path().join("events.jsonl");
+        let mut host = NativeTestHost::spawn(
+            Command::new(env!("CARGO_BIN_EXE_lector"))
+                .arg("tts")
+                .env("LECTOR_SPEECH_TEST_MUTE", "1")
+                .env("LECTOR_SPEECH_EVENT_LOG", &event_log),
+        );
+        let initialized = host.rpc(
+            1,
+            "initialize",
+            serde_json::json!({
+                "protocol": {"major": 2, "minimumMinor": 7, "maximumMinor": 7},
+                "client": {"name": "lector-test", "version": "1"},
+                "clientCapabilities": {"speechEvents": true, "progressModes": ["utf8ByteOffset"]}
+            }),
+        );
+        assert_eq!(initialized["result"]["capabilities"]["soundCues"], true);
+        let accepted = host.rpc(
+            2,
+            "speech.speak",
+            serde_json::json!({
+                "utteranceId": "status",
+                "text": "Fixture needs attention",
+                "cues": [{"cue": "programStatus", "offset": 0}]
+            }),
+        );
+        assert_eq!(accepted["result"]["accepted"], true);
+        host.wait_for_completion("status");
+        let events = fs::read_to_string(&event_log).unwrap();
+        assert_eq!(events.matches("program-status-cue-begin").count(), 1);
+        assert_eq!(events.matches("program-status-cue-playing").count(), 1);
+        host.finish();
+    }
+
+    #[test]
+    #[ignore = "requires native audio; run scripts/test-native-speech"]
     fn synchronized_sound_cues_complete_and_stop_with_speech() {
         let directory = tempfile::tempdir().expect("speech test directory");
         let event_log = directory.path().join("events.jsonl");

@@ -1259,41 +1259,64 @@ fn standalone_program_status_probes_before_da_and_announces_with_auto_read_off()
     let _serial = serialize_live_pty_test();
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     let config = config_dir.path().join("init.lua");
-    fs::write(
-        &config,
-        r#"
-            lector.o.auto_read = false
-            lector.o.speech.server = {
-                program = assert(os.getenv("LECTOR_TEST_STARTUP_SPEECH_SERVER")),
-                args = {"speech", "--speech-log", assert(os.getenv("LECTOR_TEST_STARTUP_ORDER_LOG"))},
-            }
-        "#,
-    )
-    .expect("write isolated speech settings");
-    let mut lector = LiveLector::spawn_with_config("program-status", &config);
+    for (tones, supports_cues) in [(true, true), (false, true), (true, false)] {
+        let sound_cues = if supports_cues {
+            r#""--sound-cues","#
+        } else {
+            ""
+        };
+        fs::write(
+            &config,
+            format!(
+                r#"
+                lector.o.auto_read = false
+                lector.o.tones = {tones}
+                lector.o.speech.server = {{
+                    program = assert(os.getenv("LECTOR_TEST_STARTUP_SPEECH_SERVER")),
+                    args = {{"speech", {sound_cues} "--rpc-log", assert(os.getenv("LECTOR_TEST_STARTUP_ORDER_LOG"))}},
+                }}
+                "#,
+            ),
+        )
+        .expect("write isolated speech settings");
+        let mut lector = LiveLector::spawn_with_config("program-status", &config);
 
-    assert!(
-        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
-            physical_screen_contains(terminal, "STATUS READY")
-        })
-    );
-    lector.send(b"p");
-    assert!(
-        lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
-            physical_screen_contains(terminal, "PROBE ACCEPTED")
-        })
-    );
-    assert!(lector.wait_for_speech(
-        Duration::from_secs(3),
-        |speech| speech.lines().any(|line| {
-            serde_json::from_str::<String>(line)
-                .is_ok_and(|entry| entry == "Fixture needs attention")
-        }),
-        &lector.inner_speech_log.clone(),
-    ));
+        assert!(
+            lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+                physical_screen_contains(terminal, "STATUS READY")
+            })
+        );
+        let start = lector.output.len();
+        lector.send(b"p");
+        assert!(
+            lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {
+                physical_screen_contains(terminal, "PROBE ACCEPTED")
+            })
+        );
+        let expected_cues = if tones && supports_cues {
+            serde_json::json!([{"cue": "programStatus", "offset": 0}])
+        } else {
+            serde_json::Value::Null
+        };
+        assert!(
+            lector.wait_for_speech(
+                Duration::from_secs(3),
+                |speech| speech.lines().any(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|entry| {
+                        entry["method"] == "speech.speak"
+                            && entry["params"]["text"] == "Fixture needs attention"
+                            && entry["params"]["cues"] == expected_cues
+                    })
+                }),
+                &lector.inner_speech_log.clone(),
+            ),
+            "tones={tones}, supports_cues={supports_cues}",
+        );
+        assert!(!lector.output[start..].contains(&0x07));
 
-    lector.send(b"q");
-    assert!(lector.finish(Duration::from_secs(3)));
+        lector.send(b"q");
+        assert!(lector.finish(Duration::from_secs(3)));
+    }
 }
 
 #[test]

@@ -138,6 +138,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn program_status_uses_the_start_marker_and_keeps_the_original_fallback() {
+        let text = "Fixture is done";
+        let cues = [SoundCueAt {
+            cue: SoundCue::ProgramStatus,
+            offset: 0,
+        }];
+        let plan = make_ssml(text, &cues, 7, false);
+        assert_eq!(plan.marks, [vec![SoundCue::ProgramStatus]]);
+        assert_eq!(
+            plan.text,
+            r#"<speak><mark name="7:0"/>Fixture is done</speak>"#
+        );
+        assert_eq!(spoken_text(text, &cues), text);
+    }
+
+    #[test]
     fn first_link_and_direction_share_the_speech_start_marker() {
         let cues = [
             SoundCueAt {
