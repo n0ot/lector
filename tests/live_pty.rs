@@ -1255,11 +1255,17 @@ fn live_pty_drains_output_that_was_ready_before_poll_registration_and_delivers_b
 }
 
 #[test]
-fn standalone_program_status_probes_before_da_and_announces_with_auto_read_off() {
+fn standalone_program_status_probes_before_da_and_uses_the_speech_host() {
     let _serial = serialize_live_pty_test();
     let config_dir = tempfile::tempdir().expect("create isolated config directory");
     let config = config_dir.path().join("init.lua");
-    for (tones, supports_cues) in [(true, true), (false, true), (true, false)] {
+    for (focused, tones, supports_cues) in [
+        (true, true, true),
+        (true, false, true),
+        (true, true, false),
+        (false, true, true),
+    ] {
+        let auto_read = !focused;
         let sound_cues = if supports_cues {
             r#""--sound-cues","#
         } else {
@@ -1269,7 +1275,7 @@ fn standalone_program_status_probes_before_da_and_announces_with_auto_read_off()
             &config,
             format!(
                 r#"
-                lector.o.auto_read = false
+                lector.o.auto_read = {auto_read}
                 lector.o.tones = {tones}
                 lector.o.speech.server = {{
                     program = assert(os.getenv("LECTOR_TEST_STARTUP_SPEECH_SERVER")),
@@ -1287,6 +1293,9 @@ fn standalone_program_status_probes_before_da_and_announces_with_auto_read_off()
             })
         );
         let start = lector.output.len();
+        if !focused {
+            lector.send(b"\x1b[O");
+        }
         lector.send(b"p");
         assert!(
             lector.wait_for_physical_terminal(Duration::from_secs(5), |terminal| {

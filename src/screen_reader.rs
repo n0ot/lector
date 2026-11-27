@@ -867,6 +867,9 @@ impl ScreenReader {
         text: &str,
         interrupt: bool,
     ) -> Result<Option<crate::speech::protocol::UtteranceId>> {
+        if !self.terminal_focused {
+            return Ok(None);
+        }
         self.speak_with(text, interrupt, |speech| speech.speak(text, interrupt))
     }
 
@@ -881,7 +884,7 @@ impl ScreenReader {
         interrupt: bool,
         submit: impl FnOnce(&mut Speech) -> speech::Result<speech::protocol::UtteranceId>,
     ) -> Result<Option<speech::protocol::UtteranceId>> {
-        if text.is_empty() || !self.terminal_focused {
+        if text.is_empty() {
             return Ok(None);
         }
         self.call_hook_on_speech_start(text, interrupt)?;

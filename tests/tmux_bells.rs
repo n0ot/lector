@@ -961,6 +961,39 @@ fn tmux_program_status_observes_each_pane_and_respects_accessibility_settings() 
     );
     assert_eq!(recorder.messages().len(), 3);
     assert!(physical.is_empty());
+    sr.set_auto_read_enabled(true);
+    app.handle_stdin(&mut sr, b"\x1b[O", &mut Vec::new(), &mut physical)
+        .unwrap();
+    recorder.clear();
+    for pane in [20, 21] {
+        for report in [working, blocked, done] {
+            feed(
+                &mut app,
+                &mut sr,
+                &mut router,
+                &pane_output(pane, report),
+                &mut physical,
+            );
+        }
+    }
+    app.handle_stdin(&mut sr, b"\x1b[I", &mut Vec::new(), &mut physical)
+        .unwrap();
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(21, done),
+        &mut physical,
+    );
+    assert_eq!(
+        recorder.messages(),
+        [
+            "Fixture needs attention",
+            "Fixture is done",
+            "Fixture needs attention",
+            "Fixture is done"
+        ]
+    );
     assert_eq!(app.debug_active_view_contents(), contents);
     assert_eq!(app.active_tmux_connection(), Some(1));
 }
