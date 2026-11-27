@@ -175,9 +175,10 @@ See [Troubleshooting](troubleshooting.md#nothing-is-spoken).
 
 Apps that report their status using OSC 7501 can announce when they need
 attention or finish. Lector uses short messages such as “Codex needs attention”
-and “Codex is done.” The current pane gets these announcements when auto-read
-is off. Background panes in a supported tmux session can announce them either
-way.
+and “Codex is done.” When the terminal is unfocused, these announcements play with
+auto-read on or off. While the terminal has focus, the current pane announces
+these updates only with auto-read off. Background panes in a supported tmux
+session can announce them either way.
 
 Set `lector.o.program_status_announcements = false` to silence both the
 announcement and its tone. The tone plays through a compatible speech host.

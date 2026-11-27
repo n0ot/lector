@@ -381,8 +381,7 @@ impl App {
         current: bool,
     ) -> Result<()> {
         if !sr.program_status_announcements()
-            || !sr.terminal_focused()
-            || (current && sr.auto_read_enabled())
+            || (current && sr.terminal_focused() && sr.auto_read_enabled())
         {
             return Ok(());
         }
