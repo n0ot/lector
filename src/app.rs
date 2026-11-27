@@ -1529,7 +1529,22 @@ impl TmuxConnectionState {
                     connection.initial_command_seen = true;
                     return Ok(None);
                 }
-                match connection.expected_replies.pop_front() {
+                let mut expected = connection.expected_replies.pop_front();
+                // tmux rejects an entire command sequence in one reply when
+                // parsing fails. A bootstrap pair can hit this on versions
+                // where capture-pane does not recognize the line-flags option.
+                if let Some(ExpectedTmuxReply::BootstrapProgramStatus(pane_id)) = expected
+                    && status == crate::tmux_control::CommandStatus::Error
+                    && output.iter().any(|line| line.starts_with(b"parse error: "))
+                    && matches!(
+                        connection.expected_replies.front(),
+                        Some(ExpectedTmuxReply::Bootstrap { pane_id: capture, .. })
+                            if *capture == pane_id
+                    )
+                {
+                    expected = connection.expected_replies.pop_front();
+                }
+                match expected {
                     Some(ExpectedTmuxReply::Inventory) => {
                         connection.inventory_replies_remaining =
                             connection.inventory_replies_remaining.saturating_sub(1);
