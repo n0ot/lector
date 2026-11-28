@@ -596,8 +596,14 @@ impl TmuxConnectionView {
     }
 
     pub(crate) fn accessibility_location(&self, live: bool) -> PresentedLocation {
-        let ActiveDocument::Pane(pane_id) = self.active_document() else {
-            return PresentedLocation::named(self.accessible_title());
+        let pane_id = match self.active_document() {
+            ActiveDocument::Pane(id) => id,
+            ActiveDocument::Placeholder => {
+                return PresentedLocation::TmuxPlaceholder(self.accessible_title());
+            }
+            ActiveDocument::ConnectionPortal | ActiveDocument::PanePortal(_) => {
+                return PresentedLocation::named("tmux portal");
+            }
         };
         let Some(location) = self.topology.attached_location() else {
             return PresentedLocation::named(self.accessible_title());
@@ -611,16 +617,15 @@ impl TmuxConnectionView {
         } else {
             view.screen()
         };
-        let pane = self.topology.pane(pane_id);
-        let title = screen
-            .title
-            .as_deref()
-            .or_else(|| pane.map(|p| p.title.as_str()))
-            .unwrap_or_default();
+        let pane = self
+            .topology
+            .pane(pane_id)
+            .expect("ready pane has topology");
+        let title = screen.title.as_deref().unwrap_or(&pane.title);
         PresentedLocation::Pane {
             title: title.to_owned(),
             location,
-            pane_number: pane.map_or(pane_id.0, |p| u64::from(p.index)),
+            pane_number: pane.index,
             program: view.location_program(live),
         }
     }

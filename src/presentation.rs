@@ -91,9 +91,10 @@ pub(crate) enum PresentedLocation {
     Pane {
         title: String,
         location: crate::tmux_model::TmuxLocation,
-        pane_number: u64,
+        pane_number: u32,
         program: LocationProgram,
     },
+    TmuxPlaceholder(String),
     Named(String),
 }
 
@@ -107,7 +108,7 @@ impl PresentedLocation {
             Self::Terminal { title, .. } if !title.is_empty() => format!("terminal, {title}"),
             Self::Terminal { .. } => "terminal".to_owned(),
             Self::Pane { location, .. } => location.accessible_title(),
-            Self::Named(label) => label.clone(),
+            Self::TmuxPlaceholder(label) | Self::Named(label) => label.clone(),
         }
     }
 
@@ -138,7 +139,8 @@ impl PresentedLocation {
                     label
                 }
             }
-            Self::Named(label) => label.clone(),
+            Self::TmuxPlaceholder(_) if !detailed => "tmux".to_owned(),
+            Self::TmuxPlaceholder(label) | Self::Named(label) => label.clone(),
         }
     }
 }

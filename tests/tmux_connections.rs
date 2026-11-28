@@ -436,7 +436,7 @@ fn identical_tmux_ids_remain_isolated_across_connections_input_replies_and_speec
             .0
             .borrow()
             .iter()
-            .any(|message| message == "tmux, same, 1: same"),
+            .any(|message| message == "tmux, same, 1: pane 1 - same"),
         "speech={:?}",
         recorder.0.borrow()
     );

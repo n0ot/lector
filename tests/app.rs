@@ -7260,9 +7260,9 @@ fn current_location_hotkeys_speak_standalone_title_context_and_activity() {
             "terminal, Example",
         ),
         (
-            b"\x1b]2;Draft | myEXAMPLEproject\x1b\\",
-            "Draft | myEXAMPLEproject",
-            "terminal, Draft | myEXAMPLEproject",
+            b"\x1b]2;Draft | myexampleproject\x1b\\",
+            "Draft | myexampleproject",
+            "terminal, Draft | myexampleproject",
         ),
     ] {
         app.handle_pty(&mut sr, output, &mut term_out)
@@ -7402,7 +7402,7 @@ fn say_overlay_tracks_a_flushed_title_effect_before_its_cell_render() {
         .expect("say the title before either transaction flushes");
     assert_eq!(
         recorder.inner.borrow().speaks.last(),
-        Some(&("terminal, committed".into(), false))
+        Some(&("terminal - committed".into(), false))
     );
 
     let report = app
@@ -7415,7 +7415,7 @@ fn say_overlay_tracks_a_flushed_title_effect_before_its_cell_render() {
         .expect("say the physically applied title");
     assert_eq!(
         recorder.inner.borrow().speaks.last(),
-        Some(&("terminal, working".into(), false))
+        Some(&("terminal - working".into(), false))
     );
     app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
         .expect("read the still-presented cells");
