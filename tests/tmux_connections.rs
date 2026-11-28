@@ -430,7 +430,7 @@ fn identical_tmux_ids_remain_isolated_across_connections_input_replies_and_speec
     input(&mut app, &mut sr, &mut physical, b"\r");
 
     recorder.0.borrow_mut().clear();
-    input(&mut app, &mut sr, &mut physical, b"\x1bw");
+    input(&mut app, &mut sr, &mut physical, b"\x1bW");
     assert!(
         recorder
             .0
@@ -439,6 +439,63 @@ fn identical_tmux_ids_remain_isolated_across_connections_input_replies_and_speec
             .any(|message| message == "tmux, same, 1: same"),
         "speech={:?}",
         recorder.0.borrow()
+    );
+}
+
+#[test]
+fn tmux_title_receipt_cannot_rename_the_still_presented_standalone_terminal() {
+    const WINDOW_EFFECTS: &[u8] = b"\x1b]7;\x1b\\\x1b]2;Window label\x1b\\";
+
+    let (mut app, mut sr, recorder, mut physical) = app();
+    sr.set_program_status_announcements(false);
+    app.handle_pty(
+        &mut sr,
+        b"\x1b]2;Standalone task\x1b\\\x1b]7501;state=working\x1b\\",
+        &mut physical,
+    )
+    .unwrap();
+    app.enable_output_scheduler(OutputSchedulerConfig {
+        latency_budget_ms: 0,
+        write_budget_bytes: WINDOW_EFFECTS.len(),
+        ..OutputSchedulerConfig::default()
+    });
+    physical.clear();
+    let _router = add_ready_connection(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        inventory("fixture", "Window label", "Pane label", "client"),
+        "pane text",
+    );
+
+    let report = app.drain_scheduled_output(&mut physical, false).unwrap();
+    assert_eq!(physical, WINDOW_EFFECTS);
+    assert_eq!(report.completed_effects.len(), 2);
+    assert!(report.completed_renders.is_empty());
+
+    recorder.0.borrow_mut().clear();
+    assert!(input(&mut app, &mut sr, &mut physical, b"\x1bw\x1bW").is_empty());
+    assert_eq!(
+        &*recorder.0.borrow(),
+        &[
+            "Standalone task (working)",
+            "terminal, Standalone task (working)"
+        ]
+    );
+
+    let render_completed = (0..128).any(|_| {
+        !app.drain_scheduled_output(&mut physical, true)
+            .unwrap()
+            .completed_renders
+            .is_empty()
+    });
+    assert!(render_completed);
+    recorder.0.borrow_mut().clear();
+    assert!(input(&mut app, &mut sr, &mut physical, b"\x1bw\x1bW").is_empty());
+    assert_eq!(
+        &*recorder.0.borrow(),
+        &["Pane label", "tmux, fixture, 1: Window label"]
     );
 }
 

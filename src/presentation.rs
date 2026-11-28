@@ -42,6 +42,74 @@ pub struct AccessibilityEpoch {
     pub start_revision: ViewRevision,
 }
 
+/// Program states with an on-demand location suffix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgramActivity {
+    Working,
+    Blocked,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PresentedLocation {
+    Terminal {
+        view_id: ViewId,
+        title: String,
+        activity: Option<ProgramActivity>,
+    },
+    Named {
+        brief: Option<String>,
+        detailed: String,
+        activity: Option<ProgramActivity>,
+    },
+}
+
+impl PresentedLocation {
+    pub(crate) fn named(name: impl Into<String>) -> Self {
+        Self::Named {
+            brief: None,
+            detailed: name.into(),
+            activity: None,
+        }
+    }
+
+    pub(crate) fn label(&self, detailed: bool) -> String {
+        match self {
+            Self::Terminal { title, .. } => {
+                if title.is_empty() {
+                    "terminal".to_owned()
+                } else if detailed {
+                    format!("terminal, {title}")
+                } else {
+                    title.clone()
+                }
+            }
+            Self::Named {
+                brief: title,
+                detailed: location,
+                ..
+            } => {
+                if detailed {
+                    location.clone()
+                } else {
+                    title.as_ref().unwrap_or(location).clone()
+                }
+            }
+        }
+    }
+
+    pub(crate) fn announcement(&self, detailed: bool) -> String {
+        let mut label = self.label(detailed);
+        match self {
+            Self::Terminal { activity, .. } | Self::Named { activity, .. } => match activity {
+                Some(ProgramActivity::Working) => label.push_str(" (working)"),
+                Some(ProgramActivity::Blocked) => label.push_str(" (blocked)"),
+                None => {}
+            },
+        }
+        label
+    }
+}
+
 /// The exact view state represented by one physically presented surface.
 ///
 /// Visible state is retained with the render transaction. Scrollback is
@@ -56,6 +124,7 @@ pub struct PresentedViewFrame {
     /// separately so unchanged history can be shared instead of copied for
     /// every frame.
     pub snapshot: TerminalSnapshot,
+    pub program_activity: Option<ProgramActivity>,
     pub history_revision: u64,
     /// Basis of the history carried or reused by this frame. This is separate
     /// from visible geometry because compositor transitions may fit an older
@@ -129,14 +198,9 @@ pub struct PresentedHistoryDelta {
 pub struct PresentedAccessibilityBundle {
     /// View which owns screen-relative accessibility commands for this scene.
     pub active_view: Option<ViewId>,
-    /// Exact user-facing identity of the active view in this scene. Controller
-    /// titles (notably tmux locations) can change without changing `ViewId`, so
-    /// this label must cross the same flush boundary as the view frames.
-    pub active_label: Option<String>,
-    /// Terminal views derive their spoken label from the outer terminal's OSC
-    /// title. That effect has its own flush receipt and may complete before the
-    /// associated cell render under backpressure.
-    pub active_label_tracks_terminal_title: bool,
+    /// The active view's title, context, and program activity captured with
+    /// this scene. Controller titles can change without changing its ViewId.
+    pub(crate) active_location: Option<PresentedLocation>,
     pub frames: Vec<PresentedViewFrame>,
 }
 
@@ -172,24 +236,13 @@ impl PresentedAccessibilityBundle {
     pub fn new(active_view: Option<ViewId>, frames: Vec<PresentedViewFrame>) -> Self {
         Self {
             active_view,
-            active_label: None,
-            active_label_tracks_terminal_title: false,
+            active_location: None,
             frames,
         }
     }
 
-    pub fn with_active_label(
-        mut self,
-        active_label: impl Into<String>,
-        tracks_terminal_title: bool,
-    ) -> Self {
-        self.active_label = Some(active_label.into());
-        self.active_label_tracks_terminal_title = tracks_terminal_title;
-        self
-    }
-
     pub fn is_empty(&self) -> bool {
-        self.active_view.is_none() && self.active_label.is_none() && self.frames.is_empty()
+        self.active_view.is_none() && self.active_location.is_none() && self.frames.is_empty()
     }
 }
 

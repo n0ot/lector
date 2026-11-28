@@ -3079,6 +3079,7 @@ impl Terminal {
         self.history_changed_since_open_checkpoint = true;
         let _ = self.effect_sink.take()?;
         self.semantic_marks.clear();
+        self.snapshot.title = None;
         self.refresh_snapshot().map(|_| ())
     }
 
@@ -3582,7 +3583,15 @@ impl Terminal {
             ffi::TERMINAL_SCREEN_ALTERNATE => true,
             _ => return Err(Error::InvalidValue),
         };
-        let title = terminal_string(&self.terminal, ffi::TERMINAL_DATA_TITLE)?;
+        let title = terminal_string(&self.terminal, ffi::TERMINAL_DATA_TITLE)?.or_else(|| {
+            // Preserve an explicit OSC title clear, which the native query
+            // represents the same way as a terminal that never had a title.
+            self.snapshot
+                .title
+                .as_ref()
+                .filter(|title| title.is_empty())
+                .cloned()
+        });
         let working_directory = terminal_string(&self.terminal, ffi::TERMINAL_DATA_PWD)?;
         let actual_scrollback_extent = self.actual_scrollback_extent()?;
         let scrollback_extent = actual_scrollback_extent.min(self.scrollback_capacity);

@@ -250,8 +250,8 @@ unrelated shell.
 
 ## Announcements
 
-`M-w` names the current location, such as "tmux, dev, 1: editor", or
-"tmux, dev, 1.1: editor" in a split window.
+The [location keys](../../guide/tmux.md#where-am-i) speak the title and status
+of the presented view. Lector also announces changes automatically.
 
 - A window change announces the window title.
 - A session change announces the session, then the window title.

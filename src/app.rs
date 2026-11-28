@@ -5,8 +5,9 @@ use crate::{
     output_scheduler::{DrainReport, OutputScheduler, OutputSchedulerConfig, ScheduledOutputClass},
     presentation::{
         CursorOwner, GridPoint, IncrementalVtRenderer, PhysicalKeyboardProtocol,
-        PhysicalTerminalLifecycle, PresentedScene, RenderCapabilities, RendererBackend, Scene,
-        SceneDamage, SceneOverlay, SceneSurface, SurfaceId, ViewId, ViewRevision,
+        PhysicalTerminalLifecycle, PresentedLocation, PresentedScene, RenderCapabilities,
+        RendererBackend, Scene, SceneDamage, SceneOverlay, SceneSurface, SurfaceId, ViewId,
+        ViewRevision,
     },
     screen_reader::{ScreenReader, TmuxBellMode},
     terminal::{ScreenIdentity, TerminalGeometry, UpdateSummary},
@@ -951,14 +952,6 @@ impl StabilizationProfile {
     }
 }
 
-fn format_terminal_accessibility_label(title: &str) -> String {
-    if title.is_empty() {
-        "terminal".to_owned()
-    } else {
-        format!("terminal, {title}")
-    }
-}
-
 pub trait Clock {
     fn now_ms(&self) -> u128;
 }
@@ -1251,8 +1244,7 @@ pub struct App {
     scene_renderer: IncrementalVtRenderer,
     presented_scene: PresentedScene,
     presented_accessibility_view: Option<ViewId>,
-    presented_accessibility_label: Option<String>,
-    presented_accessibility_label_tracks_terminal_title: bool,
+    presented_accessibility_location: PresentedLocation,
     /// Monotonic count of bell bytes which crossed a successful physical
     /// terminal flush. Input receipts use this event sequence without making
     /// a bell part of persistent screen state.
@@ -2485,6 +2477,7 @@ impl App {
     pub fn new_with_clock(mut view_stack: views::ViewStack, clock: Box<dyn Clock>) -> Result<Self> {
         let geometry = view_stack.root_mut().model().live_screen().geometry;
         let physical_profile = PhysicalTerminalProfile::conservative(geometry);
+        let presented_accessibility_location = view_stack.active_accessibility_location(true);
         let mut app = Self {
             url_opener: crate::review::links::UrlOpener::default(),
             view_stack,
@@ -2515,8 +2508,7 @@ impl App {
             }),
             presented_scene: PresentedScene::blank(geometry),
             presented_accessibility_view: None,
-            presented_accessibility_label: None,
-            presented_accessibility_label_tracks_terminal_title: false,
+            presented_accessibility_location,
             presented_bell_count: 0,
             pending_view_announcement: false,
             pending_tmux_location_announcement: None,
@@ -2809,9 +2801,6 @@ impl App {
         self.compositor_transition_retry_attempt = None;
         self.view_stack.enable_presentation_tracking();
         self.presented_accessibility_view = Some(self.view_stack.logical_active_view_id());
-        let (label, tracks_terminal_title) = self.view_stack.active_accessibility_label(false);
-        self.presented_accessibility_label = Some(label);
-        self.presented_accessibility_label_tracks_terminal_title = tracks_terminal_title;
     }
 
     fn presented_accessibility_model_mut(&mut self) -> &mut View {
@@ -3043,10 +3032,9 @@ impl App {
             if let Some(active_view) = completed.accessibility.active_view {
                 self.presented_accessibility_view = Some(active_view);
             }
-            self.presented_accessibility_label
-                .clone_from(&completed.accessibility.active_label);
-            self.presented_accessibility_label_tracks_terminal_title =
-                completed.accessibility.active_label_tracks_terminal_title;
+            if let Some(location) = &completed.accessibility.active_location {
+                self.presented_accessibility_location.clone_from(location);
+            }
             self.log_latency_stage("presentation-flushed", || {
                 let revision = completed
                     .accessibility
@@ -3063,17 +3051,18 @@ impl App {
         self.presented_bell_count = self
             .presented_bell_count
             .saturating_add(u64::try_from(report.completed_bells).unwrap_or(u64::MAX));
-        for completed in &report.completed_effects {
+        for (index, completed) in report.completed_effects.iter().enumerate() {
             self.presented_scene.apply_terminal_effect(&completed.event);
+            if index >= report.effects_before_last_render
+                && let PresentedLocation::Terminal { view_id, title, .. } =
+                    &mut self.presented_accessibility_location
+                && completed.originating_view == Some(*view_id)
+                && let crate::terminal::TerminalEvent::TitleChanged(updated) = &completed.event
+            {
+                title.clone_from(updated);
+            }
             if matches!(completed.event, crate::terminal::TerminalEvent::Bell) {
                 self.presented_bell_count = self.presented_bell_count.saturating_add(1);
-            }
-            if completed.owner == ROOT_SOURCE
-                && self.presented_accessibility_label_tracks_terminal_title
-                && let crate::terminal::TerminalEvent::TitleChanged(title) = &completed.event
-            {
-                self.presented_accessibility_label =
-                    Some(format_terminal_accessibility_label(title));
             }
         }
         let application_synchronization_ignored = self

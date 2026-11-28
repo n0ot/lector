@@ -719,29 +719,110 @@ fn chooser_and_command_popups_match_the_ghostty_physical_oracle() {
 }
 
 #[test]
-fn tmux_m_w_announces_connection_and_window_while_terminal_wording_stays_separate() {
-    let (mut app, mut sr, recorder, mut physical) = ready_app();
-    recorder.0.borrow_mut().clear();
-    input(&mut app, &mut sr, &mut physical, b"\x1bw");
-    assert!(
-        recorder
-            .0
-            .borrow()
-            .iter()
-            .any(|message| message == "tmux, work, 1.1: duplicate")
+fn location_hotkeys_follow_the_presented_tmux_pane_and_chooser() {
+    let (mut app, mut sr, recorder, clock, mut physical) = ready_app_with_clock();
+    sr.set_program_status_announcements(false);
+    let say_location =
+        |app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>, expected: [&str; 2]| {
+            recorder.0.borrow_mut().clear();
+            let mut commands = Vec::new();
+            for key in [b"\x1bw", b"\x1bW"] {
+                app.handle_stdin(sr, key, &mut commands, physical).unwrap();
+            }
+            assert_eq!(&*recorder.0.borrow(), &expected);
+            assert!(commands.is_empty());
+        };
+
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        ["left", "tmux, work, 1.1: duplicate"],
+    );
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(
+            20,
+            b"\x1b]2;Task list\x1b\\\x1b]7501;state=working:app=Fixture\x1b\\",
+        ),
+        &mut physical,
+    )
+    .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(23, b"\x1b]7501;state=blocked:app=Fixture\x1b\\"),
+        &mut physical,
+    )
+    .unwrap();
+
+    app.enable_output_scheduler(OutputSchedulerConfig::default());
+    app.handle_pty(&mut sr, b"%window-pane-changed @10 %23\n", &mut physical)
+        .unwrap();
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        [
+            "Task list (working)",
+            "tmux, work, 1.1: duplicate (working)",
+        ],
+    );
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut physical, false).unwrap();
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        ["right (blocked)", "tmux, work, 1.2: duplicate (blocked)"],
     );
 
-    let recorder = Recorder::default();
-    let stack = views::ViewStack::new(Box::new(views::PtyView::new(4, 20)));
-    let mut terminal = App::new(stack).unwrap();
-    let mut terminal_sr = ScreenReader::new(speech::Speech::new(Box::new(recorder.clone())));
-    input(&mut terminal, &mut terminal_sr, &mut Vec::new(), b"\x1bw");
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(23, b"\x1b]2;\x1b\\\x1b]7501;state=clear\x1b\\"),
+        &mut physical,
+    )
+    .unwrap();
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        ["right (blocked)", "tmux, work, 1.2: duplicate (blocked)"],
+    );
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut physical, false).unwrap();
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        ["pane 23", "tmux, work, 1.2: duplicate"],
+    );
+
+    app.handle_pty(
+        &mut sr,
+        &pane_output_record(23, b"\x1b]7501;state=working\x1b\\"),
+        &mut physical,
+    )
+    .unwrap();
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut physical, false).unwrap();
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        ["pane 23 (working)", "tmux, work, 1.2: duplicate (working)"],
+    );
+
     assert!(
-        recorder
-            .0
-            .borrow()
-            .iter()
-            .any(|message| message == "terminal")
+        app.show_tmux_session_chooser(&mut sr, &mut physical)
+            .unwrap()
+    );
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut physical, false).unwrap();
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        ["tmux sessions", "tmux sessions"],
     );
 }
 

@@ -1,6 +1,8 @@
 use super::{Result, ViewAction, ViewController, ViewKind};
 use crate::{
-    presentation::{PresentedFrameIndex, PresentedViewFrame, Scene, SurfaceId, ViewId},
+    presentation::{
+        PresentedFrameIndex, PresentedLocation, PresentedViewFrame, Scene, SurfaceId, ViewId,
+    },
     screen_reader::ScreenReader,
     terminal::{TerminalGeometry, UpdateSummary},
     terminal_input::KeyInput,
@@ -538,6 +540,40 @@ impl TmuxConnectionView {
             || format!("tmux, {}, no active window", self.topology.label()),
             |location| location.accessible_title(),
         )
+    }
+
+    pub(crate) fn accessibility_location(&self, live: bool) -> PresentedLocation {
+        let detailed = self.accessible_title();
+        let (brief, activity) = match self.active_document() {
+            ActiveDocument::Pane(pane_id) => {
+                let view = self
+                    .panes
+                    .pane_view(pane_id)
+                    .expect("active pane owns a view");
+                let screen = if live {
+                    view.live_screen()
+                } else {
+                    view.screen()
+                };
+                let title = screen
+                    .title
+                    .as_deref()
+                    .or_else(|| self.topology.pane(pane_id).map(|pane| pane.title.as_str()));
+                let brief = title
+                    .filter(|title| !title.is_empty())
+                    .map_or_else(|| format!("pane {}", pane_id.0), str::to_owned);
+                (brief, view.program_activity(live))
+            }
+            ActiveDocument::ConnectionPortal | ActiveDocument::PanePortal(_) => {
+                ("tmux portal".to_owned(), None)
+            }
+            ActiveDocument::Placeholder => ("tmux".to_owned(), None),
+        };
+        PresentedLocation::Named {
+            brief: Some(brief),
+            detailed,
+            activity,
+        }
     }
 
     #[must_use]

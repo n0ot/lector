@@ -496,7 +496,16 @@ impl App {
                         || application_synchronization_timed_out),
             );
             if let Some(effect) = title_effect {
-                scheduler.enqueue_terminal_effect(ROOT_SOURCE, effect, self.clock.now_ms());
+                let title_view = match accessibility.active_location.as_ref() {
+                    Some(PresentedLocation::Terminal { view_id, .. }) => Some(*view_id),
+                    _ => None,
+                };
+                scheduler.enqueue_terminal_effect_for_view(
+                    ROOT_SOURCE,
+                    effect,
+                    title_view,
+                    self.clock.now_ms(),
+                );
             }
             if let Some(effect) = working_directory_effect {
                 scheduler.enqueue_terminal_effect(ROOT_SOURCE, effect, self.clock.now_ms());
@@ -575,6 +584,7 @@ impl App {
             .saturating_add(u64::try_from(bell_count).unwrap_or(u64::MAX));
         self.scene_renderer.confirm(&batch.predicted);
         self.presented_scene = batch.predicted;
+        self.presented_accessibility_location = self.view_stack.active_accessibility_location(true);
         if let Some(transition) = synchronization.compositor_transition {
             self.view_stack.complete_compositor_transition(transition);
         }
@@ -775,7 +785,7 @@ impl App {
         let title = if !announce_title {
             None
         } else if self.output_scheduler.is_some() {
-            self.presented_accessibility_label.clone()
+            Some(self.presented_accessibility_location.label(true))
         } else {
             Some(self.view_stack.active_mut().title().to_string())
         };

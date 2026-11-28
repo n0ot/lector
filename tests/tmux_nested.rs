@@ -587,6 +587,57 @@ fn nested_connection_routes_commands_through_its_parent_portal_and_preserves_sib
 }
 
 #[test]
+fn current_location_keeps_matching_pane_ids_in_nested_connections_separate() {
+    let (mut app, mut sr, recorder, mut physical) = recording_app();
+    sr.set_program_status_announcements(false);
+    ready_root(&mut app, &mut sr, &mut physical);
+    app.handle_pty(
+        &mut sr,
+        &pane_output(20, b"\x1b]2;Outer task\x1b\\\x1b]7501;state=working\x1b\\"),
+        &mut physical,
+    )
+    .unwrap();
+    recorder.0.borrow_mut().clear();
+    input(&mut app, &mut sr, &mut physical, b"\x1bw\x1bW");
+    assert_eq!(
+        &*recorder.0.borrow(),
+        &["Outer task (working)", "tmux, outer, 1.1: outer (working)"]
+    );
+
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        "inner",
+        "/dev/ttys-inner",
+    );
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &pane_output(20, b"\x1b]2;Inner task\x1b\\\x1b]7501;state=blocked\x1b\\"),
+    );
+
+    recorder.0.borrow_mut().clear();
+    input(&mut app, &mut sr, &mut physical, b"\x1bw\x1bW");
+    assert_eq!(
+        &*recorder.0.borrow(),
+        &["Inner task (blocked)", "tmux, inner, 1: inner (blocked)"]
+    );
+
+    assert!(
+        app.activate_tmux_connection(1, &mut sr, &mut physical)
+            .unwrap()
+    );
+    recorder.0.borrow_mut().clear();
+    input(&mut app, &mut sr, &mut physical, b"\x1bw\x1bW");
+    assert_eq!(&*recorder.0.borrow(), &["tmux portal", "tmux portal"]);
+}
+
+#[test]
 fn parent_controls_render_and_announce_when_focus_returns_to_a_nested_pane_portal() {
     let (mut app, mut sr, recorder, mut physical) = recording_app();
     ready_root(&mut app, &mut sr, &mut physical);

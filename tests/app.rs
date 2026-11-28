@@ -7210,74 +7210,157 @@ fn toggle_stop_on_focus_loss_hotkey_disables_stopping() {
 }
 
 #[test]
-fn say_overlay_hotkey_speaks_terminal_mode_and_current_title() {
+fn current_location_hotkeys_speak_standalone_title_context_and_activity() {
     let (mut app, mut sr, recorder, _clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
+    sr.set_program_status_announcements(false);
 
-    app.handle_pty(&mut sr, b"\x1b]2;Build status\x1b\\", &mut term_out)
-        .expect("model application title");
-
-    app.handle_stdin(&mut sr, b"\x1Bw", &mut pty_out, &mut term_out)
-        .expect("handle stdin");
-
-    let speaks = &recorder.inner.borrow().speaks;
-    assert!(
-        speaks
-            .iter()
-            .any(|(text, _)| text == "terminal, Build status"),
-        "speaks={speaks:?}"
-    );
+    for (output, brief, detailed) in [
+        (b"".as_slice(), "terminal", "terminal"),
+        (
+            b"\x1b]2;Build panel\x1b\\\x1b]7501;state=working:app=Fixture\x1b\\",
+            "Build panel (working)",
+            "terminal, Build panel (working)",
+        ),
+        (
+            b"\x1b]7501;state=blocked:app=Fixture\x1b\\",
+            "Build panel (blocked)",
+            "terminal, Build panel (blocked)",
+        ),
+        (
+            b"\x1b]7501;state=done\x1b\\",
+            "Build panel",
+            "terminal, Build panel",
+        ),
+        (
+            b"\x1b]7501;state=idle\x1b\\",
+            "Build panel",
+            "terminal, Build panel",
+        ),
+        (
+            b"\x1b]7501;state=error\x1b\\",
+            "Build panel",
+            "terminal, Build panel",
+        ),
+        (
+            b"\x1b]7501;state=working\x1b\\\x1b]7501;state=clear\x1b\\",
+            "Build panel",
+            "terminal, Build panel",
+        ),
+        (
+            b"\x1b]7501;state=unknown\x1b\\",
+            "Build panel",
+            "terminal, Build panel",
+        ),
+        (b"\x1b]2;\x1b\\", "terminal", "terminal"),
+    ] {
+        app.handle_pty(&mut sr, output, &mut term_out)
+            .expect("present terminal update");
+        recorder.inner.borrow_mut().speaks.clear();
+        for key in [b"\x1bw", b"\x1bW"] {
+            app.handle_stdin(&mut sr, key, &mut pty_out, &mut term_out)
+                .expect("say current location");
+        }
+        assert_eq!(
+            recorder.inner.borrow().speaks,
+            [(brief.to_owned(), false), (detailed.to_owned(), false)]
+        );
+    }
+    assert!(pty_out.is_empty());
 }
 
 #[test]
-fn say_overlay_follows_the_completed_overlay_identity_across_backpressure() {
+fn current_location_follows_the_completed_overlay_identity_across_backpressure() {
     let (mut app, mut sr, recorder, clock) = make_app();
     let mut pty_out = Vec::new();
     let mut term_out = Vec::new();
+    let say_location = |app: &mut App,
+                        sr: &mut ScreenReader,
+                        pty_out: &mut Vec<u8>,
+                        term_out: &mut Vec<u8>,
+                        brief: &str,
+                        detailed: &str| {
+        recorder.inner.borrow_mut().speaks.clear();
+        for key in [
+            b"\x1b[119;3:1;119u\x1b[119;3:3u".as_slice(),
+            b"\x1b[119:87;4:1;87u\x1b[119:87;4:3u",
+        ] {
+            app.handle_stdin(sr, key, pty_out, term_out)
+                .expect("say the presented location");
+        }
+        assert_eq!(
+            recorder.inner.borrow().speaks,
+            [(brief.to_owned(), false), (detailed.to_owned(), false)]
+        );
+    };
 
-    app.handle_pty(&mut sr, b"\x1b]2;Base title\x1b\\base", &mut term_out)
-        .expect("present the initial terminal");
+    app.handle_pty(
+        &mut sr,
+        b"\x1b]2;Base title\x1b\\\x1b]7501;state=working\x1b\\base",
+        &mut term_out,
+    )
+    .expect("present the initial terminal");
     app.enable_output_scheduler(OutputSchedulerConfig::default());
     term_out.clear();
 
     app.show_message(&mut sr, "Notice", "foreground", &mut term_out)
-        .expect("queue the overlay");
-    recorder.inner.borrow_mut().speaks.clear();
-    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
-        .expect("say the still-presented terminal");
-    assert_eq!(
-        recorder.inner.borrow().speaks.last(),
-        Some(&("terminal, Base title".into(), false))
+        .expect("queue an overlay");
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut pty_out,
+        &mut term_out,
+        "Base title (working)",
+        "terminal, Base title (working)",
     );
 
     clock.advance_ms(4);
     app.drain_scheduled_output(&mut term_out, false)
         .expect("present the overlay");
-    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
-        .expect("say the presented overlay");
-    assert_eq!(
-        recorder.inner.borrow().speaks.last(),
-        Some(&("Notice".into(), false))
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut pty_out,
+        &mut term_out,
+        "Notice",
+        "Notice",
     );
 
     app.handle_stdin(&mut sr, b"\r", &mut pty_out, &mut term_out)
         .expect("queue overlay dismissal");
-    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
-        .expect("keep saying the physical overlay");
-    assert_eq!(
-        recorder.inner.borrow().speaks.last(),
-        Some(&("Notice".into(), false))
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut pty_out,
+        &mut term_out,
+        "Notice",
+        "Notice",
     );
 
     clock.advance_ms(4);
     app.drain_scheduled_output(&mut term_out, false)
         .expect("present the revealed terminal");
-    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
-        .expect("say the revealed terminal");
-    assert_eq!(
-        recorder.inner.borrow().speaks.last(),
-        Some(&("terminal, Base title".into(), false))
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut pty_out,
+        &mut term_out,
+        "Base title (working)",
+        "terminal, Base title (working)",
+    );
+    app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
+        .expect("open Review");
+    clock.advance_ms(4);
+    app.drain_scheduled_output(&mut term_out, false)
+        .expect("ensure Review is presented");
+    say_location(
+        &mut app,
+        &mut sr,
+        &mut pty_out,
+        &mut term_out,
+        "Review",
+        "Review",
     );
     assert!(pty_out.is_empty());
 }
@@ -7305,7 +7388,7 @@ fn say_overlay_tracks_a_flushed_title_effect_before_its_cell_render() {
         &mut term_out,
     )
     .expect("queue a title and cell update");
-    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
+    app.handle_stdin(&mut sr, b"\x1bW", &mut pty_out, &mut term_out)
         .expect("say the title before either transaction flushes");
     assert_eq!(
         recorder.inner.borrow().speaks.last(),
@@ -7318,7 +7401,7 @@ fn say_overlay_tracks_a_flushed_title_effect_before_its_cell_render() {
     assert_eq!(report.completed_effects.len(), 1);
     assert!(report.completed_renders.is_empty());
 
-    app.handle_stdin(&mut sr, b"\x1bw", &mut pty_out, &mut term_out)
+    app.handle_stdin(&mut sr, b"\x1bW", &mut pty_out, &mut term_out)
         .expect("say the physically applied title");
     assert_eq!(
         recorder.inner.borrow().speaks.last(),

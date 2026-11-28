@@ -54,8 +54,12 @@ any other screen. `Enter` or `Escape` closes it.
 
 ## Where am I?
 
-Press `M-w`. Lector answers with something like "tmux, dev, 1: editor", or
-"tmux, dev, 1.1: editor" when the window is split.
+Press `M-w` to hear the active pane's title. For an untitled pane, Lector
+says its pane ID, such as "pane 23".
+Press `M-W` (Meta-Shift-w) for the full location, such as "tmux, dev, 1: editor"
+or "tmux, dev, 1.1: editor" when the window is split. Both keys add "(working)"
+or "(blocked)" when the pane's program reports that status. When Review or a
+chooser is visible, both keys say its name.
 
 Lector also announces the window title when you change windows, and the
 session and window when you change sessions.
