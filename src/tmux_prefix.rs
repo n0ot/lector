@@ -241,57 +241,23 @@ fn check_choose_tree_format(operand: &str) -> Result<(), String> {
         segment_start = false;
     }
 
-    let mut depth = 0usize;
-    let mut chars = source.char_indices().peekable();
-    while let Some((start, character)) = chars.next() {
-        match character {
-            '#' => match chars.peek().map(|(_, next)| *next) {
-                Some('{') => {
-                    depth += 1;
-                    chars.next();
-                }
-                Some('#' | '}' | ',') => {
-                    chars.next();
-                }
-                Some('(') => {
-                    return Err(
-                        "uses a shell format with different context in the accessible picker"
-                            .into(),
-                    );
-                }
-                _ => {}
-            },
-            '}' => depth = depth.saturating_sub(1),
-            character if depth != 0 && is_format_word_character(character) => {
-                while chars
-                    .peek()
-                    .is_some_and(|(_, next)| is_format_word_character(*next))
-                {
-                    chars.next();
-                }
-                let end = chars.peek().map_or(source.len(), |(index, _)| *index);
-                let word = &source[start..end];
-                let prefix = &source[..start];
-                let lookup = prefix.ends_with(['{', '?', ':']) && !prefix.ends_with("#{l:");
-                if lookup
-                    && (matches!(word, "line" | "command" | "hook" | "window_bigger")
-                        || word.starts_with("client_")
-                        || word.starts_with("hook_"))
-                {
-                    return Err(format!(
-                        "uses {word}, which has different context in the accessible picker"
-                    ));
-                }
-                if prefix.ends_with(['{', ';'])
-                    && matches!(word, "E" | "T" | "I" | "S")
-                    && chars
-                        .peek()
-                        .is_some_and(|(_, next)| matches!(next, ':' | ';' | '/'))
-                {
-                    return Err(format!(
-                        "uses the {word} modifier, which has different context in the accessible picker"
-                    ));
-                }
+    // Check the expression headers, including nested expressions inside
+    // comparisons and branches. tmux still expands the original operand.
+    let mut format = source.as_str();
+    while let Some((_, after_hash)) = format.split_once('#') {
+        let Some(marker) = after_hash.chars().next() else {
+            break;
+        };
+        format = &after_hash[marker.len_utf8()..];
+        match marker {
+            '{' => check_choose_tree_expression(format)?,
+            '(' => return Err("uses a shell format unavailable in the accessible picker".into()),
+            // These shortcuts expand to the same fields as the named forms.
+            'D' | 'F' | 'H' | 'I' | 'P' | 'S' | 'T' | 'W' | 'h' => {}
+            marker if marker.is_ascii_alphabetic() => {
+                return Err(format!(
+                    "uses shorthand #{marker} unavailable in the accessible picker"
+                ));
             }
             _ => {}
         }
@@ -299,8 +265,73 @@ fn check_choose_tree_format(operand: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_format_word_character(character: char) -> bool {
-    character.is_ascii_alphanumeric() || character == '_'
+fn check_choose_tree_expression(expression: &str) -> Result<(), String> {
+    if let Some(condition) = expression.strip_prefix('?') {
+        if condition.starts_with("#{") {
+            return Ok(());
+        }
+        let field = condition.split([',', '}']).next().unwrap_or_default();
+        return check_choose_tree_field(field);
+    }
+    if ["==:", "!=:", "<=:", ">=:", "&&:", "||:", "m:"]
+        .iter()
+        .any(|modifier| expression.starts_with(modifier))
+    {
+        return Ok(());
+    }
+    let (part, rest) = expression
+        .find([':', '}'])
+        .map_or((expression, ""), |end| expression.split_at(end));
+    if let Some(field) = rest.strip_prefix(':') {
+        let width = part
+            .strip_prefix('=')
+            .and_then(|width| width.parse::<i32>().ok());
+        if width.is_some() {
+            return check_choose_tree_field(field.split('}').next().unwrap_or_default());
+        }
+        return Err(format!(
+            "uses the {part} modifier unavailable in the accessible picker"
+        ));
+    }
+    check_choose_tree_field(part)
+}
+
+fn check_choose_tree_field(field: &str) -> Result<(), String> {
+    // These values depend only on the server or explicit row/descendant
+    // objects. Similar-looking names (such as session_active) can also
+    // depend on the invoking client, which differs in list commands.
+    if matches!(
+        field,
+        "host"
+            | "host_short"
+            | "session_attached"
+            | "session_format"
+            | "session_id"
+            | "session_name"
+            | "session_windows"
+            | "window_active"
+            | "window_flags"
+            | "window_format"
+            | "window_id"
+            | "window_index"
+            | "window_name"
+            | "window_panes"
+            | "window_zoomed_flag"
+            | "pane_active"
+            | "pane_current_command"
+            | "pane_current_path"
+            | "pane_dead"
+            | "pane_format"
+            | "pane_id"
+            | "pane_index"
+            | "pane_title"
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "uses {field}, which is unavailable in the accessible picker’s format context"
+        ))
+    }
 }
 
 /// Whether a successful discovered command can invalidate prefix discovery.

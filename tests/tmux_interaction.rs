@@ -57,6 +57,8 @@ fn inventory_groups(session_two_name: &str) -> Vec<Vec<Vec<u8>>> {
             b"B\tt\t0\tchoose-tree -Zs -t 'window scope'".to_vec(),
             b"B\td\t0\tchoose-tree -Zw -F '#{session_name}'".to_vec(),
             b"B\tu\t0\tchoose-tree -Zw -f '#{?client_control_mode,1,0}'".to_vec(),
+            b"B\tz\t0\tchoose-tree -Zs -f '#{session_active}'".to_vec(),
+            b"B\tp\t0\tchoose-tree -F '#{pane_title}'".to_vec(),
             b"B\tq\t0\tdisplay-panes".to_vec(),
             b"B\t:\t0\tcommand-prompt".to_vec(),
             b"B\tZ\t0\tdisplay-message -p -F \"#{session_name}:#{window_index}:#{pane_index}\""
@@ -138,6 +140,12 @@ fn reply(serial: usize, lines: &[Vec<u8>], success: bool) -> Vec<u8> {
 }
 
 fn ready_app_with_clock() -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
+    ready_app_with_inventory(&inventory_groups("work"))
+}
+
+fn ready_app_with_inventory(
+    groups: &[Vec<Vec<u8>>],
+) -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
     let recorder = Recorder::default();
     let stack = views::ViewStack::new(Box::new(views::PtyView::new(24, 80)));
     let clock = TestClock::default();
@@ -173,7 +181,7 @@ fn ready_app_with_clock() -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
     .unwrap();
     app.handle_pty(&mut sr, &reply(4, &[], true), &mut physical)
         .unwrap();
-    for (index, group) in inventory_groups("work").iter().enumerate() {
+    for (index, group) in groups.iter().enumerate() {
         app.handle_pty(&mut sr, &reply(index + 5, group, true), &mut physical)
             .unwrap();
     }
@@ -668,7 +676,15 @@ fn discovered_choose_tree_bare_and_unsupported_bindings_are_accessible() {
 
     input(&mut app, &mut sr, &mut physical, b"\x01u");
     assert!(recorder.0.borrow().iter().any(|utterance| {
-        utterance.contains("client_control_mode") && utterance.contains("different context")
+        utterance.contains("client_control_mode") && utterance.contains("format context")
+    }));
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    assert_eq!(app.debug_active_view_contents(), original);
+
+    input(&mut app, &mut sr, &mut physical, b"\x01z");
+    assert!(recorder.0.borrow().iter().any(|utterance| {
+        utterance.contains("session_active") && utterance.contains("format context")
     }));
     assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
     input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
@@ -679,6 +695,29 @@ fn discovered_choose_tree_bare_and_unsupported_bindings_are_accessible() {
         tick(&mut app, &mut sr, &mut physical),
         b"select-pane -t %23\n"
     );
+}
+
+#[test]
+fn discovered_custom_choose_tree_rejects_ambiguous_window_links() {
+    let mut groups = inventory_groups("work");
+    groups[1].push(format!("W\t$1\t@10\t3\t0\t{SPLIT}\t{SPLIT}\t-\tduplicate").into_bytes());
+    let (mut app, mut sr, recorder, _, mut physical) = ready_app_with_inventory(&groups);
+    let original = app.debug_active_view_contents();
+
+    for key in *b"cdp" {
+        recorder.0.borrow_mut().clear();
+        input(&mut app, &mut sr, &mut physical, &[1, key]);
+        assert!(
+            recorder
+                .0
+                .borrow()
+                .iter()
+                .any(|utterance| utterance.contains("require unique window links"))
+        );
+        assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+        input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+        assert_eq!(app.debug_active_view_contents(), original);
+    }
 }
 
 #[test]

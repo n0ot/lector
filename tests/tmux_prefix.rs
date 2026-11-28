@@ -152,6 +152,11 @@ fn choose_tree_flags_stop_at_option_operands() {
             Panes,
         ),
         (r#"choose-tree -F '#{?pane_active,line,other}'"#, Panes),
+        (
+            r#"choose-tree -w -f '#{&&:#{window_active},#{==:#{pane_title},north west}}'"#,
+            Windows,
+        ),
+        (r#"choose-tree -s -F '#{=12:session_name} #S'"#, Sessions),
         ("choose-tree -F -w", Panes),
     ] {
         assert!(
@@ -170,6 +175,8 @@ fn choose_tree_flags_stop_at_option_operands() {
         "choose-tree -w; display-message other",
         r#"choose-tree -w \; display-message other"#,
         r#"choose-tree -f '#{line}'"#,
+        r#"choose-tree -Zs -f '#{session_active}'"#,
+        r#"choose-tree -Zw -F '#{?session_active,active,inactive}'"#,
         r#"choose-tree -F '#{?client_control_mode,yes,no}'"#,
         r#"choose-tree -F '#{?pane_active,#{==:#{line},0},no}'"#,
         r#"choose-tree -F '#{E:@custom}'"#,

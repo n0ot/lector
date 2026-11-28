@@ -29,7 +29,7 @@ pub enum TmuxChooserTarget {
 enum TmuxChooserScope {
     Sessions,
     Windows(SessionId),
-    Panes(WindowId),
+    Panes(SessionId, WindowId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,13 +48,13 @@ struct TmuxTreeRows {
     pending: usize,
     matching: Option<BTreeSet<TmuxChooserTarget>>,
     labels: Option<BTreeMap<TmuxChooserTarget, String>>,
-    failed: bool,
+    error: Option<&'static str>,
 }
 
 impl TmuxTreeRows {
     fn status(&self) -> Option<&'static str> {
-        if self.failed {
-            Some("tmux could not evaluate the chooser format or filter")
+        if let Some(error) = self.error {
+            Some(error)
         } else if self.pending != 0 {
             Some("loading tmux chooser rows")
         } else {
@@ -125,9 +125,9 @@ impl TmuxChooserView {
 
     #[must_use]
     pub fn panes(rows: u16, cols: u16, connection_id: u64, topology: &TmuxTopology) -> Self {
+        let session_id = topology.attached_session().unwrap_or(SessionId(u64::MAX));
         let window_id = topology
-            .attached_session()
-            .and_then(|session_id| topology.session(session_id))
+            .session(session_id)
             .and_then(|session| session.active_window)
             .unwrap_or(WindowId(u64::MAX));
         let selected = topology
@@ -139,7 +139,7 @@ impl TmuxChooserView {
             cols,
             connection_id,
             "tmux panes",
-            TmuxChooserScope::Panes(window_id),
+            TmuxChooserScope::Panes(session_id, window_id),
             selected,
             topology,
         )
@@ -179,11 +179,35 @@ impl TmuxChooserView {
         self.selected
     }
 
+    fn tree_scope_error(&self, topology: &TmuxTopology) -> Option<&'static str> {
+        let (session_id, chosen_window) = match self.scope {
+            TmuxChooserScope::Sessions => return None,
+            TmuxChooserScope::Windows(session_id) => (session_id, None),
+            TmuxChooserScope::Panes(session_id, window_id) => (session_id, Some(window_id)),
+        };
+        let mut seen = BTreeSet::new();
+        let ambiguous = topology
+            .session(session_id)?
+            .windows
+            .values()
+            .filter(|window_id| chosen_window.is_none_or(|chosen| chosen == **window_id))
+            .any(|window_id| !seen.insert(*window_id));
+        ambiguous.then_some(
+            "custom tmux filters and formats require unique window links in this session",
+        )
+    }
+
     pub(crate) fn begin_tree_queries(
         &mut self,
         options: ChooseTree,
         topology: &TmuxTopology,
-    ) -> Vec<(TmuxTreeQuery, Vec<u8>)> {
+    ) -> std::result::Result<Vec<(TmuxTreeQuery, Vec<u8>)>, &'static str> {
+        if options.filter.is_none() && options.format.is_none() {
+            return Ok(Vec::new());
+        }
+        if let Some(error) = self.tree_scope_error(topology) {
+            return Err(error);
+        }
         let mut queries = Vec::new();
         let (id, panes, rows) = match self.scope {
             TmuxChooserScope::Sessions => (
@@ -196,10 +220,9 @@ impl TmuxChooserView {
                 format!("list-panes -s -t '${}'", session_id.0),
                 format!("list-windows -t '${}'", session_id.0),
             ),
-            TmuxChooserScope::Panes(window_id) => {
+            TmuxChooserScope::Panes(session_id, window_id) => {
                 // A linked window may have different session/index formats.
-                let session = topology.attached_session().unwrap_or(SessionId(u64::MAX));
-                let panes = format!("list-panes -t '${}:@{}'", session.0, window_id.0);
+                let panes = format!("list-panes -t '${}:@{}'", session_id.0, window_id.0);
                 ("#{pane_id}", panes.clone(), panes)
             }
         };
@@ -219,16 +242,14 @@ impl TmuxChooserView {
                 format!("{rows} -F 'R {id} '{format}\n").into_bytes(),
             ));
         }
-        if !queries.is_empty() {
-            self.tree_rows = Some(TmuxTreeRows {
-                pending: queries.len(),
-                matching: None,
-                labels: None,
-                failed: false,
-            });
-            self.sync_topology(topology);
-        }
-        queries
+        self.tree_rows = Some(TmuxTreeRows {
+            pending: queries.len(),
+            matching: None,
+            labels: None,
+            error: None,
+        });
+        self.sync_topology(topology);
+        Ok(queries)
     }
 
     pub(crate) fn apply_tree_reply(
@@ -239,7 +260,7 @@ impl TmuxChooserView {
         topology: &TmuxTopology,
     ) -> Option<String> {
         let rows = self.tree_rows.as_mut()?;
-        if rows.failed {
+        if rows.error.is_some() {
             return None;
         }
         let parsed = status == CommandStatus::Success
@@ -263,9 +284,11 @@ impl TmuxChooserView {
                     valid
                 }
             };
-        rows.failed = !parsed;
+        if !parsed {
+            rows.error = Some("tmux could not evaluate the chooser format or filter");
+        }
         rows.pending -= 1;
-        if !rows.failed && rows.pending != 0 {
+        if rows.error.is_none() && rows.pending != 0 {
             return None;
         }
         self.sync_topology(topology);
@@ -277,6 +300,12 @@ impl TmuxChooserView {
     }
 
     pub fn sync_topology(&mut self, topology: &TmuxTopology) {
+        if self.tree_rows.is_some()
+            && let Some(error) = self.tree_scope_error(topology)
+            && let Some(rows) = &mut self.tree_rows
+        {
+            rows.error = Some(error);
+        }
         if self
             .tree_rows
             .as_ref()
@@ -311,7 +340,7 @@ impl TmuxChooserView {
                     })
                 })
                 .collect(),
-            TmuxChooserScope::Panes(window_id) => {
+            TmuxChooserScope::Panes(_, window_id) => {
                 let mut panes = topology
                     .panes()
                     .values()
@@ -457,7 +486,7 @@ impl TmuxChooserView {
         match self.scope {
             TmuxChooserScope::Sessions => "no matching sessions",
             TmuxChooserScope::Windows(_) => "no matching windows",
-            TmuxChooserScope::Panes(_) => "no matching panes",
+            TmuxChooserScope::Panes(..) => "no matching panes",
         }
     }
 

@@ -1527,7 +1527,17 @@ impl App {
             ChooseTreeLevel::Panes => views::TmuxChooserView::panes,
         };
         let mut chooser = create(rows, cols, connection_id, &topology);
-        let queries = chooser.begin_tree_queries(options, &topology);
+        let queries = match chooser.begin_tree_queries(options, &topology) {
+            Ok(queries) => queries,
+            Err(reason) => {
+                return self.show_popup_error(
+                    sr,
+                    "tmux choose-tree is unavailable",
+                    reason,
+                    term_out,
+                );
+            }
+        };
         let view_id = views::ViewController::model(&mut chooser).view_id();
         self.handle_view_action(sr, views::ViewAction::Push(Box::new(chooser)), term_out)?;
         for (kind, bytes) in queries {
