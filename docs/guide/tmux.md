@@ -38,10 +38,21 @@ accessible version instead:
 | tmux command | What you get in Lector |
 | --- | --- |
 | Copy mode (`copy-mode`) | Lector's [Review](review.md) |
-| Session and window trees (`choose-tree`) | A filterable session or window list |
+| Session and window trees (`choose-tree`) | A filterable session, window, or pane list |
 | Pane numbers (`display-panes`) | A filterable pane list |
 | Command prompt (`command-prompt`) | A command prompt with history |
 | Kill confirmations (`confirm-before`) | A prompt naming exactly what will be closed |
+
+A `choose-tree` binding opens sessions with `-s`, windows in the current
+session with `-w`, or panes in the current window by default. tmux evaluates
+`-f` filters and `-F` row text when the picker opens. A session or window is
+included when one of its panes matches the filter. Custom text appears
+alongside the row's name or index. The picker supports literal text, row
+fields such as `session_name`, `window_index`, and `pane_title`, and basic
+comparisons, conditionals, and text truncation. Lector explains when a
+binding uses an unsupported expression, target pane, or command template.
+Custom window and pane choosers require a single link per window within
+the listed scope.
 
 In the lists, type to filter, press Up and Down to move, `Enter` to select,
 and `Escape` to cancel.

@@ -300,6 +300,18 @@ impl ViewStack {
             .downcast_mut::<crate::views::TmuxChooserView>()
     }
 
+    pub(crate) fn tmux_chooser_by_id_mut(
+        &mut self,
+        view_id: crate::presentation::ViewId,
+    ) -> Option<&mut crate::views::TmuxChooserView> {
+        self.views[self.base_count..].iter_mut().find_map(|view| {
+            let chooser = view
+                .as_any_mut()
+                .downcast_mut::<crate::views::TmuxChooserView>()?;
+            (chooser.model().view_id() == view_id).then_some(chooser)
+        })
+    }
+
     pub(crate) fn active_tmux_connection_chooser_mut(
         &mut self,
     ) -> Option<&mut crate::views::TmuxConnectionChooserView> {

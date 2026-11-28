@@ -273,17 +273,11 @@ impl App {
                     self.queue_tmux_user_command(connection_id, "send-prefix")
                 }
             }
-            crate::tmux_prefix::BindingAction::ChooseSession => {
-                if !self.show_tmux_session_chooser(sr, term_out)? {
-                    sr.speak("tmux session chooser is unavailable", false)?;
-                }
-                Ok(())
+            crate::tmux_prefix::BindingAction::ChooseTree(options) => {
+                self.show_tmux_tree_chooser(sr, connection_id, options, term_out)
             }
-            crate::tmux_prefix::BindingAction::ChooseWindow => {
-                if !self.show_tmux_window_chooser(sr, term_out)? {
-                    sr.speak("tmux window chooser is unavailable", false)?;
-                }
-                Ok(())
+            crate::tmux_prefix::BindingAction::UnsupportedChooseTree(reason) => {
+                self.show_popup_error(sr, "tmux choose-tree is unavailable", &reason, term_out)
             }
             crate::tmux_prefix::BindingAction::ChoosePane => {
                 if !self.show_tmux_pane_chooser(sr, term_out)? {

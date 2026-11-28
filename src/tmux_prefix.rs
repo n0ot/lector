@@ -16,8 +16,8 @@ pub enum BindingAction {
         command: String,
     },
     SendPrefix,
-    ChooseSession,
-    ChooseWindow,
+    ChooseTree(ChooseTree),
+    UnsupportedChooseTree(String),
     ChoosePane,
     CommandPrompt,
     SetKeyTable {
@@ -54,21 +54,14 @@ pub fn classify_binding(command: &str) -> Result<BindingAction, PrefixError> {
     if command == "copy-mode -u" {
         return Ok(BindingAction::OpenReview { page_up: true });
     }
-    if command.starts_with("choose-tree ") {
-        if command
-            .split_ascii_whitespace()
-            .skip(1)
-            .any(|argument| argument.contains('s'))
-        {
-            return Ok(BindingAction::ChooseSession);
-        }
-        if command
-            .split_ascii_whitespace()
-            .skip(1)
-            .any(|argument| argument.contains('w'))
-        {
-            return Ok(BindingAction::ChooseWindow);
-        }
+    if let Some(arguments) = command
+        .strip_prefix("choose-tree")
+        .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t', ';']))
+    {
+        return Ok(match ChooseTree::parse(arguments) {
+            Ok(options) => BindingAction::ChooseTree(options),
+            Err(reason) => BindingAction::UnsupportedChooseTree(reason),
+        });
     }
     if command == "command-prompt" || command.starts_with("command-prompt ") {
         return Ok(BindingAction::CommandPrompt);
@@ -94,6 +87,254 @@ pub fn classify_binding(command: &str) -> Result<BindingAction, PrefixError> {
         });
     }
     Ok(BindingAction::Execute(command.to_owned()))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ChooseTreeLevel {
+    #[default]
+    Panes,
+    Windows,
+    Sessions,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChooseTree {
+    pub level: ChooseTreeLevel,
+    // Keep the original tmux spelling (including quotes) so the server
+    // interprets escapes in filter and format operands exactly once.
+    pub(crate) filter: Option<String>,
+    pub(crate) format: Option<String>,
+}
+
+impl ChooseTree {
+    fn parse(mut arguments: &str) -> Result<Self, String> {
+        let mut options = Self::default();
+        while let Some(word) = choose_tree_word(&mut arguments)? {
+            if word == "--" && arguments.trim().is_empty() {
+                break;
+            }
+            let Some(flags) = word
+                .strip_prefix('-')
+                .filter(|flags| !flags.is_empty() && !flags.starts_with('-'))
+            else {
+                return Err(
+                    "choose-tree command templates are unavailable in the accessible picker".into(),
+                );
+            };
+            for (index, flag) in flags.char_indices() {
+                match flag {
+                    's' => options.level = ChooseTreeLevel::Sessions,
+                    'w' if options.level != ChooseTreeLevel::Sessions => {
+                        options.level = ChooseTreeLevel::Windows;
+                    }
+                    // The Lector overlay already covers the terminal, so it
+                    // needs no temporary zoom of the underlying tmux pane.
+                    'w' | 'Z' => {}
+                    'f' | 'F' => {
+                        let attached = &flags[index + 1..];
+                        let operand = if attached.is_empty() {
+                            choose_tree_word(&mut arguments)?
+                                .ok_or_else(|| format!("choose-tree -{flag} requires a value"))?
+                        } else {
+                            attached
+                        };
+                        let destination = if flag == 'f' {
+                            &mut options.filter
+                        } else {
+                            &mut options.format
+                        };
+                        *destination = Some(operand.to_owned());
+                        break;
+                    }
+                    _ => {
+                        return Err(format!(
+                            "choose-tree option -{flag} is unavailable in the accessible picker"
+                        ));
+                    }
+                }
+            }
+        }
+        for (flag, operand) in [('f', &options.filter), ('F', &options.format)] {
+            if let Some(operand) = operand
+                && let Err(reason) = check_choose_tree_format(operand)
+            {
+                return Err(format!("choose-tree -{flag} {reason}"));
+            }
+        }
+        Ok(options)
+    }
+}
+
+/// Read one word in the command syntax printed by tmux list-keys. This only
+/// locates the operand boundaries. tmux still interprets the operand itself.
+fn choose_tree_word<'a>(arguments: &mut &'a str) -> Result<Option<&'a str>, String> {
+    let input = arguments.trim_start_matches([' ', '\t']);
+    if input.is_empty() {
+        return Ok(None);
+    }
+    let mut quote = None;
+    let mut chars = input.char_indices();
+    while let Some((index, character)) = chars.next() {
+        match character {
+            ' ' | '\t' if quote.is_none() => {
+                *arguments = &input[index..];
+                return Ok(Some(&input[..index]));
+            }
+            '\\' if quote != Some('\'') => {
+                if chars.next().is_none() {
+                    return Err("incomplete escape in choose-tree binding".into());
+                }
+            }
+            '\'' | '"' if quote == Some(character) => quote = None,
+            '\'' | '"' if quote.is_none() => quote = Some(character),
+            ';' | '{' | '}' if quote.is_none() => {
+                return Err("choose-tree command sequences and templates are unavailable in the accessible picker".into());
+            }
+            '#' if index == 0 => {
+                return Err("expected a choose-tree value before the comment".into());
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() {
+        return Err("unterminated quote in choose-tree binding".into());
+    }
+    *arguments = "";
+    Ok(Some(input))
+}
+
+/// The list commands expose context missing from the tree, including their
+/// row ordinal and sometimes the command's client. Forward only operands
+/// whose format text can be checked for dependencies on that extra context.
+fn check_choose_tree_format(operand: &str) -> Result<(), String> {
+    let mut source = String::new();
+    let mut quote = None;
+    let mut segment_start = true;
+    let mut chars = operand.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\'' | '"' if quote.is_none() || quote == Some(character) => {
+                quote = quote.is_none().then_some(character);
+                segment_start = true;
+                continue;
+            }
+            '\\' if quote != Some('\'') => match chars.next() {
+                // Tmux treats these C-style escapes as non-word characters.
+                Some('a' | 'b' | 'e' | 'f' | 'n' | 'r' | 's' | 't' | 'v') => source.push(' '),
+                Some('0'..='7' | 'u' | 'U') | None => {
+                    return Err("uses an encoded escape the accessible picker cannot check".into());
+                }
+                Some(escaped) => source.push(escaped),
+            },
+            '$' if quote != Some('\'')
+                && chars.peek().is_some_and(|character| {
+                    character.is_ascii_alphabetic() || matches!(character, '_' | '{')
+                }) =>
+            {
+                return Err("uses a dynamic argument the accessible picker cannot check".into());
+            }
+            '~' if quote != Some('\'') && segment_start => {
+                return Err("uses a dynamic argument the accessible picker cannot check".into());
+            }
+            _ => source.push(character),
+        }
+        segment_start = false;
+    }
+
+    // Check the expression headers, including nested expressions inside
+    // comparisons and branches. tmux still expands the original operand.
+    let mut format = source.as_str();
+    while let Some((_, after_hash)) = format.split_once('#') {
+        let Some(marker) = after_hash.chars().next() else {
+            break;
+        };
+        format = &after_hash[marker.len_utf8()..];
+        match marker {
+            '{' => check_choose_tree_expression(format)?,
+            '(' => return Err("uses a shell format unavailable in the accessible picker".into()),
+            // These shortcuts expand to the same fields as the named forms.
+            'D' | 'F' | 'H' | 'I' | 'P' | 'S' | 'T' | 'W' | 'h' => {}
+            marker if marker.is_ascii_alphabetic() => {
+                return Err(format!(
+                    "uses shorthand #{marker} unavailable in the accessible picker"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_choose_tree_expression(expression: &str) -> Result<(), String> {
+    if let Some(condition) = expression.strip_prefix('?') {
+        if condition.starts_with("#{") {
+            return Ok(());
+        }
+        let field = condition.split([',', '}']).next().unwrap_or_default();
+        return check_choose_tree_field(field);
+    }
+    if ["==:", "!=:", "<=:", ">=:", "&&:", "||:", "m:"]
+        .iter()
+        .any(|modifier| expression.starts_with(modifier))
+    {
+        return Ok(());
+    }
+    let (part, rest) = expression
+        .find([':', '}'])
+        .map_or((expression, ""), |end| expression.split_at(end));
+    if let Some(field) = rest.strip_prefix(':') {
+        let width = part
+            .strip_prefix('=')
+            .and_then(|width| width.parse::<i32>().ok());
+        if width.is_some() {
+            return check_choose_tree_field(field.split('}').next().unwrap_or_default());
+        }
+        return Err(format!(
+            "uses the {part} modifier unavailable in the accessible picker"
+        ));
+    }
+    check_choose_tree_field(part)
+}
+
+fn check_choose_tree_field(field: &str) -> Result<(), String> {
+    // These values depend only on the server or explicit row/descendant
+    // objects. Similar-looking names (such as session_active) can also
+    // depend on the invoking client, which differs in list commands.
+    if matches!(
+        field,
+        "host"
+            | "host_short"
+            | "session_attached"
+            | "session_format"
+            | "session_id"
+            | "session_name"
+            | "session_windows"
+            | "window_active"
+            | "window_flags"
+            | "window_format"
+            | "window_id"
+            | "window_index"
+            | "window_name"
+            | "window_panes"
+            | "window_zoomed_flag"
+            | "pane_active"
+            | "pane_current_command"
+            | "pane_current_path"
+            | "pane_dead"
+            | "pane_format"
+            | "pane_id"
+            | "pane_index"
+            | "pane_program_message"
+            | "pane_program_name"
+            | "pane_program_state"
+            | "pane_title"
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "uses {field}, which is unavailable in the accessible picker’s format context"
+        ))
+    }
 }
 
 /// Whether a successful discovered command can invalidate prefix discovery.

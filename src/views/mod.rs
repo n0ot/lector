@@ -20,6 +20,7 @@ pub use pty::PtyView;
 pub use review::ReviewView;
 pub(crate) use stack::CompositorTransitionToken;
 pub use stack::ViewStack;
+pub(crate) use tmux_chooser::TmuxTreeQuery;
 pub use tmux_chooser::{TmuxChooserTarget, TmuxChooserView};
 pub use tmux_command::TmuxCommandView;
 pub use tmux_connection::TmuxConnectionView;

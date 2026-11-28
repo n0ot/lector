@@ -52,6 +52,14 @@ fn inventory_groups(session_two_name: &str) -> Vec<Vec<Vec<u8>>> {
         vec![
             b"B\ts\t0\tchoose-tree -Zs".to_vec(),
             b"B\tw\t0\tchoose-tree -Zw".to_vec(),
+            b"B\tb\t0\tchoose-tree".to_vec(),
+            b"B\tc\t0\tchoose-tree -Zw -f '#{==:#{pane_title},north west}' -F \"window's #{session_name} #{window_name}\"".to_vec(),
+            b"B\tt\t0\tchoose-tree -Zs -t 'window scope'".to_vec(),
+            b"B\td\t0\tchoose-tree -Zw -F '#{session_name}'".to_vec(),
+            b"B\tu\t0\tchoose-tree -Zw -f '#{?client_control_mode,1,0}'".to_vec(),
+            b"B\tz\t0\tchoose-tree -Zs -f '#{session_active}'".to_vec(),
+            b"B\tp\t0\tchoose-tree -F '#{pane_title}'".to_vec(),
+            b"B\tA\t0\tchoose-tree -Zw -f '#{==:#{pane_program_state},blocked}' -F '#{pane_program_name} #{pane_program_state} #{pane_program_message}'".to_vec(),
             b"B\tq\t0\tdisplay-panes".to_vec(),
             b"B\t:\t0\tcommand-prompt".to_vec(),
             b"B\tZ\t0\tdisplay-message -p -F \"#{session_name}:#{window_index}:#{pane_index}\""
@@ -133,6 +141,12 @@ fn reply(serial: usize, lines: &[Vec<u8>], success: bool) -> Vec<u8> {
 }
 
 fn ready_app_with_clock() -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
+    ready_app_with_inventory(&inventory_groups("work"))
+}
+
+fn ready_app_with_inventory(
+    groups: &[Vec<Vec<u8>>],
+) -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
     let recorder = Recorder::default();
     let stack = views::ViewStack::new(Box::new(views::PtyView::new(24, 80)));
     let clock = TestClock::default();
@@ -168,7 +182,7 @@ fn ready_app_with_clock() -> (App, ScreenReader, Recorder, TestClock, Vec<u8>) {
     .unwrap();
     app.handle_pty(&mut sr, &reply(4, &[], true), &mut physical)
         .unwrap();
-    for (index, group) in inventory_groups("work").iter().enumerate() {
+    for (index, group) in groups.iter().enumerate() {
         app.handle_pty(&mut sr, &reply(index + 5, group, true), &mut physical)
             .unwrap();
     }
@@ -492,6 +506,259 @@ fn discovered_and_explicit_chooser_actions_execute_stable_scoped_ids() {
             .iter()
             .any(|message| message == "tmux command")
     );
+}
+
+#[test]
+fn discovered_choose_tree_waits_for_native_filtered_labels_and_selects_their_id() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    input(&mut app, &mut sr, &mut physical, b"\x01c");
+    assert!(
+        app.debug_active_view_contents()
+            .contains("loading tmux chooser rows")
+    );
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"list-panes -s -t '$1' -f '#{==:#{pane_title},north west}' -F '#{window_id}'\n\
+          list-windows -t '$1' -F 'R #{window_id} '\"window's #{session_name} #{window_name}\"\n"
+    );
+    app.handle_pty(&mut sr, &reply(40, &[b"@11".to_vec()], true), &mut physical)
+        .unwrap();
+    assert!(
+        app.debug_active_view_contents()
+            .contains("loading tmux chooser rows")
+    );
+    app.handle_pty(
+        &mut sr,
+        &reply(
+            41,
+            &[
+                b"R @10 excluded label".to_vec(),
+                b"R @11 #[bold]custom west label#[default] ##[literal]".to_vec(),
+            ],
+            true,
+        ),
+        &mut physical,
+    )
+    .unwrap();
+
+    let contents = app.debug_active_view_contents();
+    assert!(contents.contains("custom west label"), "{contents}");
+    assert!(!contents.contains("excluded label"), "{contents}");
+    assert!(contents.contains("#[literal]"), "{contents}");
+    assert!(!contents.contains("#[bold]"), "{contents}");
+    assert!(
+        recorder.0.borrow().iter().any(|utterance| {
+            utterance.contains("at 11 2 duplicate custom west label")
+                && utterance.contains("left bracket literal right bracket")
+        }),
+        "{:?}",
+        recorder.0.borrow()
+    );
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|utterance| utterance == "tmux windows")
+    );
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"select-window -t @11\n"
+    );
+}
+
+#[test]
+fn discovered_choose_tree_keeps_identity_with_duplicate_custom_text() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    input(&mut app, &mut sr, &mut physical, b"\x01d");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"list-windows -t '$1' -F 'R #{window_id} ''#{session_name}'\n"
+    );
+    app.handle_pty(
+        &mut sr,
+        &reply(40, &[b"R @10 work".to_vec(), b"R @11 work".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    let contents = app.debug_active_view_contents();
+    assert!(contents.contains("@10 1 duplicate work"), "{contents}");
+    assert!(contents.contains("@11 2 duplicate work"), "{contents}");
+    input(&mut app, &mut sr, &mut physical, b"@11");
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|utterance| utterance.trim() == "at 11 2 duplicate work"),
+        "{:?}",
+        recorder.0.borrow()
+    );
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"select-window -t @11\n"
+    );
+}
+
+#[test]
+fn discovered_choose_tree_filters_and_labels_pane_program_status() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    input(&mut app, &mut sr, &mut physical, b"\x01A");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"list-panes -s -t '$1' -f '#{==:#{pane_program_state},blocked}' -F '#{window_id}'\n\
+          list-windows -t '$1' -F 'R #{window_id} ''#{pane_program_name} #{pane_program_state} #{pane_program_message}'\n"
+    );
+    app.handle_pty(&mut sr, &reply(40, &[b"@11".to_vec()], true), &mut physical)
+        .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &reply(
+            41,
+            &[
+                b"R @10 Fixture working".to_vec(),
+                b"R @11 Fixture blocked sample reason".to_vec(),
+            ],
+            true,
+        ),
+        &mut physical,
+    )
+    .unwrap();
+    let contents = app.debug_active_view_contents();
+    assert!(
+        contents.contains("@11 2 duplicate Fixture blocked sample reason"),
+        "{contents}"
+    );
+    assert!(!contents.contains("Fixture working"), "{contents}");
+    assert!(recorder.0.borrow().iter().any(|utterance| {
+        utterance.contains("at 11 2 duplicate Fixture blocked sample reason")
+    }));
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"select-window -t @11\n"
+    );
+}
+
+#[test]
+fn discovered_choose_tree_cancels_and_discards_late_results() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    let original = app.debug_active_view_contents();
+    input(&mut app, &mut sr, &mut physical, b"\x01c");
+    tick(&mut app, &mut sr, &mut physical);
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    assert_eq!(app.debug_active_view_contents(), original);
+
+    input(&mut app, &mut sr, &mut physical, b"\x01c");
+    tick(&mut app, &mut sr, &mut physical);
+    app.handle_pty(&mut sr, &reply(40, &[b"@11".to_vec()], true), &mut physical)
+        .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &reply(41, &[b"R @11 stale label".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    assert!(
+        app.debug_active_view_contents()
+            .contains("loading tmux chooser rows")
+    );
+    assert!(
+        !recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|utterance| utterance == "stale label")
+    );
+
+    app.handle_pty(&mut sr, &reply(42, &[], false), &mut physical)
+        .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &reply(43, &[b"R @10 another label".to_vec()], true),
+        &mut physical,
+    )
+    .unwrap();
+    assert!(
+        app.debug_active_view_contents()
+            .contains("tmux could not evaluate")
+    );
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|utterance| utterance.contains("could not evaluate"))
+    );
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    assert_eq!(app.debug_active_view_contents(), original);
+}
+
+#[test]
+fn discovered_choose_tree_bare_and_unsupported_bindings_are_accessible() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    let original = app.debug_active_view_contents();
+    input(&mut app, &mut sr, &mut physical, b"\x01t");
+    assert!(
+        recorder
+            .0
+            .borrow()
+            .iter()
+            .any(|utterance| utterance.contains("option -t"))
+    );
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    assert_eq!(app.debug_active_view_contents(), original);
+
+    input(&mut app, &mut sr, &mut physical, b"\x01u");
+    assert!(recorder.0.borrow().iter().any(|utterance| {
+        utterance.contains("client_control_mode") && utterance.contains("format context")
+    }));
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    assert_eq!(app.debug_active_view_contents(), original);
+
+    input(&mut app, &mut sr, &mut physical, b"\x01z");
+    assert!(recorder.0.borrow().iter().any(|utterance| {
+        utterance.contains("session_active") && utterance.contains("format context")
+    }));
+    assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    assert_eq!(app.debug_active_view_contents(), original);
+
+    input(&mut app, &mut sr, &mut physical, b"\x01b\x1b[B\r");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"select-pane -t %23\n"
+    );
+}
+
+#[test]
+fn discovered_custom_choose_tree_rejects_ambiguous_window_links() {
+    let mut groups = inventory_groups("work");
+    groups[1].push(format!("W\t$1\t@10\t3\t0\t{SPLIT}\t{SPLIT}\t-\tduplicate").into_bytes());
+    let (mut app, mut sr, recorder, _, mut physical) = ready_app_with_inventory(&groups);
+    let original = app.debug_active_view_contents();
+
+    for key in *b"cdp" {
+        recorder.0.borrow_mut().clear();
+        input(&mut app, &mut sr, &mut physical, &[1, key]);
+        assert!(
+            recorder
+                .0
+                .borrow()
+                .iter()
+                .any(|utterance| utterance.contains("require unique window links"))
+        );
+        assert!(tick(&mut app, &mut sr, &mut physical).is_empty());
+        input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+        assert_eq!(app.debug_active_view_contents(), original);
+    }
 }
 
 #[test]
@@ -1322,6 +1589,103 @@ fn real_tmux_session_chooser_and_command_prompt_cross_the_control_connection() {
             app.debug_active_view_contents()
                 .contains("real-command-result")
         },
+    );
+
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    let selected_window = super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-t",
+            &format!("{second_session}:"),
+            "-n",
+            "choice",
+            "/bin/sh -c 'printf CHOSEN; exec cat'",
+        ],
+    );
+    let matching_pane = super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            &format!("{second_session}:choice"),
+            "/bin/sh -c 'exec cat'",
+        ],
+    );
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "select-pane",
+            "-t",
+            matching_pane.trim(),
+            "-T",
+            "north west",
+        ],
+    );
+    drive_real_tmux(
+        "filtered window inventory",
+        &mut app,
+        &mut sr,
+        &receiver,
+        writer.as_mut(),
+        &mut physical,
+        |app| {
+            app.debug_tmux_topology(1)
+                .is_some_and(|dump| dump.contains("choice"))
+        },
+    );
+
+    input(&mut app, &mut sr, &mut physical, b"\x01W");
+    let label = format!("window's choice from {} #[literal]", &second_session[..12]);
+    drive_real_tmux(
+        "custom window chooser label",
+        &mut app,
+        &mut sr,
+        &receiver,
+        writer.as_mut(),
+        &mut physical,
+        |app| app.debug_active_view_contents().contains(&label),
+    );
+    assert_eq!(
+        app.debug_active_view_contents()
+            .matches("window's ")
+            .count(),
+        1
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+    assert!(app.debug_active_view_contents().contains("SECOND"));
+
+    input(&mut app, &mut sr, &mut physical, b"\x01W");
+    drive_real_tmux(
+        "reopened custom window chooser",
+        &mut app,
+        &mut sr,
+        &receiver,
+        writer.as_mut(),
+        &mut physical,
+        |app| app.debug_active_view_contents().contains(&label),
+    );
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    assert_eq!(
+        write_real_commands(&mut app, &mut sr, writer.as_mut(), &mut physical),
+        format!("select-window -t {}\n", selected_window.trim()).as_bytes()
+    );
+    drive_real_tmux(
+        "filtered window activation",
+        &mut app,
+        &mut sr,
+        &receiver,
+        writer.as_mut(),
+        &mut physical,
+        |app| app.debug_active_view_contents().contains("CHOSEN"),
     );
 
     super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
