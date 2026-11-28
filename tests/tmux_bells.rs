@@ -1180,6 +1180,21 @@ fn real_tmux_preview_announces_background_program_status_once_across_reattach() 
             "pty",
         ],
     );
+    super::run_real_tmux_fixture_command(
+        &socket,
+        &[
+            "bind-key",
+            "-T",
+            "prefix",
+            "A",
+            "choose-tree",
+            "-Zw",
+            "-f",
+            "#{==:#{pane_program_state},blocked}",
+            "-F",
+            "#{pane_program_name} #{pane_program_state} #{pane_program_message}",
+        ],
+    );
     let background = super::run_real_tmux_fixture_command(
         &socket,
         &[
@@ -1226,6 +1241,37 @@ fn real_tmux_preview_announces_background_program_status_once_across_reattach() 
             .trim(),
             "blocked Fixture"
         );
+        client
+            .app
+            .handle_stdin(
+                &mut client.sr,
+                b"\x02A",
+                &mut Vec::new(),
+                &mut client.physical,
+            )
+            .unwrap();
+        client.drive("filtered program status chooser", |app| {
+            app.debug_active_view_contents()
+                .contains("Fixture blocked sample reason")
+        });
+        assert!(client.app.has_overlay());
+        client
+            .app
+            .handle_stdin(
+                &mut client.sr,
+                b"\x1b[27;1u",
+                &mut Vec::new(),
+                &mut client.physical,
+            )
+            .unwrap();
+        assert!(!client.app.has_overlay());
+        assert!(
+            client
+                .app
+                .debug_active_view_contents()
+                .contains("STATUS READY")
+        );
+
         super::run_real_tmux_fixture_command(&socket, &["detach-client", "-s", session]);
     }
     {

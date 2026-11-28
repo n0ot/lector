@@ -324,6 +324,9 @@ fn check_choose_tree_field(field: &str) -> Result<(), String> {
             | "pane_format"
             | "pane_id"
             | "pane_index"
+            | "pane_program_message"
+            | "pane_program_name"
+            | "pane_program_state"
             | "pane_title"
     ) {
         Ok(())

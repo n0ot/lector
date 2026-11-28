@@ -59,6 +59,7 @@ fn inventory_groups(session_two_name: &str) -> Vec<Vec<Vec<u8>>> {
             b"B\tu\t0\tchoose-tree -Zw -f '#{?client_control_mode,1,0}'".to_vec(),
             b"B\tz\t0\tchoose-tree -Zs -f '#{session_active}'".to_vec(),
             b"B\tp\t0\tchoose-tree -F '#{pane_title}'".to_vec(),
+            b"B\tA\t0\tchoose-tree -Zw -f '#{==:#{pane_program_state},blocked}' -F '#{pane_program_name} #{pane_program_state} #{pane_program_message}'".to_vec(),
             b"B\tq\t0\tdisplay-panes".to_vec(),
             b"B\t:\t0\tcommand-prompt".to_vec(),
             b"B\tZ\t0\tdisplay-message -p -F \"#{session_name}:#{window_index}:#{pane_index}\""
@@ -595,6 +596,46 @@ fn discovered_choose_tree_keeps_identity_with_duplicate_custom_text() {
         "{:?}",
         recorder.0.borrow()
     );
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"select-window -t @11\n"
+    );
+}
+
+#[test]
+fn discovered_choose_tree_filters_and_labels_pane_program_status() {
+    let (mut app, mut sr, recorder, mut physical) = ready_app();
+    input(&mut app, &mut sr, &mut physical, b"\x01A");
+    assert_eq!(
+        tick(&mut app, &mut sr, &mut physical),
+        b"list-panes -s -t '$1' -f '#{==:#{pane_program_state},blocked}' -F '#{window_id}'\n\
+          list-windows -t '$1' -F 'R #{window_id} ''#{pane_program_name} #{pane_program_state} #{pane_program_message}'\n"
+    );
+    app.handle_pty(&mut sr, &reply(40, &[b"@11".to_vec()], true), &mut physical)
+        .unwrap();
+    app.handle_pty(
+        &mut sr,
+        &reply(
+            41,
+            &[
+                b"R @10 Fixture working".to_vec(),
+                b"R @11 Fixture blocked sample reason".to_vec(),
+            ],
+            true,
+        ),
+        &mut physical,
+    )
+    .unwrap();
+    let contents = app.debug_active_view_contents();
+    assert!(
+        contents.contains("@11 2 duplicate Fixture blocked sample reason"),
+        "{contents}"
+    );
+    assert!(!contents.contains("Fixture working"), "{contents}");
+    assert!(recorder.0.borrow().iter().any(|utterance| {
+        utterance.contains("at 11 2 duplicate Fixture blocked sample reason")
+    }));
     input(&mut app, &mut sr, &mut physical, b"\r");
     assert_eq!(
         tick(&mut app, &mut sr, &mut physical),
