@@ -140,7 +140,7 @@ fn add_connection_with_bootstrap_sample(
     sr: &mut ScreenReader,
     physical: &mut Vec<u8>,
     connection_id: u64,
-    pending_reports: &[(u64, &str)],
+    pending_records: &[Vec<u8>],
     reports_after_sample: &[(u64, &str)],
     captured_status: Option<BootstrapSample<'_>>,
 ) -> TmuxGatewayRouter {
@@ -192,8 +192,8 @@ fn add_connection_with_bootstrap_sample(
             String::from_utf8_lossy(&commands)
         );
     }
-    for &(pane, report) in pending_reports {
-        feed(app, sr, &mut router, &pane_output(pane, report), physical);
+    for record in pending_records {
+        feed(app, sr, &mut router, record, physical);
     }
     let commands = std::str::from_utf8(&commands).unwrap();
     assert_eq!(
@@ -1362,7 +1362,7 @@ fn pending_status_bootstrap_keeps_order_and_corroborated_live_details_silently()
             &mut sr,
             &mut physical,
             1,
-            &[(21, &buffered)],
+            &[pane_output(21, &buffered)],
             &reports_after_sample,
             sample.map(|(state, message)| BootstrapSample {
                 pane: 21,
@@ -1371,6 +1371,50 @@ fn pending_status_bootstrap_keeps_order_and_corroborated_live_details_silently()
                 message,
                 pending_escape: &[],
             }),
+        );
+        assert!(
+            !recorder
+                .messages()
+                .iter()
+                .any(|message| message.contains("Sample"))
+        );
+        recorder.clear();
+        app.show_pending_tmux_panes(&mut sr, &mut physical).unwrap();
+        assert_eq!(recorder.messages(), [expected]);
+        assert_eq!(app.has_overlay(), expected != "No pending panes");
+    }
+}
+
+#[test]
+fn pending_bootstrap_replays_older_output_first_when_a_pane_becomes_visible() {
+    for (older, newer, expected) in [
+        (
+            "\\033]7501;state=blocked:kind=ques",
+            "tion:app=Sample\\033\\134",
+            "window 2, pane 1, Sample, question",
+        ),
+        (
+            "\\033]7501;state=done:app=Sample\\033\\134",
+            "\\033]7501;state=clear\\033\\134",
+            "No pending panes",
+        ),
+    ] {
+        let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
+        let deferred = format!("{}{older}", ".".repeat(4200));
+        let records = [
+            pane_output(21, &deferred),
+            b"%session-window-changed $1 @11\n".to_vec(),
+            pane_output(21, newer),
+            b"%session-window-changed $1 @10\n".to_vec(),
+        ];
+        let _router = add_connection_with_bootstrap_sample(
+            &mut app,
+            &mut sr,
+            &mut physical,
+            1,
+            &records,
+            &[],
+            None,
         );
         assert!(
             !recorder
@@ -1395,7 +1439,7 @@ fn tmux_bootstrap_uses_the_capture_time_status_after_buffered_transitions() {
         &mut sr,
         &mut physical,
         1,
-        &[(21, working), (21, blocked)],
+        &[pane_output(21, working), pane_output(21, blocked)],
         &[],
         Some(BootstrapSample {
             pane: 21,
@@ -1432,7 +1476,7 @@ fn tmux_bootstrap_resumes_a_program_report_split_at_capture() {
         &mut sr,
         &mut physical,
         1,
-        &[(21, "\\033]7501;app=Fixture:state=bloc")],
+        &[pane_output(21, "\\033]7501;app=Fixture:state=bloc")],
         &[],
         Some(BootstrapSample {
             pane: 21,

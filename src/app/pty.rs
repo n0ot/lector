@@ -939,14 +939,14 @@ impl App {
             || bootstrap_reply.is_some()
             || matches!(pane_resync_result, Some(TmuxPaneResyncResult::Success(..)));
         if let Some(pane_id) = bootstrap_status_sampled {
-            self.buffer_deferred_tmux_bootstrap_output(sr, connection_id, pane_id, term_out)?;
+            self.process_tmux_output_in_order(sr, connection_id, pane_id, &[], term_out)?;
             if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
                 view.note_bootstrap_status_sample(pane_id);
             }
         }
         if let Some((capture, status, output)) = bootstrap_reply {
             let pane_id = capture.pane_id;
-            self.buffer_deferred_tmux_bootstrap_output(sr, connection_id, pane_id, term_out)?;
+            self.process_tmux_output_in_order(sr, connection_id, pane_id, &[], term_out)?;
             let bootstrap_replies =
                 if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
                     let was_ready = view.is_ready();
@@ -1335,23 +1335,33 @@ impl App {
         Ok(())
     }
 
-    fn buffer_deferred_tmux_bootstrap_output(
+    fn process_tmux_output_in_order(
         &mut self,
         sr: &mut ScreenReader,
         connection_id: u64,
         pane_id: crate::tmux_model::PaneId,
+        bytes: &[u8],
         term_out: &mut dyn Write,
     ) -> Result<()> {
-        if let Some(mut queued) = self
+        let mut queued = self
             .pending_tmux_background_output
-            .take((connection_id, pane_id))
-        {
+            .take((connection_id, pane_id));
+        let bytes = if let Some(queued) = &mut queued {
+            // Older retained bytes must precede immediate output when a
+            // pane becomes visible or starts carrying a nested connection.
+            queued.extend(bytes);
             let bytes = queued.make_contiguous();
-            if !self.discard_stale_tmux_pane_output(connection_id, pane_id, bytes) {
-                self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out)?;
+            if self.discard_stale_tmux_pane_output(connection_id, pane_id, bytes) {
+                return Ok(());
             }
+            bytes
+        } else {
+            bytes
+        };
+        if bytes.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out)
     }
 
     fn process_or_defer_tmux_pane_output(
@@ -1381,7 +1391,7 @@ impl App {
         // matching resume. Model visible bytes immediately within the outer
         // bounded turn.
         if pane_is_visible {
-            return self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out);
+            return self.process_tmux_output_in_order(sr, connection_id, pane_id, bytes, term_out);
         }
 
         let has_deferred_output = self.pending_tmux_background_output.contains(key);
