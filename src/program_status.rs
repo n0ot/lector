@@ -218,7 +218,14 @@ pub(crate) struct ProgramStatusTracker {
 }
 
 impl ProgramStatusTracker {
-    pub(crate) fn activity(&self) -> Option<ProgramActivity> {
+    pub(crate) fn location_program(&self) -> crate::presentation::LocationProgram {
+        crate::presentation::LocationProgram {
+            name: self.current.as_ref().and_then(|s| s.app.clone()),
+            activity: self.activity(),
+        }
+    }
+
+    fn activity(&self) -> Option<ProgramActivity> {
         match self.current.as_ref()?.state {
             State::Working => Some(ProgramActivity::Working),
             State::Blocked => Some(ProgramActivity::Blocked),

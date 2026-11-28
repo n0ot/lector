@@ -596,36 +596,32 @@ impl TmuxConnectionView {
     }
 
     pub(crate) fn accessibility_location(&self, live: bool) -> PresentedLocation {
-        let detailed = self.accessible_title();
-        let (brief, activity) = match self.active_document() {
-            ActiveDocument::Pane(pane_id) => {
-                let view = self
-                    .panes
-                    .pane_view(pane_id)
-                    .expect("active pane owns a view");
-                let screen = if live {
-                    view.live_screen()
-                } else {
-                    view.screen()
-                };
-                let title = screen
-                    .title
-                    .as_deref()
-                    .or_else(|| self.topology.pane(pane_id).map(|pane| pane.title.as_str()));
-                let brief = title
-                    .filter(|title| !title.is_empty())
-                    .map_or_else(|| format!("pane {}", pane_id.0), str::to_owned);
-                (brief, view.program_activity(live))
-            }
-            ActiveDocument::ConnectionPortal | ActiveDocument::PanePortal(_) => {
-                ("tmux portal".to_owned(), None)
-            }
-            ActiveDocument::Placeholder => ("tmux".to_owned(), None),
+        let ActiveDocument::Pane(pane_id) = self.active_document() else {
+            return PresentedLocation::named(self.accessible_title());
         };
-        PresentedLocation::Named {
-            brief: Some(brief),
-            detailed,
-            activity,
+        let Some(location) = self.topology.attached_location() else {
+            return PresentedLocation::named(self.accessible_title());
+        };
+        let view = self
+            .panes
+            .pane_view(pane_id)
+            .expect("active pane owns a view");
+        let screen = if live {
+            view.live_screen()
+        } else {
+            view.screen()
+        };
+        let pane = self.topology.pane(pane_id);
+        let title = screen
+            .title
+            .as_deref()
+            .or_else(|| pane.map(|p| p.title.as_str()))
+            .unwrap_or_default();
+        PresentedLocation::Pane {
+            title: title.to_owned(),
+            location,
+            pane_number: pane.map_or(pane_id.0, |p| u64::from(p.index)),
+            program: view.location_program(live),
         }
     }
 

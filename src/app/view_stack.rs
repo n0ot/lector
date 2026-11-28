@@ -794,7 +794,7 @@ impl App {
         } else if active_announcement.is_some() {
             active_announcement
         } else if self.output_scheduler.is_some() {
-            Some(self.presented_accessibility_location.label(true))
+            Some(self.presented_accessibility_location.activation_label())
         } else {
             Some(self.view_stack.active_mut().title().to_string())
         };

@@ -28,7 +28,7 @@ Two things help when you forget a key:
 | `M-'` | Toggle automatic reading of new output |
 | `M-s` | Cycle symbol level (how much punctuation is spoken) |
 | `M-g` | Toggle stopping speech when the terminal loses focus |
-| `M-w` | Say the current title and any working or blocked status |
+| `M-w` | Say the app name, title, and any working or blocked status |
 | `M-W` | Say the full location and any working or blocked status |
 | `F12` | Say time |
 

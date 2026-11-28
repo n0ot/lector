@@ -153,14 +153,19 @@ pub struct TmuxLocation {
 
 impl TmuxLocation {
     #[must_use]
-    pub fn window_title(&self) -> String {
+    pub(crate) fn window_position(&self) -> String {
         if self.pane_count > 1
             && let Some(pane_index) = self.pane_index
         {
-            format!("{}.{}: {}", self.window_index, pane_index, self.window_name)
+            format!("{}.{}", self.window_index, pane_index)
         } else {
-            format!("{}: {}", self.window_index, self.window_name)
+            self.window_index.to_string()
         }
+    }
+
+    #[must_use]
+    pub fn window_title(&self) -> String {
+        format!("{}: {}", self.window_position(), self.window_name)
     }
 
     #[must_use]
