@@ -49,64 +49,99 @@ pub enum ProgramActivity {
     Blocked,
 }
 
+/// App identity and activity from the same root status report.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LocationProgram {
+    pub name: Option<String>,
+    pub activity: Option<ProgramActivity>,
+}
+
+impl LocationProgram {
+    fn describe(&self, title: &str, fallback: &str) -> String {
+        let name = self.name.as_deref().filter(|name| !name.is_empty());
+        let subject = name.unwrap_or(fallback);
+        let mut label = if title.is_empty() {
+            subject.to_owned()
+        } else if name.is_some_and(|name| {
+            title
+                .as_bytes()
+                .windows(name.len())
+                .any(|part| part.eq_ignore_ascii_case(name.as_bytes()))
+        }) {
+            title.to_owned()
+        } else {
+            format!("{subject} - {title}")
+        };
+        match self.activity {
+            Some(ProgramActivity::Working) => label.push_str(" (working)"),
+            Some(ProgramActivity::Blocked) => label.push_str(" (blocked)"),
+            None => {}
+        }
+        label
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PresentedLocation {
     Terminal {
         view_id: ViewId,
         title: String,
-        activity: Option<ProgramActivity>,
+        program: LocationProgram,
     },
-    Named {
-        brief: Option<String>,
-        detailed: String,
-        activity: Option<ProgramActivity>,
+    Pane {
+        title: String,
+        location: crate::tmux_model::TmuxLocation,
+        pane_number: u32,
+        program: LocationProgram,
     },
+    TmuxPlaceholder(String),
+    Named(String),
 }
 
 impl PresentedLocation {
     pub(crate) fn named(name: impl Into<String>) -> Self {
-        Self::Named {
-            brief: None,
-            detailed: name.into(),
-            activity: None,
-        }
+        Self::Named(name.into())
     }
 
-    pub(crate) fn label(&self, detailed: bool) -> String {
+    pub(crate) fn activation_label(&self) -> String {
         match self {
-            Self::Terminal { title, .. } => {
-                if title.is_empty() {
-                    "terminal".to_owned()
-                } else if detailed {
-                    format!("terminal, {title}")
-                } else {
-                    title.clone()
-                }
-            }
-            Self::Named {
-                brief: title,
-                detailed: location,
-                ..
-            } => {
-                if detailed {
-                    location.clone()
-                } else {
-                    title.as_ref().unwrap_or(location).clone()
-                }
-            }
+            Self::Terminal { title, .. } if !title.is_empty() => format!("terminal, {title}"),
+            Self::Terminal { .. } => "terminal".to_owned(),
+            Self::Pane { location, .. } => location.accessible_title(),
+            Self::TmuxPlaceholder(label) | Self::Named(label) => label.clone(),
         }
     }
 
     pub(crate) fn announcement(&self, detailed: bool) -> String {
-        let mut label = self.label(detailed);
         match self {
-            Self::Terminal { activity, .. } | Self::Named { activity, .. } => match activity {
-                Some(ProgramActivity::Working) => label.push_str(" (working)"),
-                Some(ProgramActivity::Blocked) => label.push_str(" (blocked)"),
-                None => {}
-            },
+            Self::Terminal { title, program, .. } => {
+                let label = program.describe(title, "terminal");
+                if detailed && program.name.is_some() {
+                    format!("terminal, {label}")
+                } else {
+                    label
+                }
+            }
+            Self::Pane {
+                title,
+                location,
+                pane_number,
+                program,
+            } => {
+                let label = program.describe(title, &format!("pane {pane_number}"));
+                if detailed {
+                    format!(
+                        "tmux, {}, {}: {label}",
+                        location.session_name,
+                        location.window_position()
+                    )
+                } else {
+                    label
+                }
+            }
+            Self::TmuxPlaceholder(_) if !detailed => "tmux".to_owned(),
+            Self::TmuxPlaceholder(label) | Self::Named(label) => label.clone(),
         }
-        label
     }
 }
 
@@ -124,7 +159,7 @@ pub struct PresentedViewFrame {
     /// separately so unchanged history can be shared instead of copied for
     /// every frame.
     pub snapshot: TerminalSnapshot,
-    pub program_activity: Option<ProgramActivity>,
+    pub location_program: LocationProgram,
     pub history_revision: u64,
     /// Basis of the history carried or reused by this frame. This is separate
     /// from visible geometry because compositor transitions may fit an older

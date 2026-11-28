@@ -1004,7 +1004,7 @@ fn location_hotkeys_follow_the_presented_tmux_pane_and_chooser() {
         &mut app,
         &mut sr,
         &mut physical,
-        ["left", "tmux, work, 1.1: duplicate"],
+        ["pane 1 - left", "tmux, work, 1.1: pane 1 - left"],
     );
     app.handle_pty(
         &mut sr,
@@ -1030,8 +1030,8 @@ fn location_hotkeys_follow_the_presented_tmux_pane_and_chooser() {
         &mut sr,
         &mut physical,
         [
-            "Task list (working)",
-            "tmux, work, 1.1: duplicate (working)",
+            "Fixture - Task list (working)",
+            "tmux, work, 1.1: Fixture - Task list (working)",
         ],
     );
     clock.advance_ms(4);
@@ -1040,7 +1040,10 @@ fn location_hotkeys_follow_the_presented_tmux_pane_and_chooser() {
         &mut app,
         &mut sr,
         &mut physical,
-        ["right (blocked)", "tmux, work, 1.2: duplicate (blocked)"],
+        [
+            "Fixture - right (blocked)",
+            "tmux, work, 1.2: Fixture - right (blocked)",
+        ],
     );
 
     app.handle_pty(
@@ -1053,7 +1056,10 @@ fn location_hotkeys_follow_the_presented_tmux_pane_and_chooser() {
         &mut app,
         &mut sr,
         &mut physical,
-        ["right (blocked)", "tmux, work, 1.2: duplicate (blocked)"],
+        [
+            "Fixture - right (blocked)",
+            "tmux, work, 1.2: Fixture - right (blocked)",
+        ],
     );
     clock.advance_ms(4);
     app.drain_scheduled_output(&mut physical, false).unwrap();
@@ -1061,7 +1067,7 @@ fn location_hotkeys_follow_the_presented_tmux_pane_and_chooser() {
         &mut app,
         &mut sr,
         &mut physical,
-        ["pane 23", "tmux, work, 1.2: duplicate"],
+        ["pane 2", "tmux, work, 1.2: pane 2"],
     );
 
     app.handle_pty(
@@ -1076,7 +1082,7 @@ fn location_hotkeys_follow_the_presented_tmux_pane_and_chooser() {
         &mut app,
         &mut sr,
         &mut physical,
-        ["pane 23 (working)", "tmux, work, 1.2: duplicate (working)"],
+        ["pane 2 (working)", "tmux, work, 1.2: pane 2 (working)"],
     );
 
     assert!(

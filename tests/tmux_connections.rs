@@ -436,7 +436,7 @@ fn identical_tmux_ids_remain_isolated_across_connections_input_replies_and_speec
             .0
             .borrow()
             .iter()
-            .any(|message| message == "tmux, same, 1: same"),
+            .any(|message| message == "tmux, same, 1: pane 1 - same"),
         "speech={:?}",
         recorder.0.borrow()
     );
@@ -479,8 +479,8 @@ fn tmux_title_receipt_cannot_rename_the_still_presented_standalone_terminal() {
     assert_eq!(
         &*recorder.0.borrow(),
         &[
-            "Standalone task (working)",
-            "terminal, Standalone task (working)"
+            "terminal - Standalone task (working)",
+            "terminal - Standalone task (working)"
         ]
     );
 
@@ -495,7 +495,10 @@ fn tmux_title_receipt_cannot_rename_the_still_presented_standalone_terminal() {
     assert!(input(&mut app, &mut sr, &mut physical, b"\x1bw\x1bW").is_empty());
     assert_eq!(
         &*recorder.0.borrow(),
-        &["Pane label", "tmux, fixture, 1: Window label"]
+        &[
+            "pane 1 - Pane label",
+            "tmux, fixture, 1: pane 1 - Pane label"
+        ]
     );
 }
 

@@ -627,7 +627,10 @@ fn current_location_keeps_matching_pane_ids_in_nested_connections_separate() {
     input(&mut app, &mut sr, &mut physical, b"\x1bw\x1bW");
     assert_eq!(
         &*recorder.0.borrow(),
-        &["Outer task (working)", "tmux, outer, 1.1: outer (working)"]
+        &[
+            "pane 1 - Outer task (working)",
+            "tmux, outer, 1.1: pane 1 - Outer task (working)"
+        ]
     );
 
     start_nested(&mut app, &mut sr, &mut physical, 1);
@@ -651,7 +654,10 @@ fn current_location_keeps_matching_pane_ids_in_nested_connections_separate() {
     input(&mut app, &mut sr, &mut physical, b"\x1bw\x1bW");
     assert_eq!(
         &*recorder.0.borrow(),
-        &["Inner task (blocked)", "tmux, inner, 1: inner (blocked)"]
+        &[
+            "pane 1 - Inner task (blocked)",
+            "tmux, inner, 1: pane 1 - Inner task (blocked)"
+        ]
     );
 
     assert!(

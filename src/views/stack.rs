@@ -500,7 +500,7 @@ impl ViewStack {
             return PresentedLocation::Terminal {
                 view_id: view.view_id(),
                 title: screen.title.clone().unwrap_or_default(),
-                activity: view.program_activity(live_application),
+                program: view.location_program(live_application),
             };
         }
         PresentedLocation::named(active.title())

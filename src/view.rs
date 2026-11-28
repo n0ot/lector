@@ -561,7 +561,7 @@ impl TextCaches {
 pub struct View {
     view_id: ViewId,
     program_status: crate::program_status::ProgramStatusTracker,
-    presented_program_activity: Option<crate::presentation::ProgramActivity>,
+    presented_location_program: crate::presentation::LocationProgram,
     review_navigation: [crate::review::navigation::SharedNavigation; 2],
     presentation_tracking: bool,
     live_revision: ViewRevision,
@@ -652,7 +652,7 @@ impl View {
         View {
             review_navigation: Default::default(),
             program_status: Default::default(),
-            presented_program_activity: None,
+            presented_location_program: Default::default(),
             view_id: ViewId(NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed)),
             presentation_tracking: false,
             live_revision: ViewRevision(0),
@@ -1221,7 +1221,7 @@ impl View {
         self.presented_history_basis =
             PresentedHistoryBasis::from_snapshot(&self.committed_snapshot);
         self.presented_revision = ViewRevision(0);
-        self.presented_program_activity = self.program_status.activity();
+        self.presented_location_program = self.program_status.location_program();
     }
 
     pub(crate) fn view_id(&self) -> ViewId {
@@ -1261,7 +1261,7 @@ impl View {
             revision: self.live_revision,
             surface_id,
             snapshot,
-            program_activity: self.program_status.activity(),
+            location_program: self.program_status.location_program(),
             history_revision: self.live_history_revision,
             history_basis,
             history,
@@ -1292,7 +1292,7 @@ impl View {
             revision: self.presented_revision,
             surface_id,
             snapshot: self.committed_presentation_snapshot(),
-            program_activity: self.presented_program_activity,
+            location_program: self.presented_location_program.clone(),
             history_revision: self.presented_history_revision,
             history_basis,
             history: None,
@@ -1387,7 +1387,7 @@ impl View {
             self.presented_history_basis = target.basis;
         }
         self.presented_revision = frame.revision;
-        self.presented_program_activity = frame.program_activity;
+        self.presented_location_program = frame.location_program.clone();
         self.completed_linear_record_cache = None;
         let accessibility_epoch_is_current =
             accessibility_epoch.generation >= self.accessibility_epoch_floor_generation;
@@ -1597,14 +1597,11 @@ impl View {
         speech
     }
 
-    pub(crate) fn program_activity(
-        &self,
-        live: bool,
-    ) -> Option<crate::presentation::ProgramActivity> {
+    pub(crate) fn location_program(&self, live: bool) -> crate::presentation::LocationProgram {
         if live || !self.presentation_tracking {
-            self.program_status.activity()
+            self.program_status.location_program()
         } else {
-            self.presented_program_activity
+            self.presented_location_program.clone()
         }
     }
 

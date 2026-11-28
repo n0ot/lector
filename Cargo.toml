@@ -1,6 +1,6 @@
 [package]
 name = "lector"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 rust-version.workspace = true
 autobins = false
@@ -54,10 +54,10 @@ unicode-segmentation = "1.13.3"
 unicode-width = { version = "0.2.3", default-features = false }
 unicode_names2 = "4.0.0"
 mlua = { version = "0.12.2", features = ["luajit", "vendored", "error-send"] }
-tts = { package = "lector-tts", version = "=0.4.3", path = "crates/lector-tts" }
+tts = { package = "lector-tts", version = "=0.5.0", path = "crates/lector-tts" }
 terminput = "0.5.16"
 thiserror = "2.0.21"
-lector-ghostty = { version = "=0.4.3", path = "crates/lector-ghostty" }
+lector-ghostty = { version = "=0.5.0", path = "crates/lector-ghostty" }
 
 [[bin]]
 name = "lector"

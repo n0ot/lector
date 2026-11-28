@@ -596,36 +596,37 @@ impl TmuxConnectionView {
     }
 
     pub(crate) fn accessibility_location(&self, live: bool) -> PresentedLocation {
-        let detailed = self.accessible_title();
-        let (brief, activity) = match self.active_document() {
-            ActiveDocument::Pane(pane_id) => {
-                let view = self
-                    .panes
-                    .pane_view(pane_id)
-                    .expect("active pane owns a view");
-                let screen = if live {
-                    view.live_screen()
-                } else {
-                    view.screen()
-                };
-                let title = screen
-                    .title
-                    .as_deref()
-                    .or_else(|| self.topology.pane(pane_id).map(|pane| pane.title.as_str()));
-                let brief = title
-                    .filter(|title| !title.is_empty())
-                    .map_or_else(|| format!("pane {}", pane_id.0), str::to_owned);
-                (brief, view.program_activity(live))
+        let pane_id = match self.active_document() {
+            ActiveDocument::Pane(id) => id,
+            ActiveDocument::Placeholder => {
+                return PresentedLocation::TmuxPlaceholder(self.accessible_title());
             }
             ActiveDocument::ConnectionPortal | ActiveDocument::PanePortal(_) => {
-                ("tmux portal".to_owned(), None)
+                return PresentedLocation::named("tmux portal");
             }
-            ActiveDocument::Placeholder => ("tmux".to_owned(), None),
         };
-        PresentedLocation::Named {
-            brief: Some(brief),
-            detailed,
-            activity,
+        let Some(location) = self.topology.attached_location() else {
+            return PresentedLocation::named(self.accessible_title());
+        };
+        let view = self
+            .panes
+            .pane_view(pane_id)
+            .expect("active pane owns a view");
+        let screen = if live {
+            view.live_screen()
+        } else {
+            view.screen()
+        };
+        let pane = self
+            .topology
+            .pane(pane_id)
+            .expect("ready pane has topology");
+        let title = screen.title.as_deref().unwrap_or(&pane.title);
+        PresentedLocation::Pane {
+            title: title.to_owned(),
+            location,
+            pane_number: pane.index,
+            program: view.location_program(live),
         }
     }
 

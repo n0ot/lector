@@ -7220,40 +7220,50 @@ fn current_location_hotkeys_speak_standalone_title_context_and_activity() {
         (b"".as_slice(), "terminal", "terminal"),
         (
             b"\x1b]2;Build panel\x1b\\\x1b]7501;state=working:app=Fixture\x1b\\",
-            "Build panel (working)",
-            "terminal, Build panel (working)",
+            "Fixture - Build panel (working)",
+            "terminal, Fixture - Build panel (working)",
         ),
         (
             b"\x1b]7501;state=blocked:app=Fixture\x1b\\",
-            "Build panel (blocked)",
-            "terminal, Build panel (blocked)",
+            "Fixture - Build panel (blocked)",
+            "terminal, Fixture - Build panel (blocked)",
         ),
         (
             b"\x1b]7501;state=done\x1b\\",
-            "Build panel",
-            "terminal, Build panel",
+            "terminal - Build panel",
+            "terminal - Build panel",
         ),
         (
             b"\x1b]7501;state=idle\x1b\\",
-            "Build panel",
-            "terminal, Build panel",
+            "terminal - Build panel",
+            "terminal - Build panel",
         ),
         (
             b"\x1b]7501;state=error\x1b\\",
-            "Build panel",
-            "terminal, Build panel",
+            "terminal - Build panel",
+            "terminal - Build panel",
         ),
         (
             b"\x1b]7501;state=working\x1b\\\x1b]7501;state=clear\x1b\\",
-            "Build panel",
-            "terminal, Build panel",
+            "terminal - Build panel",
+            "terminal - Build panel",
         ),
         (
             b"\x1b]7501;state=unknown\x1b\\",
-            "Build panel",
-            "terminal, Build panel",
+            "terminal - Build panel",
+            "terminal - Build panel",
         ),
         (b"\x1b]2;\x1b\\", "terminal", "terminal"),
+        (
+            b"\x1b]7501;state=done:app=Example\x1b\\",
+            "Example",
+            "terminal, Example",
+        ),
+        (
+            b"\x1b]2;Draft | myexampleproject\x1b\\",
+            "Draft | myexampleproject",
+            "terminal, Draft | myexampleproject",
+        ),
     ] {
         app.handle_pty(&mut sr, output, &mut term_out)
             .expect("present terminal update");
@@ -7297,7 +7307,7 @@ fn current_location_follows_the_completed_overlay_identity_across_backpressure()
 
     app.handle_pty(
         &mut sr,
-        b"\x1b]2;Base title\x1b\\\x1b]7501;state=working\x1b\\base",
+        b"\x1b]2;Base title\x1b\\\x1b]7501;state=working:app=Fixture\x1b\\base",
         &mut term_out,
     )
     .expect("present the initial terminal");
@@ -7311,8 +7321,8 @@ fn current_location_follows_the_completed_overlay_identity_across_backpressure()
         &mut sr,
         &mut pty_out,
         &mut term_out,
-        "Base title (working)",
-        "terminal, Base title (working)",
+        "Fixture - Base title (working)",
+        "terminal, Fixture - Base title (working)",
     );
 
     clock.advance_ms(4);
@@ -7346,8 +7356,8 @@ fn current_location_follows_the_completed_overlay_identity_across_backpressure()
         &mut sr,
         &mut pty_out,
         &mut term_out,
-        "Base title (working)",
-        "terminal, Base title (working)",
+        "Fixture - Base title (working)",
+        "terminal, Fixture - Base title (working)",
     );
     app.handle_stdin(&mut sr, b"\x1br", &mut pty_out, &mut term_out)
         .expect("open Review");
@@ -7392,7 +7402,7 @@ fn say_overlay_tracks_a_flushed_title_effect_before_its_cell_render() {
         .expect("say the title before either transaction flushes");
     assert_eq!(
         recorder.inner.borrow().speaks.last(),
-        Some(&("terminal, committed".into(), false))
+        Some(&("terminal - committed".into(), false))
     );
 
     let report = app
@@ -7405,7 +7415,7 @@ fn say_overlay_tracks_a_flushed_title_effect_before_its_cell_render() {
         .expect("say the physically applied title");
     assert_eq!(
         recorder.inner.borrow().speaks.last(),
-        Some(&("terminal, working".into(), false))
+        Some(&("terminal - working".into(), false))
     );
     app.handle_stdin(&mut sr, b"\x1bi", &mut pty_out, &mut term_out)
         .expect("read the still-presented cells");
