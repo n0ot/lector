@@ -1504,6 +1504,73 @@ impl App {
         self.handle_view_action(sr, views::ViewAction::Pop, term_out)
     }
 
+    pub(super) fn show_tmux_tree_chooser(
+        &mut self,
+        sr: &mut ScreenReader,
+        connection_id: u64,
+        options: crate::tmux_prefix::ChooseTree,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        use crate::tmux_prefix::ChooseTreeLevel;
+
+        let Some((_, topology)) = self
+            .active_visible_tmux_snapshot()
+            .filter(|(active, _)| *active == connection_id)
+        else {
+            sr.speak("tmux chooser is unavailable", false)?;
+            return Ok(());
+        };
+        let (rows, cols) = self.view_stack.root_mut().model().live_size();
+        let create = match options.level {
+            ChooseTreeLevel::Sessions => views::TmuxChooserView::sessions,
+            ChooseTreeLevel::Windows => views::TmuxChooserView::windows,
+            ChooseTreeLevel::Panes => views::TmuxChooserView::panes,
+        };
+        let mut chooser = create(rows, cols, connection_id, &topology);
+        let queries = chooser.begin_tree_queries(options, &topology);
+        let view_id = views::ViewController::model(&mut chooser).view_id();
+        self.handle_view_action(sr, views::ViewAction::Push(Box::new(chooser)), term_out)?;
+        for (kind, bytes) in queries {
+            self.pending_tmux_commands.push_back(PendingTmuxCommand {
+                connection_id,
+                bytes,
+                expected_replies: vec![ExpectedTmuxReply::TreeChooser { view_id, kind }],
+                kind: PendingTmuxCommandKind::Ordinary,
+            });
+        }
+        Ok(())
+    }
+
+    pub(super) fn handle_tmux_tree_reply(
+        &mut self,
+        sr: &mut ScreenReader,
+        connection_id: u64,
+        reply: TmuxTreeReply,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        let Some(topology) = self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+            .map(|connection| &connection.topology)
+        else {
+            return Ok(());
+        };
+        let announcement = self
+            .view_stack
+            .tmux_chooser_by_id_mut(reply.view_id)
+            .and_then(|chooser| {
+                chooser.apply_tree_reply(reply.kind, reply.status, &reply.output, topology)
+            });
+        if let Some(announcement) = announcement
+            && self.view_stack.logical_active_view_id() == reply.view_id
+        {
+            self.render_active_view(term_out)?;
+            sr.speak(&announcement, false)?;
+        }
+        Ok(())
+    }
+
     pub fn show_tmux_session_chooser(
         &mut self,
         sr: &mut ScreenReader,

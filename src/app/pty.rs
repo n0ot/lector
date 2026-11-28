@@ -634,6 +634,7 @@ impl App {
         let TmuxControlStep {
             pane_resync_result,
             carrier_reply,
+            tree_reply,
             request_resync,
             sync_topology,
             mut render_topology,
@@ -1204,6 +1205,9 @@ impl App {
             }
         }
         // 6. Command-result UI precedes notification UI.
+        if let Some(reply) = tree_reply {
+            self.handle_tmux_tree_reply(sr, connection_id, reply, term_out)?;
+        }
         if let Some((status, description, output, show_success)) = user_command_result {
             let detail = output
                 .iter()

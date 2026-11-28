@@ -1473,12 +1473,20 @@ enum TmuxCarrierReply {
     ),
 }
 
+struct TmuxTreeReply {
+    view_id: ViewId,
+    kind: views::TmuxTreeQuery,
+    status: crate::tmux_control::CommandStatus,
+    output: Vec<Vec<u8>>,
+}
+
 /// Deferred effects of one connection transition, applied in App's fixed order.
 /// Independent topology data can accompany a reply; see the co-occurrence audit.
 #[derive(Default)]
 struct TmuxControlStep {
     pane_resync_result: Option<TmuxPaneResyncResult>,
     carrier_reply: Option<TmuxCarrierReply>,
+    tree_reply: Option<TmuxTreeReply>,
     request_resync: bool,
     sync_topology: bool,
     render_topology: bool,
@@ -1954,6 +1962,14 @@ impl TmuxConnectionState {
                             output,
                         ));
                     }
+                    Some(ExpectedTmuxReply::TreeChooser { view_id, kind }) => {
+                        step.tree_reply = Some(TmuxTreeReply {
+                            view_id,
+                            kind,
+                            status,
+                            output,
+                        });
+                    }
                     Some(ExpectedTmuxReply::Ignored) => {}
                     Some(ExpectedTmuxReply::UserCommand {
                         description,
@@ -2353,6 +2369,10 @@ enum ExpectedTmuxReply {
     },
     CarrierSessionSwitch {
         session_id: crate::tmux_model::SessionId,
+    },
+    TreeChooser {
+        view_id: ViewId,
+        kind: views::TmuxTreeQuery,
     },
     Ignored,
     UserCommand {

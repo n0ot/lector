@@ -131,6 +131,62 @@ fn user_prefix_fixture_preserves_options_repeatability_commands_and_quotes() {
 }
 
 #[test]
+fn choose_tree_flags_stop_at_option_operands() {
+    use lector::tmux_prefix::ChooseTreeLevel::{Panes, Sessions, Windows};
+
+    for (binding, level) in [
+        ("choose-tree", Panes),
+        ("choose-tree --", Panes),
+        (
+            r#"choose-tree -F "switch window \"quoted\"" -f 'words with s and w'"#,
+            Panes,
+        ),
+        (r#"choose-tree -ZwF'#{session_name} says w'"#, Windows),
+        (
+            r#"choose-tree -Zw -F 'words with s; still a label'"#,
+            Windows,
+        ),
+        (r#"choose-tree -Zws -F 'window'"#, Sessions),
+        (
+            r#"choose-tree -F 'client_control_mode and line ##{line}'"#,
+            Panes,
+        ),
+        (r#"choose-tree -F '#{?pane_active,line,other}'"#, Panes),
+        ("choose-tree -F -w", Panes),
+    ] {
+        assert!(
+            matches!(
+                classify_binding(binding).unwrap(),
+                BindingAction::ChooseTree(options) if options.level == level
+            ),
+            "{binding}"
+        );
+    }
+
+    for binding in [
+        r#"choose-tree -w -t 'session with space'"#,
+        r#"choose-tree 'select-window -t %%'"#,
+        "choose-tree -wF",
+        "choose-tree -w; display-message other",
+        r#"choose-tree -w \; display-message other"#,
+        r#"choose-tree -f '#{line}'"#,
+        r#"choose-tree -F '#{?client_control_mode,yes,no}'"#,
+        r#"choose-tree -F '#{?pane_active,#{==:#{line},0},no}'"#,
+        r#"choose-tree -F '#{E:@custom}'"#,
+        r#"choose-tree -F '#{li'ne\}"#,
+        "choose-tree -F 'unterminated",
+    ] {
+        assert!(
+            matches!(
+                classify_binding(binding).unwrap(),
+                BindingAction::UnsupportedChooseTree(_)
+            ),
+            "{binding}"
+        );
+    }
+}
+
+#[test]
 fn binding_classifier_recognizes_accessible_and_safe_passthrough_actions() {
     assert!(matches!(
         classify_binding("confirm-before -p \"kill-pane #P? (y/n)\" kill-pane").unwrap(),
@@ -154,11 +210,13 @@ fn binding_classifier_recognizes_accessible_and_safe_passthrough_actions() {
     );
     assert!(matches!(
         classify_binding("choose-tree -Zs").unwrap(),
-        BindingAction::ChooseSession
+        BindingAction::ChooseTree(options)
+            if options.level == lector::tmux_prefix::ChooseTreeLevel::Sessions
     ));
     assert!(matches!(
         classify_binding("choose-tree -Zw").unwrap(),
-        BindingAction::ChooseWindow
+        BindingAction::ChooseTree(options)
+            if options.level == lector::tmux_prefix::ChooseTreeLevel::Windows
     ));
     assert!(matches!(
         classify_binding("command-prompt").unwrap(),

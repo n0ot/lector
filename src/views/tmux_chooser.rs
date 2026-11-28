@@ -6,13 +6,19 @@ use crate::{
     line_editor::{EditorAction, LineEditor},
     screen_reader::ScreenReader,
     terminal_input::KeyInput,
+    tmux_control::CommandStatus,
     tmux_model::{PaneId, SessionId, TmuxTopology, WindowId},
+    tmux_prefix::ChooseTree,
     view::View,
 };
-use std::{any::Any, io::Write};
+use std::{
+    any::Any,
+    collections::{BTreeMap, BTreeSet},
+    io::Write,
+};
 use terminput::KeyCode;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum TmuxChooserTarget {
     Session(SessionId),
     Window(WindowId),
@@ -32,12 +38,54 @@ struct ChooserItem {
     label: String,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum TmuxTreeQuery {
+    Filter,
+    Labels,
+}
+
+struct TmuxTreeRows {
+    pending: usize,
+    matching: Option<BTreeSet<TmuxChooserTarget>>,
+    labels: Option<BTreeMap<TmuxChooserTarget, String>>,
+    failed: bool,
+}
+
+impl TmuxTreeRows {
+    fn status(&self) -> Option<&'static str> {
+        if self.failed {
+            Some("tmux could not evaluate the chooser format or filter")
+        } else if self.pending != 0 {
+            Some("loading tmux chooser rows")
+        } else {
+            None
+        }
+    }
+}
+
+impl TmuxChooserTarget {
+    fn parse(id: &str) -> Option<Self> {
+        let (kind, number) = id.split_at_checked(1)?;
+        if !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let number = number.parse().ok()?;
+        match kind {
+            "$" => Some(Self::Session(SessionId(number))),
+            "@" => Some(Self::Window(WindowId(number))),
+            "%" => Some(Self::Pane(PaneId(number))),
+            _ => None,
+        }
+    }
+}
+
 pub struct TmuxChooserView {
     view: View,
     title: String,
     connection_id: u64,
     scope: TmuxChooserScope,
     items: Vec<ChooserItem>,
+    tree_rows: Option<TmuxTreeRows>,
     editor: LineEditor,
     selected: Option<TmuxChooserTarget>,
     viewport_start: usize,
@@ -112,6 +160,7 @@ impl TmuxChooserView {
             connection_id,
             scope,
             items: Vec::new(),
+            tree_rows: None,
             editor: LineEditor::new(),
             selected,
             viewport_start: 0,
@@ -130,7 +179,114 @@ impl TmuxChooserView {
         self.selected
     }
 
+    pub(crate) fn begin_tree_queries(
+        &mut self,
+        options: ChooseTree,
+        topology: &TmuxTopology,
+    ) -> Vec<(TmuxTreeQuery, Vec<u8>)> {
+        let mut queries = Vec::new();
+        let (id, panes, rows) = match self.scope {
+            TmuxChooserScope::Sessions => (
+                "#{session_id}",
+                "list-panes -a".to_owned(),
+                "list-sessions".to_owned(),
+            ),
+            TmuxChooserScope::Windows(session_id) => (
+                "#{window_id}",
+                format!("list-panes -s -t '${}'", session_id.0),
+                format!("list-windows -t '${}'", session_id.0),
+            ),
+            TmuxChooserScope::Panes(window_id) => {
+                // A linked window may have different session/index formats.
+                let session = topology.attached_session().unwrap_or(SessionId(u64::MAX));
+                let panes = format!("list-panes -t '${}:@{}'", session.0, window_id.0);
+                ("#{pane_id}", panes.clone(), panes)
+            }
+        };
+        if let Some(filter) = options.filter {
+            // tmux filters the tree on each pane. Parent rows survive when any
+            // of their descendants matches, even if the active pane does not.
+            queries.push((
+                TmuxTreeQuery::Filter,
+                format!("{panes} -f {filter} -F '{id}'\n").into_bytes(),
+            ));
+        }
+        if let Some(format) = options.format {
+            // Prepend an ID in the same tmux argument. The label may be empty
+            // or identical for several rows and never supplies the target ID.
+            queries.push((
+                TmuxTreeQuery::Labels,
+                format!("{rows} -F 'R {id} '{format}\n").into_bytes(),
+            ));
+        }
+        if !queries.is_empty() {
+            self.tree_rows = Some(TmuxTreeRows {
+                pending: queries.len(),
+                matching: None,
+                labels: None,
+                failed: false,
+            });
+            self.sync_topology(topology);
+        }
+        queries
+    }
+
+    pub(crate) fn apply_tree_reply(
+        &mut self,
+        kind: TmuxTreeQuery,
+        status: CommandStatus,
+        output: &[Vec<u8>],
+        topology: &TmuxTopology,
+    ) -> Option<String> {
+        let rows = self.tree_rows.as_mut()?;
+        if rows.failed {
+            return None;
+        }
+        let parsed = status == CommandStatus::Success
+            && match kind {
+                TmuxTreeQuery::Filter => {
+                    rows.matching = output
+                        .iter()
+                        .map(|line| TmuxChooserTarget::parse(std::str::from_utf8(line).ok()?))
+                        .collect();
+                    rows.matching.is_some()
+                }
+                TmuxTreeQuery::Labels => {
+                    let mut labels = BTreeMap::new();
+                    let valid = output.iter().all(|line| {
+                        let Some((target, label)) = parse_tree_label(line) else {
+                            return false;
+                        };
+                        labels.insert(target, label).is_none()
+                    });
+                    rows.labels = valid.then_some(labels);
+                    valid
+                }
+            };
+        rows.failed = !parsed;
+        rows.pending -= 1;
+        if !rows.failed && rows.pending != 0 {
+            return None;
+        }
+        self.sync_topology(topology);
+        Some(
+            self.selected_label()
+                .unwrap_or_else(|| self.empty_text())
+                .to_owned(),
+        )
+    }
+
     pub fn sync_topology(&mut self, topology: &TmuxTopology) {
+        if self
+            .tree_rows
+            .as_ref()
+            .and_then(TmuxTreeRows::status)
+            .is_some()
+        {
+            self.items.clear();
+            self.render();
+            return;
+        }
         self.items = match self.scope {
             TmuxChooserScope::Sessions => topology
                 .sessions()
@@ -174,6 +330,27 @@ impl TmuxChooserView {
                 panes
             }
         };
+        if let Some(rows) = &self.tree_rows {
+            self.items.retain_mut(|item| {
+                if let Some(matching) = &rows.matching
+                    && !matching.contains(&item.target)
+                {
+                    return false;
+                }
+                if let Some(labels) = &rows.labels {
+                    let Some(label) = labels.get(&item.target) else {
+                        return false;
+                    };
+                    if !label.trim().is_empty() {
+                        // Native choose-tree also displays row identity
+                        // independently of the user-supplied row text.
+                        item.label.push(' ');
+                        item.label.push_str(label);
+                    }
+                }
+                true
+            });
+        }
         self.reconcile_selection();
         self.render();
     }
@@ -199,6 +376,9 @@ impl TmuxChooserView {
 
     fn move_selection(&mut self, delta: isize) -> bool {
         let matching = self.matching_items();
+        if matching.is_empty() {
+            return false;
+        }
         let Some(current) = self.selected else {
             self.selected = matching.first().map(|item| item.target);
             return self.selected.is_some();
@@ -225,6 +405,7 @@ impl TmuxChooserView {
 
     fn choose(&self) -> ViewAction {
         self.selected
+            .filter(|target| self.items.iter().any(|item| item.target == *target))
             .map_or(ViewAction::Bell, |target| ViewAction::TmuxChooserSelect {
                 connection_id: self.connection_id,
                 target,
@@ -238,7 +419,14 @@ impl TmuxChooserView {
     ) -> Result<ViewAction> {
         match action {
             EditorAction::Changed => {
-                self.reconcile_selection();
+                if self
+                    .tree_rows
+                    .as_ref()
+                    .and_then(TmuxTreeRows::status)
+                    .is_none()
+                {
+                    self.reconcile_selection();
+                }
                 self.render();
                 if let Some(label) = self.selected_label() {
                     sr.speak(label, false)?;
@@ -263,6 +451,9 @@ impl TmuxChooserView {
     }
 
     fn empty_text(&self) -> &'static str {
+        if let Some(status) = self.tree_rows.as_ref().and_then(TmuxTreeRows::status) {
+            return status;
+        }
         match self.scope {
             TmuxChooserScope::Sessions => "no matching sessions",
             TmuxChooserScope::Windows(_) => "no matching windows",
@@ -348,6 +539,40 @@ impl TmuxChooserView {
         self.view.process_changes(&bytes);
         self.view.clear_update_summary();
     }
+}
+
+fn parse_tree_label(line: &[u8]) -> Option<(TmuxChooserTarget, String)> {
+    let (id, label) = std::str::from_utf8(line)
+        .ok()?
+        .strip_prefix("R ")?
+        .split_once(' ')?;
+    let target = TmuxChooserTarget::parse(id)?;
+    Some((target, plain_tree_label(label)))
+}
+
+/// Tmux keeps style directives in the expanded format so its renderer can
+/// interpret them. An even run of hashes before '[' escapes the marker.
+fn plain_tree_label(mut label: &str) -> String {
+    let mut text = String::with_capacity(label.len());
+    while let Some((part, tail)) = label.split_once('#') {
+        text.push_str(part);
+        let hashes = 1 + tail.bytes().take_while(|byte| *byte == b'#').count();
+        label = &tail[hashes - 1..];
+        if let Some(style) = label.strip_prefix('[') {
+            if hashes.is_multiple_of(2) {
+                text.extend(std::iter::repeat_n('#', hashes / 2));
+                continue;
+            }
+            if let Some((_, tail)) = style.split_once(']') {
+                text.extend(std::iter::repeat_n('#', hashes / 2));
+                label = tail;
+                continue;
+            }
+        }
+        text.extend(std::iter::repeat_n('#', hashes));
+    }
+    text.push_str(label);
+    text.replace(char::is_control, " ")
 }
 
 impl ViewController for TmuxChooserView {

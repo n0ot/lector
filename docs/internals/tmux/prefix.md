@@ -78,7 +78,7 @@ into two commands.
 | `confirm-before` (kill pane or window) | Shows its own Enter or Escape prompt. See below. |
 | `detach-client` | Detaches this connection, and any nested ones first. |
 | `send-prefix` | Sends the prefix bytes to the active pane through the hexadecimal input path. |
-| `choose-tree -s`, `choose-tree -w`, `display-panes` | Opens a session, window, or pane chooser. |
+| `choose-tree -s`, `choose-tree -w`, `choose-tree`, `display-panes` | Opens a scoped chooser. For `choose-tree`, tmux evaluates custom filters and labels through list commands and Lector associates rows with stable target IDs. |
 | `command-prompt` | Opens Lector's command prompt. |
 | Key-table switches | Enters the table tmux reports. An unbound key in a root or custom table goes to the pane unchanged. |
 
