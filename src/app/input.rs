@@ -390,6 +390,7 @@ impl App {
                     binding,
                     Binding::Builtin(
                         commands::Action::OpenTmuxConnectionChooser
+                            | commands::Action::OpenPendingTmuxPanes
                             | commands::Action::DetachTmuxConnection
                             | commands::Action::ForceAbandonTmuxGateway
                     )
@@ -523,6 +524,10 @@ impl App {
                         }
                         commands::Action::OpenTmuxPaneChooser => {
                             Some(self.show_tmux_pane_chooser(sr, term_out)?)
+                        }
+                        commands::Action::OpenPendingTmuxPanes => {
+                            self.show_pending_tmux_panes(sr, term_out)?;
+                            Some(true)
                         }
                         commands::Action::OpenTmuxCommandPrompt => {
                             Some(self.show_tmux_command_prompt(sr, term_out)?)

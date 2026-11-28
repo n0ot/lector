@@ -242,6 +242,7 @@ impl App {
     }
 
     pub(super) fn render_active_view(&mut self, term_out: &mut dyn Write) -> Result<()> {
+        self.refresh_pending_tmux_panes();
         self.render_full_scene(term_out, 0)
     }
 
@@ -585,6 +586,7 @@ impl App {
         self.scene_renderer.confirm(&batch.predicted);
         self.presented_scene = batch.predicted;
         self.presented_accessibility_location = self.view_stack.active_accessibility_location(true);
+        self.confirm_presented_tmux_pane(self.view_stack.active_tmux_pane());
         if let Some(transition) = synchronization.compositor_transition {
             self.view_stack.complete_compositor_transition(transition);
         }
@@ -782,8 +784,15 @@ impl App {
 
     fn announce_active_view(&mut self, sr: &mut ScreenReader, announce_title: bool) -> Result<()> {
         self.pending_active_view_read = None;
+        let active_announcement = announce_title
+            .then(|| self.view_stack.active_mut().activation_announcement())
+            .flatten()
+            .map(str::to_owned);
+        let speaks_selection = active_announcement.is_some();
         let title = if !announce_title {
             None
+        } else if active_announcement.is_some() {
+            active_announcement
         } else if self.output_scheduler.is_some() {
             Some(self.presented_accessibility_location.label(true))
         } else {
@@ -803,10 +812,12 @@ impl App {
         let context_activated =
             sr.terminal_focused() && view.activate_accessible_document_context();
         view.with_live_screen(|view| -> Result<()> {
-            if context_activated && !application_policy.suppress_auto_read {
-                sr.auto_read(view)?;
-            } else if !context_activated && !application_policy.suppress_cursor_tracking {
-                speak_application_cursor_line(sr, view)?;
+            if !speaks_selection {
+                if context_activated && !application_policy.suppress_auto_read {
+                    sr.auto_read(view)?;
+                } else if !context_activated && !application_policy.suppress_cursor_tracking {
+                    speak_application_cursor_line(sr, view)?;
+                }
             }
             view.complete_accessibility_screen_transition();
             view.finalize_changes(now_ms);

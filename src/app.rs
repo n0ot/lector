@@ -37,6 +37,8 @@ mod lua_automation;
 mod protocol;
 mod pty;
 mod tmux_interaction;
+mod tmux_pending;
+use tmux_pending::{PendingTmuxPaneVisit, TmuxPaneVisit};
 mod tmux_prefix;
 mod view_stack;
 
@@ -1286,6 +1288,9 @@ pub struct App {
         TmuxCarrierLease,
     >,
     pending_tmux_session_switches: BTreeMap<u64, PendingTmuxSessionSwitch>,
+    pending_tmux_pane_visit: Option<PendingTmuxPaneVisit>,
+    tmux_pane_visit_serial: u64,
+    last_presented_tmux_pane: Option<crate::tmux_model::TmuxPaneIdentity>,
     rejected_tmux_carrier_indices: BTreeMap<
         (
             u64,
@@ -1369,6 +1374,7 @@ struct TmuxCarrierLease {
 struct PendingTmuxSessionSwitch {
     destination_session_id: crate::tmux_model::SessionId,
     following_commands: Vec<String>,
+    pane_visit: Option<TmuxPaneVisit>,
     rejected_indices: BTreeSet<u32>,
     stage: TmuxSessionSwitchStage,
 }
@@ -1487,6 +1493,7 @@ struct TmuxControlStep {
     pane_resync_result: Option<TmuxPaneResyncResult>,
     carrier_reply: Option<TmuxCarrierReply>,
     tree_reply: Option<TmuxTreeReply>,
+    pane_visit_reply: Option<(TmuxPaneVisit, bool)>,
     request_resync: bool,
     sync_topology: bool,
     render_topology: bool,
@@ -1496,6 +1503,7 @@ struct TmuxControlStep {
         Vec<Vec<u8>>,
     )>,
     bootstrap_retry: Option<(crate::tmux_model::PaneId, Vec<u8>, bool)>,
+    bootstrap_status_sampled: Option<crate::tmux_model::PaneId>,
     pane_resync_probe: Option<crate::tmux_model::PaneCaptureMetadata>,
     pane_resync_request: Option<crate::tmux_model::PaneId>,
     pane_resume_request: Option<crate::tmux_model::PaneId>,
@@ -1676,6 +1684,7 @@ impl TmuxConnectionState {
                                         _ => None,
                                     };
                                     capture.stage = BootstrapCaptureStage::PendingEscape;
+                                    step.bootstrap_status_sampled = Some(pane_id);
                                 }
                                 BootstrapCaptureStage::PendingEscape => {
                                     capture.recovered.pending_escape =
@@ -1969,6 +1978,10 @@ impl TmuxConnectionState {
                             status,
                             output,
                         });
+                    }
+                    Some(ExpectedTmuxReply::PaneVisit(visit)) => {
+                        step.pane_visit_reply =
+                            Some((visit, status == crate::tmux_control::CommandStatus::Success));
                     }
                     Some(ExpectedTmuxReply::Ignored) => {}
                     Some(ExpectedTmuxReply::UserCommand {
@@ -2329,6 +2342,7 @@ enum TmuxInventoryPhase {
 
 #[derive(Clone)]
 enum ExpectedTmuxReply {
+    PaneVisit(TmuxPaneVisit),
     Inventory,
     FlowControlPolicy,
     FlowControlVerification,
@@ -2550,6 +2564,9 @@ impl App {
             waiting_tmux_bootstraps: VecDeque::new(),
             tmux_carrier_leases: BTreeMap::new(),
             pending_tmux_session_switches: BTreeMap::new(),
+            pending_tmux_pane_visit: None,
+            tmux_pane_visit_serial: 0,
+            last_presented_tmux_pane: None,
             rejected_tmux_carrier_indices: BTreeMap::new(),
             active_tmux_connection: None,
             pending_confirmation: None,
@@ -3049,6 +3066,7 @@ impl App {
             self.presented_scene = completed.predicted.clone();
             self.view_stack
                 .apply_presented_bundle(&completed.accessibility);
+            self.confirm_presented_tmux_pane(completed.accessibility.active_tmux_pane);
             if let Some(active_view) = completed.accessibility.active_view {
                 self.presented_accessibility_view = Some(active_view);
             }
@@ -3529,18 +3547,25 @@ impl App {
         sr: &mut ScreenReader,
         term_out: &mut dyn Write,
     ) -> Result<bool> {
-        if !self
-            .tmux_connections
-            .iter()
-            .any(|connection| connection.id == connection_id)
-            || !self.view_stack.activate_tmux_connection(connection_id)
-        {
+        if self.view_stack.tmux_connection(connection_id).is_none() {
+            return Ok(false);
+        }
+        self.queue_tmux_connection_activation(connection_id);
+        self.present_tmux_connection(connection_id, sr, term_out)
+    }
+
+    fn present_tmux_connection(
+        &mut self,
+        connection_id: u64,
+        sr: &mut ScreenReader,
+        term_out: &mut dyn Write,
+    ) -> Result<bool> {
+        if !self.view_stack.activate_tmux_connection(connection_id) {
             return Ok(false);
         }
         self.pending_confirmation = None;
         self.active_tmux_connection = Some(connection_id);
         self.cancel_stabilization_bursts();
-        self.queue_tmux_connection_activation(connection_id);
         if let Some(connection) = self.view_stack.tmux_connection_mut(connection_id) {
             connection.show_connection();
         }

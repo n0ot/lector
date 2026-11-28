@@ -193,6 +193,7 @@ define_actions! {
     OpenTmuxSessionChooser => ("open tmux session chooser", "open_tmux_session_chooser"),
     OpenTmuxWindowChooser => ("open tmux window chooser", "open_tmux_window_chooser"),
     OpenTmuxPaneChooser => ("open tmux pane chooser", "open_tmux_pane_chooser"),
+    OpenPendingTmuxPanes => ("open pending tmux panes", "open_pending_tmux_panes"),
     OpenTmuxCommandPrompt => ("open tmux command prompt", "open_tmux_command_prompt"),
     DetachTmuxConnection => ("gracefully detach the active tmux connection", "detach_tmux_connection"),
     ForceAbandonTmuxGateway => ("expose a stuck active tmux gateway as raw terminal input", "force_abandon_tmux_gateway"),
@@ -332,6 +333,7 @@ pub fn handle(
         | Action::OpenTmuxSessionChooser
         | Action::OpenTmuxWindowChooser
         | Action::OpenTmuxPaneChooser
+        | Action::OpenPendingTmuxPanes
         | Action::OpenTmuxCommandPrompt
         | Action::DetachTmuxConnection
         | Action::ForceAbandonTmuxGateway => {

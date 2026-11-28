@@ -7,7 +7,7 @@ use crate::{
     terminal::{TerminalGeometry, UpdateSummary},
     terminal_input::KeyInput,
     tmux_control::CommandStatus,
-    tmux_model::{PaneCaptureMetadata, PaneId, TmuxTopology},
+    tmux_model::{PaneCaptureMetadata, PaneId, TmuxPaneIdentity, TmuxTopology},
     tmux_panes::{
         BootstrapRequest, LayoutError, LayoutPane, TmuxLayout, TmuxPaneError, TmuxPaneSet,
     },
@@ -35,6 +35,7 @@ pub struct TmuxConnectionView {
 pub(crate) struct PaneOutput {
     pub update: UpdateSummary,
     pub bells: usize,
+    pub pending_changed: bool,
     pub program_announcements: Vec<String>,
 }
 
@@ -239,13 +240,19 @@ impl TmuxConnectionView {
             retain_for_accessibility,
         )?;
         Ok(update.map(|mut update| {
+            let pending_changed =
+                !update.program_status_updates.is_empty() || update.effects.bells > 0;
             let program_announcements = self
                 .panes
                 .pane_view_mut(pane_id)
                 .expect("only a known pane can produce an update")
                 .program_status_announcements(&mut update);
+            if update.effects.bells > 0 {
+                self.panes.record_bell(pane_id);
+            }
             PaneOutput {
                 bells: update.effects.bells,
+                pending_changed,
                 update,
                 program_announcements,
             }
@@ -283,6 +290,14 @@ impl TmuxConnectionView {
             crate::tmux_panes::BootstrapTerminalState::default(),
             now_ms,
         )
+    }
+
+    pub(crate) fn note_bootstrap_status_sample(&mut self, pane_id: PaneId) {
+        self.panes.note_bootstrap_status_sample(pane_id);
+    }
+
+    pub(crate) fn pane_is_bootstrapped(&self, pane_id: PaneId) -> bool {
+        self.panes.pane_is_bootstrapped(pane_id)
     }
 
     pub(crate) fn apply_bootstrap_capture(
@@ -418,6 +433,34 @@ impl TmuxConnectionView {
     }
 
     #[must_use]
+    pub(crate) fn pending_reason(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<(
+        crate::program_status::PendingKind,
+        Option<&crate::program_status::ProgramStatus>,
+    )> {
+        self.panes.pending_reason(pane_id)
+    }
+
+    pub(crate) fn acknowledge_pending(&mut self, identity: TmuxPaneIdentity) {
+        if self.connection_id == identity.connection_id
+            && self.placeholder.view_id() == identity.connection_view_id
+        {
+            self.panes
+                .acknowledge_pending(identity.pane_id, identity.surface_id);
+        }
+    }
+
+    pub(crate) fn pane_identity(&self, pane_id: PaneId) -> Option<TmuxPaneIdentity> {
+        Some(TmuxPaneIdentity {
+            connection_id: self.connection_id,
+            connection_view_id: self.placeholder.view_id(),
+            pane_id,
+            surface_id: self.surface_id(pane_id)?,
+        })
+    }
+
     pub fn surface_id(&self, pane_id: PaneId) -> Option<SurfaceId> {
         self.panes.surface_id(pane_id)
     }
@@ -510,6 +553,16 @@ impl TmuxConnectionView {
             return None;
         }
         self.active_window.active_pane()
+    }
+
+    pub(crate) fn confirmed_active_pane(&self) -> Option<TmuxPaneIdentity> {
+        let pane_id = self.active_input_pane()?;
+        // An incomplete zoom/layout update can temporarily show a fallback
+        // pane. A presentation of that fallback does not confirm a visit.
+        if self.topology.attached_active_pane() != Some(pane_id) {
+            return None;
+        }
+        self.pane_identity(pane_id)
     }
 
     pub fn set_inventory_error(&mut self, detail: &str) {
@@ -1187,6 +1240,27 @@ mod tests {
         let (previous, current, _, _) = first.document_contents_cached();
         assert!(!previous.contains("hidden"));
         assert!(current.contains("hidden"));
+    }
+
+    #[test]
+    fn a_retired_connection_receipt_cannot_acknowledge_a_reused_pane_number() {
+        let original = ready_two_window_connection();
+        let mut replacement = ready_two_window_connection();
+        let pane_id = PaneId(20);
+        let old = original.pane_identity(pane_id).unwrap();
+        let new = replacement.pane_identity(pane_id).unwrap();
+        assert_eq!(
+            (old.connection_id, old.surface_id),
+            (new.connection_id, new.surface_id)
+        );
+        assert_ne!(old, new);
+        replacement
+            .process_output(pane_id, b"\x1b]7501;state=done\x1b\\", false)
+            .unwrap();
+        replacement.acknowledge_pending(old);
+        assert!(replacement.pending_reason(pane_id).is_some());
+        replacement.acknowledge_pending(new);
+        assert!(replacement.pending_reason(pane_id).is_none());
     }
 
     #[test]

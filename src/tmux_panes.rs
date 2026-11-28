@@ -508,14 +508,43 @@ pub enum TmuxPaneError {
     MissingLayout,
 }
 
+struct BootstrapOutput<'a> {
+    before_sample: &'a [u8],
+    after_sample: &'a [u8],
+    sample: Option<crate::program_status::ProgramStatus>,
+}
+
+impl BootstrapOutput<'_> {
+    fn apply(self, view: &mut View, retain_for_accessibility: bool) -> (Vec<u8>, usize) {
+        let mut before =
+            view.process_changes_with_batch(self.before_sample, retain_for_accessibility);
+        for report in std::mem::take(&mut before.program_status_updates) {
+            view.program_status_mut().observe(report);
+        }
+        view.program_status_mut()
+            .restore_bootstrap_sample(self.sample);
+        let after = view.process_changes_with_batch(self.after_sample, retain_for_accessibility);
+        for report in after.program_status_updates {
+            view.program_status_mut().observe(report);
+        }
+        before.pty_replies.extend(after.pty_replies);
+        (
+            before.pty_replies,
+            before.effects.bells.saturating_add(after.effects.bells),
+        )
+    }
+}
+
 struct PaneState {
     view: View,
     portal: Option<PanePortal>,
     metadata: Pane,
     surface_id: SurfaceId,
+    pending_bell: bool,
     bootstrap_requested: bool,
     bootstrapped: bool,
     prebootstrap_output: Vec<u8>,
+    bootstrap_status_boundary: Option<usize>,
 }
 
 struct PanePortal {
@@ -628,9 +657,11 @@ impl TmuxPaneSet {
                     portal: None,
                     metadata: pane.clone(),
                     surface_id,
+                    pending_bell: false,
                     bootstrap_requested: false,
                     bootstrapped: false,
                     prebootstrap_output: self.orphan_output.remove(&pane.id).unwrap_or_default(),
+                    bootstrap_status_boundary: None,
                 }
             });
             if state.view.live_size() != (rows, cols) {
@@ -753,6 +784,14 @@ impl TmuxPaneSet {
         Ok(Some(update))
     }
 
+    pub(crate) fn note_bootstrap_status_sample(&mut self, pane_id: PaneId) {
+        if let Some(pane) = self.panes.get_mut(&pane_id)
+            && !pane.bootstrapped
+        {
+            pane.bootstrap_status_boundary = Some(pane.prebootstrap_output.len());
+        }
+    }
+
     pub fn apply_bootstrap(
         &mut self,
         pane_id: PaneId,
@@ -794,36 +833,41 @@ impl TmuxPaneSet {
             .panes
             .get_mut(&pane_id)
             .ok_or(TmuxPaneError::UnknownPane(pane_id.0))?;
+        let buffered = std::mem::take(&mut state.prebootstrap_output);
+        self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
+        let status_boundary = state
+            .bootstrap_status_boundary
+            .take()
+            .unwrap_or(buffered.len());
+        let (before_sample, after_sample) = buffered.split_at(status_boundary);
+        let effects = BootstrapOutput {
+            before_sample,
+            after_sample,
+            sample: recovered.program_status,
+        };
         if status == CommandStatus::Error {
-            state.view.restore_program_status(recovered.program_status);
             state.bootstrapped = true;
             state.bootstrap_requested = false;
-            let buffered = std::mem::take(&mut state.prebootstrap_output);
-            self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
-            let update = state.view.process_changes_with_batch(&buffered, true);
+            let (replies, bells) = effects.apply(&mut state.view, true);
+            state.pending_bell |= bells > 0;
             state.view.discard_shadow_pty_replies();
-            return Ok(update.pty_replies);
+            return Ok(replies);
         }
 
         let rows = dimension(state.metadata.height);
         let cols = dimension(state.metadata.width);
-        let buffered = std::mem::take(&mut state.prebootstrap_output);
-        self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
-
-        // A capture can already contain every visible byte from the buffered
-        // `%output`, so replaying that stream into the authoritative view is
-        // conditional below. Terminal report queries are non-visual and do
-        // not appear in a capture, however. Parse the bounded buffer once in
-        // an isolated shadow so its OSC 10/11 replies survive either branch
-        // without duplicating text or accessibility revisions.
-        let buffered_replies = if buffered.is_empty() {
-            Vec::new()
+        // The screen capture can contain the buffer's visible text. Parse
+        // live side effects in the shadow independently of screen replay.
+        let (buffered_replies, program_status) = if buffered.is_empty() {
+            let mut program_status = crate::program_status::ProgramStatusTracker::default();
+            program_status.restore_bootstrap_sample(effects.sample);
+            (Vec::new(), program_status)
         } else {
-            let mut effect_shadow = View::new(rows, cols);
-            effect_shadow.set_virtual_terminal_colors(self.virtual_terminal_colors);
-            effect_shadow
-                .process_changes_with_batch(&buffered, false)
-                .pty_replies
+            let mut shadow = View::new(rows, cols);
+            shadow.set_virtual_terminal_colors(self.virtual_terminal_colors);
+            let (replies, bells) = effects.apply(&mut shadow, false);
+            state.pending_bell |= bells > 0;
+            (replies, std::mem::take(shadow.program_status_mut()))
         };
 
         let mut view = View::new(rows, cols);
@@ -855,7 +899,7 @@ impl TmuxPaneSet {
             view.process_changes(&recovered.pending_escape);
         }
         view.discard_shadow_pty_replies();
-        view.restore_program_status(recovered.program_status);
+        *view.program_status_mut() = program_status;
         // An authoritative capture establishes the pane's diff baseline; it is
         // not application output to announce. Finalize it while parsing is
         // still the publication boundary, then let physical receipts own every
@@ -930,6 +974,9 @@ impl TmuxPaneSet {
         );
         view.process_changes(&bytes);
         view.discard_shadow_pty_replies();
+        // Capture replaces the terminal model, but the pane and its visit
+        // history survive. Restore only the fields present in the snapshot.
+        *view.program_status_mut() = std::mem::take(state.view.program_status_mut());
         view.restore_program_status(metadata.program_status.clone());
         // Baseline the authoritative snapshot before presentation tracking
         // starts so capture text cannot taint the first later output receipt.
@@ -944,6 +991,37 @@ impl TmuxPaneSet {
             self.retired_presentations.push(retired);
         }
         Ok(())
+    }
+
+    pub(crate) fn record_bell(&mut self, pane_id: PaneId) {
+        if let Some(pane) = self.panes.get_mut(&pane_id) {
+            pane.pending_bell = true;
+        }
+    }
+
+    pub(crate) fn pending_reason(
+        &self,
+        pane_id: PaneId,
+    ) -> Option<(
+        crate::program_status::PendingKind,
+        Option<&crate::program_status::ProgramStatus>,
+    )> {
+        let pane = self.panes.get(&pane_id)?;
+        if let Some((kind, status)) = pane.view.program_status().pending() {
+            Some((kind, Some(status)))
+        } else {
+            pane.pending_bell
+                .then_some((crate::program_status::PendingKind::Bell, None))
+        }
+    }
+
+    pub(crate) fn acknowledge_pending(&mut self, pane_id: PaneId, surface_id: SurfaceId) {
+        if let Some(pane) = self.panes.get_mut(&pane_id)
+            && pane.surface_id == surface_id
+        {
+            pane.pending_bell = false;
+            pane.view.program_status_mut().acknowledge();
+        }
     }
 
     #[must_use]
@@ -1497,7 +1575,7 @@ fn capture_line_flags(line: &[u8]) -> (&[u8], &[u8]) {
 #[cfg(test)]
 mod synchronization_tests {
     use super::{
-        PaneState, TmuxLayout, TmuxPaneSet, capture_command_for_metadata,
+        BootstrapTerminalState, PaneState, TmuxLayout, TmuxPaneSet, capture_command_for_metadata,
         pending_escape_capture_command, portable_capture_command_for_metadata,
     };
     use crate::{
@@ -1598,9 +1676,11 @@ mod synchronization_tests {
                         history_size: 0,
                     },
                     surface_id,
+                    pending_bell: false,
                     bootstrap_requested: false,
                     bootstrapped: true,
                     prebootstrap_output: Vec::new(),
+                    bootstrap_status_boundary: None,
                 },
             );
         }
@@ -2065,6 +2145,66 @@ mod synchronization_tests {
         panes.retain_accessibility_views(&[replacement]);
         assert!(panes.model_by_id_mut(portal_id).is_none());
         assert!(panes.model_by_id_mut(pane_id).is_none());
+    }
+
+    #[test]
+    fn resync_preserves_acknowledgment_until_the_pane_lifetime_ends() {
+        let topology = split_topology();
+        let mut panes = TmuxPaneSet::new(1);
+        let pane_id = PaneId(20);
+        let status =
+            crate::program_status::ProgramStatus::from_fields(b"done", b"Sample", b"Saved");
+        panes.reconcile(&topology).unwrap();
+        panes
+            .apply_bootstrap_capture(
+                pane_id,
+                CommandStatus::Success,
+                &[b"initial".to_vec()],
+                false,
+                BootstrapTerminalState {
+                    program_status: status.clone(),
+                    pending_escape: vec![],
+                },
+                0,
+            )
+            .unwrap();
+        let lifetime = panes.surface_id(pane_id).unwrap();
+        panes.acknowledge_pending(pane_id, lifetime);
+        assert!(panes.pending_reason(pane_id).is_none());
+
+        let metadata = PaneCaptureMetadata {
+            pane_id,
+            left: 0,
+            top: 0,
+            width: 40,
+            height: 24,
+            dead: false,
+            cursor_x: 0,
+            cursor_y: 0,
+            cursor_visible: true,
+            cursor_shape: "default".to_owned(),
+            alternate_on: false,
+            pane_in_mode: 0,
+            history_size: 0,
+            program_status: status,
+        };
+        panes
+            .apply_resync_capture(&metadata, &[b"resync".to_vec()], &[], 1)
+            .unwrap();
+        assert_eq!(panes.surface_id(pane_id), Some(lifetime));
+        assert!(panes.pending_reason(pane_id).is_none());
+
+        panes.reconcile(&right_only_topology()).unwrap();
+        panes.reconcile(&topology).unwrap();
+        assert_ne!(panes.surface_id(pane_id), Some(lifetime));
+        panes
+            .apply_resync_capture(&metadata, &[b"new pane".to_vec()], &[], 2)
+            .unwrap();
+        panes.acknowledge_pending(pane_id, lifetime);
+        assert_eq!(
+            panes.pending_reason(pane_id).unwrap().0,
+            crate::program_status::PendingKind::Done
+        );
     }
 
     #[test]

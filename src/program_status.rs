@@ -25,19 +25,94 @@ impl State {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockReason {
+    Approval,
+    Question,
+    Authentication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum PendingKind {
+    Attention,
+    Done,
+    Bell,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramStatus {
     state: State,
     app: Option<String>,
+    // Recovery exposes no category. A live report can explicitly omit it.
+    reason: Option<Option<BlockReason>>,
+    message: Option<String>,
 }
 
 impl ProgramStatus {
-    pub(crate) fn from_fields(state: &[u8], app: &[u8]) -> Option<Self> {
+    pub(crate) fn from_fields(state: &[u8], app: &[u8], message: &[u8]) -> Option<Self> {
         Some(Self {
             state: State::parse(state)?,
             app: parse_app(app).map(str::to_owned),
+            reason: None,
+            message: clean_text(message, 2048),
         })
     }
+
+    fn pending_kind(&self) -> Option<PendingKind> {
+        match self.state {
+            State::Blocked | State::Error => Some(PendingKind::Attention),
+            State::Done => Some(PendingKind::Done),
+            State::Idle | State::Working => None,
+        }
+    }
+
+    pub(crate) fn app(&self) -> Option<&str> {
+        self.app.as_deref()
+    }
+
+    pub(crate) fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    pub(crate) fn reason(&self) -> &'static str {
+        match self.state {
+            State::Blocked => match self.reason.flatten() {
+                Some(BlockReason::Approval) => "approval",
+                Some(BlockReason::Question) => "question",
+                Some(BlockReason::Authentication) => "authentication",
+                None => "needs attention",
+            },
+            State::Error => "failed",
+            State::Done => "done",
+            State::Idle | State::Working => unreachable!("nonpending status"),
+        }
+    }
+
+    fn matches_acknowledged(&self, acknowledged: &Self, recovering: bool) -> bool {
+        self.state == acknowledged.state
+            && (self.app == acknowledged.app || (recovering && self.app.is_none()))
+            && (self.message == acknowledged.message
+                || (recovering && self.message.is_none())
+                || self
+                    .message
+                    .as_ref()
+                    .zip(acknowledged.message.as_ref())
+                    .is_some_and(|(current, previous)| {
+                        // tmux sanitizes this pair in user-facing recovered names.
+                        // The lost character cannot establish a new report.
+                        (recovering && recovered_message_matches(previous, current))
+                            || (acknowledged.reason.is_none()
+                                && recovered_message_matches(current, previous))
+                    }))
+            && self
+                .reason
+                .zip(acknowledged.reason)
+                .is_none_or(|(a, b)| a == b)
+    }
+}
+
+fn recovered_message_matches(observed: &str, recovered: &str) -> bool {
+    observed.contains("#(") && observed.replace("#(", "_(") == recovered
 }
 
 fn parse_app(app: &[u8]) -> Option<&str> {
@@ -49,9 +124,15 @@ fn parse_app(app: &[u8]) -> Option<&str> {
     .then(|| std::str::from_utf8(app).expect("ASCII program name"))
 }
 
-fn valid_text(value: &[u8], encoded_limit: usize, decoded_limit: usize) -> bool {
+fn clean_text(bytes: &[u8], limit: usize) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    (bytes.len() <= limit && !text.is_empty() && !text.chars().any(char::is_control))
+        .then(|| text.to_owned())
+}
+
+fn decode_text(value: &[u8], encoded_limit: usize, decoded_limit: usize) -> Option<String> {
     if value.len() > encoded_limit {
-        return false;
+        return None;
     }
     let end = value
         .iter()
@@ -60,18 +141,21 @@ fn valid_text(value: &[u8], encoded_limit: usize, decoded_limit: usize) -> bool 
     let unpadded = &value[..end];
     let padding = value.len() - unpadded.len();
     if padding > 0 && (padding > 2 || !value.len().is_multiple_of(4)) {
-        return false;
+        return None;
     }
-    crate::base64::decode_unpadded(unpadded).is_some_and(|text| {
-        text.len() <= decoded_limit
-            && std::str::from_utf8(&text).is_ok_and(|text| !text.chars().any(char::is_control))
-    })
+    let decoded = crate::base64::decode_unpadded(unpadded)?;
+    if decoded.is_empty() {
+        return Some(String::new());
+    }
+    clean_text(&decoded, decoded_limit)
 }
 
 /// The outer option represents a well-formed report and the inner one allows clear.
 fn parse_report(body: &[u8]) -> Option<Option<ProgramStatus>> {
     let mut state = b"".as_slice();
     let mut app = b"".as_slice();
+    let mut reason = None;
+    let mut message = None;
     for pair in body.split(|byte| *byte == b':') {
         let Some(separator) = pair.iter().position(|byte| *byte == b'=') else {
             continue;
@@ -96,21 +180,41 @@ fn parse_report(body: &[u8]) -> Option<Option<ProgramStatus>> {
             b"state" => state = value,
             b"app" if value.len() <= 32 => app = value,
             b"app" => return None,
-            b"title" if !valid_text(value, 256, 192) => return None,
-            b"msg" if !valid_text(value, 2732, 2048) => return None,
+            b"kind" => {
+                reason = match value {
+                    b"permission" => Some(BlockReason::Approval),
+                    b"question" => Some(BlockReason::Question),
+                    b"auth" => Some(BlockReason::Authentication),
+                    _ => None,
+                };
+            }
+            b"title" => {
+                decode_text(value, 256, 192)?;
+            }
+            b"msg" => {
+                let decoded = decode_text(value, 2732, 2048)?;
+                message = (!decoded.is_empty()).then_some(decoded);
+            }
             _ => {}
         }
     }
     if state == b"clear" {
         Some(None)
     } else {
-        ProgramStatus::from_fields(state, app).map(Some)
+        let state = State::parse(state)?;
+        Some(Some(ProgramStatus {
+            state,
+            app: parse_app(app).map(str::to_owned),
+            reason: Some(reason.filter(|_| state == State::Blocked)),
+            message,
+        }))
     }
 }
 
 #[derive(Default)]
 pub(crate) struct ProgramStatusTracker {
     current: Option<ProgramStatus>,
+    acknowledged: Option<ProgramStatus>,
 }
 
 impl ProgramStatusTracker {
@@ -123,7 +227,57 @@ impl ProgramStatusTracker {
     }
 
     pub(crate) fn restore(&mut self, current: Option<ProgramStatus>) {
+        // No root status in a snapshot can also mean tmux does not expose
+        // it. Keep the acknowledgment until there is evidence of a change.
+        if let Some(current) = &current {
+            self.reconcile_acknowledgment(current, true);
+        }
         self.current = current;
+    }
+
+    pub(crate) fn restore_bootstrap_sample(&mut self, sample: Option<ProgramStatus>) {
+        let Some(mut sample) = sample else {
+            // Empty status fields cannot distinguish clear from an older
+            // server without the fields. Keep explicit live transitions.
+            return;
+        };
+        if let Some(observed) = &self.current
+            && sample.state == observed.state
+            && sample.app == observed.app
+            && (sample.message == observed.message
+                || sample
+                    .message
+                    .as_ref()
+                    .zip(observed.message.as_ref())
+                    .is_some_and(|(sample, observed)| recovered_message_matches(observed, sample)))
+        {
+            sample.reason = observed.reason;
+            sample.message.clone_from(&observed.message);
+        }
+        self.current = Some(sample);
+    }
+
+    pub(crate) fn pending(&self) -> Option<(PendingKind, &ProgramStatus)> {
+        let current = self.current.as_ref()?;
+        self.acknowledged
+            .is_none()
+            .then_some((current.pending_kind()?, current))
+    }
+
+    pub(crate) fn acknowledge(&mut self) {
+        if let Some((_, current)) = self.pending() {
+            self.acknowledged = Some(current.clone());
+        }
+    }
+
+    fn reconcile_acknowledgment(&mut self, current: &ProgramStatus, recovering: bool) {
+        if let Some(acknowledged) = &self.acknowledged {
+            if !current.matches_acknowledged(acknowledged, recovering) {
+                self.acknowledged = None;
+            } else if !recovering && acknowledged.reason.is_none() {
+                self.acknowledged = Some(current.clone());
+            }
+        }
     }
 
     pub(crate) fn observe(&mut self, update: ProgramStatusUpdate) -> Option<String> {
@@ -137,9 +291,21 @@ impl ProgramStatusTracker {
                     }) {
                         self.current = None;
                     }
+                    if self
+                        .acknowledged
+                        .as_ref()
+                        .is_some_and(|status| status.state == State::Blocked)
+                    {
+                        self.acknowledged = None;
+                    }
                     return None;
                 }
             };
+        if let Some(next) = &next {
+            self.reconcile_acknowledgment(next, false);
+        } else {
+            self.acknowledged = None;
+        }
         let previous = std::mem::replace(&mut self.current, next);
         let next = self.current.as_ref()?;
         if previous.as_ref().is_some_and(|previous| {
@@ -173,7 +339,7 @@ mod tests {
     #[test]
     fn recovery_and_details_are_silent_and_a_new_work_cycle_rearms_completion() {
         let mut tracker = ProgramStatusTracker::default();
-        tracker.restore(ProgramStatus::from_fields(b"blocked", b"Example"));
+        tracker.restore(ProgramStatus::from_fields(b"blocked", b"Example", b""));
         assert_eq!(report(&mut tracker, "state=blocked:app=Example"), None);
         assert_eq!(
             report(
@@ -201,9 +367,55 @@ mod tests {
     }
 
     #[test]
+    fn pending_acknowledgment_survives_partial_recovery_and_rearms_on_new_evidence() {
+        let mut tracker = ProgramStatusTracker::default();
+        let approval = "state=blocked:kind=permission:app=Sample:msg=Q29udGludWU/";
+        assert_eq!(
+            report(&mut tracker, approval).as_deref(),
+            Some("Sample needs attention")
+        );
+        let (kind, status) = tracker.pending().unwrap();
+        assert_eq!(kind, PendingKind::Attention);
+        assert_eq!(status.reason(), "approval");
+        assert_eq!(status.message(), Some("Continue?"));
+        tracker.acknowledge();
+        tracker.restore(ProgramStatus::from_fields(
+            b"blocked",
+            b"Sample",
+            b"Continue?",
+        ));
+        assert!(tracker.pending().is_none());
+        assert!(report(&mut tracker, approval).is_none());
+        assert!(tracker.pending().is_none());
+
+        let question = "state=blocked:kind=question:app=Sample:msg=Q29udGludWU/";
+        assert!(report(&mut tracker, question).is_none());
+        assert_eq!(tracker.pending().unwrap().1.reason(), "question");
+        tracker.acknowledge();
+        tracker.restore(ProgramStatus::from_fields(
+            b"blocked",
+            b"Sample",
+            b"Different question",
+        ));
+        let (_, recovered) = tracker.pending().unwrap();
+        assert_eq!(recovered.reason(), "needs attention");
+        assert_eq!(recovered.message(), Some("Different question"));
+        tracker.acknowledge();
+        report(&mut tracker, "state=working:app=Sample");
+        assert!(tracker.pending().is_none());
+        report(&mut tracker, approval);
+        assert_eq!(tracker.pending().unwrap().1.reason(), "approval");
+        tracker.acknowledge();
+        tracker.restore(None);
+        assert!(tracker.observe(ProgramStatusUpdate::PromptStart).is_none());
+        report(&mut tracker, approval);
+        assert!(tracker.pending().is_some());
+    }
+
+    #[test]
     fn invalid_reports_and_non_root_records_do_not_replace_the_root() {
         let mut tracker = ProgramStatusTracker::default();
-        tracker.restore(ProgramStatus::from_fields(b"done", b"Example"));
+        tracker.restore(ProgramStatus::from_fields(b"done", b"Example", b""));
         for body in [
             "state=working:msg=Cg==",
             "state=working:title=/w==",

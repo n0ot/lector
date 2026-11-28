@@ -91,7 +91,21 @@ lector.o.tmux_bells = "audible"
 | --- | --- |
 | `"audible"` | The default. Rings the terminal bell and says where it came from, such as "bell in window 1". Bells in the window you are in just ring. |
 | `"spoken"` | Announces the connection, session, window, and pane by name. |
-| `"off"` | Ignores pane bells. |
+| `"off"` | Silences automatic bell announcements and sounds. |
+
+## Pending panes
+
+Press `M-P` (Meta-Shift-p) to find panes that need attention, have finished,
+or rang a bell. Lector lists them in that order across reachable tmux
+connections, including nested connections, and reads the first row aloud.
+Each pane appears once. When an app reports details, Lector includes its name,
+the reason, and its message.
+
+Use Up and Down to browse, type to filter, and press `Enter` to visit the
+selected pane. `Escape` returns to your previous view and reading position.
+Visiting a pane clears its pending status and bell. A new report or bell can
+bring it back. The chooser works with auto-read and automatic announcements
+turned off.
 
 ## Managing connections
 
@@ -149,6 +163,7 @@ These actions can be bound to keys in your
 - `lector.open_tmux_session_chooser`
 - `lector.open_tmux_window_chooser`
 - `lector.open_tmux_pane_chooser`
+- `lector.open_pending_tmux_panes` (default `M-P`)
 - `lector.open_tmux_command_prompt`
 - `lector.rename_tmux_connection`
 - `lector.detach_tmux_connection`

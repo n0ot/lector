@@ -1618,6 +1618,16 @@ impl View {
             .collect()
     }
 
+    pub(crate) fn program_status(&self) -> &crate::program_status::ProgramStatusTracker {
+        &self.program_status
+    }
+
+    pub(crate) fn program_status_mut(
+        &mut self,
+    ) -> &mut crate::program_status::ProgramStatusTracker {
+        &mut self.program_status
+    }
+
     pub(crate) fn restore_program_status(
         &mut self,
         status: Option<crate::program_status::ProgramStatus>,

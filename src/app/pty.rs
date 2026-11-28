@@ -492,6 +492,7 @@ impl App {
             .view_stack
             .active_tmux_connection_chooser_mut()
             .is_some();
+        let preserve_pending_chooser = self.view_stack.has_pending_tmux_pane_chooser();
         let previously_active = self.active_tmux_connection;
         let ending_origin = self.tmux_hierarchy.origin(connection_id);
         if let Some(GatewayOrigin::Pane {
@@ -575,12 +576,14 @@ impl App {
                     .flatten()
             });
         self.cancel_stabilization_bursts();
-        if !preserve_connection_chooser {
+        if !preserve_connection_chooser && !preserve_pending_chooser {
             self.view_stack.clear_overlays();
         }
         self.view_stack
             .remove_tmux_connections(&removed_connections);
-        if self.tmux_connections.is_empty() {
+        if preserve_pending_chooser {
+            self.settle_pending_tmux_pane_visit(sr, None, term_out)?;
+        } else if self.tmux_connections.is_empty() {
             self.view_stack.activate_terminal();
         } else if preserve_connection_chooser {
             self.sync_tmux_connection_chooser();
@@ -635,11 +638,13 @@ impl App {
             pane_resync_result,
             carrier_reply,
             tree_reply,
+            pane_visit_reply,
             request_resync,
             sync_topology,
             mut render_topology,
             bootstrap_reply,
             bootstrap_retry,
+            bootstrap_status_sampled,
             pane_resync_probe,
             pane_resync_request,
             pane_resume_request,
@@ -719,6 +724,20 @@ impl App {
                 );
             }
             None => {}
+        }
+        if let Some((visit, success)) = pane_visit_reply {
+            if self
+                .pending_tmux_session_switches
+                .get(&connection_id)
+                .is_some_and(|pending| pending.pane_visit == Some(visit))
+            {
+                self.handle_tmux_carrier_session_switch_reply(
+                    connection_id,
+                    visit.destination.session_id,
+                    success,
+                );
+            }
+            self.record_pending_tmux_pane_visit_reply(visit, success);
         }
         if inventory_applied {
             self.reconcile_tmux_carrier_leases(connection_id);
@@ -860,6 +879,7 @@ impl App {
                 kind: PendingTmuxCommandKind::Ordinary,
             });
         }
+        let inventory_finished = inventory_applied || inventory_terminal_failure.is_some();
         if let Some((had_inventory, detail)) = inventory_terminal_failure {
             if had_inventory {
                 notification_popup = Some((
@@ -915,10 +935,18 @@ impl App {
             self.open_review(sr, false, term_out)?;
         }
         // 4. Applying captures may raise new render/announcement/resume work.
+        let pending_pane_state_changed = sync_topology
+            || bootstrap_reply.is_some()
+            || matches!(pane_resync_result, Some(TmuxPaneResyncResult::Success(..)));
+        if let Some(pane_id) = bootstrap_status_sampled {
+            self.process_tmux_output_in_order(sr, connection_id, pane_id, &[], term_out)?;
+            if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
+                view.note_bootstrap_status_sample(pane_id);
+            }
+        }
         if let Some((capture, status, output)) = bootstrap_reply {
             let pane_id = capture.pane_id;
-            self.pending_tmux_background_output
-                .remove((connection_id, pane_id));
+            self.process_tmux_output_in_order(sr, connection_id, pane_id, &[], term_out)?;
             let bootstrap_replies =
                 if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
                     let was_ready = view.is_ready();
@@ -1180,6 +1208,14 @@ impl App {
                 kind: PendingTmuxCommandKind::Ordinary,
             });
         }
+        self.settle_pending_tmux_pane_visit(
+            sr,
+            inventory_finished.then_some(connection_id),
+            term_out,
+        )?;
+        if pending_pane_state_changed && self.refresh_pending_tmux_panes() {
+            self.render_active_view(term_out)?;
+        }
         if let Some((pane_id, bytes)) = pane_output {
             self.process_tmux_pane_transport(sr, connection_id, pane_id, &bytes, term_out)?;
         } else if chooser_updated {
@@ -1299,6 +1335,35 @@ impl App {
         Ok(())
     }
 
+    fn process_tmux_output_in_order(
+        &mut self,
+        sr: &mut ScreenReader,
+        connection_id: u64,
+        pane_id: crate::tmux_model::PaneId,
+        bytes: &[u8],
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        let mut queued = self
+            .pending_tmux_background_output
+            .take((connection_id, pane_id));
+        let bytes = if let Some(queued) = &mut queued {
+            // Older retained bytes must precede immediate output when a
+            // pane becomes visible or starts carrying a nested connection.
+            queued.extend(bytes);
+            let bytes = queued.make_contiguous();
+            if self.discard_stale_tmux_pane_output(connection_id, pane_id, bytes) {
+                return Ok(());
+            }
+            bytes
+        } else {
+            bytes
+        };
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out)
+    }
+
     fn process_or_defer_tmux_pane_output(
         &mut self,
         sr: &mut ScreenReader,
@@ -1326,7 +1391,7 @@ impl App {
         // matching resume. Model visible bytes immediately within the outer
         // bounded turn.
         if pane_is_visible {
-            return self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out);
+            return self.process_tmux_output_in_order(sr, connection_id, pane_id, bytes, term_out);
         }
 
         let has_deferred_output = self.pending_tmux_background_output.contains(key);
@@ -1728,6 +1793,9 @@ impl App {
             )?;
         }
         let bells = outcome.as_ref().map_or(0, |outcome| outcome.bells);
+        let pending_changed = outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.pending_changed);
         let output_screen = outcome.as_ref().map(|outcome| {
             (
                 outcome.update.screen_after,
@@ -1760,6 +1828,9 @@ impl App {
                     adaptive_quiet_trainable,
                 );
             }
+        }
+        if pending_changed && self.refresh_pending_tmux_panes() {
+            self.render_active_view(term_out)?;
         }
         Ok(())
     }
@@ -1815,7 +1886,8 @@ impl App {
             .view_stack
             .active_tmux_connection_chooser_mut()
             .is_some();
-        if !preserve_connection_chooser {
+        let preserve_pending_chooser = self.view_stack.has_pending_tmux_pane_chooser();
+        if !preserve_connection_chooser && !preserve_pending_chooser {
             self.view_stack.clear_overlays();
         }
         removed.sort_unstable();
@@ -1826,6 +1898,8 @@ impl App {
             .retain(|command| !removed.contains(&command.connection_id));
         self.waiting_tmux_bootstraps
             .retain(|command| !removed.contains(&command.connection_id));
+        self.pending_tmux_session_switches
+            .retain(|id, _| !removed.contains(id));
         self.pending_direct_gateway_input
             .retain(|input| !removed.contains(&input.connection_id));
         self.pending_tmux_background_output
@@ -1847,9 +1921,10 @@ impl App {
         if preserve_connection_chooser {
             self.sync_tmux_connection_chooser();
         } else if let Some(connection_id) = self.active_tmux_connection {
-            self.view_stack.activate_tmux_connection(connection_id);
+            self.view_stack
+                .select_tmux_base(connection_id, !preserve_pending_chooser);
             self.sync_tmux_panes(connection_id)?;
-        } else {
+        } else if !preserve_pending_chooser {
             self.view_stack.activate_terminal();
         }
         sr.speak(
@@ -1927,12 +2002,20 @@ impl App {
             }
         }
 
+        // Bootstrap consumes retained live output at its sample and screen
+        // boundaries. Exposing an already bootstrapped pane instead needs a
+        // fresh recovery snapshot before deferred output can be discarded.
         let obsolete_deferred = self
             .pending_tmux_background_output
             .panes()
             .filter(|(source_connection_id, pane_id)| {
                 *source_connection_id == connection_id
-                    && (topology.pane(*pane_id).is_none() || pane_is_presented(*pane_id))
+                    && (topology.pane(*pane_id).is_none()
+                        || (pane_is_presented(*pane_id)
+                            && self
+                                .view_stack
+                                .tmux_connection(connection_id)
+                                .is_some_and(|view| view.pane_is_bootstrapped(*pane_id))))
             })
             .collect::<Vec<_>>();
         for key @ (_, pane_id) in obsolete_deferred {
@@ -2046,7 +2129,7 @@ impl App {
         let chooser_updated = self
             .view_stack
             .active_tmux_chooser_mut()
-            .filter(|chooser| chooser.connection_id() == connection_id)
+            .filter(|chooser| chooser.connection_id() == Some(connection_id))
             .map(|chooser| chooser.sync_topology(&topology))
             .is_some();
         Ok(chooser_updated)
@@ -2285,6 +2368,7 @@ impl App {
         if let Some(connection_id) = self.tmux_gateway.active_connection() {
             self.drain_tmux_commands_for(connection_id, pty_out)?;
         }
+        self.settle_pending_tmux_pane_visit(sr, None, term_out)?;
         self.expire_tmux_force_abandon(sr, term_out)?;
         let released_probe_input = self
             .startup_probe_broker
@@ -2588,8 +2672,21 @@ impl App {
             }
             let rejected_connection_id = command.connection_id;
             let rejected_replies = command.expected_replies.clone();
+            let pane_visit = match rejected_replies.as_slice() {
+                [ExpectedTmuxReply::PaneVisit(visit)] => Some(*visit),
+                _ => None,
+            };
+            if let Some(visit) = pane_visit
+                && !self.can_send_tmux_pane_visit(visit)
+            {
+                self.reject_unsent_tmux_pane_visit(visit);
+                continue;
+            }
             let Some((root_connection_id, encoded)) = self.route_tmux_command(command)? else {
                 self.recover_discarded_tmux_flow_command(rejected_connection_id, &rejected_replies);
+                if let Some(visit) = pane_visit {
+                    self.reject_unsent_tmux_pane_visit(visit);
+                }
                 continue;
             };
             self.mark_tmux_flow_commands_in_flight(rejected_connection_id, &rejected_replies);

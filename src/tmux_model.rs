@@ -130,6 +130,15 @@ impl PaneCaptureMetadata {
     }
 }
 
+/// A pane number scoped to its connection and its lifetime within that connection.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TmuxPaneIdentity {
+    pub connection_id: u64,
+    pub connection_view_id: crate::presentation::ViewId,
+    pub pane_id: PaneId,
+    pub surface_id: crate::presentation::SurfaceId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TmuxLocation {
     pub session_id: SessionId,
@@ -1176,21 +1185,46 @@ fn empty_pane(id: PaneId, window_id: WindowId) -> Pane {
     }
 }
 
+fn recovered_program_status(state: &[u8], name: &[u8], message: &[u8]) -> Option<ProgramStatus> {
+    // tmux's pane_program_message has already escaped literal backslashes.
+    // Preserve other printable escapes rather than introducing controls.
+    let message = std::str::from_utf8(message).unwrap_or_default();
+    if message.contains("\\\\") {
+        let unescaped = message.replace("\\\\", "\\");
+        ProgramStatus::from_fields(state, name, unescaped.as_bytes())
+    } else {
+        ProgramStatus::from_fields(state, name, message.as_bytes())
+    }
+}
+
 /// Keep the prefix unambiguous for legacy replies and leave the pane title
 /// at the end, where it can contain tabs without consuming status fields.
 fn split_program_status_fields(
     line: &[u8],
 ) -> Result<(std::borrow::Cow<'_, [u8]>, Option<ProgramStatus>), TopologyError> {
-    if line.get(1..9) != Some(b"\tstatus\t") {
+    let (prefix, includes_message) = if line.get(1..17) == Some(b"\tprogram-status\t") {
+        (17, true)
+    } else if line.get(1..9) == Some(b"\tstatus\t") {
+        (9, false)
+    } else {
         return Ok((std::borrow::Cow::Borrowed(line), None));
-    }
-    let mut parts = line[9..].splitn(3, |byte| *byte == b'\t');
+    };
+    let mut parts =
+        line[prefix..].splitn(if includes_message { 4 } else { 3 }, |byte| *byte == b'\t');
     let state = parts.next().ok_or(TopologyError::MalformedInventory)?;
     let name = parts.next().ok_or(TopologyError::MalformedInventory)?;
+    let message = if includes_message {
+        parts.next().ok_or(TopologyError::MalformedInventory)?
+    } else {
+        b""
+    };
     let fields = parts.next().ok_or(TopologyError::MalformedInventory)?;
     let mut original = line[..2].to_vec();
     original.extend_from_slice(fields);
-    Ok((original.into(), ProgramStatus::from_fields(state, name)))
+    Ok((
+        original.into(),
+        recovered_program_status(state, name, message),
+    ))
 }
 
 fn split_inventory(line: &[u8], fields: usize) -> Result<Vec<&[u8]>, TopologyError> {
@@ -1247,7 +1281,7 @@ fn parse_cursor_shape(bytes: &[u8]) -> Result<String, TopologyError> {
 
 pub(crate) fn pane_program_status_command(pane_id: PaneId) -> Vec<u8> {
     format!(
-        "display-message -p -t %{} -F 'T\t#{{pane_id}}\t#{{pane_program_state}}\t#{{pane_program_name}}'\n",
+        "display-message -p -t %{} -F 'T\t#{{pane_id}}\t#{{pane_program_state}}\t#{{pane_program_name}}\t#{{pane_program_message}}'\n",
         pane_id.0
     )
     .into_bytes()
@@ -1257,17 +1291,21 @@ pub(crate) fn parse_pane_program_status(
     line: &[u8],
     expected_pane_id: PaneId,
 ) -> Option<ProgramStatus> {
-    let fields = split_inventory(line, 4).ok()?;
-    if fields[0] != b"T" || parse_pane_id(fields[1]).ok()? != expected_pane_id {
+    let mut fields = line.splitn(5, |byte| *byte == b'\t');
+    if fields.next()? != b"T" || parse_pane_id(fields.next()?).ok()? != expected_pane_id {
         return None;
     }
-    ProgramStatus::from_fields(fields[2], fields[3])
+    recovered_program_status(
+        fields.next()?,
+        fields.next()?,
+        fields.next().unwrap_or_default(),
+    )
 }
 
 #[must_use]
 pub fn pane_capture_metadata_command(pane_id: PaneId) -> Vec<u8> {
     format!(
-        "display-message -p -t %{} -F 'R\tstatus\t#{{pane_program_state}}\t#{{pane_program_name}}\t#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}\t#{{pane_width}}\t#{{pane_height}}\t#{{pane_dead}}\t#{{cursor_x}}\t#{{cursor_y}}\t#{{cursor_flag}}\t#{{cursor_shape}}\t#{{alternate_on}}\t#{{pane_in_mode}}\t#{{history_size}}'\n",
+        "display-message -p -t %{} -F 'R\tprogram-status\t#{{pane_program_state}}\t#{{pane_program_name}}\t#{{pane_program_message}}\t#{{pane_id}}\t#{{pane_left}}\t#{{pane_top}}\t#{{pane_width}}\t#{{pane_height}}\t#{{pane_dead}}\t#{{cursor_x}}\t#{{cursor_y}}\t#{{cursor_flag}}\t#{{cursor_shape}}\t#{{alternate_on}}\t#{{pane_in_mode}}\t#{{history_size}}'\n",
         pane_id.0
     )
     .into_bytes()
