@@ -51,7 +51,11 @@ pub enum ProgramActivity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PresentedLocation {
-    Terminal(Option<ProgramActivity>),
+    Terminal {
+        view_id: ViewId,
+        title: String,
+        activity: Option<ProgramActivity>,
+    },
     Named {
         brief: Option<String>,
         detailed: String,
@@ -68,13 +72,17 @@ impl PresentedLocation {
         }
     }
 
-    pub(crate) fn label(&self, terminal_title: Option<&str>, detailed: bool) -> String {
+    pub(crate) fn label(&self, detailed: bool) -> String {
         match self {
-            Self::Terminal(_) => match terminal_title.filter(|title| !title.is_empty()) {
-                Some(title) if detailed => format!("terminal, {title}"),
-                Some(title) => title.to_owned(),
-                None => "terminal".to_owned(),
-            },
+            Self::Terminal { title, .. } => {
+                if title.is_empty() {
+                    "terminal".to_owned()
+                } else if detailed {
+                    format!("terminal, {title}")
+                } else {
+                    title.clone()
+                }
+            }
             Self::Named {
                 brief: title,
                 detailed: location,
@@ -89,10 +97,10 @@ impl PresentedLocation {
         }
     }
 
-    pub(crate) fn announcement(&self, terminal_title: Option<&str>, detailed: bool) -> String {
-        let mut label = self.label(terminal_title, detailed);
+    pub(crate) fn announcement(&self, detailed: bool) -> String {
+        let mut label = self.label(detailed);
         match self {
-            Self::Terminal(activity) | Self::Named { activity, .. } => match activity {
+            Self::Terminal { activity, .. } | Self::Named { activity, .. } => match activity {
                 Some(ProgramActivity::Working) => label.push_str(" (working)"),
                 Some(ProgramActivity::Blocked) => label.push_str(" (blocked)"),
                 None => {}

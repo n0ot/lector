@@ -575,12 +575,9 @@ impl App {
                         synchronize_pending_review_cursor(sr, view)?;
                     }
                     let title = match action {
-                        commands::Action::SayLocation | commands::Action::SayOverlay => {
-                            self.presented_accessibility_location.announcement(
-                                self.presented_scene.title(),
-                                action == commands::Action::SayOverlay,
-                            )
-                        }
+                        commands::Action::SayLocation | commands::Action::SayOverlay => self
+                            .presented_accessibility_location
+                            .announcement(action == commands::Action::SayOverlay),
                         _ => String::new(),
                     };
                     let command_result = if action.uses_presented_view() {

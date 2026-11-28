@@ -70,6 +70,9 @@ pub struct DrainReport {
     pub bytes_written: usize,
     pub completed_renders: Vec<CompletedRender>,
     pub completed_effects: Vec<ScheduledTerminalEffect>,
+    /// Effects preceding the newest completed render in physical write order.
+    /// That render's model takes precedence over these earlier receipts.
+    pub(crate) effects_before_last_render: usize,
     /// Physical bells whose bytes reached the same successful flush fence as
     /// the completed render and effect receipts in this report.
     pub completed_bells: usize,
@@ -111,6 +114,9 @@ struct TrackedRender {
 pub struct ScheduledTerminalEffect {
     pub owner: SurfaceId,
     pub event: TerminalEvent,
+    /// The accessibility view which supplied this title, when it comes from
+    /// a standalone terminal. The physical effect owner remains terminal-wide.
+    pub(crate) originating_view: Option<ViewId>,
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +166,7 @@ pub struct OutputScheduler {
     active: VecDeque<ActiveTransaction>,
     awaiting_flush_renders: Vec<TrackedRender>,
     awaiting_flush_effects: Vec<ScheduledTerminalEffect>,
+    awaiting_flush_effects_before_last_render: usize,
     awaiting_flush_bells: usize,
     flush_required: bool,
     waiting_for_writable: bool,
@@ -184,6 +191,7 @@ impl OutputScheduler {
             active: VecDeque::new(),
             awaiting_flush_renders: Vec::new(),
             awaiting_flush_effects: Vec::new(),
+            awaiting_flush_effects_before_last_render: 0,
             awaiting_flush_bells: 0,
             flush_required: false,
             waiting_for_writable: false,
@@ -376,6 +384,16 @@ impl OutputScheduler {
         event: TerminalEvent,
         now_ms: u128,
     ) {
+        self.enqueue_terminal_effect_for_view(owner, event, None, now_ms);
+    }
+
+    pub(crate) fn enqueue_terminal_effect_for_view(
+        &mut self,
+        owner: SurfaceId,
+        event: TerminalEvent,
+        originating_view: Option<ViewId>,
+        now_ms: u128,
+    ) {
         let event = bound_terminal_effect(event, self.config.maximum_pending_bytes);
         let event_kind = terminal_event_kind(&event);
         if matches!(
@@ -410,8 +428,11 @@ impl OutputScheduler {
             return;
         }
         self.note_pending(now_ms);
-        self.pending_effects
-            .push_back(ScheduledTerminalEffect { owner, event });
+        self.pending_effects.push_back(ScheduledTerminalEffect {
+            owner,
+            event,
+            originating_view,
+        });
     }
 
     pub fn set_synchronized_output_supported(&mut self, supported: bool) {
@@ -794,20 +815,7 @@ impl OutputScheduler {
                 break;
             }
             if transaction.remaining().is_empty() {
-                let completed = self.active.pop_front().expect("active front exists");
-                reached_synchronization_bypass =
-                    completed.completed_render.as_ref().is_some_and(|render| {
-                        Some(render.generation)
-                            == self.application_synchronization_bypass_generation
-                    });
-                if let Some(predicted) = completed.completed_render {
-                    self.awaiting_flush_renders.push(predicted);
-                }
-                self.awaiting_flush_effects
-                    .extend(completed.completed_effects);
-                self.awaiting_flush_bells = self
-                    .awaiting_flush_bells
-                    .saturating_add(completed.completed_bells);
+                reached_synchronization_bypass = self.finish_active_transaction();
                 if reached_synchronization_bypass {
                     break;
                 }
@@ -839,19 +847,7 @@ impl OutputScheduler {
                 .front()
                 .is_some_and(|transaction| transaction.remaining().is_empty())
         {
-            let completed = self.active.pop_front().expect("active front exists");
-            reached_synchronization_bypass =
-                completed.completed_render.as_ref().is_some_and(|render| {
-                    Some(render.generation) == self.application_synchronization_bypass_generation
-                });
-            if let Some(predicted) = completed.completed_render {
-                self.awaiting_flush_renders.push(predicted);
-            }
-            self.awaiting_flush_effects
-                .extend(completed.completed_effects);
-            self.awaiting_flush_bells = self
-                .awaiting_flush_bells
-                .saturating_add(completed.completed_bells);
+            reached_synchronization_bypass = self.finish_active_transaction();
         }
         if self.flush_required && !self.flush_writer(writer, &mut report)? {
             return Ok(report);
@@ -869,6 +865,23 @@ impl OutputScheduler {
             || !self.pending_effects.is_empty()
             || self.pending_bells != 0;
         Ok(report)
+    }
+
+    fn finish_active_transaction(&mut self) -> bool {
+        let completed = self.active.pop_front().expect("active front exists");
+        let mut reached_synchronization_bypass = false;
+        if let Some(render) = completed.completed_render {
+            reached_synchronization_bypass =
+                Some(render.generation) == self.application_synchronization_bypass_generation;
+            self.awaiting_flush_renders.push(render);
+            self.awaiting_flush_effects_before_last_render = self.awaiting_flush_effects.len();
+        }
+        self.awaiting_flush_effects
+            .extend(completed.completed_effects);
+        self.awaiting_flush_bells = self
+            .awaiting_flush_bells
+            .saturating_add(completed.completed_bells);
+        reached_synchronization_bypass
     }
 
     fn note_pending(&mut self, now_ms: u128) {
@@ -965,6 +978,7 @@ impl OutputScheduler {
         self.active.clear();
         self.awaiting_flush_renders.clear();
         self.awaiting_flush_effects.clear();
+        self.awaiting_flush_effects_before_last_render = 0;
         self.awaiting_flush_bells = 0;
         self.flush_required = false;
         self.waiting_for_writable = false;
@@ -1005,6 +1019,11 @@ impl OutputScheduler {
     }
 
     fn complete_awaiting_renders(&mut self, report: &mut DrainReport) {
+        if !self.awaiting_flush_renders.is_empty() {
+            report.effects_before_last_render =
+                report.completed_effects.len() + self.awaiting_flush_effects_before_last_render;
+        }
+        self.awaiting_flush_effects_before_last_render = 0;
         for render in self.awaiting_flush_renders.drain(..) {
             let releases_synchronization =
                 Some(render.generation) == self.synchronization_timeout_release_generation;

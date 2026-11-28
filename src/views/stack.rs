@@ -414,7 +414,17 @@ impl ViewStack {
             return connection.accessibility_location(live_application);
         }
         if active.kind() == crate::views::ViewKind::Terminal {
-            return PresentedLocation::Terminal(active.model().program_activity(live_application));
+            let view = active.model();
+            let screen = if live_application {
+                view.live_screen()
+            } else {
+                view.screen()
+            };
+            return PresentedLocation::Terminal {
+                view_id: view.view_id(),
+                title: screen.title.clone().unwrap_or_default(),
+                activity: view.program_activity(live_application),
+            };
         }
         PresentedLocation::named(active.title())
     }

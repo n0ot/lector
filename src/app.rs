@@ -3051,8 +3051,16 @@ impl App {
         self.presented_bell_count = self
             .presented_bell_count
             .saturating_add(u64::try_from(report.completed_bells).unwrap_or(u64::MAX));
-        for completed in &report.completed_effects {
+        for (index, completed) in report.completed_effects.iter().enumerate() {
             self.presented_scene.apply_terminal_effect(&completed.event);
+            if index >= report.effects_before_last_render
+                && let PresentedLocation::Terminal { view_id, title, .. } =
+                    &mut self.presented_accessibility_location
+                && completed.originating_view == Some(*view_id)
+                && let crate::terminal::TerminalEvent::TitleChanged(updated) = &completed.event
+            {
+                title.clone_from(updated);
+            }
             if matches!(completed.event, crate::terminal::TerminalEvent::Bell) {
                 self.presented_bell_count = self.presented_bell_count.saturating_add(1);
             }
