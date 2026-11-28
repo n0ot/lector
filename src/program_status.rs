@@ -1,5 +1,6 @@
 //! Root program records from OSC 7501 and tmux's pane state.
 
+use crate::presentation::ProgramActivity;
 use lector_ghostty::ProgramStatusUpdate;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +114,14 @@ pub(crate) struct ProgramStatusTracker {
 }
 
 impl ProgramStatusTracker {
+    pub(crate) fn activity(&self) -> Option<ProgramActivity> {
+        match self.current.as_ref()?.state {
+            State::Working => Some(ProgramActivity::Working),
+            State::Blocked => Some(ProgramActivity::Blocked),
+            State::Idle | State::Done | State::Error => None,
+        }
+    }
+
     pub(crate) fn restore(&mut self, current: Option<ProgramStatus>) {
         self.current = current;
     }

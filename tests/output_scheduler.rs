@@ -57,6 +57,7 @@ fn accessibility_bundle(marker: u64) -> PresentedAccessibilityBundle {
                 title: Some(format!("frame-{marker}")),
                 ..TerminalSnapshot::default()
             },
+            program_activity: None,
             history_revision: 0,
             history_basis: Default::default(),
             history: None,

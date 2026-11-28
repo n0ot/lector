@@ -430,7 +430,7 @@ fn identical_tmux_ids_remain_isolated_across_connections_input_replies_and_speec
     input(&mut app, &mut sr, &mut physical, b"\r");
 
     recorder.0.borrow_mut().clear();
-    input(&mut app, &mut sr, &mut physical, b"\x1bw");
+    input(&mut app, &mut sr, &mut physical, b"\x1bW");
     assert!(
         recorder
             .0

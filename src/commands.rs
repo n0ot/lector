@@ -58,6 +58,7 @@ macro_rules! define_actions {
                 matches!(
                     self,
                     Action::SayOverlay
+                        | Action::SayLocation
                         | Action::ToggleReviewCursorFollowsScreenCursor
                         | Action::OpenReview
                         | Action::OpenBindings
@@ -120,7 +121,8 @@ define_actions! {
     ToggleHelp => ("toggle help mode", "toggle_help"),
     OpenBindings => ("open bindings viewer", "open_bindings"),
     OpenReview => ("open Review", "open_review"),
-    SayOverlay => ("say current overlay", "say_overlay"),
+    SayLocation => ("say current title", "say_location"),
+    SayOverlay => ("say detailed location", "say_overlay"),
     SayTime => ("say time", "say_time"),
     PassNextKey => ("forward next key press", "pass_next_key"),
     ReloadConfig => ("reload Lua configuration", "reload_config"),
@@ -255,7 +257,7 @@ pub fn handle(
             system::toggle_review_follows_screen_cursor(sr, view)
         }
         Action::ToggleSymbolLevel => system::toggle_symbol_level(sr),
-        Action::SayOverlay => system::say_overlay(sr, title),
+        Action::SayLocation | Action::SayOverlay => system::say_overlay(sr, title),
         Action::PassNextKey => system::pass_next_key(sr),
         Action::PauseSpeaking => system::pause(sr),
         Action::CancelSpeaking => system::cancel(sr),

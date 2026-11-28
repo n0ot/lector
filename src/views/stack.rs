@@ -1,8 +1,8 @@
 use super::ViewController;
 use crate::{
     presentation::{
-        GridPoint, GridRect, PresentedAccessibilityBundle, PresentedFrameIndex, PresentedViewFrame,
-        Scene, SurfaceId,
+        GridPoint, GridRect, PresentedAccessibilityBundle, PresentedFrameIndex, PresentedLocation,
+        PresentedViewFrame, Scene, SurfaceId,
     },
     terminal::{TerminalGeometry, TerminalSnapshot},
 };
@@ -357,8 +357,7 @@ impl ViewStack {
         &mut self,
         live_application: bool,
     ) -> PresentedAccessibilityBundle {
-        let (active_label, tracks_terminal_title) =
-            self.active_accessibility_label(live_application);
+        let active_location = self.active_accessibility_location(live_application);
         let mut frames = Vec::<PresentedViewFrame>::new();
         let base_active_view;
 
@@ -396,37 +395,28 @@ impl ViewStack {
             frames.push(model.capture_live_presentation_frame(surface_id));
         }
 
-        PresentedAccessibilityBundle::new(active_view, frames)
-            .with_active_label(active_label, tracks_terminal_title)
+        let mut bundle = PresentedAccessibilityBundle::new(active_view, frames);
+        bundle.active_location = Some(active_location);
+        bundle
     }
 
-    /// Returns the label represented by the scene being captured. Unlike a
-    /// later controller lookup, this remains exact when a tmux location changes
-    /// without replacing its active pane, or when an overlay transition is
-    /// waiting behind terminal backpressure.
-    pub(crate) fn active_accessibility_label(&mut self, live_application: bool) -> (String, bool) {
+    /// Capture the scene's identity before a logical focus or overlay change
+    /// can leave this scene waiting behind terminal backpressure.
+    pub(crate) fn active_accessibility_location(
+        &mut self,
+        live_application: bool,
+    ) -> PresentedLocation {
         let active = self.active_mut();
         if let Some(connection) = active
             .as_any()
             .downcast_ref::<crate::views::TmuxConnectionView>()
         {
-            return (connection.accessible_title(), false);
+            return connection.accessibility_location(live_application);
         }
         if active.kind() == crate::views::ViewKind::Terminal {
-            let title = if live_application {
-                active.model().live_screen().title.as_deref()
-            } else {
-                active.model().screen().title.as_deref()
-            };
-            return (
-                title.filter(|title| !title.is_empty()).map_or_else(
-                    || "terminal".to_owned(),
-                    |title| format!("terminal, {title}"),
-                ),
-                true,
-            );
+            return PresentedLocation::Terminal(active.model().program_activity(live_application));
         }
-        (active.title().to_owned(), false)
+        PresentedLocation::named(active.title())
     }
 
     pub(crate) fn apply_presented_bundle(&mut self, bundle: &PresentedAccessibilityBundle) {

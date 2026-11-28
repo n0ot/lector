@@ -28,8 +28,15 @@ Two things help when you forget a key:
 | `M-'` | Toggle automatic reading of new output |
 | `M-s` | Cycle symbol level (how much punctuation is spoken) |
 | `M-g` | Toggle stopping speech when the terminal loses focus |
-| `M-w` | Say where you are (the current overlay or tmux location) |
+| `M-w` | Say the current title and any working or blocked status |
+| `M-W` | Say the full location and any working or blocked status |
 | `F12` | Say time |
+
+Both keys say the overlay's name when Review, a chooser, or another overlay
+is visible. In a plain terminal, the detailed form starts with "terminal".
+An untitled terminal is called "terminal" in both forms. To customize the
+bindings, use `say_location` for the brief form and `say_overlay` for the
+detailed form.
 
 Typing also pauses speech. Pausing keeps whatever was waiting to be spoken, so
 `M-x` picks up where it left off.

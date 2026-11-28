@@ -574,32 +574,14 @@ impl App {
                         };
                         synchronize_pending_review_cursor(sr, view)?;
                     }
-                    let title = if matches!(action, commands::Action::SayOverlay)
-                        && self.output_scheduler.is_some()
-                    {
-                        self.presented_accessibility_label
-                            .clone()
-                            .unwrap_or_else(|| "terminal".to_owned())
-                    } else {
-                        let active = self.view_stack.active_mut();
-                        if let Some(tmux) =
-                            active.as_any().downcast_ref::<views::TmuxConnectionView>()
-                        {
-                            tmux.accessible_title()
-                        } else if active.kind() == views::ViewKind::Terminal {
-                            active
-                                .model()
-                                .screen()
-                                .title
-                                .as_deref()
-                                .filter(|title| !title.is_empty())
-                                .map_or_else(
-                                    || "terminal".to_string(),
-                                    |title| format!("terminal, {title}"),
-                                )
-                        } else {
-                            active.title().to_string()
+                    let title = match action {
+                        commands::Action::SayLocation | commands::Action::SayOverlay => {
+                            self.presented_accessibility_location.announcement(
+                                self.presented_scene.title(),
+                                action == commands::Action::SayOverlay,
+                            )
                         }
+                        _ => String::new(),
                     };
                     let command_result = if action.uses_presented_view() {
                         commands::handle(

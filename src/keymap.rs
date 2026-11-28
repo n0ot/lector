@@ -126,7 +126,8 @@ const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("M-\"", Action::ToggleReviewCursorFollowsScreenCursor),
     ("M-s", Action::ToggleSymbolLevel),
     ("M-r", Action::OpenReview),
-    ("M-w", Action::SayOverlay),
+    ("M-w", Action::SayLocation),
+    ("M-W", Action::SayOverlay),
     ("M-R", Action::ReloadConfig),
     ("M-n", Action::PassNextKey),
     ("M-x", Action::ToggleSpeaking),
@@ -529,6 +530,10 @@ mod tests {
         ));
         assert!(matches!(
             bindings.binding_for_mode(InputMode::Normal, "M-w"),
+            Some(Binding::Builtin(Action::SayLocation))
+        ));
+        assert!(matches!(
+            bindings.binding_for_mode(InputMode::Normal, "M-W"),
             Some(Binding::Builtin(Action::SayOverlay))
         ));
         for key in ["M-z", "M-PageUp", "M-PageDown", "M-Up", "M-Down"] {
