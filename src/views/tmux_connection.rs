@@ -292,6 +292,14 @@ impl TmuxConnectionView {
         )
     }
 
+    pub(crate) fn note_bootstrap_status_sample(&mut self, pane_id: PaneId) {
+        self.panes.note_bootstrap_status_sample(pane_id);
+    }
+
+    pub(crate) fn pane_is_bootstrapped(&self, pane_id: PaneId) -> bool {
+        self.panes.pane_is_bootstrapped(pane_id)
+    }
+
     pub(crate) fn apply_bootstrap_capture(
         &mut self,
         pane_id: PaneId,

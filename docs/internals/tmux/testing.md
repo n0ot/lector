@@ -161,9 +161,11 @@ prebuilt preview image with `LECTOR_REAL_TMUX_PREBUILT_IMAGE` and an explicit
 
 Lector observes root records in live pane output. At attach and
 resynchronization, tmux capture metadata can supply the state, name, and
-message. Category is available only from live reports. Recovered status is
-silent, and an unchanged report stays acknowledged for the same pane
-lifetime. The capture also recovers unfinished terminal sequences, including
+message. Category is available only from live reports. During bootstrap,
+Lector reconciles earlier live reports with the sample, then applies later
+reports in stream order. A blank sample leaves explicit live observations
+in place. Recovered status is silent, and an unchanged report stays
+acknowledged for the same pane lifetime. The capture also recovers unfinished terminal sequences, including
 an OSC split by the boundary.
 
 The pending chooser keeps its selection by connection and pane lifetime.

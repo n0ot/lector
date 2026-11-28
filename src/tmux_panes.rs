@@ -508,6 +508,33 @@ pub enum TmuxPaneError {
     MissingLayout,
 }
 
+struct BootstrapOutput<'a> {
+    before_sample: &'a [u8],
+    after_sample: &'a [u8],
+    sample: Option<crate::program_status::ProgramStatus>,
+}
+
+impl BootstrapOutput<'_> {
+    fn apply(self, view: &mut View, retain_for_accessibility: bool) -> (Vec<u8>, usize) {
+        let mut before =
+            view.process_changes_with_batch(self.before_sample, retain_for_accessibility);
+        for report in std::mem::take(&mut before.program_status_updates) {
+            view.program_status_mut().observe(report);
+        }
+        view.program_status_mut()
+            .restore_bootstrap_sample(self.sample);
+        let after = view.process_changes_with_batch(self.after_sample, retain_for_accessibility);
+        for report in after.program_status_updates {
+            view.program_status_mut().observe(report);
+        }
+        before.pty_replies.extend(after.pty_replies);
+        (
+            before.pty_replies,
+            before.effects.bells.saturating_add(after.effects.bells),
+        )
+    }
+}
+
 struct PaneState {
     view: View,
     portal: Option<PanePortal>,
@@ -517,6 +544,7 @@ struct PaneState {
     bootstrap_requested: bool,
     bootstrapped: bool,
     prebootstrap_output: Vec<u8>,
+    bootstrap_status_boundary: Option<usize>,
 }
 
 struct PanePortal {
@@ -633,6 +661,7 @@ impl TmuxPaneSet {
                     bootstrap_requested: false,
                     bootstrapped: false,
                     prebootstrap_output: self.orphan_output.remove(&pane.id).unwrap_or_default(),
+                    bootstrap_status_boundary: None,
                 }
             });
             if state.view.live_size() != (rows, cols) {
@@ -755,6 +784,14 @@ impl TmuxPaneSet {
         Ok(Some(update))
     }
 
+    pub(crate) fn note_bootstrap_status_sample(&mut self, pane_id: PaneId) {
+        if let Some(pane) = self.panes.get_mut(&pane_id)
+            && !pane.bootstrapped
+        {
+            pane.bootstrap_status_boundary = Some(pane.prebootstrap_output.len());
+        }
+    }
+
     pub fn apply_bootstrap(
         &mut self,
         pane_id: PaneId,
@@ -796,37 +833,41 @@ impl TmuxPaneSet {
             .panes
             .get_mut(&pane_id)
             .ok_or(TmuxPaneError::UnknownPane(pane_id.0))?;
+        let buffered = std::mem::take(&mut state.prebootstrap_output);
+        self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
+        let status_boundary = state
+            .bootstrap_status_boundary
+            .take()
+            .unwrap_or(buffered.len());
+        let (before_sample, after_sample) = buffered.split_at(status_boundary);
+        let effects = BootstrapOutput {
+            before_sample,
+            after_sample,
+            sample: recovered.program_status,
+        };
         if status == CommandStatus::Error {
-            state.view.restore_program_status(recovered.program_status);
             state.bootstrapped = true;
             state.bootstrap_requested = false;
-            let buffered = std::mem::take(&mut state.prebootstrap_output);
-            self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
-            let update = state.view.process_changes_with_batch(&buffered, true);
-            state.pending_bell |= update.effects.bells > 0;
+            let (replies, bells) = effects.apply(&mut state.view, true);
+            state.pending_bell |= bells > 0;
             state.view.discard_shadow_pty_replies();
-            return Ok(update.pty_replies);
+            return Ok(replies);
         }
 
         let rows = dimension(state.metadata.height);
         let cols = dimension(state.metadata.width);
-        let buffered = std::mem::take(&mut state.prebootstrap_output);
-        self.prebootstrap_bytes = self.prebootstrap_bytes.saturating_sub(buffered.len());
-
-        // A capture can already contain every visible byte from the buffered
-        // `%output`, so replaying that stream into the authoritative view is
-        // conditional below. Terminal report queries are non-visual and do
-        // not appear in a capture, however. Parse the bounded buffer once in
-        // an isolated shadow so its OSC 10/11 replies survive either branch
-        // without duplicating text or accessibility revisions.
-        let buffered_replies = if buffered.is_empty() {
-            Vec::new()
+        // The screen capture can contain the buffer's visible text. Parse
+        // live side effects in the shadow independently of screen replay.
+        let (buffered_replies, program_status) = if buffered.is_empty() {
+            let mut program_status = crate::program_status::ProgramStatusTracker::default();
+            program_status.restore_bootstrap_sample(effects.sample);
+            (Vec::new(), program_status)
         } else {
-            let mut effect_shadow = View::new(rows, cols);
-            effect_shadow.set_virtual_terminal_colors(self.virtual_terminal_colors);
-            let update = effect_shadow.process_changes_with_batch(&buffered, false);
-            state.pending_bell |= update.effects.bells > 0;
-            update.pty_replies
+            let mut shadow = View::new(rows, cols);
+            shadow.set_virtual_terminal_colors(self.virtual_terminal_colors);
+            let (replies, bells) = effects.apply(&mut shadow, false);
+            state.pending_bell |= bells > 0;
+            (replies, std::mem::take(shadow.program_status_mut()))
         };
 
         let mut view = View::new(rows, cols);
@@ -858,7 +899,7 @@ impl TmuxPaneSet {
             view.process_changes(&recovered.pending_escape);
         }
         view.discard_shadow_pty_replies();
-        view.restore_program_status(recovered.program_status);
+        *view.program_status_mut() = program_status;
         // An authoritative capture establishes the pane's diff baseline; it is
         // not application output to announce. Finalize it while parsing is
         // still the publication boundary, then let physical receipts own every
@@ -1639,6 +1680,7 @@ mod synchronization_tests {
                     bootstrap_requested: false,
                     bootstrapped: true,
                     prebootstrap_output: Vec::new(),
+                    bootstrap_status_boundary: None,
                 },
             );
         }

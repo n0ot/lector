@@ -644,6 +644,7 @@ impl App {
             mut render_topology,
             bootstrap_reply,
             bootstrap_retry,
+            bootstrap_status_sampled,
             pane_resync_probe,
             pane_resync_request,
             pane_resume_request,
@@ -937,10 +938,15 @@ impl App {
         let pending_pane_state_changed = sync_topology
             || bootstrap_reply.is_some()
             || matches!(pane_resync_result, Some(TmuxPaneResyncResult::Success(..)));
+        if let Some(pane_id) = bootstrap_status_sampled {
+            self.buffer_deferred_tmux_bootstrap_output(sr, connection_id, pane_id, term_out)?;
+            if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
+                view.note_bootstrap_status_sample(pane_id);
+            }
+        }
         if let Some((capture, status, output)) = bootstrap_reply {
             let pane_id = capture.pane_id;
-            self.pending_tmux_background_output
-                .remove((connection_id, pane_id));
+            self.buffer_deferred_tmux_bootstrap_output(sr, connection_id, pane_id, term_out)?;
             let bootstrap_replies =
                 if let Some(view) = self.view_stack.tmux_connection_mut(connection_id) {
                     let was_ready = view.is_ready();
@@ -1325,6 +1331,25 @@ impl App {
             // A rename or other label-only topology update stays silent while
             // the user remains in the same tmux session, window, and pane.
             Some(_) => {}
+        }
+        Ok(())
+    }
+
+    fn buffer_deferred_tmux_bootstrap_output(
+        &mut self,
+        sr: &mut ScreenReader,
+        connection_id: u64,
+        pane_id: crate::tmux_model::PaneId,
+        term_out: &mut dyn Write,
+    ) -> Result<()> {
+        if let Some(mut queued) = self
+            .pending_tmux_background_output
+            .take((connection_id, pane_id))
+        {
+            let bytes = queued.make_contiguous();
+            if !self.discard_stale_tmux_pane_output(connection_id, pane_id, bytes) {
+                self.process_tmux_pane_output(sr, connection_id, pane_id, bytes, term_out)?;
+            }
         }
         Ok(())
     }
@@ -1967,12 +1992,20 @@ impl App {
             }
         }
 
+        // Bootstrap consumes retained live output at its sample and screen
+        // boundaries. Exposing an already bootstrapped pane instead needs a
+        // fresh recovery snapshot before deferred output can be discarded.
         let obsolete_deferred = self
             .pending_tmux_background_output
             .panes()
             .filter(|(source_connection_id, pane_id)| {
                 *source_connection_id == connection_id
-                    && (topology.pane(*pane_id).is_none() || pane_is_presented(*pane_id))
+                    && (topology.pane(*pane_id).is_none()
+                        || (pane_is_presented(*pane_id)
+                            && self
+                                .view_stack
+                                .tmux_connection(connection_id)
+                                .is_some_and(|view| view.pane_is_bootstrapped(*pane_id))))
             })
             .collect::<Vec<_>>();
         for key @ (_, pane_id) in obsolete_deferred {

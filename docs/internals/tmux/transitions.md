@@ -24,7 +24,7 @@ return.
 | Initial command | None; return before App effects | Must not pop an expected reply |
 | Inventory reply | Drain, retry, terminal failure, or publish | Publication carries removed panes/windows, native copy-mode panes, topology synchronization/rendering, location/session changes, and possibly a flow-control warning |
 | Flow policy / verification | None | Connection acceptance/retention state only |
-| Bootstrap reply | Portable retry or bootstrap application | Application can later request render, location announcement and resume |
+| Bootstrap reply | Status sample boundary, portable retry, or bootstrap application | Application can later request render, location announcement and resume |
 | Resync probe | Capture batch or failure | Probe stores capture metadata; failure discards it |
 | Resync continue / capture / pending escape | None | Mutate the pending capture; failed continue poisons the later snapshot |
 | Resync verify | Success, raced, or failure (exclusive) | Success updates topology metadata; application can later request rendering and resume |
@@ -62,7 +62,8 @@ earlier phase creates work for a later one.
    capture batch, inventory-failure UI, resume command, resync request. Commands
    retain their paired expected replies and existing bounded queue handling.
 3. Resolve destroyed gateways, synchronize panes, optionally open review.
-4. Apply bootstrap, successful capture, raced capture or failed capture. Keep
+4. Preserve deferred pane output at the bootstrap status boundary, then
+   apply bootstrap, successful capture, raced capture or failed capture. Keep
    mutable render/location flags and collect any resume discovered here.
 5. Queue that late resume, settle a pending pane visit against the reconciled
    location, and refresh its chooser rows. Then present **pane output, else

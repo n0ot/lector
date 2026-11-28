@@ -776,6 +776,103 @@ fn pending_pane_visit_routes_nested_colliding_ids_and_rejects_target_loss() {
 }
 
 #[test]
+fn a_pending_visit_waiting_on_capture_can_be_superseded_and_retried() {
+    let (mut app, mut sr, recorder, mut physical) = recording_app();
+    sr.set_program_status_announcements(false);
+    ready_root(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested(&mut app, &mut sr, &mut physical, 1, "inner", "child");
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    let report = b"\x1b]7501;state=done:app=Sample\x1b\\";
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &pane_output(20, report),
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1bP\r");
+    assert_eq!(
+        decode_send_keys(&drain_root(&mut app), 20),
+        b"switch-client -E -t '$1:@10.%20'\n"
+    );
+
+    // The target remains selected, but its window acquired a new pane whose
+    // capture cannot complete until after the visit command reply.
+    let layout = format!("%layout-change @10 {SPLIT_LAYOUT} {SPLIT_LAYOUT} *\n");
+    for notification in [
+        layout.as_bytes(),
+        b"%window-pane-changed @10 %21\n",
+        b"%window-pane-changed @10 %20\n",
+    ] {
+        feed_at_depth(&mut app, &mut sr, &mut physical, 1, notification);
+    }
+    feed_at_depth(&mut app, &mut sr, &mut physical, 1, &reply(130, &[], true));
+    assert!(app.has_overlay());
+    assert_eq!(app.active_tmux_connection(), Some(1));
+    recorder.0.borrow_mut().clear();
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        b"%window-pane-changed @10 %21\n",
+    );
+    assert_eq!(&*recorder.0.borrow(), &["Pending pane unavailable"]);
+    assert!(app.debug_active_view_contents().contains("Sample, done"));
+
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    let wire = decode_send_keys(&drain_root(&mut app), 20);
+    assert!(wire.ends_with(b"switch-client -E -t '$1:@10.%20'\n"));
+    assert!(wire.starts_with(lector::tmux_model::INVENTORY_COMMAND.as_bytes()));
+    assert!(String::from_utf8_lossy(&wire).contains("capture-pane -p -e -F -J -S - -t %21\n"));
+
+    let mut groups = inventory(true, "inner", "child");
+    groups[2][0] = b"P\t@10\t%20\t1\t0\t0\t0\t40\t24\t0\t6\t0\t1\t0\t0\t0\t0\tfirst".to_vec();
+    groups[2][1] = b"P\t@10\t%21\t2\t1\t41\t0\t39\t24\t0\t7\t0\t1\t0\t0\t0\t0\tsecond".to_vec();
+    for (index, group) in groups.iter().enumerate() {
+        feed_at_depth(
+            &mut app,
+            &mut sr,
+            &mut physical,
+            1,
+            &reply(140 + index, group, true),
+        );
+    }
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &reply(160, &[b"other pane".to_vec()], true),
+    );
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &pane_output(21, b"\x1b]7501;state=error:app=Sibling\x1b\\"),
+    );
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        b"%window-pane-changed @10 %20\n",
+    );
+    feed_at_depth(&mut app, &mut sr, &mut physical, 1, &reply(161, &[], true));
+    assert!(!app.has_overlay());
+    assert_eq!(app.active_tmux_connection(), Some(2));
+    assert!(app.debug_active_view_contents().contains("inner-READY"));
+    app.show_pending_tmux_panes(&mut sr, &mut physical).unwrap();
+    assert!(
+        app.debug_active_view_contents()
+            .contains("window 1, pane 2, Sibling, failed")
+    );
+}
+
+#[test]
 fn parent_controls_render_and_announce_when_focus_returns_to_a_nested_pane_portal() {
     let (mut app, mut sr, recorder, mut physical) = recording_app();
     ready_root(&mut app, &mut sr, &mut physical);

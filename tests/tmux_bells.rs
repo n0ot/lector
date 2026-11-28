@@ -124,13 +124,14 @@ fn add_ready_connection(
     physical: &mut Vec<u8>,
     connection_id: u64,
 ) -> TmuxGatewayRouter {
-    add_connection_with_bootstrap_sample(app, sr, physical, connection_id, &[], None)
+    add_connection_with_bootstrap_sample(app, sr, physical, connection_id, &[], &[], None)
 }
 
 struct BootstrapSample<'a> {
     pane: u64,
     state: &'a str,
     name: &'a str,
+    message: &'a str,
     pending_escape: &'a [u8],
 }
 
@@ -140,6 +141,7 @@ fn add_connection_with_bootstrap_sample(
     physical: &mut Vec<u8>,
     connection_id: u64,
     pending_reports: &[(u64, &str)],
+    reports_after_sample: &[(u64, &str)],
     captured_status: Option<BootstrapSample<'_>>,
 ) -> TmuxGatewayRouter {
     let mut router = TmuxGatewayRouter::with_first_connection_id(connection_id);
@@ -207,7 +209,12 @@ fn add_connection_with_bootstrap_sample(
             .filter(|sample| sample.pane == pane_id);
         let sample = pending.map_or_else(
             || format!("T\t%{pane_id}\t\t"),
-            |sample| format!("T\t%{pane_id}\t{}\t{}", sample.state, sample.name),
+            |sample| {
+                format!(
+                    "T\t%{pane_id}\t{}\t{}\t{}",
+                    sample.state, sample.name, sample.message
+                )
+            },
         );
         feed(
             app,
@@ -216,6 +223,12 @@ fn add_connection_with_bootstrap_sample(
             &reply(30 + index * 3, &[sample.into_bytes()]),
             physical,
         );
+        for &(target, report) in reports_after_sample
+            .iter()
+            .filter(|(target, _)| *target == pane_id)
+        {
+            feed(app, sr, &mut router, &pane_output(target, report), physical);
+        }
         let pending_escape = pending
             .map(|sample| sample.pending_escape.to_vec())
             .into_iter()
@@ -1304,6 +1317,75 @@ fn empty_pending_tmux_chooser_preserves_an_existing_overlay_and_edit_position() 
 }
 
 #[test]
+fn pending_status_bootstrap_keeps_order_and_corroborated_live_details_silently() {
+    let report = "\\033]7501;state=blocked:kind=permission:app=Sample:msg=Q29udGludWU/\\033\\134";
+    let before_split = "\\033]7501;state=blocked:kind=ques";
+    let after_split = "tion:app=Sample\\033\\134";
+    let clear = "\\033]7501;state=clear\\033\\134";
+    for (before, sample, after, expected) in [
+        (
+            report,
+            Some(("blocked", "Continue?")),
+            "",
+            "window 2, pane 1, Sample, approval. Continue?",
+        ),
+        (
+            report,
+            None,
+            "",
+            "window 2, pane 1, Sample, approval. Continue?",
+        ),
+        (
+            report,
+            Some(("done", "")),
+            "",
+            "window 2, pane 1, Sample, done",
+        ),
+        (
+            before_split,
+            Some(("working", "")),
+            after_split,
+            "window 2, pane 1, Sample, question",
+        ),
+        (report, None, clear, "No pending panes"),
+    ] {
+        let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
+        // Send enough live bytes to place this hidden pane's pre-sample
+        // report in App's deferred queue rather than the immediate budget.
+        let buffered = format!("{}{before}", ".".repeat(4200));
+        let reports_after_sample = (!after.is_empty())
+            .then_some((21, after))
+            .into_iter()
+            .collect::<Vec<_>>();
+        let _router = add_connection_with_bootstrap_sample(
+            &mut app,
+            &mut sr,
+            &mut physical,
+            1,
+            &[(21, &buffered)],
+            &reports_after_sample,
+            sample.map(|(state, message)| BootstrapSample {
+                pane: 21,
+                state,
+                name: "Sample",
+                message,
+                pending_escape: &[],
+            }),
+        );
+        assert!(
+            !recorder
+                .messages()
+                .iter()
+                .any(|message| message.contains("Sample"))
+        );
+        recorder.clear();
+        app.show_pending_tmux_panes(&mut sr, &mut physical).unwrap();
+        assert_eq!(recorder.messages(), [expected]);
+        assert_eq!(app.has_overlay(), expected != "No pending panes");
+    }
+}
+
+#[test]
 fn tmux_bootstrap_uses_the_capture_time_status_after_buffered_transitions() {
     let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
     let working = "\\033]7501;state=working:app=Fixture\\033\\134";
@@ -1314,10 +1396,12 @@ fn tmux_bootstrap_uses_the_capture_time_status_after_buffered_transitions() {
         &mut physical,
         1,
         &[(21, working), (21, blocked)],
+        &[],
         Some(BootstrapSample {
             pane: 21,
             state: "blocked",
             name: "Fixture",
+            message: "",
             pending_escape: &[],
         }),
     );
@@ -1349,10 +1433,12 @@ fn tmux_bootstrap_resumes_a_program_report_split_at_capture() {
         &mut physical,
         1,
         &[(21, "\\033]7501;app=Fixture:state=bloc")],
+        &[],
         Some(BootstrapSample {
             pane: 21,
             state: "working",
             name: "Fixture",
+            message: "",
             pending_escape: b"\x1b]7501;app=Fixture:state=bloc",
         }),
     );

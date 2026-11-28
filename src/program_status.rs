@@ -100,19 +100,19 @@ impl ProgramStatus {
                     .is_some_and(|(current, previous)| {
                         // tmux sanitizes this pair in user-facing recovered names.
                         // The lost character cannot establish a new report.
-                        if recovering && previous.contains("#(") {
-                            previous.replace("#(", "_(") == *current
-                        } else if acknowledged.reason.is_none() && current.contains("#(") {
-                            current.replace("#(", "_(") == *previous
-                        } else {
-                            false
-                        }
+                        (recovering && recovered_message_matches(previous, current))
+                            || (acknowledged.reason.is_none()
+                                && recovered_message_matches(current, previous))
                     }))
             && self
                 .reason
                 .zip(acknowledged.reason)
                 .is_none_or(|(a, b)| a == b)
     }
+}
+
+fn recovered_message_matches(observed: &str, recovered: &str) -> bool {
+    observed.contains("#(") && observed.replace("#(", "_(") == recovered
 }
 
 fn parse_app(app: &[u8]) -> Option<&str> {
@@ -233,6 +233,28 @@ impl ProgramStatusTracker {
             self.reconcile_acknowledgment(current, true);
         }
         self.current = current;
+    }
+
+    pub(crate) fn restore_bootstrap_sample(&mut self, sample: Option<ProgramStatus>) {
+        let Some(mut sample) = sample else {
+            // Empty status fields cannot distinguish clear from an older
+            // server without the fields. Keep explicit live transitions.
+            return;
+        };
+        if let Some(observed) = &self.current
+            && sample.state == observed.state
+            && sample.app == observed.app
+            && (sample.message == observed.message
+                || sample
+                    .message
+                    .as_ref()
+                    .zip(observed.message.as_ref())
+                    .is_some_and(|(sample, observed)| recovered_message_matches(observed, sample)))
+        {
+            sample.reason = observed.reason;
+            sample.message.clone_from(&observed.message);
+        }
+        self.current = Some(sample);
     }
 
     pub(crate) fn pending(&self) -> Option<(PendingKind, &ProgramStatus)> {

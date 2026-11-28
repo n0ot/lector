@@ -19,6 +19,7 @@ pub(super) struct PendingTmuxPaneVisit {
     pub visit: TmuxPaneVisit,
     pub switches_session: bool,
     pub command_succeeded: Option<bool>,
+    location_observed: bool,
 }
 
 impl TmuxPaneVisit {
@@ -199,6 +200,7 @@ impl App {
             visit,
             switches_session,
             command_succeeded: None,
+            location_observed: false,
         });
         if switches_session {
             if !self.queue_tmux_session_switch_to(
@@ -315,22 +317,28 @@ impl App {
     }
 
     fn tmux_pane_visit_location_matches(&self, destination: TmuxPaneDestination) -> bool {
+        self.tmux_pane_is_active_in_layout(destination) && self.tmux_pane_is_selected(destination)
+    }
+
+    fn tmux_pane_is_active_in_layout(&self, destination: TmuxPaneDestination) -> bool {
         self.view_stack
             .tmux_connection(destination.pane.connection_id)
             .is_some_and(|view| view.is_active_pane(destination.pane.pane_id))
-            && self
-                .tmux_connections
-                .iter()
-                .find(|connection| connection.id == destination.pane.connection_id)
-                .is_some_and(|connection| {
-                    let topology = &connection.topology;
-                    topology.attached_session() == Some(destination.session_id)
-                        && topology
-                            .session(destination.session_id)
-                            .and_then(|session| session.active_window)
-                            == Some(destination.window_id)
-                        && topology.attached_active_pane() == Some(destination.pane.pane_id)
-                })
+    }
+
+    fn tmux_pane_is_selected(&self, destination: TmuxPaneDestination) -> bool {
+        self.tmux_connections
+            .iter()
+            .find(|connection| connection.id == destination.pane.connection_id)
+            .is_some_and(|connection| {
+                let topology = &connection.topology;
+                topology.attached_session() == Some(destination.session_id)
+                    && topology
+                        .session(destination.session_id)
+                        .and_then(|session| session.active_window)
+                        == Some(destination.window_id)
+                    && topology.attached_active_pane() == Some(destination.pane.pane_id)
+            })
     }
 
     pub(super) fn settle_pending_tmux_pane_visit(
@@ -346,6 +354,7 @@ impl App {
             visit,
             switches_session,
             command_succeeded,
+            location_observed,
         } = *pending;
         let connection_id = visit.destination.pane.connection_id;
         if self.view_stack.logical_active_view_id() != visit.chooser {
@@ -366,8 +375,14 @@ impl App {
         if command_succeeded != Some(true) {
             return Ok(());
         }
-        if !self.tmux_pane_visit_location_matches(visit.destination) {
-            if inventory_finished_for == Some(connection_id) {
+        let selected = self.tmux_pane_is_selected(visit.destination);
+        if selected && let Some(pending) = &mut self.pending_tmux_pane_visit {
+            pending.location_observed = true;
+        }
+        if !selected || !self.tmux_pane_is_active_in_layout(visit.destination) {
+            // Once the target was selected, later focus elsewhere supersedes
+            // this visit even while its first pane captures are outstanding.
+            if (!selected && location_observed) || inventory_finished_for == Some(connection_id) {
                 self.pending_tmux_pane_visit = None;
                 return self.pending_tmux_pane_unavailable(sr, term_out);
             }

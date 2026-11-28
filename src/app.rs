@@ -1503,6 +1503,7 @@ struct TmuxControlStep {
         Vec<Vec<u8>>,
     )>,
     bootstrap_retry: Option<(crate::tmux_model::PaneId, Vec<u8>, bool)>,
+    bootstrap_status_sampled: Option<crate::tmux_model::PaneId>,
     pane_resync_probe: Option<crate::tmux_model::PaneCaptureMetadata>,
     pane_resync_request: Option<crate::tmux_model::PaneId>,
     pane_resume_request: Option<crate::tmux_model::PaneId>,
@@ -1683,6 +1684,7 @@ impl TmuxConnectionState {
                                         _ => None,
                                     };
                                     capture.stage = BootstrapCaptureStage::PendingEscape;
+                                    step.bootstrap_status_sampled = Some(pane_id);
                                 }
                                 BootstrapCaptureStage::PendingEscape => {
                                     capture.recovered.pending_escape =

@@ -53,10 +53,14 @@ impl DeferredTmuxOutput {
     }
 
     pub(super) fn remove(&mut self, key: PaneKey) -> usize {
-        let dropped = self.panes.remove(&key).map_or(0, |pane| pane.len());
-        self.bytes -= dropped;
+        self.take(key).map_or(0, |pane| pane.len())
+    }
+
+    pub(super) fn take(&mut self, key: PaneKey) -> Option<VecDeque<u8>> {
+        let pane = self.panes.remove(&key)?;
+        self.bytes -= pane.len();
         self.order.retain(|candidate| *candidate != key);
-        dropped
+        Some(pane)
     }
 
     pub(super) fn remove_connections(&mut self, connections: &[u64]) {
