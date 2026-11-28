@@ -374,7 +374,7 @@ impl App {
         })
     }
 
-    fn live_tmux_gateway_windows(
+    pub(super) fn live_tmux_gateway_windows(
         &self,
         parent_connection_id: u64,
     ) -> BTreeSet<crate::tmux_model::WindowId> {
@@ -550,6 +550,21 @@ impl App {
         destination_session_id: crate::tmux_model::SessionId,
         following_commands: Vec<String>,
     ) -> bool {
+        self.queue_tmux_session_switch_to(
+            connection_id,
+            destination_session_id,
+            following_commands,
+            None,
+        )
+    }
+
+    pub(super) fn queue_tmux_session_switch_to(
+        &mut self,
+        connection_id: u64,
+        destination_session_id: crate::tmux_model::SessionId,
+        following_commands: Vec<String>,
+        pane_visit: Option<TmuxPaneVisit>,
+    ) -> bool {
         let destination_exists = self
             .tmux_connections
             .iter()
@@ -576,6 +591,7 @@ impl App {
             PendingTmuxSessionSwitch {
                 destination_session_id,
                 following_commands,
+                pane_visit,
                 rejected_indices: BTreeSet::new(),
                 stage: TmuxSessionSwitchStage::Planning,
             },
@@ -591,6 +607,13 @@ impl App {
             return true;
         }
         let destination_session_id = pending.destination_session_id;
+        let pane_visit = pending.pane_visit;
+        if let Some(visit) = pane_visit
+            && !self.pending_tmux_pane_visit_is_current(visit)
+        {
+            self.cancel_planned_tmux_session_switch(connection_id);
+            return false;
+        }
         let carrier_windows = self.live_tmux_gateway_windows(connection_id);
         let Some(connection) = self
             .tmux_connections
@@ -658,19 +681,23 @@ impl App {
             return true;
         }
 
-        if connection.topology.attached_session() == Some(destination_session_id) {
+        let source_session_id = connection.topology.attached_session();
+        if source_session_id == Some(destination_session_id) && pane_visit.is_none() {
             self.finish_tmux_session_switch(connection_id);
             return true;
         }
-        let source_session_id = connection.topology.attached_session();
         self.pending_tmux_session_switches
             .get_mut(&connection_id)
             .expect("session switch remains pending before switch-client")
             .stage = TmuxSessionSwitchStage::Switching {
             source_session_id,
             command_succeeded: false,
-            notification_observed: false,
+            notification_observed: source_session_id == Some(destination_session_id),
         };
+        if let Some(visit) = pane_visit {
+            self.pending_tmux_commands.push_back(visit.command());
+            return true;
+        }
         self.pending_tmux_commands.push_back(PendingTmuxCommand {
             connection_id,
             bytes: format!("switch-client -t ${}\n", destination_session_id.0).into_bytes(),
@@ -680,6 +707,18 @@ impl App {
             kind: PendingTmuxCommandKind::Ordinary,
         });
         true
+    }
+
+    pub(super) fn cancel_planned_tmux_session_switch(&mut self, connection_id: u64) {
+        self.pending_tmux_session_switches.remove(&connection_id);
+        if let Some(session_id) = self
+            .tmux_connections
+            .iter()
+            .find(|connection| connection.id == connection_id)
+            .and_then(|connection| connection.topology.attached_session())
+        {
+            self.queue_obsolete_tmux_carrier_unlinks(connection_id, session_id);
+        }
     }
 
     fn finish_tmux_session_switch(&mut self, connection_id: u64) {
@@ -1273,8 +1312,33 @@ impl App {
         }
     }
 
+    pub(super) fn tmux_gateway_path_is_reachable(&self, connection_id: u64) -> bool {
+        self.tmux_gateway_path(connection_id).is_some_and(|path| {
+            path.iter().all(|hop| {
+                self.tmux_connections
+                    .iter()
+                    .find(|connection| connection.id == hop.parent_connection_id)
+                    .is_some_and(|parent| {
+                        let topology = &parent.topology;
+                        topology
+                            .attached_session()
+                            .and_then(|session_id| topology.session(session_id))
+                            .is_some_and(|session| {
+                                session.windows.values().any(|id| *id == hop.window_id)
+                            })
+                            && topology
+                                .pane(hop.pane_id)
+                                .is_some_and(|pane| pane.window_id == hop.window_id && !pane.dead)
+                    })
+            })
+        })
+    }
+
     pub(super) fn queue_tmux_gateway_path_resumes(&mut self, connection_id: u64) -> bool {
-        let Some(gateway_path) = self.tmux_gateway_path(connection_id) else {
+        let Some(gateway_path) = self
+            .tmux_gateway_path(connection_id)
+            .filter(|_| self.tmux_gateway_path_is_reachable(connection_id))
+        else {
             return false;
         };
         for hop in &gateway_path {
@@ -1295,36 +1359,6 @@ impl App {
                     .and_then(|connection| connection.pane_flow.get_mut(&hop.pane_id))
             {
                 flow.pause_requested = false;
-            }
-        }
-        for hop in &gateway_path {
-            let Some(connection) = self
-                .tmux_connections
-                .iter()
-                .find(|connection| connection.id == hop.parent_connection_id)
-            else {
-                return false;
-            };
-            let topology = &connection.topology;
-            let Some(attached_session) = topology
-                .attached_session()
-                .and_then(|session_id| topology.session(session_id))
-            else {
-                return false;
-            };
-            let Some(_window) = topology.window(hop.window_id) else {
-                return false;
-            };
-            let Some(pane) = topology.pane(hop.pane_id) else {
-                return false;
-            };
-            if pane.window_id != hop.window_id
-                || !attached_session
-                    .windows
-                    .values()
-                    .any(|window_id| *window_id == hop.window_id)
-            {
-                return false;
             }
         }
         for hop in gateway_path {
@@ -1661,6 +1695,9 @@ impl App {
         target: views::TmuxChooserTarget,
         term_out: &mut dyn Write,
     ) -> Result<()> {
+        if let views::TmuxChooserTarget::PendingPane(pane) = target {
+            return self.start_pending_tmux_pane_visit(sr, pane, term_out);
+        }
         if let views::TmuxChooserTarget::Session(session_id) = target {
             let exists = self
                 .tmux_connections
@@ -1682,7 +1719,9 @@ impl App {
             .iter()
             .find(|connection| connection.id == connection_id)
             .and_then(|connection| match target {
-                views::TmuxChooserTarget::Session(_) => unreachable!("handled above"),
+                views::TmuxChooserTarget::Session(_) | views::TmuxChooserTarget::PendingPane(_) => {
+                    unreachable!("handled separately")
+                }
                 views::TmuxChooserTarget::Window(window_id) => {
                     let session = connection
                         .topology

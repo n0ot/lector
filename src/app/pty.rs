@@ -492,6 +492,7 @@ impl App {
             .view_stack
             .active_tmux_connection_chooser_mut()
             .is_some();
+        let preserve_pending_chooser = self.view_stack.has_pending_tmux_pane_chooser();
         let previously_active = self.active_tmux_connection;
         let ending_origin = self.tmux_hierarchy.origin(connection_id);
         if let Some(GatewayOrigin::Pane {
@@ -575,12 +576,14 @@ impl App {
                     .flatten()
             });
         self.cancel_stabilization_bursts();
-        if !preserve_connection_chooser {
+        if !preserve_connection_chooser && !preserve_pending_chooser {
             self.view_stack.clear_overlays();
         }
         self.view_stack
             .remove_tmux_connections(&removed_connections);
-        if self.tmux_connections.is_empty() {
+        if preserve_pending_chooser {
+            self.settle_pending_tmux_pane_visit(sr, None, term_out)?;
+        } else if self.tmux_connections.is_empty() {
             self.view_stack.activate_terminal();
         } else if preserve_connection_chooser {
             self.sync_tmux_connection_chooser();
@@ -635,6 +638,7 @@ impl App {
             pane_resync_result,
             carrier_reply,
             tree_reply,
+            pane_visit_reply,
             request_resync,
             sync_topology,
             mut render_topology,
@@ -719,6 +723,20 @@ impl App {
                 );
             }
             None => {}
+        }
+        if let Some((visit, success)) = pane_visit_reply {
+            if self
+                .pending_tmux_session_switches
+                .get(&connection_id)
+                .is_some_and(|pending| pending.pane_visit == Some(visit))
+            {
+                self.handle_tmux_carrier_session_switch_reply(
+                    connection_id,
+                    visit.destination.session_id,
+                    success,
+                );
+            }
+            self.record_pending_tmux_pane_visit_reply(visit, success);
         }
         if inventory_applied {
             self.reconcile_tmux_carrier_leases(connection_id);
@@ -860,6 +878,7 @@ impl App {
                 kind: PendingTmuxCommandKind::Ordinary,
             });
         }
+        let inventory_finished = inventory_applied || inventory_terminal_failure.is_some();
         if let Some((had_inventory, detail)) = inventory_terminal_failure {
             if had_inventory {
                 notification_popup = Some((
@@ -915,6 +934,9 @@ impl App {
             self.open_review(sr, false, term_out)?;
         }
         // 4. Applying captures may raise new render/announcement/resume work.
+        let pending_pane_state_changed = sync_topology
+            || bootstrap_reply.is_some()
+            || matches!(pane_resync_result, Some(TmuxPaneResyncResult::Success(..)));
         if let Some((capture, status, output)) = bootstrap_reply {
             let pane_id = capture.pane_id;
             self.pending_tmux_background_output
@@ -1179,6 +1201,14 @@ impl App {
                 expected_replies: vec![ExpectedTmuxReply::PaneContinue(pane_id)],
                 kind: PendingTmuxCommandKind::Ordinary,
             });
+        }
+        self.settle_pending_tmux_pane_visit(
+            sr,
+            inventory_finished.then_some(connection_id),
+            term_out,
+        )?;
+        if pending_pane_state_changed && self.refresh_pending_tmux_panes() {
+            self.render_active_view(term_out)?;
         }
         if let Some((pane_id, bytes)) = pane_output {
             self.process_tmux_pane_transport(sr, connection_id, pane_id, &bytes, term_out)?;
@@ -1728,6 +1758,9 @@ impl App {
             )?;
         }
         let bells = outcome.as_ref().map_or(0, |outcome| outcome.bells);
+        let pending_changed = outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.pending_changed);
         let output_screen = outcome.as_ref().map(|outcome| {
             (
                 outcome.update.screen_after,
@@ -1760,6 +1793,9 @@ impl App {
                     adaptive_quiet_trainable,
                 );
             }
+        }
+        if pending_changed && self.refresh_pending_tmux_panes() {
+            self.render_active_view(term_out)?;
         }
         Ok(())
     }
@@ -1815,7 +1851,8 @@ impl App {
             .view_stack
             .active_tmux_connection_chooser_mut()
             .is_some();
-        if !preserve_connection_chooser {
+        let preserve_pending_chooser = self.view_stack.has_pending_tmux_pane_chooser();
+        if !preserve_connection_chooser && !preserve_pending_chooser {
             self.view_stack.clear_overlays();
         }
         removed.sort_unstable();
@@ -1826,6 +1863,8 @@ impl App {
             .retain(|command| !removed.contains(&command.connection_id));
         self.waiting_tmux_bootstraps
             .retain(|command| !removed.contains(&command.connection_id));
+        self.pending_tmux_session_switches
+            .retain(|id, _| !removed.contains(id));
         self.pending_direct_gateway_input
             .retain(|input| !removed.contains(&input.connection_id));
         self.pending_tmux_background_output
@@ -1847,9 +1886,10 @@ impl App {
         if preserve_connection_chooser {
             self.sync_tmux_connection_chooser();
         } else if let Some(connection_id) = self.active_tmux_connection {
-            self.view_stack.activate_tmux_connection(connection_id);
+            self.view_stack
+                .select_tmux_base(connection_id, !preserve_pending_chooser);
             self.sync_tmux_panes(connection_id)?;
-        } else {
+        } else if !preserve_pending_chooser {
             self.view_stack.activate_terminal();
         }
         sr.speak(
@@ -2046,7 +2086,7 @@ impl App {
         let chooser_updated = self
             .view_stack
             .active_tmux_chooser_mut()
-            .filter(|chooser| chooser.connection_id() == connection_id)
+            .filter(|chooser| chooser.connection_id() == Some(connection_id))
             .map(|chooser| chooser.sync_topology(&topology))
             .is_some();
         Ok(chooser_updated)
@@ -2285,6 +2325,7 @@ impl App {
         if let Some(connection_id) = self.tmux_gateway.active_connection() {
             self.drain_tmux_commands_for(connection_id, pty_out)?;
         }
+        self.settle_pending_tmux_pane_visit(sr, None, term_out)?;
         self.expire_tmux_force_abandon(sr, term_out)?;
         let released_probe_input = self
             .startup_probe_broker
@@ -2588,8 +2629,21 @@ impl App {
             }
             let rejected_connection_id = command.connection_id;
             let rejected_replies = command.expected_replies.clone();
+            let pane_visit = match rejected_replies.as_slice() {
+                [ExpectedTmuxReply::PaneVisit(visit)] => Some(*visit),
+                _ => None,
+            };
+            if let Some(visit) = pane_visit
+                && !self.can_send_tmux_pane_visit(visit)
+            {
+                self.reject_unsent_tmux_pane_visit(visit);
+                continue;
+            }
             let Some((root_connection_id, encoded)) = self.route_tmux_command(command)? else {
                 self.recover_discarded_tmux_flow_command(rejected_connection_id, &rejected_replies);
+                if let Some(visit) = pane_visit {
+                    self.reject_unsent_tmux_pane_visit(visit);
+                }
                 continue;
             };
             self.mark_tmux_flow_commands_in_flight(rejected_connection_id, &rejected_replies);

@@ -31,6 +31,7 @@ return.
 | Pause command reply | Optional resync request | Flow state/backoff changes |
 | Continue command reply | Optional resync request | Earlier capture instead schedules recapture; failures retain retry policy |
 | Carrier command reply | Exactly one create/verify/unlink/switch/move/move-verify result | No other reply outcome from this command |
+| Pending pane visit reply | Record success or failure | May advance a carrier-safe session switch and request fresh inventory if location is unconfirmed |
 | User command reply | Optional result popup | Key configuration changes can also request inventory |
 | Ignored / unsolicited command | None | Unsolicited replies do not fabricate an expected reply |
 | Output / extended output | Pane transport | Flow entry/age bookkeeping; App transport can itself change topology/presentation |
@@ -54,16 +55,19 @@ Two things follow from the table:
 App applies a result in these phases. Keep the order, including when an
 earlier phase creates work for a later one.
 
-1. Carrier reply; inventory lease reconciliation; attached-session observation;
-   lost-carrier failure. Then preferred location and bell acknowledgment.
+1. Carrier and pane visit replies, inventory lease reconciliation,
+   attached-session observation, and lost-carrier failure. Then update
+   preferred location and automatic bell delivery state.
 2. Bootstrap retry, inventory request, native copy-mode exit commands, resync
    capture batch, inventory-failure UI, resume command, resync request. Commands
    retain their paired expected replies and existing bounded queue handling.
 3. Resolve destroyed gateways, synchronize panes, optionally open review.
 4. Apply bootstrap, successful capture, raced capture or failed capture. Keep
    mutable render/location flags and collect any resume discovered here.
-5. Queue that late resume, then present **pane output, else chooser update, else
-   topology render**. Do not freeze presentation decisions at transition time.
+5. Queue that late resume, settle a pending pane visit against the reconciled
+   location, and refresh its chooser rows. Then present **pane output, else
+   chooser update, else topology render**. The active pane acknowledges its
+   pending reasons when the replacement scene is presented.
 6. User command result, then notification popup (including inventory failure).
 
 Errors propagate through App; missing connections and the initial reply

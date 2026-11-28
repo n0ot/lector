@@ -885,6 +885,20 @@ fn real_tmux_ignores_background_activity_and_reports_pane_bells() {
         recorder.messages()
     );
 
+    recorder.clear();
+    client
+        .app
+        .show_pending_tmux_panes(&mut client.sr, &mut client.physical)
+        .unwrap();
+    assert_eq!(recorder.messages(), ["window 0, pane 0, bell"]);
+    client
+        .app
+        .handle_stdin(&mut client.sr, b"\r", &mut Vec::new(), &mut client.physical)
+        .unwrap();
+    client.drive("visit the pane that rang", |app| {
+        !app.has_overlay() && app.debug_active_view_contents().contains("BACKGROUND_DONE")
+    });
+
     super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
     drop(client);
     let _ = std::fs::remove_file(&socket);
@@ -996,6 +1010,297 @@ fn tmux_program_status_observes_each_pane_and_respects_accessibility_settings() 
     );
     assert_eq!(app.debug_active_view_contents(), contents);
     assert_eq!(app.active_tmux_connection(), Some(1));
+}
+
+#[test]
+fn pending_tmux_chooser_prioritizes_and_acknowledges_only_visits() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
+    let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
+    sr.set_program_status_announcements(false);
+    sr.set_tmux_bell_mode(TmuxBellMode::Off);
+    let mut stdin = Vec::new();
+    let attention =
+        "\\033]7501;state=blocked:kind=permission:app=Sample:msg=Q29udGludWU/\\033\\134";
+    let done = "\\033]7501;state=done\\033\\134";
+    recorder.clear();
+    for (pane_id, data) in [
+        (22, "\\007"),
+        (23, done),
+        (21, "\\007"),
+        (21, attention),
+        (20, done),
+    ] {
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            &pane_output(pane_id, data),
+            &mut physical,
+        );
+    }
+    assert!(recorder.messages().is_empty());
+
+    app.handle_stdin(&mut sr, b"\x1bP", &mut stdin, &mut physical)
+        .unwrap();
+    assert!(stdin.is_empty());
+    assert_eq!(
+        recorder.messages(),
+        ["window 2, pane 1, Sample, approval. Continue?"]
+    );
+    let rows = app.debug_active_view_contents();
+    let attention_row = rows.find("Sample, approval").unwrap();
+    let done_row = rows.find("window 1, pane 2, done").unwrap();
+    let bell_row = rows.find("session other, window 1, pane 1, bell").unwrap();
+    assert!(attention_row < done_row && done_row < bell_row, "{rows:?}");
+    assert_eq!(rows.matches("window 2, pane 1").count(), 1);
+    assert!(!rows.contains("window 1, pane 1, done"));
+    assert!(!rows.contains("no details"));
+
+    // Keep the done pane selected when another pane changes priority.
+    app.handle_stdin(&mut sr, b"\x1b[B", &mut stdin, &mut physical)
+        .unwrap();
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(22, attention),
+        &mut physical,
+    );
+    app.handle_stdin(&mut sr, b"\r", &mut stdin, &mut physical)
+        .unwrap();
+    let mut wire = Vec::new();
+    app.drain_tmux_commands_for(1, &mut wire).unwrap();
+    assert_eq!(wire, b"switch-client -E -t '$1:@10.%23'\n");
+    assert!(app.has_overlay());
+    // The location notification alone is not confirmation of the command.
+    // The visible layout can also lag behind the selected pane. Keep the
+    // chooser open until the target owns the rendered layout.
+    let zoomed = format!("%layout-change @10 {SPLIT} b25f,80x24,0,0,20 *Z\n");
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        zoomed.as_bytes(),
+        &mut physical,
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%window-pane-changed @10 %23\n",
+        &mut physical,
+    );
+    assert!(app.has_overlay());
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &reply(100, &[]),
+        &mut physical,
+    );
+    assert!(app.has_overlay());
+    let unzoomed = format!("%layout-change @10 {SPLIT} {SPLIT} *\n");
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        unzoomed.as_bytes(),
+        &mut physical,
+    );
+    assert!(app.has_overlay());
+    wire.clear();
+    app.drain_tmux_commands_for(1, &mut wire).unwrap();
+    assert_eq!(wire, lector::tmux_model::INVENTORY_COMMAND.as_bytes());
+    let mut groups = inventory(1);
+    groups[2][0] =
+        b"P\tstatus\t@10\t%20\t1\t0\t0\t0\t40\t24\t0\t0\t0\t1\t0\t0\t0\t0\tactive".to_vec();
+    groups[2][1] =
+        b"P\tstatus\t@10\t%23\t2\t1\t41\t0\t39\t24\t0\t0\t0\t1\t0\t0\t0\t0\tinactive".to_vec();
+    for (index, group) in groups.iter().enumerate() {
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            &reply(110 + index, group),
+            &mut physical,
+        );
+    }
+    assert!(!app.has_overlay());
+    assert!(app.debug_active_view_contents().contains("ready-23"));
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(23, done),
+        &mut physical,
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%window-pane-changed @10 %20\n",
+        &mut physical,
+    );
+
+    app.show_pending_tmux_panes(&mut sr, &mut physical).unwrap();
+    app.handle_stdin(&mut sr, b"Continue", &mut stdin, &mut physical)
+        .unwrap();
+    assert!(
+        !app.debug_active_view_contents()
+            .contains("window 1, pane 2")
+    );
+    app.handle_stdin(&mut sr, b"\x1b[27;1u", &mut stdin, &mut physical)
+        .unwrap();
+    assert!(!app.has_overlay());
+
+    // Ordinary navigation reaches the other pending pane and acknowledges its
+    // status and bell together. Subsequent reports repeat the same event.
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%session-window-changed $1 @11\n",
+        &mut physical,
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(21, attention),
+        &mut physical,
+    );
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        b"%session-window-changed $1 @10\n",
+        &mut physical,
+    );
+    app.show_pending_tmux_panes(&mut sr, &mut physical).unwrap();
+    assert!(
+        !app.debug_active_view_contents()
+            .contains("window 2, pane 1")
+    );
+    app.handle_stdin(&mut sr, b"\x1b[27;1u", &mut stdin, &mut physical)
+        .unwrap();
+
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(21, "\\007"),
+        &mut physical,
+    );
+    app.show_pending_tmux_panes(&mut sr, &mut physical).unwrap();
+    assert!(
+        app.debug_active_view_contents()
+            .contains("window 2, pane 1, bell")
+    );
+}
+
+#[test]
+fn pending_pane_acknowledgment_waits_for_presentation() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = make_app(true);
+    let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
+    sr.set_program_status_announcements(false);
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    feed(
+        &mut app,
+        &mut sr,
+        &mut router,
+        &pane_output(21, "\\033]7501;state=done\\033\\134"),
+        &mut physical,
+    );
+    // The two location changes coalesce. The briefly selected pane was
+    // never presented, so the report is still available.
+    for window in [11, 10] {
+        let notification = format!("%session-window-changed $1 @{window}\n");
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            notification.as_bytes(),
+            &mut physical,
+        );
+    }
+    app.drain_scheduled_output(&mut physical, true).unwrap();
+    app.show_pending_tmux_panes(&mut sr, &mut physical).unwrap();
+    assert!(app.has_overlay());
+    app.handle_stdin(&mut sr, b"\x1b[27;1u", &mut Vec::new(), &mut physical)
+        .unwrap();
+    assert!(!app.has_overlay());
+
+    for window in [11, 10] {
+        let notification = format!("%session-window-changed $1 @{window}\n");
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            notification.as_bytes(),
+            &mut physical,
+        );
+        app.drain_scheduled_output(&mut physical, true).unwrap();
+    }
+    recorder.clear();
+    app.show_pending_tmux_panes(&mut sr, &mut physical).unwrap();
+    assert!(!app.has_overlay());
+    assert_eq!(recorder.messages(), ["No pending panes"]);
+}
+
+#[test]
+fn empty_pending_tmux_chooser_preserves_an_existing_overlay_and_edit_position() {
+    let (mut app, mut sr, recorder, _clock, mut physical) = make_app(false);
+    let mut router = add_ready_connection(&mut app, &mut sr, &mut physical, 1);
+    sr.set_program_status_announcements(false);
+    for (pane_id, data) in [(20, "done"), (21, "working"), (23, "idle")] {
+        feed(
+            &mut app,
+            &mut sr,
+            &mut router,
+            &pane_output(pane_id, &format!("\\033]7501;state={data}\\033\\134")),
+            &mut physical,
+        );
+    }
+    assert!(
+        app.show_tmux_command_prompt(&mut sr, &mut physical)
+            .unwrap()
+    );
+    let mut stdin = Vec::new();
+    app.handle_stdin(&mut sr, b"abcd\x1b[D", &mut stdin, &mut physical)
+        .unwrap();
+    let before = app.debug_active_view_contents();
+    let cursor = app
+        .composed_scene()
+        .unwrap()
+        .overlays
+        .last()
+        .unwrap()
+        .surface
+        .snapshot
+        .cursor;
+    recorder.clear();
+    physical.clear();
+    app.handle_stdin(&mut sr, b"\x1bP", &mut stdin, &mut physical)
+        .unwrap();
+    assert_eq!(recorder.messages(), ["No pending panes"]);
+    assert!(physical.is_empty());
+    assert!(stdin.is_empty());
+    assert!(app.has_overlay());
+    assert_eq!(app.debug_active_view_contents(), before);
+    assert_eq!(
+        app.composed_scene()
+            .unwrap()
+            .overlays
+            .last()
+            .unwrap()
+            .surface
+            .snapshot
+            .cursor,
+        cursor
+    );
+    app.handle_stdin(&mut sr, b"x", &mut stdin, &mut physical)
+        .unwrap();
+    assert!(app.debug_active_view_contents().contains("abcxd"));
 }
 
 #[test]
@@ -1292,6 +1597,95 @@ fn real_tmux_preview_announces_background_program_status_once_across_reattach() 
                 .debug_active_view_contents()
                 .contains("STATUS REPEATED")
         );
+        client.recorder.clear();
+        client
+            .app
+            .show_pending_tmux_panes(&mut client.sr, &mut client.physical)
+            .unwrap();
+        assert_eq!(
+            client.recorder.messages(),
+            ["window 1, pane 0, Fixture, needs attention. sample reason"]
+        );
+        assert!(client.app.has_overlay());
+        client
+            .app
+            .handle_stdin(&mut client.sr, b"\r", &mut Vec::new(), &mut client.physical)
+            .unwrap();
+        client.drive("visit the recovered status pane", |app| {
+            !app.has_overlay() && app.debug_active_view_contents().contains("STATUS REPEATED")
+        });
+        super::run_real_tmux_fixture_command(
+            &socket,
+            &["select-window", "-t", &format!("{session}:0")],
+        );
+        client.drive("return to the original window", |app| {
+            !app.debug_active_view_contents().contains("STATUS REPEATED")
+        });
+        client.recorder.clear();
+        client
+            .app
+            .show_pending_tmux_panes(&mut client.sr, &mut client.physical)
+            .unwrap();
+        assert_eq!(client.recorder.messages(), ["No pending panes"]);
+        assert!(!client.app.has_overlay());
         super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
     }
+}
+
+#[test]
+#[ignore = "run through scripts/test-real-tmux-docker with the pinned OSC 7501 preview"]
+fn real_tmux_preview_visits_recovered_status_in_another_session() {
+    let _serial = super::serialize_real_tmux_test();
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tmux.sock");
+    let fixture = env!("CARGO_BIN_EXE_lector-harness");
+    for session in ["first", "second"] {
+        super::run_real_tmux_fixture_command(
+            &socket,
+            &[
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-e",
+                "LECTOR_TEST_PTY_MODE=program-status",
+                fixture,
+                "pty",
+            ],
+        );
+    }
+    let mut prep = RealTmuxClient::attach(&socket, "second");
+    let target = super::run_real_tmux_fixture_command(
+        &socket,
+        &["display-message", "-t", "second:", "-p", "#{pane_id}"],
+    );
+    let target = target.trim();
+    let pane = target.strip_prefix('%').unwrap().parse().unwrap();
+    prep.wait_for(pane, "STATUS READY");
+    super::run_real_tmux_fixture_command(&socket, &["send-keys", "-t", target, "p"]);
+    prep.wait_for(pane, "PROBE ACCEPTED");
+    super::run_real_tmux_fixture_command(&socket, &["detach-client", "-s", "second"]);
+    drop(prep);
+
+    let mut client = RealTmuxClient::attach(&socket, "first");
+    client.wait_for(pane, "PROBE ACCEPTED");
+    client.recorder.clear();
+    client
+        .app
+        .show_pending_tmux_panes(&mut client.sr, &mut client.physical)
+        .unwrap();
+    assert_eq!(
+        client.recorder.messages(),
+        ["session second, window 0, pane 0, Fixture, needs attention. sample reason"]
+    );
+    client
+        .app
+        .handle_stdin(&mut client.sr, b"\r", &mut Vec::new(), &mut client.physical)
+        .unwrap();
+    client.drive("visit a pending pane in another session", |app| {
+        !app.has_overlay() && app.debug_active_view_contents().contains("PROBE ACCEPTED")
+    });
+    super::run_real_tmux_fixture_command(&socket, &["kill-server"]);
 }

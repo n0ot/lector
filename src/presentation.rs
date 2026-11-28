@@ -201,6 +201,7 @@ pub struct PresentedAccessibilityBundle {
     /// The active view's title, context, and program activity captured with
     /// this scene. Controller titles can change without changing its ViewId.
     pub(crate) active_location: Option<PresentedLocation>,
+    pub(crate) active_tmux_pane: Option<crate::tmux_model::TmuxPaneIdentity>,
     pub frames: Vec<PresentedViewFrame>,
 }
 
@@ -237,12 +238,16 @@ impl PresentedAccessibilityBundle {
         Self {
             active_view,
             active_location: None,
+            active_tmux_pane: None,
             frames,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.active_view.is_none() && self.active_location.is_none() && self.frames.is_empty()
+        self.active_view.is_none()
+            && self.active_location.is_none()
+            && self.active_tmux_pane.is_none()
+            && self.frames.is_empty()
     }
 }
 

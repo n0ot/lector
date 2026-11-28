@@ -231,11 +231,17 @@ impl ViewStack {
     }
 
     pub(crate) fn activate_tmux_connection(&mut self, connection_id: u64) -> bool {
+        self.select_tmux_base(connection_id, true)
+    }
+
+    pub(crate) fn select_tmux_base(&mut self, connection_id: u64, clear_overlays: bool) -> bool {
         let Some(index) = self.tmux_connection_index(connection_id) else {
             return false;
         };
         let had_overlay = self.has_overlay();
-        self.clear_overlays();
+        if clear_overlays {
+            self.clear_overlays();
+        }
         if self.active_base != index {
             if !had_overlay {
                 self.deactivate_active_document_context();
@@ -258,6 +264,64 @@ impl ViewStack {
                 .downcast_mut::<crate::views::TmuxConnectionView>()
                 .is_some_and(|connection| connection.connection_id() == connection_id)
         })
+    }
+
+    pub(crate) fn tmux_connection(
+        &self,
+        connection_id: u64,
+    ) -> Option<&crate::views::TmuxConnectionView> {
+        self.views[..self.base_count]
+            .iter()
+            .filter_map(|view| {
+                view.as_any()
+                    .downcast_ref::<crate::views::TmuxConnectionView>()
+            })
+            .find(|connection| connection.connection_id() == connection_id)
+    }
+
+    fn base_tmux_connection(&self) -> Option<&crate::views::TmuxConnectionView> {
+        self.views[self.active_base]
+            .as_any()
+            .downcast_ref::<crate::views::TmuxConnectionView>()
+    }
+
+    pub(crate) fn base_tmux_pane(&self) -> Option<crate::tmux_model::TmuxPaneIdentity> {
+        let connection = self.base_tmux_connection()?;
+        connection.pane_identity(connection.active_input_pane()?)
+    }
+
+    pub(crate) fn active_tmux_pane(&self) -> Option<crate::tmux_model::TmuxPaneIdentity> {
+        if self.has_overlay() {
+            return None;
+        }
+        self.base_tmux_connection()?.confirmed_active_pane()
+    }
+
+    pub(crate) fn has_pending_tmux_pane_chooser(&self) -> bool {
+        self.views[self.base_count..].iter().any(|view| {
+            view.as_any()
+                .downcast_ref::<crate::views::TmuxChooserView>()
+                .is_some_and(crate::views::TmuxChooserView::is_pending_panes)
+        })
+    }
+
+    pub(crate) fn sync_pending_tmux_pane_choosers(
+        &mut self,
+        rows: &[(crate::tmux_model::TmuxPaneIdentity, String)],
+    ) -> bool {
+        let active = self.views.len() - 1;
+        let mut active_changed = false;
+        for (index, view) in self.views.iter_mut().enumerate().skip(self.base_count) {
+            if let Some(chooser) = view
+                .as_any_mut()
+                .downcast_mut::<crate::views::TmuxChooserView>()
+                .filter(|chooser| chooser.is_pending_panes())
+            {
+                let changed = chooser.sync_pending_panes(rows);
+                active_changed |= index == active && changed;
+            }
+        }
+        active_changed
     }
 
     pub(crate) fn tmux_connection_mut(
@@ -409,6 +473,7 @@ impl ViewStack {
 
         let mut bundle = PresentedAccessibilityBundle::new(active_view, frames);
         bundle.active_location = Some(active_location);
+        bundle.active_tmux_pane = self.active_tmux_pane();
         bundle
     }
 

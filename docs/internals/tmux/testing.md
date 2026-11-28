@@ -154,14 +154,19 @@ LECTOR_REAL_TMUX_PROGRAM_STATUS=1 scripts/test-real-tmux-docker
 The preview build uses upstream revision
 [`61aded53`](https://github.com/tmux/tmux/commit/61aded536b925f6eadfd37457dc765c85116f51a).
 The test uses a project-built pane fixture that waits for tmux's capability
-reply before reporting its status. It checks background speech and silent
-state recovery when Lector reattaches. The runner also accepts an immutable
+reply before reporting its status. It checks background speech, silent state
+recovery when Lector reattaches, and chooser navigation across sessions. The runner also accepts an immutable
 prebuilt preview image with `LECTOR_REAL_TMUX_PREBUILT_IMAGE` and an explicit
 `LECTOR_REAL_TMUX_PLATFORM`.
 
-Lector observes root records in live pane output and seeds their state and name
-from tmux capture metadata at attach and resynchronization. The same capture
-recovers unfinished terminal sequences, including an OSC split by the boundary.
-Recovered state is silent. Empty status fields mean the state is unknown.
-The reported message can contain arbitrary user-facing text and has no role
-in the transition or announcement.
+Lector observes root records in live pane output. At attach and
+resynchronization, tmux capture metadata can supply the state, name, and
+message. Category is available only from live reports. Recovered status is
+silent, and an unchanged report stays acknowledged for the same pane
+lifetime. The capture also recovers unfinished terminal sequences, including
+an OSC split by the boundary.
+
+The pending chooser keeps its selection by connection and pane lifetime.
+A chooser visit requires both a successful targeted tmux command and an
+observed matching location. Pending reasons clear when the destination is
+presented as the active pane after either kind of navigation.

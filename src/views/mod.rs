@@ -124,6 +124,9 @@ pub trait ViewController {
         self.model().enable_presentation_tracking();
     }
     fn title(&self) -> &str;
+    fn activation_announcement(&self) -> Option<&str> {
+        None
+    }
     fn kind(&self) -> ViewKind {
         ViewKind::Other
     }

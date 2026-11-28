@@ -387,6 +387,18 @@ fn ready_nested(
     name: &str,
     client: &str,
 ) {
+    ready_nested_with_layout(app, sr, physical, depth, name, client, false);
+}
+
+fn ready_nested_with_layout(
+    app: &mut App,
+    sr: &mut ScreenReader,
+    physical: &mut Vec<u8>,
+    depth: usize,
+    name: &str,
+    client: &str,
+    split: bool,
+) {
     let routed_inventory = drain_root(app);
     let mut decoded = routed_inventory;
     for _ in 0..depth {
@@ -403,7 +415,7 @@ fn ready_nested(
         .concat()
     );
 
-    let groups = inventory(false, name, client);
+    let groups = inventory(split, name, client);
     feed_at_depth(app, sr, physical, depth, &reply(49, &[], true));
     feed_at_depth(
         app,
@@ -421,7 +433,12 @@ fn ready_nested(
     for _ in 0..depth {
         decoded = decode_send_keys(&decoded, 20);
     }
-    assert_eq!(decoded, b"capture-pane -p -e -F -J -S - -t %20\n");
+    let expected = if split {
+        b"capture-pane -p -e -F -J -S - -t %20\ncapture-pane -p -e -F -J -S - -t %21\n".as_slice()
+    } else {
+        b"capture-pane -p -e -F -J -S - -t %20\n"
+    };
+    assert_eq!(decoded, expected);
     feed_at_depth(
         app,
         sr,
@@ -429,6 +446,15 @@ fn ready_nested(
         depth,
         &reply(80, &[format!("{name}-READY").into_bytes()], true),
     );
+    if split {
+        feed_at_depth(
+            app,
+            sr,
+            physical,
+            depth,
+            &reply(81, &[format!("{name}-SIBLING").into_bytes()], true),
+        );
+    }
 }
 
 fn input(app: &mut App, sr: &mut ScreenReader, physical: &mut Vec<u8>, bytes: &[u8]) {
@@ -635,6 +661,118 @@ fn current_location_keeps_matching_pane_ids_in_nested_connections_separate() {
     recorder.0.borrow_mut().clear();
     input(&mut app, &mut sr, &mut physical, b"\x1bw\x1bW");
     assert_eq!(&*recorder.0.borrow(), &["tmux portal", "tmux portal"]);
+}
+
+#[test]
+fn pending_pane_visit_routes_nested_colliding_ids_and_rejects_target_loss() {
+    let (mut app, mut sr, recorder, mut physical) = recording_app();
+    sr.set_program_status_announcements(false);
+    ready_root(&mut app, &mut sr, &mut physical);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested_with_layout(&mut app, &mut sr, &mut physical, 1, "inner", "child", true);
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 120);
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    assert!(drain_root(&mut app).is_empty());
+
+    for (depth, status) in [
+        (0, b"\x1b]7501;state=done:app=Outer\x1b\\".as_slice()),
+        (1, b"\x1b]7501;state=error:app=Inner\x1b\\".as_slice()),
+    ] {
+        feed_at_depth(
+            &mut app,
+            &mut sr,
+            &mut physical,
+            depth,
+            &pane_output(21, status),
+        );
+    }
+    recorder.0.borrow_mut().clear();
+    input(&mut app, &mut sr, &mut physical, b"\x1bP");
+    assert_eq!(
+        &*recorder.0.borrow(),
+        &["tmux 2, window 1, pane 2, Inner, failed"]
+    );
+    assert!(
+        app.debug_active_view_contents()
+            .contains("window 1, pane 2, Outer, done")
+    );
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    let wire = drain_root(&mut app);
+    assert_eq!(
+        decode_send_keys(&wire, 20),
+        b"switch-client -E -t '$1:@10.%21'\n"
+    );
+    assert_eq!(app.active_tmux_connection(), Some(1));
+    feed_at_depth(&mut app, &mut sr, &mut physical, 1, &reply(141, &[], false));
+    assert!(app.has_overlay());
+    assert_eq!(app.active_tmux_connection(), Some(1));
+    assert!(app.debug_active_view_contents().contains("Inner, failed"));
+    assert!(app.debug_active_view_contents().contains("Outer, done"));
+
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    assert_eq!(
+        decode_send_keys(&drain_root(&mut app), 20),
+        b"switch-client -E -t '$1:@10.%21'\n"
+    );
+    feed_at_depth(&mut app, &mut sr, &mut physical, 1, &reply(142, &[], true));
+    assert!(app.has_overlay());
+    assert_eq!(app.active_tmux_connection(), Some(1));
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        b"%window-pane-changed @10 %21\n",
+    );
+    assert!(!app.has_overlay());
+    assert_eq!(app.active_tmux_connection(), Some(2));
+    assert!(app.debug_active_view_contents().contains("inner-SIBLING"));
+    assert!(!app.debug_active_view_contents().contains("inner-READY"));
+
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    // The outer %21 still has its own pending status. An unchanged inner
+    // report stays acknowledged until the inner connection is replaced.
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &pane_output(21, b"\x1b]7501;state=error:app=Inner\x1b\\"),
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1bP");
+    assert!(app.debug_active_view_contents().contains("Outer, done"));
+    assert!(!app.debug_active_view_contents().contains("Inner, failed"));
+    input(&mut app, &mut sr, &mut physical, b"\x1b[27;1u");
+
+    feed_at_depth(&mut app, &mut sr, &mut physical, 1, b"%exit\n\x1b\\");
+    let _ = drain_root(&mut app);
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 170);
+    start_nested(&mut app, &mut sr, &mut physical, 1);
+    ready_nested_with_layout(&mut app, &mut sr, &mut physical, 1, "inner", "child", true);
+    acknowledge_root_replies(&mut app, &mut sr, &mut physical, 200);
+    app.activate_tmux_connection(1, &mut sr, &mut physical)
+        .unwrap();
+    feed_at_depth(
+        &mut app,
+        &mut sr,
+        &mut physical,
+        1,
+        &pane_output(21, b"\x1b]7501;state=error:app=Inner\x1b\\"),
+    );
+    input(&mut app, &mut sr, &mut physical, b"\x1bP");
+    assert!(app.debug_active_view_contents().contains("Inner, failed"));
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    feed_at_depth(&mut app, &mut sr, &mut physical, 1, b"%exit\n\x1b\\");
+    assert!(app.has_overlay());
+    assert_eq!(app.active_tmux_connection(), Some(1));
+    assert!(!app.debug_active_view_contents().contains("Inner, failed"));
+    assert!(app.debug_active_view_contents().contains("Outer, done"));
+    input(&mut app, &mut sr, &mut physical, b"\r");
+    let wire = String::from_utf8(drain_root(&mut app)).unwrap();
+    assert!(!wire.contains("switch-client"), "{wire:?}");
+    assert!(app.has_overlay());
 }
 
 #[test]

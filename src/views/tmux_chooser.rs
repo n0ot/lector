@@ -7,7 +7,7 @@ use crate::{
     screen_reader::ScreenReader,
     terminal_input::KeyInput,
     tmux_control::CommandStatus,
-    tmux_model::{PaneId, SessionId, TmuxTopology, WindowId},
+    tmux_model::{PaneId, SessionId, TmuxPaneIdentity, TmuxTopology, WindowId},
     tmux_prefix::ChooseTree,
     view::View,
 };
@@ -23,6 +23,7 @@ pub enum TmuxChooserTarget {
     Session(SessionId),
     Window(WindowId),
     Pane(PaneId),
+    PendingPane(TmuxPaneIdentity),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +31,7 @@ enum TmuxChooserScope {
     Sessions,
     Windows(SessionId),
     Panes(SessionId, WindowId),
+    PendingPanes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,7 +84,7 @@ impl TmuxChooserTarget {
 pub struct TmuxChooserView {
     view: View,
     title: String,
-    connection_id: u64,
+    connection_id: Option<u64>,
     scope: TmuxChooserScope,
     items: Vec<ChooserItem>,
     tree_rows: Option<TmuxTreeRows>,
@@ -154,7 +156,20 @@ impl TmuxChooserView {
         selected: Option<TmuxChooserTarget>,
         topology: &TmuxTopology,
     ) -> Self {
-        let mut chooser = Self {
+        let mut chooser = Self::empty(rows, cols, Some(connection_id), title, scope, selected);
+        chooser.sync_topology(topology);
+        chooser
+    }
+
+    fn empty(
+        rows: u16,
+        cols: u16,
+        connection_id: Option<u64>,
+        title: &str,
+        scope: TmuxChooserScope,
+        selected: Option<TmuxChooserTarget>,
+    ) -> Self {
+        Self {
             view: View::new(rows, cols),
             title: title.to_owned(),
             connection_id,
@@ -164,13 +179,59 @@ impl TmuxChooserView {
             editor: LineEditor::new(),
             selected,
             viewport_start: 0,
-        };
-        chooser.sync_topology(topology);
+        }
+    }
+
+    pub(crate) fn pending_panes(
+        rows: u16,
+        cols: u16,
+        items: &[(TmuxPaneIdentity, String)],
+    ) -> Self {
+        let mut chooser = Self::empty(
+            rows,
+            cols,
+            None,
+            "pending panes",
+            TmuxChooserScope::PendingPanes,
+            None,
+        );
+        chooser.sync_pending_panes(items);
+        chooser.reconcile_selection();
+        chooser.render();
         chooser
     }
 
+    pub(crate) fn is_pending_panes(&self) -> bool {
+        self.scope == TmuxChooserScope::PendingPanes
+    }
+
+    pub(crate) fn sync_pending_panes(&mut self, rows: &[(TmuxPaneIdentity, String)]) -> bool {
+        let items = rows
+            .iter()
+            .map(|(identity, label)| ChooserItem {
+                target: TmuxChooserTarget::PendingPane(*identity),
+                label: label.clone(),
+            })
+            .collect::<Vec<_>>();
+        if self.items == items {
+            return false;
+        }
+        self.items = items;
+        let matching = self.matching_items();
+        // If a row disappears while the user is about to press Enter, keep
+        // the selection empty until the user actively chooses another row.
+        if self
+            .selected
+            .is_some_and(|selected| !matching.iter().any(|item| item.target == selected))
+        {
+            self.selected = None;
+        }
+        self.render();
+        true
+    }
+
     #[must_use]
-    pub fn connection_id(&self) -> u64 {
+    pub fn connection_id(&self) -> Option<u64> {
         self.connection_id
     }
 
@@ -181,7 +242,7 @@ impl TmuxChooserView {
 
     fn tree_scope_error(&self, topology: &TmuxTopology) -> Option<&'static str> {
         let (session_id, chosen_window) = match self.scope {
-            TmuxChooserScope::Sessions => return None,
+            TmuxChooserScope::Sessions | TmuxChooserScope::PendingPanes => return None,
             TmuxChooserScope::Windows(session_id) => (session_id, None),
             TmuxChooserScope::Panes(session_id, window_id) => (session_id, Some(window_id)),
         };
@@ -225,6 +286,7 @@ impl TmuxChooserView {
                 let panes = format!("list-panes -t '${}:@{}'", session_id.0, window_id.0);
                 ("#{pane_id}", panes.clone(), panes)
             }
+            TmuxChooserScope::PendingPanes => return Err("pending panes use Lector's pane state"),
         };
         if let Some(filter) = options.filter {
             // tmux filters the tree on each pane. Parent rows survive when any
@@ -300,6 +362,9 @@ impl TmuxChooserView {
     }
 
     pub fn sync_topology(&mut self, topology: &TmuxTopology) {
+        if self.is_pending_panes() {
+            return;
+        }
         if self.tree_rows.is_some()
             && let Some(error) = self.tree_scope_error(topology)
             && let Some(rows) = &mut self.tree_rows
@@ -358,6 +423,7 @@ impl TmuxChooserView {
                 });
                 panes
             }
+            TmuxChooserScope::PendingPanes => unreachable!("synchronized separately"),
         };
         if let Some(rows) = &self.tree_rows {
             self.items.retain_mut(|item| {
@@ -435,9 +501,15 @@ impl TmuxChooserView {
     fn choose(&self) -> ViewAction {
         self.selected
             .filter(|target| self.items.iter().any(|item| item.target == *target))
-            .map_or(ViewAction::Bell, |target| ViewAction::TmuxChooserSelect {
-                connection_id: self.connection_id,
-                target,
+            .map_or(ViewAction::Bell, |target| match target {
+                TmuxChooserTarget::PendingPane(identity) => ViewAction::TmuxChooserSelect {
+                    connection_id: identity.connection_id,
+                    target,
+                },
+                _ => ViewAction::TmuxChooserSelect {
+                    connection_id: self.connection_id.expect("tmux chooser owns a connection"),
+                    target,
+                },
             })
     }
 
@@ -487,6 +559,8 @@ impl TmuxChooserView {
             TmuxChooserScope::Sessions => "no matching sessions",
             TmuxChooserScope::Windows(_) => "no matching windows",
             TmuxChooserScope::Panes(..) => "no matching panes",
+            TmuxChooserScope::PendingPanes if self.items.is_empty() => "No pending panes",
+            TmuxChooserScope::PendingPanes => "no matching panes",
         }
     }
 
@@ -619,6 +693,11 @@ impl ViewController for TmuxChooserView {
 
     fn title(&self) -> &str {
         &self.title
+    }
+
+    fn activation_announcement(&self) -> Option<&str> {
+        self.is_pending_panes()
+            .then(|| self.selected_label().unwrap_or_else(|| self.empty_text()))
     }
 
     fn kind(&self) -> ViewKind {

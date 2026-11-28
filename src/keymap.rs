@@ -157,6 +157,7 @@ const NORMAL_BINDINGS: &[(&str, Action)] = &[
     ("F12", Action::SayTime),
     ("M-L", Action::OpenLuaRepl),
     ("M-C", Action::OpenTmuxConnectionChooser),
+    ("M-P", Action::OpenPendingTmuxPanes),
     ("F5", Action::SetMark),
     ("F6", Action::Copy),
     ("F7", Action::Paste),
